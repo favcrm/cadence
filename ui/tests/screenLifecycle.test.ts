@@ -227,10 +227,10 @@ check(SCREEN_LOCALE_V1 === "screen-locale.v1", "generic locale token exported");
 check(!parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "crm-locale.v1"] }), "legacy crm-locale.v1 token is refused");
 check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"] }),
   "up to five ready capabilities parse");
-check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-actions.v1", "screen-records.v1", "screen-surfaces.v1", "screen-locale.v1", "screen-audio.v1"] }),
-  "up to six ready capabilities parse");
-check(!parseChild({ v: 1, op: "ready", accepts: ["publish-intents.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1", "screen-audio.v1"] }),
-  "more than six ready capabilities refused");
+check(parseChild({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1", "screen-locale.v1", "screen-whatsapp-compose.v1", "screen-whatsapp-reply-availability.v1", "screen-whatsapp-reply-layout.v2", "screen-whatsapp-media.v1", "screen-route-params.v1"] }),
+  "up to eight ready capabilities parse");
+check(!parseChild({ v: 1, op: "ready", accepts: ["publish-intents.v1", "screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1", "screen-audio.v1", "screen-route-params.v1", "screen-whatsapp-media.v1"] }),
+  "more than eight ready capabilities refused");
 check(parseChild({ v: 2, op: "leave", unsaved: true })?.op === "leave", "v2 leave boolean parses");
 check(!parseChild({ v: 1, op: "leave", unsaved: true }), "v1 leave refused");
 check(!parseChild({ v: 2, op: "leave", unsaved: "yes" }), "non-boolean leave refused");

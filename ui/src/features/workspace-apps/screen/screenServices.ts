@@ -1,9 +1,93 @@
 import { ApiError } from "../../../lib/api";
 import { sessionHeaders } from "../../../lib/sessionKey";
 import { displayEpoch, displayPlanKey, invalidateDisplay, observeRead, purgeDisplayCache } from "./screenDisplayCache";
-import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type ActionArgs, type ActionRefusal, type ActionResult, type RecordCallVerb, type RecordSlotVerb } from "./screenProtocol";
+import {
+  LINKED_MEDIA_MAX_BYTES,
+  LINKED_MEDIA_MAX_IMAGE_BYTES,
+  RECORD_CALL_VERBS,
+  RECORD_SLOT_VERBS,
+  validLinkedMediaId,
+  type ActionArgs,
+  type ActionRefusal,
+  type ActionResult,
+  type RecordCallVerb,
+  type RecordSlotVerb,
+} from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 import type { RecordCard, SlotPlan } from "./screenSlot";
+
+export type LinkedMediaKind = "image" | "video" | "audio" | "document";
+export type LinkedStagedAttachment = {
+  attachment_id: string;
+  kind: LinkedMediaKind;
+  mime_type: string;
+  file_name: string | null;
+  byte_length: number;
+  sha256: string;
+  expires_at: string;
+};
+export type WhatsAppMediaDownloadResult =
+  | { ok: true; bytes: ArrayBuffer; mimeType: string; fileName: string | null; sha256: string }
+  | { ok: false; refusal: ActionRefusal };
+
+const ATTACHMENT_ID_RE = /^wam_[0-9a-f]{32}$/;
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const LINKED_MEDIA_KINDS = new Set<string>(["image", "video", "audio", "document"]);
+const SAFE_LINKED_MEDIA_MIMES = new Set<string>([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "video/mp4",
+  "video/webm",
+  "video/3gpp",
+  "video/quicktime",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/mp4",
+  "audio/aac",
+  "audio/wav",
+  "audio/webm",
+  "application/pdf",
+  "text/plain",
+  "text/csv",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+]);
+
+function normalizedSafeMime(raw: string | null): string | null {
+  const base = (raw ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+  return SAFE_LINKED_MEDIA_MIMES.has(base) ? base : null;
+}
+
+async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export function formatMediaBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) {
+    const kb = n / 1024;
+    return `${kb % 1 === 0 ? kb.toFixed(0) : kb.toFixed(1)} KB`;
+  }
+  const mb = n / (1024 * 1024);
+  return `${mb % 1 === 0 ? mb.toFixed(0) : mb.toFixed(1)} MB`;
+}
+
+function parseDispositionFileName(header: string | null): string | null {
+  if (!header) return null;
+  const match = /filename="([^"\r\n]+)"/i.exec(header);
+  if (!match) return null;
+  const cleaned = match[1].replace(/[/\\]/g, "").trim();
+  if (!cleaned || cleaned === "." || cleaned === ".." || cleaned.length > 200) return null;
+  for (let i = 0; i < cleaned.length; i++) {
+    const code = cleaned.charCodeAt(i);
+    if (code < 32 || code === 127) return null;
+  }
+  return cleaned;
+}
 
 export const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 export function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).every(k => keys.includes(k)); }
@@ -261,6 +345,281 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         } };
       } catch (error) { return failed(error, operation); }
     },
+    async stageWhatsAppMedia(file: File): Promise<{ ok: true; data: LinkedStagedAttachment } | { ok: false; refusal: ActionRefusal }> {
+      if (!permitted("whatsapp.reply.prepare") || !permitted("whatsapp.reply.send")) {
+        return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
+      }
+      const actionToken = receipt.action_token!;
+      const form = new FormData();
+      form.set("action_token", actionToken);
+      form.set("provider", "linked");
+      form.set("file", file);
+      let response: Response;
+      try {
+        response = await fetch("/api/app-screen-services/whatsapp-media/stage", {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
+          body: form,
+        });
+      } catch {
+        return { ok: false, refusal: { code: "failed", text: "Could not upload attachment." } };
+      }
+      if (!current()) return { ok: false, refusal: { code: "forbidden", text: "Mount retired." } };
+      if (response.status === 404) {
+        return {
+          ok: false,
+          refusal: {
+            code: "unsupported_host",
+            text: "Attachment uploads are not supported by this workspace host yet.",
+          },
+        };
+      }
+      let value: unknown = null;
+      try {
+        const text = await response.text();
+        value = text ? JSON.parse(text) : null;
+      } catch {
+        value = null;
+      }
+      if (!response.ok) {
+        const code = serverErrorCode(value);
+        const message = serverErrorText(value) ?? "Could not upload attachment.";
+        if (response.status === 401 || response.status === 403) {
+          return {
+            ok: false,
+            refusal: failed(new ApiError(message, response.status, code ? { code } : undefined), "whatsapp.reply.prepare"),
+          };
+        }
+        if (response.status === 413) {
+          return { ok: false, refusal: { code: "payload_too_large", text: message } };
+        }
+        if (response.status === 415) {
+          return { ok: false, refusal: { code: "unsupported_media_type", text: message } };
+        }
+        return {
+          ok: false,
+          refusal: {
+            code: code && /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "failed",
+            text: message,
+          },
+        };
+      }
+      if (
+        !object(value) ||
+        !exact(value, ["attachment_id", "kind", "mime_type", "file_name", "byte_length", "sha256", "expires_at"]) ||
+        typeof value.attachment_id !== "string" || !ATTACHMENT_ID_RE.test(value.attachment_id) ||
+        typeof value.kind !== "string" || !LINKED_MEDIA_KINDS.has(value.kind) ||
+        typeof value.mime_type !== "string" || !normalizedSafeMime(value.mime_type) ||
+        (value.file_name !== null && typeof value.file_name !== "string") ||
+        typeof value.byte_length !== "number" || !Number.isSafeInteger(value.byte_length) || value.byte_length < 1 ||
+        typeof value.sha256 !== "string" || !SHA256_HEX_RE.test(value.sha256) ||
+        typeof value.expires_at !== "string"
+      ) {
+        return { ok: false, refusal: { code: "failed", text: "Invalid staged attachment receipt." } };
+      }
+      return {
+        ok: true,
+        data: {
+          attachment_id: value.attachment_id,
+          kind: value.kind as LinkedMediaKind,
+          mime_type: value.mime_type,
+          file_name: value.file_name,
+          byte_length: value.byte_length,
+          sha256: value.sha256,
+          expires_at: value.expires_at,
+        },
+      };
+    },
+    async readStagedWhatsAppMedia(
+      attachmentId: string,
+    ): Promise<{ ok: true; blob: Blob; mimeType: string; sha256: string } | { ok: false; refusal: ActionRefusal }> {
+      if (!permitted("whatsapp.reply.prepare") || !ATTACHMENT_ID_RE.test(attachmentId)) {
+        return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
+      }
+      let response: Response;
+      try {
+        response = await fetch("/api/app-screen-services/whatsapp-media/stage/content", {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+          body: JSON.stringify({ action_token: receipt.action_token, provider: "linked", attachment_id: attachmentId }),
+        });
+      } catch {
+        return { ok: false, refusal: { code: "failed", text: "Could not read staged attachment." } };
+      }
+      if (!current()) return { ok: false, refusal: { code: "forbidden", text: "Mount retired." } };
+      if (!response.ok) {
+        let value: unknown = null;
+        try {
+          value = await response.json();
+        } catch {
+          value = null;
+        }
+        const code = serverErrorCode(value);
+        const message = serverErrorText(value) ?? "Could not read staged attachment.";
+        if (response.status === 401 || response.status === 403) {
+          return {
+            ok: false,
+            refusal: failed(new ApiError(message, response.status, code ? { code } : undefined), "whatsapp.reply.prepare"),
+          };
+        }
+        return {
+          ok: false,
+          refusal: { code: code && /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "failed", text: message },
+        };
+      }
+      const mimeType = normalizedSafeMime(response.headers.get("content-type"));
+      const expectedSha = (response.headers.get("x-linked-media-sha256") ?? "").trim().toLowerCase();
+      if (!mimeType || !SHA256_HEX_RE.test(expectedSha)) {
+        return { ok: false, refusal: { code: "failed", text: "Invalid attachment metadata." } };
+      }
+      const maxBytes = mimeType.startsWith("image/") ? LINKED_MEDIA_MAX_IMAGE_BYTES : LINKED_MEDIA_MAX_BYTES;
+      const buf = await response.arrayBuffer();
+      if (!current() || buf.byteLength < 1 || buf.byteLength > maxBytes) {
+        return { ok: false, refusal: { code: "failed", text: "Attachment exceeds size limit." } };
+      }
+      if ((await sha256Hex(buf)) !== expectedSha) {
+        return { ok: false, refusal: { code: "failed", text: "Attachment integrity check failed." } };
+      }
+      return { ok: true, blob: new Blob([buf], { type: mimeType }), mimeType, sha256: expectedSha };
+    },
+    async deleteStagedWhatsAppMedia(
+      attachmentId: string,
+    ): Promise<{ ok: true } | { ok: false; refusal: ActionRefusal }> {
+      if (!permitted("whatsapp.reply.prepare") || !ATTACHMENT_ID_RE.test(attachmentId)) {
+        return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
+      }
+      let response: Response;
+      try {
+        response = await fetch("/api/app-screen-services/whatsapp-media/stage/delete", {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+          body: JSON.stringify({ action_token: receipt.action_token, provider: "linked", attachment_id: attachmentId }),
+        });
+      } catch {
+        return { ok: false, refusal: { code: "failed", text: "Could not remove attachment." } };
+      }
+      if (!current()) return { ok: false, refusal: { code: "forbidden", text: "Mount retired." } };
+      if (!response.ok) {
+        let value: unknown = null;
+        try {
+          value = await response.json();
+        } catch {
+          value = null;
+        }
+        const code = serverErrorCode(value);
+        const message = serverErrorText(value) ?? "Could not remove attachment.";
+        if (response.status === 401 || response.status === 403) {
+          return {
+            ok: false,
+            refusal: failed(new ApiError(message, response.status, code ? { code } : undefined), "whatsapp.reply.prepare"),
+          };
+        }
+        return {
+          ok: false,
+          refusal: { code: code && /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "failed", text: message },
+        };
+      }
+      return { ok: true };
+    },
+    async downloadWhatsAppMedia(
+      conversationId: string,
+      messageId: string,
+      signal?: AbortSignal,
+    ): Promise<WhatsAppMediaDownloadResult> {
+      if (!permitted("whatsapp.messages")) {
+        return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
+      }
+      if (!validLinkedMediaId(conversationId) || !validLinkedMediaId(messageId)) {
+        return { ok: false, refusal: { code: "validation_failed", text: "Invalid media request." } };
+      }
+      if (signal?.aborted) {
+        return { ok: false, refusal: { code: "cancelled", text: "Download was cancelled." } };
+      }
+      let response: Response;
+      try {
+        response = await fetch("/api/app-screen-services/whatsapp-media/download", {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+          body: JSON.stringify({
+            action_token: receipt.action_token,
+            provider: "linked",
+            conversation_id: conversationId,
+            message_id: messageId,
+          }),
+          ...(signal ? { signal } : {}),
+        });
+      } catch {
+        return {
+          ok: false,
+          refusal: signal?.aborted
+            ? { code: "cancelled", text: "Download was cancelled." }
+            : { code: "failed", text: "Could not download attachment." },
+        };
+      }
+      if (!current()) return { ok: false, refusal: { code: "forbidden", text: "Mount retired." } };
+      if (!response.ok) {
+        let value: unknown = null;
+        try {
+          value = await response.json();
+        } catch {
+          value = null;
+        }
+        const code = serverErrorCode(value);
+        const message = serverErrorText(value) ?? "Attachment is unavailable.";
+        if (response.status === 401 || response.status === 403) {
+          return {
+            ok: false,
+            refusal: failed(new ApiError(message, response.status, code ? { code } : undefined), "whatsapp.messages"),
+          };
+        }
+        return {
+          ok: false,
+          refusal: {
+            code: code && /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "media_unavailable",
+            text: message,
+          },
+        };
+      }
+      const mimeType = normalizedSafeMime(response.headers.get("content-type"));
+      const expectedSha = (response.headers.get("x-linked-media-sha256") ?? "").trim().toLowerCase();
+      if (!mimeType || !SHA256_HEX_RE.test(expectedSha)) {
+        return { ok: false, refusal: { code: "media_unavailable", text: "Attachment metadata is invalid." } };
+      }
+      const maxBytes = mimeType.startsWith("image/") ? LINKED_MEDIA_MAX_IMAGE_BYTES : LINKED_MEDIA_MAX_BYTES;
+      let buf: ArrayBuffer;
+      try {
+        buf = await response.arrayBuffer();
+      } catch {
+        return {
+          ok: false,
+          refusal: signal?.aborted
+            ? { code: "cancelled", text: "Download was cancelled." }
+            : { code: "failed", text: "Could not read attachment." },
+        };
+      }
+      if (signal?.aborted) {
+        return { ok: false, refusal: { code: "cancelled", text: "Download was cancelled." } };
+      }
+      if (!current() || buf.byteLength < 1 || buf.byteLength > maxBytes) {
+        return { ok: false, refusal: { code: "too_large", text: "Attachment exceeds size limit." } };
+      }
+      if ((await sha256Hex(buf)) !== expectedSha) {
+        return { ok: false, refusal: { code: "media_unavailable", text: "Attachment integrity check failed." } };
+      }
+      if (signal?.aborted) {
+        return { ok: false, refusal: { code: "cancelled", text: "Download was cancelled." } };
+      }
+      const fileName = parseDispositionFileName(response.headers.get("content-disposition"));
+      return { ok: true, bytes: buf, mimeType, fileName, sha256: expectedSha };
+    },
   };
 }
 
@@ -354,8 +713,33 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
     // host-computed card for the prepared digest, never from the frame.
     const recipient = object(facts.recipient) ? facts.recipient : null;
     if (!recipient || typeof facts.text !== "string" || typeof facts.digest !== "string" || typeof facts.conversation_id !== "string") throw new ApiError("Incomplete reply facts", 502);
+    let attachments: { kind: LinkedMediaKind; mime_type: string; file_name: string | null; byte_length: number; sha256: string }[] | null = null;
+    if (facts.attachments !== undefined) {
+      if (!Array.isArray(facts.attachments) || facts.attachments.length !== 1 || !object(facts.attachments[0])) {
+        throw new ApiError("Incomplete reply facts", 502);
+      }
+      const item = facts.attachments[0];
+      if (
+        typeof item.attachment_id !== "string" || !ATTACHMENT_ID_RE.test(item.attachment_id) ||
+        typeof item.kind !== "string" || !LINKED_MEDIA_KINDS.has(item.kind) ||
+        typeof item.mime_type !== "string" || !item.mime_type ||
+        (item.file_name !== null && (typeof item.file_name !== "string" || !item.file_name)) ||
+        typeof item.byte_length !== "number" || !Number.isSafeInteger(item.byte_length) || item.byte_length < 1 ||
+        typeof item.sha256 !== "string" || !SHA256_HEX_RE.test(item.sha256)
+      ) {
+        throw new ApiError("Incomplete reply facts", 502);
+      }
+      attachments = [item as { kind: LinkedMediaKind; mime_type: string; file_name: string | null; byte_length: number; sha256: string }];
+    }
     show("To", [recipient.name, recipient.phone].filter(v => typeof v === "string" && v).join(" · ") || facts.conversation_id);
-    show("Conversation", facts.conversation_id); show("Message", facts.text); show("Reply to message", facts.reply_to_message_id);
+    show("Conversation", facts.conversation_id);
+    if (!attachments || facts.text !== "") show("Message", facts.text);
+    show("Reply to message", facts.reply_to_message_id);
+    if (attachments) {
+      const att = attachments[0];
+      show("Attachment", `${att.file_name ?? att.kind} (${att.kind}, ${att.mime_type}, ${formatMediaBytes(att.byte_length)})`);
+      show("Attachment SHA-256", att.sha256);
+    }
     show("Free-text window open until", facts.freeform_until); show("Reply digest", facts.digest);
   }
   if (operation === "whatsapp.template.send") {

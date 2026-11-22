@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { sessionHeaders } from "../../../lib/sessionKey";
 import { beginPrivateOperation, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
-import { admitsWhatsAppComposer, compareShellVersions, parseMount, ScreenChannel, shellVersion, type AssetLoader, type MediaChatAttach, type ScreenActions } from "./screenLifecycle";
+import { admitsWhatsAppComposer, admitsWhatsAppMediaDownload, compareShellVersions, parseMount, ScreenChannel, shellVersion, type AssetLoader, type MediaChatAttach, type ScreenActions } from "./screenLifecycle";
 import type { ScreenFailure, ScreenPaneState } from "./screenFailure";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
@@ -48,6 +48,19 @@ function mountRefusalCode(body: unknown): string | null {
  *  its host-private action token to that child's mount request. Role is
  *  host-derived: `surfaceRole` is set by the host's own mount, never by the
  *  frame. */
+function triggerWhatsAppMediaSave(bytes: ArrayBuffer, mimeType: string, fileName: string): void {
+  const url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+  try {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    try { link.click(); } finally { link.remove(); }
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
+
 export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onMounted, onToolInvoked, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation, readOnly = false, route, surfaceRole = "primary", drawerSurface, drawerSize, drawerTarget, parentActionToken, drawerContext, restoreDrawer, onRestoreDrawerConsumed, socialSources, socialVisit }: {
   projection: ScreenPush; fallback: ReactNode;
   /** Render the specific pane for a mount failure; absent keeps `fallback`. */
@@ -368,6 +381,8 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         let selectedWhatsApp: string | null = null;
         const composeServices = primary && !readOnly && current.installation.name === "waba" && admitsWhatsAppComposer(receipt)
           ? services : null;
+        const mediaDownloadServices = current.installation.name === "waba" && admitsWhatsAppMediaDownload(receipt)
+          ? services : null;
         const composeCurrent = () => isCurrent() && !!owned && channel.current === owned && mounted.current === receipt &&
           frameRoute(receipt.navigation, receipt.tag, navigationCallbacks.current).section === "inbox";
         const selectWhatsApp = (conversationId: string | null, nomination: number | null) => {
@@ -420,6 +435,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           mountQuery.set("wa_compose_layout", "1");
           mountQuery.set("wa_compose_inset_ack", "1");
         }
+        if (mediaDownloadServices) mountQuery.set("wa_media_download", "1");
         frame.src = `${receipt.mount}${mountQuery.size ? `?${mountQuery}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
         // The URL carries the pick at mount time; a change during the load can
         // only be delivered once the document's listener runs, so repeat the
@@ -494,6 +510,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                 const revision = whatsappRevision.current;
                 setWhatsAppReply(reply => reply?.revision === revision ? { ...reply, inset: { px, seq } } : reply);
               },
+            } : {}),
+            ...(mediaDownloadServices ? {
+              onWhatsAppMediaDownload: (conversationId: string, messageId: string, signal: AbortSignal) =>
+                mediaDownloadServices.downloadWhatsAppMedia(conversationId, messageId, signal),
+              onWhatsAppMediaSave: triggerWhatsAppMediaSave,
             } : {}),
             onScreenDrawer: onScreenDrawer
               ? (mode, surface, independent, size, context) => {
