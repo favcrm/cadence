@@ -649,6 +649,15 @@ fn optional_nonempty_str(object: &Map<String, Value>, key: &str) -> Result<Optio
     }
 }
 
+fn required_nonempty_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
+    match object.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => Ok(s.as_str()),
+        _ => Err(Error::rejected(format!(
+            "required tool argument '{key}' must be a non-empty string"
+        ))),
+    }
+}
+
 fn parse_private_app_call(name: &str, args: &Value) -> Result<PrivateAppCall> {
     match name {
         "private_app_prepare" => {
@@ -728,7 +737,7 @@ fn parse_private_app_call(name: &str, args: &Value) -> Result<PrivateAppCall> {
         }
         "private_app_status" | "private_app_reconcile" => {
             let object = fields(args, &["id"], &["id"])?;
-            let id = object["id"].as_str().unwrap();
+            let id = required_nonempty_str(object, "id")?;
             if !valid_review_id(id) {
                 return Err(Error::rejected("tool argument 'id' must be par_<32 hex>"));
             }
@@ -744,9 +753,9 @@ fn parse_private_app_call(name: &str, args: &Value) -> Result<PrivateAppCall> {
                 &["id", "digest", "zip_sha256"],
                 &["id", "digest", "zip_sha256"],
             )?;
-            let id = object["id"].as_str().unwrap();
-            let digest = object["digest"].as_str().unwrap();
-            let zip_sha256 = object["zip_sha256"].as_str().unwrap();
+            let id = required_nonempty_str(object, "id")?;
+            let digest = required_nonempty_str(object, "digest")?;
+            let zip_sha256 = required_nonempty_str(object, "zip_sha256")?;
             if !valid_review_id(id) {
                 return Err(Error::rejected("tool argument 'id' must be par_<32 hex>"));
             }
@@ -1422,10 +1431,16 @@ mod tests {
                 json!({"package_ref": "pkg_1", "install_id": "bad_id"}),
             ),
             ("private_app_status", json!({"id": "par_short"})),
+            ("private_app_status", json!({"id": 123})),
             ("private_app_reconcile", json!({"id": "par_short"})),
+            ("private_app_reconcile", json!({"id": true})),
             (
                 "private_app_apply",
                 json!({"id": valid_par, "digest": valid_sha}),
+            ),
+            (
+                "private_app_apply",
+                json!({"id": 123, "digest": 456, "zip_sha256": 789}),
             ),
             (
                 "private_app_apply",

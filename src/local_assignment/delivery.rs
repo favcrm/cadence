@@ -436,7 +436,8 @@ fn canonical_agent_actor(raw: &str) -> String {
 
 fn make_updater_candidate<'a>(
     actor_opt: Option<&'a str>,
-    is_chat_default_only: bool,
+    fm_is_chat_default_only: bool,
+    chat_default_actor: Option<&str>,
     selected_actor_for_tools: Option<&str>,
     enabled_tools: Option<&'a [String]>,
     adapter: PrivateAppAdapterKind,
@@ -444,7 +445,7 @@ fn make_updater_candidate<'a>(
 ) -> Option<PrivateAppUpdaterCandidate<'a>> {
     actor_opt.map(|actor| PrivateAppUpdaterCandidate {
         actor: Some(actor),
-        is_chat_default_only,
+        is_chat_default_only: fm_is_chat_default_only || chat_default_actor == Some(actor),
         capabilities: None,
         enabled_tools: if selected_actor_for_tools == Some(actor) {
             enabled_tools
@@ -481,6 +482,8 @@ fn resolve_updater_before_download(
         non_empty_trimmed(fm.dedicated_updater.as_deref()).map(canonical_agent_actor);
     let workspace_default_actor =
         non_empty_trimmed(fm.workspace_default_updater.as_deref()).map(canonical_agent_actor);
+    let chat_default_actor =
+        non_empty_trimmed(fm.default_app_agent.as_deref()).map(canonical_agent_actor);
 
     // Fetch only the selected updater profile's own opt-in scopes, never the dispatcher login's.
     let selected_actor_for_tools = explicit_actor
@@ -490,12 +493,13 @@ fn resolve_updater_before_download(
     let profile_enabled_tools = selected_actor_for_tools
         .and_then(|actor| fetch_profile_enabled_tools(target, actor, deadline, wake_timeout));
     let enabled_tools_slice = profile_enabled_tools.as_deref();
-    let is_chat_default_only = fm.is_chat_default_only == Some(true);
+    let fm_chat_default = fm.is_chat_default_only == Some(true);
 
     let resolution = PrivateAppUpdaterResolution {
         explicit_agent: make_updater_candidate(
             explicit_actor.as_deref(),
-            is_chat_default_only,
+            fm_chat_default,
+            chat_default_actor.as_deref(),
             selected_actor_for_tools,
             enabled_tools_slice,
             adapter_kind,
@@ -503,7 +507,8 @@ fn resolve_updater_before_download(
         ),
         dedicated_app_updater: make_updater_candidate(
             dedicated_actor.as_deref(),
-            is_chat_default_only,
+            fm_chat_default,
+            chat_default_actor.as_deref(),
             selected_actor_for_tools,
             enabled_tools_slice,
             adapter_kind,
@@ -511,13 +516,15 @@ fn resolve_updater_before_download(
         ),
         workspace_default_updater: make_updater_candidate(
             workspace_default_actor.as_deref(),
-            is_chat_default_only,
+            fm_chat_default,
+            chat_default_actor.as_deref(),
             selected_actor_for_tools,
             enabled_tools_slice,
             adapter_kind,
             fm,
         ),
-        has_chat_default_app_agent: non_empty_trimmed(fm.default_app_agent.as_deref()).is_some(),
+        has_chat_default_app_agent: chat_default_actor.is_some(),
+        chat_default_actor: chat_default_actor.as_deref(),
         personal_assistant_requested: fm.personal_assistant_requested == Some(true),
     };
 
@@ -527,13 +534,17 @@ fn resolve_updater_before_download(
             format_readiness_refusal(&reasons),
         )
     })?;
-    if let Some(claimed_profile) = kickoff.profile_id {
-        if resolved.actor != canonical_agent_actor(claimed_profile) {
-            return Err(Error::invalid(
-                "private_app_readiness_refused",
-                format_readiness_refusal(&[PrivateAppReadinessReason::ActorMismatch]),
-            ));
-        }
+    let Some(claimed_profile) = non_empty_trimmed(kickoff.profile_id) else {
+        return Err(Error::invalid(
+            "private_app_readiness_refused",
+            format_readiness_refusal(&[PrivateAppReadinessReason::ActorMismatch]),
+        ));
+    };
+    if resolved.actor != canonical_agent_actor(claimed_profile) {
+        return Err(Error::invalid(
+            "private_app_readiness_refused",
+            format_readiness_refusal(&[PrivateAppReadinessReason::ActorMismatch]),
+        ));
     }
     Ok(resolved)
 }
@@ -1666,7 +1677,7 @@ mod tests {
                 bad_digest: Some(
                     "0000000000000000000000000000000000000000000000000000000000000000",
                 ),
-                profile_id: None,
+                profile_id: Some("ap_upd"),
                 expected_substr: "digest",
             },
             NegCase {
@@ -1682,8 +1693,47 @@ mod tests {
                 caps: &["cli.read", "cli.write", "wiki.read"],
                 profile_tools: Some(vec!["cadence_writes"]),
                 bad_digest: None,
-                profile_id: None,
+                profile_id: Some("ap_upd"),
                 expected_substr: "multiple private-app-zip",
+            },
+            NegCase {
+                label: "absent_claimed_profile",
+                issue_payload: base_issue(
+                    json!({"dedicated_updater": "agents/ap_upd"}),
+                    one_art.clone(),
+                ),
+                adapter_val: Some("codex/managed"),
+                caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
+                bad_digest: None,
+                profile_id: None,
+                expected_substr: "actor_mismatch",
+            },
+            NegCase {
+                label: "chat_default_as_dedicated_updater",
+                issue_payload: base_issue(
+                    json!({"dedicated_updater": "agents/ap_chat", "default_app_agent": "ap_chat"}),
+                    one_art.clone(),
+                ),
+                adapter_val: Some("codex/managed"),
+                caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
+                bad_digest: None,
+                profile_id: Some("ap_chat"),
+                expected_substr: "chat_default_not_updater",
+            },
+            NegCase {
+                label: "chat_default_as_workspace_default_updater",
+                issue_payload: base_issue(
+                    json!({"workspace_default_updater": "agents/ap_chat", "default_app_agent": "ap_chat"}),
+                    one_art.clone(),
+                ),
+                adapter_val: Some("codex/managed"),
+                caps: &["cli.read", "cli.write", "wiki.read"],
+                profile_tools: Some(vec!["cadence_writes"]),
+                bad_digest: None,
+                profile_id: Some("ap_chat"),
+                expected_substr: "chat_default_not_updater",
             },
         ];
 

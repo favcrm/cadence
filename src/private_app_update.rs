@@ -122,6 +122,8 @@ pub struct PrivateAppUpdaterResolution<'a> {
     pub workspace_default_updater: Option<PrivateAppUpdaterCandidate<'a>>,
     /// Set when only a chat-only CAD-2434 app agent exists and no updater is configured.
     pub has_chat_default_app_agent: bool,
+    /// Optional CAD-2434 chat-only default actor (`agents/<id>`), never admissible as an updater.
+    pub chat_default_actor: Option<&'a str>,
     /// Set when the caller tried to route through Personal Assistant (`service/*`).
     pub personal_assistant_requested: bool,
 }
@@ -333,6 +335,12 @@ pub fn resolve_private_app_updater(
         });
     };
 
+    if input.chat_default_actor.is_some_and(|chat| {
+        candidate.actor == Some(chat)
+            || candidate.server_readiness.and_then(|s| s.actor.as_deref()) == Some(chat)
+    }) {
+        return Err(vec![PrivateAppReadinessReason::ChatDefaultNotUpdater]);
+    }
     check_private_app_readiness(candidate)?;
     let actor = candidate
         .actor
@@ -452,7 +460,7 @@ mod tests {
             dedicated_app_updater: Some(dedicated.clone()),
             workspace_default_updater: Some(default.clone()),
             has_chat_default_app_agent: true,
-            personal_assistant_requested: false,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
@@ -501,6 +509,26 @@ mod tests {
                 ..Default::default()
             }),
             Err(vec![PrivateAppReadinessReason::PersonalAssistantExcluded])
+        );
+
+        let chat_default = ready_candidate(Some("agents/ap_chat"), &write_caps);
+        assert_eq!(
+            resolve_private_app_updater(&PrivateAppUpdaterResolution {
+                dedicated_app_updater: Some(chat_default.clone()),
+                has_chat_default_app_agent: true,
+                chat_default_actor: Some("agents/ap_chat"),
+                ..Default::default()
+            }),
+            Err(vec![PrivateAppReadinessReason::ChatDefaultNotUpdater])
+        );
+        assert_eq!(
+            resolve_private_app_updater(&PrivateAppUpdaterResolution {
+                workspace_default_updater: Some(chat_default),
+                has_chat_default_app_agent: true,
+                chat_default_actor: Some("agents/ap_chat"),
+                ..Default::default()
+            }),
+            Err(vec![PrivateAppReadinessReason::ChatDefaultNotUpdater])
         );
     }
 
