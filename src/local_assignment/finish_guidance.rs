@@ -127,12 +127,26 @@ fn release_bound<H: CoordHttp>(
         return Err(refusal(coordinator, Some(issue), selected));
     };
     if !lane.ended {
+        let assignment_id = lane.unfinished.as_deref().unwrap_or("<assignment>");
+        if lane.unfinished_external {
+            return Err(Error::rejected(format!(
+                "Hosted issue finish did not release the lane for {issue}; its session \
+                 assignment has not ended. From the owning session, report completion with \
+                 `cadence --org <workspace> agent report {assignment_id} --state result \
+                 --head <sha> --text \"...\"` (or `--state failed`), then re-run `issue \
+                 finish`. If the session is gone, `cadence --org <workspace> agent reassign \
+                 {assignment_id} --cancel` only fences the board claim and cannot \
+                 auto-release an external session lane; inspect the worktree yourself and \
+                 remove it with `git worktree remove <path>` and `git branch -d <branch>` \
+                 (`-D` for a squash-merged branch, after verifying the merge). Nothing was \
+                 removed"
+            )));
+        }
         return Err(Error::rejected(format!(
             "Hosted issue finish did not release the lane for {issue}; its assignment has not \
              ended. If the actor is gone, cancel it with \
-             `cadence --org <workspace> agent reassign {} --cancel --release-lane`; \
-             cancellation does not stop the actor. Nothing was removed",
-            lane.unfinished.as_deref().unwrap_or("<assignment>")
+             `cadence --org <workspace> agent reassign {assignment_id} --cancel --release-lane`; \
+             cancellation does not stop the actor. Nothing was removed"
         )));
     }
     if lane
@@ -372,6 +386,7 @@ struct BoundLane {
     branch: String,
     ended: bool,
     unfinished: Option<String>,
+    unfinished_external: bool,
     assignments: Vec<String>,
     guarded: Option<GuardedLane>,
 }
@@ -438,6 +453,7 @@ fn bound_lane_from_ledger(
     let mut lane = None;
     let mut ended = true;
     let mut unfinished = None;
+    let mut unfinished_external = false;
     let mut guarded = None;
     let mut matched_assignment = assignment.is_none();
     let mut assignments = Vec::new();
@@ -532,6 +548,8 @@ fn bound_lane_from_ledger(
                 return Ok(None);
             }
             unfinished = Some(id.clone());
+            unfinished_external |= attempt.handoff.as_ref().is_some_and(|h| h.external)
+                || attempt.session_profile.is_some();
         }
         lane = Some(candidate);
         ended &= matches!(attempt.state.as_str(), "result" | "failed" | "cancelled");
@@ -559,6 +577,7 @@ fn bound_lane_from_ledger(
         branch,
         ended,
         unfinished,
+        unfinished_external,
         assignments,
         guarded,
     }))
@@ -3057,5 +3076,62 @@ mod tests {
         assert_eq!(reports[0]["state"], "blocked");
         assert_eq!(reports[0]["claim_id"], "hlc_test");
         assert_eq!(reports[0]["text"], reason);
+    }
+
+    #[test]
+    fn unfinished_external_profile_lane_guides_to_agent_report_and_keeps_cancel_guard() {
+        let fx = CancelReleaseFixture::new(true);
+        let tip = git(&fx.repo, &["rev-parse", "cadence/test"]);
+        let coord =
+            Coordinator::new(ReleaseCancelReply, "ws_test".into(), fx.auth.clone()).unwrap();
+
+        let non_external = release(&coord, "CAD-1", Some(fx.lane.as_path()), &fx.state)
+            .expect_err("running non-external lane must refuse release")
+            .to_string();
+        assert!(
+            non_external.contains("agent reassign hla_test --cancel --release-lane"),
+            "{non_external}"
+        );
+        fx.assert_intact(&tip);
+
+        let mut ledger = Ledger::load(&fx.auth, "ws_test").unwrap();
+        let attempt = ledger
+            .attempts
+            .get_mut(&attempt_key("CAD-1", "start", None))
+            .unwrap();
+        attempt.handoff = Some(Handoff {
+            claim_id: "hlc_test".into(),
+            generation: 1,
+            external: true,
+        });
+        attempt.session_profile = Some("ap_test".into());
+        ledger.save(&fx.auth, "ws_test").unwrap();
+
+        let coord =
+            Coordinator::new(ReleaseCancelReply, "ws_test".into(), fx.auth.clone()).unwrap();
+        let external = release(&coord, "CAD-1", Some(fx.lane.as_path()), &fx.state)
+            .expect_err("running external --profile lane must refuse release")
+            .to_string();
+        assert!(
+            external.contains("agent report hla_test --state result --head")
+                && external.contains("--state failed")
+                && external.contains("agent reassign hla_test --cancel")
+                && external.contains("git worktree remove"),
+            "{external}"
+        );
+        assert!(!external.contains("--cancel --release-lane"), "{external}");
+        fx.assert_intact(&tip);
+
+        let cancelled = fx.cancel();
+        for refused in [
+            release_cancelled(&cancelled, "hla_test", &fx.state).err(),
+            release(&cancelled, "CAD-1", Some(fx.lane.as_path()), &fx.state).err(),
+        ] {
+            let error = refused
+                .expect("cancelled external lane must keep fail-closed guard")
+                .to_string();
+            assert!(error.contains("cannot prove"), "{error}");
+        }
+        fx.assert_intact(&tip);
     }
 }
