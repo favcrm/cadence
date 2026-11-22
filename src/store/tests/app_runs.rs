@@ -319,6 +319,7 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
             input_digest: &input_digest,
             result: &result,
             asset: None,
+            actual_charge_micros: Some(4_200),
         })
         .unwrap();
     assert_eq!(first["result"], result);
@@ -343,9 +344,21 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
             input_digest: &input_digest,
             result: &result,
             asset: None,
+            actual_charge_micros: Some(2_100),
         })
         .unwrap(),
         first
+    );
+    let events = s.events_tail(Store::DAEMON_STREAM, 10).unwrap();
+    let mut receipts = events
+        .iter()
+        .filter(|e| e.kind == "app_capability_result_recorded");
+    let audit = receipts.next().expect("retained receipt audit event");
+    assert_eq!(audit.payload["digest"], first["digest"]);
+    assert_eq!(audit.payload["actual_charge_micros"], 4_200);
+    assert!(
+        receipts.next().is_none(),
+        "a replay must not rewrite settlement"
     );
     assert!(s
         .app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
@@ -360,6 +373,7 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
             input_digest: "different",
             result: &result,
             asset: None,
+            actual_charge_micros: None,
         })
         .is_err());
     assert!(
@@ -375,6 +389,7 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
             input_digest: &input_digest,
             result: &result,
             asset: None,
+            actual_charge_micros: None,
         })
         .is_err(),
         "one approved slot must not permit a second charge"
@@ -406,6 +421,7 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
             input_digest: &input_digest,
             result: &result,
             asset: None,
+            actual_charge_micros: None,
         })
         .is_err());
 }
@@ -1896,6 +1912,7 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
         input_digest: &input_digest,
         result: &result,
         asset: None,
+        actual_charge_micros: None,
     })
     .unwrap();
 

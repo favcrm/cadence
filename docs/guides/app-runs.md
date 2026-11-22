@@ -329,6 +329,24 @@ run, active-turn, assignment, artifact, and review checks as a bare
 envelope, and the already failed run stays historical: broker-retained
 receipts remain independent of the app turn result and are never replayed.
 
+For native AgenticOS text tools, Cadence records the verified settled charge
+in the `daemon` event stream with the retained receipt ID and digest.
+`app_capability_result_recorded` (run) and `app_tool_result_recorded`
+(standalone) carry `actual_charge_micros` in USD. The text result remains
+`{text, finishReason, usage}`. The quote does not cap the actual; missing
+or malformed charge evidence leaves the outcome uncertain. Historical
+receipts without this field do not imply a zero charge.
+The audit event commits with the local result. If Cadence cannot retain
+that result, reconcile against AgenticOS by the original request rather
+than treating the missing local event as a free call.
+
+Native text can still use a server that explicitly advertises the legacy
+fixed-price protocol. It does not quote or dispatch new `quote@2` or
+request-priced text: the run is approved before a worker writes the final
+prompt. A server that stops offering the old protocol makes fresh native
+text unavailable. Hosted private-app approval on AgenticOS is separate
+and does not authorize a native call.
+
 Inspect runs with `cadence app run ls [--install-id <installation-id>]`.
 Use `cadence app run cancel <run-id>` to prevent further execution, or
 `cadence app catalog revoke <installation-id> --digest <installed-digest>`

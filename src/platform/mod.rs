@@ -91,7 +91,16 @@ pub fn saved_login_account(platform: &str, account: &str) -> bool {
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Exact operator-visible price of one frozen provider capability call.
+pub(crate) fn valid_pricing_revision(revision: &str) -> bool {
+    revision.len() == 71
+        && revision.starts_with("sha256:")
+        && revision
+            .bytes()
+            .skip(7)
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Operator-visible quote; a verified final charge may differ from an estimate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppCapabilityQuote {
@@ -101,6 +110,17 @@ pub struct AppCapabilityQuote {
     pub units: u32,
     pub total_price_micros: u64,
     pub price_revision: String,
+    /// Server-selected model and priced variant, frozen for the admitted job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_slug: Option<String>,
+    /// Server-issued binding to the exact image pricing policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_revision: Option<String>,
+    /// A server-advertised informational quote protocol, never a cost cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge_protocol: Option<String>,
 }
 
 impl AppCapabilityQuote {
@@ -109,10 +129,26 @@ impl AppCapabilityQuote {
             && self.currency == "USD"
             && (1..=100).contains(&self.units)
             && self.unit_price_micros > 0
-            && self.total_price_micros == self.unit_price_micros.saturating_mul(self.units as u64)
-            && self.total_price_micros <= 1_000_000_000
+            && self.unit_price_micros.checked_mul(self.units as u64)
+                == Some(self.total_price_micros)
             && !self.price_revision.is_empty()
             && self.price_revision.len() <= 128
+            && self
+                .model
+                .as_ref()
+                .is_none_or(|value| !value.is_empty() && value.len() <= 120)
+            && self
+                .price_slug
+                .as_ref()
+                .is_none_or(|value| !value.is_empty() && value.len() <= 120)
+            && self
+                .pricing_revision
+                .as_deref()
+                .is_none_or(valid_pricing_revision)
+            && self
+                .charge_protocol
+                .as_deref()
+                .is_none_or(|value| value == "quote@2")
     }
 }
 
@@ -129,6 +165,10 @@ mod app_capability_quote_tests {
             units: 1,
             total_price_micros: 1_880,
             price_revision: "price-v1".into(),
+            model: None,
+            price_slug: None,
+            pricing_revision: None,
+            charge_protocol: None,
         };
         assert!(valid.valid());
         let mut changed = valid.clone();
@@ -141,6 +181,25 @@ mod app_capability_quote_tests {
         changed.price_revision.clear();
         assert!(!changed.valid());
     }
+
+    #[test]
+    fn old_quotes_round_trip_and_large_exact_quotes_are_not_capped() {
+        let old = serde_json::json!({
+            "schema": 1,
+            "currency": "USD",
+            "unit_price_micros": 1_200_000_000_u64,
+            "units": 1,
+            "total_price_micros": 1_200_000_000_u64,
+            "price_revision": "price-v1"
+        });
+        let mut quote: AppCapabilityQuote = serde_json::from_value(old.clone()).unwrap();
+        assert!(quote.valid());
+        assert_eq!(serde_json::to_value(&quote).unwrap(), old);
+        quote.unit_price_micros = u64::MAX;
+        quote.units = 2;
+        quote.total_price_micros = u64::MAX;
+        assert!(!quote.valid());
+    }
 }
 
 /// Bounded provider output. The broker stores the JSON receipt and optional
@@ -148,6 +207,8 @@ mod app_capability_quote_tests {
 pub struct AppCapabilityOutput {
     pub result: Value,
     pub asset: Option<AppCapabilityAsset>,
+    /// Verified USD microcharge, separate from the app's result contract.
+    pub actual_charge_micros: Option<u64>,
 }
 
 pub struct AppCapabilityAsset {

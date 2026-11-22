@@ -73,6 +73,7 @@ fn cad1177_tool_record_retains_one_receipt_and_replays_it() {
             input,
             result,
             asset: None,
+            actual_charge_micros: None,
         }
     }
     assert!(store.app_tool_record(mk("req-1", &input, &result)).is_err());
@@ -149,6 +150,7 @@ fn soc54_source_reads_are_selected_before_the_history_bound() {
                 input: &input,
                 result: if is_source { &source } else { &upload },
                 asset: None,
+                actual_charge_micros: None,
             })
             .unwrap();
     }
@@ -239,6 +241,7 @@ fn cad1177_tool_receipt_survives_reopen() {
             input: &json!({}),
             result: &json!({"posts": [{"id": "p1"}]}),
             asset: None,
+            actual_charge_micros: Some(3_100),
         })
         .unwrap();
     drop(store);
@@ -248,6 +251,15 @@ fn cad1177_tool_receipt_survives_reopen() {
         .unwrap()
         .unwrap();
     assert_eq!(receipt["result"]["posts"][0]["id"], "p1");
+    assert!(receipt.get("actual_charge_micros").is_none());
+    let events = reopened.events_tail(Store::DAEMON_STREAM, 10).unwrap();
+    let audit = events
+        .iter()
+        .find(|e| e.kind == "app_tool_result_recorded")
+        .expect("retained receipt audit event");
+    assert_eq!(audit.payload["receipt_id"], receipt["id"]);
+    assert_eq!(audit.payload["digest"], receipt["digest"]);
+    assert_eq!(audit.payload["actual_charge_micros"], 3_100);
 }
 
 #[test]

@@ -92,6 +92,65 @@ function parseDispositionFileName(header: string | null): string | null {
 export const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 export function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).every(k => keys.includes(k)); }
 const TOKEN = /^[a-f0-9]{64}$/;
+const PLATFORM_ORIGIN = "https://app-v2.agenticos.hk";
+function platformLink(value: unknown, kind: "approval" | "grant", installId?: string): string | null {
+  if (typeof value !== "string" || value.length > 2048) return null;
+  try {
+    const url = new URL(value);
+    const parameter = kind === "approval" ? "candidate" : "installation";
+    const keys = [...url.searchParams.keys()];
+    const workspace = url.searchParams.get("workspace");
+    const subject = url.searchParams.get(parameter);
+    return url.origin === PLATFORM_ORIGIN && url.pathname === `/hosted-text-${kind}` &&
+      !url.username && !url.password && !url.hash && keys.length === 2 &&
+      keys.filter(k => k === "workspace").length === 1 && keys.filter(k => k === parameter).length === 1 &&
+      !!workspace && /^[A-Za-z0-9_-]{1,256}$/.test(workspace) &&
+      !!subject && /^[A-Za-z0-9_-]{1,256}$/.test(subject) &&
+      (kind !== "grant" || (!!installId && subject === installId)) ? url.href : null;
+  } catch { return null; }
+}
+function validCatalogReceipt(value: unknown): boolean {
+  if (!object(value) || typeof value.slug !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(value.slug) ||
+      (value.effect !== "read" && value.effect !== "draft") || !object(value.price) ||
+      value.price.currency !== "USD" || value.price.scale !== 6 || typeof value.price.amount !== "string" ||
+      !/^(0|[1-9]\d{0,9})\.\d{6}$/.test(value.price.amount) || !Object.hasOwn(value, "result")) return false;
+  if (value.slug !== "generate_text") return true;
+  const result = value.result;
+  if (value.effect !== "draft" || !exact(value, ["slug", "effect", "price", "result"]) ||
+      !exact(value.price, ["currency", "scale", "amount"]) || !object(result) ||
+      !exact(result, ["text", "finishReason", "usage"]) || typeof result.text !== "string" || !result.text ||
+      new TextEncoder().encode(result.text).byteLength > 65536 ||
+      (result.finishReason !== "stop" && result.finishReason !== "length")) return false;
+  const keys = ["inputTokens", "outputTokens", "totalTokens", "cachedInputTokens", "reasoningOutputTokens"];
+  const usage = result.usage;
+  return usage === null || (object(usage) && exact(usage, keys) &&
+    keys.every(k => usage[k] === null || (typeof usage[k] === "number" && Number.isFinite(usage[k]))));
+}
+const BOUND_STATUS_VERSION = "bound@1";
+function statusBinding(value: unknown, args: ActionArgs) {
+  if (!object(value) || !exact(value, ["version", "slot", "request_id", "slug", "effect", "status"]) ||
+      value.version !== BOUND_STATUS_VERSION || value.slot !== args.slot || value.request_id !== args.request_id ||
+      typeof value.slug !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(value.slug) ||
+      (value.effect !== "read" && value.effect !== "draft") || !object(value.status))
+    throw new ApiError("Invalid app tool status identity", 502);
+  const { status, slug, effect } = value;
+  if (status.result_available === true &&
+      (!object(status.receipt) || status.receipt.slug !== slug || status.receipt.effect !== effect))
+    throw new ApiError("Invalid app tool receipt identity", 502);
+  return status;
+}
+function catalogStatus(value: unknown, bound: boolean): unknown {
+  if (!object(value) || typeof value.state !== "string") throw new ApiError("Invalid app tool status", 502);
+  if (["not_started", "review_required", "uncertain"].includes(value.state) && exact(value, ["state"])) return { state: "uncertain" };
+  // Older installed app-kit versions only understand uncertain, not the
+  // platform's richer nonterminal and refusal states. Never imply retry.
+  if (bound && ["awaiting_approval", "in_progress", "refused", "expired", "declined", "uncertain"].includes(value.state) &&
+      exact(value, ["state", "result_available"]) && value.result_available === false) return { state: "uncertain" };
+  if (value.state === "settled" && typeof value.result_available === "boolean" &&
+      exact(value, value.result_available ? ["state", "result_available", "receipt"] : ["state", "result_available"]) &&
+      (!value.result_available || validCatalogReceipt(value.receipt))) return value;
+  throw new ApiError("Invalid app tool status", 502);
+}
 const WRITES = new Set([
   "records.create", "records.update", "records.batch", "segments.save", "exclusions.save",
   "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply",
@@ -190,7 +249,9 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
   }
   if (operation?.startsWith("catalog.") && error instanceof ApiError && status === 409 &&
       ["confirmation_required", "quote_changed", "grant_changed", "uncertain", "confirmation_invalid"].includes(error.code ?? ""))
-    return { code: error.code!, text: error.message };
+    return { code: error.code!, text: error.code === "confirmation_required"
+      ? "Review this app tool before it runs."
+      : "Cadence refused this request. Inspect fresh status before retrying an effect." };
    if (status === 409 && error instanceof ApiError && error.code === "facts_changed") return { code: "facts_changed", text: "That changed. Refresh before trying again." };
   // CAD-1827: a stale campaign-work revision keeps its own code through the
   // bridge too. The app's stale-save recovery (re-read the row, keep the
@@ -234,6 +295,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     let value: unknown;
     try { value = JSON.parse(text); } catch { throw new ApiError("Invalid service reply", 502); }
     if (!response.ok) {
+      if (catalog && path === "slot-prepare" && response.status === 409 && object(value) && value.code === "grant_required") return value;
       const code = serverErrorCode(value);
       const check = serverErrorCheck(value);
       throw new ApiError(
@@ -249,6 +311,18 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         typeof args.request_id !== "string" || !object(args.input))
       throw new ApiError("Invalid app tool request", 400);
     return { slot: args.slot, request_id: args.request_id, input: args.input };
+  }
+  async function readCatalogStatus(input: ActionArgs): Promise<unknown> {
+    const args = catalogArgs(input);
+    let raw: unknown;
+    try {
+      raw = await post("status", { ...args, status_version: BOUND_STATUS_VERSION }, true);
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 400 || error.code !== "validation_failed" ||
+          error.message !== "The tool request is malformed.") throw error;
+      return catalogStatus(await post("status", args, true), false);
+    }
+    return catalogStatus(statusBinding(raw, args), true);
   }
   function failed(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
     csv.clear();
@@ -284,15 +358,13 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         latestShow = { id: previewId, revision };
       } else if (previewId && operation === "screen.preview.clear" && latestShow?.id === previewId) latestShow = null;
       try {
-        const raw = operation === "catalog.call" || operation === "catalog.status"
-          ? await post(operation === "catalog.status" ? "status" : "call", catalogArgs(args), true)
-          : await post("call", { operation, args });
+        const raw = operation === "catalog.status"
+          ? await readCatalogStatus(args)
+          : operation === "catalog.call"
+            ? await post("call", catalogArgs(args), true)
+            : await post("call", { operation, args });
         const stalePreview = !!previewId && ((operation === "screen.preview.show" && (latestShow?.id !== previewId || latestShow.revision !== revision)) || (operation === "screen.preview.clear" && latestShow?.id === previewId && latestShow.revision > revision));
-        let data = deliver(raw, !stalePreview);
-        if (operation === "catalog.status" && object(data) && (data.state === "not_started" || data.state === "review_required")) {
-          if (!exact(data, ["state"])) throw new ApiError("Invalid app tool status", 502);
-          data = { state: "uncertain" };
-        }
+        const data = operation === "catalog.status" ? sanitized(raw) : deliver(raw, !stalePreview);
         if (WRITES.has(operation)) invalidateDisplay(domain);
         else if (operation !== "catalog.status" && receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
         return { ok: true, data };
@@ -308,6 +380,26 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         const raw = operation === "catalog.confirm"
           ? await post("slot-prepare", catalogArgs(args), true)
           : await post("slot-prepare", { operation, args });
+        if (operation === "catalog.confirm" && object(raw) &&
+            (raw.state === "platform_approval_required" || raw.code === "grant_required")) {
+          const approval = raw.state === "platform_approval_required";
+          const url = platformLink(approval ? raw.approval_url : raw.grant_url, approval ? "approval" : "grant", receipt.install_id);
+          const expires = approval ? (typeof raw.expires_at === "string" ? Date.parse(raw.expires_at) : NaN) : Date.now() + 60000;
+          if (!url || !Number.isFinite(expires) || expires <= Date.now() ||
+              !exact(raw, approval ? ["state", "approval_url", "expires_at"] : ["code", "error", "grant_url"]) ||
+              (!approval && typeof raw.error !== "string")) throw new ApiError("Invalid platform review", 502);
+          const code = approval ? "platform_approval_required" : "grant_required";
+          const text = approval ? "AgenticOS approval is required. Review the request there; check status before trying again." : "An AgenticOS app grant is required. Review it there before trying again.";
+          const card: RecordCard = { operation, title: approval ? "Review text request on AgenticOS" : "Review app text grant on AgenticOS",
+            note: text, facts: [{ label: "AgenticOS origin", value: PLATFORM_ORIGIN }] };
+          let used = false;
+          return { records: true, label: "Open AgenticOS", recordCard: card, run: async () => {
+            if (used || !current() || Date.now() >= expires) return { ok: false, refusal: { code: "expired", text: "This review has expired. Check status before trying again." } };
+            used = true;
+            window.open(url, "_blank", "noopener,noreferrer");
+            return { ok: false, refusal: { code, text } };
+          } };
+        }
         if (!object(raw) || !exact(raw, ["confirmation_token", "card"]) || typeof raw.confirmation_token !== "string" || !TOKEN.test(raw.confirmation_token) || !object(raw.card) || !exact(raw.card, operation === "whatsapp.broadcast.stop" || operation === "whatsapp.handoff.release" ? ["operation", "facts", "live"] : ["operation", "facts"]) || raw.card.operation !== operation || !object(raw.card.facts)) throw new ApiError("Invalid confirmation card", 502);
         const facts = raw.card.facts;
         const card = recordCard(operation, facts, object(raw.card.live) ? raw.card.live : undefined);

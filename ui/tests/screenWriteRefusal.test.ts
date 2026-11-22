@@ -299,6 +299,123 @@ async function main(): Promise<void> {
       assert.equal(fx.requests.length, expectedRequests, `${label}: retired mount makes no extra fetch`);
     }
 
+    {
+      const receipt = makeReceipt();
+      receipt.operations = ["catalog.call", "catalog.confirm", "catalog.status"];
+      const requests: { path: string; body: Record<string, unknown> }[] = [];
+      let response: { status: number; json: unknown } = { status: 200, json: {} };
+      let queued: { status: number; json: unknown }[] = [];
+      globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ path: String(url), body: JSON.parse(String(init?.body)) });
+        const reply = queued.shift() ?? response;
+        return new Response(JSON.stringify(reply.json), { status: reply.status });
+      }) as typeof fetch;
+      const service = recordServices(receipt, "catalog-test", { current: () => true, refused: () => {}, command: () => {} });
+      const args = { slot: "text", request_id: "request-123", input: { body: { messages: [{ role: "user", content: "Synthetic" }] } } };
+      const approval = "https://app-v2.agenticos.hk/hosted-text-approval?workspace=ws&candidate=candidate";
+      response = { status: 200, json: { state: "platform_approval_required", approval_url: approval, expires_at: new Date(Date.now() + 60000).toISOString() } };
+      const plan = await service.planner("catalog.confirm", args);
+      assert.ok("run" in plan, "platform review creates a host card");
+      if ("run" in plan) {
+        assert.equal(plan.recordCard?.facts[0].value, "https://app-v2.agenticos.hk");
+        const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+        const opened: unknown[][] = [];
+        Object.defineProperty(globalThis, "window", { configurable: true, value: { open: (...values: unknown[]) => opened.push(values) } });
+        try {
+          const result = await plan.run();
+          assert.equal(result.ok, false);
+          if (!result.ok) assert.equal(result.refusal.code, "platform_approval_required");
+          assert.equal(JSON.stringify(opened), JSON.stringify([[approval, "_blank", "noopener,noreferrer"]]));
+        } finally {
+          if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow);
+          else Reflect.deleteProperty(globalThis, "window");
+        }
+      }
+      assert.equal(requests.length, 1, "review never calls confirm");
+      assert.equal(requests[0].path, "/api/app-screen-catalog/prepare");
+      assert.equal(JSON.stringify(requests[0].body), JSON.stringify({ action_token: receipt.action_token, ...args }));
+      for (const url of [
+        "https://app-v2.agenticos.hk.evil/hosted-text-approval?workspace=ws&candidate=c",
+        "https://user@app-v2.agenticos.hk/hosted-text-approval?workspace=ws&candidate=c",
+        "https://app-v2.agenticos.hk/hosted-text-approval?workspace=ws&candidate=c&candidate=d",
+        "https://app-v2.agenticos.hk/hosted-text-approval?workspace=ws&candidate=c#fragment",
+      ]) {
+        response = { status: 200, json: { state: "platform_approval_required", approval_url: url, expires_at: new Date(Date.now() + 60000).toISOString() } };
+        assert.ok(!("run" in await service.planner("catalog.confirm", args)), "invalid review URL refused");
+      }
+      response = { status: 409, json: { code: "grant_required", error: "grant", grant_url: "https://app-v2.agenticos.hk/hosted-text-grant?workspace=ws&installation=install-write-test" } };
+      assert.ok("run" in await service.planner("catalog.confirm", args), "matching grant link accepted");
+      response = { status: 409, json: { code: "grant_required", error: "grant", grant_url: "https://app-v2.agenticos.hk/hosted-text-grant?workspace=ws&installation=other" } };
+      assert.ok(!("run" in await service.planner("catalog.confirm", args)), "other installation refused");
+      const bound = (status: unknown) => ({ version: "bound@1", slot: args.slot, request_id: args.request_id, slug: "generate_text", effect: "draft", status });
+      const statusBody = { action_token: receipt.action_token, ...args, status_version: "bound@1" };
+      for (const state of ["awaiting_approval", "in_progress", "refused", "expired", "declined", "uncertain"]) {
+        response = { status: 200, json: bound({ state, result_available: false }) };
+        const before = requests.length;
+        const status = await service.call("catalog.status", args);
+        assert.ok(status.ok);
+        if (status.ok) assert.equal(JSON.stringify(status.data), '{"state":"uncertain"}');
+        assert.equal(requests.length, before + 1, "bound status makes one request");
+        assert.equal(JSON.stringify(requests[before].body), JSON.stringify(statusBody), "bound status preserves exact identity");
+      }
+      const result = { text: "hello", finishReason: "stop", usage: null };
+      const settled = { state: "settled", result_available: true, receipt: { slug: "generate_text", effect: "draft", price: { amount: "0.100000", currency: "USD", scale: 6 }, result } };
+      response = { status: 200, json: bound(settled) };
+      const status = await service.call("catalog.status", args);
+      assert.ok(status.ok);
+      if (status.ok) assert.equal(JSON.stringify(status.data), JSON.stringify(settled), "envelope is not sent to the app");
+      for (const invalid of [
+        bound({ ...settled, receipt: { ...settled.receipt, result: {} } }),
+        bound({ ...settled, receipt: { ...settled.receipt, slug: "other" } }),
+        bound({ ...settled, receipt: { ...settled.receipt, effect: "read" } }),
+        { ...bound(settled), slot: "other" },
+        { ...bound(settled), request_id: "other-request" },
+        { ...bound(settled), version: "bound@2" },
+      ]) {
+        response = { status: 200, json: invalid };
+        const before = requests.length;
+        assert.equal((await service.call("catalog.status", args)).ok, false, "invalid bound status refused");
+        assert.equal(requests.length, before + 1, "invalid bound status never falls back");
+      }
+      queued = [
+        { status: 400, json: { code: "validation_failed", error: "The tool request is malformed." } },
+        { status: 200, json: settled },
+      ];
+      let before = requests.length;
+      const legacy = await service.call("catalog.status", args);
+      assert.ok(legacy.ok, "specific old-server validation refusal permits legacy status lookup");
+      if (legacy.ok) assert.equal(JSON.stringify(legacy.data), JSON.stringify(settled));
+      assert.equal(requests.length, before + 2, "legacy fallback occurs exactly once");
+      assert.equal(JSON.stringify(requests[before].body), JSON.stringify(statusBody));
+      assert.equal(JSON.stringify(requests[before + 1].body), JSON.stringify({ action_token: receipt.action_token, ...args }));
+      response = { status: 400, json: { code: "validation_failed", error: "The tool request is malformed." } };
+      before = requests.length;
+      assert.equal((await service.call("catalog.status", args)).ok, false, "failed legacy lookup stays refused");
+      assert.equal(requests.length, before + 2, "a failed fallback is never retried");
+      for (const failure of [
+        { status: 400, json: { code: "validation_failed", error: "Different validation error." } },
+        { status: 400, json: { code: "other", error: "The tool request is malformed." } },
+        { status: 409, json: { code: "uncertain", error: "The tool request is malformed." } },
+        { status: 503, json: { code: "unavailable", error: "The tool request is malformed." } },
+      ]) {
+        response = failure;
+        before = requests.length;
+        assert.equal((await service.call("catalog.status", args)).ok, false);
+        assert.equal(requests.length, before + 1, "only exact legacy refusal permits fallback");
+      }
+      for (const code of ["confirmation_required", "quote_changed", "grant_changed", "uncertain", "confirmation_invalid"]) {
+        response = { status: 409, json: { code, error: `See ${approval}`, approval_url: approval, grant_url: approval } };
+        before = requests.length;
+        const refused = await service.call("catalog.call", args);
+        assert.equal(refused.ok, false);
+        if (!refused.ok) {
+          assert.equal(refused.refusal.code, code);
+          assert.ok(!JSON.stringify(refused.refusal).includes(approval), "platform URL is not forwarded in a refusal");
+        }
+        assert.equal(requests.length, before + 1, "refusal does not retry");
+      }
+    }
+
     console.log("screen write refusal checks passed");
   } finally {
     globalThis.fetch = savedFetch;

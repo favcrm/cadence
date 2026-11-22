@@ -336,19 +336,14 @@ pub trait PlatformAdapter: Send + Sync {
     }
 
     /// Provider-owned execution of a frozen app read/draft action. The broker
-    /// proves the active assigned turn, exact binding and frozen price before
-    /// calling this. Implementations must validate their own resource fields
-    /// against `authority`. A repeated idempotency key must return the same
-    /// recorded provider outcome without another charged operation; reuse
-    /// with changed input or approved price must refuse. Paid providers must
-    /// enforce `authority.quote.total_price_micros` atomically at the charged
-    /// call, not merely compare an earlier discovery response — unless the
-    /// operator policy is pass-through pricing, in which case the provider
-    /// bills at the upstream rate and records the actual charge in the
-    /// receipt. CAD-1141: the daemon's execution-time re-quote accepts a
-    /// changed rate; `authority.quote` is that fresh quote. It still refuses a
-    /// provider without the charge precondition or a quote outside the
-    /// supported bound. The default refuses every provider.
+    /// proves the active assigned turn, exact binding and frozen quote before
+    /// calling this. Implementations validate resource fields against
+    /// `authority`; a repeated idempotency key returns its recorded outcome
+    /// without a second charged operation. A live quote satisfies the provider
+    /// protocol, not a spending ceiling. Verified actual charges are recorded
+    /// even when they exceed an estimate. Missing authority, an unsupported
+    /// quote protocol or an unrepresentable quote still refuses. The default
+    /// refuses every provider.
     fn execute_app_capability(
         &self,
         _credential: &[u8],
