@@ -317,6 +317,9 @@ If the install or update result is unconfirmed, it may already have committed.
 Refresh Apps and inspect the installed version before checking the ZIP again;
 do not blindly resubmit it.
 
+When a hosted screen tool call requires confirmation, the host-owned card shows
+the verified tool ID as well as its display name, effect, price and input.
+
 ## 7. Existing apps
 
 **Social Content** (`0.13.0`) uses the pinned `@cadence/app-kit` through

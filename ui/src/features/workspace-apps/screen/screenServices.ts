@@ -688,7 +688,7 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
     return { operation, title: "Run this app tool?", confirm: "Run tool",
       note: "The listed input is sent to the selected tool. Charges use the workspace balance.",
       retry: "If the outcome is uncertain, check it before requesting another call.",
-      facts: [{ label: "Tool", value: facts.tool }, { label: "Effect", value: facts.effect === "read" ? "Read" : "Draft" },
+      facts: [{ label: "Tool", value: facts.tool }, { label: "Tool ID", value: facts.slug }, { label: "Effect", value: facts.effect === "read" ? "Read" : "Draft" },
         ...(typeof facts.account === "string" ? [{ label: "Connected account", value: facts.account }] : []),
         { label: "Price", value: `USD ${price.amount}` }, { label: "Input", value: JSON.stringify(facts.input) }] };
   }
