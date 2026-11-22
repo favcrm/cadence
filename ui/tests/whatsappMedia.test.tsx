@@ -571,7 +571,9 @@ async function testComposerInteractions(): Promise<void> {
   const deletedIds: string[] = [];
   let stageCalls = 0;
   let prepareMode: "ok" | "facts_changed" = "ok";
-  let confirmOutcome: "failed" | "uncertain" = "failed";
+  let confirmOutcome: "failed" | "uncertain" | "accepted" = "failed";
+
+  let statusOutcome: "sent" | "accepted" | "uncertain" = "sent";
 
   const mockServices = {
     async call(op: string, args: Record<string, unknown>) {
@@ -596,7 +598,7 @@ async function testComposerInteractions(): Promise<void> {
           data: { decision: "prepared", effect_id: effectId, expires_at: "2099-01-01T00:00:00Z" },
         };
       }
-      return { ok: true as const, data: { state: "sent" } };
+      return { ok: true as const, data: { state: statusOutcome } };
     },
     async planner(op: string, args: Record<string, unknown>) {
       assert(op === "whatsapp.reply.send", "planner called for whatsapp.reply.send");
@@ -795,6 +797,117 @@ async function testComposerInteractions(): Promise<void> {
       await flush();
     });
     assert(!audioSendBtn.disabled && audioText.readOnly, "audio with empty caption enables send and locks caption input");
+
+    // 5. Bounded auto-poll resolves transient uncertain -> sent without alert lock
+    statusOutcome = "sent";
+    confirmOutcome = "uncertain";
+    const autoPollSelection: WhatsAppReplySelection = {
+      ...selection,
+      receiptScope: "scope-autopoll",
+      announceInset: () => 96,
+    };
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "autopoll", selection: autoPollSelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+      await flush();
+    });
+    const apText = container.querySelector("textarea") as HTMLTextAreaElement;
+    const apSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+    await React.act(async () => {
+      setTextarea(apText, "Auto poll confirm");
+      await flush();
+    });
+    await React.act(async () => {
+      trustedClick(apSend);
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "confirming" &&
+        container.textContent?.includes("Confirming send") &&
+        !container.textContent?.includes("Send not confirmed"),
+      "initial uncertain starts confirming state without showing scary alert immediately",
+    );
+    await React.act(async () => {
+      await new Promise((r) => setTimeout(r, 700));
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent" &&
+        container.textContent?.includes("Delivery confirmed") &&
+        container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true",
+      "bounded auto-poll promotes transient uncertain to sent and unlocks composer",
+    );
+
+    // 6. Persistent uncertain escalates to Send not confirmed + lock + manual Check status unlocks
+    statusOutcome = "uncertain";
+    const escalateSelection: WhatsAppReplySelection = {
+      ...selection,
+      receiptScope: "scope-escalate",
+      announceInset: () => 96,
+    };
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "escalate", selection: escalateSelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+      await flush();
+    });
+    const esText = container.querySelector("textarea") as HTMLTextAreaElement;
+    const esSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+    await React.act(async () => {
+      setTextarea(esText, "Escalation check");
+      await flush();
+    });
+    await React.act(async () => {
+      trustedClick(esSend);
+      await flush();
+    });
+    await React.act(async () => {
+      await new Promise((r) => setTimeout(r, 2_200));
+      await flush();
+    });
+    const checkBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Check status");
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "uncertain" &&
+        container.textContent?.includes("Send not confirmed") &&
+        container.querySelector(".wa-reply-card")?.getAttribute("data-locked") === "true" &&
+        !!checkBtn,
+      "exhausted auto-poll escalates to Send not confirmed with lock and Check status button",
+    );
+    statusOutcome = "sent";
+    await React.act(async () => {
+      checkBtn!.click();
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent" &&
+        container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true",
+      "manual Check status unlocks composer once resolved",
+    );
+
+    // 7. Accepted outcome keeps composer unlocked with quiet pending note
+    confirmOutcome = "accepted";
+    const acceptedSelection: WhatsAppReplySelection = {
+      ...selection,
+      receiptScope: "scope-accepted",
+    };
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "accepted", selection: acceptedSelection })));
+      await flush();
+    });
+    const acText = container.querySelector("textarea") as HTMLTextAreaElement;
+    const acSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+    await React.act(async () => {
+      setTextarea(acText, "Accepted test");
+      await flush();
+    });
+    await React.act(async () => {
+      trustedClick(acSend);
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "accepted" &&
+        container.textContent?.includes("Delivery pending") &&
+        container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true" &&
+        !acText.readOnly,
+      "accepted outcome keeps composer unlocked with non-alarming pending status",
+    );
   } finally {
     React.act(() => { root.unmount(); });
     container.remove();
