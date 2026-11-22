@@ -3863,6 +3863,8 @@ button.turnsource:hover {
 .viewcard .turncard-subject { min-width: 0; flex: 1 1 0; }
 .viewcard-title { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .viewcard-place { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* CAD-2634: the params may wrap to two lines, then ellipsis; the full text is the title. */
+.viewcard-params { margin: 0; min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
 
 /* CAD-2452 / CAD-2458: record card roles layouts (header, list rows, thread bubbles). */
 .recordcard-headwrap { display: grid; gap: .25rem; min-width: 0; }

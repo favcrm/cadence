@@ -118,7 +118,7 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
       <p className="text-label text-ink-300 viewcard-place" title={`${model.appLabel} · ${place}`}>
         {model.appLabel} · {place}
       </p>
-      {params === "" ? null : <p className="text-label text-ink-300 viewcard-place" data-view-params title={params}>{params}</p>}
+      {params === "" ? null : <p className="text-label text-ink-300 viewcard-params" data-view-params title={params}>{params}</p>}
     </TurnCard>
   );
 }
