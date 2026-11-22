@@ -3330,6 +3330,7 @@ Object.assign(zhTW, {
 Object.assign(zhTW, {
   "Check account usage": "查看帳戶用量",
   "Load a skill": "載入技能",
+  "Message an agent": "傳訊給代理程式",
   "Use an app": "使用應用程式",
   "Read app details": "讀取應用程式資料",
   "Find artifacts": "搜尋產物",

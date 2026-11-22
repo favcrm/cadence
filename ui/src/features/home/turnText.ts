@@ -32,6 +32,7 @@ export function elapsedSecs(fromMs: number | null, toMs: number | null): number 
 const TOOL_LABELS: Record<string, string> = {
   account_usage: "Check account usage",
   activate_skill: "Load a skill",
+  agent_message: "Message an agent",
   app_skill: "Load a skill",
   read_skill_resource: "Load a skill",
   app_call: "Use an app",
@@ -117,11 +118,24 @@ export function toolSubject(text: string): string {
     } catch {
       return "";
     }
-    if (!args || typeof args !== "object") return "";
-    const field = SUBJECT_KEYS.find((k) => typeof args[k] === "string" && (args[k] as string).trim() !== "");
-    const named = field ? (args[field] as string) : "";
-    const op = key === "app_call" && typeof args.op === "string" ? args.op : "";
-    subject = [op, named].filter((part) => part !== "").join(" · ");
+    if (!args || typeof args !== "object" || Array.isArray(args)) return "";
+    if (key === "agent_message") {
+      const strArg = (k: string) =>
+        typeof args[k] === "string" ? (args[k] as string).trim() : "";
+      const action = strArg("action");
+      const parts =
+        action === "read"
+          ? [action, strArg("message")]
+          : action === "inbox"
+            ? [action, strArg("alias")]
+            : [strArg("alias"), strArg("context_app")];
+      subject = parts.filter((part) => part !== "").join(" · ");
+    } else {
+      const field = SUBJECT_KEYS.find((k) => typeof args[k] === "string" && (args[k] as string).trim() !== "");
+      const named = field ? (args[field] as string) : "";
+      const op = key === "app_call" && typeof args.op === "string" ? args.op : "";
+      subject = [op, named].filter((part) => part !== "").join(" · ");
+    }
   } else {
     subject = rest.split("\n", 1)[0];
   }

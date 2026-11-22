@@ -1116,6 +1116,89 @@ fn verb_for(
             }
             "message_inbox"
         }
+        Commands::Inbox {
+            alias,
+            action:
+                Some(InboxAction::Ack {
+                    alias: ack_alias,
+                    seqs,
+                    through,
+                    reader,
+                    reset,
+                }),
+            peek,
+            after,
+            wait,
+            follow,
+            reader: outer_reader,
+            exec,
+            exec_retry_ms,
+            exec_timeout_ms,
+            exec_max_failures,
+        } => {
+            if alias.is_some()
+                || *peek
+                || after.is_some()
+                || *wait != 0
+                || *follow
+                || outer_reader.is_some()
+                || exec.is_some()
+                || *exec_retry_ms != 1000
+                || *exec_timeout_ms != 120_000
+                || *exec_max_failures != 5
+            {
+                return Err(unsupported(
+                    "inbox ack",
+                    "streaming, polling, or outer inbox flags",
+                    "remote `inbox ack` only accepts the target alias, seqs / --through, and --reader",
+                ));
+            }
+            if *reset {
+                return Err(unsupported(
+                    "inbox ack",
+                    "--reset",
+                    "remote inbox ack cannot reset a local daemon reader cursor",
+                ));
+            }
+            let ack_alias = ack_alias.trim();
+            if ack_alias.is_empty() {
+                return Err(Error::rejected(
+                    "remote `inbox ack` needs a non-empty recipient alias — nothing was sent",
+                ));
+            }
+            if seqs.is_empty() && through.is_none() {
+                return Err(Error::rejected(
+                    "`cadence inbox ack` needs at least one seq — `inbox ack <alias> <seq>...` or `--through <seq>`",
+                ));
+            }
+            if seqs.len() > 100 || seqs.iter().any(|&seq| seq <= 0) {
+                return Err(Error::rejected(
+                    "remote `inbox ack` seqs must be 1..=100 positive sequence numbers — nothing was sent",
+                ));
+            }
+            if let Some(t) = through {
+                if *t <= 0 {
+                    return Err(Error::rejected(
+                        "remote `inbox ack` `--through` must be a positive sequence number — nothing was sent",
+                    ));
+                }
+                args.insert("through".into(), json!(t));
+            }
+            if !seqs.is_empty() {
+                args.insert("seqs".into(), json!(seqs));
+            }
+            if let Some(r) = reader {
+                let trimmed = r.trim();
+                if trimmed.is_empty() || r.len() > 64 {
+                    return Err(Error::rejected(
+                        "remote `inbox ack` `--reader` must be 1..=64 bytes — nothing was sent",
+                    ));
+                }
+                args.insert("reader".into(), json!(trimmed));
+            }
+            args.insert("alias".into(), json!(ack_alias));
+            "message_ack"
+        }
         Commands::Team { action } => team_for(action, &mut args),
         // CAD-1586: `cadence master status` on a remote org — the hosted
         // `master_status` verb (settings.read) carrying only an optional
@@ -4986,6 +5069,131 @@ mod read_contract_tests {
         }
         let (verb, _) = outcome(&inbox_cmd(Some("m"), true, None, 0, false, None, None)).unwrap();
         assert_eq!(verb, "message_inbox");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inbox_ack_cmd(
+        alias: &str,
+        seqs: Vec<i64>,
+        through: Option<i64>,
+        reader: Option<&str>,
+        reset: bool,
+    ) -> Commands {
+        Commands::Inbox {
+            alias: None,
+            action: Some(InboxAction::Ack {
+                alias: alias.into(),
+                seqs,
+                through,
+                reader: reader.map(str::to_string),
+                reset,
+            }),
+            peek: false,
+            after: None,
+            wait: 0,
+            follow: false,
+            reader: None,
+            exec: None,
+            exec_retry_ms: 1000,
+            exec_timeout_ms: 120_000,
+            exec_max_failures: 5,
+        }
+    }
+
+    #[test]
+    fn inbox_ack_maps_to_message_ack_with_seqs_through_and_reader() {
+        let (verb, args) =
+            outcome(&inbox_ack_cmd("bookkeeper", vec![3, 5], None, None, false)).unwrap();
+        assert_eq!(verb, "message_ack");
+        assert_eq!(args, json!({"alias": "bookkeeper", "seqs": [3, 5]}));
+
+        let (verb, args) = outcome(&inbox_ack_cmd(
+            "bookkeeper",
+            vec![],
+            Some(10),
+            Some("ops"),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(verb, "message_ack");
+        assert_eq!(
+            args,
+            json!({"alias": "bookkeeper", "through": 10, "reader": "ops"})
+        );
+    }
+
+    #[test]
+    fn inbox_ack_refuses_reset_invalid_bounds_and_outer_flags() {
+        let err = outcome(&inbox_ack_cmd("m", vec![], None, None, true)).unwrap_err();
+        assert!(err.contains("--reset"), "{err}");
+
+        for cmd in [
+            inbox_ack_cmd("  ", vec![1], None, None, false),
+            inbox_ack_cmd("m", vec![], None, None, false),
+            inbox_ack_cmd("m", vec![0], None, None, false),
+            inbox_ack_cmd("m", vec![-2], None, None, false),
+            inbox_ack_cmd("m", (1..=101).collect(), None, None, false),
+            inbox_ack_cmd("m", vec![], Some(0), None, false),
+            inbox_ack_cmd("m", vec![1], None, Some("  "), false),
+            inbox_ack_cmd("m", vec![1], None, Some(&"r".repeat(65)), false),
+        ] {
+            assert!(outcome(&cmd).is_err());
+        }
+
+        for mutate in [
+            |c: &mut Commands| {
+                let Commands::Inbox { follow, .. } = c else {
+                    unreachable!()
+                };
+                *follow = true;
+            },
+            |c: &mut Commands| {
+                let Commands::Inbox { peek, .. } = c else {
+                    unreachable!()
+                };
+                *peek = true;
+            },
+            |c: &mut Commands| {
+                let Commands::Inbox { exec, .. } = c else {
+                    unreachable!()
+                };
+                *exec = Some(vec!["cat".into()]);
+            },
+            |c: &mut Commands| {
+                let Commands::Inbox { alias, .. } = c else {
+                    unreachable!()
+                };
+                *alias = Some("outer".into());
+            },
+        ] {
+            let mut cmd = inbox_ack_cmd("m", vec![1], None, None, false);
+            mutate(&mut cmd);
+            assert!(outcome(&cmd).is_err());
+        }
+    }
+
+    #[test]
+    fn remote_send_accepts_specialist_alias() {
+        let cmd = Commands::Send {
+            alias: Some("bookkeeper".into()),
+            to: None,
+            text: Some("Check bill #104".into()),
+            file: None,
+            message: Some("bk-msg-1".into()),
+            reply_to: None,
+            task: None,
+            ready: false,
+            force: false,
+            nudge: false,
+            steer: SteerArgs::default(),
+            wait: None,
+        };
+        let (verb, args) = outcome(&cmd).unwrap();
+        assert_eq!(verb, "message_send");
+        assert_eq!(
+            args,
+            json!({"alias": "bookkeeper", "text": "Check bill #104", "message": "bk-msg-1"})
+        );
     }
 
     #[test]

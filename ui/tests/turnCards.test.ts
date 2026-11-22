@@ -119,6 +119,49 @@ const appRow = (id: string, status = "pending") =>
   // Two turns: the staging turn shows the card, the later turn that lists it does not.
   check(stagedInTurn([call('app_call {"app":"accounting","operation":"records.create"}'), staging], rows).length === 1, "turn 1 staged it");
   check(stagedInTurn([call('app_call {"app":"accounting","operation":"records.list"}'), listing], rows).length === 0, "turn 2 only listed it");
+
+  // TASK-013: settled agent_message results surface their specialist's staged_actions.
+  const settledAgentMsg = result(
+    JSON.stringify({
+      message: "msg-1",
+      seq: 1,
+      alias: "Bookkeeper",
+      state: "answered",
+      staged_actions: [{ action_id: ACTION, app: "accounting", operation: "records.create" }, OTHER],
+    }),
+  );
+  check(
+    stagedInTurn([call('agent_message {"action":"send","alias":"bookkeeper"}'), settledAgentMsg], rows).length === 2,
+    "settled agent_message answered surfaces all staged_actions",
+  );
+  const failedWithStaged = result(
+    JSON.stringify({
+      message: "msg-2",
+      alias: "Bookkeeper",
+      state: "failed",
+      staged_actions: [{ actionId: dashed }],
+    }),
+  );
+  check(stagedInTurn([failedWithStaged], rows).map((r) => r.id).join() === ACTION, "settled agent_message failed also surfaces staged_actions");
+  const unsettledMsg = result(
+    JSON.stringify({
+      message: "msg-3",
+      alias: "Bookkeeper",
+      state: "delivered",
+      staged_actions: [{ action_id: ACTION }],
+    }),
+  );
+  check(stagedInTurn([unsettledMsg], rows).length === 0, "unsettled agent_message does not stage cards");
+  const inboxPage = result(
+    JSON.stringify({
+      alias: "Bookkeeper",
+      message: "ignored",
+      state: "answered",
+      staged_actions: [{ action_id: ACTION }],
+      items: [{ seq: 1, message: "msg-1", alias: "Bookkeeper", state: "answered", staged_actions: [{ action_id: ACTION }] }],
+    }),
+  );
+  check(stagedInTurn([inboxPage], rows).length === 0, "inbox listings with items never stage cards");
 }
 
 // A connected effect: the AOS-647 contract fixture, copied from

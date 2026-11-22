@@ -1716,7 +1716,7 @@ fn send_with_a_missing_or_malformed_binding_is_unknown_and_not_retried() {
             r["duplicate"] = json!("yes");
         }),
         tampered(&|r| {
-            r["state"] = json!("delivered");
+            r["state"] = json!("bogus");
         }),
     ];
     for receipt in receipts {
@@ -1868,6 +1868,79 @@ fn cli_message_refusals_map_bounded_codes_never_server_text() {
     let shown = out.unwrap_err().to_string();
     assert!(shown.contains("unknown"), "{shown}");
     assert!(!shown.contains("internal-server-text"), "{shown}");
+}
+
+#[test]
+fn specialist_send_receipt_allows_case_insensitive_alias_and_inbox_states() {
+    for state in ["delivered", "answered"] {
+        let mut receipt = send_receipt("bk-receipt-1");
+        receipt["alias"] = json!("Bookkeeper");
+        receipt["state"] = json!(state);
+        let (out, requests) = run(
+            vec![(200, "", receipt.clone())],
+            "message_send",
+            json!({"alias": "bookkeeper", "text": "check bill", "message": "bk-receipt-1"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            10,
+        );
+        assert_eq!(out.unwrap(), receipt);
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+}
+
+#[test]
+fn message_ack_receipt_correlates_and_rejects_mismatches() {
+    let args: Map<String, Value> = json!({"alias": "bookkeeper", "seqs": [3, 4]})
+        .as_object()
+        .unwrap()
+        .clone();
+    let valid = json!({
+        "alias": "Bookkeeper",
+        "acked_count": 2,
+        "acked_seqs": [3, 4],
+        "workspace_id": ORG_ID,
+    });
+    let (out, _) = run(
+        vec![(200, "", valid.clone())],
+        "message_ack",
+        args.clone(),
+        10,
+    );
+    assert_eq!(out.unwrap(), valid);
+
+    for bad in [
+        json!({"alias": "other", "acked_count": 2, "acked_seqs": [3, 4], "workspace_id": ORG_ID}),
+        json!({"alias": "Bookkeeper", "acked_count": 2, "acked_seqs": [3, 4], "workspace_id": "ws_foreign"}),
+        json!({"alias": "Bookkeeper", "acked_count": 2, "acked_seqs": [0], "workspace_id": ORG_ID}),
+        json!({"alias": "Bookkeeper", "acked_seqs": [3], "workspace_id": ORG_ID}),
+    ] {
+        let (out, requests) = run(vec![(200, "", bad)], "message_ack", args.clone(), 10);
+        assert_eq!(out.unwrap_err().kind(), "unknown");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+}
+
+#[test]
+fn specialist_send_and_message_ack_refusals_map_bounded_codes() {
+    let refusal =
+        |code: &str| json!({"ok": false, "error": {"code": code, "message": "internal-leak"}});
+    for (verb, status, code) in [
+        ("message_send", 400u16, "ambiguous_recipient"),
+        ("message_send", 400, "app_context_not_bound"),
+        ("message_send", 400, "ambiguous_app_context"),
+        ("message_ack", 403, "not_permitted"),
+        ("message_ack", 403, "insufficient_scope"),
+        ("message_ack", 400, "invalid_request"),
+        ("message_ack", 501, "not_implemented"),
+    ] {
+        let (out, requests) = run(vec![(status, "", refusal(code))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some(code), "{verb} {code}");
+        assert!(!err.to_string().contains("internal-leak"), "{verb}: {err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
 }
 
 #[test]
