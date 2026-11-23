@@ -62,9 +62,14 @@ pub(super) struct JobIssueSnapshot {
     intake: Option<(String, String)>,
     lane_binding: Option<(std::path::PathBuf, String, String)>,
     cloud_lane: bool,
+    spec_pin: Option<(std::path::PathBuf, String)>,
 }
 
 impl JobIssueSnapshot {
+    pub(super) fn has_intake(&self) -> bool {
+        self.intake.is_some()
+    }
+
     pub(super) fn lock(&self) -> Result<crate::issue::PmLock> {
         if self.intake.is_some() {
             crate::issue::lockseam::outside_lock("intake-pre-enqueue");
@@ -127,6 +132,13 @@ impl JobIssueSnapshot {
                 "plan_evidence_stale",
                 "task dispatch refused: approved intake scope changed while the kickoff was being prepared",
             ));
+        }
+        if let Some((path, expected)) = &self.spec_pin {
+            if sha256_file(path).as_deref() != Some(expected.as_str()) {
+                return Err(Error::rejected(
+                    "task dispatch refused: independent spec changed while preparing the kickoff",
+                ));
+            }
         }
         Ok(())
     }
@@ -2137,6 +2149,27 @@ impl Shared {
         } else {
             None
         };
+        let spec_pin = if intake.is_some() && plan.task.spec_path.is_none() {
+            let issue = gated
+                .as_ref()
+                .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+            let spec = std::path::Path::new(&plan.job.spec_path);
+            let canonical = spec
+                .canonicalize()
+                .ok()
+                .zip(issue.dir.join("issue.md").canonicalize().ok())
+                .is_some_and(|(spec, issue)| spec == issue);
+            if canonical {
+                None
+            } else {
+                plan.job
+                    .spec_sha256
+                    .as_ref()
+                    .map(|digest| (spec.to_path_buf(), digest.clone()))
+            }
+        } else {
+            None
+        };
         Ok(Some(JobIssueSnapshot {
             pm,
             issue: issue.to_string(),
@@ -2144,6 +2177,7 @@ impl Shared {
             intake,
             lane_binding,
             cloud_lane,
+            spec_pin,
         }))
     }
 
@@ -2479,16 +2513,19 @@ impl Shared {
         } else {
             None
         };
-        let intake_acceptance = approved_items.and_then(crate::issue::dispatch::acceptance_listing);
+        let intake_acceptance = approved_scope
+            .map(crate::issue::dispatch::intake_acceptance)
+            .transpose()?;
         let legacy = |reason: String| -> Result<store::PreparedJobKickoff> {
             let mut effective;
-            let task = if let Some(items) = approved_items {
+            let task = if approved_items.is_some() {
                 effective = plan.task.clone();
-                effective.acceptance = Some(crate::issue::dispatch::intake_acceptance(
-                    approved_scope
-                        .ok_or_else(|| Error::internal("approved intake has no scope"))?,
+                let approved = intake_acceptance
+                    .clone()
+                    .ok_or_else(|| Error::internal("approved intake has no scope"))?;
+                effective.acceptance = Some(crate::issue::dispatch::with_independent_acceptance(
+                    approved,
                     plan.task.acceptance.as_deref(),
-                    items,
                 )?);
                 &effective
             } else {
@@ -2541,6 +2578,14 @@ impl Shared {
         let scope = |project: &crate::issue::project::Project,
                      front: &crate::issue::model::Front|
          -> Result<()> {
+            if snapshot.cloud_lane {
+                let binding = snapshot
+                    .lane_binding
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("approved cloud intake has no lane binding"))?;
+                cloud_intake_lane(project, front, &binding.0, &binding.1, &binding.2)?;
+                return Ok(());
+            }
             let lane = self.dispatch_lane("job dispatch", project, front)?;
             let lane_root = crate::worktree::main_root(&lane).map_err(|error| {
                 crate::context_pack::Refusal::ScopeConflict {

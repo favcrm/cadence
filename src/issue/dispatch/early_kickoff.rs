@@ -10,11 +10,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use super::{acceptance_listing, LIVE_MESSAGE_STATES};
+use super::LIVE_MESSAGE_STATES;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::Front;
-use crate::issue::parse::AcceptanceItem;
 
 // ── Early accepted-kickoff gate (CAD-1846) ───────────────────────
 //
@@ -206,7 +205,6 @@ pub(super) struct EarlyDispatch<'a> {
     pub(super) lane: &'a Path,
     pub(super) branch: &'a str,
     pub(super) job_locator: Option<&'a Path>,
-    pub(super) acceptance: &'a [AcceptanceItem],
 }
 
 /// What the daemon's own rows already say about this dispatch.
@@ -222,7 +220,7 @@ pub(super) enum EarlyKickoff {
     },
     /// The issue's open job exists but was never accepted: reuse its native
     /// binding instead of minting another job.
-    ReuseJob { job: Value },
+    ReuseJob { job: Value, task: Value },
 }
 
 fn busy_error(issue: &str, lane: &Path, mode: DispatchMode, row: &Value) -> Error {
@@ -310,14 +308,6 @@ fn draft_mismatches(binding: &OpenJob, d: &EarlyDispatch<'_>) -> Result<Vec<&'st
         }
     } else if job["base_ref"].as_str() != task["base_sha"].as_str() {
         wrong.push("base");
-    }
-    let acceptance = acceptance_listing(d.acceptance);
-    if task["acceptance"].as_str() != acceptance.as_deref()
-        && !task["acceptance"]
-            .as_str()
-            .is_some_and(|saved| super::same_checklist(saved, d.acceptance))
-    {
-        wrong.push("acceptance");
     }
     Ok(wrong)
 }
@@ -488,5 +478,8 @@ pub(super) fn early_kickoff(d: &EarlyDispatch<'_>) -> Result<EarlyKickoff> {
             wrong.join(", "),
         )));
     }
-    Ok(EarlyKickoff::ReuseJob { job: binding.job })
+    Ok(EarlyKickoff::ReuseJob {
+        job: binding.job,
+        task: binding.task,
+    })
 }

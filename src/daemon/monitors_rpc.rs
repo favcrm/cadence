@@ -1206,15 +1206,6 @@ impl Shared {
                 task.state
             )));
         }
-        if task
-            .acceptance
-            .as_deref()
-            .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err(Error::rejected(format!(
-                "Task '{task_id}' has no acceptance criteria — dispatch is refused"
-            )));
-        }
         let assignee = task
             .assignee
             .as_deref()
@@ -1280,6 +1271,20 @@ impl Shared {
         } else {
             self.capture_job_issue(&plan)?
         };
+        if !plan.duplicate
+            && plan
+                .task
+                .acceptance
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+            && !issue_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.has_intake())
+        {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' has no acceptance criteria — dispatch is refused"
+            )));
+        }
         // CAD-622: the explicit monitor handoff is the same fresh kickoff —
         // guard it before the queue write.
         let delivery = if plan.duplicate {

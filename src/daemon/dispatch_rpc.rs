@@ -415,13 +415,21 @@ impl Shared {
     ) -> Result<(PathBuf, String, String)> {
         let lane = self.dispatch_lane("intake dispatch", project, front)?;
         let root = crate::worktree::main_root(&lane)?;
-        let branch = issue::finish::git_branch(&lane)?.ok_or_else(|| {
+        let mut branch_refs = front
+            .refs
+            .iter()
+            .filter(|r| r.kind == "branch" && r.closed != Some(true));
+        let branch = match (branch_refs.next(), branch_refs.next()) {
+            (Some(recorded), None) => recorded.path.as_deref(),
+            _ => None,
+        }
+        .ok_or_else(|| {
             Error::invalid(
                 "plan_evidence_stale",
-                "intake dispatch refused: issue lane has no attached branch",
+                "intake dispatch refused: issue lane has no unique recorded branch",
             )
         })?;
-        crate::worktree::validate_registered_branch(&root, &lane, &branch).map_err(|error| {
+        crate::worktree::validate_registered_branch(&root, &lane, branch).map_err(|error| {
             Error::invalid(
                 "plan_evidence_stale",
                 format!(
@@ -429,14 +437,14 @@ impl Shared {
                 ),
             )
         })?;
-        let base = issue::dispatch::original_lane_base(&root, &lane, &branch, &front.id)?
+        let base = issue::dispatch::original_lane_base(&root, &lane, branch, &front.id)?
             .ok_or_else(|| {
                 Error::invalid(
                     "plan_evidence_stale",
                     "intake dispatch refused: issue lane's original base cannot be proven",
                 )
             })?;
-        Ok((lane, branch, base))
+        Ok((lane, branch.to_string(), base))
     }
 
     /// The lane a dispatch binds, resolved daemon-side: the issue's

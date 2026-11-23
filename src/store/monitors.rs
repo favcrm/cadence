@@ -710,17 +710,20 @@ impl Store {
                     let at = now();
                     tx.execute(
                         "UPDATE tasks SET state='dispatched',revision=?,assignee=?,
-                         dispatch_message=?,head_sha=NULL,error=NULL,updated=?,
-                         acceptance=COALESCE(?, acceptance) WHERE id=?",
-                        params![revision, assignee, kickoff, at, intake_acceptance, task_id],
+                         dispatch_message=?,head_sha=NULL,error=NULL,updated=? WHERE id=?",
+                        params![revision, assignee, kickoff, at, task_id],
                     )?;
+                    let mut payload = json!({"task": task_id, "job": job.id, "assignee": assignee,
+                                             "revision": revision, "message": kickoff, "by": by,
+                                             "automatic": true});
+                    if let Some(scope) = intake_acceptance {
+                        payload["intake_acceptance"] = json!(scope);
+                    }
                     Self::event_scoped(
                         &tx,
                         &job.pm_alias,
                         "task_dispatched",
-                        json!({"task": task_id, "job": job.id, "assignee": assignee,
-                               "revision": revision, "message": kickoff, "by": by,
-                               "automatic": true}),
+                        payload,
                         Some(&job.id),
                         Some(task_id),
                     )?;

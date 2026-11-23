@@ -237,6 +237,37 @@ pub(super) fn gate_claim(pm_dir: &Path, front: &Front, body: &str, base: &str) -
     gate_snapshot_at_base(pm_dir, front, body, base).map(drop)
 }
 
+/// Claim without opening a lane. Only fresh intake admission needs scope
+/// proof; ordinary plans retain their existing status-transition rule.
+pub(super) fn gate_direct_claim(
+    pm_dir: &Path,
+    front: &Front,
+    body: &str,
+    entering_work: bool,
+) -> Result<()> {
+    if front
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.intake.is_some())
+    {
+        return gate(pm_dir, front, body);
+    }
+    if !entering_work && front.plan_epic.is_none() {
+        return Ok(());
+    }
+    match membership(pm_dir, front)? {
+        Some((epic, plan)) if plan.intake.is_some() => {
+            admit_member(pm_dir, front, body, None, &epic, &plan).map(drop)
+        }
+        Some((epic, plan)) if entering_work && plan.state != "approved" => Err(not_approved(
+            &epic,
+            &plan.state,
+            &format!("{} stays in backlog until then", front.id),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn admit(
     pm_dir: &Path,
     front: &Front,
@@ -256,9 +287,20 @@ fn admit(
     let Some((epic, plan)) = membership(pm_dir, front)? else {
         return Ok(None);
     };
+    admit_member(pm_dir, front, body, execution_base, &epic, &plan)
+}
+
+fn admit_member(
+    pm_dir: &Path,
+    front: &Front,
+    body: &str,
+    execution_base: Option<&str>,
+    epic: &str,
+    plan: &model::Plan,
+) -> Result<Option<String>> {
     if plan.state != "approved" {
         return Err(not_approved(
-            &epic,
+            epic,
             &plan.state,
             &format!("{} cannot start before its plan is approved", front.id),
         ));
@@ -274,7 +316,7 @@ fn admit(
         ));
     }
     if plan.intake.is_some() {
-        return verify_intake_dispatch(pm_dir, &epic, front, body, execution_base).map(Some);
+        return verify_intake_dispatch(pm_dir, epic, front, body, execution_base).map(Some);
     }
     Ok(None)
 }

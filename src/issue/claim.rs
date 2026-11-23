@@ -361,8 +361,12 @@ pub fn claim(
             }
         }
     }
-    let mut next = front.clone();
     let refreshed = !checked.foreign() && front.claim.as_ref().is_some_and(|c| c.by == by);
+    let entering_work = matches!(front.status.as_str(), "backlog" | "ready");
+    if !refreshed || entering_work {
+        crate::issue::plan::gate_direct_claim(&pm.dir, &front, &body, entering_work)?;
+    }
+    let mut next = front.clone();
     next.claim = Some(new_claim(&by, note.clone()));
     // `owner` stays the lane: a claim leaves it alone, so the worker a
     // later dispatch names becomes owner. A take-over displaces the old
@@ -370,11 +374,7 @@ pub fn claim(
     if checked.take_over.is_some() {
         next.owner = Some(by.clone());
     }
-    if matches!(next.status.as_str(), "backlog" | "ready") {
-        // CAD-360: claiming moves the issue into work — the same status
-        // write rule as `issue set`, so an unapproved plan's ticket is
-        // refused before anything is written.
-        crate::issue::plan::check_status_write(&pm.dir, &front, "doing")?;
+    if entering_work {
         next.status = "doing".to_string();
     }
     let suffix = note

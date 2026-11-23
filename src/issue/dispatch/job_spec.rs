@@ -355,18 +355,12 @@ pub(crate) fn job_context(
                 }
             }
         }
-        // Keep tracker frontmatter out of the spec prose. An intake caller
-        // supplies the currently approved issue checklist instead of one
-        // inherited by the task before approval.
+        // Task acceptance is independent of the approved issue scope.
         let spec_is_issue = canonical_issue_spec || spec.as_bytes() == source.as_bytes();
-        let recorded_acceptance;
-        let acceptance = match approved_issue_items {
-            Some(items) => items,
-            None => {
-                recorded_acceptance = task_acceptance(task);
-                &recorded_acceptance
-            }
-        };
+        let mut acceptance = task_acceptance(task);
+        if let Some(items) = approved_issue_items {
+            acceptance.extend(items.iter().cloned());
+        }
         let title = task
             .title
             .as_deref()
@@ -379,7 +373,7 @@ pub(crate) fn job_context(
             &task.id,
             title,
             source.as_bytes(),
-            acceptance,
+            &acceptance,
             String::new(),
         );
         contract.issue = front.id.clone();
@@ -439,18 +433,9 @@ pub(crate) fn job_context(
             request.push_str(scope);
             request.push('\n');
         }
-        if let Some(items) = approved_issue_items {
-            if let Some(recorded) = task
-                .acceptance
-                .as_deref()
-                .filter(|s| !s.trim().is_empty() && !super::same_checklist(s, items))
-            {
-                request.push_str(
-                    "\n## Recorded task acceptance\n\n\
-                     An earlier inherited issue checklist is historical where it differs \
-                     from the approved issue criteria; independent task requirements remain \
-                     applicable where compatible. Recorded task acceptance:\n\n",
-                );
+        if approved_issue_items.is_some() {
+            if let Some(recorded) = task.acceptance.as_deref().filter(|s| !s.trim().is_empty()) {
+                request.push_str("\n## Independent task acceptance (where compatible)\n\n");
                 request.push_str(recorded);
                 request.push('\n');
             }

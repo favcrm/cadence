@@ -435,6 +435,26 @@ impl Store {
         } else {
             crate::issue::dispatch::inline_listing(&outstanding)
         };
+        // The approved intake scope belongs to this exact kickoff, not to
+        // the independently maintained task criteria or a later dispatch.
+        let intake_scope = if let Some(message) = task.dispatch_message.as_deref() {
+            self.conn()
+                .query_opt(
+                    "SELECT json_extract(payload, '$.intake_acceptance') FROM events
+                 WHERE job_id=? AND task_id=? AND kind='task_dispatched'
+                   AND json_extract(payload, '$.message')=?
+                   AND json_extract(payload, '$.revision')=?
+                   AND json_extract(payload, '$.assignee')=? LIMIT 1",
+                    params![job.id, task.id, message, task.revision, recipient],
+                    |row| row.get::<_, Option<String>>(0),
+                )?
+                .flatten()
+        } else {
+            None
+        };
+        let intake_scope = intake_scope
+            .map(|scope| format!(" Approved intake scope: {}.", json!(scope)))
+            .unwrap_or_default();
         let objective = flatten_controls(
             task.title
                 .as_deref()
@@ -445,7 +465,7 @@ impl Store {
             format!(
                 "{text} — Task {} (job {}) is still open; this message amends it and does \
                  not replace it. Objective: {objective}. Spec: {}. Outstanding criteria: \
-                 {criteria}.",
+                 {criteria}.{intake_scope}",
                 task.id,
                 job.id,
                 flatten_controls(spec)
@@ -1433,24 +1453,20 @@ impl Store {
             }
             tx.execute(
                 "UPDATE tasks SET state='dispatched',revision=?,assignee=?,
-                         dispatch_message=?,head_sha=NULL,error=NULL,updated=?,
-                         acceptance=COALESCE(?, acceptance) WHERE id=?",
-                params![
-                    revision,
-                    assignee,
-                    kickoff,
-                    now(),
-                    intake_acceptance,
-                    task_id
-                ],
+                         dispatch_message=?,head_sha=NULL,error=NULL,updated=? WHERE id=?",
+                params![revision, assignee, kickoff, now(), task_id],
             )?;
+            let mut payload = json!({"task": task_id, "job": job.id, "assignee": assignee,
+                                     "revision": revision, "message": kickoff, "by": by,
+                                     "project": project});
+            if let Some(scope) = intake_acceptance {
+                payload["intake_acceptance"] = json!(scope);
+            }
             Self::event_scoped(
                 &tx,
                 &job.pm_alias,
                 "task_dispatched",
-                json!({"task": task_id, "job": job.id, "assignee": assignee,
-                               "revision": revision, "message": kickoff, "by": by,
-                               "project": project}),
+                payload,
                 Some(&job.id),
                 Some(task_id),
             )?;

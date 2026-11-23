@@ -326,6 +326,9 @@ unfinished prerequisite that retained work still needs. Approval supersedes
 the old scope without stopping active work. Fresh kickoff rechecks the
 approval before enqueue; retransmitting an accepted kickoff keeps its
 original receipt. Existing coordinator and worker admission rules still apply.
+A job kickoff pins that revision's complete issue acceptance for
+task-bound follow-ups. Separately authored task criteria still apply
+where compatible; they do not expand the approved issue scope.
 
 ## Finding a command
 

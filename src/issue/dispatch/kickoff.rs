@@ -84,21 +84,22 @@ pub(crate) fn acceptance_listing(items: &[AcceptanceItem]) -> Option<String> {
 }
 
 /// Render the approved Markdown as one anchored, unambiguous scope.
-pub(crate) fn intake_acceptance(
-    scope: &str,
-    recorded: Option<&str>,
-    items: &[AcceptanceItem],
-) -> Result<String> {
+pub(crate) fn intake_acceptance(scope: &str) -> Result<String> {
     let scope = serde_json::to_string(scope).map_err(|e| Error::internal(e.to_string()))?;
-    let mut rendered =
-        format!("Approved issue acceptance Markdown (including qualifiers): {scope}");
-    if let Some(recorded) =
-        recorded.filter(|s| !s.trim().is_empty() && !super::same_checklist(s, items))
-    {
-        rendered.push_str(&format!(
-            ". Recorded task acceptance: {}. An earlier inherited issue checklist is historical where it differs; independent task requirements remain applicable where compatible",
-            serde_json::to_string(recorded).map_err(|e| Error::internal(e.to_string()))?
-        ));
+    Ok(format!(
+        "Approved issue acceptance Markdown (including qualifiers): {scope}"
+    ))
+}
+
+pub(crate) fn with_independent_acceptance(
+    mut rendered: String,
+    independent: Option<&str>,
+) -> Result<String> {
+    if let Some(recorded) = independent.filter(|s| !s.trim().is_empty()) {
+        rendered.push_str(". Independent task acceptance (where compatible): ");
+        rendered.push_str(
+            &serde_json::to_string(recorded).map_err(|e| Error::internal(e.to_string()))?,
+        );
     }
     Ok(rendered)
 }
