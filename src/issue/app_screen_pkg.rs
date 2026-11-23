@@ -57,6 +57,8 @@ pub struct ScreenPackage {
     pub tools: BTreeMap<String, String>,
     pub operations: Vec<app_screen_decl::ScreenOperation>,
     pub navigation: Option<app_screen_decl::ScreenNavigation>,
+    /// CAD-2710: the declared app views, so the board can read their option labels.
+    pub views: Option<Vec<app_screen_decl::ScreenView>>,
 }
 
 /// `true` when `tag` is a legal screen tag (the bundle's tag grammar).
@@ -140,25 +142,44 @@ pub fn declares_whatsapp_door(files: &BTreeMap<String, String>, app: &str) -> bo
     })
 }
 
+/// The bundle's one valid screen package whose `app` matches `app`.
+fn single_screen_package(files: &BTreeMap<String, String>, app: &str) -> Option<ScreenPackage> {
+    let tags = tags_in(files).ok()?;
+    let [tag] = tags.as_slice() else {
+        return None;
+    };
+    extract(files, tag).ok().filter(|pkg| pkg.app == app)
+}
+
+/// The declared `navigation` and (CAD-2710) `views` of the bundle's single
+/// valid screen package whose `app` matches `app`, as JSON; `Value::Null` for
+/// each the package does not declare or when there is no such package.
+pub fn single_screen_navigation_and_views(
+    files: &BTreeMap<String, String>,
+    app: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let json = |v: Option<serde_json::Result<serde_json::Value>>| {
+        v.and_then(std::result::Result::ok)
+            .unwrap_or(serde_json::Value::Null)
+    };
+    match single_screen_package(files, app) {
+        Some(pkg) => (
+            json(pkg.navigation.map(serde_json::to_value)),
+            json(pkg.views.map(serde_json::to_value)),
+        ),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    }
+}
+
 /// Extract declared `navigation` when the bundle carries a single valid screen
 /// package whose `app` matches `app`. Returns `Value::Null` otherwise.
 pub fn single_screen_navigation(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
-    let Ok(tags) = tags_in(files) else {
-        return serde_json::Value::Null;
-    };
-    let [tag] = tags.as_slice() else {
-        return serde_json::Value::Null;
-    };
-    let Ok(pkg) = extract(files, tag) else {
-        return serde_json::Value::Null;
-    };
-    if pkg.app != app {
-        return serde_json::Value::Null;
-    }
-    match pkg.navigation {
-        Some(nav) => serde_json::to_value(nav).unwrap_or(serde_json::Value::Null),
-        None => serde_json::Value::Null,
-    }
+    single_screen_navigation_and_views(files, app).0
+}
+
+/// CAD-2710: the declared `views` of that same single screen package.
+pub fn single_screen_views(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
+    single_screen_navigation_and_views(files, app).1
 }
 
 /// CAD-1827: how one installed bundle relates to the campaign-work contract.
@@ -351,6 +372,7 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
         tools: checked.tools().clone(),
         operations: checked.operations().to_vec(),
         navigation: checked.navigation().cloned(),
+        views: checked.views().map(<[_]>::to_vec),
     })
 }
 
@@ -706,6 +728,16 @@ mod tests {
             (&json!("customers"), &json!("客戶"))
         );
         assert!(single_screen_navigation(&files, "other").is_null());
+        assert!(single_screen_views(&files, "crm").is_null());
+        let mut with_views = with_nav.clone();
+        with_views["views"] = json!([{"id":"pnl","label":{"en":"P&L"},"section":"customers","params":{"compare":{"type":"enum","values":["prior_year"],"labels":{"prior_year":{"zh-TW":"對比去年"}}}}}]);
+        let viewed = bundle_with("main", &with_views.to_string(), &[("client.js", js)]);
+        assert_eq!(
+            single_screen_views(&viewed, "crm")[0]["params"]["compare"]["labels"]["prior_year"]
+                ["zh-TW"],
+            json!("對比去年")
+        );
+        assert!(single_screen_views(&viewed, "other").is_null());
         assert!(single_screen_navigation(
             &bundle_with("main", &decl(&[("client.js", js)]), &[("client.js", js)]),
             "crm"
@@ -718,5 +750,46 @@ mod tests {
         );
         two.insert("screens/second/client.js".to_string(), js.to_string());
         assert!(single_screen_navigation(&two, "crm").is_null());
+    }
+    /// AOS-714 / CAD-2710: the cases shared byte-for-byte with agenticos-v2's
+    /// hosted reader (`apps/api/src/tenant-board/cad2710-view-option-labels.fixture.json`).
+    #[test]
+    fn cad2710_shared_view_label_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/cad2710-view-option-labels.fixture.json"
+        ))
+        .unwrap();
+        let js = "console.log(1);";
+        let bundle = |views: &serde_json::Value| {
+            let mut decl: serde_json::Value =
+                serde_json::from_str(&decl_records(&[("client.js", js)], &[])).unwrap();
+            let sections: Vec<_> = fixture["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| json!({"id": id, "label": "S"}))
+                .collect();
+            decl["navigation"] = json!({"section_query":"section","default_section":"customers","sections":sections});
+            decl["views"] = views.clone();
+            bundle_with("main", &decl.to_string(), &[("client.js", js)])
+        };
+        let mut disagree = Vec::new();
+        for (key, accepted) in [("valid", true), ("invalid", false)] {
+            for case in fixture[key].as_array().unwrap() {
+                let files = bundle(&json!([case["view"]]));
+                if extract(&files, "main").is_ok() != accepted {
+                    disagree.push(format!("{key}: {}", case["name"]));
+                }
+            }
+        }
+        let projection = &fixture["projection"];
+        assert_eq!(
+            single_screen_views(&bundle(&projection["views_in"]), "crm"),
+            projection["views_out"]
+        );
+        assert!(
+            disagree.is_empty(),
+            "cases the Rust reader disagrees on: {disagree:?}"
+        );
     }
 }

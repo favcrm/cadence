@@ -9,6 +9,7 @@
 
 mod blob_cat;
 mod document_template;
+mod issue_text;
 mod media_artifact;
 mod merge_gate;
 
@@ -88,6 +89,11 @@ fn verb_for(
 ) -> Result<(&'static str, serde_json::Map<String, Value>)> {
     if let Commands::Wiki { action } = command {
         return wiki_for(action, command_path);
+    }
+    if let Commands::Issue { action } = command {
+        if let Some(args) = issue_text::edit_args(action)? {
+            return Ok(("issue_set", args));
+        }
     }
     let mut args = serde_json::Map::new();
     let verb = match command {
@@ -1796,6 +1802,37 @@ fn valid_whatsapp_company_id(value: &str) -> bool {
         && !value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
 }
 
+fn whatsapp_connection_stderr_hint(
+    action: &super::connection::WhatsappAction,
+    body: &Value,
+) -> Option<String> {
+    use super::connection::{WhatsappAction, WhatsappProviderArg};
+    let url = body
+        .pointer("/data/url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("https://"))?;
+    match action {
+        WhatsappAction::Connect {
+            provider: WhatsappProviderArg::Linked,
+        } => {
+            if body
+                .pointer("/data/alreadyConnected")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                Some(format!(
+                    "Linked WhatsApp is already connected. Open Cadence WhatsApp Settings to manage or pause ($0/mo):\n  {url}"
+                ))
+            } else {
+                Some(format!(
+                    "Open Cadence WhatsApp Settings in your browser to scan the pairing QR code (no browser was opened here and no QR secret is printed):\n  {url}"
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn platform_request_key(
     tool: &str,
     query: Option<&Value>,
@@ -2539,60 +2576,9 @@ fn team_for(
     }
 }
 
-/// The rows in `hosted-verbs.toml` (CAD-2180): the verbs whose
-/// hosted refusal needs a fact the generic message cannot give. Every other
-/// refusal keeps the default — not implemented for a remote org in this
-/// build — and names `cadence commands --all`, which is a real answer.
-const HOSTED_VERBS_TOML: &str = include_str!("hosted-verbs.toml");
-
-#[derive(serde::Deserialize)]
-struct HostedVerbs {
-    #[serde(default)]
-    verb: Vec<HostedVerb>,
-}
-
-#[derive(serde::Deserialize)]
-struct HostedVerb {
-    path: String,
-    class: String,
-    #[serde(default)]
-    ticket: Option<String>,
-    #[serde(default)]
-    alternative: Option<String>,
-}
-
-fn hosted_verbs() -> &'static HostedVerbs {
-    static TABLE: std::sync::OnceLock<HostedVerbs> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        toml::from_str(HOSTED_VERBS_TOML).expect("src/cli/hosted-verbs.toml is a valid verb table")
-    })
-}
-
-fn hosted_gap(path: &str) -> Option<&'static HostedVerb> {
-    hosted_verbs().verb.iter().find(|row| row.path == path)
-}
-
 fn unavailable(command_path: Option<&str>) -> Error {
     let path = command_path.unwrap_or("<command>");
     let listed = "`cadence commands --all` lists every verb this client offers.";
-    if let Some(gap) = hosted_gap(path) {
-        let alternative = gap
-            .alternative
-            .as_deref()
-            .map(|alt| format!(" Use `cadence {alt}` today."))
-            .unwrap_or_default();
-        let case = match gap.class.as_str() {
-            "planned" => format!(
-                "it is planned ({})",
-                gap.ticket.as_deref().unwrap_or("no ticket")
-            ),
-            _ => "it is local-only and will not be sent to a remote org".to_string(),
-        };
-        return Error::rejected(format!(
-            "`cadence {path}` is not available on a remote org in this build: {case}; \
-             nothing was sent.{alternative} {listed}"
-        ));
-    }
     Error::rejected(format!(
         "`cadence {path}` is not available on a remote org in this build; nothing was sent. {listed}"
     ))
@@ -3051,7 +3037,12 @@ where
         // managed agent on its owner's login from the owner.
         super::workspace_skill::refuse_managed_decision(action, target.identity.is_some())?;
     }
-    let (verb, args) = verb_for(&command, command_path.as_deref())?;
+    if let Commands::Issue { action } = &command {
+        if issue_text::needs_human(action) {
+            refuse_managed(&target, "hosted issue text editing")?;
+        }
+    }
+    let (verb, mut args) = verb_for(&command, command_path.as_deref())?;
     let keyed_issue_create = verb == "issue_new" && args.contains_key("request_id");
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
@@ -3158,6 +3149,8 @@ where
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_secs(wake_timeout))
         .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
+    let edits_issue_text =
+        verb == "issue_set" && issue_text::resolve(&target, &mut args, deadline, wake_timeout)?;
     let issue_ls_fallback = (verb == "issue_ls")
         .then(|| {
             let n = args.get("limit").and_then(Value::as_u64)? as usize;
@@ -3205,6 +3198,12 @@ where
                     Err(retry_err) => return remote_failure(retry_err),
                 }
             } else {
+                if edits_issue_text && error.code() == Some("invalid_request") {
+                    eprint_line(
+                        "The server refused this edit. If this board predates CLI body editing, \
+                         use the issue page's description editor or upgrade the board.",
+                    );
+                }
                 if verb == "issue_new" && error.kind() == "unknown" {
                     if keyed_issue_create {
                         eprint_line(
@@ -3296,20 +3295,13 @@ where
                 );
                 return Ok(0);
             }
-            if matches!(
-                &command,
-                Commands::Connection {
-                    action: ConnectionAction::Whatsapp {
-                        action: super::connection::WhatsappAction::Connect { .. }
-                            | super::connection::WhatsappAction::Rescope { .. }
-                    }
-                }
-            ) && body.pointer("/data/url").and_then(Value::as_str).is_some()
+            if let Commands::Connection {
+                action: ConnectionAction::Whatsapp { action },
+            } = &command
             {
-                eprint_line(
-                    "Open this authenticated URL in your own browser; no browser was opened \
-                     here and no pairing QR secret is printed.",
-                );
+                if let Some(hint) = whatsapp_connection_stderr_hint(action, &body) {
+                    eprint_line(&hint);
+                }
             }
             if matches!(&command, Commands::Platform { .. }) {
                 for summary in super::platform::platform_human_summary(&body) {
@@ -6120,81 +6112,6 @@ mod read_contract_tests {
         assert!(err.contains("not available on a remote org"), "{err}");
     }
 
-    fn collect_paths(cmd: &clap::Command, prefix: &mut Vec<String>, out: &mut Vec<String>) {
-        for sub in cmd.get_subcommands() {
-            if sub.get_name() == "help" {
-                continue;
-            }
-            prefix.push(sub.get_name().to_string());
-            out.push(prefix.join(" "));
-            collect_paths(sub, prefix, out);
-            prefix.pop();
-        }
-    }
-
-    #[test]
-    fn hosted_verb_rows_name_real_commands_and_supported_alternatives() {
-        let root = super::super::help::root_command(false);
-        let mut paths = Vec::new();
-        collect_paths(&root, &mut Vec::new(), &mut paths);
-        let real: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
-        let rows = hosted_verbs();
-        assert!(
-            !rows.verb.is_empty(),
-            "src/cli/hosted-verbs.toml has no rows"
-        );
-        let gaps: std::collections::HashSet<&str> =
-            rows.verb.iter().map(|row| row.path.as_str()).collect();
-        for row in &rows.verb {
-            assert!(
-                real.contains(row.path.as_str()),
-                "{} is not a command",
-                row.path
-            );
-            assert!(
-                matches!(row.class.as_str(), "planned" | "local-only"),
-                "{}: unknown class {}",
-                row.path,
-                row.class
-            );
-            if row.class == "planned" {
-                let ticket = row.ticket.as_deref().unwrap_or("");
-                let numbered = ticket
-                    .strip_prefix("CAD-")
-                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-                assert!(numbered, "{}: planned without a ticket", row.path);
-            }
-            if let Some(alt) = &row.alternative {
-                assert!(
-                    real.contains(alt.as_str()),
-                    "{}: alternative {alt} is not a command",
-                    row.path
-                );
-                assert!(
-                    !gaps.contains(alt.as_str()),
-                    "{}: alternative {alt} is itself a gap",
-                    row.path
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_planned_verb_refusal_names_its_ticket_and_a_supported_alternative() {
-        let message = unavailable(Some("issue edit")).to_string();
-        assert!(message.contains("`cadence issue edit`"), "{message}");
-        assert!(message.contains("planned (CAD-2202)"), "{message}");
-        assert!(message.contains("`cadence issue comment`"), "{message}");
-        assert!(message.contains("nothing was sent"), "{message}");
-        let generic = unavailable(Some("ui")).to_string();
-        assert!(
-            generic.contains("not available on a remote org"),
-            "{generic}"
-        );
-        assert!(generic.contains("cadence commands --all"), "{generic}");
-        assert!(generic.contains("nothing was sent"), "{generic}");
-    }
-
     #[test]
     fn a_scope_gap_refusal_names_the_login_flag_and_the_credential() {
         let caps = vec!["cli.read".to_string(), "cli.write".to_string()];
@@ -6264,6 +6181,9 @@ mod read_contract_tests {
             assert!(!message.contains("--org local"), "{message}");
             assert!(!message.contains("org switch"), "{message}");
             assert!(message.contains("nothing was sent"), "{message}");
+            if expected == "`cadence wiki mkdir`" {
+                assert!(message.contains("cadence commands --all"), "{message}");
+            }
         }
     }
 
@@ -6596,7 +6516,7 @@ mod read_contract_tests {
                 "provider": "linked",
                 "action": "connect",
                 "state": "pairing",
-                "url": "https://app.example.test/account#linked",
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked",
                 "expiresAt": "2026-11-23T02:00:00Z",
                 "extraRenamedSecret": "strip-me"
             }}),
@@ -6608,7 +6528,7 @@ mod read_contract_tests {
                 "provider": "linked",
                 "action": "connect",
                 "state": "pairing",
-                "url": "https://app.example.test/account#linked",
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked",
                 "expiresAt": "2026-11-23T02:00:00Z"
             }})
         );
@@ -6628,6 +6548,75 @@ mod read_contract_tests {
                 "expected refusal for {bad_connect}"
             );
         }
+
+        let linked_pairing_hint = whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &connect_ok,
+        )
+        .unwrap();
+        assert!(linked_pairing_hint.contains("Cadence WhatsApp Settings"));
+        assert!(linked_pairing_hint
+            .contains("https://alpha.board.example.test/apps/waba?waba=connection&mode=linked"));
+        assert!(linked_pairing_hint.contains("no QR secret is printed"));
+
+        let linked_connected_hint = whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "alreadyConnected": true,
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked"
+            }}),
+        )
+        .unwrap();
+        assert!(linked_connected_hint.contains("already connected"));
+        assert!(linked_connected_hint.contains("$0/mo"));
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "url": "http://insecure.example.test/apps/waba"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Official,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "action": "connect",
+                "url": "https://portal.favcrm.example.test/wa/connect?token=tok"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Rescope { request: None },
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "action": "rescope",
+                "url": "https://portal.favcrm.example.test/wa/connect?token=tok"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Status {
+                provider: WhatsappProviderArg::Linked
+            },
+            &json!({"ok": true, "data": {"provider": "linked", "state": "connected"}}),
+        )
+        .is_none());
     }
 
     #[test]

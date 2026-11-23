@@ -790,6 +790,44 @@ pub fn parse(text: &str) -> Result<Option<DeliveryPolicy>> {
     Ok(Some(policy))
 }
 
+/// CAD-2708: the PROJECT.md text [`parse`] reads for a stored `delivery:`
+/// section. The CLI uses it, and a host that wraps a stored section itself
+/// must read every text the same way, so the CLI and the hosted gate parse,
+/// and digest, the same policy. A host can instead send the stored text as
+/// `policy_section` to `delivery.requirements.evaluate`, which wraps it with
+/// this function (CAD-2715).
+///
+/// A hosted org stores the section as its owner wrote it: the section's YAML
+/// value, or the section with its own `delivery:` key. Either may start with
+/// a BOM, blank lines or `#` comments and may use CRLF line endings. The
+/// first line that is neither blank nor a comment decides: one that starts
+/// with the `delivery:` key is the keyed form and is fenced as it is;
+/// anything else is the value and is nested under one `delivery:` key. A
+/// text that already opens a frontmatter fence passes through unchanged.
+pub fn section_front(section: &str) -> String {
+    let text = section.strip_prefix('\u{feff}').unwrap_or(section);
+    if text.starts_with("---\n") || text.starts_with("---\r\n") {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    let keyed = lines
+        .iter()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .and_then(|line| line.strip_prefix("delivery:"))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']));
+    let mut front = String::from(if keyed { "---\n" } else { "---\ndelivery:\n" });
+    for line in lines {
+        if !keyed {
+            front.push_str("  ");
+        }
+        front.push_str(line);
+        front.push('\n');
+    }
+    front.push_str("---\n");
+    front
+}
+
 /// [`load`] over a PROJECT.md text already read — locally or from a
 /// hosted org (CAD-1946). `None` is "no PROJECT.md".
 pub fn parse_project(key: &str, text: Option<&str>) -> Result<Option<DeliveryPolicy>> {
@@ -1496,5 +1534,69 @@ mod tests {
             "delivery_digest": digest(&p),
         });
         assert_eq!(approved_from(&mismatched_null), None);
+    }
+
+    /// CAD-2708: every way an owner may write one stored section — its
+    /// value or its keyed form, with a BOM, comments, blank lines, CRLF,
+    /// reordered keys or an existing fence — reads as the same policy, so
+    /// it has one digest.
+    #[test]
+    fn section_front_reads_every_stored_form_as_one_policy() {
+        let value = "reviews:\n  review: {kind: agent, focus: general}\n  \
+                     qa: {kind: agent, focus: browser-qa}\nrisk:\n  - require: [review]\n  \
+                     - when: {paths: [\"web/**\"]}\n    require: [review, qa]\n";
+        let indented: String = value.lines().map(|l| format!("  {l}\n")).collect();
+        let keyed = format!("delivery:\n{indented}");
+        let expected = parse(&section_front(value)).unwrap().unwrap();
+        let forms = [
+            keyed.clone(),
+            format!("# Browser QA for shared navigation\n{value}"),
+            format!("# Browser QA for shared navigation\n\n{keyed}"),
+            format!("\n\n{keyed}\n\n"),
+            format!("\u{feff}{keyed}"),
+            format!("\u{feff}# note\n{value}"),
+            keyed.replace('\n', "\r\n"),
+            value.replace('\n', "\r\n"),
+            keyed
+                .lines()
+                .map(|l| format!("  {l}\n"))
+                .collect::<String>(),
+            format!("---\n{keyed}---\n"),
+            format!("\u{feff}---\r\n{}---\r\n", keyed.replace('\n', "\r\n")),
+            // The same mapping with its keys reordered and a trailing comment.
+            "risk:\n  - require: [review]\n  - when: {paths: [\"web/**\"]}\n    \
+             require: [review, qa]\nreviews:\n  qa: {kind: agent, focus: browser-qa}\n  \
+             review: {kind: agent, focus: general}  # the floor\n"
+                .to_string(),
+        ];
+        for form in forms {
+            let policy = parse(&section_front(&form))
+                .unwrap_or_else(|e| panic!("{form:?}: {e}"))
+                .unwrap_or_else(|| panic!("{form:?}: no section"));
+            assert_eq!(policy, expected, "{form:?}");
+            assert_eq!(digest(&policy), digest(&expected), "{form:?}");
+        }
+    }
+
+    /// A comment above the bare value is not the keyed form, and a key that
+    /// only starts with `delivery` is the value, which the strict section
+    /// then refuses.
+    #[test]
+    fn section_front_decides_on_the_first_significant_line() {
+        assert_eq!(
+            section_front("# delivery: is not a key here\nmax_revise: 3\n"),
+            "---\ndelivery:\n  # delivery: is not a key here\n  max_revise: 3\n---\n"
+        );
+        assert_eq!(
+            section_front("\n# note\ndelivery:\n  max_revise: 3\n"),
+            "---\n\n# note\ndelivery:\n  max_revise: 3\n---\n"
+        );
+        assert!(parse(&section_front("delivery_x:\n  max_revise: 3\n")).is_err());
+        let flow = "delivery: {reviews: {review: {kind: agent, focus: general}}, \
+                    risk: [{require: [review]}], max_revise: 3}";
+        assert_eq!(
+            parse(&section_front(flow)).unwrap().map(|p| p.max_revise),
+            Some(3)
+        );
     }
 }

@@ -233,7 +233,7 @@ async function main() {
 
     assert(calls.some((c) => c.op === "whatsapp.reply.prepare" && c.args.provider === "official"), "prepares with provider=official");
     assert(calls.some((c) => c.op === "planner:whatsapp.reply.send" && c.args.provider === "official" && c.args.effect_id === "wa_official_eff_1"), "confirms send via planner with effect_id");
-    assert(host.textContent?.includes("Delivery confirmed."), "shows delivery confirmed banner");
+    assert(host.textContent?.includes("Delivered"), "shows quiet delivered pill");
   }
 
   // 4. Official composer closed 24h window (`template_only`): disables composer and names 24h template requirement.

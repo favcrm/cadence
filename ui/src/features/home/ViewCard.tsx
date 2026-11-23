@@ -5,7 +5,7 @@ import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 import { appViewId, sameRoute } from "../canvas/appView";
 import { effective, MAX_PANES } from "../canvas/canvasLayout";
 import { openAppView, useCanvas } from "../canvas/canvasStore";
-import { optionsLine } from "../canvas/viewParams";
+import { declaredOptionLabel, optionsLine } from "../canvas/viewParams";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
 import { HOME_VIEW_SCOPE, parseViewRef, plainText, viewCardAppView, viewHere, type ViewScope } from "./chatCards";
 import type { ThreadEntry } from "./thread";
@@ -27,26 +27,26 @@ import type { ThreadEntry } from "./thread";
 /** Which install and context the surrounding conversation belongs to (the app pane sets it). */
 export const ViewScopeContext = createContext<ViewScope>(HOME_VIEW_SCOPE);
 
-type Probe = { status: "checking" | "ok" | "denied" | "missing"; sections: string[] | null };
+type Probe = { status: "checking" | "ok" | "denied" | "missing"; sections: string[] | null; views: unknown };
 
 /** Reads the install once per card: its availability and the sections it declares. */
 function useInstallProbe(installId: string | null): Probe {
-  const [probe, setProbe] = useState<Probe>({ status: "checking", sections: null });
+  const [probe, setProbe] = useState<Probe>({ status: "checking", sections: null, views: null });
   useEffect(() => {
     if (installId === null) return;
     const controller = new AbortController();
-    setProbe({ status: "checking", sections: null });
+    setProbe({ status: "checking", sections: null, views: null });
     workspaceApps.detail(installId, controller.signal).then(
       (installation) => {
         if (controller.signal.aborted) return;
-        if (installation.removed != null || installation.state === "removed") setProbe({ status: "missing", sections: null });
-        else setProbe({ status: "ok", sections: installation.navigation ? installation.navigation.sections.map((s) => s.id) : null });
+        if (installation.removed != null || installation.state === "removed") setProbe({ status: "missing", sections: null, views: null });
+        else setProbe({ status: "ok", sections: installation.navigation ? installation.navigation.sections.map((s) => s.id) : null, views: installation.views ?? null });
       },
       (error: unknown) => {
         if (controller.signal.aborted) return;
         const status = error instanceof ApiError ? error.status : 0;
         // Any other failure leaves the button: opening the tab reports it itself.
-        setProbe({ status: status === 404 ? "missing" : status === 401 || status === 403 ? "denied" : "ok", sections: null });
+        setProbe({ status: status === 404 ? "missing" : status === 401 || status === 403 ? "denied" : "ok", sections: null, views: null });
       },
     );
     return () => controller.abort();
@@ -94,7 +94,7 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
   }[state];
   // A declared view names its place by its label (CAD-2555) and shows its params on a line of their own.
   const place = model.viewLabel ?? (model.recordId === null ? model.section : `${model.section} / ${model.recordId}`);
-  const params = optionsLine(model.params, locale, t);
+  const params = optionsLine(model.params, locale, t, declaredOptionLabel(probe.views, model.view, locale));
   return (
     <TurnCard
       kind="view"

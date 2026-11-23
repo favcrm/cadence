@@ -852,9 +852,10 @@ async function testComposerInteractions(): Promise<void> {
     });
     assert(
       container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent" &&
-        container.textContent?.includes("Delivery confirmed") &&
+        container.querySelector(".wa-reply-status")?.getAttribute("data-quiet") === "true" &&
+        container.textContent?.includes("Delivered") &&
         container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true",
-      "bounded auto-poll promotes transient uncertain to sent and unlocks composer",
+      "bounded auto-poll promotes transient uncertain to sent quiet pill and unlocks composer",
     );
 
     // 6. Persistent uncertain escalates to Send not confirmed + lock + manual Check status unlocks
@@ -907,12 +908,15 @@ async function testComposerInteractions(): Promise<void> {
     });
     assert(
       container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent" &&
+        container.textContent?.includes("Delivered") &&
         container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true",
       "manual Check status unlocks composer once resolved",
     );
 
-    // 7. Accepted outcome keeps composer unlocked with quiet pending note
+    // 7. Accepted outcome shows quiet Sent pill, silently upgrades to Delivered, clears on typing,
+    //    auto-dismisses if unconfirmed, and never resurrects across chat switches.
     confirmOutcome = "accepted";
+    statusOutcome = "accepted";
     const acceptedSelection: WhatsAppReplySelection = {
       ...selection,
       receiptScope: "scope-accepted",
@@ -933,15 +937,114 @@ async function testComposerInteractions(): Promise<void> {
     });
     assert(
       container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "accepted" &&
-        container.textContent?.includes("Delivery pending") &&
+        container.querySelector(".wa-reply-status")?.getAttribute("data-quiet") === "true" &&
+        container.textContent?.includes("Sent") &&
+        !container.textContent?.includes("Delivery pending") &&
+        !container.textContent?.includes("Recheck") &&
         container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true" &&
         !acText.readOnly,
-      "accepted outcome keeps composer unlocked with non-alarming pending status",
+      "accepted outcome shows unlocked quiet Sent pill without Delivery pending or Recheck button",
+    );
+    statusOutcome = "sent";
+    await React.act(async () => {
+      await new Promise((r) => setTimeout(r, 600));
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent" &&
+        container.querySelector(".wa-reply-status")?.getAttribute("data-quiet") === "true" &&
+        container.textContent?.includes("Delivered") &&
+        !acText.readOnly,
+      "silent background poll upgrades quiet Sent pill to Delivered without blocking",
+    );
+    await React.act(async () => {
+      setTextarea(acText, "Next reply clears pill");
+      await flush();
+    });
+    assert(!container.querySelector(".wa-reply-status"), "typing immediately dismisses settled quiet status pill");
+
+    // 7b. Offline accepted pill does not resurrect when switching away and back; uncertain still does.
+    statusOutcome = "accepted";
+    confirmOutcome = "accepted";
+    const offlineSelection: WhatsAppReplySelection = {
+      ...selection,
+      receiptScope: "scope-offline-norecover",
+    };
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "offline-1", selection: offlineSelection })));
+      await flush();
+    });
+    await React.act(async () => {
+      setTextarea(container.querySelector("textarea") as HTMLTextAreaElement, "Offline send");
+      await flush();
+    });
+    await React.act(async () => {
+      trustedClick(container.querySelector("button.wa-reply-send") as HTMLButtonElement);
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "accepted",
+      "offline accepted pill is visible right after send",
+    );
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "offline-2", selection: { ...offlineSelection } })));
+      await flush();
+    });
+    assert(!container.querySelector(".wa-reply-status"), "accepted receipt does not resurrect after conversation remount");
+
+    // 7c. Manual dismiss button clears quiet pill immediately
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "manual-dismiss", selection: { ...selection, receiptScope: "scope-manual-dismiss" } })));
+      await flush();
+    });
+    await React.act(async () => {
+      setTextarea(container.querySelector("textarea") as HTMLTextAreaElement, "Dismiss test");
+      await flush();
+    });
+    await React.act(async () => {
+      trustedClick(container.querySelector("button.wa-reply-send") as HTMLButtonElement);
+      await flush();
+    });
+    const dismissBtn = container.querySelector("button.wa-reply-status-close") as HTMLButtonElement | null;
+    assert(!!dismissBtn, "quiet status pill exposes dismiss button");
+    await React.act(async () => {
+      dismissBtn!.click();
+      await flush();
+    });
+    assert(!container.querySelector(".wa-reply-status"), "clicking dismiss closes quiet status pill");
+
+    // 7d. Uncertain outcome still resurrects locked across remounts
+    confirmOutcome = "uncertain";
+    statusOutcome = "uncertain";
+    const uncertainPersistScope: WhatsAppReplySelection = {
+      ...selection,
+      receiptScope: "scope-uncertain-persist",
+    };
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "up-1", selection: uncertainPersistScope })));
+      await flush();
+    });
+    await React.act(async () => {
+      setTextarea(container.querySelector("textarea") as HTMLTextAreaElement, "Uncertain persistence");
+      await flush();
+    });
+    await React.act(async () => {
+      trustedClick(container.querySelector("button.wa-reply-send") as HTMLButtonElement);
+      await flush();
+    });
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "up-2", selection: { ...uncertainPersistScope } })));
+      await flush();
+    });
+    assert(
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "uncertain" &&
+        container.querySelector(".wa-reply-card")?.getAttribute("data-locked") === "true",
+      "unresolved uncertain send still resurrects locked across conversation switch",
     );
 
-    // 8. In-flight send shows sending spinner + banner; manual Check status shows Button loading spinner
+    // 8. In-flight send shows sending spinner on send button; manual Check status shows loading spinner
     confirmOutcome = "uncertain";
-    statusOutcome = "sent";
+    statusOutcome = "uncertain";
     const defer = () => {
       let resolve!: () => void;
       const promise = new Promise<void>((res) => { resolve = res; });
@@ -978,37 +1081,196 @@ async function testComposerInteractions(): Promise<void> {
         !!ldSend.querySelector(".wa-reply-spinner"),
       "in-flight send shows loading spinner on send button without status banner",
     );
-    confirmOutcome = "accepted";
+    confirmOutcome = "uncertain";
     await React.act(async () => {
       sendGate.resolve();
       await flush();
     });
-    assert(
-      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "accepted",
-      "accepted settles after in-flight send completes",
-    );
-    const recheckBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Recheck");
-    assert(!!recheckBtn, "accepted non-group renders Recheck button");
-    const checkGate = defer();
-    statusGate = checkGate;
     await React.act(async () => {
-      recheckBtn!.click();
+      await new Promise((r) => setTimeout(r, 6_400));
       await flush();
     });
-    const busyCheckBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Recheck");
+    const manualCheckBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Check status");
+    assert(!!manualCheckBtn, "uncertain outcome renders Check status button");
+    const checkGate = defer();
+    statusGate = checkGate;
+    statusOutcome = "sent";
+    await React.act(async () => {
+      manualCheckBtn!.click();
+      await flush();
+    });
+    const busyCheckBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Check status");
     assert(
       busyCheckBtn?.getAttribute("aria-busy") === "true" &&
         !!busyCheckBtn.querySelector(".btn-spin"),
-      "Recheck/Check status button shows native loading spinner while in flight",
+      "Check status button shows native loading spinner while in flight",
     );
     await React.act(async () => {
       checkGate.resolve();
       await flush();
     });
     assert(
-      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent",
-      "resolved Recheck settles to sent",
+      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent" &&
+        container.textContent?.includes("Delivered"),
+      "resolved Check status settles to quiet Delivered pill",
     );
+
+    // 9. Overlay mode delays 'Verifying recipient…' placeholder by 300ms deterministically while keeping
+    //    read-only safety; fast (<300ms) and blocked conversations cancel the timer and settle cleanly.
+    let showGate: { promise: Promise<void>; resolve: () => void } | null = defer();
+    let showBlocked = false;
+    const delayServices = {
+      ...mockServices,
+      async call(op: string, args: Record<string, unknown>) {
+        if (op === "whatsapp.conversations.show") {
+          if (showGate) await showGate.promise;
+          if (showBlocked) {
+            return { ok: false as const, refusal: { code: "unavailable", text: "Unavailable" } };
+          }
+        }
+        return mockServices.call(op, args);
+      },
+    };
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const delayTimers = new Map<number, () => void>();
+    const timerCount = () => delayTimers.size;
+    let nextTimerId = 1_000_000;
+    globalThis.setTimeout = ((handler: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      if ((delay === 300 || delay === 3500) && typeof handler === "function") {
+        const id = nextTimerId++;
+        delayTimers.set(id, () => handler(...args));
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return realSetTimeout(handler as (...a: never[]) => void, delay, ...(args as never[]));
+    }) as unknown as typeof setTimeout;
+    globalThis.clearTimeout = ((id?: ReturnType<typeof setTimeout>) => {
+      if (typeof id === "number" && delayTimers.delete(id)) return;
+      realClearTimeout(id);
+    }) as typeof clearTimeout;
+    try {
+      const delaySelection: WhatsAppReplySelection = {
+        ...selection,
+        receiptScope: "scope-verify-delay",
+        services: delayServices as unknown as WhatsAppReplySelection["services"],
+        announceInset: () => 96,
+      };
+      await React.act(async () => {
+        root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-delay", selection: delaySelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+        await flush();
+      });
+      const vdText = container.querySelector("textarea") as HTMLTextAreaElement;
+      const vdSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+      assert(
+        timerCount() === 1 &&
+          vdText.getAttribute("placeholder") === "Write a reply…" &&
+          vdText.readOnly &&
+          vdSend.disabled,
+        "<300ms recipient check schedules delay timer and keeps quiet placeholder with readOnly and Send disabled",
+      );
+      const fireDelay = [...delayTimers.values()][0]!;
+      delayTimers.clear();
+      await React.act(async () => {
+        fireDelay();
+        await flush();
+      });
+      assert(
+        vdText.getAttribute("placeholder") === "Verifying recipient…" && vdText.readOnly && vdSend.disabled,
+        ">=300ms timer firing reveals Verifying recipient placeholder while remaining readOnly",
+      );
+      await React.act(async () => {
+        showGate!.resolve();
+        showGate = null;
+        await flush();
+      });
+      assert(
+        vdText.getAttribute("placeholder") === "Write a reply…" && !vdText.readOnly,
+        "resolved recipient verification restores editable reply composer",
+      );
+
+      // Fast (<300ms) verification cancels the pending timer cleanly without showing the verifying hint.
+      showGate = defer();
+      const fastSelection: WhatsAppReplySelection = {
+        ...selection,
+        receiptScope: "scope-verify-fast",
+        services: delayServices as unknown as WhatsAppReplySelection["services"],
+        announceInset: () => 96,
+      };
+      await React.act(async () => {
+        root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-fast", selection: fastSelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+        await flush();
+      });
+      assert(timerCount() === 1, "pending fast check arms one 300ms timer");
+      await React.act(async () => {
+        showGate!.resolve();
+        showGate = null;
+        await flush();
+      });
+      const vfText = container.querySelector("textarea") as HTMLTextAreaElement;
+      assert(
+        timerCount() === 0 && vfText.getAttribute("placeholder") === "Write a reply…" && !vfText.readOnly,
+        "fast resolution cancels 300ms timer and avoids Verifying recipient placeholder",
+      );
+
+      // Blocked state displays immediately and cancels the 300ms timer.
+      showBlocked = true;
+      const blockedDelaySelection: WhatsAppReplySelection = {
+        ...selection,
+        receiptScope: "scope-verify-blocked",
+        services: delayServices as unknown as WhatsAppReplySelection["services"],
+        announceInset: () => 96,
+      };
+      await React.act(async () => {
+        root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-blocked", selection: blockedDelaySelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+        await flush();
+      });
+      const vbText = container.querySelector("textarea") as HTMLTextAreaElement;
+      const vbSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+      assert(
+        timerCount() === 0 &&
+          vbText.getAttribute("placeholder") === "Can’t reply in this conversation" &&
+          vbText.readOnly &&
+          vbSend.disabled,
+        "blocked recipient state cancels timer and shows Can't reply placeholder immediately",
+      );
+
+      // Accepted quiet Sent pill auto-dismisses deterministically after 3500ms when unconfirmed.
+      showBlocked = false;
+      confirmOutcome = "accepted";
+      statusOutcome = "accepted";
+      const dismissSelection: WhatsAppReplySelection = {
+        ...selection,
+        receiptScope: "scope-accepted-autodismiss",
+        announceInset: () => 96,
+      };
+      await React.act(async () => {
+        root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "acc-dismiss", selection: dismissSelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+        await flush();
+      });
+      await React.act(async () => {
+        setTextarea(container.querySelector("textarea") as HTMLTextAreaElement, "Offline dismiss timer");
+        await flush();
+      });
+      await React.act(async () => {
+        trustedClick(container.querySelector("button.wa-reply-send") as HTMLButtonElement);
+        await flush();
+      });
+      assert(
+        container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "accepted" &&
+          timerCount() === 1,
+        "unconfirmed accepted send schedules deterministic 3500ms dismiss timer",
+      );
+      const fireDismiss = [...delayTimers.values()][0]!;
+      delayTimers.clear();
+      await React.act(async () => {
+        fireDismiss();
+        await flush();
+      });
+      assert(!container.querySelector(".wa-reply-status"), "3500ms timer dismisses quiet Sent pill");
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
   } finally {
     React.act(() => { root.unmount(); });
     container.remove();

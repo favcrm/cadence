@@ -124,6 +124,7 @@ pub(crate) mod test_ports;
 pub mod test_queue;
 pub mod test_seam;
 pub(crate) mod thread_budget;
+pub mod thread_search;
 pub mod ui;
 pub mod update;
 pub mod upgrade;

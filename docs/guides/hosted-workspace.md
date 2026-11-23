@@ -96,14 +96,25 @@ membership and human approval decisions remain with that platform.
 
 In a member's private Home chat, the existing typing indicator appears when
 the assistant reports that the turn is working, not when the send is queued.
-It shows the current tool step once it appears in history. If the live feed
-disconnects, the indicator clears; history still refreshes.
+It shows the current tool step once it appears in history. If live progress
+disconnects during that turn, the indicator clears and a reconnect notice
+appears for that send. A saved reply clears the notice even while progress is
+offline. **Retry** rechecks the assistant's binding if needed and reopens the
+progress feed without resending the message.
+If the last working update did not identify the send, Home asks the same feed
+for its current state before showing activity for another message.
 
 In hosted Home, type `/skills` and press Enter to browse approved workspace
 skills without sending a message. Selecting a skill inserts `/skill:<name>`
 in the draft. Send it with your request, or type the command directly. The
 sent prompt highlights the command; the highlight does not confirm that the
 skill loaded or that any action ran.
+
+In the workspace owner's Home, selecting an option in a choice card does not
+send it. Use **Send answer** to submit; the card keeps the recorded choices,
+not optional fields left blank.
+When a Browser card says **Needs you**, **Open Browser** opens the existing
+panel. It does not sign in or take over on your behalf.
 
 An owner can review a write staged in an installed app's assistant conversation
 beside that conversation. **Review** shows the stored changes and declared
@@ -113,6 +124,9 @@ decision.
 If a reply is lost, **Check again** re-reads the outcome rather than submitting
 another decision. Reads and decisions retain the selected conversation; the
 Home queue remains separate. Members cannot decide these requests.
+
+An applied or denied action in the chat transcript keeps its outcome visible
+with **Show details**. Failed or unconfirmed outcomes stay expanded.
 
 Every tool execution rechecks the supplied refusal and live authorization,
 including recovered executions and runtime-owned skill tools. Cancellation is
@@ -907,6 +921,35 @@ Search results are discovery, not evidence:
 read the actual page and cite its canonical path and revision. Wiki and CLI
 scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
+
+### Edit a hosted issue's description or acceptance
+
+On the issue's Overview tab, choose **Edit description** to edit the Markdown,
+including the `## Acceptance` section. A signed-in project writer can save it;
+if the issue changed after the editor opened, the save refuses and keeps the
+draft available to copy.
+
+In a plain human CLI session with `cli.write`, take `<rev>` from
+`cadence --org acme issue show <issue-id> --json`. Use one of:
+
+```sh
+cadence --org acme issue edit <issue-id> --body description.md --if-rev <rev>
+cadence --org acme issue edit <issue-id> --acceptance checklist.md --if-rev <rev>
+cadence --org acme issue acceptance <issue-id> --from checklist.md --if-rev <rev>
+cadence --org acme issue set <issue-id> 'acceptance=- [ ] Verify the amended result' --if-rev <rev>
+```
+
+Use `-` for stdin instead of a filename. `--body` replaces the whole body.
+The acceptance forms read the current body, replace only the checklist in the
+level-two Acceptance section with explicit `- [ ]` or `- [x]` rows, and save under the
+same revision guard. They require `cli.read` as well as `cli.write`. A stale
+revision never overwrites another edit. If an older host refuses the CLI
+edit, use its issue-page editor if available or upgrade the host; nothing
+falls back to a comment or an unguarded write.
+
+Review workflows read the issue body, not activity comments. Amending the
+contract does not replace a verdict already filed at the same head; the owner
+can [accept an incorrect workflow REVISE for that head](delivery.md#what-the-human-approval-does).
 
 `wiki cp` copies a file or a folder into the hosted wiki and out of it on a
 board that supports it; see "Recursive copy" in

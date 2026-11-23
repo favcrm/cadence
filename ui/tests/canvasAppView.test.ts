@@ -106,16 +106,20 @@ equal(resourceAppView("/apps/crm", "inst_crm", "ctx_1", "crm", { kind: "customer
 
 // Read-only: the mount keeps only read operations; a write the app declared is closed.
 const receipt = { mount: "/api/app-screen/n", bridge_nonce: "b", generation: 1, tag: "crm", action_token: "t", tools: [], host_contract: "screen-records.v1", operations: ["records.list", "records.show", "records.update", "records.create", "sends.approve", "screen.route.patch", "records.csv.import", "works.get"] } as unknown as MountReceipt;
-equal(readOnlyReceipt(receipt).operations, ["records.list", "records.show", "screen.route.patch"], "only reads and route patches survive");
+equal(readOnlyReceipt(receipt).operations, ["records.list", "records.show", "screen.route.patch", "works.get"], "only reads and route patches survive (works.get is a read since CAD-2683)");
 const aggregateReceipt = { ...receipt, operations: ["records.aggregate", "records.batch", "records.update", "records.list"] } as unknown as MountReceipt;
 equal(readOnlyReceipt(aggregateReceipt).operations, ["records.aggregate", "records.list"], "records.aggregate is kept, writes still dropped");
 equal([...READ_ONLY_OPERATIONS].sort(), [...SCREEN_READ_VERBS].sort(), "canvas read-only set matches the screen read set");
+// CAD-2683: a read-only mount keeps the Works reads and drops every Works write and slot.
+const worksReceipt = { ...receipt, operations: ["works.query", "works.get", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review", "works.review", "works.export"] } as unknown as MountReceipt;
+equal(readOnlyReceipt(worksReceipt).operations, ["works.query", "works.get"], "works reads survive; works writes and slots are dropped");
 equal(receipt.operations?.length, 8, "the original receipt is not mutated");
 
 // CAD-2555: a route's params. A route without them has its old shape; the board URL carries them as `p.<name>`.
 const paramsRoute = { section: "reports", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-07-01", to: "2026-09-30" } };
 equal(appViewRef(ref("pnl", { route: paramsRoute }))?.route, paramsRoute, "a route with params is a reference");
 equal(appViewRef(ref("pnl", { route: { ...paramsRoute, params: {} } }))?.route.params, undefined, "empty params are no params");
+equal([appViewRef(ref("pnl", { viewId: "pnl" }))?.viewId, appViewRef(ref("pnl", { viewId: "Bad Id" }))?.viewId, appViewRef(ref("pnl"))?.viewId], ["pnl", undefined, undefined], "a declared view id is kept only in its grammar (CAD-2710)");
 for (const params of [[], "x", { From: "a" }, { from: "" }, { from: "x".repeat(201) }, { from: "a\u0007" }, { from: 1 }, Object.fromEntries("abcdefg".split("").map((k) => [k, "x"]))]) {
   equal(appViewRef(ref("pnl", { route: { ...paramsRoute, params } })), null, `refused params ${JSON.stringify(params)?.slice(0, 40)}`);
 }

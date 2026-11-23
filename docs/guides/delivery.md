@@ -65,6 +65,11 @@ cadence --org acme issue project delivery <project-key> \
   --repo <owner>/<repo> --delivery-file delivery.yaml
 ```
 
+`delivery.yaml` holds the section's value or the whole section under its own
+top-level `delivery:` key. Comments, blank lines, indentation, key order, a
+BOM and CRLF line endings do not change the policy: the approval binds to the
+parsed policy, not to the text.
+
 The owner's save is the approval: the board accepts it only from the owner, so
 a hosted project's saved section is in force from the next gate read. On a
 native board the operator approves the section with
@@ -202,12 +207,19 @@ still needs Browser QA under any policy. The
 needs the reviews its rules name.
 
 A change to the section takes effect only through the owner's approval: an
-agent's edit to `PROJECT.md` is not the approved policy. This section describes
-the hosted gate. The native merge queue does not apply an approved custom policy
-yet. It refuses a change that the policy alone decides. It accepts a change at
-the strict floor, but enforces only the floor, the owner's approval and Browser
-QA, not the policy's own required checks or named reviews. Keep a native project
-on the default policy until it does.
+agent's edit to `PROJECT.md` is not the approved policy.
+
+The native merge queue (`scripts/enqueue-reviewed`) applies the approved policy
+the same way. It counts the reviews the policy names, including a single
+`standards` or `spec_security` review or none. It also requires every
+`check` review in `mode: required` on the exact head: the latest run of that
+check name from the named GitHub App, matched by slug, must have succeeded. A
+run from another App never counts. A non-pass verdict still blocks, whatever
+its axis. These checks come on top of the base
+branch's required contexts and the review and approval floors. The gate refuses
+an answer it does not recognize: an unknown field or review shape, required
+checks that do not match the policy's `check` reviews, or a check with no App.
+A project without an approved custom policy is unchanged.
 
 ## Review evidence
 
@@ -340,6 +352,11 @@ cadence --org acme audit accept-revise --project <project-key> --issue <issue-id
 
 This lifts that one refusal. An owner's own `revise`, a missing check, a scope or
 a missing merge approval still refuse.
+
+Both review workflows retry once within the same run if a complete model
+answer is malformed JSON or fails verdict validation. A valid `revise` is
+filed as-is. If neither attempt yields a valid answer, nothing is filed and
+the gate still requires that review.
 
 ## Hosted operator commands
 

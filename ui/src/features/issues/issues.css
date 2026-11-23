@@ -1,6 +1,34 @@
 .issue-workspace {
   overflow-wrap: anywhere;
 }
+.issue-title {
+  font-size: clamp(var(--text-drawer), 2vw, 1.625rem);
+  line-height: 1.2;
+  text-wrap: pretty;
+}
+.issue-context,
+.issue-overview [tabindex="-1"] {
+  scroll-margin-block-start: 1rem;
+}
+.issue-field,
+.issue-link-list {
+  display: grid;
+  grid-template-columns: minmax(0, 5rem) minmax(0, 1fr);
+  gap: 0.5rem;
+}
+.issue-field {
+  align-items: center;
+}
+.issue-field > span {
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+.issue-fields .select,
+.issue-fields .select-trigger,
+.issue-fields .field,
+.issue-link-form .select-trigger {
+  min-inline-size: 0;
+}
 .issue-workspace .section-nav {
   margin-top: 0.75rem;
 }
@@ -21,23 +49,6 @@
   margin: 0.25rem 0 0;
 }
 .issue-read-notice strong {
-  color: var(--color-ink-100);
-}
-.issue-acceptance-progress {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  padding: 0.875rem 1rem;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  background: var(--color-ink-850);
-  font-size: var(--text-secondary);
-  color: var(--color-ink-400);
-}
-.issue-acceptance-progress strong {
-  font-weight: 500;
   color: var(--color-ink-100);
 }
 .issue-workspace [data-testid="lane-card"],
@@ -90,43 +101,6 @@
 }
 .issue-output-links {
   list-style: none;
-}
-.issue-deliverable-preview {
-  margin: 0 0.75rem 0.75rem;
-  min-width: 0;
-  max-width: calc(100% - 1.5rem);
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  overflow: hidden;
-  background: var(--color-ink-900);
-}
-.issue-deliverable-preview .cv-head {
-  flex-wrap: wrap;
-  min-width: 0;
-}
-.issue-deliverable-preview .cv-title {
-  min-width: 0;
-  flex: 1 1 10rem;
-}
-.issue-deliverable-preview .cv-body {
-  min-width: 0;
-  max-width: 100%;
-  max-height: 70vh;
-  overflow: auto;
-}
-.issue-deliverable-preview .cv-csv-scroll,
-.issue-deliverable-preview .cv-source,
-.issue-deliverable-preview .cv-source .codeblock,
-.issue-deliverable-preview .cv-source pre {
-  min-width: 0;
-  max-width: 100%;
-}
-.issue-deliverable-preview .cv-source pre {
-  overflow-x: auto;
-}
-.issue-deliverable-preview .canvas-frame {
-  min-height: 28rem;
-  max-width: 100%;
 }
 @media (max-width: 640px) {
   .issue-workspace .btn,

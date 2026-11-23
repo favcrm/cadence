@@ -429,7 +429,12 @@ export function openAppView(input: unknown, placement?: Placement): boolean {
   const id = appViewId(ref);
   // An open tab that moved inside its frame goes back to the card's own route.
   const tabs = state.tabs.some((t) => t.id === id)
-    ? state.tabs.map((t) => (t.id === id && t.app && !sameRoute(t.app.route, ref.route) ? { ...t, title: ref.title, app: { ...t.app, route: ref.route } } : t))
+    ? state.tabs.map((t) => {
+        if (t.id !== id || !t.app || (sameRoute(t.app.route, ref.route) && t.app.viewId === ref.viewId)) return t;
+        // The declared view (CAD-2710) travels with the route: two views can share a section and record.
+        const { viewId: _viewId, viewLabel: _viewLabel, ...rest } = t.app;
+        return { ...t, title: ref.title, app: { ...rest, route: ref.route, ...(ref.viewId === undefined ? {} : { viewId: ref.viewId }), ...(ref.viewLabel === undefined ? {} : { viewLabel: ref.viewLabel }) } };
+      })
     : [...state.tabs, appTab(id, ref)];
   set({ ...state, tabs, ...present(tabs, state.active, state.lastOpened, state.layout, id, placement), lastOpened: id, open: true });
   artifactFocused("user");
@@ -444,7 +449,10 @@ export function patchAppViewRoute(id: string, patch: RoutePatch): void {
     tabs: state.tabs.map((t) => {
       if (!t.app || t.id !== id) return t;
       const route = applyRoutePatch(t.app.route, patch);
-      return { ...t, title: appViewTitle(t.id, t.app.title, route), app: { ...t.app, route } };
+      // Navigating to another section or record leaves the declared view (CAD-2710); a params-only change stays in it.
+      const same = route.section === t.app.route.section && route.record_id === t.app.route.record_id;
+      const { viewId: _viewId, viewLabel: _viewLabel, ...rest } = t.app;
+      return { ...t, title: appViewTitle(t.id, t.app.title, route), app: same ? { ...t.app, route } : { ...rest, route } };
     }),
   });
 }

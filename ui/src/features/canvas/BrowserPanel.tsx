@@ -636,6 +636,8 @@ export function BrowserCard() {
   if (phase === "none" || phase === "ended") return null;
   const shown = isBrowserPanelShown(canvas, b);
   const statusText = browserStatus(b, t).text;
+  const handoff = phase === "handoff" && !b.loadError && b.stop !== "stopping";
+  const openLabel = t("Open Browser");
   // Only the real host, never the raw address (a look-alike can hide behind
   // userinfo), on a line of its own and never preceded by words that could push
   // its end out of the box: when it is too long, the START is what is clipped.
@@ -649,7 +651,7 @@ export function BrowserCard() {
         className="bz-card"
         data-kind="session"
         open={shown}
-        aria-label={[t("Open Browser"), statusText, host].filter(Boolean).join(" · ")}
+        aria-label={[openLabel, statusText, host].filter(Boolean).join(" · ")}
         onClick={openBrowser}
         icon={<GlobeIcon size={16} />}
         subject={t("Browser")}
@@ -659,6 +661,7 @@ export function BrowserCard() {
             {host ? <span className="artmeta bz-card-host" title={host}><span>{host}</span></span> : null}
           </>
         }
+        trailing={handoff ? <span className="artopen">{openLabel}</span> : undefined}
       />
     </div>
   );

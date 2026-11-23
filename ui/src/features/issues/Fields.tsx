@@ -45,10 +45,10 @@ export function Fields({
       .catch((e) => onError(e, "epic"));
   };
   return (
-    <section className="card p-3.5 grid gap-2.5" aria-label={t("Fields")}>
-      <div className="slabel">{t("Fields")}</div>
-      <label className="grid gap-1.5">
-        <span className="slabel">{t("Status")}</span>
+    <section className="issue-fields grid grid-cols-[minmax(0,1fr)] gap-3" aria-label={t("Fields")}>
+      <h2 className="text-cardtitle font-semibold text-ink-100 m-0">{t("Fields")}</h2>
+      <label className="issue-field">
+        <span>{t("Status")}</span>
         <Select
           full
           value={detail.status}
@@ -64,8 +64,8 @@ export function Fields({
           onChange={(status) => onPatch({ status }, `${detail.id} status`)}
         />
       </label>
-      <label className="grid gap-1.5">
-        <span className="slabel">{t("Priority")}</span>
+      <label className="issue-field">
+        <span>{t("Priority")}</span>
         <Select
           full
           value={detail.priority}
@@ -82,8 +82,8 @@ export function Fields({
           }
         />
       </label>
-      <label className="grid gap-1.5">
-        <span className="slabel">{t("Owner")}</span>
+      <label className="issue-field">
+        <span>{t("Owner")}</span>
         <input
           className="field w-full"
           value={owner}
@@ -96,8 +96,8 @@ export function Fields({
           }}
         />
       </label>
-      <label className="grid gap-1.5">
-        <span className="slabel">{t("Epic")}</span>
+      <label className="issue-field">
+        <span>{t("Epic")}</span>
         <Select
           full
           value={detail.parent ?? ""}

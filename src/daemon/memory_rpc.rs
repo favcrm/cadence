@@ -296,6 +296,19 @@ impl Shared {
     /// CAD-2662: the caller's own running turn — the explicit `message` and
     /// `token` pair, or else the single turn it holds.
     fn memory_turn(&self, alias: &str, params: &Value, purpose: &str) -> Result<(String, String)> {
+        self.held_turn(alias, params, purpose, "issue turn")
+    }
+
+    /// The turn a lookup acts within: the `message` and `token` pair the
+    /// request names, else the agent's single running turn. `turn` names the
+    /// kind of turn in the refusal ("issue turn", "turn").
+    pub(super) fn held_turn(
+        &self,
+        alias: &str,
+        params: &Value,
+        purpose: &str,
+        turn: &str,
+    ) -> Result<(String, String)> {
         match (
             optional_str(params, "message"),
             optional_str(params, "token"),
@@ -313,7 +326,7 @@ impl Shared {
                         ))
                     }),
                 [] => Err(Error::rejected(format!(
-                    "{purpose} needs a running issue turn, and this agent holds none"
+                    "{purpose} needs a running {turn}, and this agent holds none"
                 ))),
                 many => Err(Error::rejected(format!(
                     "{purpose}: this agent holds {} running turns; name one with the \

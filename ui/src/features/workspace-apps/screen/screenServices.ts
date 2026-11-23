@@ -93,7 +93,7 @@ export const object = (v: unknown): v is Record<string, unknown> => !!v && typeo
 export function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).every(k => keys.includes(k)); }
 const TOKEN = /^[a-f0-9]{64}$/;
 const WRITES = new Set([
-  "records.create", "records.update", "records.batch", "segments.save", "exclusions.save",
+  "records.create", "records.update", "records.batch", "records.merge", "segments.save", "exclusions.save",
   "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply",
   "proposals.discard", "sender-bindings.save", "whatsapp.broadcast.draft", "whatsapp.handoff.set",
   "whatsapp.draft.discard", "works.create", "works.patch", "works.trash", "works.restore",
@@ -111,7 +111,7 @@ export const SCREEN_READ_VERBS: ReadonlySet<string> = new Set([
   "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.status",
   "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.status",
   "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate",
-  "whatsapp.broadcast.results", "whatsapp.draft.show", "campaign-work.show", "calendar.query", "records.aggregate",
+  "whatsapp.broadcast.results", "whatsapp.draft.show", "campaign-work.show", "calendar.query", "records.aggregate", "works.query", "works.get",
 ]);
 const READ_ONLY_CALL_MESSAGE = "a read-only screen admits only read operations";
 

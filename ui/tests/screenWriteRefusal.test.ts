@@ -29,8 +29,16 @@ function makeReceipt(): MountReceipt {
       "records.list",
       "records.create",
       "records.update",
+      "records.merge",
       "works.query",
+      "works.get",
       "works.create",
+      "works.patch",
+      "works.trash",
+      "works.restore",
+      "works.request_review",
+      "works.review",
+      "works.export",
       "sends.prepare",
       "whatsapp.reply.prepare",
       "content.approve",
@@ -159,16 +167,16 @@ async function main(): Promise<void> {
     }
 
     // 1. owner_required 403 on write keeps mount active; subsequent reads still succeed.
-    {
+    for (const verb of ["records.create", "records.merge"] as const) {
       const fx = makeFixture((_path, body) => {
-        if (body.operation === "records.create") {
+        if (body.operation === verb) {
           return { status: 403, json: { code: "owner_required", error: "Owner required." } };
         }
         return { status: 200, json: { rows: [{ id: "c1" }] } };
       });
-      const createRes = await fx.services.call("records.create", { name: "Ada" } as ActionArgs);
-      assert.equal(createRes.ok, false, "owner_required write returns refusal");
-      if (!createRes.ok) assert.equal(createRes.refusal.code, "owner_required");
+      const result = await fx.services.call(verb, {});
+      assert.equal(result.ok, false, `${verb} returns the owner refusal`);
+      if (!result.ok) assert.equal(result.refusal.code, "owner_required");
       assert.equal(fx.refusedCount(), 0, "owner_required 403 does not call host.refused()");
       assert.equal(fx.isCurrent(), true, "owner_required 403 keeps mount active");
       assert.equal((await fx.services.call("records.list", {})).ok, true, "subsequent read succeeds after owner_required 403");
@@ -188,7 +196,7 @@ async function main(): Promise<void> {
     }
 
     // 2. Explicit native read-only 403 on non-read RECORD_CALL_VERBS (including Works, Sends, WhatsApp) keeps mount active.
-    for (const verb of ["records.update", "works.create", "sends.prepare", "whatsapp.reply.prepare"] as const satisfies readonly RecordCallVerb[]) {
+    for (const verb of ["records.update", "records.merge", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review", "sends.prepare", "whatsapp.reply.prepare"] as const satisfies readonly RecordCallVerb[]) {
       const fx = makeFixture((_path, body) => {
         if (body.operation === verb) {
           return { status: 403, json: { code: "forbidden", error: "a read-only screen admits only read operations" } };
@@ -203,6 +211,26 @@ async function main(): Promise<void> {
       }
       assert.equal(fx.refusedCount(), 0, `${verb} read-only 403 does not retire mount`);
       assert.equal((await fx.services.call("records.list", {})).ok, true, `reads still work after ${verb} 403`);
+    }
+
+    // CAD-2683: Works reads are screen reads; a read-only 403 on one is not a non-read refusal, and the two Works slots stay slots.
+    assert.ok(SCREEN_READ_VERBS.has("works.query") && SCREEN_READ_VERBS.has("works.get"), "works reads are screen reads");
+    for (const verb of ["works.create", "works.patch", "works.trash", "works.restore", "works.request_review", "works.review", "works.export"]) {
+      assert.ok(!SCREEN_READ_VERBS.has(verb), `${verb} is not a screen read`);
+    }
+    for (const verb of ["works.review", "works.export"] as const) {
+      const fx = makeFixture((path) => path === "slot-prepare"
+        ? { status: 403, json: { code: "forbidden", error: "a read-only screen admits only read operations" } }
+        : { status: 200, json: { rows: [] } });
+      const planRes = await fx.services.planner(verb, { id: "w-1" } as ActionArgs);
+      assert.ok(!("run" in planRes), `${verb} slot-prepare is refused on a read-only mount`);
+      if (!("run" in planRes)) assert.equal(planRes.code, "forbidden", `code on ${verb}`);
+      assert.equal(fx.refusedCount(), 0, `${verb} read-only refusal does not retire mount`);
+    }
+    {
+      const fx = makeFixture(() => ({ status: 403, json: { code: "forbidden", error: "a read-only screen admits only read operations" } }));
+      assert.equal((await fx.services.call("works.get", { id: "w-1" } as ActionArgs)).ok, false, "a refused works.get is a refusal");
+      assert.equal(fx.refusedCount(), 1, "works.get is a read: a read-only 403 retires the mount like any read");
     }
 
     // 3. Hosted undeclared operation refusal (`operation_not_declared`) on non-read verb is non-fatal.

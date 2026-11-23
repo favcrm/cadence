@@ -32,7 +32,7 @@ import {
   sendToAssistant,
 } from "./memberThread";
 import { initialFollow, motionBehavior, onSend, type Follow } from "./scrollFollow";
-import { ThreadTurn } from "./ThreadView";
+import { StreamBanner, ThreadTurn } from "./ThreadView";
 import {
   inFlightTurnKey,
   itemMessage,
@@ -96,6 +96,13 @@ interface MemberSurface {
   identity: IdentityRead;
 }
 
+interface MemberLiveTurn {
+  conversation: string;
+  message: string | null;
+  sendMessage?: string;
+  state: "working" | "reconnecting" | "stopped";
+}
+
 const LOADING_IDENTITY: IdentityRead = { state: "loading" };
 
 
@@ -143,7 +150,13 @@ export default function MemberChat({
     [store],
   );
   const [surface, setSurface] = useState<MemberSurface | null>(null);
-  const [liveTurn, setLiveTurn] = useState<{ conversation: string; message: string | null } | null>(null);
+  const [activityFeed, setActivityFeed] = useState<{ revision: number; turn: MemberLiveTurn | null }>({
+    revision: 0,
+    turn: null,
+  });
+  const { revision: feedRevision, turn: liveTurn } = activityFeed;
+  const retryActivity = useRef<(() => void) | null>(null);
+  const resumeActivity = useRef<{ conversation: string; after: string } | null>(null);
   const [pendingLook, setPendingLook] = useState<AvatarLook | null>(null);
   const alive = useRef(true);
   const identityGate = useRef<{ inflight: boolean; again: boolean; timer: number | null }>({
@@ -275,50 +288,86 @@ export default function MemberChat({
   // assistant's conversation (the same id the image provider below uses) is
   // wired to the canvas and the Browser tab explicitly.
   const conversationId = surface?.conversation ?? null;
+  const available = surface?.ok === true;
   useEffect(() => {
-    if (conversationId === null || surface?.ok !== true) return;
-    // An absent message means the runtime confirmed activity but couldn't
-    // name the send. Undefined means there is no verified running turn.
+    const updateTurn = (update: (turn: MemberLiveTurn | null) => MemberLiveTurn | null) => {
+      setActivityFeed((current) => {
+        // A retired stream may still have state updates queued in React.
+        if (current.revision !== feedRevision) return current;
+        const turn = update(current.turn);
+        return turn === current.turn ? current : { revision: feedRevision, turn };
+      });
+    };
+    const resume = resumeActivity.current;
+    if (resume?.conversation !== conversationId) resumeActivity.current = null;
+    updateTurn((turn) => {
+      if (turn === null || turn.conversation !== conversationId) return null;
+      return !available && turn.state === "working" ? { ...turn, state: "reconnecting" } : turn;
+    });
+    if (conversationId === null || !available) return;
+    // Null names a verified but unnamed turn. Undefined means no verified turn.
     let previous: string | null | undefined;
     const publish = (message?: string | null) => {
       if (previous !== message) {
         previous = message;
         void store.invalidate();
       }
-      setLiveTurn((turn) =>
-        message === undefined ? null
-          : turn?.conversation === conversationId && turn.message === message ? turn
-          : { conversation: conversationId, message },
+      updateTurn((turn) => {
+        if (message === undefined) return null;
+        if (turn?.conversation === conversationId && turn.message === message) {
+          return turn.state === "working" ? turn : { ...turn, state: "working" };
+        }
+        return { conversation: conversationId, message, state: "working" };
+      });
+    };
+    const interrupt = (state: "reconnecting" | "stopped") => {
+      updateTurn((turn) =>
+        turn?.conversation === conversationId && turn.state !== state ? { ...turn, state } : turn,
       );
     };
-    const stream = subscribeSse({
+    const connect = (lastEventId?: string | null) => subscribeSse({
       url: `/api/threads/master/stream?${new URLSearchParams({ conversation: conversationId })}`,
       // Entry ids advance the reconnect cursor, but member history keeps
       // its own opaque cursor. Don't merge entries or subscribe to previews.
+      lastEventId,
       events: ["master", "entry"],
       onEvent: ({ type, data }) => {
         if (type !== "master") return;
         try {
           const snapshot = JSON.parse(data) as MasterState | null;
-          const turn = snapshot?.turn;
           if (snapshot?.session?.id === conversationId &&
-              (!Object.hasOwn(snapshot, "actor_identity") || snapshot.actor_identity?.conversation_id === conversationId) &&
-              turn?.conversation === conversationId && turn.state === "working") {
-            publish(typeof turn.message === "string" && turn.message !== "" ? turn.message : null);
+              (!Object.hasOwn(snapshot, "actor_identity") || snapshot.actor_identity?.conversation_id === conversationId)) {
+            const turn = snapshot.turn;
+            if (turn?.conversation === conversationId && turn.state === "working") {
+              publish(typeof turn.message === "string" && turn.message !== "" ? turn.message : null);
+            } else {
+              publish();
+            }
             return;
           }
         } catch {
           // An unusable frame is not evidence that the agent is working.
         }
-        publish();
+        // Don't resume on an unusable frame. Keep the notice until a
+        // conversation snapshot or the saved result can settle it.
+        interrupt("reconnecting");
       },
-      onError: () => setLiveTurn(null),
+      onError: (state) => interrupt(state === "stopped" ? "stopped" : "reconnecting"),
     });
-    return () => {
+    let stream = connect(resumeActivity.current?.after);
+    retryActivity.current = () => {
+      const after = stream.lastEventId();
       stream.close();
-      setLiveTurn(null);
+      interrupt("reconnecting");
+      stream = connect(after);
     };
-  }, [conversationId, store, surface?.ok]);
+    return () => {
+      retryActivity.current = null;
+      const after = stream.lastEventId();
+      if (after !== null) resumeActivity.current = { conversation: conversationId, after };
+      stream.close();
+    };
+  }, [conversationId, store, available, feedRevision]);
   // Auto-open is off here: an artifact opens the drawer when the person asks,
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
@@ -479,19 +528,40 @@ export default function MemberChat({
   );
 
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
-  const working = liveTurn?.conversation === conversationId ? liveTurn : null;
-  const sendIndex = working === null ? -1 : shown.findLastIndex((item) =>
-    item.type === "operator"
-      ? working.message === null || itemMessage(item) === working.message
-      : item.type === "pending" && item.pending.state !== "failed" &&
-        working.message !== null && item.pending.message === working.message,
-  );
-  // A stored result wins over an older working frame. An unnamed turn can
-  // only follow a stored send, never the latest optimistic message.
-  const workingItem = sendIndex < 0 || shown.some((item, index) =>
-    index > sendIndex && item.type === "answer" &&
-      (working?.message == null || item.entry.message == null || item.entry.message === working.message),
-  ) ? null : shown[sendIndex];
+  const activity = liveTurn?.conversation === conversationId ? liveTurn : null;
+  const followedMessage = activity?.message ?? activity?.sendMessage ?? null;
+  const sendIndex = activity === null ? -1 : shown.findLastIndex((item) => {
+    if (item.type === "operator") {
+      return followedMessage === null
+        ? available && activity.state === "working"
+        : itemMessage(item) === followedMessage;
+    }
+    return item.type === "pending" && item.pending.state !== "failed" &&
+      activity.message !== null && item.pending.message === activity.message;
+  });
+  const send = sendIndex < 0 ? null : shown[sendIndex];
+  const message = followedMessage ?? (send === null ? null : itemMessage(send));
+  // A saved result wins even outside the display window. Legacy untagged
+  // results can only settle work when they follow its visible send.
+  const replied =
+    (message !== null && items.some((item) => item.type === "answer" && item.entry.message === message)) ||
+    (sendIndex >= 0 && shown.some((item, index) =>
+      index > sendIndex && item.type === "answer" && item.entry.message == null,
+    ));
+  const activeItem = replied ? null : send;
+  const progress = activity?.state === "working" && !available ? "reconnecting" : activity?.state;
+  const workingItem = progress === "working" ? activeItem : null;
+  const interrupted = activeItem !== null && progress !== "working" ? progress : undefined;
+  if (replied && followedMessage !== null) {
+    // An unnamed working frame may have described the successor before
+    // history reported this reply. Ask the same feed for a fresh snapshot
+    // instead of attaching that ambiguous frame to the next stored send.
+    const recheck = available && activity?.message === null && activity.state === "working";
+    setActivityFeed({ revision: recheck ? feedRevision + 1 : feedRevision, turn: null });
+  } else if (workingItem?.type === "operator" && activity?.message === null && activity.sendMessage === undefined && message) {
+    // The saved message id survives even when member history renumbers rows.
+    setActivityFeed({ revision: feedRevision, turn: { ...activity, sendMessage: message } });
+  }
   const running = workingItem === null ? null : itemMessage(workingItem);
   const runningUnnamed = workingItem !== null && running === null;
   const openingItem = workingItem !== null && inFlightTurnKey(shown, running, runningUnnamed) === null
@@ -569,6 +639,17 @@ export default function MemberChat({
           )}
           {!loaded && history.error?.kind !== "failed" && (
             <p className="text-label text-ink-500 pt-3">{t("Reading the thread…")}</p>
+          )}
+          {interrupted && (
+            <div className="pt-2">
+              <StreamBanner
+                progress={interrupted}
+                onRetry={() => {
+                  if (available) retryActivity.current?.();
+                  else loadSurface();
+                }}
+              />
+            </div>
           )}
 
           <div className="chat-scroll min-h-0 flex-1 overflow-y-auto pt-3" ref={scrollRef} data-chat-scroll>

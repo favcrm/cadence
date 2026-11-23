@@ -834,7 +834,7 @@ export default function NeedsRail({
     <>
       {/* The desktop column scrolls independently of the conversation. */}
       <div className="hidden rail:block h-full min-h-0">
-        <section className="card needsrail overflow-hidden" aria-label={t("to do")}>
+        <section className="needsrail overflow-hidden rounded-lg" aria-label={t("to do")}>
           {tabs}
           {panelSubhead}
           <div className="rail-scroll min-h-0" ref={desktopScrollRef}>{panelBody}</div>
