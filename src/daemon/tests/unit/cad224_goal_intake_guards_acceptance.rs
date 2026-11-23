@@ -462,6 +462,52 @@ fn intake_native_start_refuses_unready_dependency_and_old_base_without_claim() {
         .front
         .claim
         .is_none());
+
+    std::fs::write(fx.repo.join("docs/scope.md"), "Approved scope\n").unwrap();
+    git(&fx.repo, &["add", "docs/scope.md"]);
+    git(&fx.repo, &["commit", "-qm", "Restore approved scope"]);
+    crate::issue::claim::claim(
+        &fx.pm,
+        prerequisite,
+        Some("acceptance"),
+        None,
+        None,
+        "acceptance",
+    )
+    .unwrap();
+    let (_, issue_dir) = write::issue_dir(&fx.pm, prerequisite).unwrap();
+    let (mut claimed, body) = write::load_front(&issue_dir).unwrap();
+    claimed.claim.as_mut().unwrap().stale = Some("worker offline".into());
+    write::save_front(&issue_dir, &claimed, &body).unwrap();
+    fx.pm
+        .commit(&[issue_dir.join("issue.md")], "Mark claim stale")
+        .unwrap();
+    std::fs::write(fx.repo.join("docs/scope.md"), "Changed scope again\n").unwrap();
+    git(&fx.repo, &["add", "docs/scope.md"]);
+    git(
+        &fx.repo,
+        &["commit", "-qm", "Change scope before claim renewal"],
+    );
+    let before = fx.snapshot(prerequisite);
+    let refusal = crate::issue::claim::claim(
+        &fx.pm,
+        prerequisite,
+        Some("acceptance"),
+        None,
+        None,
+        "acceptance",
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert_eq!(fx.snapshot(prerequisite), before);
+    let after = board::find_issue(&fx.pm.dir, prerequisite).unwrap().front;
+    assert_eq!(
+        after
+            .claim
+            .as_ref()
+            .and_then(|claim| claim.stale.as_deref()),
+        Some("worker offline")
+    );
 }
 
 #[test]
@@ -587,7 +633,7 @@ fn intake_reused_lane_checks_its_old_base_even_with_newer_explicit_base() {
     let source = std::fs::read_to_string(dir.join("issue.md")).unwrap();
     let text = format!(
         "Begin the revised work {}",
-        crate::issue::dispatch::intake_legacy_suffix(&source).unwrap()
+        crate::issue::dispatch::intake_legacy_suffix(&source, revised_epic, &scope).unwrap()
     );
 
     let opts = ServeOptions {
@@ -868,4 +914,150 @@ fn omitted_completed_prerequisite_keeps_historical_scope_and_drop_guard() {
     let refusal = fx.start(dependent, None).unwrap_err();
     assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
     assert_eq!(fx.snapshot(dependent), before);
+}
+
+#[test]
+fn cad224_opted_in_relative_job_spec_refuses_drift_before_enqueue() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let fx = IntakeFixture::new();
+    let manifest = fx.repo.join("docs/cadence/project-context.yaml");
+    let current = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        current.replace(
+            "project: cadence\n",
+            "project: cadence\nagent_delivery: true\n",
+        ),
+    )
+    .unwrap();
+    let spec = fx.repo.join("specs/intake-job.md");
+    std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+    let original_spec = "Implement the approved prerequisite.\n";
+    std::fs::write(&spec, original_spec).unwrap();
+    git(
+        &fx.repo,
+        &[
+            "add",
+            "docs/cadence/project-context.yaml",
+            "specs/intake-job.md",
+        ],
+    );
+    git(&fx.repo, &["commit", "-qm", "Opt in and add job spec"]);
+    let proposal = fx.propose(LINKED_INTAKE);
+    let issue = proposal["tickets"][0].as_str().unwrap();
+    fx.approve(proposal["epic"].as_str().unwrap());
+    let started = fx.start(issue, None).unwrap();
+    let lane = started["worktree"].as_str().unwrap();
+    let branch = started["branch"].as_str().unwrap();
+    let base = started["base"]["sha"].as_str().unwrap();
+
+    let opts = ServeOptions {
+        test_seam: true,
+        ..Default::default()
+    };
+    opts.provider_env
+        .set("CADENCE_PM_DIR", fx.pm.dir.to_str().unwrap());
+    let shared = Shared::new(fx._dir.path(), &opts).unwrap();
+    register(&shared, fx._dir.path(), "acceptance");
+    let sha = crate::delegation::sha256_hex(original_spec.as_bytes());
+    shared
+        .store
+        .create_job(
+            "cad224-relative",
+            None,
+            "specs/intake-job.md",
+            &sha,
+            "acceptance",
+            Some(issue),
+            Some(fx.repo.to_str().unwrap()),
+            None,
+            2,
+            None,
+            Some("Implement prerequisite"),
+            Some(lane),
+            Some(branch),
+            Some(base),
+            Some("acceptance"),
+            None,
+        )
+        .unwrap();
+    shared
+        .store
+        .create_task(
+            "cad224-relative",
+            "cad224-relative-fresh",
+            Some("Follow the same spec"),
+            Some("acceptance"),
+            None,
+            None,
+            Some(lane),
+            Some(branch),
+            Some(base),
+        )
+        .unwrap();
+    let accepted = shared
+        .rpc_task_dispatch(&json!({
+            "task": "cad224-relative-t1",
+            "by": "acceptance",
+            "message": "cad224-relative-accepted",
+        }))
+        .unwrap();
+    assert_eq!(accepted["duplicate"], false, "{accepted}");
+    assert!(shared
+        .store
+        .message_exists("cad224-relative-accepted")
+        .unwrap());
+
+    let before = fx.snapshot(issue);
+    let before_task = shared
+        .store
+        .task("cad224-relative-fresh")
+        .unwrap()
+        .to_json();
+    let before_queue = shared.store.queued_count("acceptance").unwrap();
+    let seen = Rc::new(Cell::new(false));
+    let observed = Rc::clone(&seen);
+    let changed_spec = spec.clone();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        if point == "intake-pre-enqueue" {
+            assert!(!observed.replace(true), "enqueue seam ran twice");
+            std::fs::write(&changed_spec, "Changed independent spec.\n").unwrap();
+        }
+    })));
+    let result = shared.rpc_task_dispatch(&json!({
+        "task": "cad224-relative-fresh",
+        "by": "acceptance",
+        "message": "cad224-relative-stale",
+    }));
+    crate::issue::lockseam::set_hook(None);
+    assert!(
+        seen.get(),
+        "relative spec did not reach the enqueue seam: {result:?}"
+    );
+    let refusal = result.unwrap_err();
+    assert!(
+        refusal
+            .to_string()
+            .contains("independent spec changed while preparing"),
+        "{refusal:?}"
+    );
+    assert!(!shared
+        .store
+        .message_exists("cad224-relative-stale")
+        .unwrap());
+    assert_eq!(
+        shared.store.queued_count("acceptance").unwrap(),
+        before_queue
+    );
+    assert_eq!(
+        shared
+            .store
+            .task("cad224-relative-fresh")
+            .unwrap()
+            .to_json(),
+        before_task
+    );
+    assert_eq!(fx.snapshot(issue), before);
 }

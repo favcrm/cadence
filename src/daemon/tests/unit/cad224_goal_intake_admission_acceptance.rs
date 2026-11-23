@@ -386,10 +386,26 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
 
     let scope = plan::scope_digest(&front, &body).unwrap();
     let source = std::fs::read_to_string(issue_dir.join("issue.md")).unwrap();
-    let dispatch_text = format!(
-        "Begin the approved work {}",
-        crate::issue::dispatch::intake_legacy_suffix(&source).unwrap()
-    );
+    let suffix = crate::issue::dispatch::intake_legacy_suffix(&source, epic, &scope).unwrap();
+    let marker = crate::issue::dispatch::intake_scope_marker(epic, &scope);
+    assert!(suffix.ends_with(&marker));
+    let dispatch_text = format!("Begin the approved work {suffix}");
+    assert!(crate::issue::dispatch::body_has_intake_scope(
+        &dispatch_text,
+        &suffix
+    ));
+    assert!(crate::issue::dispatch::body_has_intake_scope(
+        &format!("{dispatch_text} Lessons: /tmp/lessons.md."),
+        &suffix
+    ));
+    assert!(!crate::issue::dispatch::body_has_intake_scope(
+        &format!("{dispatch_text} arbitrary trailer"),
+        &suffix
+    ));
+    assert!(!crate::issue::dispatch::body_has_intake_scope(
+        &serde_json::to_string(&dispatch_text).unwrap(),
+        &suffix
+    ));
     let accepted_message = "cad224accepteddispatch0000000001";
     let accepted_request = json!({
         "alias": "worker-1",
@@ -819,9 +835,17 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     let (live_front, live_body) = write::load_front(&issue_dir).unwrap();
     assert_eq!(
         plan::gate_snapshot(&pm.dir, &live_front, &live_body).unwrap(),
-        Some(revised_epic)
+        Some(revised_epic.clone())
     );
     assert_eq!(plan::scope_digest(&live_front, &live_body).unwrap(), scope);
+    let revised_source = std::fs::read_to_string(issue_dir.join("issue.md")).unwrap();
+    let revised_suffix =
+        crate::issue::dispatch::intake_legacy_suffix(&revised_source, &revised_epic, &scope)
+            .unwrap();
+    assert!(!crate::issue::dispatch::body_has_intake_scope(
+        &dispatch_text,
+        &revised_suffix
+    ));
     let stale_proof_message = "cad224-old-proof";
     let mut stale_proof_request = old_proof_request.clone();
     stale_proof_request["message"] = json!(stale_proof_message);
