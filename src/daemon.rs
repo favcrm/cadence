@@ -285,6 +285,7 @@ pub(crate) mod supervisor_grant;
 #[cfg(all(test, feature = "test-seam"))]
 pub(crate) mod team_assistants_refusal;
 mod test_queue_rpc;
+mod thread_search_rpc;
 mod threads_rpc;
 mod timers;
 mod topics_rpc;
@@ -4678,6 +4679,7 @@ impl Shared {
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
             "thread_read" => self.rpc_thread_read(params, peer_pid),
+            "thread_search" => self.rpc_thread_search(params, peer_pid),
             "activity_query" => self.rpc_activity_query(params, peer_pid),
             "activity_export" => self.rpc_activity_export(params, peer_pid),
             "pm_activity_prepare" => self.rpc_pm_activity_prepare(params, peer_pid),

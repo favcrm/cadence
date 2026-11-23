@@ -3,11 +3,13 @@
 //! Codex starts local MCP servers outside its command sandbox. This process
 //! remains a descendant of the enrolled provider, so the daemon derives the
 //! caller from SO_PEERCRED and /proc ancestry. `self`, `app_run_artifact`,
-//! `memory_match` and `memory_propose` call one named daemon RPC each in this
-//! process, with fixed fields; none is a general RPC tool, and none spawns a
-//! CLI child that would carry a turn token in argv. The memory tools never
-//! send a project, role or provider: the daemon takes them from the caller's
-//! own running issue turn (CAD-2662). The other tools still run the Cadence
+//! `memory_match`, `memory_propose` and `thread_search` call one named daemon
+//! RPC each in this process, with fixed fields; none is a general RPC tool,
+//! and none spawns a CLI child that would carry a turn token in argv. The
+//! memory tools never send a project, role or provider: the daemon takes them
+//! from the caller's own running issue turn (CAD-2662). `thread_search` never
+//! names an agent, thread or conversation: the daemon searches the caller's
+//! own running turn's conversation (CAD-2663). The other tools still run the Cadence
 //! CLI as children of this process, which keeps the same enrolled ancestry.
 
 use std::io::{BufRead, Write};
@@ -70,7 +72,7 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                 } else if is_hosted_app_tool(name) {
                     parse_hosted_app_call(name, &args)
                         .and_then(|call| execute_hosted_app_call(state_dir, &alias, call))
-                } else if let Some(parse) = memory_tool(name) {
+                } else if let Some(parse) = rpc_tool(name) {
                     parse(&args).and_then(|(method, params)| {
                         crate::client::rpc(state_dir, method, params).map(|out| out.to_string())
                     })
@@ -146,6 +148,16 @@ fn tools(platform_tools: &[PlatformTool]) -> Value {
              "message":{"type":"string","description":"Only when you hold several turns: the id from self."},
              "token":{"type":"string","description":"Only with message: that turn's turn_id from self."}},
              "required":["kind","text","source"],"additionalProperties":false}},
+        {"name":"thread_search","description":THREAD_SEARCH_DESCRIPTION,
+         "inputSchema":{"type":"object","properties":{
+             "query":{"type":"string","description":"An exact phrase, or up to 6 words. Omit when you pass around."},
+             "limit":{"type":"integer","minimum":1,"maximum":10,"description":"Most hits to return (default 5). Only with query."},
+             "around":{"type":"string","description":"A hit's handle from an earlier search: read the entries just before and after it."},
+             "before":{"type":"integer","minimum":0,"maximum":6,"description":"Entries before the hit (default 3). Only with around."},
+             "after":{"type":"integer","minimum":0,"maximum":6,"description":"Entries after the hit (default 3). Only with around."},
+             "message":{"type":"string","description":"Only when you hold several turns: the id from self."},
+             "token":{"type":"string","description":"Only with message: that turn's turn_id from self."}},
+             "additionalProperties":false}},
         {"name":"app_run_artifact","description":"Read one text dependency artifact for your current assigned app turn. Required strings: artifact_id from the kickoff, plus message and token equal to the id and turn_id from self. Alias, provider, path, and command are refused.",
          "inputSchema":{"type":"object","properties":{
              "artifact_id":{"type":"string"},
@@ -255,13 +267,25 @@ const MEMORY_PROPOSE_DESCRIPTION: &str = "Propose a project lesson you learned o
     scope (paths, components, providers, tags, or scope_project). Propose after you resolve \
     something a later task would otherwise rediscover.";
 
-const STATIC_TOOL_NAMES: [&str; 15] = [
+/// When to search the conversation — the tool description and the
+/// continuity pack's line (CAD-2663) say the same thing.
+const THREAD_SEARCH_DESCRIPTION: &str = "Search your own earlier conversation in this task for an \
+    exact fact: a number, decision, name, path or command. Your context may have been compacted \
+    or rebuilt, and older turns survive only as one line each. Before you state something exact \
+    from earlier that is not in front of you, search for it; if it is not found, say so instead \
+    of guessing. Pass query: an exact phrase, or up to 6 words. Hits holding the whole phrase \
+    come first, then hits ranked by how many words they hold. Each hit has a handle; call again \
+    with around set to it to read the entries just before and after. Only your own \
+    conversation is searched, and only messages that reached you.";
+
+const STATIC_TOOL_NAMES: [&str; 16] = [
     "self",
     "wiki_search",
     "wiki_read",
     "issue_show",
     "memory_match",
     "memory_propose",
+    "thread_search",
     "app_run_artifact",
     "private_app_prepare",
     "private_app_status",
@@ -544,15 +568,56 @@ fn command_args(name: &str, args: &Value, platform_tools: &[PlatformTool]) -> Re
     }
 }
 
-type MemoryParse = fn(&Value) -> Result<(&'static str, Value)>;
+type RpcParse = fn(&Value) -> Result<(&'static str, Value)>;
 
-/// The memory tools: each maps to exactly one daemon RPC.
-fn memory_tool(name: &str) -> Option<MemoryParse> {
+/// The tools that call the daemon in-process: each maps to exactly one RPC.
+fn rpc_tool(name: &str) -> Option<RpcParse> {
     match name {
         "memory_match" => Some(memory_match_params),
         "memory_propose" => Some(memory_propose_params),
+        "thread_search" => Some(thread_search_params),
         _ => None,
     }
+}
+
+/// `thread_search`: the query or hit handle and its bounds, plus an
+/// optional turn pair. An agent, thread or conversation argument is refused
+/// by name; the daemon also refuses them.
+fn thread_search_params(args: &Value) -> Result<(&'static str, Value)> {
+    let object = tool_object(
+        args,
+        &[
+            "query", "limit", "around", "before", "after", "message", "token",
+        ],
+    )?;
+    let number = |key: &str| -> Result<Option<u64>> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+                Error::rejected(format!("tool argument '{key}' must be a whole number"))
+            }),
+        }
+    };
+    let mut params = crate::thread_search::request(
+        tool_str(object, "query")?,
+        tool_str(object, "around")?,
+        number("limit")?,
+        number("before")?,
+        number("after")?,
+    );
+    match (tool_str(object, "message")?, tool_str(object, "token")?) {
+        (Some(message), Some(token)) => {
+            params["message"] = json!(message);
+            params["token"] = json!(token);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(Error::rejected(
+                "thread_search takes message and token together, or neither",
+            ))
+        }
+    }
+    Ok(("thread_search", params))
 }
 
 /// An object whose keys are all in `allowed`, so a `project`, `role`,

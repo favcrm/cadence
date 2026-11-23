@@ -16,10 +16,48 @@ pub(crate) enum ThreadAction {
         #[arg(long, default_value_t = 100)]
         limit: i64,
     },
+    /// Search your own earlier conversation in the running task for an
+    /// exact fact (CAD-2663): an exact phrase, or up to 6 words. Each hit
+    /// has a handle; `--around <handle>` reads the entries either side.
+    /// Only the calling agent's own conversation is searched.
+    Search {
+        /// An exact phrase, or up to 6 words.
+        #[arg(required_unless_present = "around", conflicts_with = "around")]
+        query: Option<String>,
+        /// A hit's handle: read the entries just before and after it.
+        #[arg(long)]
+        around: Option<String>,
+        /// Most hits (1-10, default 5).
+        #[arg(long, conflicts_with = "around")]
+        limit: Option<u64>,
+        /// Entries before the hit (0-6, default 3).
+        #[arg(long, requires = "around")]
+        before: Option<u64>,
+        /// Entries after the hit (0-6, default 3).
+        #[arg(long, requires = "around")]
+        after: Option<u64>,
+    },
 }
 
 pub(super) fn run(state_dir: PathBuf, action: ThreadAction) -> Result<i32> {
     match action {
+        ThreadAction::Search {
+            query,
+            around,
+            limit,
+            before,
+            after,
+        } => {
+            let params = cadence_agent::thread_search::request(
+                query.as_deref(),
+                around.as_deref(),
+                limit,
+                before,
+                after,
+            );
+            print_json(&client::rpc(&state_dir, "thread_search", params)?);
+            Ok(0)
+        }
         ThreadAction::Show {
             alias,
             after,

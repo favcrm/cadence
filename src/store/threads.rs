@@ -1671,6 +1671,64 @@ impl Store {
         Ok((rows, more))
     }
 
+    /// CAD-2663: one batch of a thread as its own agent may search it. A row
+    /// qualifies when its message:
+    /// - belongs to the thread's own agent;
+    /// - reached the agent, the [`Self::continuity_entries`] rule:
+    ///   delivered ([`DELIVERED_STATES`]) and not `current`;
+    /// - is either bound to an issue the agent's read scope admits (the
+    ///   scoped-agent filter `thread_read` applies), or bound to no issue
+    ///   and no task at all — a conversation turn the continuity pack
+    ///   already carries back to this agent.
+    ///
+    /// Rows tied to no message (system notes) never qualify. Backward reads
+    /// the rows below `anchor`, newest first; forward the rows above it,
+    /// oldest first. The flag says more rows lie beyond the batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn thread_entries_reached_scoped(
+        &self,
+        thread_id: &str,
+        current: &str,
+        anchor: i64,
+        backward: bool,
+        limit: i64,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+    ) -> Result<(Vec<ThreadEntry>, bool)> {
+        let conn = self.conn();
+        let issues = super::messages::project_filter_json(
+            issues,
+            Some(&denied.tasks),
+            Some(&denied.issues),
+            denied.exclude_cloud,
+        )?;
+        let limit = limit.clamp(1, PAGE_MAX);
+        let (bound, order) = if backward {
+            ("seq<?", "DESC")
+        } else {
+            ("seq>?", "ASC")
+        };
+        let sql = format!(
+            "SELECT thread_entries.* FROM thread_entries
+             WHERE thread_id=? AND {bound} AND EXISTS (SELECT 1 FROM messages
+               WHERE messages.id=thread_entries.message_id
+                 AND messages.alias=(SELECT alias FROM threads WHERE id=thread_entries.thread_id)
+                 AND messages.id != ? AND messages.state IN {DELIVERED_STATES}
+                 AND ((messages.issue IS NULL AND messages.task_id IS NULL)
+                      OR (1 {})))
+             ORDER BY seq {order} LIMIT ?",
+            super::messages::INDEX_PROJECT_FILTER
+        );
+        let mut rows = conn.query_vec(
+            &sql,
+            params![thread_id, anchor, current, issues, limit + 1],
+            row_entry,
+        )?;
+        let more = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        Ok((rows, more))
+    }
+
     pub(crate) fn thread_reply_seq_scoped(
         &self,
         thread_id: &str,
