@@ -125,6 +125,40 @@ struct MonitorAckIdentity {
     pane: Option<(u32, Option<u64>)>,
 }
 
+/// An opened scoped position paired with the native registration that
+/// opened it. Only the scoped RPC constructs one. It resolves live
+/// project access under the same tracker/slot guards as its write.
+struct ScopedMonitorAck<'a> {
+    identity: MonitorAckIdentity,
+    monitor_id: &'a str,
+    by: &'a str,
+    seq: i64,
+    codec: ScopedCursorCodec,
+    principal: String,
+    resource: String,
+}
+
+impl ScopedMonitorAck<'_> {
+    fn commit(self, shared: &Shared) -> Result<Value> {
+        let pm = shared.pm()?;
+        let tracker = pm.lock()?;
+        let actor = format!("agents/{}", self.identity.alias);
+        let scope = shared.project_scope_for_actor(&actor)?;
+        let mut slots = shared.slots.lock().unwrap_or_else(|e| e.into_inner());
+        // Acceptance seam: no store connection/tx is held yet.
+        #[cfg(any(test, feature = "test-seam"))]
+        if let Some(hook) = &shared.monitor_ack_writer_hook {
+            hook();
+        }
+        let out = shared
+            .store
+            .ack_scoped_monitor_alert(&mut slots, &scope, &self)?;
+        drop(slots);
+        drop(tracker);
+        Ok(out)
+    }
+}
+
 fn monitor_visible(
     scope: &Option<ProjectScope>,
     denied: &store::PrivateJobDenials,
@@ -326,6 +360,132 @@ fn scoped_alert_page(
     });
     page[READER_SCOPE_FIELD] = json!(MONITOR_READER_SCOPE_ACK);
     Ok(page)
+}
+
+impl store::Store {
+    /// Re-run the native identity decision inside the acknowledgement write
+    /// transaction. `slots` is held by the caller; this helper must not call
+    /// `agent_caller`, `slot_identity`, `revalidate_enrollments` or any store
+    /// accessor that reacquires the store/slots mutex.
+    fn revalidate_monitor_ack_in(
+        &self,
+        tx: &impl crate::store::StoreConn,
+        slots: &mut crate::slots::Slots,
+        evidence: &MonitorAckIdentity,
+        by: &str,
+    ) -> Result<()> {
+        let changed =
+            || Error::rejected("monitor alert acknowledgement refused: reader access changed");
+        if evidence.alias != by {
+            return Err(changed());
+        }
+        if let Some(asserted) = crate::test_seam::asserted() {
+            match asserted {
+                crate::test_seam::Asserted::Agent(alias) if alias == evidence.alias => {}
+                _ => return Err(changed()),
+            }
+        } else {
+            let pane_rows = self.pty_pane_pids_in(tx)?;
+            if let Some((pid, start)) = evidence.pane {
+                let current = pane_rows
+                    .iter()
+                    .find(|row| row.0 == evidence.alias)
+                    .map(|row| (row.1, row.2));
+                if current != Some((pid, start)) {
+                    return Err(changed());
+                }
+            }
+            let recorded = crate::peer::AgentPids::classify(pane_rows);
+            recorded
+                .refuse_unproven_on(&evidence.chain)
+                .map_err(|why| {
+                    Error::rejected(format!("monitor alert acknowledgement refused: {why}"))
+                })?;
+            let panes = recorded.live();
+            let current =
+                Shared::slot_identity_from(evidence.peer_pid, &evidence.chain, &panes, slots)
+                    .map_err(|_| changed())?
+                    .ok_or_else(changed)?;
+            if current.lane() != evidence.alias {
+                return Err(changed());
+            }
+            match (&evidence.slot, &current) {
+                (super::identity::SlotWho::Pane { .. }, super::identity::SlotWho::Pane { .. }) => {}
+                (
+                    super::identity::SlotWho::Strict(before),
+                    super::identity::SlotWho::Strict(now),
+                ) => {
+                    if before.enrollment_id != now.enrollment_id {
+                        return Err(changed());
+                    }
+                    let enrollment = slots
+                        .endpoint_enrollment(&now.enrollment_id)
+                        .cloned()
+                        .ok_or_else(changed)?;
+                    let agent = self.agent_in(tx, &evidence.alias)?;
+                    if enrollment.owner_actor != evidence.alias
+                        || super::identity::owner_generation(&agent).as_deref()
+                            != Some(enrollment.owner_generation.as_str())
+                        || agent.pid != Some(i64::from(enrollment.root.pid))
+                        || agent.pid_start.and_then(|start| u64::try_from(start).ok())
+                            != Some(enrollment.root.starttime)
+                    {
+                        return Err(changed());
+                    }
+                }
+                _ => return Err(changed()),
+            }
+        }
+        let agent = self.agent_in(tx, &evidence.alias)?;
+        if agent.uid != evidence.uid {
+            return Err(changed());
+        }
+        Ok(())
+    }
+
+    /// Check native authority and mutate the exact alert in one fenced write.
+    /// The caller holds the tracker and slots guards, in that order. Rendering
+    /// stays inside the transaction so a cursor error rolls the mutation back.
+    fn ack_scoped_monitor_alert(
+        &self,
+        slots: &mut crate::slots::Slots,
+        scope: &Option<ProjectScope>,
+        ack: &ScopedMonitorAck<'_>,
+    ) -> Result<Value> {
+        self.write_tx(|tx| {
+            self.revalidate_monitor_ack_in(&*tx, slots, &ack.identity, ack.by)?;
+            let current = self.project_monitor_view_in(&*tx, ack.monitor_id)?;
+            if monitor_resource(&current.monitor) != ack.resource {
+                return Err(Error::rejected(
+                    "monitor alert acknowledgement refused: monitor identity changed",
+                ));
+            }
+            let denied = self.private_job_denials_in(
+                &*tx,
+                store::PrivateJobReader::Agent(&ack.identity.alias),
+            )?;
+            if !monitor_visible(scope, &denied, &current.coverage) {
+                return Err(Error::rejected(
+                    "monitor alert acknowledgement refused: reader access changed",
+                ));
+            }
+            let alert = self.monitor_alert_in(&*tx, ack.seq)?;
+            if !current
+                .coverage
+                .iter()
+                .any(|(task, _)| task == &alert.task_id)
+            {
+                return Err(Error::rejected(
+                    "monitor alert acknowledgement refused: alert is outside current coverage",
+                ));
+            }
+            let alert = self.ack_monitor_alert_in(&*tx, ack.monitor_id, ack.seq, ack.by)?;
+            let row = scoped_alert_json(&ack.codec, &ack.principal, &ack.resource, &alert)?;
+            let mut out = json!({"alert": row});
+            out[READER_SCOPE_FIELD] = json!(MONITOR_READER_SCOPE_ACK);
+            Ok(out)
+        })
+    }
 }
 
 impl Shared {
@@ -827,86 +987,6 @@ impl Shared {
         })
     }
 
-    /// Re-run the native identity decision inside the acknowledgement write
-    /// transaction. `slots` is held by the caller; this helper must not call
-    /// `agent_caller`, `slot_identity`, `revalidate_enrollments` or any store
-    /// accessor that reacquires the store/slots mutex.
-    fn revalidate_monitor_ack_in(
-        &self,
-        tx: &impl crate::store::StoreConn,
-        slots: &mut crate::slots::Slots,
-        evidence: &MonitorAckIdentity,
-        by: &str,
-    ) -> Result<()> {
-        let changed =
-            || Error::rejected("monitor alert acknowledgement refused: reader access changed");
-        if evidence.alias != by {
-            return Err(changed());
-        }
-        if let Some(asserted) = crate::test_seam::asserted() {
-            match asserted {
-                crate::test_seam::Asserted::Agent(alias) if alias == evidence.alias => {}
-                _ => return Err(changed()),
-            }
-        } else {
-            let pane_rows = self.store.pty_pane_pids_in(tx)?;
-            if let Some((pid, start)) = evidence.pane {
-                let current = pane_rows
-                    .iter()
-                    .find(|row| row.0 == evidence.alias)
-                    .map(|row| (row.1, row.2));
-                if current != Some((pid, start)) {
-                    return Err(changed());
-                }
-            }
-            let recorded = crate::peer::AgentPids::classify(pane_rows);
-            recorded
-                .refuse_unproven_on(&evidence.chain)
-                .map_err(|why| {
-                    Error::rejected(format!("monitor alert acknowledgement refused: {why}"))
-                })?;
-            let panes = recorded.live();
-            let current =
-                Self::slot_identity_from(evidence.peer_pid, &evidence.chain, &panes, slots)
-                    .map_err(|_| changed())?
-                    .ok_or_else(changed)?;
-            if current.lane() != evidence.alias {
-                return Err(changed());
-            }
-            match (&evidence.slot, &current) {
-                (super::identity::SlotWho::Pane { .. }, super::identity::SlotWho::Pane { .. }) => {}
-                (
-                    super::identity::SlotWho::Strict(before),
-                    super::identity::SlotWho::Strict(now),
-                ) => {
-                    if before.enrollment_id != now.enrollment_id {
-                        return Err(changed());
-                    }
-                    let enrollment = slots
-                        .endpoint_enrollment(&now.enrollment_id)
-                        .cloned()
-                        .ok_or_else(changed)?;
-                    let agent = self.store.agent_in(tx, &evidence.alias)?;
-                    if enrollment.owner_actor != evidence.alias
-                        || super::identity::owner_generation(&agent).as_deref()
-                            != Some(enrollment.owner_generation.as_str())
-                        || agent.pid != Some(i64::from(enrollment.root.pid))
-                        || agent.pid_start.and_then(|start| u64::try_from(start).ok())
-                            != Some(enrollment.root.starttime)
-                    {
-                        return Err(changed());
-                    }
-                }
-                _ => return Err(changed()),
-            }
-        }
-        let agent = self.store.agent_in(tx, &evidence.alias)?;
-        if agent.uid != evidence.uid {
-            return Err(changed());
-        }
-        Ok(())
-    }
-
     pub(super) fn rpc_monitor_alert_ack(
         self: &Arc<Self>,
         params: &Value,
@@ -969,50 +1049,16 @@ impl Shared {
         if let Some(hook) = &self.monitor_read_snapshot_hook {
             hook("ack");
         }
-        let pm = self.pm()?;
-        let _tracker = pm.lock()?;
-        let actor = format!("agents/{}", identity.alias);
-        let scope = self.project_scope_for_actor(&actor)?;
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        // Main's test seam: no store connection/tx is held here.
-        #[cfg(any(test, feature = "test-seam"))]
-        if let Some(hook) = &self.monitor_ack_writer_hook {
-            hook();
+        let out = ScopedMonitorAck {
+            identity,
+            monitor_id: id,
+            by,
+            seq,
+            codec,
+            principal,
+            resource,
         }
-        let out = self.store.write_tx(|tx| {
-            self.revalidate_monitor_ack_in(&*tx, &mut slots, &identity, by)?;
-            let current = self.store.project_monitor_view_in(&*tx, id)?;
-            if monitor_resource(&current.monitor) != resource {
-                return Err(Error::rejected(
-                    "monitor alert acknowledgement refused: monitor identity changed",
-                ));
-            }
-            let denied = self
-                .store
-                .private_job_denials_in(&*tx, store::PrivateJobReader::Agent(&identity.alias))?;
-            if !monitor_visible(&scope, &denied, &current.coverage) {
-                return Err(Error::rejected(
-                    "monitor alert acknowledgement refused: reader access changed",
-                ));
-            }
-            let alert = self.store.monitor_alert_in(&*tx, seq)?;
-            if !current
-                .coverage
-                .iter()
-                .any(|(task, _)| task == &alert.task_id)
-            {
-                return Err(Error::rejected(
-                    "monitor alert acknowledgement refused: alert is outside current coverage",
-                ));
-            }
-            let alert = self.store.ack_monitor_alert_in(&*tx, id, seq, by)?;
-            let row = scoped_alert_json(&codec, &principal, &resource, &alert)?;
-            let mut out = json!({"alert": row});
-            out[READER_SCOPE_FIELD] = json!(MONITOR_READER_SCOPE_ACK);
-            Ok(out)
-        })?;
-        drop(slots);
-        drop(_tracker);
+        .commit(self)?;
         self.wake();
         Ok(out)
     }
