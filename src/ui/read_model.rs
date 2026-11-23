@@ -2883,6 +2883,7 @@ mod tests {
             decided_at: None,
             reason: None,
             workflow: None,
+            intake: None,
         });
         let mut plan_retitled = plan.clone();
         plan_retitled.front.title = "renamed plan".into();

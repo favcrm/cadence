@@ -294,6 +294,27 @@ The default `cadence --help` lists nouns. Actions sit under them.
 - `message send` is the canonical enqueue. `cadence send` still parses.
 - Dispatch stays `cadence dispatch <id> --to <alias>`. It starts an issue, so it is not under `agent`.
 
+### Goal-intake plans
+
+On a native tracker, use `cadence plan propose --project KEY --file PLAN.md`
+to submit a goal for operator review. Add `intake:` to the normal plan
+frontmatter, with `constraints` (an explicit list), `success_criteria` (at
+least one), and optional `unknowns`. Put `sources:` (registered project
+context document IDs) and `paths:` (tracked module paths) immediately under
+each ticket heading. Use the nearest tracked directory for a new file. Every
+outcome needs an Acceptance checklist; `reuse: ISSUE-ID` maps it to an
+existing issue in this project without editing that issue or its dependencies.
+Other outcomes can depend on it by section number or issue ID.
+
+`cadence plan show EPIC` reports the pinned commit, document digests and
+outcome scopes, with the reason if evidence is blocked. Exact retries return
+the existing epic. Unresolved unknowns prevent approval. Changes to cited
+sources or the issue scope prevent new dispatch; submit an updated plan file
+with `intake.revises: EPIC` and have the operator approve that revision.
+Approval supersedes the old scope without stopping active work. New and
+carried tickets still use the existing coordinator, dependency and worker
+admission rules.
+
 ## Finding a command
 
 `cadence commands` and `cadence schema` are offline. They do not open a

@@ -19554,3 +19554,193 @@ mod cad2494_acceptance {
         gate(&repo, &head, json!({}), vec![]).refused("review");
     }
 }
+
+#[test]
+fn cad224_intake_replay_and_stale_source_blocks_dispatch() {
+    use cadence_agent::issue::{plan, write, Pm};
+    use cadence_agent::secret::Allowlist;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("source");
+    std::fs::create_dir_all(repo.join("docs/cadence")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.name", "Acceptance"]);
+    git(
+        &repo,
+        &["config", "user.email", "acceptance@example.invalid"],
+    );
+    std::fs::write(repo.join("docs/scope.md"), "Original scope\n").unwrap();
+    std::fs::write(repo.join("src/module.rs"), "// tracked module\n").unwrap();
+    std::fs::write(
+        repo.join("docs/cadence/project-context.yaml"),
+        "schema: 1\nproject: cadence\ndocuments:\n  - id: scope\n    kind: scope\n    path: docs/scope.md\n    title: Scope\n    required: true\n    roles: []\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "Initial source"]);
+
+    let pm_path = tmp.path().join("pm");
+    let pm = Pm::init(&pm_path).unwrap();
+    write::project_add(
+        &pm,
+        "cadence",
+        "CAD",
+        &[repo.to_string_lossy().into_owned()],
+        &[],
+        &[],
+        None,
+    )
+    .unwrap();
+    write::new_issue(
+        &pm,
+        tmp.path(),
+        Some("cadence"),
+        "Existing work",
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "acceptance",
+    )
+    .unwrap();
+    let existing = pm.dir.join("cadence/CAD-1/issue.md");
+    let original = std::fs::read(&existing).unwrap();
+    let draft = r#"---
+title: Deliver the scoped outcome
+goal: Deliver the planned capability
+intake:
+  constraints: [Keep the existing integration]
+  success_criteria: [The capability is available]
+  unknowns: [Confirm the integration detail]
+---
+
+## Reuse existing work
+sources: scope
+paths: src/module.rs
+reuse: CAD-1
+
+### Acceptance
+- [ ] Existing integration is accounted for
+
+## Implement the capability
+sources: scope
+paths: src/module.rs
+depends_on: 1
+
+### Acceptance
+- [ ] Capability is available
+"#;
+    let allow = Allowlist::default();
+    let result = plan::propose(&pm, "cadence", draft, None, &allow, "acceptance", &|| {
+        Ok(Default::default())
+    })
+    .unwrap();
+    let epic = result["epic"].as_str().unwrap().to_owned();
+    let tickets = result["tickets"].as_array().unwrap();
+    let fresh: Vec<_> = tickets
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|id| *id != "CAD-1")
+        .collect();
+    assert_eq!(fresh.len(), 1, "{result}");
+    let fresh = fresh[0].to_owned();
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
+    let fresh_text =
+        std::fs::read_to_string(pm.dir.join("cadence").join(&fresh).join("issue.md")).unwrap();
+    let (fresh_front, _) = cadence_agent::issue::parse::parse_issue(&fresh_text).unwrap();
+    assert!(fresh_front.blocked_by.iter().any(|id| id == "CAD-1"));
+    drop(pm);
+
+    let pm = Pm::at(&pm_path).unwrap();
+    let replay = plan::propose(&pm, "cadence", draft, None, &allow, "acceptance", &|| {
+        Ok(Default::default())
+    })
+    .unwrap();
+    assert_eq!(replay["epic"], epic);
+    assert_eq!(replay["tickets"], result["tickets"]);
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
+    let issue_count = || {
+        std::fs::read_dir(pm.dir.join("cadence"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("CAD-"))
+            .count()
+    };
+    let count = issue_count();
+    let missing = draft.replace("sources: scope", "sources: missing");
+    assert!(plan::propose(
+        &pm,
+        "cadence",
+        &missing,
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .is_err());
+    assert_eq!(issue_count(), count);
+
+    let refusal = write::decide_plan(&pm, &epic, true, "operator", None).unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_unknowns_unresolved"),
+        "{refusal:?}"
+    );
+    assert!(plan::gate_id(&pm.dir, &fresh).is_err());
+    assert_eq!(issue_count(), count);
+
+    let resolved = draft.replace(
+        "  unknowns: [Confirm the integration detail]",
+        &format!("  unknowns: []\n  revises: {epic}"),
+    );
+    let revised = plan::propose(
+        &pm,
+        "cadence",
+        &resolved,
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap();
+    let revised_epic = revised["epic"].as_str().unwrap();
+    assert_ne!(revised_epic, epic);
+    let revised_tickets: Vec<_> = revised["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|id| *id != "CAD-1")
+        .collect();
+    assert_eq!(revised_tickets.len(), 1, "{revised}");
+    let fresh = revised_tickets[0];
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
+    write::decide_plan(&pm, revised_epic, true, "operator", None).unwrap();
+    plan::gate_id(&pm.dir, &fresh).unwrap();
+    std::fs::write(repo.join("docs/scope.md"), "Revised scope\n").unwrap();
+    git(&repo, &["add", "docs/scope.md"]);
+    git(&repo, &["commit", "-qm", "Revise scope"]);
+    let refusal = plan::gate_id(&pm.dir, &fresh).unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+}

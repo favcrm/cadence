@@ -42,8 +42,10 @@ use crate::issue::parse;
 use crate::issue::{board, write, Pm};
 
 mod doc;
+mod intake;
 
 pub use doc::{parse_plan, Dep, PlanDoc, Ticket};
+pub use intake::GoalIntake;
 
 /// Largest plan text `propose` accepts.
 pub const MAX_PLAN_BYTES: usize = 256 * 1024;
@@ -76,6 +78,11 @@ pub fn propose(
     }
     let warnings = crate::secret::guard_with("plan", text, allow)?;
     let doc = parse_plan(text)?;
+    if workflow.is_some() && doc.intake.is_some() {
+        return Err(Error::rejected(
+            "goal intake must be an ordinary file proposal, not a workflow render",
+        ));
+    }
     if doc.tickets.len() > MAX_TICKETS {
         return Err(Error::rejected(format!(
             "Plan has {} tickets — a plan carries at most {MAX_TICKETS}; split it",
@@ -237,7 +244,63 @@ pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
             ),
         ));
     }
+    if plan.intake.is_some() {
+        verify_intake_dispatch(pm_dir, &epic, front, body)?;
+    }
     Ok(())
+}
+
+fn verify_intake_dispatch(pm_dir: &Path, epic: &str, front: &Front, body: &str) -> Result<()> {
+    let mut issue = probe_issue(pm_dir, epic)?
+        .ok_or_else(|| unreadable(epic, "goal-intake epic is missing"))?;
+    let project = crate::issue::project::list(pm_dir)?
+        .into_iter()
+        .find(|project| project.key == issue.project)
+        .ok_or_else(|| unreadable(epic, "its project is missing"))?;
+    let mut visited = HashSet::new();
+    loop {
+        let id = &issue.front.id;
+        if !visited.insert(id.clone()) {
+            return Err(unreadable(id, "cyclic intake revisions"));
+        }
+        let intake = issue
+            .front
+            .plan
+            .as_ref()
+            .filter(|plan| plan.state == "approved")
+            .and_then(|plan| plan.intake.as_ref())
+            .ok_or_else(|| unreadable(id, "intake approval evidence is missing"))?;
+        let Some(next) = &intake.superseded_by else {
+            intake.require_goal(&issue.body)?;
+            intake.require_scope(front, body)?;
+            return intake.require_sources(&project, Some(front.id.as_str()));
+        };
+        let revision =
+            board::load_issue(pm_dir, &project.key, next).map_err(|e| unreadable(next, e))?;
+        let carries = revision
+            .front
+            .plan
+            .as_ref()
+            .filter(|plan| plan.state == "approved")
+            .and_then(|plan| plan.intake.as_ref())
+            .is_some_and(|next| {
+                next.revises.as_deref() == Some(id.as_str())
+                    && next
+                        .outcomes
+                        .get(&front.id)
+                        .is_some_and(|outcome| outcome.reused)
+            });
+        if !carries {
+            return Err(Error::invalid(
+                "plan_evidence_stale",
+                format!(
+                    "{id} was superseded by {next}; {} is not in that scope",
+                    front.id
+                ),
+            ));
+        }
+        issue = revision;
+    }
 }
 
 /// CAD-339: the master's dispatch gate — [`gate`], and the issue must
@@ -372,7 +435,7 @@ pub fn plan_json(epic: &board::View, views_by_id: &HashMap<String, &board::View>
             (s.to_string(), json!(n))
         })
         .collect();
-    json!({
+    let mut result = json!({
         "state": plan.state,
         "proposed_by": plan.proposed_by,
         "proposed_at": plan.proposed_at,
@@ -386,7 +449,11 @@ pub fn plan_json(epic: &board::View, views_by_id: &HashMap<String, &board::View>
             "ratio": ratio(done, total),
             "counts": counts,
         },
-    })
+    });
+    if let Some(intake) = &plan.intake {
+        result["intake"] = json!(intake);
+    }
+    result
 }
 
 fn ratio(done: u64, total: u64) -> f64 {
@@ -492,18 +559,48 @@ pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     let view = by_id
         .get(id)
         .ok_or_else(|| Error::rejected(format!("Unknown issue '{id}'")))?;
-    if view.issue.front.plan.is_none() {
+    let Some(plan) = &view.issue.front.plan else {
         return Err(Error::rejected(format!(
             "{id} is not a plan — `cadence plan propose` creates one"
         )));
-    }
-    Ok(json!({
+    };
+    let mut result = json!({
         "id": id,
         "project": view.issue.project,
         "title": view.issue.front.title,
         "status": view.status,
         "plan": plan_json(view, &by_id),
-    }))
+    });
+    if let Some(intake) = &plan.intake {
+        let evidence = (|| -> Result<()> {
+            if let Some(next) = &intake.superseded_by {
+                return Err(Error::invalid(
+                    "plan_superseded",
+                    format!("plan {id} was superseded by {next}"),
+                ));
+            }
+            intake.require_goal(&view.issue.body)?;
+            for outcome in intake.outcomes.keys() {
+                let issue = &by_id
+                    .get(outcome)
+                    .ok_or_else(|| unreadable(outcome, "outcome issue is missing"))?
+                    .issue;
+                intake.require_scope(&issue.front, &issue.body)?;
+            }
+            let project = crate::issue::project::list(&pm.dir)?
+                .into_iter()
+                .find(|project| project.key == view.issue.project)
+                .ok_or_else(|| unreadable(id, "its project is missing"))?;
+            intake.require_sources(&project, None)
+        })();
+        result["intake_evidence"] = match evidence {
+            Ok(()) => json!({"state": "current"}),
+            Err(error) => {
+                json!({"state": "blocked", "code": error.code(), "reason": error.to_string()})
+            }
+        };
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
