@@ -267,10 +267,15 @@ impl Shared {
         }
         let gated = (matches!(&caller, AgentCaller::Agent(_)) || automatic)
             && self.unattended_issue_bound(&id)?;
+        let fresh_plan_send = !already_accepted && front.plan_epic.is_some();
         // Grant→tracker order; keep canonical semantics and owner stable
         // through enqueue. Resolve blocking reads/Git before the live helper,
         // whose final expiry check must follow all dispatch setup waits.
-        let _tracker = gated.then(|| pm.lock()).transpose()?;
+        let _tracker = (gated || fresh_plan_send).then(|| pm.lock()).transpose()?;
+        if fresh_plan_send {
+            let (live_front, live_body) = issue::write::load_front(&dir)?;
+            issue::plan::gate(&pm.dir, &live_front, &live_body)?;
+        }
         let mut authorized_until = None;
         if gated {
             let (live_front, _) = issue::write::load_front(&dir)?;

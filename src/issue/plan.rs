@@ -274,11 +274,7 @@ fn verify_intake_dispatch(pm_dir: &Path, epic: &str, front: &Front, body: &str) 
             intake.require_goal(&issue.body)?;
             intake.require_scope(front, body)?;
             for id in &front.blocked_by {
-                if intake
-                    .outcomes
-                    .get(id)
-                    .is_some_and(|outcome| outcome.reused)
-                {
+                if intake.outcomes.contains_key(id) {
                     let dependency = board::load_issue(pm_dir, &project.key, id)
                         .map_err(|e| unreadable(id, e))?;
                     intake.require_scope(&dependency.front, &dependency.body)?;

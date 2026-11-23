@@ -260,18 +260,21 @@ fn intake_predecessor<'a>(
     Ok(issue)
 }
 
-/// A revision must not strand retained work behind a prerequisite it retires.
-fn check_retained_dependencies(
-    issues: &[board::Issue],
-    previous: &board::Issue,
+/// The old plan members this revision removes, including carried ancestors.
+/// Refuse any revision that leaves retained work blocked on one of them.
+fn revision_retirements<'a>(
+    issues: &'a [board::Issue],
+    previous: &'a board::Issue,
     intake: &crate::issue::plan::GoalIntake,
-) -> Result<()> {
+) -> Result<HashSet<&'a str>> {
     let by_id: HashMap<&str, &board::Issue> = issues
         .iter()
         .map(|issue| (issue.front.id.as_str(), issue))
         .collect();
     let mut ancestors = HashSet::new();
     let mut retiring = HashSet::new();
+    let mut continuously_carried: HashSet<&str> =
+        intake.outcomes.keys().map(String::as_str).collect();
     let mut cursor = Some(previous);
     while let Some(issue) = cursor {
         if !ancestors.insert(issue.front.id.as_str()) {
@@ -282,16 +285,29 @@ fn check_retained_dependencies(
             .plan
             .as_ref()
             .ok_or_else(|| Error::rejected("invalid intake revision history"))?;
-        retiring.extend(
-            plan.tickets
-                .iter()
-                .filter(|id| !intake.outcomes.contains_key(*id))
-                .map(String::as_str),
-        );
-        cursor = plan
+        for id in &plan.tickets {
+            let id = id.as_str();
+            if !intake.outcomes.contains_key(id) {
+                retiring.insert(id);
+            } else if !continuously_carried.contains(id)
+                && !by_id
+                    .get(id)
+                    .is_some_and(|ticket| ticket.front.status == "done")
+            {
+                return Err(Error::invalid(
+                    "plan_revision_strands_dependency",
+                    format!("{id} was retired by an earlier revision and cannot be carried"),
+                ));
+            }
+        }
+        let record = plan
             .intake
             .as_ref()
-            .and_then(|record| record.revises.as_deref())
+            .ok_or_else(|| Error::rejected("invalid intake revision history"))?;
+        continuously_carried.retain(|id| record.outcomes.contains_key(*id));
+        cursor = record
+            .revises
+            .as_deref()
             .map(|id| {
                 by_id
                     .get(id)
@@ -315,7 +331,7 @@ fn check_retained_dependencies(
         let dependency = by_id
             .get(id)
             .ok_or_else(|| Error::rejected(format!("intake dependency {id} is missing")))?;
-        if matches!(dependency.front.status.as_str(), "done" | "dropped") {
+        if dependency.front.status == "done" {
             continue;
         }
         if retiring.contains(id) {
@@ -324,9 +340,12 @@ fn check_retained_dependencies(
                 format!("retain unfinished prerequisite {id} in this revision"),
             ));
         }
+        if dependency.front.status == "dropped" {
+            continue;
+        }
         pending.extend(dependency.front.blocked_by.iter().map(String::as_str));
     }
-    Ok(())
+    Ok(retiring)
 }
 
 /// CAD-225: the canonical original semantics an unattended grant binds
@@ -774,7 +793,7 @@ pub fn decide_plan(
         intake.require_sources(&project, None)?;
         if let Some(id) = &intake.revises {
             let previous = intake_predecessor(&issues, &project.key, id)?;
-            check_retained_dependencies(&issues, previous, intake)?;
+            let retired = revision_retirements(&issues, previous, intake)?;
             let mut prior = previous.front.clone();
             let previous_plan = prior
                 .plan
@@ -796,10 +815,12 @@ pub fn decide_plan(
                 .ok_or_else(|| Error::internal("missing predecessor evidence"))?;
             previous_intake.superseded_by = Some(epic.to_string());
             for ticket in issues.iter().filter(|ticket| {
-                previous_plan.tickets.contains(&ticket.front.id)
-                    && !intake.outcomes.contains_key(&ticket.front.id)
+                retired.contains(ticket.front.id.as_str())
                     && ticket.front.status == "ready"
                     && ticket.front.claim.is_none()
+                    && !ticket.front.refs.iter().any(|reference| {
+                        reference.kind == "worktree" && reference.closed != Some(true)
+                    })
             }) {
                 let mut front = ticket.front.clone();
                 front.status = "backlog".to_string();

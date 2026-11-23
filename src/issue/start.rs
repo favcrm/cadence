@@ -379,10 +379,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
     }
     let (project, dir) = write::issue_dir(pm, id)?;
-    // CAD-360: the plan gate, before anything is created — `issue
-    // start`, `dispatch` and `dispatch --job` all come through here.
-    let (initial_front, initial_body) = write::load_front(&dir)?;
-    crate::issue::plan::gate(&pm.dir, &initial_front, &initial_body)?;
+    let (initial_front, _) = write::load_front(&dir)?;
     // CAD-202: a pty assignee whose pane cwd is deleted or outside the
     // project's repos refuses here, before anything is created.
     let mut cloud = false;
@@ -478,6 +475,9 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     // records the lane refs.
     let lock = pm.lock()?;
     let (mut front, body) = write::load_front(&dir)?;
+    // An intake revision can retire this scope while we resolve the lane.
+    // Admit the current plan under the same tracker lock as the claim.
+    crate::issue::plan::gate(&pm.dir, &front, &body)?;
     let front_id = front.id.clone();
     // CAD-383: a doing/review issue held by someone else refuses before
     // any lane is touched; a take-over is its own commit, made now.

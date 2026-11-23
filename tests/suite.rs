@@ -19726,6 +19726,36 @@ depends_on: 1
     assert_eq!(issue_count(), count);
     assert_eq!(std::fs::read(&existing).unwrap(), original);
 
+    let manifest = repo.join("docs/cadence/project-context.yaml");
+    let valid_manifest = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        valid_manifest.replace("project: cadence", "project: other"),
+    )
+    .unwrap();
+    git(&repo, &["add", "docs/cadence/project-context.yaml"]);
+    git(&repo, &["commit", "-qm", "Conflicting project context"]);
+    let conflicting = draft.replace("Deliver the scoped outcome", "A different outcome");
+    let refusal = plan::propose(
+        &pm,
+        "cadence",
+        &conflicting,
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_context_unavailable"),
+        "{refusal:?}"
+    );
+    assert_eq!(issue_count(), count);
+    std::fs::write(&manifest, valid_manifest).unwrap();
+    git(&repo, &["add", "docs/cadence/project-context.yaml"]);
+    git(&repo, &["commit", "-qm", "Restore project context"]);
+
     let refusal = write::decide_plan(&pm, &epic, true, "operator", None).unwrap_err();
     assert_eq!(
         refusal.code(),
@@ -19772,6 +19802,58 @@ depends_on: 1
         .unwrap_err()
         .to_string();
     assert!(blocked.contains("CAD-1"), "{blocked}");
+
+    let linked = r#"---
+title: Deliver linked outcomes
+goal: Deliver both outcomes
+intake:
+  constraints: [Preserve the integration]
+  success_criteria: [Both outcomes are available]
+  unknowns: []
+---
+
+## Prerequisite
+sources: scope
+paths: src/module.rs
+
+### Acceptance
+- [ ] Prerequisite is available
+
+## Dependent
+sources: scope
+paths: src/module.rs
+depends_on: 1
+
+### Acceptance
+- [ ] Dependent outcome is available
+"#;
+    let linked_plan = plan::propose(&pm, "cadence", linked, None, &allow, "acceptance", &|| {
+        Ok(Default::default())
+    })
+    .unwrap();
+    let linked_epic = linked_plan["epic"].as_str().unwrap();
+    let prerequisite = linked_plan["tickets"][0].as_str().unwrap();
+    let dependent = linked_plan["tickets"][1].as_str().unwrap();
+    write::decide_plan(&pm, linked_epic, true, "operator", None).unwrap();
+    plan::gate_id(&pm.dir, dependent).unwrap();
+    cadence_agent::issue::edit::edit(
+        &pm,
+        prerequisite,
+        &cadence_agent::issue::edit::EditSpec {
+            set: vec!["status=dropped".into()],
+            ..Default::default()
+        },
+        "acceptance",
+        None,
+    )
+    .unwrap();
+    let refusal = plan::gate_id(&pm.dir, dependent).unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    let dependent_text =
+        std::fs::read_to_string(pm.dir.join("cadence").join(dependent).join("issue.md")).unwrap();
+    let (dependent_front, _) = cadence_agent::issue::parse::parse_issue(&dependent_text).unwrap();
+    assert!(dependent_front.claim.is_none());
+
     std::fs::write(repo.join("docs/scope.md"), "Revised scope\n").unwrap();
     git(&repo, &["add", "docs/scope.md"]);
     git(&repo, &["commit", "-qm", "Revise scope"]);

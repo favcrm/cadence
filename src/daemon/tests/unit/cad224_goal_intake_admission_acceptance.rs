@@ -1,6 +1,5 @@
 use super::*;
 use crate::issue::{board, plan, write, Pm};
-use crate::secret::Allowlist;
 use crate::test_seam::{scoped, Asserted};
 
 #[test]
@@ -50,19 +49,6 @@ fn approved_intake_after_restart_refuses_provider_attention_without_dispatch() {
     )
     .unwrap();
     let draft = "---\ntitle: Deliver capability\ngoal: Deliver the scoped capability\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Capability available]\n  unknowns: []\n---\n\n## Implement capability\nagent: worker-1\nsources: scope\npaths: src/module.rs\n\n### Acceptance\n- [ ] Capability is available\n";
-    let proposal = plan::propose(
-        &pm,
-        "cadence",
-        draft,
-        None,
-        &Allowlist::default(),
-        "acceptance",
-        &|| Ok(Default::default()),
-    )
-    .unwrap();
-    let epic = proposal["epic"].as_str().unwrap();
-    let issue = proposal["tickets"][0].as_str().unwrap();
-    write::decide_plan(&pm, epic, true, "operator", None).unwrap();
     drop(pm);
 
     let opts = ServeOptions {
@@ -72,6 +58,17 @@ fn approved_intake_after_restart_refuses_provider_attention_without_dispatch() {
     opts.provider_env
         .set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let shared = Shared::new(dir.path(), &opts).unwrap();
+    let request = json!({"project": "cadence", "text": draft});
+    let proposal = scoped(Asserted::Operator, || {
+        shared.rpc_plan_propose(&request, std::process::id())
+    })
+    .unwrap();
+    let epic = proposal["epic"].as_str().unwrap();
+    let issue = proposal["tickets"][0].as_str().unwrap();
+    scoped(Asserted::Operator, || {
+        shared.rpc_plan_decide(&json!({"epic": epic}), std::process::id(), true)
+    })
+    .unwrap();
     let master = crate::master::ALIAS;
     register(&shared, dir.path(), master);
     shared
@@ -101,6 +98,33 @@ fn approved_intake_after_restart_refuses_provider_attention_without_dispatch() {
         .unwrap();
     drop(shared);
     let shared = Shared::new(dir.path(), &opts).unwrap();
+    let event_counts = || {
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        ["plan_proposed", "plan_approved"].map(|kind| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = ?1",
+                [kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        })
+    };
+    let before_events = event_counts();
+    assert_eq!(before_events, [1, 1]);
+    let before_head = git(&pm_dir, &["rev-parse", "HEAD"]);
+    let before_replay_queue = shared.store.queued_count("worker-1").unwrap();
+    let replay = scoped(Asserted::Operator, || {
+        shared.rpc_plan_propose(&request, std::process::id())
+    })
+    .unwrap();
+    assert_eq!(replay["epic"], epic);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(git(&pm_dir, &["rev-parse", "HEAD"]), before_head);
+    assert_eq!(event_counts(), before_events);
+    assert_eq!(
+        shared.store.queued_count("worker-1").unwrap(),
+        before_replay_queue
+    );
     let pm = Pm::at(&pm_dir).unwrap();
     let before = board::find_issue(&pm.dir, issue).unwrap();
     assert_eq!(before.front.status, "ready");

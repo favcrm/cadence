@@ -197,9 +197,10 @@ impl GoalIntake {
             .outcomes
             .get(&front.id)
             .ok_or_else(|| stale(format!("{} has no recorded outcome", front.id)))?;
-        if (outcome.reused && front.status == "dropped")
-            || outcome.scope_digest != scope_digest(front, body)?
-        {
+        if front.status == "dropped" {
+            return Err(stale(format!("{} was dropped, not completed", front.id)));
+        }
+        if outcome.scope_digest != scope_digest(front, body)? {
             return Err(stale(format!("{} scope or acceptance changed", front.id)));
         }
         Ok(())
@@ -209,10 +210,8 @@ impl GoalIntake {
     /// invalidate the outcomes that cite them. Unrelated commits are safe.
     pub(crate) fn require_sources(&self, project: &Project, issue: Option<&Front>) -> Result<()> {
         let affected = || {
-            self.outcomes.iter().filter(move |(id, outcome)| {
-                issue.is_none_or(|front| {
-                    &front.id == *id || (outcome.reused && front.blocked_by.contains(id))
-                })
+            self.outcomes.iter().filter(move |(id, _)| {
+                issue.is_none_or(|front| &front.id == *id || front.blocked_by.contains(id))
             })
         };
         let cited: BTreeSet<&str> = affected()
