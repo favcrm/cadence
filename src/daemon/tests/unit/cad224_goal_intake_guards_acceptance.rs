@@ -366,14 +366,84 @@ fn intake_native_start_refuses_unready_dependency_and_old_base_without_claim() {
 }
 
 #[test]
+fn intake_reused_lane_checks_its_old_base_even_with_newer_explicit_base() {
+    let fx = IntakeFixture::new();
+    let draft = LINKED_INTAKE.replace("paths: src/module.rs", "paths: README");
+    let original = fx.propose(&draft);
+    let epic = original["epic"].as_str().unwrap();
+    let issue = original["tickets"][0].as_str().unwrap();
+    fx.approve(epic);
+
+    let started = fx.start(issue, Some(fx.old_base.clone())).unwrap();
+    let lane = std::path::PathBuf::from(started["worktree"].as_str().unwrap());
+    assert!(lane.join("README").is_file());
+    assert!(!lane.join("src/module.rs").exists());
+    let (_, dir) = write::issue_dir(&fx.pm, issue).unwrap();
+    let (mut front, body) = write::load_front(&dir).unwrap();
+    front.paths.push("src/module.rs".into());
+    write::save_front(&dir, &front, &body).unwrap();
+    fx.pm
+        .commit(&[dir.join("issue.md")], "Map module in revised scope")
+        .unwrap();
+    let revision = format!(
+        "---\ntitle: Revise prerequisite\ngoal: Deliver the prerequisite\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Prerequisite available]\n  unknowns: []\n  revises: {epic}\n---\n\n## Prerequisite\nsources: scope\npaths: src/module.rs\nreuse: {issue}\n\n### Acceptance\n- [ ] Prerequisite is available\n"
+    );
+    let revised = fx.propose(&revision);
+    fx.approve(revised["epic"].as_str().unwrap());
+    plan::gate_id(&fx.pm.dir, issue).unwrap();
+
+    let newer_base = git(&fx.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let before = fx.snapshot(issue);
+    let refusal = fx.start(issue, Some(newer_base)).unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert_eq!(fx.snapshot(issue), before);
+    assert!(!lane.join("src/module.rs").exists());
+}
+
+#[test]
 fn intake_start_rechecks_changed_scope_before_locked_claim() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
     let fx = IntakeFixture::new();
-    let proposal = fx.propose(LINKED_INTAKE);
-    fx.approve(proposal["epic"].as_str().unwrap());
+    let draft = LINKED_INTAKE.replace(
+        "- [ ] Prerequisite is available",
+        "- [ ] Prerequisite is available\n- [ ] Additional property",
+    );
+    let proposal = fx.propose(&draft);
+    let epic = proposal["epic"].as_str().unwrap();
+    fx.approve(epic);
     let issue = proposal["tickets"][0].as_str().unwrap();
+    let (_, issue_dir) = write::issue_dir(&fx.pm, issue).unwrap();
+    let (front, body) = write::load_front(&issue_dir).unwrap();
+    let qualified = body.replace(
+        "- [ ] Prerequisite is available\n- [ ] Additional property\n",
+        "- [ ] Prerequisite is available\n  Under production traffic\n- [ ] Additional property\n",
+    );
+    assert_ne!(qualified, body);
+    write::save_front(&issue_dir, &front, &qualified).unwrap();
+    fx.pm
+        .commit(&[issue_dir.join("issue.md")], "Qualify prerequisite scope")
+        .unwrap();
+    let revision = format!(
+        "---\ntitle: Qualify prerequisite\ngoal: Deliver the prerequisite\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Prerequisite available]\n  unknowns: []\n  revises: {epic}\n---\n\n## Prerequisite\nsources: scope\npaths: src/module.rs\nreuse: {issue}\n\n### Acceptance\n- [ ] Prerequisite is available\n- [ ] Additional property\n"
+    );
+    let revised = fx.propose(&revision);
+    fx.approve(revised["epic"].as_str().unwrap());
+    plan::gate_id(&fx.pm.dir, issue).unwrap();
+    let checked = qualified.replace(
+        "- [ ] Prerequisite is available",
+        "- [x] Prerequisite is available",
+    );
+    assert_ne!(checked, qualified);
+    write::save_front(&issue_dir, &front, &checked).unwrap();
+    fx.pm
+        .commit(
+            &[issue_dir.join("issue.md")],
+            "Check prerequisite criterion",
+        )
+        .unwrap();
+    plan::gate_id(&fx.pm.dir, issue).unwrap();
     let before = fx.snapshot(issue);
     let changed = Rc::new(RefCell::new(None));
     let recorded = Rc::clone(&changed);
@@ -387,10 +457,12 @@ fn intake_start_rechecks_changed_scope_before_locked_claim() {
         let _lock = pm.lock().unwrap();
         let (_, dir) = write::issue_dir(&pm, &id).unwrap();
         let (front, body) = write::load_front(&dir).unwrap();
-        let body = body.replace(
-            "Prerequisite is available",
-            "Prerequisite changed after preflight",
+        let changed = body.replace(
+            "- [x] Prerequisite is available\n  Under production traffic\n- [ ] Additional property\n",
+            "- [x] Prerequisite is available\n- [ ] Additional property\n  Under production traffic\n",
         );
+        assert_ne!(changed, body);
+        let body = changed;
         write::save_front(&dir, &front, &body).unwrap();
         pm.commit(&[dir.join("issue.md")], "Change intake scope during start")
             .unwrap();
@@ -419,7 +491,6 @@ fn intake_cannot_approve_revision_through_unapproved_predecessor() {
     let fx = IntakeFixture::new();
     let a = fx.propose(LINKED_INTAKE);
     let a_id = a["epic"].as_str().unwrap();
-    fx.approve(a_id);
     let revision = |previous: &str, title: &str| {
         format!(
         "---\ntitle: {title}\ngoal: Deliver another outcome\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Outcome available]\n  unknowns: []\n  revises: {previous}\n---\n\n## {title}\nsources: scope\npaths: src/module.rs\n\n### Acceptance\n- [ ] Outcome is available\n"
@@ -429,42 +500,47 @@ fn intake_cannot_approve_revision_through_unapproved_predecessor() {
     let b_id = b["epic"].as_str().unwrap();
     let c = fx.propose(&revision(b_id, "Proposed C"));
     let c_id = c["epic"].as_str().unwrap();
-    let before_head = git(&fx.pm.dir, &["rev-parse", "HEAD"]);
-    let before_status = git(
-        &fx.pm.dir,
-        &["status", "--porcelain", "--untracked-files=all"],
-    );
-    let ids = [
-        a_id,
-        b_id,
-        c_id,
-        a["tickets"][0].as_str().unwrap(),
-        a["tickets"][1].as_str().unwrap(),
-    ];
-    let files: Vec<_> = ids
-        .iter()
-        .map(|id| std::fs::read(fx.pm.dir.join("cadence").join(id).join("issue.md")).unwrap())
-        .collect();
-    let refusal = write::decide_plan(&fx.pm, c_id, true, "operator", None).unwrap_err();
-    assert_eq!(
-        refusal.code(),
-        Some("plan_revision_noncontinuous"),
-        "{refusal:?}"
-    );
-    assert_eq!(git(&fx.pm.dir, &["rev-parse", "HEAD"]), before_head);
-    assert_eq!(
-        git(
+    let assert_refused_without_mutation = || {
+        let before_head = git(&fx.pm.dir, &["rev-parse", "HEAD"]);
+        let before_status = git(
             &fx.pm.dir,
-            &["status", "--porcelain", "--untracked-files=all"]
-        ),
-        before_status
-    );
-    for (id, expected) in ids.iter().zip(files) {
-        assert_eq!(
-            std::fs::read(fx.pm.dir.join("cadence").join(id).join("issue.md")).unwrap(),
-            expected
+            &["status", "--porcelain", "--untracked-files=all"],
         );
-    }
+        let ids = [
+            a_id,
+            b_id,
+            c_id,
+            a["tickets"][0].as_str().unwrap(),
+            a["tickets"][1].as_str().unwrap(),
+        ];
+        let files: Vec<_> = ids
+            .iter()
+            .map(|id| std::fs::read(fx.pm.dir.join("cadence").join(id).join("issue.md")).unwrap())
+            .collect();
+        let refusal = write::decide_plan(&fx.pm, c_id, true, "operator", None).unwrap_err();
+        assert_eq!(
+            refusal.code(),
+            Some("plan_revision_noncontinuous"),
+            "{refusal:?}"
+        );
+        assert_eq!(git(&fx.pm.dir, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(
+            git(
+                &fx.pm.dir,
+                &["status", "--porcelain", "--untracked-files=all"]
+            ),
+            before_status
+        );
+        for (id, expected) in ids.iter().zip(files) {
+            assert_eq!(
+                std::fs::read(fx.pm.dir.join("cadence").join(id).join("issue.md")).unwrap(),
+                expected
+            );
+        }
+    };
+    assert_refused_without_mutation();
+    fx.approve(a_id);
+    assert_refused_without_mutation();
 }
 
 #[test]

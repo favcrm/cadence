@@ -275,6 +275,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     })
     .unwrap();
     register(&shared, dir.path(), "worker-1");
+    register(&shared, dir.path(), "dispatcher");
     shared
         .store
         .register_agent(&NewAgent {
@@ -352,7 +353,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
         "alias": "worker-1",
         "issue": issue,
         "text": "Begin the approved work",
-        "reply_to": "worker-1",
+        "reply_to": "dispatcher",
         "message": accepted_message,
         "intake_revision": epic,
         "intake_scope": scope,
@@ -386,7 +387,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             None,
             None,
             Some("worker-1"),
-            Some("Capability is available"),
+            Some("Retired criterion"),
         )
         .unwrap();
     shared
@@ -419,6 +420,29 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
         json!({"task": "cad224-job-t1", "by": "worker-1", "message": "cad224-job-message"});
     let accepted_job = shared.rpc_task_dispatch(&job_request).unwrap();
     assert_eq!(accepted_job["duplicate"], false, "{accepted_job}");
+    let accepted_job_id = accepted_job["message"].as_str().unwrap();
+    let accepted_body = shared.store.message(accepted_job_id).unwrap().unwrap().body;
+    assert!(
+        accepted_body.contains("1) [ ] \"Capability is available\" (approved issue criteria)"),
+        "{accepted_body}"
+    );
+    assert!(
+        accepted_body.contains("Recorded task acceptance: \"Retired criterion\""),
+        "{accepted_body}"
+    );
+    assert!(
+        accepted_body.contains("earlier inherited issue checklist is historical"),
+        "{accepted_body}"
+    );
+    assert_eq!(
+        shared
+            .store
+            .task("cad224-job-t1")
+            .unwrap()
+            .acceptance
+            .as_deref(),
+        Some("Retired criterion")
+    );
     let queue_with_job = shared.store.queued_count("worker-1").unwrap();
     assert_eq!(queue_with_job, accepted_queue + 1);
 
@@ -493,7 +517,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
                         "alias": "worker-1",
                         "issue": issue,
                         "text": "Begin the approved work",
-                        "reply_to": "worker-1",
+                        "reply_to": "dispatcher",
                         "message": direct_message,
                         "intake_revision": epic,
                         "intake_scope": scope,
@@ -522,6 +546,106 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
         );
     }
 
+    // A revision can carry exactly the same scope and keep the live gate
+    // valid, but a kickoff prepared against its predecessor is still stale.
+    let revision = format!(
+        "---\ntitle: Carry the capability\ngoal: Deliver the scoped capability\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Capability available]\n  unknowns: []\n  revises: {epic}\n---\n\n## Implement capability\nsources: scope\npaths: src/module.rs\nreuse: {issue}\n\n### Acceptance\n- [ ] Capability is available\n"
+    );
+    let proposed = plan::propose(
+        &pm,
+        "cadence",
+        &revision,
+        None,
+        &crate::secret::Allowlist::default(),
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap();
+    let revised_epic = proposed["epic"].as_str().unwrap().to_string();
+    let before_head = git(&pm_dir, &["rev-parse", "HEAD"]);
+    let before_issue = std::fs::read(issue_dir.join("issue.md")).unwrap();
+    let before_lanes = git(&repo, &["worktree", "list", "--porcelain"]);
+    let before_task = shared.store.task("cad224-fresh-task").unwrap().to_json();
+    let before_queue = shared.store.queued_count("worker-1").unwrap();
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let recorded = std::rc::Rc::clone(&seen);
+    let revision_pm = pm_dir.clone();
+    let revision_id = revised_epic.clone();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        if point != "intake-pre-enqueue" {
+            return;
+        }
+        assert!(recorded.borrow().is_none(), "enqueue seam ran twice");
+        let pm = Pm::at(&revision_pm).unwrap();
+        write::decide_plan(&pm, &revision_id, true, "operator", None).unwrap();
+        *recorded.borrow_mut() = Some(git(&revision_pm, &["rev-parse", "HEAD"]));
+    })));
+    let revision_message = "cad224-late-revision";
+    let old_proof_request = json!({
+        "alias": "worker-1",
+        "issue": issue,
+        "text": "Begin the approved work",
+        "reply_to": "dispatcher",
+        "message": revision_message,
+        "intake_revision": epic,
+        "intake_scope": scope,
+    });
+    let result = scoped(Asserted::Operator, || {
+        shared.rpc_dispatch_send(&old_proof_request, std::process::id())
+    });
+    crate::issue::lockseam::set_hook(None);
+    let refusal = result.unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(
+        refusal
+            .to_string()
+            .contains("changed while the kickoff was being prepared"),
+        "{refusal:?}"
+    );
+    let revision_head = seen
+        .borrow()
+        .clone()
+        .expect("revision was approved at the seam");
+    assert_ne!(revision_head, before_head);
+    assert_eq!(git(&pm_dir, &["rev-parse", "HEAD"]), revision_head);
+    assert_eq!(
+        std::fs::read(issue_dir.join("issue.md")).unwrap(),
+        before_issue
+    );
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        before_lanes
+    );
+    assert_eq!(shared.store.queued_count("worker-1").unwrap(), before_queue);
+    assert_eq!(
+        shared.store.task("cad224-fresh-task").unwrap().to_json(),
+        before_task
+    );
+    assert!(!shared.store.message_exists(revision_message).unwrap());
+    let (live_front, live_body) = write::load_front(&issue_dir).unwrap();
+    assert_eq!(
+        plan::gate_snapshot(&pm.dir, &live_front, &live_body).unwrap(),
+        Some(revised_epic)
+    );
+    assert_eq!(plan::scope_digest(&live_front, &live_body).unwrap(), scope);
+    let stale_proof_message = "cad224-old-proof";
+    let mut stale_proof_request = old_proof_request.clone();
+    stale_proof_request["message"] = json!(stale_proof_message);
+    let refusal = scoped(Asserted::Operator, || {
+        shared.rpc_dispatch_send(&stale_proof_request, std::process::id())
+    })
+    .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(refusal.to_string().contains("not prepared"), "{refusal:?}");
+    assert!(!shared.store.message_exists(stale_proof_message).unwrap());
+    let replay = scoped(Asserted::Operator, || {
+        shared.rpc_dispatch_send(&accepted_request, std::process::id())
+    })
+    .unwrap();
+    assert_eq!(replay["duplicate"], true, "{replay}");
+    assert_eq!(replay["message"], accepted_message);
+    assert_eq!(shared.store.queued_count("worker-1").unwrap(), before_queue);
+
     std::fs::write(repo.join("docs/scope.md"), "Changed scope\n").unwrap();
     git(&repo, &["add", "docs/scope.md"]);
     git(&repo, &["commit", "-qm", "Change cited scope"]);
@@ -544,6 +668,19 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     let replay_job = shared.rpc_task_dispatch(&job_request).unwrap();
     assert_eq!(replay_job["duplicate"], true, "{replay_job}");
     assert_eq!(replay_job["message"], accepted_job["message"]);
+    assert_eq!(
+        shared.store.message(accepted_job_id).unwrap().unwrap().body,
+        accepted_body
+    );
+    assert_eq!(
+        shared
+            .store
+            .task("cad224-job-t1")
+            .unwrap()
+            .acceptance
+            .as_deref(),
+        Some("Retired criterion")
+    );
     let replay_monitor = scoped(Asserted::Operator, || {
         shared.rpc_monitor_dispatch(
             &json!({"monitor": "cad224-monitor", "task": "cad224-job-t1"}),
@@ -597,7 +734,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
                 "alias": "worker-1",
                 "issue": issue,
                 "text": "Begin the approved work",
-                "reply_to": "worker-1",
+                "reply_to": "dispatcher",
                 "message": message,
                 "intake_revision": epic,
                 "intake_scope": scope,
