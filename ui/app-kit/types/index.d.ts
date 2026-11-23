@@ -169,6 +169,20 @@ export interface ScreenScope {
   contextId?: string;
 }
 
+/** One param of a view declared in `screens.json` (CAD-2555). */
+export interface ScreenViewParamDeclaration {
+  type: "date" | "string" | "enum";
+  /** `enum` only: the allowed values. */
+  values?: string[];
+  required?: boolean;
+  /**
+   * `enum` only (CAD-2710): the words the board shows for a value, `{ "<value>": { "<locale>": "<text>" } }`.
+   * Keys must be declared `values`; each lists 1 to 8 locales, up to 40 characters, no control characters.
+   * A value without one is shown humanized. Enum values themselves are unchanged.
+   */
+  labels?: Record<string, Record<string, string>>;
+}
+
 export interface ScreenRoute<Section extends string = string, View extends string = "list" | "new"> {
   section: Section;
   view: View;

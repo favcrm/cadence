@@ -17,7 +17,7 @@ import { readAppScopeFresh, type AppContext, type Installation } from "../worksp
 import { closeTab, patchAppViewRoute, type CanvasTab } from "./canvasStore";
 import type { AppViewRef } from "./appView";
 import { setQueryParams } from "../workspace-apps/screen/routeParams";
-import { optionsLine } from "./viewParams";
+import { declaredOptionLabel, optionsLine } from "./viewParams";
 import ViewHeader from "./ViewHeader";
 
 type Load =
@@ -94,7 +94,7 @@ export default function AppViewBody({ tab, app, sheet, tabbed, tabRow, expanded,
   // The frame's own navigation stays on this tab; it never reaches the board URL.
   const onRoute = useCallback((patch: RoutePatch) => patchAppViewRoute(tab.id, patch), [tab.id]);
   const href = app.fromCard === true ? (load.status === "ready" ? installationHref(load.installation, app) : null) : app.href;
-  const options = optionsLine(app.route.params, locale, t);
+  const options = optionsLine(app.route.params, locale, t, declaredOptionLabel(load.status === "ready" ? load.installation.views : null, app.viewId, locale));
   const openLabel = t("Open in {app}").replace("{app}", appName);
   const denied = <p className="cv-appview-note" role="alert">{t("No access")}</p>;
   const failure = (state: ScreenPaneState, retry: () => void) =>

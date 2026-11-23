@@ -1880,6 +1880,17 @@ pub(crate) fn describe_id(pm: &Pm, catalog: &Catalog, id: &InstallationId) -> Re
 }
 
 fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value> {
+    describe_with(root, catalog, id, false)
+}
+
+/// `with_views` adds the declared `views` (CAD-2710) for the single-installation read only;
+/// list rows and every other caller leave the key out.
+fn describe_with(
+    root: &Root,
+    catalog: &Catalog,
+    id: &InstallationId,
+    with_views: bool,
+) -> Result<Value> {
     catalog.require_current(root)?;
     catalog.installation(root, id)?;
     let entry = &catalog.installations[id];
@@ -1982,9 +1993,13 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
             json!({"name":name,"inputs":inputs,"source_digest":source_digest,"label":label,"capability_slots":capability_slots,"distinct":distinct,"execution":execution})
         })
         .collect::<Vec<_>>();
-    Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"compatibility":compatibility,"source":record.source,"catalogue":record.catalogue,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"smtp_custody":crate::issue::app_screen_pkg::declares_smtp_custody(&files, &manifest.app),"whatsapp_door":crate::issue::app_screen_pkg::declares_whatsapp_door(&files, &manifest.app),"navigation":crate::issue::app_screen_pkg::single_screen_navigation(&files, &manifest.app),"i18n":manifest.display_i18n(),"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
-    )
+    let (navigation, views) =
+        crate::issue::app_screen_pkg::single_screen_navigation_and_views(&files, &manifest.app);
+    let mut row = json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"compatibility":compatibility,"source":record.source,"catalogue":record.catalogue,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"smtp_custody":crate::issue::app_screen_pkg::declares_smtp_custody(&files, &manifest.app),"whatsapp_door":crate::issue::app_screen_pkg::declares_whatsapp_door(&files, &manifest.app),"navigation":navigation,"i18n":manifest.display_i18n(),"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows });
+    if with_views {
+        row["views"] = views;
+    }
+    Ok(row)
 }
 /// CAD-1189: catalog reads take no lock. Every writer journals first
 /// (`*-pending.yaml`) and publishes `catalog.yaml` atomically, so a read
@@ -2176,7 +2191,7 @@ pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     read_catalog(pm, || {
         let catalog = Catalog::load(&pm.dir)?;
         let root = Root::open(&pm.dir)?;
-        describe(&root, &catalog, &id)
+        describe_with(&root, &catalog, &id, true)
     })
 }
 
@@ -2592,6 +2607,8 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
             "host_contract": "screen-records.v1", "may": [],
             "navigation": {"section_query": "section", "default_section": "c", "sections": [{"id": "c", "label": "Customers", "i18n": {"zh-TW": {"label": "客戶"}}}]}
         });
+        let mut screen = screen;
+        screen["views"] = serde_json::json!([{"id":"pnl","label":{"en":"P"},"section":"c"}]);
         std::fs::create_dir_all(src.join("screens/main")).unwrap();
         std::fs::write(src.join("screens/main/client.js"), js).unwrap();
         std::fs::write(src.join("screens/main/screens.json"), screen.to_string()).unwrap();
@@ -2619,5 +2636,11 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
             ),
             (&json!("客戶管理"), &json!("輕鬆"), &json!("客戶"))
         );
+        // CAD-2710: only the single-installation read carries the declared views.
+        assert!(desc.get("views").is_none());
+        assert!(list(&pm).unwrap()[0].get("views").is_none());
+        let shown = show(&pm, out["install_id"].as_str().unwrap()).unwrap();
+        assert_eq!(shown["views"][0]["id"], "pnl");
+        assert_eq!(shown["navigation"], desc["navigation"]);
     }
 }

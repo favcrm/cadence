@@ -43,7 +43,9 @@ const ViewHeader = require("../src/features/canvas/ViewHeader").default;
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const canvasStore = require("../src/features/canvas/canvasStore") as typeof import("../src/features/canvas/canvasStore");
 const chrome = require("../src/features/canvas/canvasChrome") as typeof import("../src/features/canvas/canvasChrome");
-const { optionsLine } = require("../src/features/canvas/viewParams") as typeof import("../src/features/canvas/viewParams");
+const { declaredOptionLabel, optionsLine } = require("../src/features/canvas/viewParams") as typeof import("../src/features/canvas/viewParams");
+const { ViewCard } = require("../src/features/home/ViewCard") as typeof import("../src/features/home/ViewCard");
+const { asEntry } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
 
 const settle = () => React.act(async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); });
 const el = (root: ParentNode, sel: string) => root.querySelector(sel) as HTMLElement | null;
@@ -63,6 +65,18 @@ equal(optionsLine({ q: "vip" }, "en", same), "Vip", "a value is sentence case");
 equal(optionsLine({ basis: "cash", as_at: "2026-02-30" }, "en", same), "Cash · 2026-02-30", "an impossible day is a plain value, in order");
 equal(optionsLine({ period: "Q3 2026", by: "by month" }, "en", same), "Q3 2026 · By month", "a free value only gets a capital");
 equal(optionsLine(undefined, "en", same), "", "no options, no line");
+
+// ---- CAD-2710: the app's own words for option values ----
+const declared = [{ id: "pnl", params: { compare: { labels: { prior_year: { en: "vs prior year", "zh-TW": "對比去年" } } }, columns: { labels: { monthly: { zh: "按月", en: "by month" } } } } }];
+const pnl = { from: "2026-07-01", to: "2026-09-30", compare: "prior_year", columns: "monthly" };
+equal(optionsLine(pnl, "en", same, declaredOptionLabel(declared, "pnl", "en")), "1 Jul – 30 Sep 2026 · vs prior year · by month", "declared labels replace the humanized values");
+equal(optionsLine(pnl, "zh-TW", zh, declaredOptionLabel(declared, "pnl", "zh-TW")), "7月1日 – 2026年9月30日 · 對比去年 · 按月", "exact locale, then the language prefix");
+equal(optionsLine({ compare: "prior_year" }, "fr", same, declaredOptionLabel(declared, "pnl", "fr")), "vs prior year", "then en");
+equal(optionsLine({ compare: "prior_year", columns: "weekly" }, "en", same, declaredOptionLabel(declared, "pnl", "en")), "vs prior year · Weekly", "a value without a label is humanized");
+equal(optionsLine({ columns: "monthly" }, "fr", same, declaredOptionLabel([{ id: "pnl", params: { columns: { labels: { monthly: { "zh-TW": "按月" } } } } }], "pnl", "fr")), "Monthly", "no usable locale falls back to humanize");
+for (const lookup of [declaredOptionLabel(declared, "other", "en"), declaredOptionLabel(declared, undefined, "en"), declaredOptionLabel(null, "pnl", "en"), declaredOptionLabel([{ id: "pnl" }], "pnl", "en")])
+  equal(optionsLine(pnl, "en", same, lookup), "1 Jul – 30 Sep 2026 · Prior year · Monthly", "an unlabelled declaration changes nothing");
+equal(declaredOptionLabel([{ id: "pnl", params: { compare: { labels: {} } } }], "pnl", "en")?.("compare", "constructor"), undefined, "an inherited key is not a label");
 
 // ---- the header, composed ----
 const render = (props: Record<string, unknown>) => renderToStaticMarkup(React.createElement(LocaleProvider, null, React.createElement(ViewHeader, {
@@ -194,6 +208,36 @@ assert(!chrome.canvasChrome().full, "the collapse icon restores the split");
 await click(el(hostEl, '[aria-label="Expand canvas"]')!);
 await click(el(hostEl, '[aria-label="Close canvas"]')!);
 assert(!chrome.canvasChrome().full && !document.documentElement.hasAttribute("data-canvas-full"), "closing an expanded canvas restores the board");
+
+// CAD-2710: the header and the view card read the installed declaration's labels.
+const installationBody = (views: unknown) => JSON.stringify({
+  install_id: "inst_acct", name: "accounting", title: "Accounting", state: "active", removed: null, digest: "d", files: [],
+  navigation: { section_query: "acc", default_section: "reports", sections: [{ id: "reports", label: "Reports" }] }, views,
+});
+const serve = (views: unknown) => { globalThis.fetch = (async (url: string) => new Response(String(url).endsWith("/contexts") ? '{"contexts":[]}' : installationBody(views), { status: 200 })) as typeof fetch; };
+const labelled = [{ id: "pnl", params: { compare: { labels: { prior_year: { en: "vs prior year", "zh-TW": "對比去年" } } }, columns: { labels: { monthly: { en: "by month" } } } } }];
+const labelRef = (record: string, installId: string) => ref(record, { installId, viewId: "pnl", route: { section: "reports", view: "list", record_id: record, segment_id: null, params: { from: "2026-07-01", to: "2026-09-30", compare: "prior_year", columns: "monthly", basis: "cash" } } });
+const cardEntry = (installId: string) => asEntry({ seq: 1, role: "agent", kind: "view_ref", text: "Opened", payload: { v: 1, app: "accounting", app_label: "Accounting", install_id: installId, screen_tag: "accounting", section: "reports", record_id: "pnl", title: "Profit and loss", view: "pnl", view_label: "Profit and loss", params: { from: "2026-07-01", to: "2026-09-30", compare: "prior_year", columns: "monthly", basis: "cash" } } })!;
+// A fresh install id per case: the app scope read is cached per install.
+const cardRoot = createRoot(document.body.appendChild(document.createElement("div")));
+for (const [i, [views, line]] of ([[labelled, "1 Jul – 30 Sep 2026 · vs prior year · by month · Cash"], [[{ id: "pnl", params: { compare: {} } }], "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"], [null, "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"],
+  // A malformed installation read never blanks the page (QA): bad entries are skipped, bad shapes read as no label.
+  [[null, 7, "x", { id: "pnl", params: { compare: { labels: { prior_year: { en: "vs prior year" } } }, columns: null, basis: { labels: { cash: "Cash!" } } } }], "1 Jul – 30 Sep 2026 · vs prior year · Monthly · Cash"],
+  [{ id: "pnl", params: {} }, "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"],
+  [[{ id: "pnl", params: null }], "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"],
+  [[{ id: "pnl", params: { compare: { labels: null }, columns: { labels: { monthly: null } }, basis: { labels: { cash: { en: 5 } } } } }], "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"]] as const).entries()) {
+  const installId = `inst_lbl${i}`;
+  serve(views);
+  canvasStore.resetCanvas("c1", "k", "home");
+  await React.act(async () => { canvasStore.openAppView(labelRef("l", installId)); });
+  await settle();
+  equal(el(hostEl, ".cv-meta-text")?.textContent, `Accounting · ${line}`, "the header line uses the declared labels, humanizing the rest");
+  await React.act(async () => { cardRoot.render(React.createElement(LocaleProvider, null, React.createElement(ViewCard, { entry: cardEntry(installId) }))); });
+  await settle();
+  equal(document.querySelector("[data-view-params]")?.textContent, line, "the view card line uses the declared labels, humanizing the rest");
+}
+await React.act(async () => { cardRoot.unmount(); });
+canvasStore.resetCanvas("c1", "k", "home");
 
 await React.act(async () => { root.unmount(); });
 console.log("canvas chrome tests passed");

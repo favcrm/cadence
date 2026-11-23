@@ -692,6 +692,8 @@ const MAX_VIEW_ENUM_VALUES: usize = 20;
 pub const MAX_VIEW_PARAM_VALUE: usize = 200;
 /// Longest view label, UTF-16 units (the `view_ref` card's `view_label` bound).
 const MAX_VIEW_LABEL: usize = 60;
+/// Longest label for one enum value, UTF-16 units (a navigation section label's bound).
+const MAX_VIEW_OPTION_LABEL: usize = 40;
 
 /// CAD-2555: one declared app view — a named, parameterised place in a
 /// screen ("Profit and loss" for a date range). A declaration only; it grants
@@ -733,6 +735,50 @@ pub struct ScreenViewParam {
     pub values: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub required: bool,
+    /// CAD-2710, `enum` only: value → locale → text the board shows in place
+    /// of the humanized value. Optional per value; the values themselves do
+    /// not change.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "unique_option_labels"
+    )]
+    pub labels: Option<OptionLabelMap>,
+}
+
+/// An enum param's `labels`: value → locale → text.
+pub type OptionLabelMap = BTreeMap<String, BTreeMap<String, String>>;
+
+/// One value's locale → text map, a repeated locale refused.
+struct LocaleLabels(BTreeMap<String, String>);
+
+impl<'de> Deserialize<'de> for LocaleLabels {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        unique_btreemap(d, "option label locale").map(Self)
+    }
+}
+
+/// An enum param's `labels`, a repeated value or locale refused.
+struct OptionLabels(BTreeMap<String, LocaleLabels>);
+
+impl<'de> Deserialize<'de> for OptionLabels {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        unique_btreemap(d, "option label value").map(Self)
+    }
+}
+
+fn unique_option_labels<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<OptionLabelMap>, D::Error> {
+    // Absent is `None` (serde `default`); a present `labels` must be an object, so `null` is refused.
+    let labels = OptionLabels::deserialize(d)?;
+    Ok(Some(
+        labels
+            .0
+            .into_iter()
+            .map(|(value, l)| (value, l.0))
+            .collect(),
+    ))
 }
 
 fn is_false(value: &bool) -> bool {
@@ -827,6 +873,9 @@ fn validate_views(views: &[ScreenView], nav: Option<&ScreenNavigation>) -> Resul
             if !valid_view_param_name(name) {
                 return Err(Error::rejected("invalid view param name"));
             }
+            if param.labels.is_some() && param.kind != ScreenViewParamType::Enum {
+                return Err(Error::rejected("only an enum view param declares labels"));
+            }
             match (param.kind, &param.values) {
                 (ScreenViewParamType::Enum, Some(values)) => {
                     let mut distinct = HashSet::new();
@@ -837,6 +886,24 @@ fn validate_views(views: &[ScreenView], nav: Option<&ScreenNavigation>) -> Resul
                             .all(|v| valid_view_param_value(v) && distinct.insert(v.as_str()))
                     {
                         return Err(Error::rejected("invalid view enum values"));
+                    }
+                    if param.labels.as_ref().is_some_and(|l| l.is_empty()) {
+                        return Err(Error::rejected("invalid view enum labels"));
+                    }
+                    for (value, texts) in param.labels.iter().flatten() {
+                        if !values.contains(value)
+                            || texts.is_empty()
+                            || texts.len() > MAX_I18N_LOCALES
+                            || !texts.iter().all(|(locale, text)| {
+                                valid_locale_tag(locale)
+                                    // Blank = only Unicode White_Space or U+FEFF (`trim` keeps U+FEFF).
+                                    && !text.chars().all(|c| c.is_whitespace() || c == '\u{feff}')
+                                    && text.encode_utf16().count() <= MAX_VIEW_OPTION_LABEL
+                                    && !has_disallowed_ctrl(text)
+                            })
+                        {
+                            return Err(Error::rejected("invalid view enum labels"));
+                        }
                     }
                 }
                 (ScreenViewParamType::Enum, None) => {
@@ -2467,9 +2534,41 @@ mod tests {
             Some(&["cash".to_string(), "accrual".to_string()][..])
         );
         assert!(!view.params["from"].required);
+        assert!(view.params["basis"].labels.is_none());
         // A screen without `views` still validates and reports none.
         let bare = views_manifest("[]").replacen(r#","views":[]"#, "", 1);
         assert!(validate_map(&bare, &bodies).unwrap().views().is_none());
+    }
+
+    #[test]
+    fn enum_params_carry_optional_value_labels() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let view = r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"compare":{"type":"enum","values":["prior_year","none"],"labels":{"prior_year":{"en":"vs prior year","zh-TW":"對比去年"}}}}}"#;
+        let checked = validate_map(&views_manifest(&format!("[{view}]")), &bodies).unwrap();
+        let param = &checked.views().unwrap()[0].params["compare"];
+        let labels = param.labels.as_ref().unwrap();
+        assert_eq!(labels["prior_year"]["zh-TW"], "對比去年");
+        // A value without a label is allowed, and the values are untouched.
+        assert!(!labels.contains_key("none"));
+        assert_eq!(param.values.as_ref().unwrap().len(), 2);
+        // The bound is 40 UTF-16 units.
+        let long = |n: usize| {
+            let v = format!(
+                r#"{{"id":"v","label":{{"en":"V"}},"section":"reports","params":{{"a":{{"type":"enum","values":["x"],"labels":{{"x":{{"en":"{}"}}}}}}}}}}"#,
+                "x".repeat(n)
+            );
+            validate_map(&views_manifest(&format!("[{v}]")), &bodies)
+        };
+        assert!(long(40).is_ok() && long(41).is_err());
+        // Blank means only White_Space or U+FEFF (`trim` keeps U+FEFF); FEFF inside text is fine.
+        let text = |t: &str| {
+            let v = format!(
+                r#"{{"id":"v","label":{{"en":"V"}},"section":"reports","params":{{"a":{{"type":"enum","values":["x"],"labels":{{"x":{{"en":"{t}"}}}}}}}}}}"#
+            );
+            validate_map(&views_manifest(&format!("[{v}]")), &bodies)
+        };
+        assert!(text("\u{feff}").is_err() && text("\u{a0}\u{feff}\u{2003}").is_err());
+        assert!(text("a\u{feff}b").is_ok());
     }
 
     #[test]
@@ -2510,6 +2609,18 @@ mod tests {
             r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x","x"]}}}"#,
             r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"date","extra":1}}}"#,
             r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"date"},"a":{"type":"date"}}}"#,
+            // CAD-2710: option labels
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"y":{"en":"Y"}}}}}"#, // undeclared value
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":{}}}}}"#, // empty locale map
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{}}}}"#, // empty labels
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"string","labels":{"x":{"en":"X"}}}}}"#, // not an enum
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":{"en":"X","en":"Y"}}}}}"#, // repeated locale
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":{"en":"X"},"x":{"en":"Y"}}}}}"#, // repeated value
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":{"zh_TW":"X"}}}}}"#, // bad locale tag
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":{"en":" "}}}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":{"en":"X\n"}}}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":"X"}}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":null}}}"#, // null labels
             r#"{"id":"v","label":{"en":"V","en":"W"},"section":"reports"}"#,
         ];
         for view in bad {
