@@ -20,6 +20,7 @@ import AgentForm from "./AgentForm";
 import { ConnectCard } from "./ConnectCard";
 import { RecordCard } from "./RecordCard";
 import { ViewCard } from "./ViewCard";
+import { ShareRequestCard } from "./ShareRequestCard";
 import { ACTION_MARK } from "./formModel";
 import { foldable, formReceipt, inlineTokens, lineCount, segments, type Inline } from "./operatorText";
 import { elapsedSecs, errorReason, formatElapsed, resultCount, toolKey, toolLabel, toolSubject } from "./turnText";
@@ -467,6 +468,8 @@ export function ThreadItemView({
       return <RecordCard entry={item.entry} density={density} />;
     case "view":
       return <ViewCard entry={item.entry} density={density} />;
+    case "share":
+      return <ShareRequestCard entry={item.entry} density={density} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.
@@ -1350,6 +1353,8 @@ export function ThreadTurn({
               <div key={item.key} data-item-key={item.key} {...fadeProps}><RecordCard entry={item.entry} density={density} /></div>
             ) : item.type === "view" ? (
               <div key={item.key} data-item-key={item.key} {...fadeProps}><ViewCard entry={item.entry} density={density} /></div>
+            ) : item.type === "share" ? (
+              <div key={item.key} data-item-key={item.key}><ShareRequestCard entry={item.entry} density={density} /></div>
             ) : item.type === "artifact" || item.type === "image" || item.type === "video" ? (
               <div key={item.key} data-item-key={item.key} {...(item.type === "artifact" ? fadeProps : { className: "turn-image" })}>
                 {item.type === "image" ? <ImageBlock entry={item.entry} /> : item.type === "video" ? <VideoBlock entry={item.entry} /> : <ArtifactCard entry={item.entry} density={density} />}

@@ -1,6 +1,7 @@
 import { useEffect, useSyncExternalStore } from "react";
-import { subscribeMasterChanged } from "../../lib/masterChanged";
 import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
+import { requestThreadReload, subscribeMasterChanged } from "../../lib/masterChanged";
+import { decideShareRequest, type ShareOutcome } from "../home/shareRequest";
 import { failureReason, outcomeOf, parseStagedList, type StagedOutcome, type StagedWrite } from "./stagedWrite";
 
 /**
@@ -22,8 +23,10 @@ export type Attempt =
   | { phase: "unconfirmed"; verb: Verb }
   /** The server refused the owner (403). */
   | { phase: "access" }
-  /** It was decided, or is gone, by someone else. */
-  | { phase: "elsewhere" };
+  /** It was decided, or is gone, by someone else. `winner`: a share request's 409, naming who decided. */
+  | { phase: "elsewhere"; winner?: Extract<ShareOutcome, { kind: "already" }> }
+  /** AOS-711: the report could not be prepared; the request is still pending and Share can be tried again. */
+  | { phase: "snapshot" };
 
 export type Verb = "approve" | "deny";
 export type DecideResult = "decided" | "elsewhere" | "access" | "unconfirmed";
@@ -35,6 +38,8 @@ export interface DecisionNotice {
   reason?: string;
   /** A connected draft or send: its outcome reads Sent or Drafted. */
   effect?: "draft" | "send";
+  /** AOS-711: a share request, whose outcome reads Shared or Declined. */
+  share?: true;
 }
 
 export interface DecisionsState {
@@ -221,7 +226,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
 
   function failedOrDone(row: StagedWrite): DecisionNotice {
     const outcome = outcomeOf(row);
-    const effect = row.connected === null ? {} : { effect: row.connected.effect };
+    const effect = row.share ? { share: true as const } : row.connected === null ? {} : { effect: row.connected.effect };
     return outcome === "failed" ? { outcome, title: row.title, reason: failureReason(row), ...effect } : { outcome, title: row.title, ...effect };
   }
 
@@ -274,6 +279,48 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
       return "unconfirmed";
     }
     return settle(id, verb, epoch);
+  }
+
+  /**
+   * AOS-711: share or decline a member's request for an owner-only report. This
+   * goes through the share-request routes, never the generic approve/deny (which
+   * cannot see the request). A 503 leaves the row pending and retryable; a 409
+   * names who decided first. Never resubmits on its own.
+   */
+  async function decideShare(id: string, verb: "share" | "decline", note?: string): Promise<DecideResult> {
+    const epoch = lifetime;
+    const current = state.rows.find((r) => r.id === id);
+    if (current === undefined || current.status !== "pending" || current.share === undefined) return "elsewhere";
+    for (const attempt of state.attempts.values()) if (attempt.phase === "busy") return "unconfirmed";
+    if (state.attempts.get(id)?.phase === "unconfirmed") return "unconfirmed";
+    setAttempt(id, { phase: "busy", verb: verb === "share" ? "approve" : "deny" });
+    const outcome = await decideShareRequest(current.share.requestId, verb, note);
+    if (epoch !== lifetime) return "unconfirmed";
+    // The thread's own card follows the request; the rail follows the list.
+    if (outcome.kind === "done" || outcome.kind === "already") requestThreadReload();
+    switch (outcome.kind) {
+      case "access":
+        setAttempt(id, { phase: "access" });
+        return "access";
+      case "snapshot":
+        setAttempt(id, { phase: "snapshot" });
+        return "unconfirmed";
+      case "already":
+      case "missing":
+        await reloadDecisions();
+        if (epoch !== lifetime) return "unconfirmed";
+        setAttempt(id, outcome.kind === "already" ? { phase: "elsewhere", winner: outcome } : { phase: "elsewhere" });
+        return "elsewhere";
+      case "unknown":
+        setAttempt(id, { phase: "unconfirmed", verb: verb === "share" ? "approve" : "deny" });
+        return "unconfirmed";
+      case "done":
+        if (holders === 0) {
+          setAttempt(id, { phase: "unconfirmed", verb: verb === "share" ? "approve" : "deny" });
+          return "unconfirmed";
+        }
+        return settle(id, verb === "share" ? "approve" : "deny", epoch);
+    }
   }
 
   /** After a reply that says it worked, trust the list, not the reply. */
@@ -366,7 +413,7 @@ export function createDecisionsStore(conversation: string | null, retain: (unres
 
   return {
     conversation,
-    acquire, release, currentDecisions, reloadDecisions, backgroundReload, decide, checkDecision,
+    acquire, release, currentDecisions, reloadDecisions, backgroundReload, decide, decideShare, checkDecision,
     clearNotice, markFailedSeen, resetDecisions, requestReview, onReviewRequest,
     subscribe(listener: () => void) {
       listeners.add(listener);

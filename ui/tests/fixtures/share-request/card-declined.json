@@ -1,0 +1,25 @@
+{
+  "role": "agent",
+  "kind": "share_request",
+  "text": "Chris declined: Not final until the audit closes. Ask again next week.",
+  "payload": {
+    "v": 1,
+    "id": "sr_0123456789abcdef0123456789abcdef",
+    "app": "accounting",
+    "app_label": "Accounting",
+    "view": "pnl",
+    "view_label": "Profit and loss",
+    "title": "Profit and loss",
+    "params": {
+      "from": "2026-07-01",
+      "to": "2026-09-30",
+      "compare": "prior_year"
+    },
+    "reason": "Preparing the Q4 budget review on Thursday.",
+    "requested_at": "2026-11-23T02:43:00.000Z",
+    "status": "declined",
+    "decided_at": "2026-11-23T03:05:00.000Z",
+    "decided_by": "Chris",
+    "note": "Not final until the audit closes. Ask again next week."
+  }
+}

@@ -3,6 +3,7 @@ import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
+import { onThreadReload } from "../../lib/masterChanged";
 import { displayUiNotice } from "../../lib/uiNotice";
 import { subscribeSse } from "../../lib/sse";
 import type { MasterState, ThreadRef } from "../../lib/types";
@@ -127,6 +128,15 @@ export default function MemberChat({
   useEffect(() => {
     void store.revalidate();
   }, [store]);
+  // AOS-711: a share request card was decided; read the newest page again so the rewritten card and its file show.
+  useEffect(
+    () =>
+      onThreadReload(() => {
+        if (store.get().data) memberWrite(store, (cur) => ({ ...cur!, tailReload: true }));
+        void store.invalidate();
+      }),
+    [store],
+  );
   const [surface, setSurface] = useState<MemberSurface | null>(null);
   const [liveTurn, setLiveTurn] = useState<{ conversation: string; message: string | null } | null>(null);
   const [pendingLook, setPendingLook] = useState<AvatarLook | null>(null);
@@ -308,7 +318,7 @@ export default function MemberChat({
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
   // Browser activity still follows the last stored item when the feed is down.
-  const tail = [...items].reverse().find((i) => !["system", "artifact", "image", "video", "hire"].includes(i.type));
+  const tail = [...items].reverse().find((i) => !["system", "artifact", "image", "video", "hire", "share"].includes(i.type));
   const turnOpen = tail !== undefined && tail.type !== "answer" && !(tail.type === "pending" && tail.pending.state === "failed");
   useBrowserFeed(conversationId, turnOpen, `${lastSeq(thread.data) ?? 0}:${thread.data?.pending?.length ?? 0}`);
 
