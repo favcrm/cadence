@@ -7,11 +7,13 @@
 /// The longest handle any derivation keeps. A longer subject is cut, so
 /// nothing longer can ever be a caller key — the store refuses such a grant
 /// rather than record one no caller could match.
-pub(crate) const HANDLE_MAX: usize = 64;
+#[doc(hidden)]
+pub const HANDLE_MAX: usize = 64;
 
 /// `raw` in the identifier grammar: every character outside the grammar
 /// becomes `_`, cut to [`HANDLE_MAX`]. Distinct subjects can collide.
-pub(crate) fn sanitized(raw: &str) -> String {
+#[doc(hidden)]
+pub fn sanitized(raw: &str) -> String {
     raw.chars()
         .map(|c| if is_ident_char(c) { c } else { '_' })
         .take(HANDLE_MAX)
@@ -20,7 +22,8 @@ pub(crate) fn sanitized(raw: &str) -> String {
 
 /// Is `raw` itself a handle: non-empty, at most `max` bytes, every
 /// character inside the grammar.
-pub(crate) fn is_handle(raw: &str, max: usize) -> bool {
+#[doc(hidden)]
+pub fn is_handle(raw: &str, max: usize) -> bool {
     !raw.is_empty() && raw.len() <= max && raw.chars().all(is_ident_char)
 }
 

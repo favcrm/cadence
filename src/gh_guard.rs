@@ -176,7 +176,8 @@ pub(crate) fn with_call_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
 /// binds (a one-shot CLI) neither writes nor obeys a pause.
 static BOUND: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-pub(crate) fn bind(state_dir: &Path) {
+#[doc(hidden)]
+pub fn bind(state_dir: &Path) {
     *BOUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(state_dir.to_path_buf());
 }
 

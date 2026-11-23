@@ -846,7 +846,7 @@ impl Shared {
                 let events = visible(&projection, events)?;
                 (events, has_older, Some(cursor))
             };
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             if scoped {
                 if let Some(hook) = &self.agent_events_selected_hook {
                     hook(&alias, &events);
@@ -935,7 +935,7 @@ impl Shared {
                     || self.closing.load(Ordering::SeqCst)
                     || Instant::now() >= deadline
                 {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-seam"))]
                     if let Some(hook) = &self.agent_events_selected_hook {
                         hook(&alias, &collected);
                     }

@@ -276,7 +276,8 @@ pub(super) fn monitoring_view(
     })
 }
 
-pub(crate) fn monitoring_unavailable(error: impl Into<String>) -> Value {
+#[doc(hidden)]
+pub fn monitoring_unavailable(error: impl Into<String>) -> Value {
     json!({
         "available": false,
         "state": "unavailable",

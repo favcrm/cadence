@@ -10,7 +10,8 @@ use crate::issue::app::CatalogueOrigin;
 
 /// What an install or upgrade request said about catalogue provenance.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CatalogueClaim {
+#[doc(hidden)]
+pub enum CatalogueClaim {
     /// The field was omitted. A fresh install or a non-catalogue update
     /// records no origin. Omitting it on a catalogue-origin install refuses.
     Absent,
@@ -24,7 +25,8 @@ pub(crate) enum CatalogueClaim {
 /// origin. `Origin` is only for a test that already bound a loopback
 /// directory; it is not a request field.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum CatalogueDirectory<'a> {
+#[doc(hidden)]
+pub enum CatalogueDirectory<'a> {
     Configured,
     /// Only the workspace catalogue tests construct this — the variant
     /// exists so a bound loopback directory can stand in for the
@@ -39,7 +41,8 @@ pub(super) struct Provenance {
     pub(super) manual: bool,
 }
 
-pub(crate) fn claim_from_object(object: &serde_json::Map<String, Value>) -> Result<CatalogueClaim> {
+#[doc(hidden)]
+pub fn claim_from_object(object: &serde_json::Map<String, Value>) -> Result<CatalogueClaim> {
     let catalogue = object.get("catalogue");
     let resolution = object.get("catalogue_resolution");
     if catalogue.is_some() && resolution.is_some() {

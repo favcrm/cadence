@@ -81,6 +81,8 @@ one_review_exclude = [
   "src/adapter/pty/**",
   "src/ui.rs",
   "src/ui/**",
+  "crates/cadence-ui/**",
+  "crates/cadence-cli/**",
   "ui/**",
   "src/operator_auth.rs",
   "src/tailnet_proof.rs",

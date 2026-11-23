@@ -317,7 +317,7 @@ def has_runnable(suite):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--package", required=True)
+    parser.add_argument("--package", action="append", required=True)
     parser.add_argument("--targets-file")
     parser.add_argument("--inventory", action="append", default=[])
     parser.add_argument("--ignored-manifest")
@@ -359,6 +359,8 @@ def main():
     suites = []
     for path in args.junit:
         suites.extend(ET.parse(path).getroot().iter("testsuite"))
+    packages = set(args.package)
+    bin_prefixes = tuple(f"{pkg}::bin/" for pkg in packages)
     if args.targets_file is not None:
         with open(args.targets_file) as handle:
             expected = [line.strip() for line in handle if line.strip()]
@@ -374,13 +376,13 @@ def main():
                 )
                 failed = True
         if not any(
-            suite.get("name") == args.package and has_runnable(suite)
+            suite.get("name") in packages and has_runnable(suite)
             for suite in suites
         ):
             print("::error::lib selection has no runnable tests", file=sys.stderr)
             failed = True
         if not any(
-            suite.get("name", "").startswith(f"{args.package}::bin/")
+            suite.get("name", "").startswith(bin_prefixes)
             and has_runnable(suite)
             for suite in suites
         ):

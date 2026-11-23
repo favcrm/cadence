@@ -1404,7 +1404,8 @@ impl Store {
     /// writer.
     #[cfg(any(test, feature = "test-seam"))]
     #[allow(dead_code)]
-    pub(crate) fn fixture_write<R>(
+    #[doc(hidden)]
+    pub fn fixture_write<R>(
         &self,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>

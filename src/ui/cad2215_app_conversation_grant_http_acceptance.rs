@@ -401,7 +401,15 @@ fn member_access_fixture() -> MemberAccess {
     roster.lock().unwrap().owner_cookie = owner.clone();
     let ana = login(&rig, "ana", "member");
     let ben = login(&rig, "ben", "member");
-    let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "{}/tests/fixtures/apps/crm",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+    );
     let installed = grant_native(&rig, "app_workspace_install", json!({"source":source}))
         .expect("real workspace app install");
     let install = installed["install_id"]
@@ -527,7 +535,15 @@ pub(super) fn master_thread_real_grant_fixture() -> (Rig, String, String, String
     let member = login(&rig, "ana", "member");
     let owner = login(&rig, "grant-owner", "owner");
     roster.lock().unwrap().owner_cookie = owner.clone();
-    let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "{}/tests/fixtures/apps/crm",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+    );
     let installed = grant_native(&rig, "app_workspace_install", json!({"source":source}))
         .expect("real workspace app install");
     let install = installed["install_id"]
@@ -582,7 +598,15 @@ fn exact_app_conversation_grant_never_widens_project_or_member_authority() {
     let ben_token = ben.split_once('=').unwrap().1;
     let ana_token = ana.split_once('=').unwrap().1;
 
-    let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "{}/tests/fixtures/apps/crm",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+    );
     let installed = grant_native(&rig, "app_workspace_install", json!({"source":source}))
         .expect("real workspace app install");
     let install = installed["install_id"].as_str().unwrap().to_string();
@@ -1131,7 +1155,15 @@ fn granted_forward_reply_watermark_and_inflight_revoke_are_reproved() {
     let owner_token = owner.split_once('=').unwrap().1;
     let ana_token = ana.split_once('=').unwrap().1;
 
-    let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "{}/tests/fixtures/apps/crm",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+    );
     let installed = grant_native(&rig, "app_workspace_install", json!({"source":source}))
         .expect("real workspace install");
     let install = installed["install_id"].as_str().unwrap().to_string();
@@ -1836,7 +1868,15 @@ fn inflight_member_read_rejects_revoked_and_regranted_epoch() {
     let owner_token = owner.split_once('=').unwrap().1;
     let ana_token = ana.split_once('=').unwrap().1;
 
-    let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "{}/tests/fixtures/apps/crm",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+    );
     let installed = grant_native(&rig, "app_workspace_install", json!({"source": source}))
         .expect("real workspace install");
     let install = installed["install_id"].as_str().unwrap().to_string();

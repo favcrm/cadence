@@ -102,53 +102,7 @@ mod cad2215_member_scope_acceptance;
 mod cad2215_private_completion_acceptance;
 mod cad2215_private_delivery_native_acceptance;
 
-/// The ONE process-wide lock arming `HOSTED_CADENCE_ASSISTANT_ENABLED` for
-/// the enabled-path fixtures in BOTH independent refusal modules
-/// (`daemon::team_assistants_refusal` and `ui::team_assistants_http_refusal`
-/// — the UI module imports this guard; two module-local locks would restore
-/// the var while the other module's positive case still runs). The env gate
-/// in `members_rpc::member_caller` / `assist_route::assistant_enabled` reads
-/// the PROCESS env, which `scripts/run-result-tests` scrubs — so every
-/// positive case holds this guard for its whole body: the flag is exactly
-/// `"true"` while held and the previous value is restored on drop (panic
-/// included). Flag-off child probes run in spawned processes with the var
-/// absent/`"false"`/garbage and never take this lock. Edition 2021 keeps
-/// `set_var`/`remove_var` safe; production default OFF is untouched — this
-/// is test-only process env, never a config or seam bypass.
-static ASSISTANT_FLAG_LOCK: Mutex<()> = Mutex::new(());
-
-/// Holds `HOSTED_CADENCE_ASSISTANT_ENABLED="true"` under
-/// [`ASSISTANT_FLAG_LOCK`] for the guard's lifetime, restoring the prior
-/// value (or absence) on drop.
-pub(crate) struct AssistantFlagOn {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl AssistantFlagOn {
-    /// Arms the rollout flag for ONE enabled-path test. Panics on poison
-    /// would hide a failing sibling's report — recover and still fail.
-    pub(crate) fn arm() -> Self {
-        let lock = ASSISTANT_FLAG_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os("HOSTED_CADENCE_ASSISTANT_ENABLED");
-        std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", "true");
-        Self {
-            _lock: lock,
-            previous,
-        }
-    }
-}
-
-impl Drop for AssistantFlagOn {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(v) => std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", v),
-            None => std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED"),
-        }
-    }
-}
+pub use super::AssistantFlagOn;
 
 /// The org (workspace) id this fixture's bindings live under — the
 /// `organization_id` pin of every minted envelope and the `company` of the

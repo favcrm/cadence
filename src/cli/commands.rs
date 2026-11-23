@@ -1533,7 +1533,7 @@ pub(crate) enum Commands {
     /// The read-only board UI + JSON API on loopback.
     Ui {
         #[command(subcommand)]
-        action: cadence_agent::ui::UiAction,
+        action: cadence_ui::UiAction,
     },
     /// One-screen fleet overview: one row per agent with state, the
     /// running message's age and head, queued/unknown counts, pane

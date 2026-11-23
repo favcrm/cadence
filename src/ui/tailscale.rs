@@ -12,7 +12,7 @@ use super::lifecycle::{http_get, kill_detached, read_pid, start_inner};
 use super::tailscale_serve;
 use super::{
     clear_persisted_share, load_opts, load_opts_strict, qr_term, refuse_share_port_change,
-    resolve_device_login, save_opts, serve_opts, validate_share_target, TailscaleAction,
+    resolve_device_login, resolve_ui_bind, save_opts, validate_share_target, TailscaleAction,
     TailscaleOpts, UiFlags, UiOpts,
 };
 use crate::error::{Error, Result};
@@ -22,7 +22,8 @@ use crate::proc::{self, BoundedError};
 
 /// One bounded, read-only `tailscale` CLI invocation. Serve mutations use
 /// the conditional LocalAPI transport in `tailscale_serve`; `funnel` is never among the args.
-pub(crate) fn ts(args: &[&str]) -> Result<std::process::Output> {
+#[doc(hidden)]
+pub fn ts(args: &[&str]) -> Result<std::process::Output> {
     tailscale_serve::validate_socket_override()?;
     let mut cmd = Command::new("tailscale");
     if let Some(socket) = std::env::var_os("CADENCE_TAILSCALE_SOCKET") {
@@ -44,13 +45,15 @@ pub(crate) fn is_ts_offline(e: &Error) -> bool {
     matches!(e, Error::Rejected(m) if m.contains("tailscale LocalAPI offline:"))
 }
 
-pub(crate) struct TsSelf {
-    pub(crate) dns_name: String,
+#[doc(hidden)]
+pub struct TsSelf {
+    pub dns_name: String,
 }
 
 /// `tailscale status --json` → the node's DNS name, with the three
 /// refusal states the operator can act on named plainly.
-pub(crate) fn ts_self() -> Result<TsSelf> {
+#[doc(hidden)]
+pub fn ts_self() -> Result<TsSelf> {
     let out = ts(&["status", "--json"])?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -138,20 +141,23 @@ pub(crate) fn prepare_mapping(
     tailscale_serve::prepare_ensure(dns, port, target)
 }
 
-pub(crate) fn ensure_mapping(dns: &str, port: u16, target: &str) -> Result<bool> {
+#[doc(hidden)]
+pub fn ensure_mapping(dns: &str, port: u16, target: &str) -> Result<bool> {
     prepare_mapping(dns, port, target)?.apply()
 }
 
 /// Remove the mapping only while it still targets what cadence
 /// recorded — a foreign or absent mapping returns false.
-pub(crate) fn remove_mapping(dns: &str, port: u16, expected: &str) -> Result<bool> {
+#[doc(hidden)]
+pub fn remove_mapping(dns: &str, port: u16, expected: &str) -> Result<bool> {
     crate::sandbox::refuse_global_unless_allowed("`tailscale serve off`")?;
     tailscale_serve::remove(dns, port, expected)
 }
 
 // ---------- `ui tailscale …` ----------
 
-pub(crate) fn tailscale_cli(state_dir: &Path, action: &TailscaleAction) -> Result<i32> {
+#[doc(hidden)]
+pub fn tailscale_cli(state_dir: &Path, action: &TailscaleAction) -> Result<i32> {
     match action {
         TailscaleAction::Start { port, read_only } => ts_start(state_dir, *port, *read_only),
         TailscaleAction::Stop => ts_stop(state_dir),
@@ -168,7 +174,8 @@ fn ts_start(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
 
 /// `ui tailscale start` with no stdout — for composed callers
 /// (session's `--fix`).
-pub(crate) fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
+#[doc(hidden)]
+pub fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
     ts_start_inner(state_dir, https_port, read_only, true)
 }
 
@@ -191,7 +198,7 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
     }
     // Validate configuration and device-login inputs before saving,
     // publishing a map, or stopping a running board.
-    let _ = serve_opts(&opts)?;
+    let _ = resolve_ui_bind(&opts)?;
     resolve_device_login(&UiFlags::default())?;
     let mapping_created = !mapping_matches(&me.dns_name, https_port, &target)?;
     save_opts(state_dir, &opts)?;

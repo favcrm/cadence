@@ -63,7 +63,8 @@ use main_ci::main_ci_view;
 #[cfg(test)]
 use main_ci::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
 pub use monitoring::monitoring;
-pub(crate) use monitoring::{monitoring_for_tasks, monitoring_unavailable};
+#[doc(hidden)]
+pub use monitoring::{monitoring_for_tasks, monitoring_unavailable};
 use needs_merge::{merge_by_subject, sort_needs};
 #[cfg(test)]
 use sources::probe_agent;
@@ -73,6 +74,7 @@ use sources::{AgentProbe, DaemonView};
 /// Git identity baked in by build.rs — `unknown` when git or a repo
 /// was absent at build time, which every consumer reads as "cannot
 /// tell", never as zero.
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const BUILD_COMMIT: &str = env!("CADENCE_BUILD_COMMIT");
 /// The full build id `cadence --version` prints (`0.1.0+<sha>`, the
 /// same concat main.rs gives clap). The board announces it in the
@@ -721,7 +723,8 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
 /// every other row after classification and the subject merge. `title`
 /// is the board's text — already one line, bounded and redacted;
 /// `since` is when the problem began (epoch secs).
-pub(crate) fn delivery_sync_row(title: &str, subject: &str, since: i64, now: i64) -> Value {
+#[doc(hidden)]
+pub fn delivery_sync_row(title: &str, subject: &str, since: i64, now: i64) -> Value {
     let mut rows = vec![item(
         120,
         "delivery_sync",

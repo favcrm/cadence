@@ -410,14 +410,14 @@ fn emit_fixture_root(election: Option<&FixtureElection>) {
         ),
     }
     let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR");
-    std::fs::write(Path::new(&out_dir).join("native_fixture_root.rs"), out)
-        .expect("emit native_fixture_root.rs");
+    let dest = Path::new(&out_dir).join("native_fixture_root.rs");
+    if std::fs::read(&dest).ok().as_deref() != Some(out.as_bytes()) {
+        std::fs::write(&dest, out).expect("emit native_fixture_root.rs");
+    }
 }
 
 fn native_fixture_root() {
     let path = Path::new(FIXTURE_DESCRIPTOR);
-    // Rebuild when the owner stages or rotates the private descriptor.
-    println!("cargo:rerun-if-changed={FIXTURE_DESCRIPTOR}");
     let valid_combo = std::env::var_os("CARGO_FEATURE_NATIVE_FIXTURE_ADMISSION").is_some()
         && std::env::var_os("CARGO_FEATURE_TEST_SEAM").is_some()
         && std::env::var("PROFILE").ok().as_deref() == Some("debug");
@@ -430,6 +430,8 @@ fn native_fixture_root() {
         emit_fixture_root(None);
         return;
     }
+    // Rebuild when the owner stages or rotates the private descriptor.
+    println!("cargo:rerun-if-changed={FIXTURE_DESCRIPTOR}");
     if !path.is_file() {
         fail("feature combo requires the owner-elected private descriptor — missing");
     }

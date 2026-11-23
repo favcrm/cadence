@@ -16,7 +16,8 @@ pub use resolve::{
     claimants_for, claimants_for_cwd, expand_home, key_for_cwd, key_for_issue, list, list_checked,
     load, normalize_remote, observe, resolve,
 };
-pub(crate) use resolve::{repo_identity, unknown_project};
+#[doc(hidden)]
+pub use resolve::{repo_identity, unknown_project};
 
 // Unknown keys are refused on every project.yaml table: a misspelled
 // policy key must fail loudly, not be dropped (CAD-170).

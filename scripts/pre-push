@@ -113,12 +113,12 @@ def focused_tests(root, changed):
         # CAD-1024: a new top-level verb in src/cli/commands.rs went red
         # on CI — the help-bucket invariant lives in cli::help tests.
         (("src/cli/commands.rs", "src/cli/help.rs"),
-         ["cargo", "test", "--bin", "cadence", "cli::help"]),
+         ["cargo", "test", "-p", "cadence-cli", "--bin", "cadence", "cli::help"]),
         # CAD-2257: the delegation tests pin risk-classes.md to risk-paths.toml
         # and read the context manifest; PR CI does not run them.
         (("docs/roles/risk-classes.md", "docs/roles/risk-paths.toml",
           "docs/cadence/project-context.yaml", "src/delegation.rs"),
-         ["cargo", "test", "--lib", "delegation::tests"]),
+         ["cargo", "test", "-p", "cadence-agent", "--lib", "delegation::tests"]),
     ]
     out = []
     for paths, argv in MAP:

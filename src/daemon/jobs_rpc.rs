@@ -14,13 +14,15 @@ use std::collections::BTreeSet;
 /// from `board_api::READER_SCOPE_FIELD` — a `job_list` document is not a
 /// `master_state` document or a thread page, and must not borrow another
 /// verb's confirmation. The board removes it before any client sees it.
-pub(crate) const JOB_SCOPE_FIELD: &str = "_job_scope";
+#[doc(hidden)]
+pub const JOB_SCOPE_FIELD: &str = "_job_scope";
 
 /// The exact value of [`JOB_SCOPE_FIELD`]: the daemon narrowed this reply for
 /// the relayed reader and re-proved its membership, project scope and
 /// private-job denials in the same answer. A missing or different value means
 /// the board cannot tell a scoped reply from a global one.
-pub(crate) const JOB_SCOPE_ACK: &str = "cad2215.jobs.v1";
+#[doc(hidden)]
+pub const JOB_SCOPE_ACK: &str = "cad2215.jobs.v1";
 
 /// The settled identity of one member-private job, proven once per scan:
 /// a unique request whose owner is the globally settled queue+ledger
@@ -253,7 +255,7 @@ impl Shared {
             out.push(j);
         }
         if private_denials.is_some() || public_principal.is_some() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             if let Some(hook) = &self.job_list_snapshot_hook {
                 hook("job_list", "");
             }
@@ -388,7 +390,7 @@ impl Shared {
             kickoffs.extend(kickoff);
         }
         jj["tasks"] = json!(tasks);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(hook) = &self.job_detail_snapshot_hook {
             hook("job_show", id);
         }
@@ -563,7 +565,7 @@ impl Shared {
         // From here to the body loop below, the kickoff admitted above is the
         // only kickoff-derived content in hand: a witness that this reply must
         // re-prove even when the later selection drops the message.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(hook) = &self.job_detail_snapshot_hook {
             hook("task_show_kickoff", &task.id);
         }
@@ -593,7 +595,7 @@ impl Shared {
             .iter()
             .map(|verdict| super::identity::verdict_json_for_scope(verdict, scope.is_some()))
             .collect::<Vec<_>>());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(hook) = &self.job_detail_snapshot_hook {
             hook("task_show", id);
         }
@@ -737,7 +739,7 @@ impl Shared {
             // The store returns oldest first; omit the extra row without
             // shifting the retained events.
             let events = &events[usize::from(has_older)..];
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             if let Some(hook) = &self.job_events_snapshot_hook {
                 hook(id);
             }
@@ -771,7 +773,7 @@ impl Shared {
                 || self.closing.load(Ordering::SeqCst)
                 || Instant::now() >= deadline
             {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-seam"))]
                 if let Some(hook) = &self.job_events_snapshot_hook {
                     hook(id);
                 }

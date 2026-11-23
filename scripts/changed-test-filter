@@ -67,7 +67,7 @@ import sys
 DAEMON_ROOT = "src/daemon/tests/"
 SUITE = "tests/suite.rs"
 LIB = "binary_id(=cadence-agent)"
-SUITE_BIN = "binary_id(=cadence-agent::suite)"
+SUITE_BIN = "binary_id(=cadence-cli::suite)"
 
 
 def git(*args):

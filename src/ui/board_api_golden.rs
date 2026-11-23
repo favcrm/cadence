@@ -6,10 +6,17 @@ use super::serve::agents_payload_from;
 use serde_json::Value;
 use std::path::PathBuf;
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates dir")
+        .parent()
+        .expect("repo root")
+        .to_path_buf()
+}
+
 pub(super) fn golden(name: &str, actual: &Value) {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src/ui/board_api_golden")
-        .join(name);
+    let path = repo_root().join("src/ui/board_api_golden").join(name);
     let text = serde_json::to_string_pretty(actual).unwrap() + "\n";
     if std::env::var_os("CADENCE_WRITE_GOLDEN").is_some() {
         std::fs::write(&path, &text).unwrap();
@@ -494,7 +501,7 @@ fn meta_bytes_are_unchanged() {
 /// this copy runs in the required `test` job on every PR and in the queue.
 #[test]
 fn committed_contract_schemas_match_core_types() {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo = repo_root();
     for (path, generated) in cadence_core::contracts::committed_schemas() {
         let committed = std::fs::read_to_string(repo.join(path)).unwrap_or_default();
         assert_eq!(

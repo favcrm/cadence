@@ -58,7 +58,8 @@ fn refusal_code(code: &str) -> bool {
 }
 
 /// The board relays a quote refusal only in the exact [`price_refusal`] shape.
-pub(crate) fn operator_price_refusal(message: &str) -> Option<&str> {
+#[doc(hidden)]
+pub fn operator_price_refusal(message: &str) -> Option<&str> {
     let code = message.strip_prefix(PRICE_REFUSED)?;
     (code.is_empty() || code.strip_prefix(": ").is_some_and(refusal_code)).then_some(message)
 }

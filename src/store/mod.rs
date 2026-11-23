@@ -162,7 +162,8 @@ pub(crate) mod scoped_cursor_keys;
 pub(crate) mod seal;
 pub(crate) use scoped_cursor_keys::CursorKeyringInit;
 pub(crate) mod wiki_transfers;
-pub(crate) use schema::open_read_only;
+#[doc(hidden)]
+pub use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
 pub use seal::OpenMode;
 // `WriteTxn` is `pub` so the `ShutdownEntriesHook` test seam (a `pub`
@@ -387,7 +388,8 @@ impl Store {
         }
     }
 
-    pub(crate) fn try_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+    #[doc(hidden)]
+    pub fn try_conn(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn
             .try_lock()
             .map_err(|_| Error::busy("store is busy"))

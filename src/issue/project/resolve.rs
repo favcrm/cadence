@@ -58,7 +58,8 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 /// The cwd's repo identity: `(main checkout root, normalised remote)`.
 /// The main checkout root comes from `--git-common-dir` so every
 /// worktree maps to the same identity.
-pub(crate) fn repo_identity(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
+#[doc(hidden)]
+pub fn repo_identity(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
     let common = git(cwd, &["rev-parse", "--git-common-dir"])?;
     let common = if Path::new(&common).is_absolute() {
         PathBuf::from(common)
@@ -411,7 +412,8 @@ pub fn observe(pm_dir: &Path, cwd: &Path, named: Option<&str>) -> Value {
     }
 }
 
-pub(crate) fn unknown_project(name: &str, pm_dir: &Path) -> Error {
+#[doc(hidden)]
+pub fn unknown_project(name: &str, pm_dir: &Path) -> Error {
     let known = list(pm_dir)
         .map(|ps| ps.iter().map(|p| p.key.clone()).collect::<Vec<_>>())
         .unwrap_or_default();

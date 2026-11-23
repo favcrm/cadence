@@ -2,6 +2,15 @@
 //!
 //! The integration target also carries acceptance checks for changed gates.
 
+pub(crate) fn repo_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates dir")
+        .parent()
+        .expect("repo root")
+        .to_path_buf()
+}
+
 #[test]
 fn an_identifier_is_validated_before_anything_uses_it() {
     assert!(cadence_agent::proto::identifier("cad1234", "issue id").is_ok());
@@ -997,9 +1006,7 @@ sys.exit(p.returncode)
 
         /// The base as it really is: the repository's own risk and one-review lists.
         fn base_files(&self) -> Value {
-            let real = |path: &str| {
-                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
-            };
+            let real = |path: &str| std::fs::read_to_string(crate::repo_root().join(path)).unwrap();
             json!({
                 ".github/workflows/ci.yml": "jobs:\n  ci:\n    runs-on: x\n",
                 RISK_PATHS: real(RISK_PATHS),
@@ -1105,8 +1112,7 @@ sys.exit(p.returncode)
             });
             let scenario_path = self.dir.path().join(".scenario.json");
             std::fs::write(&scenario_path, serde_json::to_vec(&scenario).unwrap()).unwrap();
-            let script: PathBuf =
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/enqueue-reviewed");
+            let script: PathBuf = crate::repo_root().join("scripts/enqueue-reviewed");
             let out = cadence_agent::reaper::output(
                 Command::new("python3")
                     .arg(script)
@@ -2172,8 +2178,7 @@ sys.exit(p.returncode)
         let mut case = scenario(rows("svc_std", "svc_spec"));
         case.identities = identities.clone();
         refused(&f, case, "names workflow principal");
-        let real =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(ALLOWLIST)).unwrap();
+        let real = std::fs::read_to_string(crate::repo_root().join(ALLOWLIST)).unwrap();
         let mut files = f.base_files();
         files[ALLOWLIST] = json!(real);
         let mut case = scenario(rows("svc_review_standards", "svc_review_spec"));
@@ -2261,7 +2266,7 @@ sys.exit(p.returncode)
             ("svc_review_standards", "standards", STD_FILE),
             ("svc_review_spec", "spec-security", SPEC_FILE),
         ];
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(ALLOWLIST);
+        let path = crate::repo_root().join(ALLOWLIST);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} is not in the repository: {e}", path.display()));
         let doc: toml::Table = text.parse().unwrap();
@@ -4310,9 +4315,7 @@ sys.exit(p.returncode)
         #[test]
         fn the_real_workflow_auto_paths_file_is_exactly_markdown_under_docs_and_crosses_no_src_glob(
         ) {
-            let text =
-                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(AUTO_PATHS))
-                    .unwrap();
+            let text = std::fs::read_to_string(crate::repo_root().join(AUTO_PATHS)).unwrap();
             let doc: toml::Table = text.parse().unwrap();
             let auto: Vec<&str> = doc["auto"]["paths"]
                 .as_array()
@@ -9969,7 +9972,7 @@ mod cad2100_classifier_merge_base {
     }
 
     fn real(path: &str) -> String {
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+        std::fs::read_to_string(crate::repo_root().join(path)).unwrap()
     }
 
     fn install_stub(bin: &Path, names: &[&str]) {
@@ -10264,7 +10267,7 @@ mod cad2100_classifier_merge_base {
             );
             let scenario_path = root.join(".scenario.json");
             std::fs::write(&scenario_path, serde_json::to_vec(&scenario).unwrap()).unwrap();
-            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/enqueue-reviewed");
+            let script = crate::repo_root().join("scripts/enqueue-reviewed");
             let mut cmd = Command::new("python3");
             cmd.arg(script)
                 .args(["7", "--head", &self.head, "--repo", REPO])
@@ -11392,9 +11395,7 @@ if (mode === 'keys') {
     }
 
     fn load(file: &'static str) -> Wf {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".github/workflows")
-            .join(file);
+        let path = crate::repo_root().join(".github/workflows").join(file);
         let raw =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let doc: Value = serde_yaml::from_str(&raw).unwrap_or_else(|e| panic!("{file}: {e}"));
@@ -15671,9 +15672,7 @@ mod cad2108_gate_copy {
     }
 
     fn script(name: &str) -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts")
-            .join(name);
+        let path = crate::repo_root().join("scripts").join(name);
         std::fs::read_to_string(path).unwrap()
     }
 
@@ -19171,9 +19170,7 @@ mod cad2494_acceptance {
                 "docs/roles/risk-paths.toml",
                 "docs/roles/one-review-paths.toml",
             ] {
-                let text =
-                    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(list))
-                        .unwrap();
+                let text = std::fs::read_to_string(crate::repo_root().join(list)).unwrap();
                 put(&work, list, &text);
             }
             put(&work, "src/area/lib.rs", "old\n");
@@ -19297,7 +19294,7 @@ mod cad2494_acceptance {
             });
             let scenario_path = root.join(".scenario.json");
             std::fs::write(&scenario_path, serde_json::to_vec(&scenario).unwrap()).unwrap();
-            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/enqueue-reviewed");
+            let script = crate::repo_root().join("scripts/enqueue-reviewed");
             let out = cadence_agent::reaper::output(
                 Command::new("python3")
                     .arg(script)

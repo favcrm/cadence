@@ -58,8 +58,18 @@ jobs:
       - name: Check the report against the binaries
         run: |
           set -euo pipefail
+          package_args=()
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] && package_args+=(--package "$pkg")
+          done < <(cargo metadata --no-deps --format-version 1 --locked | python3 -c '
+          import json, sys
+          m = json.load(sys.stdin)
+          d = set(m.get("workspace_default_members") or [])
+          for n in sorted({p["name"] for p in m["packages"] if not d or p["id"] in d}):
+              print(n)
+          ')
           python3 scripts/check-test-junit.py \
-            --package "$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')" \
+            "${package_args[@]}" \
             --targets-file target/nextest/cadence/expected-targets.txt \
             --complete-partition \
             --inventory target/nextest/cadence/inventory.json \

@@ -73,7 +73,8 @@ fn validate_chat_file_owner_shape(conn: &Connection) -> Result<()> {
 
 /// Read-only open of the daemon store from another process, with the
 /// shared busy timeout — never creates or migrates the file.
-pub(crate) fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
+#[doc(hidden)]
+pub fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(conn)

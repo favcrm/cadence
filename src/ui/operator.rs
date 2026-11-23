@@ -1011,9 +1011,7 @@ impl Caller {
 /// name is never sent to another board, an agent's dev server or any
 /// other service on `127.0.0.1`/`localhost`/`cadence.localhost`, whatever
 /// its port. Loopback sessions are opened and honoured on this Host only.
-pub(crate) fn board_host(port: u16) -> String {
-    format!("cadence-{port}.localhost:{port}")
-}
+pub(crate) use super::board_host;
 
 /// Where a request came from, for session binding. `Entry` is the
 /// deployment-pinned credential-entry origin: a distinct browser origin and
@@ -1078,7 +1076,7 @@ fn request_origin(request: &Request, opts: &ServeOpts) -> ReqOrigin {
 /// The public session cookie (contract §7): `__Host-` pins `Secure`,
 /// `Path=/` and no `Domain`, so a sibling host under `*.BOARD_DOMAIN`
 /// can neither toss nor overwrite it.
-pub(crate) const PUBLIC_COOKIE: &str = "__Host-aos-board-session";
+pub(crate) use super::PUBLIC_COOKIE;
 /// The unprefixed spelling the platform worker accepts inbound as a
 /// local-dev allowance — the board reads it too; it always mints the
 /// `__Host-` name.
@@ -1257,14 +1255,7 @@ fn own_origin(request: &Request, origin: Origin) -> String {
 /// The scheme a public board host speaks (contract §1): `*.localhost`
 /// is a trustworthy context where plain http applies; every real board
 /// host is https — `cadencecloud.app` sits on an HSTS-preloaded TLD.
-pub(crate) fn public_scheme(host: &str) -> &'static str {
-    let name = host.split(':').next().unwrap_or_default();
-    if name == "localhost" || name.ends_with(".localhost") {
-        "http"
-    } else {
-        "https"
-    }
-}
+pub(crate) use super::public_scheme;
 
 /// A cookie-bearing write must say where it comes from, and it must be
 /// here: `Origin` present and equal to this request's scheme + Host.

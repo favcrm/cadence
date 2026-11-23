@@ -353,7 +353,8 @@ fn public_scheme(host: &str) -> &'static str {
 /// `users/<sub>`/`service/<sub>`/`agents/<id>` map to their namespaced
 /// tail so the daemon-visible author can never read as `operator` or
 /// collide with a pane alias it does not own.
-pub(crate) fn handle_of(actor: &str, sub: &str) -> String {
+#[doc(hidden)]
+pub fn handle_of(actor: &str, sub: &str) -> String {
     let tail = actor.split_once('/').map(|(_, t)| t).unwrap_or(sub);
     crate::ident::sanitized(tail)
 }

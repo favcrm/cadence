@@ -2483,7 +2483,7 @@ fn handle(
                             .tailnet
                             .as_ref()
                             .map(|(dns, port)| tailnet_url(dns, *port)),
-                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        version: crate::overview::BUILD_VERSION.to_string(),
                         build_commit: crate::overview::BUILD_COMMIT.to_string(),
                         build_time: crate::overview::BUILD_TIME.to_string(),
                         daemon,
@@ -4714,7 +4714,7 @@ mod protected_entry_host_tests {
             });
             for (host, path, status) in cases {
                 let (actual, body) =
-                    crate::ui::http_get("127.0.0.1", port, path, host, &[]).unwrap();
+                    cadence_agent::ui::http_get("127.0.0.1", port, path, host, &[]).unwrap();
                 assert_eq!(actual, status, "{host}{path}: {body}");
                 if status == 200 {
                     assert!(body.contains(&format!("https://{board}/connections/authorize/{id}")));
