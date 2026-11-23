@@ -5,6 +5,7 @@ import { READ_ONLY_COPY } from "../home/AnswerForm";
 import { useTranslate } from "../../lib/localeText";
 import { ageText, approvable, askedBy, failureReason, isUncertain, isolate, outcomeOf, reasonText, sentFields, stagedDomain, stagedDomainLabel, titleOf, type StagedChange, type StagedDomain, type StagedWrite } from "./stagedWrite";
 import type { DecisionNotice, DecisionsState, DecisionsStore, Verb } from "./useDecisions";
+import ShareRequestDrawer from "./ShareRequestDrawer";
 import "./decisions.css";
 
 type Say = (english: string) => string;
@@ -72,8 +73,10 @@ const iso = (text: string) => `\u2068${isolate(text)}\u2069`;
 export function noticeText(n: DecisionNotice, t: Say): string {
   switch (n.outcome) {
     case "applied":
+      if (n.share) return `${t("Shared")} · ${iso(n.title)}`;
       return `${t(n.effect === "send" ? "Sent" : n.effect === "draft" ? "Drafted" : "Applied")} · ${iso(n.title)}`;
     case "denied":
+      if (n.share) return `${t("Declined")} · ${iso(n.title)}`;
       return `${t("Denied")} · ${iso(n.title)} · ${t("nothing ran")}`;
     case "failed":
       return t("{title} was approved but did not apply: {reason}. See Feed.")
@@ -651,6 +654,31 @@ export default function StagedWriteDetail({
               : t("Already decided elsewhere. See Feed.")}
         </p>
       </DrawerShell>
+    );
+  }
+
+  // AOS-711: a member's request for an owner-only report has its own drawer and its own routes.
+  if (write.share) {
+    const gone = elsewhere || attempt?.phase === "elsewhere";
+    const open = (clicks: number) => clicks <= 1 && Date.now() >= armedAt.current && block === null && pending && busy === undefined && !lost && !uncertain && !gone;
+    return (
+      <ShareRequestDrawer
+        write={write}
+        attempt={attempt}
+        busy={busy !== undefined}
+        lost={lost}
+        uncertain={uncertain}
+        elsewhere={gone}
+        block={block}
+        at={at}
+        total={n}
+        onShare={(clicks) => { if (open(clicks)) void run(() => store.decideShare(write.id, "share")); }}
+        onDecline={(note, clicks) => { if (open(clicks)) void run(() => store.decideShare(write.id, "decline", note)); }}
+        onCheck={check}
+        onContinue={advance}
+        onSkip={skip}
+        onClose={onClose}
+      />
     );
   }
 

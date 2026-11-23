@@ -1,0 +1,13 @@
+{
+  "role": "agent",
+  "kind": "artifact",
+  "text": "",
+  "payload": {
+    "id": "art-0123456789abcdef0123456789abcdef",
+    "version": 1,
+    "kind": "pdf",
+    "title": "Profit and loss \u00b7 2026-07-01 \u2013 2026-09-30 \u2013 prior_year",
+    "bytes": 48213,
+    "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

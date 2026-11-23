@@ -17,3 +17,21 @@ export function subscribeMasterChanged(listener: () => void): () => void {
     masterListeners.delete(listener);
   };
 }
+
+/**
+ * AOS-711: a card the host rewrites in place (a share request that was
+ * decided) is not in the thread's forward page. Whoever learns of the change
+ * asks the member chat to read the thread's newest page again.
+ */
+const reloadListeners = new Set<() => void>();
+
+export function requestThreadReload(): void {
+  for (const listener of reloadListeners) listener();
+}
+
+export function onThreadReload(listener: () => void): () => void {
+  reloadListeners.add(listener);
+  return () => {
+    reloadListeners.delete(listener);
+  };
+}

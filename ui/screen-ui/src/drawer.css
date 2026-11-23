@@ -162,11 +162,13 @@
   gap: 0.3rem;
   margin-top: 0.45rem;
 }
+/* 32px: the smallest close/icon target that still fits a 375px drawer header
+   (CAD-2705 Browser QA measured 30px before). */
 .s-drawer-top .btn-icon,
 .crm-drawer-top .btn-icon,
 .s-drawer-foot .btn-icon,
 .crm-drawer-foot .btn-icon {
-  width: 1.875rem;
+  width: 2rem;
   padding: 0;
   justify-content: center;
 }

@@ -1,0 +1,22 @@
+{
+  "role": "agent",
+  "kind": "share_request",
+  "text": "Asked an owner to share Accounting \u00b7 Profit and loss. Waiting for an answer.",
+  "payload": {
+    "v": 1,
+    "id": "sr_0123456789abcdef0123456789abcdef",
+    "app": "accounting",
+    "app_label": "Accounting",
+    "view": "pnl",
+    "view_label": "Profit and loss",
+    "title": "Profit and loss",
+    "params": {
+      "from": "2026-07-01",
+      "to": "2026-09-30",
+      "compare": "prior_year"
+    },
+    "reason": "Preparing the Q4 budget review on Thursday.",
+    "requested_at": "2026-11-23T02:43:00.000Z",
+    "status": "pending"
+  }
+}

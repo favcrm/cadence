@@ -856,6 +856,52 @@ Object.assign(zhTW, {
   "{n} of {m} on": "{n} / {m} 已啟用",
 });
 
+// AOS-711 / CAD-2705: a member asks an owner to share an owner-only report.
+Object.assign(zhTW, {
+  "Share request card": "分享請求卡片",
+  "Share request": "分享請求",
+  "Declined": "已拒絕",
+  "Cancelled": "已取消",
+  "An owner": "擁有者",
+  "Waiting for an owner. You'll hear back here.": "正在等待擁有者回覆，結果會顯示在此。",
+  "Shared by {name}": "由 {name} 分享",
+  "{name} declined: {note}": "{name} 已拒絕：{note}",
+  "{owner} declined.": "{owner} 已拒絕。",
+  "You cancelled this request.": "你已取消此請求。",
+  "Cancel request": "取消請求",
+  "Cancelling…": "正在取消…",
+  "This request is no longer available.": "此請求已不存在。",
+  "You can't cancel this request.": "你無法取消此請求。",
+  "Couldn't cancel this request. Try again.": "無法取消此請求。請再試。",
+  "This request was already decided.": "此請求已有決定。",
+  "{name} already shared this.": "{name} 已分享此報告。",
+  "{name} already declined this.": "{name} 已拒絕此請求。",
+  "{name} already cancelled this.": "{name} 已取消此請求。",
+  "{name} already decided this.": "{name} 已處理此請求。",
+  "{name} asks for {view}": "{name} 要求分享{view}",
+  "Share a report with {name}?": "要與 {name} 分享報告嗎？",
+  "Decline {name}'s request": "拒絕 {name} 的請求",
+  "Note to {name} (optional)": "給 {name} 的備註（選填）",
+  "Why are you declining? (optional)": "為何拒絕？（選填）",
+  "{name} sees that you declined, with your note. Nothing else changes.": "{name} 會看到你已拒絕及你的備註，其他一切維持不變。",
+  "Who": "對象",
+  "What": "內容",
+  "Reason": "原因",
+  "member": "成員",
+  "Shares a read-only PDF of this report. {name} gets no access to the books.": "分享此報告的唯讀 PDF。{name} 不會取得帳簿的存取權限。",
+  "The PDF is generated at the moment you approve and won't update afterwards.": "PDF 於你核准的一刻產生，之後不會更新。",
+  "Share report": "分享報告",
+  "Decline…": "拒絕…",
+  "Decline request": "拒絕請求",
+  "Declining…": "正在拒絕…",
+  "Preparing the report…": "正在準備報告…",
+  "The report couldn't be prepared. It is still waiting, so you can try again later.": "無法準備報告。請求仍在等待中，你可以稍後再試。",
+  "We could not confirm the result. It may already have gone through, so do not decide again; check first.": "無法確認結果，決定可能已生效，請勿再次決定，先檢查。",
+  "This was already decided elsewhere. The list has been refreshed.": "此請求已在其他地方處理，清單已重新整理。",
+  "This print request is not valid.": "此列印請求無效。",
+  "This view is not available.": "此檢視無法使用。",
+});
+
 export function translateUiText(english: string, locale: Locale): string {
   return locale === "zh-TW" ? (zhTW[english] ?? english) : english;
 }

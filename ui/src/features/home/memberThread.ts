@@ -143,6 +143,8 @@ export interface MemberThreadState extends ThreadState {
   history?: MemberHistoryObservation;
   /** Opaque server positions; numeric render ordering below never leaves the browser. */
   memberPosition?: { forward: string | null; before: string | null };
+  /** AOS-711: a card was rewritten in place; the next read replaces the held rows with the newest page, not only what is after the cursor. */
+  tailReload?: true;
 }
 
 /** Derive the observation the component trusts. It reads the PAYLOAD's
@@ -234,6 +236,11 @@ async function memberLoadThread(current: MemberThreadState | null): Promise<Memb
     if (state.entries.length > 0) throw new ApiError("member history needs a fresh session", 0);
     const page = memberPage(await api.memberAssistHistory({ tail: true, limit: MEMBER_PAGE_LIMIT }));
     state = foldMemberPage(state, page, "tail");
+  } else if (state.tailReload) {
+    // Start over from the newest page. A decided share request adds a file row after its card, which
+    // renumbers every later row's `csrid_`, so rows already held cannot be matched by id.
+    const page = memberPage(await api.memberAssistHistory({ tail: true, limit: MEMBER_PAGE_LIMIT }));
+    state = foldMemberPage({ ...EMPTY_THREAD, pending: state.pending, replySeq: state.replySeq, conversation: state.conversation }, page, "tail");
   } else {
     for (let i = 0; i < 2; i++) {
       const after = state.memberPosition?.forward ?? null;

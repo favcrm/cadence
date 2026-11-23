@@ -17,7 +17,7 @@ import { answeredData, parse, walk } from "./formModel";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal" | "ticket_proposal" | "surface" | "connect_ref" | "record_ref" | "view_ref";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal" | "ticket_proposal" | "surface" | "connect_ref" | "record_ref" | "view_ref" | "share_request";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -364,6 +364,7 @@ export type ThreadItem =
   | { type: "connect"; key: string; entry: ThreadEntry }
   | { type: "record"; key: string; entry: ThreadEntry }
   | { type: "view"; key: string; entry: ThreadEntry }
+  | { type: "share"; key: string; entry: ThreadEntry }
   | { type: "image"; key: string; entry: ThreadEntry }
   | { type: "video"; key: string; entry: ThreadEntry }
   | { type: "hire"; key: string; entry: ThreadEntry; reason: string | null }
@@ -403,7 +404,7 @@ export function formStatus(seq: number, entries: ThreadEntry[], pending: Pending
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
 
 /** The item type of an entry kind that is a card in a turn; null otherwise. */
-const cardType = (kind: string): "artifact" | "image" | "video" | "connect" | "record" | "view" | null =>
+const cardType = (kind: string): "artifact" | "image" | "video" | "connect" | "record" | "view" | "share" | null =>
   kind === "artifact"
     ? "artifact"
     : kind === "image_job"
@@ -416,7 +417,9 @@ const cardType = (kind: string): "artifact" | "image" | "video" | "connect" | "r
             ? "record"
             : kind === "view_ref"
               ? "view"
-              : null;
+              : kind === "share_request"
+                ? "share"
+                : null;
 
 /**
  * Entries by kind: the operator's message, `assistant_text` as
@@ -487,6 +490,9 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
     } else if (entry.kind === "view_ref") {
       // CAD-2475: the host's canvas view card — a reference to an app screen, never its content.
       items.push({ type: "view", key, entry });
+    } else if (entry.kind === "share_request") {
+      // AOS-711 (CAD-2705): the member's request for an owner-only report — the host's card.
+      items.push({ type: "share", key, entry });
     } else if (entry.kind === "image_job") {
       // A generated image's block: a job id and a shape, never the picture.
       items.push({ type: "image", key, entry });
@@ -507,11 +513,11 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 }
 
 /** Item types that belong to an assistant turn. */
-const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "video", "hire", "form", "connect", "record", "view"]);
+const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "video", "hire", "form", "connect", "record", "view", "share"]);
 
 /** A card that follows its turn's answer without ending or starting a turn. */
 export const isCardItem = (item: { type: string }): boolean =>
-  item.type === "artifact" || item.type === "image" || item.type === "video" || item.type === "form" || item.type === "connect" || item.type === "record" || item.type === "view";
+  item.type === "artifact" || item.type === "image" || item.type === "video" || item.type === "form" || item.type === "connect" || item.type === "record" || item.type === "view" || item.type === "share";
 
 /** One render run: an assistant turn (its flat items), or one item that is
  *  not part of a turn. The items themselves stay flat — `threadItems` is

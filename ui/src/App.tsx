@@ -112,6 +112,9 @@ import type { UpdateBanner } from "./lib/types";
 import { RESOURCE_NAMES } from "./lib/cache";
 import { noteThreadsChanged } from "./features/threads/threadsClient";
 import { noteMasterChanged } from "./lib/masterChanged";
+import { applyThemePref } from "./lib/theme";
+import PrintView from "./features/print/PrintView";
+import { isPrintPath } from "./features/print/printRequest";
 import { useHomeUnread } from "./features/app-shell/chat/homeUnread";
 import { AssistantUnreadProbes } from "./features/app-shell/chat/unreadShell";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
@@ -236,6 +239,11 @@ export default function App() {
         <CredentialEntry requestId={entry.requestId} />
       </NavigationProvider>
     );
+  }
+  // AOS-711: the snapshot renderer's page — one app view, no chrome, under the signed-in viewer's own session.
+  if (isPrintPath(window.location.pathname)) {
+    applyThemePref("light");
+    return <NavigationProvider adapter={hostNavigation}><AuthBoundary>{() => <PrintView search={window.location.search} />}</AuthBoundary></NavigationProvider>;
   }
   // Private room alerts share the admitted workspace's concealment and reset lifecycle.
   return <NavigationProvider adapter={hostNavigation}><AuthBoundary>{(meta, recheck) => <NotificationToastProvider><Workspace meta={meta} recheck={recheck} /></NotificationToastProvider>}</AuthBoundary></NavigationProvider>;

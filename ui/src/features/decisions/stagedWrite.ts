@@ -10,6 +10,9 @@
  * `subject` sentence and the raw call, with the summary marked incomplete.
  */
 
+import { optionsLine } from "../canvas/viewParams";
+import { parseShareInput, type ShareInput } from "../home/shareRequest";
+
 export type StagedStatus = "pending" | "approved" | "denied";
 /** What the owner sees: a failed apply is `approved` with `result.ok === false`. */
 /** `unconfirmed`: approved, but the row carries no `result.ok === true` to say it applied. */
@@ -59,7 +62,7 @@ export interface StagedWhatsApp {
 
 export interface StagedWrite {
   id: string;
-  kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli" | "custom_mcp_effect";
+  kind: "app_call" | "create_issue" | "connected_effect" | "cadence_cli" | "custom_mcp_effect" | "share_request";
   status: StagedStatus;
   createdAt: number;
   decidedAt: number | null;
@@ -87,6 +90,10 @@ export interface StagedWrite {
   cli?: { verb: string; summary: string | null; requestedBy: string | null };
   /** `app_call` for `waba` / `whatsapp.*` operations. */
   whatsapp?: StagedWhatsApp | null;
+  /** AOS-711 `share_request`: a member's ask for an owner-only report. Decided through the share-request routes, never approve/deny. */
+  share?: ShareInput;
+  /** `share_request`: the owner who shared it, once decided. */
+  decidedBy?: string | null;
   /** `connected_effect`: the draft or send a connected tool would make. */
   connected: {
     effect: "draft" | "send";
@@ -593,6 +600,35 @@ function parseCadenceCli(base: Pick<StagedWrite, "id" | "status" | "createdAt" |
   };
 }
 
+/** AOS-711: a member's request for an owner-only report. A row whose input is not the contract's is dropped. */
+function parseShareRequest(base: Pick<StagedWrite, "id" | "status" | "createdAt" | "decidedAt" | "decisionReason" | "proposer">, row: Record<string, unknown>, result: StagedResult | null): StagedWrite | null {
+  const share = parseShareInput(row.input);
+  if (share === null) return null;
+  const approvedBy = isRecord(row.approvedBy) ? str(row.approvedBy.label) : null;
+  return {
+    ...base,
+    proposer: null,
+    kind: "share_request",
+    title: `${share.requester} · ${share.viewLabel}`,
+    app: share.appLabel,
+    target: null,
+    changes: [],
+    unchangedCount: 0,
+    changesComplete: true,
+    reason: share.reason ?? null,
+    consent: null,
+    effects: [],
+    raw: rawText(row.input),
+    origin: null,
+    result,
+    recordLink: null,
+    connected: null,
+    customMcp: null,
+    share,
+    decidedBy: approvedBy,
+  };
+}
+
 /** Approve is offered only for a row whose whole request can be read. Deny is always safe. */
 export const approvable = (write: StagedWrite): boolean => write.kind !== "cadence_cli" || write.changesComplete;
 
@@ -610,7 +646,8 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
     status: status as StagedStatus,
     createdAt: row.createdAt,
     decidedAt: typeof row.decidedAt === "number" && Number.isFinite(row.decidedAt) ? row.decidedAt : null,
-    decisionReason: str(row.decision_reason),
+    // The share-request fixture names it `decisionReason`; the other tools `decision_reason`.
+    decisionReason: str(row.decision_reason) ?? str(row.decisionReason),
     // An explicit origin identifies the original CLI/MCP actor, not the assistant.
     proposer: row.origin == null ? parseProposer(row.proposer) : null,
   };
@@ -619,6 +656,7 @@ export function parseStagedRow(row: unknown): StagedWrite | null {
   if (row.tool === "connected_effect") return parseConnectedEffect(base, row, result);
   if (row.tool === "custom_mcp_effect") return parseCustomMcpEffect(base, row, result);
   if (row.tool === "cadence_cli") return parseCadenceCli(base, row, result);
+  if (row.tool === "share_request") return parseShareRequest(base, row, result);
   return null;
 }
 
@@ -707,8 +745,18 @@ export function reasonText(reason: string, t: (english: string) => string): stri
   return code === undefined ? t(reason) : t("refused ({code})").replace("{code}", () => isolate(code));
 }
 
+/** "Jamie asks for Profit and loss · 1 Jul – 30 Sep 2026 · Prior year": who, what, and the view's options in words. */
+export function shareHeadline(share: Pick<ShareInput, "requester" | "viewLabel" | "params">, t: (english: string) => string): string {
+  // `optionsLine` only needs to know whether dates read in Chinese; the catalogue answers that.
+  const locale = t("Prior year") === "Prior year" ? "en" : "zh-TW";
+  const head = t("{name} asks for {view}").replace("{name}", () => share.requester).replace("{view}", () => share.viewLabel);
+  const period = optionsLine(share.params, locale, t);
+  return period === "" ? head : `${head} · ${period}`;
+}
+
 /** The row's own heading: a connected effect leads with its verb. */
 export function titleOf(write: StagedWrite, t: (english: string) => string): string {
+  if (write.share) return shareHeadline(write.share, t);
   if (write.customMcp != null) return `${t("Run tool")} · ${write.title}`;
   return write.connected === null ? write.title : `${t(write.connected.effect === "send" ? "Send" : "Draft")} · ${write.title}`;
 }
@@ -718,6 +766,7 @@ const same: Say = (s) => s;
 
 /** External attribution is kept by the parser; a verified assistant label wins over a Home fallback. */
 export function askedBy(write: StagedWrite, t: Say = same): string | null {
+  if (write.share) return write.share.requester;
   if (write.proposer) {
     const { label, scope } = write.proposer;
     return `${label} · ${t(scope === "workspace" ? "Workspace assistant" : "Personal assistant")}`;
