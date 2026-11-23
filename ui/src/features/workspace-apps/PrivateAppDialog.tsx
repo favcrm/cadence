@@ -696,6 +696,7 @@ function screenOperationLabel(operation: string, t: (english: string) => string)
   switch (operation) {
     case "calendar.query": return t("Read workspace calendar items, including task and routine titles");
     case "routines.list": return t("Read workspace routines");
+    case "connections.assets": return t("Read connected account lists");
     case "catalog.call": return t("Run a granted platform tool with app data");
     case "smtp.test-send": return t("Send a test email through the configured account");
     default: return operation;

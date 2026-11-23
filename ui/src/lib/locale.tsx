@@ -259,6 +259,7 @@ Object.assign(zhTW, {
   "Not declared": "未宣告",
   "Read workspace calendar items, including task and routine titles": "讀取工作區行事曆項目，包括任務與例行工作的標題",
   "Read workspace routines": "讀取工作區的例行工作",
+  "Read connected account lists": "讀取已連結的帳號清單",
   "Run a granted platform tool with app data": "使用應用程式資料執行已授權的平台工具",
   "Send a test email through the configured account": "透過已設定的帳戶傳送測試電郵",
   "Loads images from": "從以下來源載入圖片",
