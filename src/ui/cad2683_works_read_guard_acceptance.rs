@@ -34,10 +34,21 @@ const OPERATIONS: [&str; 7] = [
     "works.request_review",
 ];
 
+/// A validly shaped minimal argument set for each operation, so the closed-shape
+/// check (which runs before the session proof and the read-only guard) passes
+/// and the guard is the only reason left for a refusal.
 fn args_for(operation: &str) -> Value {
     match operation {
-        "works.query" | "works.create" => json!({}),
-        _ => json!({"id": "doc-1"}),
+        "works.query" => json!({}),
+        "works.get" => json!({"id": "missing-doc"}),
+        "works.create" => json!({"kind": "doc", "title": "T", "content": {},
+            "idempotency_key": "create-1"}),
+        "works.patch" => json!({"id": "missing-doc", "if_revision": 1, "operations": [],
+            "idempotency_key": "patch-1"}),
+        "works.trash" | "works.restore" => json!({"id": "missing-doc", "if_revision": 1,
+            "idempotency_key": "trash-1"}),
+        "works.request_review" => json!({"id": "missing-doc", "revision": 1}),
+        other => panic!("no fixture arguments for {other}"),
     }
 }
 
@@ -84,15 +95,23 @@ fn cad2683_operator_read_only_mount_reads_works_and_member_is_refused() {
         );
     }
     let action = consume(&rig, &minted);
-    for read in READS {
-        if let Err(error) = call_rpc(&rig, &action, creds, read) {
-            let text = error.to_string();
-            assert!(
-                !text.contains("read-only screen admits") && !text.contains("operator-role"),
-                "operator read {read} hit the guard: {text}"
-            );
-        }
-    }
+    let listed = call_rpc(&rig, &action, creds, "works.query")
+        .expect("operator works.query is admitted on a read-only mount");
+    assert!(
+        listed.to_string().contains("[]") || listed.is_object() || listed.is_array(),
+        "works.query reply: {listed}"
+    );
+    let error = call_rpc(&rig, &action, creds, "works.get")
+        .expect_err("works.get of a missing id fails in the store");
+    let text = error.to_string();
+    assert!(
+        !text.contains("read-only screen admits") && !text.contains("operator-role"),
+        "operator works.get hit the guard: {text}"
+    );
+    assert!(
+        text.contains("not_found") || text.contains("not found"),
+        "works.get of a missing id is not_found: {text}"
+    );
     for write in WRITES {
         let error = call_rpc(&rig, &action, creds, write)
             .expect_err(&format!("{write} must be refused on a read-only mount"));
