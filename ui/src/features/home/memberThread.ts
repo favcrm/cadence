@@ -143,7 +143,7 @@ export interface MemberThreadState extends ThreadState {
   history?: MemberHistoryObservation;
   /** Opaque server positions; numeric render ordering below never leaves the browser. */
   memberPosition?: { forward: string | null; before: string | null };
-  /** AOS-711: a card was rewritten in place; the next read takes the newest page again, not only what is after the cursor. */
+  /** AOS-711: a card was rewritten in place; the next read replaces the held rows with the newest page, not only what is after the cursor. */
   tailReload?: true;
 }
 
@@ -237,12 +237,10 @@ async function memberLoadThread(current: MemberThreadState | null): Promise<Memb
     const page = memberPage(await api.memberAssistHistory({ tail: true, limit: MEMBER_PAGE_LIMIT }));
     state = foldMemberPage(state, page, "tail");
   } else if (state.tailReload) {
-    // Known rows (same ids) are replaced in place, new ones follow; the older-history position stays.
+    // Start over from the newest page. A decided share request adds a file row after its card, which
+    // renumbers every later row's `csrid_`, so rows already held cannot be matched by id.
     const page = memberPage(await api.memberAssistHistory({ tail: true, limit: MEMBER_PAGE_LIMIT }));
-    const held = state.memberPosition;
-    const { tailReload: _done, ...rest } = state;
-    state = foldMemberPage(rest, page, "tail");
-    state = { ...state, memberPosition: { forward: page.cursor, before: held?.before ?? page.before }, moreBefore: rest.moreBefore ?? state.moreBefore };
+    state = foldMemberPage({ ...EMPTY_THREAD, pending: state.pending, replySeq: state.replySeq, conversation: state.conversation }, page, "tail");
   } else {
     for (let i = 0; i < 2; i++) {
       const after = state.memberPosition?.forward ?? null;

@@ -114,7 +114,7 @@ import { noteThreadsChanged } from "./features/threads/threadsClient";
 import { noteMasterChanged } from "./lib/masterChanged";
 import { applyThemePref } from "./lib/theme";
 import PrintView from "./features/print/PrintView";
-import { isPrintPath } from "./features/print/printView";
+import { isPrintPath } from "./features/print/printRequest";
 import { useHomeUnread } from "./features/app-shell/chat/homeUnread";
 import { AssistantUnreadProbes } from "./features/app-shell/chat/unreadShell";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";

@@ -4,7 +4,7 @@ import { useTranslate } from "../../lib/locale";
 import { isNoAccess } from "../canvas/AppViewBody";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import { readAppScopeFresh, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
-import { parsePrintQuery, printRefusal, printRoute, PRINT_SETTLE_MS } from "./printView";
+import { parsePrintQuery, printRefusal, printRoute, PRINT_SETTLE_MS } from "./printRequest";
 import "./print.css";
 
 declare global {

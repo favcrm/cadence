@@ -57,7 +57,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const PrintView = require("../src/features/print/PrintView").default;
-const { isPrintPath, parsePrintQuery, printRefusal, printRoute } = require("../src/features/print/printView") as typeof import("../src/features/print/printView");
+const { isPrintPath, parsePrintQuery, printRefusal, printRoute } = require("../src/features/print/printRequest") as typeof import("../src/features/print/printRequest");
 
 // ---- the request grammar ----
 {
