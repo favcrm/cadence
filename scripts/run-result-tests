@@ -1,7 +1,6 @@
 #!/bin/bash
-# CAD-1334: run every integration test target from scripts/result-test-args,
-# the lib suite and binary unit tests in one pinned nextest invocation. Keep
-# the exact target scope from CI and `scripts/pre-push --tests`.
+# CAD-1334 / CAD-2701: build the workspace integration targets and the root
+# package's lib and bin tests once. Run and inventory the same built binaries.
 #  - --features test-seam: some targets are cfg(feature = "test-seam") and
 #    would otherwise run 0 tests and pass.
 #  - the post-run guard compares the junit against the selection read back
@@ -235,7 +234,9 @@ refuse_prod_path() { # <label> <path>
 refuse_prod_path CADENCE_SUITE_LOCK "${CADENCE_SUITE_LOCK:-}"
 refuse_prod_path TMPDIR "${TMPDIR:-}"
 cd "$root"
-targets=$("$root/scripts/result-test-args")
+manifest_for_coverage=${manifest_path:-$root/Cargo.toml}
+manifest_args=(--manifest-path "$manifest_for_coverage")
+targets=$("$root/scripts/result-test-args" "$manifest_for_coverage")
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 if [ -n "${CARGO_TARGET_DIR:-}" ]; then
   case $CARGO_TARGET_DIR in
@@ -313,19 +314,7 @@ else
 fi
 status=0
 
-mapfile -t target_args <<< "$targets"
-integration_targets=()
-for ((i = 0; i < ${#target_args[@]}; i += 2)); do
-  if [ "${target_args[$i]}" != "--test" ] || [ -z "${target_args[$((i + 1))]:-}" ]; then
-    echo "::error::malformed integration target selection from result-test-args" >&2
-    exit 1
-  fi
-  integration_targets+=("${target_args[$((i + 1))]}")
-done
-if [ "${#integration_targets[@]}" -eq 0 ]; then
-  echo "::error::result-test-args selected no integration targets" >&2
-  exit 1
-fi
+mapfile -t integration_targets <<< "$targets"
 # CAD-1370: a narrowed integration selection is honored only for a real
 # pull_request event and only when every requested identifier is a
 # nonempty distinct member of THIS checkout's full inventory (validated
@@ -341,38 +330,29 @@ if [ -n "$selection_file" ]; then
         echo "::error::test selection line is not an identifier: $line" >&2
         exit 1 ;;
     esac
-    match=0
+    matches=()
     for full in "${integration_targets[@]}"; do
-      if [ "$full" = "$line" ]; then match=1; break; fi
+      if [ "${full#*::}" = "$line" ]; then matches+=("$full"); fi
     done
-    if [ "$match" -ne 1 ]; then
-      echo "::error::test selection names a target outside this checkout's inventory: $line" >&2
+    if [ "${#matches[@]}" -ne 1 ]; then
+      echo "::error::test selection must name one unambiguous target in this checkout: $line" >&2
       exit 1
     fi
-    for seen in ${selected[@]+"${selected[@]}"}; do
-      if [ "$seen" = "$line" ]; then
+    for seen in "${selected[@]}"; do
+      if [ "$seen" = "${matches[0]}" ]; then
         echo "::error::test selection repeats a target: $line" >&2
         exit 1
       fi
     done
-    selected+=("$line")
+    selected+=("${matches[0]}")
   done < "$selection_file"
   if [ "${#selected[@]}" -eq 0 ]; then
     echo "::error::test selection file selected no targets" >&2
     exit 1
   fi
-  target_args=()
   integration_targets=("${selected[@]}")
-  for name in "${selected[@]}"; do
-    target_args+=(--test "$name")
-  done
-fi
-manifest_args=()
-if [ -n "$manifest_path" ]; then
-  manifest_args=(--manifest-path "$manifest_path")
 fi
 printf 'running %d integration targets, plus lib and bins\n' "${#integration_targets[@]}"
-manifest_for_coverage=${manifest_path:-$root/Cargo.toml}
 package_name=$(python3 - "$manifest_for_coverage" <<'PY'
 import sys
 import tomllib
@@ -380,6 +360,27 @@ with open(sys.argv[1], "rb") as manifest:
     print(tomllib.load(manifest)["package"]["name"])
 PY
 )
+# Cargo applies target selectors across all selected packages. Include the
+# owner of each integration test, and keep names deduplicated for Cargo.
+declare -A packages=(["$package_name"]=1) test_names=()
+package_args=(--package "$package_name")
+target_args=()
+for target in "${integration_targets[@]}"; do
+  owner=${target%%::*}
+  name=${target#*::}
+  if [[ ! $owner =~ ^[A-Za-z0-9_-]+$ || ! $name =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::malformed integration binary ID: $target" >&2
+    exit 1
+  fi
+  if [ -z "${packages[$owner]:-}" ]; then
+    packages[$owner]=1
+    package_args+=(--package "$owner")
+  fi
+  if [ -z "${test_names[$name]:-}" ]; then
+    test_names[$name]=1
+    target_args+=(--test "$name")
+  fi
+done
 workspace_dir=$(dirname "$manifest_for_coverage")
 junit_report=$workspace_dir/target/nextest/cadence/junit.xml
 # The expected integration inventory travels next to the junit so a
@@ -403,35 +404,88 @@ if [ "$(realpath -m -- "$manifest_for_coverage")" = "$(realpath -m -- "$root/Car
 else
   guard_args+=(--no-ignored-manifest)
 fi
+# Keep the same outer suite lock across compile, execution and reporting.
+# Close its fd in child processes so detached test children cannot hold it.
+printf 'run-result-tests: suite lock %s; wait limit %ss (contention exit 75)\n' \
+  "$SUITE_LOCK_PATH" "$SUITE_LOCK_WAIT_SECS" >&2
+exec 9>>"$SUITE_LOCK_PATH"
+PATH=$lib_path flock -w "$SUITE_LOCK_WAIT_SECS" -E 75 9
+# Bash defers these traps while a foreground command runs. A signal sent
+# only to this shell must not unlock or remove scratch beneath nextest.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$(dirname "$junit_report")"
 rm -f "$junit_report" "$inventory_report"
 printf '%s\n' "${integration_targets[@]}" > "$targets_report"
 
-# One pinned nextest invocation replaces 56 serial cargo test invocations.
-# Its JUnit report is checked against the exact target list afterward so a
-# missing or zero-test target cannot silently shrink the required CI scope.
-# A --partition run checks only that its own junit is well-formed; the CI
-# aggregate job re-runs the same full-coverage check over every shard's
-# merged report. cargo-nextest honors CARGO for its Cargo subprocess while
-# preserving PATH for test processes. Under an admitted lane run this
-# selects the compiler symlink directly; tests retain the lane shim first
-# on PATH but receive no slot identity.
+# A partition's full target coverage is checked only after aggregating its
+# reports. Each individual partition still checks its own test identities.
 partition_args=()
 if [ -n "$partition" ]; then
   partition_args=(--partition "hash:$part_k/$part_n")
 fi
-cargo_env=("PATH=$lib_path" "CADENCE_SUITE_LOCK_WAIT_SECS=$SUITE_LOCK_WAIT_SECS")
+cargo_cmd=${CARGO:-cargo}
+cargo_env=("PATH=$lib_path")
 if [ "$slot_admitted" -eq 1 ]; then
-  cargo_env+=("CARGO=$compiler_dir/cargo")
+  cargo_cmd=$compiler_dir/cargo
+  cargo_env+=("CARGO=$cargo_cmd")
 fi
-if ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" --locked --features test-seam \
-    "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
-    "${partition_args[@]}" \
-    -j "$jobs" 2>&1 | tee "$scratch/nextest.log"; then
+# Use the real Cargo under the admitted slot and keep the shim on test PATH.
+# The nextest wrapper pins the profile and recognizes the outer lock.
+nextest() {
+  env "${cargo_env[@]}" CADENCE_SUITE_LOCK= \
+    CADENCE_REVIEW_SUITE_LOCK_HELD=1 CADENCE_REVIEW_PR=direct CADENCE_REVIEW_HEAD=direct \
+    "$root/scripts/cadence-nextest" "$@" 9>&-
+}
+
+build_start=$SECONDS
+nextest list --list-type binaries-only --message-format json --locked \
+  --features test-seam "${package_args[@]}" "${target_args[@]}" \
+  --lib --bins "${manifest_args[@]}" > "$scratch/compiled.json"
+# --lib and --bins also build those harnesses in secondary packages. They
+# are not in the suite scope. Keep the root harnesses and exact integration
+# IDs in the metadata that both execution and inventory consume.
+platform=$(python3 - "$scratch" "$targets_report" "$package_name" 9>&- <<'PY'
+import json
+import sys
+from pathlib import Path
+
+scratch, targets = map(Path, sys.argv[1:3])
+root = sys.argv[3]
+metadata = json.loads((scratch / "compiled.json").read_bytes())
+wanted = set(Path(targets).read_text().splitlines())
+binaries = metadata["rust-binaries"]
+missing = wanted - binaries.keys()
+if missing:
+    sys.exit("::error::missing compiled integration binaries: " + ", ".join(sorted(missing)))
+metadata["rust-binaries"] = {name: binary for name, binary in binaries.items()
+                             if name in wanted or name == root or name.startswith(f"{root}::bin/")}
+with (scratch / "binaries.json").open("w") as output:
+    json.dump(metadata, output)
+# Match the platform and feature graph used by this pinned nextest build.
+platforms = metadata["rust-build-meta"]["platforms"]
+platform = (platforms["targets"] or [platforms["host"]])[0]["platform"]
+triple = platform["triple"]
+if platform.get("custom-json") is not None:
+    spec = scratch / (Path(triple).name + ".json")
+    spec.write_text(platform["custom-json"])
+    print(spec)
+else:
+    print(triple)
+PY
+)
+PATH=$lib_path "$cargo_cmd" metadata --format-version 1 --locked --all-features \
+  --filter-platform "$platform" "${manifest_args[@]}" > "$scratch/cargo.json" 9>&-
+printf 'suite_build_seconds=%s\n' "$((SECONDS - build_start))"
+reuse_args=(--cargo-metadata "$scratch/cargo.json" --binaries-metadata "$scratch/binaries.json")
+run_start=$SECONDS
+if ! nextest "${reuse_args[@]}" "${partition_args[@]}" -j "$jobs" 2>&1; then
   status=1
   printf '::error::integration target selection or test run failed: %s\n' \
     "${integration_targets[*]}" >&2
 fi
+printf 'suite_execution_seconds=%s\n' "$((SECONDS - run_start))"
 
 if [ ! -f "$junit_report" ]; then
   echo "::error::nextest did not produce its required JUnit report: $junit_report" >&2
@@ -440,14 +494,13 @@ fi
 # Read the same selection back out of the built binaries. A failure here is
 # fatal: without an inventory the junit cannot be checked, and an unchecked
 # junit is what let a case disappear unnoticed.
-if [ -f "$junit_report" ] && ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" list \
-    --locked --features test-seam \
-    "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
-    "${partition_args[@]}" \
+inventory_start=$SECONDS
+if [ -f "$junit_report" ] && ! nextest list "${reuse_args[@]}" "${partition_args[@]}" \
     --message-format json > "$inventory_report"; then
   echo "::error::nextest did not produce the inventory its JUnit is checked against" >&2
   status=1
 fi
+printf 'suite_inventory_seconds=%s\n' "$((SECONDS - inventory_start))"
 if [ -f "$junit_report" ] && [ -n "$partition" ]; then
   # A partition checks its own share strictly here; the aggregate re-checks
   # the union, so a gap or overlap between shards cannot pass either.
