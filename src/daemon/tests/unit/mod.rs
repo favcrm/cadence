@@ -557,6 +557,7 @@ mod cad2215_scoped_cursor_acceptance;
 #[cfg(feature = "test-seam")]
 mod cad2215_task_detail_scope_acceptance;
 mod cad2259_fenced_default_kickoff_acceptance;
+mod cad2737_native_take_acceptance;
 mod caller;
 mod cloud_hold;
 mod continuity;
