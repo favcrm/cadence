@@ -993,6 +993,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
     carries two counted principals (serial rebinding), the set refuses and
     those rows count for nothing."""
     reasons, counted = [], []
+    ignored = policy_ignored_kinds(policy_kind)
     identity = lambda v: reviewer_key(v, hosted)
 
     def evidence(n):
@@ -1009,7 +1010,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         stamped = [n for n in notes if n["stamp"]]
         passes = [n for n in stamped if n["outcome"] == "pass"]
         for n in notes:
-            if n["outcome"] == "pass":
+            if n["outcome"] == "pass" or n["kind"] in ignored:
                 continue
             # CAD-2192: a later pass supersedes only what it re-reviewed. A
             # Browser QA failure is cleared by Browser QA, not by the same
@@ -1396,6 +1397,37 @@ def policy_evidence(req):
         kind = "combined" if axes["general"] else "none"
     return {"names": sorted(names), "checks": sorted(listed), "kind": kind,
             "browser_qa": qa, "operator": operator}
+
+
+def policy_ignored_kinds(policy_kind):
+    """The verdict kinds a policy asking one axis or no code review does not need:
+    as on the hosted gate, a non-pass of one of them does not block."""
+    return {"none": ("standards", "spec-security"), "standards": ("spec-security",),
+            "spec_security": ("standards",)}.get(policy_kind, ())
+
+
+def policy_floor_reasons(changes, lines, risk, never):
+    """Why a policy `consequential` answer understates this script's own diff.
+
+    The approved policy may lower the reviews only on ordinary paths: a change
+    that is not a plain add or modify, a human-class or trust-boundary path, a
+    path the one-review list excludes, or a diff over the size limit keeps the
+    strict floor, and an unreadable list cannot show it does not apply."""
+    out = []
+    if risk is None or never is None:
+        out.append("the trusted path lists cannot be read at the diff's anchor")
+        risk, never = (), ()
+    if any(not (s in ("A", "M") and new in ("100644", "100755") and (old == new or s == "A"))
+           for s, old, new, _ in changes):
+        out.append("a change is not a plain add or modify of a regular file")
+    if any(is_human_path(path, risk) or any(glob_match(g, path) for g in never)
+           for _, _, _, path in changes):
+        out.append("a path is human-class, a trust boundary or excluded from one review")
+    if lines > HUMAN_LINES:
+        out.append(f"{lines} changed lines is over {HUMAN_LINES}")
+    return ([f"the approved policy's consequential class does not hold for this script's diff: "
+             f"{'; '.join(out)} (the trusted-list floor applies; refusing rather than merging "
+             "on the policy's reviews alone)"] if out else [])
 
 
 def policy_check_reasons(repo, head, checks):
@@ -1907,12 +1939,14 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         authors.add(str(ticket["claim"]["by"]).lower())
 
     authority = None
-    policy = None
+    policy, ignored_kinds = None, ()
     required_comment_evidence = []
     if issue:
         try:
             authority = requirements_inspection(issue, repo, pr, head)
             policy = authority["policy"]
+            if policy is not None and authority["requirements"]["class"] == "consequential":
+                ignored_kinds = policy_ignored_kinds(authority["requirements"]["review_kind"])
             if (authority["binding"]["base"] != base_oid
                     or authority["binding"]["base_ref"] != base
                     or authority["binding"]["repo"] != repo.lower()
@@ -2128,7 +2162,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     # "missing or malformed acceptance names the head it would need" rule: a
     # failed or absent read answers with the same sentence, never with a lift.
     if (accepted_revise is None and hosted_project is not None
-            and any(is_workflow_row(v) and v["outcome"] != "pass" for v in verdicts)):
+            and any(is_workflow_row(v) and v["outcome"] != "pass" and v["kind"] not in ignored_kinds
+                    for v in verdicts)):
         reasons.append(
             f"a workflow review at head {head} is not a pass and no acceptance is recorded for "
             f"that head; the operator accepts it with `cadence audit accept-revise --pr {pr} "
@@ -2154,6 +2189,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     if authority is not None and authority["requirements"]["activation"] == "active":
         reasons += lean_class_reasons(authority["requirements"]["class"], changes, one,
                                       [p for p in paths if is_human_path(p, risk or ())], lines)
+    if policy is not None and authority["requirements"]["class"] == "consequential":
+        reasons += policy_floor_reasons(changes, lines, risk, workflow_never_globs(one_text, risk_text))
     if has_workflow:
         auto_text = None
         if main_tip:
@@ -2595,8 +2632,10 @@ def self_test():
         ("a combined verdict satisfies a single-axis policy", "spec_security",
          [dict(row("p3.md", "usr_alice", "alice", "combined"))], None),
         ("a no-review policy needs no verdict", "none", [], None),
-        ("a non-pass verdict still refuses under a no-review policy", "none",
-         [dict(row("p4.md", "usr_alice", "alice", "standards", "revise"))], "is not a pass"),
+        ("a non-pass verdict on an unrequired axis does not block", "none",
+         [dict(row("p4.md", "usr_alice", "alice", "standards", "revise"))], None),
+        ("a non-pass verdict on the required axis still refuses", "standards",
+         [dict(row("p5.md", "usr_alice", "alice", "standards", "revise"))], "is not a pass"),
     ]:
         reasons, _ = check_reviews(rows, False, False, {"author"}, "CAD-1",
                                    hosted("author", "usr_author"), policy_kind=kind)

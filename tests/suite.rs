@@ -19542,4 +19542,35 @@ mod cad2494_policy_gate {
         gate(&repo, &head, json!({}), one()).passes();
         gate(&repo, &head, json!({}), vec![]).refused("one review is required");
     }
+
+    // A review the policy does not ask for does not block, and the floor is the
+    // script's own: a consequential answer cannot waive it.
+    #[test]
+    fn an_unrequired_axis_does_not_block_and_the_floor_cannot_be_waived() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let mut revise = owner("20261103-000200-b.md", "usr_bob", "bob", "spec-security");
+        for key in ["outcome", "title_outcome", "section_outcome"] {
+            revise[key] = json!("revise");
+        }
+        let std_policy = || {
+            policy(
+                "consequential",
+                1,
+                "standards",
+                vec![agent("s", "standards")],
+                vec![],
+            )
+        };
+        let pass = owner("20261103-000100-a.md", "usr_alice", "alice", "standards");
+        gate(&repo, &head, std_policy(), vec![pass.clone(), revise]).passes();
+        let peer = repo.head("peer", "src/peer.rs");
+        gate(
+            &repo,
+            &peer,
+            policy("consequential", 0, "none", vec![], vec![]),
+            vec![],
+        )
+        .refused("consequential class does not hold");
+    }
 }
