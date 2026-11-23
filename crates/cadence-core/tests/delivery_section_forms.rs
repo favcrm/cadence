@@ -1,6 +1,6 @@
 //! CAD-2708: every stored hosted `delivery:` section form in the shared
 //! fixture resolves, through `section_front`, to the owner-approved digest
-//! it names, or to no policy when it names none. agenticos-v2 runs a
+//! it names, or to no policy when it names none. The hosted service runs a
 //! byte-identical copy of the fixture through its own wrapper and pinned
 //! core, so the CLI and the hosted gate read the same policy from the same
 //! stored text.

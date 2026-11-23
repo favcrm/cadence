@@ -1,5 +1,5 @@
 {
-  "about": "CAD-2708: stored hosted `delivery:` section forms and the owner-approved digest each must resolve to (null: no approved policy). The Cadence CLI reads them with `cadence_core::delivery::section_front`; agenticos-v2 keeps a byte-identical copy at apps/api/src/tenant-board/delivery-section-forms.fixture.json and reads them with `deliveryFrontmatter` and its pinned core. Change both copies together.",
+  "about": "CAD-2708: stored hosted `delivery:` section forms and the owner-approved digest each must resolve to (null: no approved policy). The Cadence CLI reads them with `cadence_core::delivery::section_front`; the hosted service keeps a byte-identical copy and reads it with its own wrapper and pinned core. Change both copies together.",
   "forms": [
     {
       "name": "value",
