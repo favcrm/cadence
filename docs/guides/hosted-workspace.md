@@ -807,14 +807,20 @@ Discover and call the actions a hosted app exposes without nesting JSON strings:
 ```sh
 cadence --org acme app describe
 cadence --org acme app describe social-content
+cadence --org acme app skill social-content drafting
 cadence --org acme app call social-content social.sources.show
 cadence --org acme app call social-content social.drafts.show \
   --args '{"draft_id":"draft_from_list"}'
+cadence --org acme app pending
+cadence --org acme app pending --status pending --id <action-id>
 ```
 
-Both commands use the existing hosted app tools and require `cli.write`. The
-host checks the installed app, action, current member and role; a refused
-effect is not approved or performed by this command. `--args` accepts a JSON
+`app describe`, `app call`, and `app skill` use the existing hosted app tools and
+require `cli.write`; `app pending` reads staged actions via `board_pending_actions`
+(`cli.read`, defaulting to your Home conversation; `--conversation` is available
+to people only and refused for agents). The host checks the installed app,
+action, current member and role; a refused effect is not approved or performed by
+these commands. `--args` accepts a JSON
 object inline, from `@file`, a path or `-` for stdin. Draft writes may name a
 stable `--request`; keep that handle and the same input if the result is
 uncertain. `--reason` accompanies a write held for an owner's decision.
