@@ -36,6 +36,9 @@ The `build` job runs the platform-minted board assertion check as a named
 Cargo example (CAD-2721). It links the production verifier and shares the
 assertions with the scheduled library test. A missing example or a failed
 assertion fails the job; there is no test-name filter that can match zero tests.
+The manifest points to an entry point under the existing protected `tests/**`
+paths, so changes to either the runner or the shared assertions require
+operator approval.
 The [matched Boat benchmark](https://fav-limited.cadencecloud.app/projects/cadence/issues/CAD-2721)
 saved 50–65s with warm dependencies and 25–64s cold across the PR and merge-queue
 Rust sequences, compared with building the full library harness once

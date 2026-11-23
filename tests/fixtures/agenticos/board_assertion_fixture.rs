@@ -2,9 +2,8 @@
 
 use cadence_agent::board_identity;
 
-#[path = "../tests/fixtures/agenticos/board_assertion.rs"]
-mod fixture;
+mod board_assertion;
 
 fn main() {
-    fixture::check();
+    board_assertion::check();
 }
