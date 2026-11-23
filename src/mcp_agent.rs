@@ -2,12 +2,13 @@
 //!
 //! Codex starts local MCP servers outside its command sandbox. This process
 //! remains a descendant of the enrolled provider, so the daemon derives the
-//! caller from SO_PEERCRED and /proc ancestry. `self` and `app_run_artifact`
-//! call those existing daemon RPCs in this process. `app_run_artifact` is
-//! only that one guarded method and the tool's three strings; it is not a
-//! general RPC tool, and it does not spawn a CLI child that would carry the
-//! turn token in argv. The other tools still run the Cadence CLI as children
-//! of this process, which keeps the same enrolled ancestry.
+//! caller from SO_PEERCRED and /proc ancestry. `self`, `app_run_artifact`,
+//! `memory_match` and `memory_propose` call one named daemon RPC each in this
+//! process, with fixed fields; none is a general RPC tool, and none spawns a
+//! CLI child that would carry a turn token in argv. The memory tools never
+//! send a project, role or provider: the daemon takes them from the caller's
+//! own running issue turn (CAD-2662). The other tools still run the Cadence
+//! CLI as children of this process, which keeps the same enrolled ancestry.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -69,6 +70,10 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                 } else if is_hosted_app_tool(name) {
                     parse_hosted_app_call(name, &args)
                         .and_then(|call| execute_hosted_app_call(state_dir, &alias, call))
+                } else if let Some(parse) = memory_tool(name) {
+                    parse(&args).and_then(|(method, params)| {
+                        crate::client::rpc(state_dir, method, params).map(|out| out.to_string())
+                    })
                 } else {
                     let list = discovered.get_or_insert_with(|| platform_tools(state_dir));
                     command_args(name, &args, &*list)
@@ -117,6 +122,28 @@ fn tools(platform_tools: &[PlatformTool]) -> Value {
         {"name":"issue_show","description":"Read one Cadence issue by ID.",
          "inputSchema":{"type":"object","properties":{"id":{"type":"string"}},
              "required":["id"],"additionalProperties":false}},
+        {"name":"memory_match","description":MEMORY_MATCH_DESCRIPTION,
+         "inputSchema":{"type":"object","properties":{
+             "paths":{"type":"array","items":{"type":"string"},"description":"Repo-relative paths or globs you are now working on (src/adapter/**). Optional."},
+             "components":{"type":"array","items":{"type":"string"},"description":"Project components you are now working in. Optional."},
+             "tags":{"type":"array","items":{"type":"string"},"description":"Issue tags that now apply. Optional."},
+             "message":{"type":"string","description":"Only when you hold several turns: the id from self."},
+             "token":{"type":"string","description":"Only with message: that turn's turn_id from self."}},
+             "additionalProperties":false}},
+        {"name":"memory_propose","description":MEMORY_PROPOSE_DESCRIPTION,
+         "inputSchema":{"type":"object","properties":{
+             "kind":{"type":"string","enum":["rule","gotcha","decision","recipe"]},
+             "text":{"type":"string","description":"The fact on the first line, then **Why:** and **How to apply:** sections."},
+             "source":{"type":"string","description":"Where it was learned: an issue id, note path or commit."},
+             "confidence":{"type":"string","enum":["low","medium","high"]},
+             "id":{"type":"string","description":"Optional slug; otherwise taken from the fact's first line."},
+             "nature":{"type":"string","enum":["judgement","mechanical"]},
+             "scope_paths":{"type":"array","items":{"type":"string"},"description":"Repo-relative globs the lesson applies to."},
+             "scope_components":{"type":"array","items":{"type":"string"}},
+             "scope_providers":{"type":"array","items":{"type":"string"}},
+             "scope_tags":{"type":"array","items":{"type":"string"}},
+             "scope_project":{"type":"boolean","description":"The lesson applies to every task in the project."}},
+             "required":["kind","text","source"],"additionalProperties":false}},
         {"name":"app_run_artifact","description":"Read one text dependency artifact for your current assigned app turn. Required strings: artifact_id from the kickoff, plus message and token equal to the id and turn_id from self. Alias, provider, path, and command are refused.",
          "inputSchema":{"type":"object","properties":{
              "artifact_id":{"type":"string"},
@@ -209,11 +236,30 @@ struct PlatformTool {
     connected_read: bool,
 }
 
-const STATIC_TOOL_NAMES: [&str; 13] = [
+/// When to look up lessons — shared by the tool description and the Codex
+/// developer instructions so the two never disagree.
+const MEMORY_MATCH_DESCRIPTION: &str = "Project lessons that apply to your current task: \
+    the same reviewed selection your kickoff was given, recomputed now. Call it at the start \
+    of a task, whenever the scope changes (a new path, component or tag), and before you \
+    repeat an approach that already failed. Pass the paths, components or tags you are now \
+    working on to widen the match within your task's project. The project, issue, role and \
+    provider come from your own running turn and cannot be chosen. A stale or withheld \
+    lesson is listed as slug and reason only. Each call is recorded.";
+
+const MEMORY_PROPOSE_DESCRIPTION: &str = "Propose a project lesson you learned on this task: \
+    a rule, gotcha, decision or recipe a later task should know. It is filed into your current \
+    task's project as a proposal and goes through the same review as `cadence memory propose`; \
+    it is never accepted by this call. Give a source (the issue id, note or commit) and a \
+    scope (paths, components, providers, tags, or scope_project). Propose after you resolve \
+    something a later task would otherwise rediscover.";
+
+const STATIC_TOOL_NAMES: [&str; 15] = [
     "self",
     "wiki_search",
     "wiki_read",
     "issue_show",
+    "memory_match",
+    "memory_propose",
     "app_run_artifact",
     "private_app_prepare",
     "private_app_status",
@@ -494,6 +540,134 @@ fn command_args(name: &str, args: &Value, platform_tools: &[PlatformTool]) -> Re
         }
         _ => Err(Error::rejected("unknown Cadence agent tool")),
     }
+}
+
+type MemoryParse = fn(&Value) -> Result<(&'static str, Value)>;
+
+/// The memory tools: each maps to exactly one daemon RPC.
+fn memory_tool(name: &str) -> Option<MemoryParse> {
+    match name {
+        "memory_match" => Some(memory_match_params),
+        "memory_propose" => Some(memory_propose_params),
+        _ => None,
+    }
+}
+
+/// An object whose keys are all in `allowed`, so a `project`, `role`,
+/// `provider` or `alias` argument is refused by name.
+fn tool_object<'a>(args: &'a Value, allowed: &[&str]) -> Result<&'a Map<String, Value>> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| Error::rejected("tool arguments must be an object"))?;
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(Error::rejected(format!("unexpected tool argument '{key}'")));
+    }
+    Ok(object)
+}
+
+fn tool_strings(object: &Map<String, Value>, key: &str) -> Result<Vec<String>> {
+    match object.get(key) {
+        None => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_owned).ok_or_else(|| {
+                    Error::rejected(format!("tool argument '{key}' must be an array of strings"))
+                })
+            })
+            .collect(),
+        Some(_) => Err(Error::rejected(format!(
+            "tool argument '{key}' must be an array of strings"
+        ))),
+    }
+}
+
+fn tool_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(_) => Err(Error::rejected(format!(
+            "tool argument '{key}' must be a non-empty string"
+        ))),
+    }
+}
+
+fn memory_match_params(args: &Value) -> Result<(&'static str, Value)> {
+    let object = tool_object(args, &["paths", "components", "tags", "message", "token"])?;
+    let mut params = json!({
+        "paths": tool_strings(object, "paths")?,
+        "components": tool_strings(object, "components")?,
+        "tags": tool_strings(object, "tags")?,
+    });
+    match (tool_str(object, "message")?, tool_str(object, "token")?) {
+        (Some(message), Some(token)) => {
+            params["message"] = json!(message);
+            params["token"] = json!(token);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(Error::rejected(
+                "memory_match takes message and token together, or neither",
+            ))
+        }
+    }
+    Ok(("memory_match", params))
+}
+
+fn memory_propose_params(args: &Value) -> Result<(&'static str, Value)> {
+    let object = tool_object(
+        args,
+        &[
+            "kind",
+            "text",
+            "source",
+            "confidence",
+            "id",
+            "nature",
+            "scope_paths",
+            "scope_components",
+            "scope_providers",
+            "scope_tags",
+            "scope_project",
+        ],
+    )?;
+    let required = |key: &str| {
+        tool_str(object, key)?
+            .ok_or_else(|| Error::rejected(format!("required string argument '{key}' is missing")))
+    };
+    let scope_project = match object.get("scope_project") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(Error::rejected(
+                "tool argument 'scope_project' must be a boolean",
+            ))
+        }
+    };
+    let scope = crate::memory::Scope {
+        components: tool_strings(object, "scope_components")?,
+        paths: tool_strings(object, "scope_paths")?,
+        providers: tool_strings(object, "scope_providers")?,
+        tags: tool_strings(object, "scope_tags")?,
+        project: scope_project,
+    };
+    // The CLI's own defaults for what this tool does not expose.
+    let params = crate::memory::cli::propose_params(&crate::memory::cli::Proposal {
+        project: None,
+        kind: required("kind")?,
+        scope: &scope,
+        source: Some(required("source")?),
+        confidence: tool_str(object, "confidence")?,
+        from: None,
+        text: Some(required("text")?),
+        id: tool_str(object, "id")?,
+        nature: tool_str(object, "nature")?.unwrap_or("judgement"),
+        audience: "project",
+        roles: &[],
+        evidence_refs: &[],
+        verification_condition: None,
+    });
+    Ok(("memory_propose", params))
 }
 
 fn tool_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>> {
@@ -2261,5 +2435,116 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         drop(handle);
+    }
+
+    /// CAD-2662: `memory_match` sends only the extra axes (and an optional
+    /// turn pair). A project, role, provider or alias argument is refused by
+    /// name, so a caller cannot widen past its own turn from here.
+    #[test]
+    fn memory_match_refuses_project_role_and_provider_arguments() {
+        let (method, params) = memory_match_params(&json!({
+            "paths": ["src/adapter/codex.rs"], "components": ["daemon"], "tags": ["memory"]
+        }))
+        .unwrap();
+        assert_eq!(method, "memory_match");
+        assert_eq!(
+            params,
+            json!({"paths": ["src/adapter/codex.rs"], "components": ["daemon"], "tags": ["memory"]})
+        );
+        let (_, bare) = memory_match_params(&json!({})).unwrap();
+        assert_eq!(bare, json!({"paths": [], "components": [], "tags": []}));
+        for (key, value) in [
+            ("project", json!("other")),
+            ("role", json!("pm")),
+            ("provider", json!("claude")),
+            ("alias", json!("someone")),
+            ("issue", json!("CAD-1")),
+        ] {
+            let mut args = json!({"paths": ["src/x.rs"]});
+            args[key] = value;
+            let error = memory_match_params(&args).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("unexpected tool argument '{key}'"),
+                "{key}"
+            );
+        }
+        assert!(memory_match_params(&json!({"paths": "src/x.rs"})).is_err());
+        assert!(memory_match_params(&json!({"message": "m1"})).is_err());
+        let (_, turn) = memory_match_params(&json!({"message": "m1", "token": "t1"})).unwrap();
+        assert_eq!(turn["message"], "m1");
+        assert_eq!(turn["token"], "t1");
+    }
+
+    /// CAD-2662: `memory_propose` builds the CLI's own request through the
+    /// shared builder, minus the project the daemon derives from the turn.
+    #[test]
+    fn memory_propose_sends_the_cli_request_without_a_project() {
+        let (method, params) = memory_propose_params(&json!({
+            "kind": "gotcha",
+            "text": "Fact line\n\n**Why:** w\n\n**How to apply:** h\n",
+            "source": "CAD-2662",
+            "scope_paths": ["src/adapter/**"],
+            "scope_project": false
+        }))
+        .unwrap();
+        assert_eq!(method, "memory_propose");
+        let scope = crate::memory::Scope {
+            paths: vec!["src/adapter/**".into()],
+            ..crate::memory::Scope::default()
+        };
+        let cli = crate::memory::cli::propose_params(&crate::memory::cli::Proposal {
+            project: Some("cadence"),
+            kind: "gotcha",
+            scope: &scope,
+            source: Some("CAD-2662"),
+            confidence: None,
+            from: None,
+            text: Some("Fact line\n\n**Why:** w\n\n**How to apply:** h\n"),
+            id: None,
+            nature: "judgement",
+            audience: "project",
+            roles: &[],
+            evidence_refs: &[],
+            verification_condition: None,
+        });
+        let mut expected = cli;
+        expected.as_object_mut().unwrap().remove("project");
+        assert_eq!(params, expected);
+        assert!(params.get("project").is_none());
+        let error = memory_propose_params(&json!({
+            "kind": "rule", "text": "x", "source": "CAD-1", "project": "other"
+        }))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unexpected tool argument 'project'");
+        let missing = memory_propose_params(&json!({"kind": "rule", "text": "x"})).unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "required string argument 'source' is missing"
+        );
+    }
+
+    #[test]
+    fn memory_tool_descriptions_say_when_to_call() {
+        for phrase in [
+            "at the start of a task",
+            "whenever the scope changes",
+            "before you repeat an approach that already failed",
+        ] {
+            assert!(MEMORY_MATCH_DESCRIPTION.contains(phrase), "{phrase}");
+        }
+        assert!(MEMORY_PROPOSE_DESCRIPTION.contains("never accepted by this call"));
+        let listed = tools(&[]);
+        for name in ["memory_match", "memory_propose"] {
+            assert!(
+                listed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == name),
+                "{name}"
+            );
+            assert!(static_tool_names().contains(&name));
+        }
     }
 }

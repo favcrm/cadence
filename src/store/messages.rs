@@ -1894,11 +1894,41 @@ impl Store {
         token: &str,
         save: impl FnOnce(Agent, Message, String) -> Result<Value>,
     ) -> Result<Value> {
+        self.with_owned_issue_turn(expected, id, token, "feedback", save)
+    }
+
+    /// CAD-2662: the issue this native agent's current owned active turn is
+    /// bound to — the same fence `with_memory_feedback` applies, for a
+    /// read-only lesson lookup. `purpose` names the refused operation.
+    pub(crate) fn owned_issue_turn(
+        &self,
+        expected: &Agent,
+        id: &str,
+        token: &str,
+        purpose: &str,
+    ) -> Result<(Agent, Message, String)> {
+        self.with_owned_issue_turn(expected, id, token, purpose, |agent, message, issue| {
+            Ok((agent, message, issue))
+        })
+    }
+
+    /// One fence for every caller that acts within its own running turn:
+    /// current registration, generation and process, a running message it
+    /// owns with the live turn token, and the issue that turn is bound to.
+    /// Refusals start with `purpose`.
+    fn with_owned_issue_turn<T: 'static>(
+        &self,
+        expected: &Agent,
+        id: &str,
+        token: &str,
+        purpose: &str,
+        save: impl FnOnce(Agent, Message, String) -> Result<T>,
+    ) -> Result<T> {
         self.write_tx(|tx| {
             let agent = self.agent_in(tx, &expected.alias)?;
             let message = self
                 .message_in(tx, id)?
-                .ok_or_else(|| Error::rejected("unknown feedback message"))?;
+                .ok_or_else(|| Error::rejected(format!("unknown {purpose} message")))?;
             if !matches!(agent.role.as_str(), "pm" | "worker")
                 || message.alias != expected.alias
                 || message.recipient_uid.as_deref() != Some(agent.uid.as_str())
@@ -1916,9 +1946,9 @@ impl Store {
                     token,
                 )
             {
-                return Err(Error::rejected(
-                    "feedback requires this native agent's current owned active turn",
-                ));
+                return Err(Error::rejected(format!(
+                    "{purpose} requires this native agent's current owned active turn"
+                )));
             }
             let bound_issue = match message.task_id.as_deref() {
                 Some(task_id) => {
@@ -1929,22 +1959,22 @@ impl Store {
                         || !matches!(task.state.as_str(), "dispatched" | "running")
                         || job.state != "open"
                     {
-                        return Err(Error::rejected(
-                            "feedback task is not this active native assignment",
-                        ));
+                        return Err(Error::rejected(format!(
+                            "{purpose} task is not this active native assignment"
+                        )));
                     }
-                    let issue = job
-                        .issue_id
-                        .ok_or_else(|| Error::rejected("feedback job has no issue scope"))?;
+                    let issue = job.issue_id.ok_or_else(|| {
+                        Error::rejected(format!("{purpose} job has no issue scope"))
+                    })?;
                     if message.issue.as_deref().is_some_and(|bound| bound != issue) {
-                        return Err(Error::rejected(
-                            "feedback message and native job disagree on issue scope",
-                        ));
+                        return Err(Error::rejected(format!(
+                            "{purpose} message and native job disagree on issue scope"
+                        )));
                     }
                     issue
                 }
                 None => message.issue.clone().ok_or_else(|| {
-                    Error::rejected("feedback message has no trusted issue scope")
+                    Error::rejected(format!("{purpose} message has no trusted issue scope"))
                 })?,
             };
             save(agent, message, bound_issue)

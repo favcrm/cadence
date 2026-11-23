@@ -335,3 +335,15 @@ exploration. Its inferred edges should carry provenance and must not replace
 the canonical text or the direct source fetch. Reviewed project memory remains
 a separate, short lesson workflow: use `cadence memory propose`, independent
 reviews, and acceptance when a fact should be injected into future dispatches.
+
+A managed Codex agent also has two lesson tools on its Cadence MCP server.
+`memory_match` repeats dispatch's lesson selection for the issue the agent's
+running turn is bound to, using the same 12-entry and 4 KiB caps. It can add
+the paths, components or tags the agent is now working on. The project, role
+and provider come from that turn and cannot be passed. A stale or withheld
+lesson comes back as its slug and reason only. Each call records a
+`lessons_supplied` event on the agent. That row is separate from the
+dispatch `context_supplied` row and does not affect context restore.
+`memory_propose` files a proposal into that same project through the same
+review as the CLI. Claude and Pi agents do not load this server. They use the
+`cadence memory` CLI.

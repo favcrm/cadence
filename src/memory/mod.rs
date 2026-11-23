@@ -35,6 +35,7 @@ mod matching;
 pub mod policy;
 mod quorum;
 mod rendering;
+pub mod supply;
 pub(crate) mod v2;
 
 use std::path::{Path, PathBuf};
@@ -2959,5 +2960,98 @@ mod tests {
         assert_eq!(committed, [rel]);
         let status = git(&pm.dir, &["status", "--porcelain"]).unwrap();
         assert_eq!(status.trim(), "?? demo/planted.md");
+    }
+
+    fn supply_fixture() -> (tempfile::TempDir, Pm, board::Issue) {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(dir.path()).unwrap();
+        supply::fixture::two_projects(dir.path());
+        let issue = board::Issue {
+            project: "alpha".into(),
+            dir: dir.path().join("alpha").join("A-1"),
+            front: crate::issue::model::Front::new("A-1", "t", "2026-11-22T00:00:00Z"),
+            body: String::new(),
+            comments: vec![],
+            artifacts: vec![],
+        };
+        (dir, pm, issue)
+    }
+
+    #[test]
+    fn cad2662_lookup_supplies_only_the_turn_projects_lessons() {
+        let (_dir, pm, issue) = supply_fixture();
+        let supply =
+            supply::supply_for_issue(&pm, &issue, "codex", None, &supply::Axes::default()).unwrap();
+        let response = &supply.response;
+        let supplied: Vec<&str> = response["supplied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["slug"].as_str().unwrap())
+            .collect();
+        assert_eq!(supplied, vec!["alpha-wide"], "{response}");
+        assert_eq!(response["project"], "alpha");
+        assert_eq!(response["issue"], "A-1");
+        assert!(response["lessons"]
+            .as_str()
+            .unwrap()
+            .contains("ALPHA_WIDE_FACT"));
+        // The other project's lesson is nowhere in the answer or receipt.
+        assert!(!response.to_string().contains("beta"), "{response}");
+        assert!(!supply.receipt.to_string().contains("beta"));
+        // The stale lesson is its slug and reason, never its body.
+        assert_eq!(
+            response["withheld"],
+            json!([{"slug": "alpha-stale", "reason": "evidence marked stale: CAD-9 reverted the fix"}])
+        );
+        assert!(
+            !response.to_string().contains("ALPHA_STALE_BODY"),
+            "{response}"
+        );
+        // Each supplied lesson carries the digest a use report needs.
+        let digest = response["supplied"][0]["digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64, "{digest}");
+        // The receipt names the same lessons and fingerprints the rendered text.
+        assert_eq!(supply.receipt["supplied"], response["supplied"]);
+        assert_eq!(supply.receipt["withheld"], response["withheld"]);
+        assert_eq!(
+            supply.receipt["lessons_bytes"],
+            json!(response["lessons"].as_str().unwrap().len())
+        );
+    }
+
+    #[test]
+    fn cad2662_extra_paths_widen_only_within_the_project() {
+        let (_dir, pm, issue) = supply_fixture();
+        let axes = supply::Axes::new(vec![], vec!["src/adapter/codex.rs".into()], vec![]).unwrap();
+        let supply = supply::supply_for_issue(&pm, &issue, "codex", None, &axes).unwrap();
+        let mut supplied: Vec<&str> = supply.response["supplied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["slug"].as_str().unwrap())
+            .collect();
+        supplied.sort_unstable();
+        assert_eq!(supplied, vec!["alpha-adapter", "alpha-wide"]);
+        assert!(supply.response["context"]["paths"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("src/adapter/codex.rs")));
+    }
+
+    #[test]
+    fn cad2662_lookup_axes_are_bounded_and_repo_relative() {
+        assert!(supply::Axes::new(vec![], vec!["../etc/passwd".into()], vec![]).is_err());
+        assert!(supply::Axes::new(vec![], vec!["/etc/passwd".into()], vec![]).is_err());
+        assert!(supply::Axes::new(vec![" ".into()], vec![], vec![]).is_err());
+        assert!(supply::Axes::new(vec![], vec![], vec!["a\u{7}".into()]).is_err());
+        let many = vec!["c".to_string(); supply::AXIS_MAX + 1];
+        assert!(supply::Axes::new(many, vec![], vec![]).is_err());
+        assert!(supply::Axes::new(
+            vec!["daemon".into()],
+            vec!["src/**".into()],
+            vec!["t".into()]
+        )
+        .is_ok());
     }
 }

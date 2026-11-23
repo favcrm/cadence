@@ -3,6 +3,9 @@
 use super::*;
 use crate::memory::{self, policy, IdentityProof, NativeIdentity};
 
+#[cfg(all(test, feature = "test-seam"))]
+mod cad2662_tests;
+
 impl Shared {
     fn memory_actor(&self, peer_pid: u32, capture_model: bool) -> Result<policy::NativeActor> {
         let verified = match self.caller_identity(peer_pid)? {
@@ -146,9 +149,23 @@ impl Shared {
             evidence_refs: Self::memory_value(params, "evidence_refs")?.unwrap_or_default(),
             verification_condition: Self::memory_value(params, "verification_condition")?,
         };
+        // CAD-2662: an agent that names no project proposes into the project
+        // of the issue its own running turn is bound to. The CLI still passes
+        // `--project`, and either way the proposal takes the same path below.
+        let derived;
+        let project = match optional_str(params, "project") {
+            Some(project) => project,
+            None if matches!(self.caller_identity(peer_pid)?, Caller::Agent(_)) => {
+                derived = self
+                    .bound_issue_turn(peer_pid, params, "lesson proposal")?
+                    .3;
+                derived.project.as_str()
+            }
+            None => required_str(params, "project")?,
+        };
         memory::propose_native(
             &pm,
-            required_str(params, "project")?,
+            project,
             required_str(params, "kind")?,
             scope,
             optional_str(params, "source"),
@@ -270,6 +287,117 @@ impl Shared {
             Self::memory_value(params, "evidence_refs")?.unwrap_or_default(),
             &actor,
         )
+    }
+
+    /// CAD-2662: the caller's own running turn — the explicit `message` and
+    /// `token` pair, or else the single turn it holds.
+    fn memory_turn(&self, alias: &str, params: &Value, purpose: &str) -> Result<(String, String)> {
+        match (
+            optional_str(params, "message"),
+            optional_str(params, "token"),
+        ) {
+            (Some(id), Some(token)) => Ok((id.to_owned(), token.to_owned())),
+            (None, None) => match self.store.held_turns(alias)?.as_slice() {
+                [held] => held
+                    .turn_id
+                    .clone()
+                    .map(|token| (held.id.clone(), token))
+                    .ok_or_else(|| {
+                        Error::rejected(format!(
+                            "{purpose}: the running turn has no submission token; \
+                             pass message and token from `self`"
+                        ))
+                    }),
+                [] => Err(Error::rejected(format!(
+                    "{purpose} needs a running issue turn, and this agent holds none"
+                ))),
+                many => Err(Error::rejected(format!(
+                    "{purpose}: this agent holds {} running turns; pass message and \
+                     token from `self`",
+                    many.len()
+                ))),
+            },
+            _ => Err(Error::rejected(format!(
+                "{purpose} takes message and token together, or neither"
+            ))),
+        }
+    }
+
+    /// CAD-2662: the verified native caller, its current owned turn and the
+    /// issue that turn is bound to — the fence `memory_feedback` uses. Nothing
+    /// in the request names the agent, project or issue.
+    fn bound_issue_turn(
+        &self,
+        peer_pid: u32,
+        params: &Value,
+        purpose: &str,
+    ) -> Result<(
+        crate::issue::Pm,
+        crate::store::Agent,
+        crate::store::Message,
+        crate::issue::board::Issue,
+    )> {
+        let Caller::Agent(verified) = self.caller_identity(peer_pid)? else {
+            return Err(Error::rejected(format!(
+                "{purpose} requires the assigned native agent"
+            )));
+        };
+        if !matches!(verified.agent.role.as_str(), "pm" | "worker") {
+            return Err(Error::rejected(format!(
+                "{purpose} requires a native PM/worker endpoint"
+            )));
+        }
+        let (id, token) = self.memory_turn(&verified.agent.alias, params, purpose)?;
+        if self.adoption_pending(&verified.agent.alias, &id, &token) {
+            return Err(Error::rejected(format!(
+                "{purpose} requires a settled native turn adoption"
+            )));
+        }
+        let (agent, message, issue) =
+            self.store
+                .owned_issue_turn(&verified.agent, &id, &token, purpose)?;
+        let pm = self.pm()?;
+        let issue = crate::issue::board::find_issue(&pm.dir, &issue)?;
+        Ok((pm, agent, message, issue))
+    }
+
+    /// Request fields `memory_match` accepts. The project, issue, provider,
+    /// role and alias come from the caller's own turn; naming any of them is
+    /// refused, never treated as a narrower or wider selection.
+    pub(super) const MATCH_FIELDS: [&'static str; 5] =
+        ["message", "token", "components", "paths", "tags"];
+
+    /// CAD-2662: the lessons that apply to the caller's current task, under
+    /// dispatch's own selection, with the paths, components and tags it is
+    /// now working on added. Every answer records a `lessons_supplied`
+    /// receipt first; a receipt that cannot be written supplies nothing.
+    pub(super) fn rpc_memory_match(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::memory_fields(params, &Self::MATCH_FIELDS)?;
+        let axes = memory::supply::Axes::new(
+            optional_strs(params, "components")?,
+            optional_strs(params, "paths")?,
+            optional_strs(params, "tags")?,
+        )?;
+        let (pm, agent, message, issue) =
+            self.bound_issue_turn(peer_pid, params, "lesson lookup")?;
+        let supply = memory::supply::supply_for_issue(
+            &pm,
+            &issue,
+            &agent.provider,
+            agent.team_role.as_deref(),
+            &axes,
+        )?;
+        let mut receipt = supply.receipt;
+        receipt["message"] = json!(message.id);
+        receipt["task"] = json!(message.task_id);
+        receipt["provider"] = json!(agent.provider);
+        receipt["role"] = json!(agent.team_role);
+        receipt["generation"] = json!(agent.generation);
+        self.store
+            .event_public(&agent.alias, memory::supply::SUPPLY_EVENT, receipt)?;
+        let mut response = supply.response;
+        response["receipt"] = json!(memory::supply::SUPPLY_EVENT);
+        Ok(response)
     }
 
     pub(super) fn rpc_memory_feedback(&self, params: &Value, peer_pid: u32) -> Result<Value> {

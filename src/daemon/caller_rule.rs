@@ -488,6 +488,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("memory_classify", Rule::Handler("rpc_memory_classify: proven_operator")),
     ("memory_feedback", Rule::Handler("rpc_memory_feedback: caller_identity and owned active turn")),
+    (
+        "memory_match",
+        Rule::Handler("rpc_memory_match: caller_identity and owned active turn; project from the turn (CAD-2662)"),
+    ),
     // The handler also admits every covered task's project before writing.
     (
         "monitor_register",

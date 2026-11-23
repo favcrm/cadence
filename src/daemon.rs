@@ -4840,6 +4840,7 @@ impl Shared {
             "memory_finalize" => self.rpc_memory_finalize(params, peer_pid),
             "memory_classify" => self.rpc_memory_classify(params, peer_pid),
             "memory_feedback" => self.rpc_memory_feedback(params, peer_pid),
+            "memory_match" => self.rpc_memory_match(params, peer_pid),
             "monitor_register" => self.rpc_monitor_register(params, peer_pid),
             "monitor_list" => self.rpc_monitor_list(params, peer_pid),
             "monitor_show" => self.rpc_monitor_show(params, peer_pid),
