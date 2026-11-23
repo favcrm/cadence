@@ -557,12 +557,14 @@ const violation = (directive: string, blocked: string, disposition = "enforce") 
   await advance(2000);
   assert(el(m.host, "iframe[data-bz-frame]") === frame, "one failed poll leaves the very same frame in place");
   assert(text(el(m.host, ".bz-badge")).includes("Can't load") && toasts.length === 0, "and says so in the state label, with no toast for one failed poll");
+  assert(!text(el(m.host, ".bz-card")).includes("Open Browser"), "a stale read does not advertise a handoff");
   assert(btn(m, "stop"), "Stop is still there");
   board.mode = "ok";
   await advance(2000);
   assert(el(m.host, "iframe[data-bz-frame]") === frame, "recovery does not remount it either");
   equal(board.views, 1, "no second viewer URL was fetched without a click");
   assert(!text(el(m.host, ".bz-badge")).includes("Can't load"), "the label clears");
+  assert(text(el(m.host, ".bz-card")).includes("Open Browser"), "a confirmed handoff offers Open Browser again");
   await m.unmount();
 }
 
@@ -1414,7 +1416,7 @@ for (const [what, setup] of [["a 500", () => { board.viewStatus = 500; }], ["a h
 }
 
 
-// ===== no leftover copy in any state, and the card says three things =====
+// ===== the Browser card keeps one target and only a confirmed handoff has a cue =====
 for (const body of [
   { state: "none" },
   { state: "ended", url: null },
@@ -1438,10 +1440,12 @@ for (const body of [
   }
   if (body.state === "active") assert(all(m.host, "[data-bz-dock] button").length === 1 && btn(m, "stop"), "active: only Stop");
   const card = el(m.host, ".bz-card");
-  if (card) {
-    const parts = all(card, ".arttext > *").map((x) => text(x));
-    equal(parts.length, body.state === "ended" ? 2 : 3, `${body.state}: the card is a name, a state and the host`);
-    assert(!/Open|in canvas/.test(text(card)), `${body.state}: and no button label`);
+  if (body.state === "active" || body.state === "handoff") {
+    assert(card?.tagName === "BUTTON" && !el(card, "button"), `${body.state}: the card is the only action`);
+    equal(all(card, ".arttext > *").length, 3, `${body.state}: the card is a name, a state and the host`);
+    equal(text(card).includes("Open Browser"), body.state === "handoff", `${body.state}: visible Open Browser cue only for a handoff`);
+  } else {
+    assert(!card, `${body.state}: no Browser card`);
   }
   await m.unmount();
 }

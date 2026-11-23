@@ -96,14 +96,25 @@ membership and human approval decisions remain with that platform.
 
 In a member's private Home chat, the existing typing indicator appears when
 the assistant reports that the turn is working, not when the send is queued.
-It shows the current tool step once it appears in history. If the live feed
-disconnects, the indicator clears; history still refreshes.
+It shows the current tool step once it appears in history. If live progress
+disconnects during that turn, the indicator clears and a reconnect notice
+appears for that send. A saved reply clears the notice even while progress is
+offline. **Retry** rechecks the assistant's binding if needed and reopens the
+progress feed without resending the message.
+If the last working update did not identify the send, Home asks the same feed
+for its current state before showing activity for another message.
 
 In hosted Home, type `/skills` and press Enter to browse approved workspace
 skills without sending a message. Selecting a skill inserts `/skill:<name>`
 in the draft. Send it with your request, or type the command directly. The
 sent prompt highlights the command; the highlight does not confirm that the
 skill loaded or that any action ran.
+
+In the workspace owner's Home, selecting an option in a choice card does not
+send it. Use **Send answer** to submit; the card keeps the recorded choices,
+not optional fields left blank.
+When a Browser card says **Needs you**, **Open Browser** opens the existing
+panel. It does not sign in or take over on your behalf.
 
 An owner can review a write staged in an installed app's assistant conversation
 beside that conversation. **Review** shows the stored changes and declared
@@ -113,6 +124,9 @@ decision.
 If a reply is lost, **Check again** re-reads the outcome rather than submitting
 another decision. Reads and decisions retain the selected conversation; the
 Home queue remains separate. Members cannot decide these requests.
+
+An applied or denied action in the chat transcript keeps its outcome visible
+with **Show details**. Failed or unconfirmed outcomes stay expanded.
 
 Every tool execution rechecks the supplied refusal and live authorization,
 including recovered executions and runtime-owned skill tools. Cancellation is
