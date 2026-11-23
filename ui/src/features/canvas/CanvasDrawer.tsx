@@ -449,6 +449,8 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   const [expandFits, setExpandFits] = useState(false);
   // A tab being dragged by its strip entry lights the stage's drop zones.
   const [dragged, setDragged] = useState<string | null>(null);
+  // CAD-2690: the tab bar's right end, where an app view docks its actions.
+  const [tabActions, setTabActions] = useState<HTMLElement | null>(null);
   const chrome = useCanvasChrome();
   const railRef = useRef<HTMLButtonElement | null>(null);
   const pathname = useHref().split("?")[0];
@@ -768,6 +770,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
             onExpand={() => setExpanded(true)}
           />
         ) : null}
+        <div className="cv-tabactions" ref={setTabActions} />
         </div>
       ) : null}
       {tab ? (
@@ -809,6 +812,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
                 app={x.app}
                 sheet={sheet}
                 tabbed={tabbed}
+                tabRow={showBrowser ? null : tabActions}
                 expanded={expanded}
                 canExpand={canExpand}
                 onExpand={() => setExpanded((v) => !v)}
