@@ -636,6 +636,7 @@ export function BrowserCard() {
   if (phase === "none" || phase === "ended") return null;
   const shown = isBrowserPanelShown(canvas, b);
   const statusText = browserStatus(b, t).text;
+  const handoff = phase === "handoff" && !b.loadError && b.stop !== "stopping";
   const openLabel = t("Open Browser");
   // Only the real host, never the raw address (a look-alike can hide behind
   // userinfo), on a line of its own and never preceded by words that could push
@@ -660,7 +661,7 @@ export function BrowserCard() {
             {host ? <span className="artmeta bz-card-host" title={host}><span>{host}</span></span> : null}
           </>
         }
-        trailing={phase === "handoff" ? <span className="artopen">{openLabel}</span> : undefined}
+        trailing={handoff ? <span className="artopen">{openLabel}</span> : undefined}
       />
     </div>
   );

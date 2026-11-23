@@ -141,9 +141,11 @@ export default function MemberChat({
   const [liveTurn, setLiveTurn] = useState<{
     conversation: string;
     message: string | null;
+    sendSeq?: number;
     state: "working" | "reconnecting" | "stopped";
   } | null>(null);
   const retryActivity = useRef<(() => void) | null>(null);
+  const resumeActivity = useRef<{ conversation: string; after: string } | null>(null);
   const [pendingLook, setPendingLook] = useState<AvatarLook | null>(null);
   const alive = useRef(true);
   const identityGate = useRef<{ inflight: boolean; again: boolean; timer: number | null }>({
@@ -275,18 +277,27 @@ export default function MemberChat({
   // assistant's conversation (the same id the image provider below uses) is
   // wired to the canvas and the Browser tab explicitly.
   const conversationId = surface?.conversation ?? null;
+  const available = surface?.ok === true;
   useEffect(() => {
-    if (conversationId === null || surface?.ok !== true) return;
+    const resume = resumeActivity.current;
+    if (resume?.conversation !== conversationId) resumeActivity.current = null;
+    setLiveTurn((turn) => {
+      if (turn === null || turn.conversation !== conversationId) return null;
+      return !available && turn.state === "working" ? { ...turn, state: "reconnecting" } : turn;
+    });
+    if (conversationId === null || !available) return;
     // Null names a verified but unnamed turn. Undefined means no verified turn.
     let previous: string | null | undefined;
-    const publish = (message?: string | null, confirmed = true) => {
+    const publish = (message?: string | null) => {
       if (previous !== message) {
         previous = message;
         void store.invalidate();
       }
       setLiveTurn((turn) => {
-        if (message === undefined) return confirmed || turn?.state === "working" ? null : turn;
-        if (turn?.conversation === conversationId && turn.message === message && turn.state === "working") return turn;
+        if (message === undefined) return null;
+        if (turn?.conversation === conversationId && turn.message === message) {
+          return turn.state === "working" ? turn : { ...turn, state: "working" };
+        }
         return { conversation: conversationId, message, state: "working" };
       });
     };
@@ -320,11 +331,11 @@ export default function MemberChat({
         }
         // Don't resume on an unusable frame. Keep the notice until a
         // conversation snapshot or the saved result can settle it.
-        publish(undefined, false);
+        interrupt("reconnecting");
       },
       onError: (state) => interrupt(state === "stopped" ? "stopped" : "reconnecting"),
     });
-    let stream = connect();
+    let stream = connect(resumeActivity.current?.after);
     retryActivity.current = () => {
       const after = stream.lastEventId();
       stream.close();
@@ -333,10 +344,11 @@ export default function MemberChat({
     };
     return () => {
       retryActivity.current = null;
+      const after = stream.lastEventId();
+      if (after !== null) resumeActivity.current = { conversation: conversationId, after };
       stream.close();
-      setLiveTurn(null);
     };
-  }, [conversationId, store, surface?.ok]);
+  }, [conversationId, store, available]);
   // Auto-open is off here: an artifact opens the drawer when the person asks,
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
@@ -486,21 +498,31 @@ export default function MemberChat({
   );
 
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
-  const activity = surface?.ok && liveTurn?.conversation === conversationId ? liveTurn : null;
-  const sendIndex = activity === null ? -1 : shown.findLastIndex((item) =>
-    item.type === "operator"
-      ? activity.message === null || itemMessage(item) === activity.message
-      : item.type === "pending" && item.pending.state !== "failed" &&
-        activity.message !== null && item.pending.message === activity.message,
-  );
+  const activity = liveTurn?.conversation === conversationId ? liveTurn : null;
+  const sendIndex = activity === null ? -1 : shown.findLastIndex((item) => {
+    if (item.type === "operator") {
+      if (activity.message !== null) return itemMessage(item) === activity.message;
+      return activity.sendSeq === undefined
+        ? available && activity.state === "working"
+        : item.entry.seq === activity.sendSeq;
+    }
+    return item.type === "pending" && item.pending.state !== "failed" &&
+      activity.message !== null && item.pending.message === activity.message;
+  });
   // A stored result wins over an older working frame. An unnamed turn can
   // only follow a stored send, never the latest optimistic message.
   const activeItem = sendIndex < 0 || shown.some((item, index) =>
     index > sendIndex && item.type === "answer" &&
       (activity?.message == null || item.entry.message == null || item.entry.message === activity.message),
   ) ? null : shown[sendIndex];
-  const workingItem = activity?.state === "working" ? activeItem : null;
-  const interrupted = activeItem !== null && activity?.state !== "working" ? activity?.state : undefined;
+  const progress = activity?.state === "working" && !available ? "reconnecting" : activity?.state;
+  const workingItem = progress === "working" ? activeItem : null;
+  const interrupted = activeItem !== null && progress !== "working" ? progress : undefined;
+  // Pin an unnamed turn to the stored send we actually followed. Its
+  // interruption cannot become the next queued send's progress.
+  if (workingItem?.type === "operator" && activity?.message === null && activity.sendSeq === undefined) {
+    setLiveTurn({ ...activity, sendSeq: workingItem.entry.seq });
+  }
   const running = workingItem === null ? null : itemMessage(workingItem);
   const runningUnnamed = workingItem !== null && running === null;
   const openingItem = workingItem !== null && inFlightTurnKey(shown, running, runningUnnamed) === null
@@ -581,7 +603,13 @@ export default function MemberChat({
           )}
           {interrupted && (
             <div className="pt-2">
-              <StreamBanner progress={interrupted} onRetry={() => retryActivity.current?.()} />
+              <StreamBanner
+                progress={interrupted}
+                onRetry={() => {
+                  if (available) retryActivity.current?.();
+                  else loadSurface();
+                }}
+              />
             </div>
           )}
 

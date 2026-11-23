@@ -100,10 +100,15 @@ export default function AgentForm({
   }
   const order = walk(surface.comps);
   const inputs = order.filter((c) => INPUTS.has(c.component));
-  // Keep mixed forms and answers without recorded choices in the full form view.
-  const choiceReceipt = answered?.known && inputs.length > 0 &&
-    inputs.every((c) => c.component === "ChoicePicker" && asList(displayed(c, data)).length > 0);
-  const title = order.find((c) => c.component === "Text" && typeof c.text === "string");
+  // Summarize only saved choices. A blank optional picker is not an answer.
+  const receiptFields = answered?.known && inputs.every((c) => c.component === "ChoicePicker")
+    ? inputs.filter((c) => {
+      const choices = displayed(c, answered.data);
+      return Array.isArray(choices) && choices.length > 0;
+    })
+    : [];
+  const title = order.find((c) => c.component === "Text" && typeof c.text === "string" &&
+    !order.some((button) => button.component === "Button" && button.child === c.id));
   const disabled = status.state !== "open" || block !== null;
 
   const update = (path: string | null, value: unknown) => {
@@ -336,6 +341,7 @@ export default function AgentForm({
             ? { tone: "muted", text: t("Sending…") }
             : { tone: "accent", text: t("Waiting for you") };
 
+  const formLabel = t("Form from the assistant");
   // CAD-2440: the card system's region shape. Header, fields, notes and
   // every hook are the form's own; only the frame is shared.
   return (
@@ -347,7 +353,7 @@ export default function AgentForm({
       bodyClassName="agentform-body"
       data-kind="form"
       data-form-state={status.state}
-      label={`${t("Form from the assistant")}: ${title ? asText(title.text) : ""}`}
+      label={title ? `${formLabel}: ${asText(title.text)}` : formLabel}
       icon={
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden="true">
           <rect x="2.75" y="2" width="10.5" height="12" rx="2" />
@@ -357,11 +363,11 @@ export default function AgentForm({
       kindLabel={t("Form")}
       status={{ text: chip.text, tone: chip.tone, attrs: { "data-form-status": status.state } }}
     >
-      {choiceReceipt ? (
+      {receiptFields.length > 0 ? (
         <>
           {render(title)}
           <dl className="turncard-fields agentform-receipt">
-            {inputs.map((c) => (
+            {receiptFields.map((c) => (
               <div key={c.id} className="turncard-field">
                 <dt><bdi>{label(c) || t("Answer")}</bdi></dt>
                 <dd><bdi>{shown(c)}</bdi></dd>

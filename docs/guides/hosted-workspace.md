@@ -98,8 +98,9 @@ In a member's private Home chat, the existing typing indicator appears when
 the assistant reports that the turn is working, not when the send is queued.
 It shows the current tool step once it appears in history. If live progress
 disconnects during that turn, the indicator clears and a reconnect notice
-appears. History still refreshes. **Retry** reopens only the progress feed;
-it does not resend the message.
+appears for that send. A saved reply clears the notice even while progress is
+offline. **Retry** rechecks the assistant's binding if needed and reopens the
+progress feed without resending the message.
 
 In hosted Home, type `/skills` and press Enter to browse approved workspace
 skills without sending a message. Selecting a skill inserts `/skill:<name>`
@@ -108,7 +109,8 @@ sent prompt highlights the command; the highlight does not confirm that the
 skill loaded or that any action ran.
 
 In the workspace owner's Home, selecting an option in a choice card does not
-send it. Use **Send answer** to confirm; the card keeps the recorded choice.
+send it. Use **Send answer** to submit; the card keeps the recorded choices,
+not optional fields left blank.
 When a Browser card says **Needs you**, **Open Browser** opens the existing
 panel. It does not sign in or take over on your behalf.
 
