@@ -261,7 +261,18 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     });
     write::save_front(&issue_dir, &front, &body).unwrap();
     git(&pm_dir, &["add", "."]);
-    git(&pm_dir, &["commit", "-qm", "Record worker lane and claim"]);
+    git(
+        &pm_dir,
+        &[
+            "-c",
+            "user.name=Acceptance",
+            "-c",
+            "user.email=acceptance@example.invalid",
+            "commit",
+            "-qm",
+            "Record worker lane and claim",
+        ],
+    );
     let (project, _) = write::issue_dir(&pm, issue).unwrap();
     assert_eq!(
         shared
@@ -291,8 +302,8 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             std::process::id(),
         )
     });
-    let refusal = result.unwrap_err().to_string();
-    assert!(refusal.contains("plan_evidence_stale"), "{refusal}");
+    let refusal = result.unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal}");
     assert!(!shared.store.message_exists(message).unwrap());
     assert_eq!(
         shared.store.queued_count("worker-1").unwrap(),
