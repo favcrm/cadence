@@ -10,7 +10,7 @@ use super::{item, parse_iso, Item};
 
 mod classify;
 
-pub(crate) use classify::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
+pub(crate) use classify::{classify_main_ci, main_ci_alerts, CiState, MainCiAlerts, ShaCi};
 
 /// The run fields [`classify_main_ci`] and the rows read — the rest of
 /// the API object is dropped before it reaches the cache.
@@ -171,7 +171,7 @@ pub(super) fn main_ci_view(
         None => (Vec::new(), Some("no local clone declared".to_string())),
     };
     let shas = classify_main_ci(runs, &first_parent);
-    let alerts = main_ci_alerts(&shas);
+    let alerts: MainCiAlerts<'_> = main_ci_alerts(&shas);
     let subject = format!("{slug}@{branch}");
     let run_at = |s: &ShaCi| s.created_at.as_deref().and_then(parse_iso);
     let run_age = |s: &ShaCi| run_at(s).map(|t| now - t).unwrap_or(0);

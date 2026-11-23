@@ -1,6 +1,3 @@
-//! Pure default-branch `ci.yml` run classification and alert summarization
-//! for the overview.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
 
