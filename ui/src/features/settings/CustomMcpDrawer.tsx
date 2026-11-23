@@ -74,8 +74,8 @@ export function CustomMcpConnectDrawer({
 }: {
   onClose: () => void;
   onConnected: (connection: CustomMcpConnectionSummary) => void;
-  onOAuthStarted: (connectionId: string) => void;
-  setup?: { label: string; endpointUrl: string; requiredScopes?: string[]; returnTo: string };
+  onOAuthStarted: (connectionId: string, endpointUrl: string, nonce: string) => void;
+  setup?: { label: string; endpointUrl: string; requiredScopes?: string[]; returnTo: string; editEndpoint?: boolean };
 }) {
   const t = useTranslate();
   const baseId = useId();
@@ -97,7 +97,15 @@ export function CustomMcpConnectDrawer({
     discovery?: CustomMcpOAuthDiscovery;
   } | null>(null);
 
-  const urlError = validateCustomMcpUrlInput(endpointUrl);
+  let urlError = validateCustomMcpUrlInput(endpointUrl);
+  if (!urlError && setup?.editEndpoint) {
+    const edited = new URL(endpointUrl.trim());
+    if (edited.origin !== new URL(setup.endpointUrl).origin) {
+      urlError = "Use the same server origin, or request a new setup card.";
+    } else if (edited.search || edited.hash) {
+      urlError = "Enter the server URL without a query or fragment.";
+    }
+  }
 
   const submit = async () => {
     if (busy) return;
@@ -138,10 +146,14 @@ export function CustomMcpConnectDrawer({
     const requiredScopes = setup
       ? setup.requiredScopes ?? (authKind === "oauth_static" && scopes.length ? scopes : undefined)
       : undefined;
-    const returnTo = setup?.returnTo ?? (
-      typeof window !== "undefined"
-        ? `${window.location.origin}/settings/connections`
-        : undefined);
+    const nonce = setup ? crypto.randomUUID() : "";
+    const returnTo = setup
+      ? (() => {
+          const url = new URL(setup.returnTo);
+          url.searchParams.set("mcp_attempt", nonce);
+          return url.href;
+        })()
+      : typeof window !== "undefined" ? `${window.location.origin}/settings/connections` : undefined;
 
     setBusy(true);
     try {
@@ -179,7 +191,7 @@ export function CustomMcpConnectDrawer({
             return;
           }
         }
-        onOAuthStarted(reply.connection_id);
+        onOAuthStarted(reply.connection_id, new URL(endpointUrl.trim()).href, nonce);
         setDiscoveryStep({
           authorizationUrl: safeUrl,
           connectionId: reply.connection_id,
@@ -249,7 +261,7 @@ export function CustomMcpConnectDrawer({
             <input
               id={`${baseId}-url`} type="url" required autoComplete="off" spellCheck={false} value={endpointUrl}
               onChange={(e) => { setEndpointUrl(e.target.value); if (!urlTouched) setUrlTouched(true); }}
-              placeholder="https://mcp.example.com/v1/mcp" className="field w-full mt-1 num" disabled={busy} readOnly={!!setup}
+              placeholder="https://mcp.example.com/v1/mcp" className="field w-full mt-1 num" disabled={busy} readOnly={!!setup && !setup.editEndpoint}
             />
             {urlTouched && endpointUrl.trim() !== "" && urlError !== null && (
               <p className="text-micro text-fail mt-1 break-words" role="alert">{t(urlError)}</p>
