@@ -11432,17 +11432,42 @@ if (mode === 'keys') {
         fn kind(&self) -> String {
             self.env_str("KIND")
         }
-        // The one `run` step of a job: its real script, the heredoc body.
+        // The Node heredoc is the last run step; review and file first install
+        // the same trusted job-local validator without access to step secrets.
         fn step(&self, job: &str) -> &Value {
-            let steps = self.job(job)["steps"].as_array().unwrap();
-            let runs: Vec<&Value> = steps.iter().filter(|s| s.get("run").is_some()).collect();
+            let runs: Vec<&Value> = self.job(job)["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| s.get("run").is_some())
+                .collect();
             assert_eq!(
                 runs.len(),
-                1,
-                "{}: job {job} must have exactly one run step",
+                if job == "prepare" { 1 } else { 2 },
+                "{}: {job}",
                 self.file
             );
-            runs[0]
+            runs.last().unwrap()
+        }
+        fn validator_step(&self, job: &str) -> &Value {
+            assert!(job == "review" || job == "file");
+            // Also checks the total run-step count.
+            self.step(job);
+            let step = self.job(job)["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s.get("run").is_some())
+                .unwrap();
+            assert_eq!(step["name"], "Write the trusted review validator");
+            assert!(step.get("env").is_none() && step.get("uses").is_none());
+            let run = step["run"].as_str().unwrap().trim_end();
+            let body = run
+                .strip_prefix("cat >\"$RUNNER_TEMP/review-validator.mjs\" <<'JS'\n")
+                .and_then(|s| s.strip_suffix("\nJS"))
+                .expect("validator must be a single quoted, job-local heredoc");
+            assert!(!body.contains("\nJS\n") && !body.contains("${{"));
+            step
         }
         fn script(&self, job: &str) -> String {
             let run = self.step(job)["run"]
@@ -11573,6 +11598,23 @@ if (mode === 'keys') {
         let runner = dir.path().join("r");
         std::fs::create_dir_all(&runner).unwrap();
         setup(&runner);
+        if job != "prepare" {
+            let validator = wf.validator_step(job);
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(validator["run"].as_str().unwrap())
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("RUNNER_TEMP", &runner);
+            let output = cadence_agent::reaper::output(&mut cmd).expect("validator setup needs sh");
+            assert!(
+                output.status.success(),
+                "{}: {job} validator setup failed: {}",
+                wf.file,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(runner.join("review-validator.mjs").is_file());
+        }
         let sc = dir.path().join("sc.json");
         let log = dir.path().join("log.jsonl");
         let git_log = dir.path().join("git.jsonl");
@@ -12043,6 +12085,25 @@ if (mode === 'keys') {
     fn each_secret_is_referenced_only_where_it_is_needed() {
         for wf in all() {
             let f = wf.file;
+            let validator = wf.validator_step("review");
+            assert_eq!(
+                validator,
+                wf.validator_step("file"),
+                "{f}: validator parity"
+            );
+            assert_eq!(
+                validator.as_object().unwrap().len(),
+                2,
+                "{f}: validator step keys"
+            );
+            assert!(
+                secret_names(&flat(validator)).is_empty(),
+                "{f}: validator secrets"
+            );
+            assert!(
+                !flat(validator).contains("OPENROUTER"),
+                "{f}: validator model key"
+            );
             let prepare = flat(wf.job("prepare"));
             assert!(
                 secret_names(&prepare).is_empty() && !prepare.contains("OPENROUTER"),
@@ -12112,13 +12173,12 @@ if (mode === 'keys') {
         let a = load(FILES[0]);
         let b = load(FILES[1]);
         let allowed = [
-            "name:",
-            "run-name:",
-            "group:",
-            "KIND:",
-            "CHECKS:",
-            "const AXIS",
-            "//",
+            "name: ",
+            "run-name: ",
+            "  group: ",
+            "  KIND: ",
+            "  CHECKS: ",
+            "          const AXIS = `",
         ];
         let strip = |w: &Wf, raw: &str| -> Vec<String> {
             let lines: Vec<&str> = raw.lines().collect();
@@ -12127,16 +12187,18 @@ if (mode === 'keys') {
                 .position(|l| *l == "on:")
                 .expect("an `on:` line");
             let mut out = Vec::new();
+            let mut axes = std::collections::BTreeSet::new();
             for (i, l) in lines.iter().enumerate() {
                 if i < on && (l.trim().is_empty() || l.starts_with('#')) {
                     continue;
                 }
                 if l.contains("per axis") {
-                    assert!(
-                        allowed.iter().any(|p| l.trim_start().starts_with(p)),
-                        "{}: `per axis` marks a line that is not axis data: {l}",
-                        w.file
-                    );
+                    let axis = allowed
+                        .iter()
+                        .find(|p| l.starts_with(**p))
+                        .unwrap_or_else(|| panic!("{}: invalid axis line: {l}", w.file));
+                    assert!(l.ends_with("# per axis") || l.ends_with("// per axis"));
+                    assert!(axes.insert(*axis), "{}: duplicate axis line: {l}", w.file);
                     continue;
                 }
                 assert!(
@@ -12147,64 +12209,10 @@ if (mode === 'keys') {
                 );
                 out.push(l.to_string());
             }
+            assert_eq!(axes.len(), allowed.len(), "{}: missing axis line", w.file);
             out
         };
-        // Bind each CAD-2359 fragment to its original shared-code neighbors.
-        assert!(b.raw.contains(concat!(
-            "            let text = '', stop = null, buf = '', failed = false, big = false, refused = false;\n",
-            "            let nonStringContent = false;\n",
-            "            let sawMetadata = false, sawDone = false;\n",
-            "            const dec = new TextDecoder();\n",
-        )));
-        assert!(b.raw.contains(concat!(
-            "                  if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }\n",
-            "                  else if (c.delta?.content != null) nonStringContent = true;\n",
-            "                  if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;\n",
-        )));
-        assert!(b.raw.contains(concat!(
-            "            }\n",
-            "            if (largeInput && (!sawMetadata || !sawDone || (buf + dec.decode()).trim() !== '')) failed = true;\n",
-            "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };\n",
-            "          }\n",
-            "          let res = null;\n",
-        )));
-        assert!(b.raw.contains(concat!(
-            "          let parsed;\n",
-            "          try { parsed = JSON.parse(res.text); } catch {\n",
-            "            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);\n",
-            "            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);\n",
-            "            die('model output is not JSON; nothing filed');\n",
-            "          }\n",
-            "          fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });\n",
-        )));
-        let mut spec = b.raw.clone();
-        for (from, to) in [
-            ("            let nonStringContent = false;\n", ""),
-            ("                  else if (c.delta?.content != null) nonStringContent = true;\n", ""),
-            (
-                "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };\n",
-                "            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };\n",
-            ),
-            (
-                concat!(
-                    "          try { parsed = JSON.parse(res.text); } catch {\n",
-                    "            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);\n",
-                    "            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);\n",
-                    "            die('model output is not JSON; nothing filed');\n",
-                    "          }\n",
-                ),
-                "          try { parsed = JSON.parse(res.text); } catch { die('model output is not JSON; nothing filed'); }\n",
-            ),
-        ] {
-            assert_eq!(
-                spec.matches(from).count(),
-                1,
-                "{}: expected exactly one occurrence of the CAD-2359 diagnostic fragment",
-                b.file
-            );
-            spec = spec.replacen(from, to, 1);
-        }
-        let (sa, sb) = (strip(&a, &a.raw), strip(&b, &spec));
+        let (sa, sb) = (strip(&a, &a.raw), strip(&b, &b.raw));
         assert_eq!(
             sa.len(),
             sb.len(),
@@ -12871,7 +12879,7 @@ if (mode === 'keys') {
     }
 
     #[test]
-    fn a_model_refusal_or_failure_files_nothing_and_a_run_makes_one_generation() {
+    fn a_model_refusal_or_failure_files_nothing_and_limits_requests() {
         for wf in all() {
             let (input, _) = prepared(&wf);
             let good = good_output(&wf).to_string();
@@ -12957,13 +12965,13 @@ if (mode === 'keys') {
                     "not json",
                     json!([model_reply("sorry, no", "stop")]),
                     "not JSON",
-                    1,
+                    2,
                 ),
                 (
                     "empty text",
                     json!([model_reply("", "stop")]),
                     "not JSON",
-                    1,
+                    2,
                 ),
                 (
                     "bad request",
@@ -13022,7 +13030,7 @@ if (mode === 'keys') {
                     "the review job never talks to the tenant"
                 );
             }
-            // A transient status then a good stream is the most it ever bills twice for (nothing was generated).
+            // A transient status followed by a good stream also stays within two requests.
             for status in [500, 429, 503] {
                 let again =
                     json!([{ "status": status, "text": "oops" }, model_reply(&good, "stop")]);
@@ -13052,6 +13060,78 @@ if (mode === 'keys') {
                 "{}: provider controls",
                 wf.file
             );
+        }
+    }
+
+    #[test]
+    fn invalid_model_answers_retry_once_but_a_valid_revise_does_not() {
+        for wf in all() {
+            let (input, _) = prepared(&wf);
+            let good = good_output(&wf);
+            for bad in ["not JSON", "{}"] {
+                let r = run_review(
+                    &wf,
+                    &input,
+                    json!([
+                        model_reply(bad, "stop"),
+                        model_reply(&good.to_string(), "stop")
+                    ]),
+                    &[],
+                );
+                assert_eq!(r.code, Some(0), "{}: {bad}: {}", wf.file, r.out);
+                assert_eq!(r.hits("openrouter").len(), 2);
+                assert_log_clean("invalid answer then valid", &r);
+                let sealed = r
+                    .read("out/review-output.json")
+                    .expect("retry must seal output");
+                let filed = run_file(
+                    &wf,
+                    &file_input(&world(&wf)),
+                    Some(&sealed),
+                    json!([verdict_ok(false, "pass")]),
+                    &[],
+                );
+                assert_eq!(filed.code, Some(0), "{}: {}", wf.file, filed.out);
+                assert_eq!(filed.hits("/verdict").len(), 1);
+
+                let refused = run_review(
+                    &wf,
+                    &input,
+                    json!([model_reply(bad, "stop"), model_reply(bad, "stop")]),
+                    &[],
+                );
+                assert!(refused.failed(), "{}: {bad}: {}", wf.file, refused.out);
+                assert_eq!(refused.hits("openrouter").len(), 2);
+                assert!(refused.files().is_empty() && refused.hits("/verdict").is_empty());
+                assert_log_clean("two invalid answers", &refused);
+            }
+            let mut revise = good;
+            revise["outcome"] = json!("revise");
+            revise["checks"][0]["result"] = json!("fail");
+            let r = run_review(
+                &wf,
+                &input,
+                json!([model_reply(&revise.to_string(), "stop")]),
+                &[],
+            );
+            assert_eq!(r.code, Some(0), "{}: {}", wf.file, r.out);
+            assert_eq!(r.hits("openrouter").len(), 1);
+            let sealed = r
+                .read("out/review-output.json")
+                .expect("revise must be sealed");
+            let filed = run_file(
+                &wf,
+                &file_input(&world(&wf)),
+                Some(&sealed),
+                json!([verdict_ok(false, "revise")]),
+                &[],
+            );
+            assert_eq!(filed.code, Some(0), "{}: {}", wf.file, filed.out);
+            let request: Value =
+                serde_json::from_str(filed.hits("/verdict")[0]["body"].as_str().unwrap()).unwrap();
+            assert_eq!(request["outcome"], "revise");
+            assert_log_clean("valid revise", &r);
+            assert_log_clean("filed revise", &filed);
         }
     }
 
@@ -13506,12 +13586,18 @@ if (mode === 'keys') {
             assert_log_clean("prepare success", &pr);
             let mut poisoned_ok = good_output(&wf);
             poisoned_ok["checks"][0]["note"] = json!(p);
-            poisoned_ok["checks"][0]["citations"] = json!([{ "file": p, "line": 1 }]);
+            let mut poisoned_citation = poisoned_ok.clone();
+            poisoned_citation["checks"][0]["citations"] = json!([{ "file": p, "line": 1 }]);
             let cases: Vec<(&str, Value, bool)> = vec![
                 (
                     "success",
                     json!([model_reply(&poisoned_ok.to_string(), "stop")]),
                     true,
+                ),
+                (
+                    "invalid citation",
+                    json!([model_reply(&poisoned_citation.to_string(), "stop")]),
+                    false,
                 ),
                 (
                     "refusal text",
@@ -13530,7 +13616,7 @@ if (mode === 'keys') {
                 (
                     "model name and usage",
                     json!([{ "status": 200, "sse": [
-                        { "type": "chunk", "model": p, "provider": p, "choices": [{ "index": 0, "delta": { "content": "{}" }, "finish_reason": null }] },
+                        { "type": "chunk", "model": p, "provider": p, "choices": [{ "index": 0, "delta": { "content": poisoned_ok.to_string() }, "finish_reason": null }] },
                         { "type": "chunk", "model": p, "choices": [{ "index": 0, "delta": { "content": "" }, "finish_reason": "stop" }], "usage": { "prompt_tokens": p, "completion_tokens": p } },
                         { "type": "done", "raw": "[DONE]" }] }]),
                     true,

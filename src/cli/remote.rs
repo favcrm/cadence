@@ -6157,6 +6157,9 @@ mod read_contract_tests {
             assert!(!message.contains("--org local"), "{message}");
             assert!(!message.contains("org switch"), "{message}");
             assert!(message.contains("nothing was sent"), "{message}");
+            if expected == "`cadence wiki mkdir`" {
+                assert!(message.contains("cadence commands --all"), "{message}");
+            }
         }
     }
 

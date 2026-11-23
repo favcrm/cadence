@@ -926,8 +926,8 @@ cadence --org acme issue set <issue-id> 'acceptance=- [ ] Verify the amended res
 ```
 
 Use `-` for stdin instead of a filename. `--body` replaces the whole body.
-The acceptance forms read the current body, replace only the level-two
-Acceptance section with explicit `- [ ]` or `- [x]` rows, and save under the
+The acceptance forms read the current body, replace only the checklist in the
+level-two Acceptance section with explicit `- [ ]` or `- [x]` rows, and save under the
 same revision guard. They require `cli.read` as well as `cli.write`. A stale
 revision never overwrites another edit. If an older host refuses the CLI
 edit, use its issue-page editor if available or upgrade the host; nothing
