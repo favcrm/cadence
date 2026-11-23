@@ -139,6 +139,59 @@
   align-items: center;
   gap: 0.5rem;
 }
+.wa-reply-dock > .wa-reply-status[data-quiet="true"] {
+  width: auto;
+  max-width: min(100%, 44rem);
+  justify-self: center;
+  padding: 0.3rem 0.55rem 0.3rem 0.7rem;
+  border-radius: 999px;
+  gap: 0.45rem;
+  font-size: var(--text-micro);
+}
+
+.wa-reply-status[data-quiet="true"] > p {
+  flex: 0 1 auto;
+  gap: 0.4rem;
+}
+
+.wa-reply-status-dot {
+  flex: none;
+  width: 0.4375rem;
+  height: 0.4375rem;
+  border-radius: 50%;
+  background: var(--color-info);
+}
+
+.wa-reply-status[data-tone="sent"] .wa-reply-status-dot {
+  background: var(--color-ok);
+}
+
+.wa-reply-status-close {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-ink-400);
+  font-size: 0.875rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.wa-reply-status-close:hover {
+  background: color-mix(in srgb, var(--color-ink-400) 16%, transparent);
+  color: var(--color-ink-100);
+}
+
+.wa-reply-status-close:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
 .wa-reply-tools { justify-content: flex-end; }
 .wa-reply-hint { margin-inline-end: auto; }
 
