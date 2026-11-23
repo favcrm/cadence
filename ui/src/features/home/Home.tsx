@@ -1881,6 +1881,16 @@ function MasterHome({
               stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
               textareaId={HOME_COMPOSER_ID}
               onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
+              mentionCandidates={(agents.data?.agents ?? [])
+                .filter((a) => !a.inbox && a.provider !== "inbox" && !a.dead && a.alias !== MASTER)
+                .map((a) => ({
+                  id: a.alias,
+                  handle: a.alias,
+                  label: a.alias,
+                  kind: "agent" as const,
+                  subtitle: a.role ?? undefined,
+                  active: true,
+                }))}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly

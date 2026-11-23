@@ -349,14 +349,149 @@ impl Shared {
         if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
             let uid = self.human_room_agent(&caller, "topic_publish")?;
             let org = crate::board_identity::read_config(&self.state_dir)?.company;
-            let (post, fresh) = self
+            let receipt = self
                 .store
                 .human_agent_post(&org, &uid, &topic.id, client_id, text)?;
+            if !receipt.fresh {
+                return Ok(json!({
+                    "topic": topic.id,
+                    "message": receipt.post.id,
+                    "duplicate": true,
+                    "deliveries": [],
+                }));
+            }
+            let sender_alias = self
+                .store
+                .alias_of_uid(&uid)?
+                .ok_or_else(|| Error::rejected("Agent not found"))?;
+            let parsed = crate::store::mentions::parse_mentions(text, false);
+            let active_agents = self.store.human_room_active_agents(&org, &receipt.room)?;
+            let active_humans = self.store.human_room_active_humans(&org, &receipt.room)?;
+            let mut outcomes = Vec::new();
+            let mut deliveries = Vec::new();
+            let mut queued_hops: i64 = 0;
+            let mut primary_unbound = self
+                .store
+                .human_room_post_has_no_primary_request(&receipt.post.id)?;
+
+            for handle in &parsed.handles {
+                if let Some((target_uid, target_alias)) = active_agents
+                    .iter()
+                    .find(|(_, alias)| alias.eq_ignore_ascii_case(handle))
+                {
+                    if target_uid == &uid {
+                        continue;
+                    }
+                    if parsed.silent {
+                        outcomes.push(crate::store::mentions::MentionOutcome {
+                            kind: "silent".to_string(),
+                            handle: format!("@{target_alias}"),
+                            label: target_alias.clone(),
+                            reason: Some("Silent note (/note)".to_string()),
+                        });
+                        continue;
+                    }
+                    if receipt.chain_count + queued_hops >= receipt.chain_limit {
+                        outcomes.push(crate::store::mentions::MentionOutcome {
+                            kind: "blocked_chain".to_string(),
+                            handle: format!("@{target_alias}"),
+                            label: target_alias.clone(),
+                            reason: Some(
+                                "Human-Turn Brake active (waiting_for_person)".to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+                    let req_id = crate::store::topic_request_id(
+                        &topic.id,
+                        &format!("{client_id}:{target_uid}"),
+                    );
+                    let queued_text = format!(
+                        "[{}] @{sender_alias} mentioned you in a channel. \
+                         Read it: `cadence topic read {topic_id}`. Reply in the same channel: \
+                         `cadence topic publish {topic_id} \"<your reply>\" --id <unique-id>`. \
+                         Source post: {post_id}.",
+                        crate::store::human_threads::ROOM_TOPIC_TYPE,
+                        topic_id = topic.id,
+                        post_id = receipt.post.id,
+                    );
+                    let binding = if primary_unbound {
+                        primary_unbound = false;
+                        Some(super::messages_rpc::SendBinding::TopicPost(
+                            &receipt.post.id,
+                        ))
+                    } else {
+                        None
+                    };
+                    let send = json!({
+                        "alias": target_alias,
+                        "text": queued_text,
+                        "message": req_id,
+                        "source": "agent"
+                    });
+                    self.send_with_human_expected(
+                        &send,
+                        &|_| Ok(crate::store::Sender::Agent(sender_alias.clone())),
+                        &|verb| {
+                            Err(Error::rejected(format!(
+                                "{verb} refused: agent hop carries no steering authority"
+                            )))
+                        },
+                        None,
+                        Some(target_uid),
+                        binding,
+                    )?;
+                    self.store.human_room_bind_post_request(
+                        &receipt.post.id,
+                        target_uid,
+                        &req_id,
+                        &sender_alias,
+                        "agent_hop",
+                    )?;
+                    queued_hops += 1;
+                    outcomes.push(crate::store::mentions::MentionOutcome {
+                        kind: "queued".to_string(),
+                        handle: format!("@{target_alias}"),
+                        label: target_alias.clone(),
+                        reason: Some(format!(
+                            "Queued agent hop ({}/{})",
+                            receipt.chain_count, receipt.chain_limit
+                        )),
+                    });
+                    deliveries.push(json!({
+                        "uid": target_uid,
+                        "alias": target_alias,
+                        "message": req_id
+                    }));
+                } else if let Some((_, human_name)) = active_humans.iter().find(|(_, name)| {
+                    !name.is_empty()
+                        && (name.trim().eq_ignore_ascii_case(handle)
+                            || crate::store::mentions::human_handle_matches(name, handle))
+                }) {
+                    outcomes.push(crate::store::mentions::MentionOutcome {
+                        kind: if parsed.silent { "silent" } else { "notified" }.to_string(),
+                        handle: format!("@{handle}"),
+                        label: human_name.clone(),
+                        reason: Some(if parsed.silent {
+                            "Silent note (/note)".to_string()
+                        } else {
+                            "Notified (bell inbox)".to_string()
+                        }),
+                    });
+                }
+            }
+            if parsed.silent || !outcomes.is_empty() {
+                self.store
+                    .human_room_save_post_meta(&receipt.post.id, parsed.silent, &outcomes)?;
+            }
             return Ok(json!({
                 "topic": topic.id,
-                "message": post.id,
-                "duplicate": !fresh,
-                "deliveries": [],
+                "message": receipt.post.id,
+                "duplicate": false,
+                "deliveries": deliveries,
+                "outcomes": outcomes,
+                "chain_count": receipt.chain_count,
+                "chain_limit": receipt.chain_limit,
             }));
         }
         self.may_use_topic(&caller, &topic, "topic_publish")?;

@@ -273,7 +273,7 @@ async function main() {
   assert(!host.textContent?.includes("Maya Park"), "a failed read does not display earlier directory data");
   directoryAvailable = true;
 
-  // Clicking Master (card, then sidebar row) navigates to the Master page, not a chat.
+  // Clicking Master (card, then sidebar row) navigates to the Master page, with no duplicate chat.
   await at("/agents");
   await click(host.querySelector(".rc-seats [aria-label='Open agent master']"));
   assert(location.pathname === "/agents/master" && location.search === "?tab=instructions", "the Master card navigates to its page");
@@ -283,10 +283,21 @@ async function main() {
   const row = Array.from(host.querySelectorAll<HTMLElement>(".ag-side-row")).find((b) => b.textContent?.includes("Master · company"));
   await click(row);
   assert(location.pathname === "/agents/master", "the Master sidebar row navigates");
-  // A hired role's card still opens its chat.
+  // Live worker's card opens its consolidated Overview (zero duplicate chat) and links to Channels.
   await at("/agents");
+  threadReads = [];
   await click(host.querySelector(".rc-seats [aria-label='Open agent crm-action-review']"));
-  assert(String(location.pathname) === "/agents/crm-action-review" && host.querySelector(".ag-chat") !== null, "another agent still opens its chat");
+  assert(
+    String(location.pathname) === "/agents/crm-action-review" &&
+      host.querySelector("main.agents-page") !== null &&
+      host.querySelector(".ag-chat") === null &&
+      host.querySelector("[data-composer]") === null &&
+      threadReads.length === 0 &&
+      Array.from(host.querySelectorAll("a")).some(
+        (a) => a.textContent?.includes("Open in Channels") && a.getAttribute("href") === "/threads?dm=crm-action-review",
+      ),
+    "live worker opens consolidated Overview with Open in Channels CTA and zero duplicate chat",
+  );
 
   // A member who types /agents/master reads the owners-only gate; the assistant is on Home.
   operator = false;
@@ -296,9 +307,16 @@ async function main() {
     "member: the gate says who Master is for",
   );
   assert(host.querySelector("textarea") === null, "member: no composer for the company Master");
+  threadReads = [];
   await at("/agents/crm-action-review");
-  assert(host.textContent?.includes("Conversations with agents here are for the workspace operator."), "member: a hired agent receives the general chat refusal");
-  assert(!host.textContent?.includes("Chat with the company Master is for owners.") && host.querySelector("textarea") === null, "the Master refusal is private to the Master route, and the hired chat remains blocked");
+  assert(
+    host.querySelector("main.agents-page") !== null &&
+      host.querySelector(".ag-chat") === null &&
+      host.querySelector("[data-composer]") === null &&
+      threadReads.length === 0,
+    "member: consolidated worker page renders Overview without a duplicate chat composer or thread reads",
+  );
+  assert(!host.textContent?.includes("Chat with the company Master is for owners."), "the Master refusal stays private to the Master route");
 
   const priorMasterReads = masterReads;
   rosterLoading = true;

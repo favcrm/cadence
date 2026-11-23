@@ -5,6 +5,13 @@ import { resources } from "../../lib/resources";
 import type { IssueHistoryEntry } from "../../lib/types";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
+import MentionPicker from "../mentions/MentionPicker";
+import {
+  applyMention,
+  filterMentionCandidates,
+  findActiveMention,
+  type MentionCandidate,
+} from "../mentions/mentions";
 import { timelineRows } from "./model";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { ReadNotice } from "./issuePageShared";
@@ -27,6 +34,7 @@ export function Activity({
   onWrite,
   onError,
   onOpen,
+  mentionCandidates,
 }: {
   id: string;
   rows: ReturnType<typeof timelineRows>;
@@ -37,13 +45,49 @@ export function Activity({
   onWrite: Props["onWrite"];
   onError: Props["onError"];
   onOpen: (id: string) => void;
+  mentionCandidates?: MentionCandidate[];
 }) {
   const { t, formatDate } = useLocale();
   const [comment, setComment] = useState("");
   const [preview, setPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [caret, setCaret] = useState(0);
+  const [mentionHi, setMentionHi] = useState(0);
+  const [mentionOffFor, setMentionOffFor] = useState<string | null>(null);
+  const commentRef = useRef<HTMLTextAreaElement | null>(null);
   const pending = useRef(false);
+  const activeMention =
+    !preview && !busy && mentionCandidates && mentionCandidates.length > 0
+      ? findActiveMention(comment, caret)
+      : null;
+  const mentionSpanKey = activeMention ? `${activeMention.start}:${activeMention.query}` : null;
+  const mentionMatches =
+    activeMention && mentionCandidates && mentionSpanKey !== mentionOffFor
+      ? filterMentionCandidates(mentionCandidates, activeMention.query)
+      : [];
+  const selectableIndices = mentionMatches
+    .map((candidate, index) => (candidate.active ? index : -1))
+    .filter((index) => index >= 0);
+  const mentionHiClamped =
+    selectableIndices.length === 0
+      ? -1
+      : selectableIndices.includes(mentionHi)
+        ? mentionHi
+        : selectableIndices[0]!;
+  const completeMention = (candidate: MentionCandidate) => {
+    if (!activeMention || !candidate.active) return;
+    const applied = applyMention(comment, activeMention, candidate);
+    setComment(applied.text);
+    setCaret(applied.caret);
+    setMentionOffFor(null);
+    requestAnimationFrame(() => {
+      const el = commentRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(applied.caret, applied.caret);
+    });
+  };
   const send = async () => {
     const body = comment.trim();
     if (!body || readOnly || pending.current) return;
@@ -143,15 +187,60 @@ export function Activity({
               )}
             </div>
           ) : (
-            <textarea
-              id="issue-comment"
-              disabled={busy}
-              className="field w-full !h-auto py-2 text-secondary"
-              rows={3}
-              value={comment}
-              onChange={(e) => setComment(e.target.value)}
-              placeholder={t("Add an update or a question…")}
-            />
+            <div className="relative">
+              {mentionMatches.length > 0 && (
+                <MentionPicker
+                  candidates={mentionMatches}
+                  highlighted={mentionHiClamped}
+                  onHighlight={setMentionHi}
+                  onSelect={completeMention}
+                />
+              )}
+              <textarea
+                ref={commentRef}
+                id="issue-comment"
+                disabled={busy}
+                className="field w-full !h-auto py-2 text-secondary"
+                rows={3}
+                value={comment}
+                onChange={(e) => {
+                  setMentionOffFor(null);
+                  setCaret(e.target.selectionStart ?? e.target.value.length);
+                  setComment(e.target.value);
+                }}
+                onClick={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+                onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+                onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+                onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+                  if (mentionMatches.length === 0 || !activeMention) return;
+                  if (e.key === "ArrowDown" && selectableIndices.length > 0) {
+                    e.preventDefault();
+                    const cur = selectableIndices.indexOf(mentionHiClamped);
+                    setMentionHi(selectableIndices[cur < 0 ? 0 : Math.min(cur + 1, selectableIndices.length - 1)]!);
+                    return;
+                  }
+                  if (e.key === "ArrowUp" && selectableIndices.length > 0) {
+                    e.preventDefault();
+                    const cur = selectableIndices.indexOf(mentionHiClamped);
+                    setMentionHi(selectableIndices[cur <= 0 ? 0 : cur - 1]!);
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setMentionOffFor(mentionSpanKey);
+                    return;
+                  }
+                  if (mentionHiClamped >= 0 && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
+                    e.preventDefault();
+                    const picked = mentionMatches[mentionHiClamped];
+                    if (picked) completeMention(picked);
+                  }
+                }}
+                placeholder={t("Add an update or a question…")}
+              />
+            </div>
           )}
           {error && (
             <p className="text-secondary text-fail m-0" role="alert">

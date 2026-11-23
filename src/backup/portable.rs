@@ -1105,10 +1105,33 @@ const CATALOG: &[(&str, &[&str])] = &[
     ("human_push_presence", &["device", "tab", "room", "expires"]),
     ("human_read_markers", &["room", "human", "seq"]),
     (
+        "human_room_events",
+        &["id", "room", "after_seq", "text", "created"],
+    ),
+    (
         "human_room_members",
         &["room", "kind", "member", "cutoff", "added", "removed"],
     ),
     ("human_room_mutes", &["room", "human", "muted"]),
+    (
+        "human_room_post_meta",
+        &["post_id", "silent", "outcomes_json"],
+    ),
+    (
+        "human_room_post_requests",
+        &[
+            "post_id",
+            "agent_uid",
+            "message_id",
+            "origin_actor",
+            "authority_mode",
+            "created",
+        ],
+    ),
+    (
+        "human_room_state",
+        &["room", "agent_chain_count", "agent_chain_limit", "updated"],
+    ),
     (
         "human_rooms",
         &[

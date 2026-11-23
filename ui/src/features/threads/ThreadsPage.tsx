@@ -10,6 +10,7 @@ import { useTranslate } from "../../lib/locale";
 import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
+import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import NewHumanConversation from "./NewHumanConversation";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
@@ -212,6 +213,7 @@ export default function ThreadsPage({
       me={human.me}
       members={humanState.members}
       denied={humanState.denied}
+      canManage={humanState.canManage}
       people={people.people}
       peopleError={people.error}
       agents={agents.agents}
@@ -410,7 +412,7 @@ export default function ThreadsPage({
   if (!operator && human.me === null && human.loading) {
     return (
       <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
-        <h1 id="threads-title" className="sr-only">Threads</h1>
+        <h1 id="threads-title" className="sr-only">Channels</h1>
         <p className="threads-note" role="status">Checking your access…</p>
       </section>
     );
@@ -419,9 +421,9 @@ export default function ThreadsPage({
   if (!operator && human.me === null) {
     return (
       <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
-        <h1 id="threads-title" className="sr-only">{t("Threads")}</h1>
+        <h1 id="threads-title" className="sr-only">{t("Channels")}</h1>
         <PageState title={t("Operator access required")}>
-          {t("Threads is available to the operator. Use Sign in in the status bar if you have operator access.")}
+          {t("Channels is available to the operator. Use Sign in in the status bar if you have operator access.")}
         </PageState>
       </section>
     );
@@ -455,7 +457,7 @@ export default function ThreadsPage({
       <div className="threads-layout">
         <aside className="threads-list" aria-label={t("Conversations")}>
           <div className="threads-list-head">
-            <h1 id="threads-title">{t("Threads")}</h1>
+            <h1 id="threads-title">{t("Channels")}</h1>
             <Button variant="ghost" size="sm" onClick={() => void loadList()} aria-label={t("Refresh conversations")}>
               <IconRefresh size={12} />
             </Button>
@@ -477,7 +479,7 @@ export default function ThreadsPage({
             />
           </label>
           {list.legacy ? (
-            <p className="threads-note">{t("This daemon predates Threads. Update it to see agent conversations.")}</p>
+            <p className="threads-note">{t("This daemon predates Channels. Update it to see agent conversations.")}</p>
           ) : list.error ? (
             <p className="threads-note" role="status">{t("Conversations could not load:")} {list.error}</p>
           ) : list.rows === null ? (
@@ -526,12 +528,23 @@ export default function ThreadsPage({
                 refresh={humanRefresh}
                 onState={onHumanState}
                 onOpenContext={() => setContextOpen(true)}
+                onInvite={() => {
+                  if (typeof window !== "undefined" && window.innerWidth < 1280) {
+                    setContextOpen(true);
+                  } else {
+                    const trigger = document.querySelector<HTMLButtonElement>(".threads-context [data-invite-select] button");
+                    if (trigger) trigger.focus();
+                    else setContextOpen(true);
+                  }
+                }}
                 onChanged={humanRooms.reload}
                 isDm={humanRoom?.kind === "dm"}
+                roomTitle={humanRoom?.title}
+                people={people.people}
               />
             ) : (
               <div className="threads-empty">
-                <p>Human rooms are unavailable for this sign-in.</p>
+                <p>Channels are unavailable for this sign-in.</p>
               </div>
             )
           ) : open ? (
@@ -607,12 +620,12 @@ export default function ThreadsPage({
         {/* The one roster: the rail on desktop. Below the desktop width the
             rail is hidden and Context opens the same panel. */}
         <aside className="threads-context" aria-label={t("Context")}>
-          {context}
+          {!contextOpen ? context : null}
         </aside>
       </div>
       {(open || humanId) && (
-        <SheetDialog open={contextOpen} title="Context" className="threads-context-sheet" onClose={() => setContextOpen(false)}>
-          {context}
+        <SheetDialog open={contextOpen} title="Details" className="threads-context-sheet" onClose={() => setContextOpen(false)}>
+          {contextOpen ? context : null}
         </SheetDialog>
       )}
       <SheetDialog open={createOpen} title="New conversation" className="threads-create-sheet"
@@ -714,7 +727,7 @@ function SheetDialog({
       aria-labelledby={titleId}
       onCancel={(event) => {
         event.preventDefault();
-        if (busy) return;
+        if (busy || document.querySelector(".s-confirm-wrap") !== null) return;
         onClose();
       }}
     >
@@ -1799,6 +1812,10 @@ function ContextPanel({
   const t = useTranslate();
   const [error, setError] = useState<string | null>(null);
   const [alias, setAlias] = useState("");
+  const [memberFilter, setMemberFilter] = useState("");
+  const [pendingRemove, setPendingRemove] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
   const isGroup = row.kind === "group";
   const act = async (fn: () => Promise<unknown>) => {
     setError(null);
@@ -1809,17 +1826,59 @@ function ContextPanel({
       setError(e instanceof ApiError ? e.message : String(e));
     }
   };
+  const confirmRemove = async () => {
+    if (!pendingRemove) return;
+    setRemoving(true);
+    setRemoveError(null);
+    try {
+      await changeSubscriber(row.id, "unsubscribe", pendingRemove);
+      setPendingRemove(null);
+      onChanged();
+    } catch (e) {
+      setRemoveError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setRemoving(false);
+    }
+  };
+  const activeCount = row.participants.filter((p) => !p.removed).length;
+  const query = memberFilter.trim().toLowerCase();
+  const visibleParticipants = query === ""
+    ? row.participants
+    : row.participants.filter((p) => participantLabel(p, t).toLowerCase().includes(query));
+  const subscribedAliases = new Set(
+    row.participants
+      .filter((p) => !p.removed && p.alias)
+      .map((p) => p.alias as string),
+  );
+  const addableAgents = roster.status === "ready"
+    ? (roster.agents ?? [])
+        .filter((a) => !a.inbox && a.provider !== "inbox" && !a.dead && !subscribedAliases.has(a.alias))
+        .map((a) => ({ value: a.alias, label: `@${a.alias}` }))
+    : [];
+
   return (
     <div className="threads-context-body">
       <div className="threads-context-heading">
         <h3 className="threads-context-title">{t("Participants")}</h3>
-        <span className="threads-context-count">{row.participants.filter((p) => !p.removed).length}</span>
+        <span className="threads-context-count">{activeCount}</span>
       </div>
+      {row.participants.length >= 5 && (
+        <div className="threads-member-filter-wrap">
+          <input
+            type="search"
+            className="field threads-member-filter"
+            value={memberFilter}
+            onChange={(e) => setMemberFilter(e.target.value)}
+            placeholder={t("Filter members…")}
+            aria-label={t("Filter members")}
+          />
+        </div>
+      )}
       <ul className="threads-roster">
-        {row.participants.map((p) => (
+        {visibleParticipants.map((p) => (
           <li key={p.uid ?? p.alias ?? p.kind} data-kind={p.kind} data-removed={p.removed || undefined}>
             <span className="threads-person">
-              <span aria-hidden className="threads-avatar">{initialOf(participantLabel(p, t))}</span>
+              <span aria-hidden className="threads-avatar" data-kind={p.kind}>{initialOf(participantLabel(p, t))}</span>
               <span>{participantLabel(p, t)}</span>
             </span>
             {isGroup && p.kind === "agent" && p.alias && !p.removed && (
@@ -1827,13 +1886,19 @@ function ContextPanel({
                 variant="ghost"
                 size="sm"
                 disabled={writeBlock !== null}
-                onClick={() => void act(() => changeSubscriber(row.id, "unsubscribe", p.alias as string))}
+                onClick={() => {
+                  setRemoveError(null);
+                  setPendingRemove(p.alias as string);
+                }}
               >
                 {t("Remove")}
               </Button>
             )}
           </li>
         ))}
+        {visibleParticipants.length === 0 && query !== "" && (
+          <li className="threads-note">{t("No members match “{query}”.").replace("{query}", memberFilter.trim())}</li>
+        )}
       </ul>
       {isGroup && (
         <form
@@ -1848,10 +1913,26 @@ function ContextPanel({
             });
           }}
         >
-          <label>
-            <span className="threads-field-label">{t("Add an agent by alias")}</span>
-            <input value={alias} onChange={(e) => setAlias(e.target.value)} placeholder={t("Add agent alias")} />
-          </label>
+          <div className="threads-form-field">
+            <span className="threads-field-label">{t("Add an agent")}</span>
+            <Select
+              full
+              searchable
+              size="sm"
+              value={alias}
+              onChange={setAlias}
+              disabled={writeBlock !== null || addableAgents.length === 0}
+              placeholder={
+                roster.status === "loading"
+                  ? t("Loading agents…")
+                  : addableAgents.length === 0
+                    ? t("No agents available")
+                    : t("Choose an agent")
+              }
+              aria-label={t("Add an agent")}
+              options={addableAgents}
+            />
+          </div>
           <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias.trim() === ""}>{t("Add")}</Button>
         </form>
       )}
@@ -1867,6 +1948,23 @@ function ContextPanel({
         onArtifactOpen={onArtifactOpen}
       />
       <p className="threads-note">{t("Workspace access applies. Linking work does not grant access.")}</p>
+      {pendingRemove && (
+        <ConfirmDialog
+          title={t("Remove agent")}
+          body={`Remove @${pendingRemove} from this channel? They will stop receiving messages here.`}
+          confirmLabel={t(removing ? "Removing…" : "Remove")}
+          confirmVariant="danger"
+          pending={removing}
+          error={removeError}
+          onConfirm={() => void confirmRemove()}
+          onCancel={() => {
+            if (!removing) {
+              setPendingRemove(null);
+              setRemoveError(null);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

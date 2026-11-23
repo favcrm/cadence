@@ -102,11 +102,13 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// (CAD-2019 / CAD-2316 / CAD-2022) adds only
 /// `business_template_versions.source_format` and
 /// `business_documents.has_unresolved_pricing`, likewise (bound extends to 70).
+/// v71 (CAD-2711) adds only `human_room_state`, `human_room_post_requests`,
+/// `human_room_post_meta`, and `human_room_events`, likewise (bound extends to 71).
 ///
 /// It stays a reviewed literal rather than `rollout::SCHEMA_VERSION`, so a
 /// migration that does touch a latch or witness table is never accepted
 /// unread; the assertion below fails the build when the two part.
-pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 70;
+pub(crate) const PROTECTED_SCHEMA_MAX: i64 = 71;
 const _: () = assert!(
     PROTECTED_SCHEMA_MAX == crate::rollout::SCHEMA_VERSION,
     "review the new migrations for latch/witness tables, then raise PROTECTED_SCHEMA_MAX"

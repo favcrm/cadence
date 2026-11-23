@@ -71,8 +71,12 @@ const PRIVATE_STORE_TABLES: &[(&str, &str)] = &[
     // these rows; a source holding them now refuses instead, so no private
     // human conversation is silently dropped.
     ("human_rooms", "human-room transcripts"),
+    ("human_room_events", "human-room transcripts"),
     ("human_room_members", "human-room transcripts"),
     ("human_room_mutes", "human-room transcripts"),
+    ("human_room_post_meta", "human-room transcripts"),
+    ("human_room_post_requests", "human-room transcripts"),
+    ("human_room_state", "human-room transcripts"),
     // Cloud-agent connections, grants, sessions and operations, and the
     // request/result text they own. Projected away before; now a refused
     // source, never a publication without its authority rows.

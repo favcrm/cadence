@@ -217,36 +217,11 @@ summary.ag-side-group .num { margin-left: auto; }
 .ag-folded { display: none; margin-top: 1rem; }
 .ag-folded summary { margin-bottom: 0.5rem; cursor: pointer; color: var(--color-ink-400); font-size: var(--text-label); }
 
-/* An agent's page: Home's chat with the agent's own panel */
-.ag-chat { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 1rem; flex: 1; min-height: 0; padding: 0.875rem 1.125rem; }
-.ag-chat-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.ag-chat-head { display: flex; align-items: center; gap: 0.625rem; padding-bottom: 0.625rem; border-bottom: 1px solid var(--color-ink-700); }
-.ag-chat-title { flex: 1; }
-.ag-chat-title h1 { margin: 0; font-size: var(--text-cardtitle); font-weight: 600; outline: 0; overflow-wrap: anywhere; }
-.ag-chat-title p { margin: 0; overflow: hidden; color: var(--color-ink-400); font-size: var(--text-micro); text-overflow: ellipsis; white-space: nowrap; }
-.ag-chat-back { display: none; width: 2.25rem; height: 2.25rem; border-radius: 0.25rem; color: var(--color-ink-300); }
-.ag-chat-gate strong { display: block; color: var(--color-ink-100); font-size: var(--text-body); }
-.ag-chat-gate p { margin: 0.125rem 0 0.625rem; color: var(--color-ink-400); font-size: var(--text-label); }
-.ag-chat-panel { position: absolute; z-index: 4; top: 0.5rem; right: 0.5rem; bottom: 0.5rem; width: min(22rem, calc(100% - 1rem)); overflow-y: auto; padding: 0.75rem 0.875rem 1rem; border: 1px solid var(--color-ink-700); border-radius: 0.5rem; background: var(--color-ink-875); box-shadow: 0 15px 50px rgb(0 0 0 / 0.35); }
-.ag-chat-panel-close { display: flex; justify-content: flex-end; }
-.ag-chat-panel-body { display: grid; gap: 1rem; justify-items: start; }
-.ag-chat-panel .ap-grid { grid-template-columns: minmax(0, 1fr); width: 100%; }
-@media (min-width: 1400px) {
-  .ag-chat[data-panel="open"] { grid-template-columns: minmax(0, 1fr) 21.25rem; }
-  .ag-chat-panel { position: static; width: auto; box-shadow: none; }
-  .ag-chat-panel-close { display: none; }
-}
 @media (max-width: 900px) {
   .ag-shell { grid-template-columns: minmax(0, 1fr); }
   .ag-side { display: none; }
   .ag-shell .ag-toolbar { display: flex; }
   .ag-folded { display: block; }
-  .ag-chat { padding: 0.625rem 0.75rem; }
-  .ag-chat-back { display: inline-grid; place-items: center; }
-}
-@media (max-width: 680px) {
-  .ag-chat-head { flex-wrap: wrap; }
-  .ag-chat-title { flex: 1 1 calc(100% - 6rem); }
 }
 
 /* the Instructions document (CAD-2091): one page-filling Markdown text */

@@ -188,7 +188,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   workspaceApp: "app",
   workspaceAppKey: "app",
   agents: "agents",
-  threads: "threads",
+  threads: "channels",
   myWork: "my work",
   wiki: "wiki",
   documents: "documents",
@@ -1665,8 +1665,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               humanThreadsEnabled={humanThreadsOn}
             />
           ) : (
-            <PageState title={t("Threads are not available here")} actions={<Button href="/">{t("Home")}</Button>}>
-              {t("This hosted workspace does not serve agent or human thread rooms.")}
+            <PageState title={t("Channels are not available here")} actions={<Button href="/">{t("Home")}</Button>}>
+              {t("This hosted workspace does not serve agent or human channels.")}
             </PageState>
           )
         )}

@@ -124,6 +124,60 @@ pub const SCHEMA_V45: &str = "CREATE TABLE IF NOT EXISTS human_notification_pref
         created REAL NOT NULL,
         UNIQUE(post, recipient));";
 
+/// Schema v71 (CAD-2711): channel Human-Turn Brake state, multi-agent
+/// `@mention` request bindings, post mention outcomes/silent metadata, and
+/// membership audit events.
+pub const SCHEMA_V71: &str = "CREATE TABLE IF NOT EXISTS human_room_state(
+        room TEXT PRIMARY KEY REFERENCES human_rooms(id),
+        agent_chain_count INTEGER NOT NULL DEFAULT 0,
+        agent_chain_limit INTEGER NOT NULL DEFAULT 2,
+        updated REAL NOT NULL);
+     CREATE TABLE IF NOT EXISTS human_room_post_requests(
+        post_id TEXT NOT NULL,
+        agent_uid TEXT NOT NULL,
+        message_id TEXT NOT NULL UNIQUE,
+        origin_actor TEXT NOT NULL,
+        authority_mode TEXT NOT NULL,
+        created REAL NOT NULL,
+        PRIMARY KEY(post_id, agent_uid));
+     CREATE TABLE IF NOT EXISTS human_room_post_meta(
+        post_id TEXT PRIMARY KEY,
+        silent INTEGER NOT NULL DEFAULT 0,
+        outcomes_json TEXT NOT NULL DEFAULT '[]');
+     CREATE TABLE IF NOT EXISTS human_room_events(
+        id TEXT PRIMARY KEY,
+        room TEXT NOT NULL REFERENCES human_rooms(id),
+        after_seq INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        created REAL NOT NULL);
+     CREATE INDEX IF NOT EXISTS idx_human_room_events_room
+        ON human_room_events(room, after_seq, created);";
+
+/// One cutoff-bounded channel membership/moderation audit event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HumanRoomAuditEvent {
+    pub id: String,
+    pub text: String,
+    pub created: f64,
+}
+
+/// Stored mention outcomes and silent mode for a channel post.
+#[derive(Debug, Clone, Default)]
+pub struct HumanPostMeta {
+    pub silent: bool,
+    pub outcomes: Vec<super::mentions::MentionOutcome>,
+}
+
+/// Receipt returned when an agent publishes a reply into a channel.
+#[derive(Debug, Clone)]
+pub struct HumanAgentPostReceipt {
+    pub post: TopicPost,
+    pub fresh: bool,
+    pub room: String,
+    pub chain_count: i64,
+    pub chain_limit: i64,
+}
+
 /// A human principal the caller has already verified. Only server-side
 /// verification may construct it; raw request fields are not a source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,12 +341,19 @@ fn human_room_cursor_scope_in(
     })
 }
 
-/// Refuse unless the actor is the room's creator and an active member.
-fn creator_room(conn: &impl StoreConn, actor: &VerifiedHuman, room: &str) -> Result<Room> {
+/// Refuse unless the actor is an active member and either the channel creator
+/// or the workspace owner (`self_role == "owner"` from live roster).
+fn manager_room(
+    conn: &impl StoreConn,
+    actor: &VerifiedHuman,
+    is_owner: bool,
+    room: &str,
+) -> Result<Room> {
     let row = readable_room(conn, actor, room)?;
-    if row.creator != actor.id {
-        return Err(Error::rejected(
-            "Only the room creator may change membership",
+    if row.creator != actor.id && !is_owner {
+        return Err(Error::invalid(
+            "not_room_manager",
+            "Only the channel creator or workspace owner can manage members",
         ));
     }
     Ok(row)
@@ -304,6 +365,54 @@ fn max_seq(conn: &impl StoreConn, topic: &str) -> Result<i64> {
         [topic],
         |r| r.get(0),
     )?)
+}
+
+/// Resolve an agent alias to its active durable uid, refusing personal assistants.
+fn shareable_agent_uid_by_alias_in(conn: &impl StoreConn, alias: &str) -> Result<String> {
+    let is_assistant: Option<i64> =
+        conn.query_opt("SELECT 1 FROM assistants WHERE alias=?", [alias], |r| {
+            r.get(0)
+        })?;
+    if is_assistant.is_some() {
+        return Err(Error::invalid(
+            "personal_assistant_excluded",
+            "Personal assistants cannot be added to shared channels",
+        ));
+    }
+    let row: Option<(String, Option<f64>)> = conn.query_opt(
+        "SELECT uid, archived_at FROM agents WHERE alias=?",
+        [alias],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    match row {
+        Some((uid, None)) => Ok(uid),
+        _ => Err(Error::rejected("Agent not found")),
+    }
+}
+
+fn record_room_event_in(
+    conn: &impl StoreConn,
+    room: &str,
+    after_seq: i64,
+    text: &str,
+    at: f64,
+) -> Result<()> {
+    let id = format!("ev-{}", uuid::Uuid::new_v4().simple());
+    conn.execute(
+        "INSERT INTO human_room_events(id,room,after_seq,text,created) VALUES(?,?,?,?,?)",
+        params![id, room, after_seq, text, at],
+    )?;
+    Ok(())
+}
+
+fn reset_chain_in(conn: &impl StoreConn, room: &str, at: f64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO human_room_state(room,agent_chain_count,agent_chain_limit,updated)
+         VALUES(?,0,?,?)
+         ON CONFLICT(room) DO UPDATE SET agent_chain_count=0, updated=excluded.updated",
+        params![room, super::mentions::AGENT_CHAIN_LIMIT, at],
+    )?;
+    Ok(())
 }
 
 /// The history cutoff of an active agent member of the topic's room in `org`.
@@ -328,6 +437,7 @@ fn agent_alias_in(conn: &impl StoreConn, agent_uid: &str) -> Result<String> {
 
 /// Write one transcript post under `client_id`, or return the stored one when
 /// the same id and body come from the same sender. No queue, no turn.
+/// Quiet posts (`silent || starts_with_note(body)`) skip `notification_intents`.
 fn insert_post(
     conn: &impl StoreConn,
     topic: &str,
@@ -335,6 +445,7 @@ fn insert_post(
     sender_uid: &str,
     sender: &str,
     body: &str,
+    silent: bool,
 ) -> Result<(TopicPost, bool)> {
     let post = post_id(topic, client_id);
     if let Some(existing) = Store::human_post_in(conn, &post)? {
@@ -354,7 +465,11 @@ fn insert_post(
         Store::human_post_in(conn, &post)?.ok_or_else(|| Error::internal("posted row missing"))?;
     // CAD-1423: the one fresh-commit point for human and agent replies. The
     // intent names the real sender uid, so no caller fabricates a human.
-    notification_intents(conn, topic, sender_uid, &saved)?;
+    // CAD-2711: silent notes (`/note` or explicit `silent: true`) record in
+    // transcript only without generating bell or push intents.
+    if !silent && !super::mentions::starts_with_note(body) {
+        notification_intents(conn, topic, sender_uid, &saved)?;
+    }
     Ok((saved, true))
 }
 
@@ -365,9 +480,10 @@ fn write_human_post(
     topic: &str,
     client_id: &str,
     body: &str,
+    silent: bool,
 ) -> Result<(TopicPost, bool)> {
     let sender = principal_name(conn, &actor.org, &actor.id)?.unwrap_or_else(|| actor.name.clone());
-    insert_post(conn, topic, client_id, &actor.id, &sender, body)
+    insert_post(conn, topic, client_id, &actor.id, &sender, body, silent)
 }
 
 /// Queue one private notification intent per current human recipient of a
@@ -398,7 +514,15 @@ fn notification_intents(
         params![room, sender_uid, post.seq],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let mentions_by_name = |name: &str| !name.is_empty() && post.body.contains(&format!("@{name}"));
+    let parsed = super::mentions::parse_mentions(&post.body, false);
+    let mentions_by_name = |name: &str| {
+        !name.is_empty()
+            && (post.body.contains(&format!("@{name}"))
+                || parsed
+                    .handles
+                    .iter()
+                    .any(|h| super::mentions::human_handle_matches(name, h)))
+    };
     for (recipient, name) in recipients {
         let reason = if kind == KIND_DM {
             "dm"
@@ -614,15 +738,10 @@ impl Store {
             for member in members {
                 match member {
                     RoomMember::Human(human) => {
-                        Self::human_member_in(conn, &actor.org, &id, human, at)?;
+                        let _ = Self::human_member_in(conn, &actor.org, &id, human, at)?;
                     }
                     RoomMember::Agent(alias) => {
-                        let uid: Option<String> = conn.query_opt(
-                            "SELECT uid FROM agents WHERE alias=?",
-                            [alias.as_str()],
-                            |r| r.get(0),
-                        )?;
-                        let uid = uid.ok_or_else(|| Error::rejected("Agent not found"))?;
+                        let uid = shareable_agent_uid_by_alias_in(conn, alias)?;
                         conn.execute(
                             "INSERT INTO human_room_members(room,kind,member,cutoff,added)
                              VALUES(?,'agent',?,0,?)",
@@ -635,20 +754,38 @@ impl Store {
         })
     }
 
-    /// Add a human to a group (creator only). A rejoin after removal gets a
-    /// new cutoff, so it never reveals history from before the removal.
+    /// Add a human to a group (creator or workspace owner). A rejoin after
+    /// removal gets a new cutoff, so it never reveals history from before the
+    /// removal.
     pub fn human_group_add_human(
         &self,
         actor: &VerifiedHuman,
+        is_owner: bool,
         room: &str,
         human: &str,
     ) -> Result<()> {
         self.write_tx(|conn| {
-            let row = creator_room(conn, actor, room)?;
+            let row = manager_room(conn, actor, is_owner, room)?;
             if row.kind == KIND_DM {
                 return Err(Error::rejected("A DM has a fixed pair of members"));
             }
-            Self::human_member_in(conn, &actor.org, room, human, now())
+            let at = now();
+            let inserted = Self::human_member_in(conn, &actor.org, room, human, at)?;
+            if inserted {
+                let actor_label = principal_name(conn, &actor.org, &actor.id)?
+                    .unwrap_or_else(|| actor.name.clone());
+                let member_label =
+                    principal_name(conn, &actor.org, human)?.unwrap_or_else(|| human.to_string());
+                let cutoff = max_seq(conn, &row.topic)?;
+                record_room_event_in(
+                    conn,
+                    room,
+                    cutoff,
+                    &format!("{actor_label} added {member_label} to the channel"),
+                    at,
+                )?;
+            }
+            Ok(())
         })
     }
 
@@ -658,7 +795,7 @@ impl Store {
         room: &str,
         human: &str,
         at: f64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let peer_org: Option<String> = conn.query_opt(
             "SELECT org FROM human_principals WHERE id=?",
             [human],
@@ -671,7 +808,7 @@ impl Store {
             .map(|r| r.topic)
             .ok_or_else(|| Error::rejected("Room not found"))?;
         let cutoff = max_seq(conn, &topic)?;
-        conn.execute(
+        let changed = conn.execute(
             "INSERT INTO human_room_members(room,kind,member,cutoff,added)
              VALUES(?,'human',?,?,?)
              ON CONFLICT(room,member) DO UPDATE
@@ -679,73 +816,116 @@ impl Store {
                WHERE human_room_members.removed IS NOT NULL",
             params![room, human, cutoff, at],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
-    /// Add an agent to a mixed group by alias (creator only). The stored
-    /// member is the agent's current durable uid.
+    /// Add a shared agent to a group by alias (creator or workspace owner),
+    /// upgrading `human_group` -> `mixed_group` automatically. Personal
+    /// assistants and DMs are refused.
     pub fn human_group_add_agent(
         &self,
         actor: &VerifiedHuman,
+        is_owner: bool,
         room: &str,
         alias: &str,
     ) -> Result<()> {
         self.write_tx(|conn| {
-            let row = creator_room(conn, actor, room)?;
-            if row.kind != KIND_MIXED_GROUP {
-                return Err(Error::rejected("Only mixed groups take agents"));
+            let row = manager_room(conn, actor, is_owner, room)?;
+            if row.kind == KIND_DM {
+                return Err(Error::invalid(
+                    "dm_agents_refused",
+                    "Shared agents cannot be added to 1:1 direct messages",
+                ));
             }
-            let uid: Option<String> =
-                conn.query_opt("SELECT uid FROM agents WHERE alias=?", [alias], |r| {
-                    r.get(0)
-                })?;
-            let uid = uid.ok_or_else(|| Error::rejected("Agent not found"))?;
+            let uid = shareable_agent_uid_by_alias_in(conn, alias)?;
+            if row.kind == KIND_HUMAN_GROUP {
+                conn.execute(
+                    "UPDATE human_rooms SET kind=? WHERE id=? AND kind=?",
+                    params![KIND_MIXED_GROUP, room, KIND_HUMAN_GROUP],
+                )?;
+            }
             let cutoff = max_seq(conn, &row.topic)?;
-            conn.execute(
+            let at = now();
+            let changed = conn.execute(
                 "INSERT INTO human_room_members(room,kind,member,cutoff,added)
                  VALUES(?,'agent',?,?,?)
                  ON CONFLICT(room,member) DO UPDATE
                    SET removed=NULL, cutoff=excluded.cutoff, added=excluded.added
                    WHERE human_room_members.removed IS NOT NULL",
-                params![room, uid, cutoff, now()],
+                params![room, uid, cutoff, at],
             )?;
+            if changed > 0 {
+                let actor_label = principal_name(conn, &actor.org, &actor.id)?
+                    .unwrap_or_else(|| actor.name.clone());
+                record_room_event_in(
+                    conn,
+                    room,
+                    cutoff,
+                    &format!("{actor_label} added @{alias} to the channel"),
+                    at,
+                )?;
+            }
             Ok(())
         })
     }
 
-    /// Remove a member from a group (creator only). The row and history stay;
-    /// the removed human is refused everywhere in this room. The creator
-    /// cannot remove themselves and a DM has no removals.
+    /// Remove a member from a group (creator or workspace owner). The row and
+    /// history stay; the removed human is refused everywhere in this room.
+    /// The creator cannot remove themselves and a DM has no removals.
     pub fn human_group_remove(
         &self,
         actor: &VerifiedHuman,
+        is_owner: bool,
         room: &str,
         kind: &str,
         member: &str,
     ) -> Result<()> {
         self.write_tx(|conn| {
-            let row = creator_room(conn, actor, room)?;
+            let row = manager_room(conn, actor, is_owner, room)?;
             if row.kind == KIND_DM {
                 return Err(Error::rejected("A DM has a fixed pair of members"));
             }
-            if kind == "human" && member == actor.id {
+            if kind == "human" && member == row.creator {
                 return Err(Error::rejected("The creator cannot remove themselves"));
             }
+            let member_label = match kind {
+                "human" => {
+                    principal_name(conn, &actor.org, member)?.unwrap_or_else(|| member.to_string())
+                }
+                "agent" => conn
+                    .query_opt("SELECT alias FROM agents WHERE uid=?", [member], |r| {
+                        r.get::<_, String>(0)
+                    })?
+                    .map(|alias| format!("@{alias}"))
+                    .unwrap_or_else(|| member.to_string()),
+                _ => member.to_string(),
+            };
+            let at = now();
             let changed = conn.execute(
                 "UPDATE human_room_members SET removed=?
                   WHERE room=? AND kind=? AND member=? AND removed IS NULL",
-                params![now(), room, kind, member],
+                params![at, room, kind, member],
             )?;
             if changed == 0 {
                 return Err(Error::rejected("Member not found"));
             }
+            let actor_label =
+                principal_name(conn, &actor.org, &actor.id)?.unwrap_or_else(|| actor.name.clone());
+            let cutoff = max_seq(conn, &row.topic)?;
+            record_room_event_in(
+                conn,
+                room,
+                cutoff,
+                &format!("{actor_label} removed {member_label} from the channel"),
+                at,
+            )?;
             Ok(())
         })
     }
 
-    /// Post to a room as a verified active human. Writes one transcript
-    /// row. No queue intent, no agent turn, no provider effect. A retry with
-    /// the same `client_id` and body returns the existing post.
+    /// Post to a room as a verified active human. Resets the channel agent
+    /// chain counter and writes one transcript row. A retry with the same
+    /// `client_id` and body returns the existing post.
     pub fn human_room_post(
         &self,
         actor: &VerifiedHuman,
@@ -753,10 +933,27 @@ impl Store {
         client_id: &str,
         body: &str,
     ) -> Result<(TopicPost, bool)> {
+        self.human_room_post_with_silent(actor, room, client_id, body, false)
+    }
+
+    /// Post to a room as a verified active human with explicit silent mode.
+    /// Silent posts (and `/note ...`) skip notification intents.
+    pub fn human_room_post_with_silent(
+        &self,
+        actor: &VerifiedHuman,
+        room: &str,
+        client_id: &str,
+        body: &str,
+        silent: bool,
+    ) -> Result<(TopicPost, bool)> {
         check_post_body(body)?;
         self.write_tx(|conn| {
             let row = readable_room(conn, actor, room)?;
-            write_human_post(conn, actor, &row.topic, client_id, body)
+            let out = write_human_post(conn, actor, &row.topic, client_id, body, silent)?;
+            if out.1 {
+                reset_chain_in(conn, room, now())?;
+            }
+            Ok(out)
         })
     }
 
@@ -999,20 +1196,29 @@ impl Store {
         self.write_tx(|conn| {
             let row = readable_room(conn, actor, room)?;
             agent_cutoff_in(conn, &actor.org, agent_uid, &row.topic)?;
-            write_human_post(conn, actor, &row.topic, client_id, body)
+            let out = write_human_post(conn, actor, &row.topic, client_id, body, false)?;
+            if out.1 {
+                reset_chain_in(conn, room, now())?;
+            }
+            Ok(out)
         })
     }
 
-    /// The private human room whose Ask produced this queued request message,
-    /// resolved through the trusted post→request binding
-    /// (`topic_post_bind_request`). Read-only; `None` when no room post
-    /// carries that request message.
+    /// The private human room whose Ask or `@mention` produced this queued
+    /// request message, resolved through `topic_posts.request_message` or
+    /// `human_room_post_requests`. Read-only; `None` when unbound.
     pub fn human_room_for_request(&self, message_id: &str) -> Result<Option<String>> {
         self.read_tx(|conn| {
             Ok(conn.query_opt(
                 "SELECT r.id FROM human_rooms r
                    JOIN topic_posts p ON p.topic_id=r.topic_id
-                  WHERE p.request_message=?",
+                  WHERE p.request_message=?1
+                 UNION
+                 SELECT r.id FROM human_room_post_requests pr
+                   JOIN topic_posts p ON p.id=pr.post_id
+                   JOIN human_rooms r ON r.topic_id=p.topic_id
+                  WHERE pr.message_id=?1
+                  LIMIT 1",
                 [message_id],
                 |r| r.get::<_, String>(0),
             )?)
@@ -1059,8 +1265,10 @@ impl Store {
         })
     }
 
-    /// An agent's transcript post in a room it is an active member of. The
-    /// sender is its current uid and alias. No queue, no turn, no provider.
+    /// An agent's transcript post in a channel it is an active member of.
+    /// Enforces `human_room_state` Human-Turn Brake (`waiting_for_person` when
+    /// `agent_chain_count >= agent_chain_limit`) and increments `agent_chain_count`
+    /// atomically on fresh commit.
     pub fn human_agent_post(
         &self,
         org: &str,
@@ -1068,12 +1276,285 @@ impl Store {
         topic: &str,
         client_id: &str,
         body: &str,
-    ) -> Result<(TopicPost, bool)> {
+    ) -> Result<HumanAgentPostReceipt> {
         check_post_body(body)?;
         self.write_tx(|conn| {
             agent_cutoff_in(conn, org, agent_uid, topic)?;
             let alias = agent_alias_in(conn, agent_uid)?;
-            insert_post(conn, topic, client_id, agent_uid, &alias, body)
+            let (room, kind): (String, String) = conn
+                .query_opt(
+                    "SELECT id,kind FROM human_rooms WHERE topic_id=? AND org=?",
+                    params![topic, org],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?
+                .ok_or_else(|| Error::rejected("Room not found"))?;
+            if kind == KIND_DM {
+                return Err(Error::invalid(
+                    "dm_agents_refused",
+                    "Shared agents cannot post to 1:1 direct messages",
+                ));
+            }
+            let (cur_count, limit) = conn
+                .query_opt(
+                    "SELECT agent_chain_count, agent_chain_limit FROM human_room_state WHERE room=?",
+                    [room.as_str()],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )?
+                .unwrap_or((0, super::mentions::AGENT_CHAIN_LIMIT));
+            let post_key = post_id(topic, client_id);
+            if let Some(existing) = Store::human_post_in(conn, &post_key)? {
+                if existing.body != body || existing.sender_uid.as_deref() != Some(agent_uid) {
+                    return Err(Error::rejected(
+                        "Post id was already used with different content",
+                    ));
+                }
+                return Ok(HumanAgentPostReceipt {
+                    post: existing,
+                    fresh: false,
+                    room,
+                    chain_count: cur_count,
+                    chain_limit: limit,
+                });
+            }
+            if cur_count >= limit {
+                return Err(Error::invalid(
+                    "waiting_for_person",
+                    "Channel paused after consecutive agent turns; a human message is required to resume",
+                ));
+            }
+            let (post, fresh) = insert_post(
+                conn,
+                topic,
+                client_id,
+                agent_uid,
+                &alias,
+                body,
+                super::mentions::starts_with_note(body),
+            )?;
+            let next_count = cur_count + 1;
+            conn.execute(
+                "INSERT INTO human_room_state(room,agent_chain_count,agent_chain_limit,updated)
+                 VALUES(?,?,?,?)
+                 ON CONFLICT(room) DO UPDATE
+                   SET agent_chain_count=excluded.agent_chain_count,
+                       agent_chain_limit=excluded.agent_chain_limit,
+                       updated=excluded.updated",
+                params![room, next_count, limit, now()],
+            )?;
+            Ok(HumanAgentPostReceipt {
+                post,
+                fresh,
+                room,
+                chain_count: next_count,
+                chain_limit: limit,
+            })
+        })
+    }
+
+    /// Active agents eligible for shared channels: excludes archived agents and
+    /// any private personal assistant in `assistants`.
+    pub fn human_shareable_agents(&self) -> Result<Vec<(String, String)>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT uid, alias FROM agents
+                  WHERE archived_at IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM assistants a WHERE a.alias=agents.alias)
+                  ORDER BY alias",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+    }
+
+    /// Active shared agent members `(uid, alias)` of a room in `org`
+    /// (defense-in-depth: also excludes any alias bound as a personal assistant).
+    pub fn human_room_active_agents(&self, org: &str, room: &str) -> Result<Vec<(String, String)>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT a.uid, a.alias
+                   FROM human_room_members m
+                   JOIN human_rooms r ON r.id=m.room
+                   JOIN agents a ON a.uid=m.member
+                  WHERE m.room=? AND r.org=? AND m.kind='agent'
+                    AND m.removed IS NULL AND a.archived_at IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM assistants asst WHERE asst.alias=a.alias)
+                  ORDER BY m.added, a.alias",
+                params![room, org],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+    }
+
+    /// Active human members `(id, name)` of a room in `org`.
+    pub fn human_room_active_humans(&self, org: &str, room: &str) -> Result<Vec<(String, String)>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT p.id, COALESCE(p.name,'')
+                   FROM human_room_members m
+                   JOIN human_rooms r ON r.id=m.room
+                   JOIN human_principals p ON p.id=m.member
+                  WHERE m.room=? AND r.org=? AND m.kind='human' AND m.removed IS NULL
+                  ORDER BY m.added, m.member",
+                params![room, org],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+    }
+
+    /// `(kind, creator)` for an active human reader of `room`.
+    pub fn human_room_meta(&self, actor: &VerifiedHuman, room: &str) -> Result<(String, String)> {
+        self.read_tx(|conn| {
+            let row = readable_room(conn, actor, room)?;
+            Ok((row.kind, row.creator))
+        })
+    }
+
+    /// `(room_id, kind)` for a `human_room` topic in `org`.
+    pub fn human_room_for_topic(&self, org: &str, topic: &str) -> Result<Option<(String, String)>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_opt(
+                "SELECT id,kind FROM human_rooms WHERE topic_id=? AND org=?",
+                params![topic, org],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+    }
+
+    /// Current `(agent_chain_count, agent_chain_limit)` for `room`. Returns `(0, 0)`
+    /// for 1:1 DMs or rooms with no active agents and zero count.
+    pub fn human_room_chain_state(&self, actor: &VerifiedHuman, room: &str) -> Result<(i64, i64)> {
+        self.read_tx(|conn| {
+            let row = readable_room(conn, actor, room)?;
+            if row.kind == KIND_DM {
+                return Ok((0, 0));
+            }
+            let has_agents: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM human_room_members WHERE room=? AND kind='agent' AND removed IS NULL)",
+                [room],
+                |r| r.get(0),
+            )?;
+            let stored = conn.query_opt(
+                "SELECT agent_chain_count, agent_chain_limit FROM human_room_state WHERE room=?",
+                [room],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )?;
+            let (count, limit) = stored.unwrap_or((0, super::mentions::AGENT_CHAIN_LIMIT));
+            if !has_agents && count == 0 {
+                Ok((0, 0))
+            } else {
+                Ok((count, limit))
+            }
+        })
+    }
+
+    /// Cutoff-bounded membership audit events visible to `actor` in `room`.
+    pub fn human_room_events_for(
+        &self,
+        actor: &VerifiedHuman,
+        room: &str,
+    ) -> Result<Vec<HumanRoomAuditEvent>> {
+        self.read_tx(|conn| {
+            let _ = readable_room(conn, actor, room)?;
+            let (cutoff, added): (i64, f64) = conn.query_row(
+                "SELECT cutoff, added FROM human_room_members
+                  WHERE room=? AND kind='human' AND member=? AND removed IS NULL",
+                params![room, actor.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(conn.query_vec(
+                "SELECT id, text, created FROM human_room_events
+                  WHERE room=? AND after_seq>=? AND created>=?
+                  ORDER BY after_seq ASC, created ASC, id ASC",
+                params![room, cutoff, added],
+                |r| {
+                    Ok(HumanRoomAuditEvent {
+                        id: r.get(0)?,
+                        text: r.get(1)?,
+                        created: r.get(2)?,
+                    })
+                },
+            )?)
+        })
+    }
+
+    /// Persist silent flag and resolved `@mention` outcomes for a channel post.
+    pub fn human_room_save_post_meta(
+        &self,
+        post_id: &str,
+        silent: bool,
+        outcomes: &[super::mentions::MentionOutcome],
+    ) -> Result<()> {
+        let json = serde_json::to_string(outcomes)
+            .map_err(|e| Error::internal(format!("serialize mention outcomes: {e}")))?;
+        self.write_tx(|conn| {
+            conn.execute(
+                "INSERT INTO human_room_post_meta(post_id,silent,outcomes_json)
+                 VALUES(?,?,?)
+                 ON CONFLICT(post_id) DO UPDATE
+                   SET silent=excluded.silent, outcomes_json=excluded.outcomes_json",
+                params![post_id, i64::from(silent), json],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Read stored mention metadata for a slice of post ids.
+    pub fn human_room_post_meta_for(
+        &self,
+        post_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, HumanPostMeta>> {
+        self.read_tx(|conn| {
+            let mut out = std::collections::HashMap::new();
+            for post_id in post_ids {
+                if let Some((silent, raw)) = conn.query_opt(
+                    "SELECT silent, outcomes_json FROM human_room_post_meta WHERE post_id=?",
+                    [post_id.as_str()],
+                    |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, String>(1)?)),
+                )? {
+                    let outcomes = serde_json::from_str(&raw).unwrap_or_default();
+                    out.insert(post_id.clone(), HumanPostMeta { silent, outcomes });
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Record a request message dispatched for an agent `@mention` on `post_id`.
+    pub fn human_room_bind_post_request(
+        &self,
+        post_id: &str,
+        agent_uid: &str,
+        message_id: &str,
+        origin_actor: &str,
+        authority_mode: &str,
+    ) -> Result<()> {
+        self.write_tx(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO human_room_post_requests
+                 (post_id,agent_uid,message_id,origin_actor,authority_mode,created)
+                 VALUES(?,?,?,?,?,?)",
+                params![
+                    post_id,
+                    agent_uid,
+                    message_id,
+                    origin_actor,
+                    authority_mode,
+                    now()
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// True if `topic_posts.request_message` is currently unset for `post_id`.
+    pub fn human_room_post_has_no_primary_request(&self, post_id: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let bound: Option<Option<String>> = conn.query_opt(
+                "SELECT request_message FROM topic_posts WHERE id=?",
+                [post_id],
+                |r| r.get(0),
+            )?;
+            Ok(matches!(bound, Some(None)))
         })
     }
 

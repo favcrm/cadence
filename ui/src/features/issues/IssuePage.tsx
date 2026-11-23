@@ -151,6 +151,7 @@ function PageBody({
   tab,
   tabHref,
   issues,
+  agents,
   detail,
   history,
   lane,
@@ -361,6 +362,16 @@ function PageBody({
               onWrite={onWrite}
               onError={onError}
               onOpen={onOpen}
+              mentionCandidates={(agents?.agents ?? [])
+                .filter((a) => !a.inbox && a.provider !== "inbox" && !a.dead)
+                .map((a) => ({
+                  id: a.alias,
+                  handle: a.alias,
+                  label: a.alias,
+                  kind: "agent" as const,
+                  subtitle: a.role ?? undefined,
+                  active: true,
+                }))}
             />
           )}
           {activeTab === "conversation" &&

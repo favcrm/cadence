@@ -299,14 +299,54 @@
 }
 .threads-reply,
 .threads-composer {
-  border-top: 1px solid var(--color-ink-700);
-  padding: 1rem;
+  border-top: 0;
+  padding: 0.35rem 1rem 0.9rem;
   display: grid;
-  gap: 0.5rem;
+  gap: 0.45rem;
+  background: linear-gradient(to bottom, transparent, var(--color-ink-900, transparent) 24%);
+}
+.threads-composer > * {
+  max-width: 52rem;
+  width: 100%;
+  margin-inline: auto;
+}
+.threads-composer-dock {
+  flex: none;
+  padding: 0.35rem 1rem 0.9rem;
+  background: linear-gradient(to bottom, transparent, var(--color-ink-900, transparent) 24%);
+  display: grid;
+  gap: 0.45rem;
+}
+.threads-composer-dock > * {
+  max-width: 52rem;
+  width: 100%;
+  margin-inline: auto;
+}
+.threads-composer-card {
+  display: grid;
+  gap: 0.3rem;
+}
+.threads-composer-card > .card,
+.threads-composer > .card {
+  border-radius: 0.75rem;
+  border: 1px solid var(--color-ink-700);
+  box-shadow: 0 8px 26px rgb(0 0 0 / 0.12);
+}
+.threads-dock-hint {
+  margin: 0;
+  padding-inline: 0.25rem;
+  font-size: var(--text-micro);
+  color: var(--color-ink-500);
+}
+.threads-messages > * {
+  max-width: 52rem;
+  width: 100%;
+  margin-inline: auto;
 }
 @media (min-width: 768px) {
   .threads-reply,
-  .threads-composer {
+  .threads-composer,
+  .threads-composer-dock {
     padding-left: 1.5rem;
     padding-right: 1.5rem;
   }
@@ -506,7 +546,8 @@
   border-top: 1px solid var(--color-ink-800);
   font-size: var(--text-secondary);
 }
-.threads-add > label {
+.threads-add > label,
+.threads-add > .threads-form-field {
   width: 100%;
   min-width: 0;
 }
@@ -916,3 +957,139 @@
     justify-content: flex-end;
   }
 }
+
+/* CAD-2711 Channels polish: header avatar stack, audit notices, @mention outcomes, brake banner & filter. */
+.threads-head {
+  align-items: center;
+}
+.threads-head-title {
+  min-width: 0;
+  display: grid;
+  gap: 0.1rem;
+}
+.threads-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+.threads-avatar-stack {
+  display: inline-flex;
+  align-items: center;
+}
+.threads-avatar-stack .threads-avatar {
+  margin-left: -0.35rem;
+  border: 2px solid var(--color-ink-900);
+}
+.threads-avatar-stack .threads-avatar:first-child {
+  margin-left: 0;
+}
+.threads-avatar[data-kind="agent"] {
+  border-radius: 0.35rem;
+  background: color-mix(in srgb, var(--color-info) 16%, transparent);
+  color: var(--color-info);
+}
+.threads-avatar-more {
+  margin-left: 0.35rem;
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+  font-variant-numeric: tabular-nums;
+}
+.threads-row-sigil {
+  display: inline-block;
+  margin-right: 0.3rem;
+  color: var(--color-ink-500);
+  font-weight: 500;
+}
+.threads-unread-pill {
+  flex: none;
+  min-width: 1.25rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--color-accent);
+  color: #fff;
+  font-size: var(--text-micro);
+  font-weight: 600;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.threads-audit-event {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  margin: 0.25rem auto;
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+  text-align: center;
+}
+.threads-silent-row {
+  display: flex;
+  padding-left: 0.25rem;
+}
+.threads-msg[data-role="operator"] .threads-silent-row {
+  justify-content: flex-end;
+}
+.threads-silent-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+.threads-outcomes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding-left: 0.25rem;
+}
+.threads-msg[data-role="operator"] .threads-outcomes {
+  justify-content: flex-end;
+}
+.threads-outcome {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+}
+.threads-outcome[data-kind="queued"],
+.threads-outcome[data-kind="notified"] {
+  border-color: color-mix(in srgb, var(--color-ok) 35%, var(--color-ink-700));
+  color: var(--color-ok);
+}
+.threads-outcome[data-kind="blocked_acl"],
+.threads-outcome[data-kind="blocked_dm"],
+.threads-outcome[data-kind="blocked_chain"] {
+  border-color: color-mix(in srgb, var(--color-warn) 40%, var(--color-ink-700));
+  color: var(--color-warn);
+}
+.threads-brake-banner {
+  padding: 0.55rem 0.8rem;
+  border-radius: 0.5rem;
+  border: 1px solid color-mix(in srgb, var(--color-warn) 45%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-warn) 10%, var(--color-ink-850));
+  color: var(--color-warn);
+  font-size: var(--text-label);
+}
+.threads-member-filter-wrap {
+  margin-bottom: 0.6rem;
+}
+.threads-member-filter {
+  width: 100%;
+  min-height: 2rem;
+  padding: 0.25rem 0.6rem;
+  font-size: var(--text-label);
+}
+.threads-member-tag {
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+

@@ -609,6 +609,16 @@ export default function MemberChat({
               storeKey={`member-assist:${scope}`}
               block={readOnly ? t("The board is read-only.") : null}
               commands={[WORKSPACE_SKILLS_COMMAND]}
+              mentionCandidates={(roster.data?.agents ?? [])
+                .filter((a) => !a.inbox && a.provider !== "inbox" && !a.dead && a.alias !== surface?.alias && a.alias !== "master")
+                .map((a) => ({
+                  id: a.alias,
+                  handle: a.alias,
+                  label: a.alias,
+                  kind: "agent" as const,
+                  subtitle: a.role ?? undefined,
+                  active: true,
+                }))}
               onNotice={(notice) => setSendNote(displayUiNotice(notice, t))}
               onSend={({ body }) => {
                 void sendToAssistant(scope, body).then((receipt) => {
