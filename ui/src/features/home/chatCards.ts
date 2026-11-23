@@ -1,4 +1,5 @@
 import { appViewRef, type AppViewRef } from "../canvas/appView";
+import { placementOf, type Placement } from "../canvas/canvasLayout";
 import { routeParams, withParams, type RouteParams } from "../workspace-apps/screen/routeParams";
 import { recordViewId, type RecordViewRef } from "../canvas/recordView";
 import type { ThreadEntry } from "./thread";
@@ -589,6 +590,8 @@ export interface ViewCardModel {
   view?: string;
   viewLabel?: string;
   params?: RouteParams;
+  /** CAD-2635 — where Nova asks for the view; a value the board does not know is dropped, never refused. */
+  placement?: Placement;
 }
 
 const plainField = (v: unknown, max: number): v is string =>
@@ -599,9 +602,9 @@ export function parseViewRef(entry: ThreadEntry): ViewCardModel | null {
   const p = payloadOf(entry, "view_ref");
   if (!p) return null;
   const hasRecord = Object.prototype.hasOwnProperty.call(p, "record_id");
-  const optional = ["view", "view_label", "params"].filter((key) => Object.prototype.hasOwnProperty.call(p, key));
+  const optional = ["view", "view_label", "params", "placement"].filter((key) => Object.prototype.hasOwnProperty.call(p, key));
   if (!exactKeys(p, ["v", "app", "app_label", "install_id", "screen_tag", "section", "title", ...(hasRecord ? ["record_id"] : []), ...optional])) return null;
-  const { app, app_label, install_id, screen_tag, section, record_id, title, view, view_label, params } = p;
+  const { app, app_label, install_id, screen_tag, section, record_id, title, view, view_label, params, placement } = p;
   if (typeof app !== "string" || !VIEW_APP.test(app)) return null;
   if (!plainField(app_label, 60) || !plainField(title, 120)) return null;
   if (typeof install_id !== "string" || !VIEW_ID.test(install_id)) return null;
@@ -616,6 +619,7 @@ export function parseViewRef(entry: ThreadEntry): ViewCardModel | null {
     ...(optional.includes("view") ? { view: view as string } : {}),
     ...(optional.includes("view_label") ? { viewLabel: view_label as string } : {}),
     ...(optional.includes("params") ? { params: params as RouteParams } : {}),
+    ...(placementOf(placement) ? { placement: placementOf(placement) } : {}),
   };
 }
 

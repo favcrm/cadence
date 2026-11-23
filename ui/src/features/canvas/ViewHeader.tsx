@@ -29,6 +29,8 @@ export interface ViewHeaderProps {
   open: { label: string; href: string; onOpen: () => void } | null;
   /** Null on the phone sheet, which is already the whole screen. */
   expand: { expanded: boolean; enabled: boolean; onToggle: () => void } | null;
+  /** In a pane (CAD-2635): "Move to tab" sits in the "⋯", and the close returns the view to its tab. */
+  pane?: { onMoveToTab: () => void } | null;
   onClose: () => void;
 }
 
@@ -42,12 +44,13 @@ function focusExpand(root: HTMLElement | null): void {
   });
 }
 
-export default function ViewHeader({ mark, back, title, chips, note, open, expand, onClose }: ViewHeaderProps) {
+export default function ViewHeader({ mark, back, title, chips, note, open, expand, pane = null, onClose }: ViewHeaderProps) {
   const t = useTranslate();
   const head = useRef<HTMLElement | null>(null);
   const more = chips.slice(1);
   const expandLabel = t(expand?.expanded ? "Collapse canvas" : "Expand canvas");
   const folded: RowMenuItem[] = [];
+  if (pane) folded.push({ key: "tab", label: t("Move to tab"), onSelect: pane.onMoveToTab });
   if (open) folded.push({ key: "open", label: open.label, hint: note ?? undefined, onSelect: () => { open.onOpen(); navigate(open.href); } });
   if (expand?.enabled) folded.push({ key: "expand", label: expandLabel, onSelect: expand.onToggle });
   return (
@@ -95,9 +98,9 @@ export default function ViewHeader({ mark, back, title, chips, note, open, expan
           </svg>
         </button>
       ) : null}
-      {folded.length === 0 ? null : <span className="cv-fold"><RowMenu label={t("More actions")} items={folded} /></span>}
+      {folded.length === 0 ? null : <span className="cv-fold" data-pane={pane ? "" : undefined}><RowMenu label={t("More actions")} items={folded} /></span>}
       {back && !back.expanded ? null : (
-        <button type="button" className="cv-iconbtn" onClick={onClose} aria-label={t("Close canvas")}>
+        <button type="button" className="cv-iconbtn" onClick={onClose} aria-label={t(pane ? "Close pane" : "Close canvas")} title={pane ? t("Close pane — the view stays in the tabs") : undefined}>
           <IconClose size={12} />
         </button>
       )}
