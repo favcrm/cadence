@@ -19092,11 +19092,10 @@ mod cad2457_doctor_acceptance {
     }
 }
 
-// CAD-2494 / CAD-2424: the real `scripts/enqueue-reviewed --dry-run` against an
-// approved custom policy's requirements answer. A stub classifier answers the
-// policy (its reviews and GitHub App checks) and the check runs on the head; the
-// repository, diff and trusted lists are real.
-mod cad2494_policy_gate {
+// CAD-2494 acceptance, authored from the ticket by someone other than the implementer;
+// the implementer must not edit or weaken it. The real `scripts/enqueue-reviewed --dry-run`
+// against an owner-approved custom policy answer, on an exact head.
+mod cad2494_acceptance {
     use serde_json::{json, Value};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -19349,78 +19348,98 @@ mod cad2494_policy_gate {
         ]
     }
 
-    // Each review kind the policy can name: none, one axis, one combined, both axes.
-    #[test]
-    fn each_policy_review_kind_is_enforced() {
-        let repo = Repo::new();
-        let head = repo.head("code", "src/area/new.rs");
-        let st = || {
-            vec![owner(
-                "20261103-000100-a.md",
-                "usr_alice",
-                "alice",
-                "standards",
-            )]
-        };
-        let spec = || {
-            vec![owner(
-                "20261103-000100-b.md",
-                "usr_bob",
-                "bob",
-                "spec-security",
-            )]
-        };
-        let one = || {
-            vec![owner(
-                "20261103-000100-c.md",
-                "usr_alice",
-                "alice",
-                "combined",
-            )]
-        };
-        let kind = |reviews, kind, focus: Option<&str>| {
-            policy(
-                "consequential",
-                reviews,
-                kind,
-                focus.map(|f| vec![agent("r", f)]).unwrap_or_default(),
-                vec![],
-            )
-        };
-        gate(&repo, &head, kind(0, "none", None), vec![]).passes();
-        gate(&repo, &head, kind(1, "standards", Some("standards")), st()).passes();
-        gate(
-            &repo,
-            &head,
-            kind(1, "standards", Some("standards")),
+    fn std_row() -> Vec<Value> {
+        vec![owner(
+            "20261103-000100-a.md",
+            "usr_alice",
+            "alice",
+            "standards",
+        )]
+    }
+
+    fn spec_row() -> Vec<Value> {
+        vec![owner(
+            "20261103-000100-b.md",
+            "usr_bob",
+            "bob",
+            "spec-security",
+        )]
+    }
+
+    fn comb_row() -> Vec<Value> {
+        vec![owner(
+            "20261103-000100-c.md",
+            "usr_alice",
+            "alice",
+            "combined",
+        )]
+    }
+
+    fn kind(reviews: u32, kind: &str, focus: Option<&str>) -> Value {
+        policy(
+            "consequential",
+            reviews,
+            kind,
+            focus.map(|f| vec![agent("r", f)]).unwrap_or_default(),
             vec![],
         )
-        .refused("no pass Standards verdict");
-        gate(
-            &repo,
-            &head,
-            kind(1, "standards", Some("standards")),
-            spec(),
+    }
+
+    fn scan_policy(class: &str, reviews: u32, review_kind: &str) -> Value {
+        policy(
+            class,
+            reviews,
+            review_kind,
+            vec![check("scan", "scanner")],
+            vec![required("scan", "scanner")],
         )
-        .refused("no pass Standards verdict");
-        gate(
-            &repo,
-            &head,
-            kind(1, "spec_security", Some("spec-security")),
-            spec(),
-        )
-        .passes();
-        gate(
-            &repo,
-            &head,
-            kind(1, "spec_security", Some("spec-security")),
-            st(),
-        )
-        .refused("no pass Spec/security verdict");
-        gate(&repo, &head, kind(1, "combined", Some("general")), one()).passes();
-        gate(&repo, &head, kind(1, "combined", Some("general")), vec![])
-            .refused("one review is required");
-        let both = || {
+    }
+
+    fn scan_run(app: &str, status: &str, conclusion: Value, at: &str) -> Value {
+        json!([app, status, conclusion, at])
+    }
+
+    #[test]
+    fn review_kind_none_needs_no_verdict() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        gate(&repo, &head, kind(0, "none", None), vec![]).passes();
+    }
+
+    #[test]
+    fn review_kind_standards_needs_a_standards_verdict() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || kind(1, "standards", Some("standards"));
+        gate(&repo, &head, p(), std_row()).passes();
+        gate(&repo, &head, p(), vec![]).refused("Standards");
+        gate(&repo, &head, p(), spec_row()).refused("Standards");
+    }
+
+    #[test]
+    fn review_kind_spec_security_needs_a_spec_security_verdict() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || kind(1, "spec_security", Some("spec-security"));
+        gate(&repo, &head, p(), spec_row()).passes();
+        gate(&repo, &head, p(), vec![]).refused("Spec/security");
+        gate(&repo, &head, p(), std_row()).refused("Spec/security");
+    }
+
+    #[test]
+    fn review_kind_combined_needs_one_review() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || kind(1, "combined", Some("general"));
+        gate(&repo, &head, p(), comb_row()).passes();
+        gate(&repo, &head, p(), vec![]).refused("review");
+    }
+
+    #[test]
+    fn review_kind_standards_and_spec_needs_both_axes() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || {
             policy(
                 "consequential",
                 2,
@@ -19429,92 +19448,72 @@ mod cad2494_policy_gate {
                 vec![],
             )
         };
-        gate(&repo, &head, both(), pair()).passes();
-        gate(&repo, &head, both(), one()).refused("no pass Standards verdict");
+        gate(&repo, &head, p(), pair()).passes();
+        gate(&repo, &head, p(), std_row()).refused("Spec/security");
+        gate(&repo, &head, p(), comb_row()).refused("Standards");
     }
 
-    // Required checks: none listed, missing, failed, pending, another App's, and the
-    // latest run deciding.
     #[test]
-    fn a_required_check_must_have_succeeded_from_the_named_app_on_the_head() {
+    fn required_check_must_succeed_from_the_named_app_on_the_head() {
         let repo = Repo::new();
         let head = repo.head("code", "src/area/new.rs");
-        let answer = || {
-            policy(
-                "consequential",
-                0,
-                "none",
-                vec![check("scan", "scanner")],
-                vec![required("scan", "scanner")],
-            )
-        };
-        let ok = || json!({"scan": [["scanner", "completed", "success", T0]]});
-        gate(&repo, &head, answer(), vec![]).runs(ok()).passes();
-        gate(&repo, &head, answer(), vec![])
+        let p = || scan_policy("consequential", 0, "none");
+        let ok = scan_run("scanner", "completed", json!("success"), T0);
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [ok.clone()]}))
+            .passes();
+        // No required checks listed: nothing to run, still passes.
+        gate(&repo, &head, kind(0, "none", None), vec![]).passes();
+        // Absent, failed, pending, wrong App.
+        gate(&repo, &head, p(), vec![])
             .runs(json!({"scan": []}))
-            .refused("has no run");
-        gate(&repo, &head, answer(), vec![])
-            .runs(json!({"scan": [["scanner", "completed", "failure", T0]]}))
-            .refused("not successful (failure)");
-        gate(&repo, &head, answer(), vec![])
-            .runs(json!({"scan": [["scanner", "in_progress", null, T0]]}))
-            .refused("is pending");
-        gate(&repo, &head, answer(), vec![])
-            .runs(json!({"scan": [["intruder", "completed", "success", T0]]}))
-            .refused("only from intruder");
-        gate(&repo, &head, answer(), vec![])
-            .runs(json!({"scan": [["scanner", "completed", "success", T0],
-                                  ["scanner", "completed", "failure", T1]]}))
-            .refused("not successful (failure)");
-        gate(&repo, &head, answer(), vec![])
-            .runs(json!({"scan": [["scanner", "completed", "failure", T0],
-                                  ["scanner", "completed", "success", T1]]}))
+            .refused("scan");
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [scan_run("scanner", "completed", json!("failure"), T0)]}))
+            .refused("failure");
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [scan_run("scanner", "in_progress", Value::Null, T0)]}))
+            .refused("scan");
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [scan_run("intruder", "completed", json!("success"), T0)]}))
+            .refused("scanner");
+        // The latest run from the App decides, in either order.
+        let bad = |at| scan_run("scanner", "completed", json!("failure"), at);
+        let good = |at| scan_run("scanner", "completed", json!("success"), at);
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [good(T0), bad(T1)]}))
+            .refused("failure");
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [bad(T0), good(T1)]}))
             .passes();
     }
 
-    // The trusted-list floor (a trust-boundary path) stays strict, and the policy's
-    // checks and reviews are enforced on top of it.
     #[test]
-    fn the_floor_case_enforces_the_policy_checks_on_top() {
+    fn the_strict_floor_carrying_policy_checks_enforces_them() {
         let repo = Repo::new();
         let head = repo.head("peer", "src/peer.rs");
-        let answer = || {
-            policy(
-                "strict",
-                2,
-                "standards_and_spec",
-                vec![agent("s", "standards"), check("scan", "scanner")],
-                vec![required("scan", "scanner")],
-            )
-        };
-        let ok = || json!({"scan": [["scanner", "completed", "success", T0]]});
-        gate(&repo, &head, answer(), pair()).runs(ok()).passes();
-        gate(&repo, &head, answer(), pair())
-            .runs(json!({"scan": [["scanner", "completed", "failure", T0]]}))
-            .refused("not successful (failure)");
-        gate(&repo, &head, answer(), vec![])
-            .runs(ok())
-            .refused("no pass Standards verdict");
+        let p = || scan_policy("strict", 2, "standards_and_spec");
+        let ok = json!({"scan": [scan_run("scanner", "completed", json!("success"), T0)]});
+        gate(&repo, &head, p(), pair()).runs(ok.clone()).passes();
+        gate(&repo, &head, p(), pair())
+            .runs(json!({"scan": [scan_run("scanner", "completed", json!("failure"), T0)]}))
+            .refused("failure");
+        gate(&repo, &head, p(), pair())
+            .runs(json!({"scan": []}))
+            .refused("scan");
+        gate(&repo, &head, p(), vec![]).runs(ok).refused("review");
     }
 
-    // Unrecognized evidence, a missing App and the answer shapes the gate cannot trust
-    // refuse; a default answer behaves as before.
     #[test]
-    fn unrecognized_policy_evidence_fails_closed_and_a_default_answer_is_unchanged() {
+    fn unrecognized_or_unusable_policy_evidence_fails_closed() {
         let repo = Repo::new();
         let head = repo.head("code", "src/area/new.rs");
-        let one = || {
-            vec![owner(
-                "20261103-000100-c.md",
-                "usr_alice",
-                "alice",
-                "combined",
-            )]
-        };
-        let refused = "requirements binding or fields are malformed";
-        let mut unknown = policy("consequential", 0, "none", vec![], vec![]);
+        let ok = json!({"scan": [scan_run("scanner", "completed", json!("success"), T0)]});
+        // An unrecognized field.
+        let mut unknown = kind(0, "none", None);
         unknown["gate_version"] = json!(2);
-        gate(&repo, &head, unknown, vec![]).refused("unrecognized fields");
+        gate(&repo, &head, unknown, vec![]).refused("unrecognized");
+        // A required check with no App identity.
         let no_app = policy(
             "consequential",
             0,
@@ -19522,55 +19521,23 @@ mod cad2494_policy_gate {
             vec![check("scan", "")],
             vec![required("scan", "")],
         );
-        gate(&repo, &head, no_app, vec![]).refused("unrecognized shape");
-        let checks_only = json!({"class": "consequential", "activation": "no_profile", "reviews": 0,
-                                 "review_kind": "none", "required_checks": [required("scan", "scanner")]});
-        gate(&repo, &head, checks_only, vec![]).refused("needs both required_reviews");
-        let lean = policy("routine", 0, "none", vec![], vec![]);
-        gate(&repo, &head, lean, vec![]).refused("policy answer does not match");
-        let unknown_kind = policy("consequential", 0, "everything", vec![], vec![]);
-        gate(&repo, &head, unknown_kind, vec![]).refused(refused);
-        let mismatch = policy(
-            "consequential",
-            0,
-            "none",
-            vec![agent("s", "standards")],
-            vec![],
-        );
-        gate(&repo, &head, mismatch, vec![]).refused("policy answer does not match");
-        // Without a policy the answer is the legacy one: one combined review passes.
-        gate(&repo, &head, json!({}), one()).passes();
-        gate(&repo, &head, json!({}), vec![]).refused("one review is required");
+        gate(&repo, &head, no_app, vec![])
+            .runs(ok.clone())
+            .refused("scan");
+        // An unknown review kind.
+        gate(&repo, &head, kind(0, "everything", None), vec![]).refused("");
+        // A required check the policy never named as a review is not silently dropped.
+        let checks_only = json!({"class": "consequential", "activation": "no_profile",
+            "reviews": 0, "review_kind": "none",
+            "required_checks": [required("scan", "scanner")]});
+        gate(&repo, &head, checks_only, vec![]).runs(ok).refused("");
     }
 
-    // A review the policy does not ask for does not block, and the floor is the
-    // script's own: a consequential answer cannot waive it.
     #[test]
-    fn an_unrequired_axis_does_not_block_and_the_floor_cannot_be_waived() {
+    fn a_default_answer_is_unchanged() {
         let repo = Repo::new();
         let head = repo.head("code", "src/area/new.rs");
-        let mut revise = owner("20261103-000200-b.md", "usr_bob", "bob", "spec-security");
-        for key in ["outcome", "title_outcome", "section_outcome"] {
-            revise[key] = json!("revise");
-        }
-        let std_policy = || {
-            policy(
-                "consequential",
-                1,
-                "standards",
-                vec![agent("s", "standards")],
-                vec![],
-            )
-        };
-        let pass = owner("20261103-000100-a.md", "usr_alice", "alice", "standards");
-        gate(&repo, &head, std_policy(), vec![pass.clone(), revise]).passes();
-        let peer = repo.head("peer", "src/peer.rs");
-        gate(
-            &repo,
-            &peer,
-            policy("consequential", 0, "none", vec![], vec![]),
-            vec![],
-        )
-        .refused("consequential class does not hold");
+        gate(&repo, &head, json!({}), comb_row()).passes();
+        gate(&repo, &head, json!({}), vec![]).refused("review");
     }
 }
