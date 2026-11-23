@@ -1503,8 +1503,8 @@ export const api = {
       {},
     ),
   /** CAD-2556 / AOS-682: Custom MCP connectors on a hosted workspace. */
-  customMcpList: (details = true) =>
-    get<CustomMcpListPayload>(details ? "/api/connections/mcp" : "/api/connections/mcp?details=false"),
+  customMcpList: (details = true, operation?: PrivateOperation) =>
+    get<CustomMcpListPayload>(details ? "/api/connections/mcp" : "/api/connections/mcp?details=false", undefined, operation),
   customMcpCreate: (body: {
     name: string;
     endpoint_url: string;
@@ -1513,6 +1513,7 @@ export const api = {
     bearer_token?: string;
     custom_headers?: Array<{ name: string; value: string }>;
     oauth_client?: { client_id: string; client_secret?: string; scopes?: string[] };
+    required_scopes?: string[];
     return_to?: string;
   }) => post<CustomMcpCreatePayload>("/api/connections/mcp", body),
   customMcpOAuthStart: (id: string, body?: { return_to?: string }) =>

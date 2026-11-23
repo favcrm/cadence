@@ -81,7 +81,6 @@ import {
 } from "./customMcpView";
 import { withoutConnectParams } from "../workspace-apps/socialConnect";
 import { connectionLabel } from "../../lib/connections";
-import "./connections.css";
 import { hostedConnectError, hostedConnectUrl, UI_HOSTED_REFUSED } from "./hostedConnect";
 import { useTranslate } from "../../lib/locale";
 import { ConnectionAssetPicker, isAssetPinningProvider } from "./ConnectionAssetPicker";

@@ -2,6 +2,7 @@ import { appViewRef, type AppViewRef } from "../canvas/appView";
 import { placementOf, type Placement } from "../canvas/canvasLayout";
 import { routeParams, withParams, type RouteParams } from "../workspace-apps/screen/routeParams";
 import { recordViewId, type RecordViewRef } from "../canvas/recordView";
+import { validateCustomMcpUrlInput } from "../settings/customMcpView";
 import type { ThreadEntry } from "./thread";
 
 /**
@@ -14,7 +15,7 @@ import type { ThreadEntry } from "./thread";
  * does not match exactly yields null and the caller shows the entry's `text`
  * as a system line, never a half-rendered card. Every value in a record card
  * is plain text (React escapes it; there is no Markdown and no link), capped.
- * A card never carries a URL: the Connect button uses the board's own flow.
+ * A Connect card never carries an authorization URL; the board owns that flow.
  *
  * CAD-2475 adds `view_ref` (agenticos-v2 AOS-654): a reference to an installed
  * app's screen, opened as a canvas app tab. Same strictness; never content.
@@ -126,6 +127,28 @@ export function parseConnectRef(entry: ThreadEntry): ConnectCardModel | null {
   if (typeof toolkit !== "string" || !TOOLKIT.test(toolkit)) return null;
   if (typeof label !== "string" || label.trim() === "" || label.length > 200) return null;
   return { toolkit, label: label.trim() };
+}
+
+/** A first-time setup suggestion is separate from the v1 reconnect action. */
+export interface CustomMcpSetup {
+  label: string;
+  endpointUrl: string;
+  requiredScopes?: string[];
+}
+
+export function parseCustomMcpSetup(entry: ThreadEntry): CustomMcpSetup | null {
+  if (entry.kind !== "connect_ref" || entry.role !== "agent") return null;
+  const p = entry.payload;
+  if (!isObject(p) || p.v !== 2 || p.toolkit !== "custom_mcp") return null;
+  const { toolkit_label: label, endpoint_url: endpoint, required_scopes: scopes } = p;
+  if (!exactKeys(p, ["v", "toolkit", "toolkit_label", "endpoint_url", ...(scopes === undefined ? [] : ["required_scopes"])])) return null;
+  if (typeof label !== "string" || !label || label !== label.trim() || label.length > 80 || /\p{Cc}/u.test(label)) return null;
+  if (typeof endpoint !== "string" || endpoint !== endpoint.trim() || /[?#]/.test(endpoint) || validateCustomMcpUrlInput(endpoint) !== null) return null;
+  if (scopes === undefined) return { label, endpointUrl: endpoint };
+  if (!Array.isArray(scopes) || scopes.length < 1 || scopes.length > 32 ||
+      !scopes.every((s): s is string => typeof s === "string" && s.length <= 200 && /^[\x21\x23-\x5B\x5D-\x7E]+$/.test(s)) ||
+      new Set(scopes).size !== scopes.length) return null;
+  return { label, endpointUrl: endpoint, requiredScopes: scopes };
 }
 
 function parseField(v: unknown): RecordField | null {

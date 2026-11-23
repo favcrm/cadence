@@ -29,6 +29,7 @@ import {
   validateCustomMcpUrlInput,
 } from "./customMcpView";
 import SettingsDrawer from "./SettingsDrawer";
+import "./connections.css";
 
 export type CustomMcpDrawerTab = "tools" | "guide" | "policies" | "auth";
 
@@ -69,15 +70,17 @@ export function CustomMcpConnectDrawer({
   onClose,
   onConnected,
   onOAuthStarted,
+  setup,
 }: {
   onClose: () => void;
   onConnected: (connection: CustomMcpConnectionSummary) => void;
   onOAuthStarted: (connectionId: string) => void;
+  setup?: { label: string; endpointUrl: string; requiredScopes?: string[]; returnTo: string };
 }) {
   const t = useTranslate();
   const baseId = useId();
-  const [name, setName] = useState("");
-  const [endpointUrl, setEndpointUrl] = useState("");
+  const [name, setName] = useState(setup?.label ?? "");
+  const [endpointUrl, setEndpointUrl] = useState(setup?.endpointUrl ?? "");
   const [urlTouched, setUrlTouched] = useState(false);
   const [visibility, setVisibility] = useState<"shared" | "personal">("shared");
   const [authKind, setAuthKind] = useState<CustomMcpAuthKind>("auto");
@@ -132,18 +135,19 @@ export function CustomMcpConnectDrawer({
       .split(/[\s,]+/)
       .map((s) => s.trim())
       .filter(Boolean);
-    const returnTo =
+    const returnTo = setup?.returnTo ?? (
       typeof window !== "undefined"
         ? `${window.location.origin}/settings/connections`
-        : undefined;
+        : undefined);
 
     setBusy(true);
     try {
       const reply = await api.customMcpCreate({
         name: trimmedName,
         endpoint_url: endpointUrl.trim(),
-        auth_kind: authKind,
+        auth_kind: setup && authKind === "auto" ? "oauth" : authKind,
         visibility,
+        ...(setup?.requiredScopes ? { required_scopes: setup.requiredScopes } : {}),
         ...(authKind === "bearer" ? { bearer_token: bearerToken.trim() } : {}),
         ...(authKind === "header" && parsedHeaders ? { custom_headers: parsedHeaders } : {}),
         ...(authKind === "oauth_static"
@@ -163,12 +167,25 @@ export function CustomMcpConnectDrawer({
           setError("Server did not return a valid https:// authorization URL.");
           return;
         }
+        if (setup?.requiredScopes) {
+          const requested = new URL(safeUrl).searchParams.getAll("scope");
+          const scopes = requested[0]?.split(" ") ?? [];
+          if (requested.length !== 1 || scopes.length !== setup.requiredScopes.length ||
+              setup.requiredScopes.some((scope) => !scopes.includes(scope))) {
+            setError("The provider did not request exactly the required OAuth scopes.");
+            return;
+          }
+        }
         onOAuthStarted(reply.connection_id);
         setDiscoveryStep({
           authorizationUrl: safeUrl,
           connectionId: reply.connection_id,
           ...(reply.discovery ? { discovery: reply.discovery } : {}),
         });
+        return;
+      }
+      if (setup) {
+        setError("This server did not start OAuth sign-in.");
         return;
       }
       onConnected(reply.connection);
@@ -208,7 +225,9 @@ export function CustomMcpConnectDrawer({
             {discoveryStep.discovery && discoveryStep.discovery.scopes.length > 0 && <MetaRow label={t("Scopes")} value={discoveryStep.discovery.scopes.join(" ")} />}
           </dl>
           <p className="text-micro text-ink-300 break-words">
-            {t("Approve access at the provider. You will return to Settings → Connections to review pinned tools.")}
+            {setup
+              ? t("Approve access at the provider. You will return to this conversation to verify the connection.")
+              : t("Approve access at the provider. You will return to Settings → Connections to review pinned tools.")}
           </p>
           <div className="flex flex-wrap gap-2">
             <a href={discoveryStep.authorizationUrl} className="btn btn-primary btn-sm">{t("Continue to OAuth sign-in →")}</a>
@@ -220,19 +239,24 @@ export function CustomMcpConnectDrawer({
         <form className="space-y-3 min-w-0" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
           <div>
             <label htmlFor={`${baseId}-name`} className="text-label font-medium text-ink-200">{t("Server name")}</label>
-            <input id={`${baseId}-name`} type="text" maxLength={80} required autoComplete="off" value={name} onChange={(e) => setName(e.target.value)} placeholder="Acme Billing MCP" className="field w-full mt-1" disabled={busy} />
+            <input id={`${baseId}-name`} type="text" maxLength={80} required autoComplete="off" value={name} onChange={(e) => setName(e.target.value)} placeholder="Acme Billing MCP" className="field w-full mt-1" disabled={busy} readOnly={!!setup} />
           </div>
           <div>
             <label htmlFor={`${baseId}-url`} className="text-label font-medium text-ink-200">{t("MCP endpoint URL")}</label>
             <input
               id={`${baseId}-url`} type="url" required autoComplete="off" spellCheck={false} value={endpointUrl}
               onChange={(e) => { setEndpointUrl(e.target.value); if (!urlTouched) setUrlTouched(true); }}
-              placeholder="https://mcp.example.com/v1/mcp" className="field w-full mt-1 num" disabled={busy}
+              placeholder="https://mcp.example.com/v1/mcp" className="field w-full mt-1 num" disabled={busy} readOnly={!!setup}
             />
             {urlTouched && endpointUrl.trim() !== "" && urlError !== null && (
               <p className="text-micro text-fail mt-1 break-words" role="alert">{t(urlError)}</p>
             )}
           </div>
+          {setup?.requiredScopes && (
+            <p className="text-label text-ink-300 break-words">
+              {t("Required OAuth scopes")}: <code>{setup.requiredScopes.join(" ")}</code>
+            </p>
+          )}
           <div className="conn-policy-group">
             <span className="slabel">{t("Who can use this server")}</span>
             <div className="conn-policy-grid" role="radiogroup" aria-label={t("Who can use this server")}>
@@ -254,7 +278,7 @@ export function CustomMcpConnectDrawer({
                     { id: "oauth_static", label: "OAuth client ID", hint: "Pre-registered client + PKCE" },
                     { id: "none", label: "No auth", hint: "Public read-only HTTPS server" },
                   ] as const
-                ).map((opt) => (
+                ).filter((opt) => !setup || opt.id === "auto" || opt.id === "oauth_static").map((opt) => (
                   <button key={opt.id} type="button" role="radio" aria-checked={authKind === opt.id} disabled={busy} className="conn-policy-opt" onClick={() => setAuthKind(opt.id)}>
                     <b>{t(opt.label)}</b>
                     <small>{t(opt.hint)}</small>
@@ -283,10 +307,12 @@ export function CustomMcpConnectDrawer({
                     <label htmlFor={`${baseId}-csec`} className="text-label text-ink-300">{t("OAuth Client Secret (optional)")}</label>
                     <input id={`${baseId}-csec`} type="password" autoComplete="off" spellCheck={false} value={oauthClientSecret} onChange={(e) => setOauthClientSecret(e.target.value)} className="field w-full mt-1 num" disabled={busy} />
                   </div>
+                  {!setup?.requiredScopes && (
                   <div>
                     <label htmlFor={`${baseId}-scopes`} className="text-label text-ink-300">{t("Scopes (optional, space-separated)")}</label>
                     <input id={`${baseId}-scopes`} type="text" autoComplete="off" spellCheck={false} value={oauthScopesText} onChange={(e) => setOauthScopesText(e.target.value)} placeholder="mcp:read mcp:write" className="field w-full mt-1 num" disabled={busy} />
                   </div>
+                  )}
                 </div>
               )}
               {(authKind === "bearer" || authKind === "header" || authKind === "oauth_static") && (
