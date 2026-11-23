@@ -777,6 +777,22 @@ restricted or unverified property is refused. Once a property is selected,
 `site_url`; a different value is refused before pricing or dispatch. Selecting
 again replaces the pin.
 
+For Meta Ads, Google Ads, or Search Console, list selectable assets and pin one
+by exact identifier:
+
+```sh
+cadence --org acme connection assets <connection-id>
+cadence --org acme connection select-asset <connection-id> act_1234567890
+cadence --org acme connection select-asset <connection-id> 412-890-3310
+cadence --org acme connection select-asset <connection-id> 'sc-domain:example.test'
+```
+
+The list includes `kind` (`meta_ad_account`, `google_ads_customer`, or
+`search_console_site`), `assets` (each with `value`, `label`, `permission`,
+`selectable`, plus optional `currency` / `timezone`), and the current `selected`
+value or `null`. Once an ad account or Google Ads customer ID is pinned, spend
+mutations target that pinned asset and refuse mismatched or unpinned accounts.
+
 Revoke the account when it is no longer needed; this disables the provider
 account, revokes its connection grants and drops the selected property:
 

@@ -30,6 +30,8 @@ import type {
   AppOutputsPayload,
   AppRunsPayload,
   AppsPayload,
+  ConnectionAssetPayload,
+  ConnectionAssetsPayload,
   ConnectionPayload,
   ConnectionProvidersPayload,
   ConnectionSitePayload,
@@ -1430,6 +1432,19 @@ export const api = {
    */
   connectionSelectSite: (id: string, body: { site_url: string }) =>
     post<ConnectionSitePayload>(`/api/connections/${encodeURIComponent(id)}/site`, body),
+  /**
+   * `GET /api/connections/<id>/assets` — live provider assets (Search Console
+   * properties, Meta ad accounts, Google Ads customers) and the current
+   * connection-level pin (operator-only).
+   */
+  connectionAssets: (id: string) =>
+    get<ConnectionAssetsPayload>(`/api/connections/${encodeURIComponent(id)}/assets`),
+  /**
+   * `POST /api/connections/<id>/asset` — pin one verified provider asset
+   * (operator-only). The server re-reads live provider assets before storing.
+   */
+  connectionSelectAsset: (id: string, body: { value: string }) =>
+    post<ConnectionAssetPayload>(`/api/connections/${encodeURIComponent(id)}/asset`, body),
   /**
    * `POST /api/connections` — enroll a scoped token for a supported
    * provider (CAD-688). Operator-only. The token crosses this one
