@@ -19563,12 +19563,9 @@ fn cad224_intake_replay_and_stale_source_blocks_dispatch() {
     use std::process::Command;
 
     fn git(repo: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .unwrap();
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repo).args(args);
+        let output = cadence_agent::reaper::output(&mut command).unwrap();
         assert!(
             output.status.success(),
             "git {args:?}: {}",
