@@ -213,6 +213,7 @@ fn bounded_git_with_limit(
         .arg("--no-optional-locks")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_TERMINAL_PROMPT", "0");
     for arg in args {
         cmd.arg(arg);

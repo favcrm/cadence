@@ -431,6 +431,7 @@ pub(crate) fn intake_branch_creation_base(root: &Path, branch: &str) -> Result<S
             .arg("--no-optional-locks")
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "")
             .env("GIT_TERMINAL_PROMPT", "0")
             .args(args);
         let (output, bounds) =

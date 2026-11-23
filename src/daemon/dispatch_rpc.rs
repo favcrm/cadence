@@ -247,6 +247,11 @@ impl Shared {
             };
             let make = || {
                 let (request, items) = issue::parse::task_request(issue_body);
+                let request = if prepared_intake.is_some() {
+                    issue::dispatch::intake_request(&request, &issue_source)?
+                } else {
+                    request
+                };
                 let contract = crate::context_pack::TaskContract::new(
                     &front.id,
                     &front.title,
@@ -274,10 +279,24 @@ impl Shared {
                         prepared.manifest.pin_payload(&mid),
                     ))
                 }
-                None => Some(store::IssueSelection::Disabled {
-                    task: id.clone(),
-                    reason: "the assigned project is not opted in to agent delivery".to_string(),
-                }),
+                None => {
+                    if prepared_intake.is_some() {
+                        let scope = issue::dispatch::intake_legacy_suffix(&issue_source)?;
+                        if !text.rsplit_once(scope.as_str()).is_some_and(|(_, tail)| {
+                            tail.is_empty() || tail.starts_with(" Lessons:")
+                        }) {
+                            return Err(Error::invalid(
+                                "plan_evidence_stale",
+                                "dispatch send refused: kickoff is missing its approved acceptance",
+                            ));
+                        }
+                    }
+                    Some(store::IssueSelection::Disabled {
+                        task: id.clone(),
+                        reason: "the assigned project is not opted in to agent delivery"
+                            .to_string(),
+                    })
+                }
             }
         };
         // CAD-1586: a dispatch is a master-target send too — the same
@@ -400,6 +419,14 @@ impl Shared {
             Error::invalid(
                 "plan_evidence_stale",
                 "intake dispatch refused: issue lane has no attached branch",
+            )
+        })?;
+        crate::worktree::validate_registered_branch(&root, &lane, &branch).map_err(|error| {
+            Error::invalid(
+                "plan_evidence_stale",
+                format!(
+                    "intake dispatch refused: issue lane is not a registered worktree ({error})"
+                ),
             )
         })?;
         let base = issue::dispatch::original_lane_base(&root, &lane, &branch, &front.id)?

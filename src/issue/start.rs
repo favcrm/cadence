@@ -345,6 +345,17 @@ fn check_job(state_dir: &Path, job: &JobArgs) -> Result<(PathBuf, String, String
 }
 
 pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -> Result<Value> {
+    run_with_verified_job(pm, id, args, actor, state_dir, None)
+}
+
+pub(super) fn run_with_verified_job(
+    pm: &Pm,
+    id: &str,
+    args: &StartArgs,
+    actor: &str,
+    state_dir: &Path,
+    verified_job: Option<&str>,
+) -> Result<Value> {
     // Daemon reachability + spec readability are checked before any
     // filesystem or tracker mutation — a `--job` that cannot be opened
     // must leave nothing behind.
@@ -1013,17 +1024,21 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         // that cannot fit rather than dropping it.
         let task_acceptance =
             crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body));
-        let created_job = client::rpc(
-            &state_dir,
-            "job_new",
-            json!({"job": job.id, "pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
-                   "title": front.title, "issue": front.id,
-                   "repo": root, "base_ref": lane_base_sha,
-                   "task_worktree": wt_name, "task_branch": branch,
-                   "task_base_sha": lane_base_sha,
-                   "task_assignee": job.assignee,
-                   "task_acceptance": task_acceptance}),
-        )?;
+        let created_job = if let Some(job_id) = verified_job {
+            json!({"job": {"id": job_id}})
+        } else {
+            client::rpc(
+                &state_dir,
+                "job_new",
+                json!({"job": job.id, "pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
+                       "title": front.title, "issue": front.id,
+                       "repo": root, "base_ref": lane_base_sha,
+                       "task_worktree": wt_name, "task_branch": branch,
+                       "task_base_sha": lane_base_sha,
+                       "task_assignee": job.assignee,
+                       "task_acceptance": task_acceptance}),
+            )?
+        };
         let job_id = created_job["job"]["id"]
             .as_str()
             .unwrap_or_default()

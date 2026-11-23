@@ -36,7 +36,9 @@ use self::early_kickoff::{
 };
 pub(crate) use self::job_spec::{canonical_issue_spec_digest, job_context};
 pub use self::kickoff::parse_acceptance_listing;
-pub(crate) use self::kickoff::{acceptance_listing, inline_listing, outstanding_items};
+pub(crate) use self::kickoff::{
+    acceptance_listing, inline_listing, intake_acceptance, outstanding_items,
+};
 use self::kickoff::{
     acceptance_warning, check_body, check_job_kickoff, job_prototype, plain_body, plain_kickoff,
 };
@@ -256,6 +258,23 @@ pub(crate) fn same_checklist(recorded: &str, items: &[AcceptanceItem]) -> bool {
     })
 }
 
+/// Attach the complete approved acceptance section to an intake request.
+pub(crate) fn intake_request(request: &str, source: &str) -> Result<String> {
+    let (_, body) = parse::split_front(source)?;
+    let scope = parse::acceptance_scope(body)
+        .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?;
+    Ok(format!(
+        "{request}\n\n## Approved issue acceptance (including qualifiers)\n\n{scope}\n"
+    ))
+}
+
+pub(crate) fn intake_legacy_suffix(source: &str) -> Result<String> {
+    let (_, body) = parse::split_front(source)?;
+    let scope = parse::acceptance_scope(body)
+        .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?;
+    intake_acceptance(scope, None, &[])
+}
+
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
 ///
 /// `dispatch_pm`: `Some(alias)` when the daemon itself dispatches
@@ -272,6 +291,7 @@ struct Preflight {
     intake_scope: Option<(String, String)>,
     items: Vec<AcceptanceItem>,
     acceptance: Value,
+    intake_plain: Option<String>,
     acceptance_warning: Option<String>,
     reply_to: String,
     note: PathBuf,
@@ -624,6 +644,11 @@ fn preflight(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
     let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;
+    let early_lane = if endpoint_kind == "sandbox" && args.job_spec.is_some() {
+        &root
+    } else {
+        &wt_dir
+    };
     // CAD-1846: an accepted kickoff is answered from the daemon's own rows
     // before any source capture, contract render, lane setup or job creation.
     // Only a fresh dispatch pays for sources, and only the native guards
@@ -634,7 +659,7 @@ fn preflight(
         DispatchMode::Plain
     };
     let job_locator = args.job_spec.as_deref().map(spec_locator);
-    let mut reuse_job: Option<String> = None;
+    let mut reuse_job: Option<Value> = None;
     match early_kickoff(&EarlyDispatch {
         state_dir,
         front: &front,
@@ -643,7 +668,7 @@ fn preflight(
         reply_to: &reply_to,
         show: &show,
         repo_root: &root,
-        lane: &wt_dir,
+        lane: early_lane,
         branch: &branch,
         job_locator: job_locator.as_deref(),
         acceptance: &items,
@@ -658,15 +683,21 @@ fn preflight(
             // An accepted row must not fetch, or depend on integration
             // configuration remaining available. These are receipt facts,
             // not a new base selection; an unprovable fact stays null.
-            let existing_base = original_lane_base(&root, &wt_dir, &branch, &front.id)
-                .ok()
-                .flatten();
+            let existing_base = if endpoint_kind == "sandbox" {
+                task.as_ref()
+                    .and_then(|task| task["base_sha"].as_str())
+                    .map(str::to_string)
+            } else {
+                original_lane_base(&root, &wt_dir, &branch, &front.id)
+                    .ok()
+                    .flatten()
+            };
             let mut out = json!({
                 "issue": front.id,
                 "worker": args.to,
                 "reply_to": reply_to,
                 "note": note,
-                "worktree": wt_dir,
+                "worktree": early_lane,
                 "branch": branch,
                 "base": {
                     "ref": Value::Null,
@@ -696,7 +727,7 @@ fn preflight(
             return Ok(std::ops::ControlFlow::Break(out));
         }
         EarlyKickoff::ReuseJob { job } => {
-            reuse_job = job["id"].as_str().map(str::to_string);
+            reuse_job = Some(job);
         }
     }
     // Accepted duplicates are settled by their existing provenance above.
@@ -710,6 +741,42 @@ fn preflight(
             ))
         })
         .transpose()?;
+    if let Some(job) = &reuse_job {
+        let spec = args
+            .job_spec
+            .as_deref()
+            .ok_or_else(|| Error::internal("draft job has no spec"))?;
+        let canonical = spec
+            .canonicalize()
+            .ok()
+            .zip(dir.join("issue.md").canonicalize().ok())
+            .is_some_and(|(spec, issue)| spec == issue);
+        if !(canonical && intake_scope.is_some()) {
+            let bytes = std::fs::read(spec)
+                .map_err(|e| Error::rejected(format!("draft spec unavailable: {e}")))?;
+            let digest = if canonical {
+                canonical_issue_spec_digest(pm, &front.id, spec, false)?
+                    .ok_or_else(|| Error::rejected("draft canonical spec cannot be proved"))?
+            } else {
+                content_digest(&bytes)
+            };
+            if job["spec_sha256"].as_str() != Some(digest.as_str()) {
+                return Err(Error::rejected(
+                    "draft job spec changed; reopen or restore the pinned spec",
+                ));
+            }
+        }
+    }
+    let intake_plain = if intake_scope.is_some() {
+        Some(intake_acceptance(
+            parse::acceptance_scope(scope_body)
+                .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?,
+            None,
+            &items,
+        )?)
+    } else {
+        None
+    };
     let base = start::resolve_base(
         &root,
         args.base.as_deref(),
@@ -754,7 +821,11 @@ fn preflight(
                     &front.title,
                     source.as_bytes(),
                     &items,
-                    request,
+                    if intake_scope.is_some() {
+                        intake_request(&request, &source)?
+                    } else {
+                        request.clone()
+                    },
                 );
                 Ok((contract, std::borrow::Cow::Owned(body)))
             },
@@ -766,26 +837,38 @@ fn preflight(
                 context_lessons = Some(ContextFacts::from_manifest(&prepared.manifest));
                 Some(prepared.body.into_owned())
             }
-            None => Some(plain_body(
-                &front,
-                summary,
-                &note,
-                &wt_dir,
-                &branch,
-                &base_sha,
-                &reply_to,
-                &items,
-                &provider,
-                &endpoint_kind,
-            )?),
+            None => {
+                let mut body = plain_body(
+                    &front,
+                    summary,
+                    &note,
+                    &wt_dir,
+                    &branch,
+                    &base_sha,
+                    &reply_to,
+                    &items,
+                    &provider,
+                    &endpoint_kind,
+                )?;
+                if let Some(scope) = &intake_plain {
+                    body.push(' ');
+                    body.push_str(scope);
+                    check_body(&body, &provider)?;
+                }
+                Some(body)
+            }
         }
     } else {
         if let Some(spec) = &args.job_spec {
-            // `issue start --job` scopes the task to the lane's dir name.
-            let wt_name = wt_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            // Sandboxes record the repository root, not a host worktree.
+            let wt_name = if endpoint_kind == "sandbox" {
+                root.to_string_lossy().into_owned()
+            } else {
+                wt_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
             let (prototype_job, prototype_task) =
                 job_prototype(&front.id, &items, spec, &wt_name, &branch, &base_sha);
             let placeholder = "0".repeat(32);
@@ -822,9 +905,23 @@ fn preflight(
                 // here against exact-length placeholders.
                 context_active = true;
             } else {
-                check_job_kickoff(
-                    &front.id, &items, spec, &wt_name, &branch, &base_sha, &agent,
-                )?;
+                if let Some(scope) = &intake_plain {
+                    let mut task = prototype_task;
+                    task.acceptance = Some(scope.clone());
+                    crate::store::job_kickoff(
+                        &prototype_job,
+                        &task,
+                        1,
+                        &placeholder,
+                        &provider,
+                        &endpoint_kind,
+                        false,
+                    )?;
+                } else {
+                    check_job_kickoff(
+                        &front.id, &items, spec, &wt_name, &branch, &base_sha, &agent,
+                    )?;
+                }
             }
         }
         None
@@ -838,6 +935,7 @@ fn preflight(
         front,
         intake_scope,
         items,
+        intake_plain,
         acceptance,
         acceptance_warning,
         reply_to,
@@ -850,7 +948,7 @@ fn preflight(
         context_active,
         context_contract_digest,
         context_lessons,
-        reuse_job,
+        reuse_job: reuse_job.and_then(|job| job["id"].as_str().map(str::to_string)),
     }))
 }
 
@@ -1246,6 +1344,7 @@ pub fn run(
         dir,
         front,
         intake_scope,
+        intake_plain,
         items,
         acceptance,
         acceptance_warning,
@@ -1268,7 +1367,7 @@ pub fn run(
         base: args.base.clone(),
         owner: Some(args.to.clone()),
         job: args.job_spec.as_ref().map(|spec| start::JobArgs {
-            id: reuse_job,
+            id: reuse_job.clone(),
             pm: reply_to.clone(),
             spec: spec.clone(),
             assignee: Some(args.to.clone()),
@@ -1277,7 +1376,8 @@ pub fn run(
         by: Some(reply_to.clone()),
         take_over: args.take_over.clone(),
     };
-    let started = start::run(pm, id, &start_args, actor, state_dir)?;
+    let started =
+        start::run_with_verified_job(pm, id, &start_args, actor, state_dir, reuse_job.as_deref())?;
 
     // The body actually sent is rebuilt from start's returned refs and
     // re-checked: identical inputs make this a no-op, but nothing
@@ -1297,6 +1397,11 @@ pub fn run(
                 &provider,
                 &endpoint_kind,
             )?;
+            let mut body = body;
+            if let Some(scope) = &intake_plain {
+                body.push(' ');
+                body.push_str(scope);
+            }
             check_body(&body, &provider).map(|_| body)
         })
         .transpose()?;
@@ -1348,7 +1453,7 @@ pub fn run(
         &show_now,
         &items,
         body.as_deref(),
-        context_active,
+        context_active || intake_scope.is_some(),
         context_contract_digest.as_deref(),
         &mut out,
     )? {

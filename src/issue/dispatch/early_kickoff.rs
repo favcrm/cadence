@@ -312,7 +312,11 @@ fn draft_mismatches(binding: &OpenJob, d: &EarlyDispatch<'_>) -> Result<Vec<&'st
         wrong.push("base");
     }
     let acceptance = acceptance_listing(d.acceptance);
-    if task["acceptance"].as_str() != acceptance.as_deref() {
+    if task["acceptance"].as_str() != acceptance.as_deref()
+        && !task["acceptance"]
+            .as_str()
+            .is_some_and(|saved| super::same_checklist(saved, d.acceptance))
+    {
         wrong.push("acceptance");
     }
     Ok(wrong)

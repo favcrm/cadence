@@ -250,15 +250,18 @@ impl GoalIntake {
         }
         let paths: std::collections::BTreeSet<&str> = affected()
             .flat_map(|(_, outcome)| outcome.paths.iter().map(String::as_str))
+            .chain(
+                issue
+                    .into_iter()
+                    .flat_map(|front| front.paths.iter().map(String::as_str)),
+            )
             .collect();
         context::check_plan_paths(project, revision, paths).map_err(|(_, detail)| stale(detail))?;
         if let (Some(base), Some(front)) = (execution_base.filter(|base| *base != revision), issue)
         {
-            let outcome = self
-                .outcomes
-                .get(&front.id)
-                .ok_or_else(|| stale(format!("{} has no recorded outcome", front.id)))?;
-            context::check_plan_paths(project, base, outcome.paths.iter().map(String::as_str))
+            // Carried intake may map a subset, but the approved scope digest
+            // and kickoff bind the entire issue and all its declared paths.
+            context::check_plan_paths(project, base, front.paths.iter().map(String::as_str))
                 .map_err(|(_, detail)| stale(format!("execution base {base}: {detail}")))?;
         }
         Ok(())

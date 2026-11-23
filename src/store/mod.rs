@@ -154,7 +154,7 @@ pub mod crm_smtp;
 mod plans;
 pub mod social_publish;
 pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
-pub(crate) use plans::{DispatchPlan, TaskHistoryEvent};
+pub(crate) use plans::{DispatchPlan, PreparedJobKickoff, TaskHistoryEvent};
 mod quota;
 mod schema;
 /// CAD-2215: the nullable `connection_metadata.cursor_keyring_fingerprint`
