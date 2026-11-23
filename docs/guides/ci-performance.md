@@ -47,6 +47,16 @@ build job, and 462–502s for the workflow. The hosted run executed the same
 single fixture, including the tamper refusals. These are observed PR timings,
 not a measured merge-queue saving.
 
+The scheduled Rust suite (CAD-2701) builds with pinned nextest once and
+uses the same binary metadata for execution and inventory. Inventory still
+lists tests directly from the binaries and checks JUnit completeness.
+`suite_build_seconds`, `suite_execution_seconds`, and `suite_inventory_seconds`
+separate the phases. The old inventory call rebuilt the workspace test
+harness on [two green runs](https://github.com/favcrm/cadence/actions/runs/43769564752)
+([second run](https://github.com/favcrm/cadence/actions/runs/43996845175)),
+adding 161s and 170s respectively. Those are historical compile costs,
+not a comparison against the new run.
+
 ## 2. The rust-cache staleness trap (the real bug)
 
 `Swatinem/rust-cache` **never overwrites an existing key**. The post-action

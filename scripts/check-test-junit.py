@@ -27,7 +27,7 @@ mode still refuses an accidental omission. Ignored cases stay unexecutable
 either way; the manifest only pins *which* cases are ignored.
 
 Target mode (``--targets-file``) stays as the independent, cheaper guard
-on the target selection itself: every integration target named in FILE,
+on the target selection itself: every package-qualified integration ID in FILE,
 the lib suite and the bins must each show at least one runnable testcase.
 
 Sanity mode (neither flag) only requires that each report parses and one
@@ -363,12 +363,13 @@ def main():
         with open(args.targets_file) as handle:
             expected = [line.strip() for line in handle if line.strip()]
         failed = False
-        for target in expected:
-            name = f"{args.package}::{target}"
+        if not expected or any(name.count("::") != 1 for name in expected):
+            refuse("expected integration targets must be package-qualified binary IDs")
+        for name in expected:
             matches = [suite for suite in suites if suite.get("name") == name]
             if not matches or not any(has_runnable(suite) for suite in matches):
                 print(
-                    f"::error::integration target {target} has no runnable tests",
+                    f"::error::integration target {name} has no runnable tests",
                     file=sys.stderr,
                 )
                 failed = True
