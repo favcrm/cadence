@@ -16,6 +16,57 @@ use crate::memory::{self, Scope};
 
 pub use args::MemoryAction;
 
+/// One `memory_propose` request, as the CLI and the agent MCP tool both
+/// send it (CAD-2662). `project: None` leaves the project to the daemon,
+/// which takes it from the calling agent's running issue turn.
+pub struct Proposal<'a> {
+    pub project: Option<&'a str>,
+    pub kind: &'a str,
+    pub scope: &'a Scope,
+    pub source: Option<&'a str>,
+    pub confidence: Option<&'a str>,
+    pub from: Option<&'a str>,
+    pub text: Option<&'a str>,
+    pub id: Option<&'a str>,
+    pub nature: &'a str,
+    pub audience: &'a str,
+    pub roles: &'a [String],
+    pub evidence_refs: &'a [memory::policy::EvidenceRef],
+    pub verification_condition: Option<&'a memory::policy::VerificationCondition>,
+}
+
+/// The `memory_propose` RPC params for `proposal`.
+pub fn propose_params(proposal: &Proposal<'_>) -> serde_json::Value {
+    let mut params = json!({
+        "kind": proposal.kind,
+        "scope": proposal.scope,
+        "source": proposal.source,
+        "confidence": proposal.confidence,
+        "from": proposal.from,
+        "text": proposal.text,
+        "id": proposal.id,
+        "nature": proposal.nature,
+        "audience": proposal.audience,
+        "roles": proposal.roles,
+        "evidence_refs": proposal.evidence_refs,
+        "verification_condition": proposal.verification_condition,
+    });
+    if let Some(project) = proposal.project {
+        params["project"] = json!(project);
+    }
+    params
+}
+
+/// The `memory_match` RPC params for a turn lookup — one shape for the CLI's
+/// `memory match --turn` and the agent MCP tool (CAD-2662).
+pub fn turn_match_params(
+    components: &[String],
+    paths: &[String],
+    tags: &[String],
+) -> serde_json::Value {
+    json!({"components": components, "paths": paths, "tags": tags})
+}
+
 /// `cadence memory …` — returns the process exit code.
 pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
     match action {
@@ -72,20 +123,20 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             let out = client::rpc(
                 state_dir,
                 "memory_propose",
-                json!({
-                    "project": project,
-                    "kind": kind,
-                    "scope": scope,
-                    "source": source,
-                    "confidence": confidence,
-                    "from": from_text,
-                    "text": text,
-                    "id": id,
-                    "nature": nature,
-                    "audience": audience,
-                    "roles": roles,
-                    "evidence_refs": evidence_refs,
-                    "verification_condition": verification_condition,
+                propose_params(&Proposal {
+                    project: project.as_deref(),
+                    kind,
+                    scope: &scope,
+                    source: source.as_deref(),
+                    confidence: confidence.as_deref(),
+                    from: from_text.as_deref(),
+                    text: text.as_deref(),
+                    id: id.as_deref(),
+                    nature,
+                    audience,
+                    roles,
+                    evidence_refs: &evidence_refs,
+                    verification_condition: verification_condition.as_ref(),
                 }),
             )?;
             crate::issue::cli::print_json(&out);
@@ -236,9 +287,39 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
+        MemoryAction::Match {
+            turn: true,
+            component,
+            path,
+            tag,
+            json: as_json,
+            ..
+        } => {
+            let out = client::rpc(
+                state_dir,
+                "memory_match",
+                turn_match_params(component, path, tag),
+            )?;
+            if *as_json {
+                crate::issue::cli::print_json(&out);
+            } else {
+                // Unreadable lesson files are named, so an empty answer is
+                // never mistaken for "nothing applies".
+                for error in out["load_errors"].as_array().into_iter().flatten() {
+                    if let Some(error) = error.as_str() {
+                        eprintln!("memory: {error}");
+                    }
+                }
+                match out["lessons"].as_str().filter(|text| !text.is_empty()) {
+                    Some(text) => print!("{text}"),
+                    None => println!("No project lessons apply to this task."),
+                }
+            }
+            Ok(0)
+        }
         MemoryAction::Ls { .. }
         | MemoryAction::Show { .. }
-        | MemoryAction::Match { .. }
+        | MemoryAction::Match { turn: false, .. }
         | MemoryAction::Lint { .. } => query::run(action),
     }
 }

@@ -2449,3 +2449,73 @@ fn wiki_search_takes_separate_words_the_master_guard_allows() {
         );
     }
 }
+
+/// CAD-2662: a shell harness looks up its own task's lessons with
+/// `memory match --turn`. The project, issue, provider and role come from
+/// its turn, so naming any of them alongside `--turn` is a usage error, and
+/// the axes it may add travel in the same request the MCP tool sends. A
+/// native agent may also propose without `--project`.
+#[test]
+fn memory_match_turn_refuses_named_scope_and_propose_takes_no_project() {
+    use cadence_agent::memory::cli::{turn_match_params, MemoryAction};
+
+    let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+    for extra in [
+        ["--project", "beta"],
+        ["--issue", "CAD-1"],
+        ["--provider", "codex"],
+        ["--role", "pm"],
+    ] {
+        let mut args = vec!["cadence", "memory", "match", "--turn"];
+        args.extend(extra);
+        assert!(
+            parse(&args).is_err(),
+            "--turn with {extra:?} must not parse"
+        );
+    }
+    let Ok(Commands::Memory {
+        action:
+            MemoryAction::Match {
+                turn: true,
+                component,
+                path,
+                tag,
+                ..
+            },
+    }) = parse(&[
+        "cadence",
+        "memory",
+        "match",
+        "--turn",
+        "--path",
+        "src/adapter/codex.rs",
+        "--tag",
+        "memory",
+    ])
+    else {
+        panic!("memory match --turn must parse");
+    };
+    assert_eq!(
+        turn_match_params(&component, &path, &tag),
+        json!({"components": [], "paths": ["src/adapter/codex.rs"], "tags": ["memory"]})
+    );
+    let Ok(Commands::Memory {
+        action: MemoryAction::Propose { project, .. },
+    }) = parse(&[
+        "cadence",
+        "memory",
+        "propose",
+        "--type",
+        "gotcha",
+        "--source",
+        "CAD-2662",
+        "--scope-path",
+        "src/**",
+        "-m",
+        "fact",
+    ])
+    else {
+        panic!("memory propose without --project must parse");
+    };
+    assert_eq!(project, None);
+}

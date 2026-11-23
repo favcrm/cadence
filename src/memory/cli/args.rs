@@ -11,9 +11,11 @@ use clap::Subcommand;
 pub enum MemoryAction {
     /// Propose a memory through the authenticated native daemon endpoint.
     Propose {
-        /// Project key (required).
+        /// Project key. A native agent may omit it: the daemon then files
+        /// the proposal into the project of its running issue turn
+        /// (CAD-2662). Anyone else must pass it.
         #[arg(long)]
-        project: String,
+        project: Option<String>,
         /// rule | gotcha | decision | recipe.
         #[arg(long = "type")]
         kind: String,
@@ -237,6 +239,14 @@ pub enum MemoryAction {
     /// paths as `context.planned_paths`, apart from the recorded and
     /// explicit `context.paths`; without `--issue` it is empty.
     Match {
+        /// Your own running task's lessons, from the daemon (CAD-2662):
+        /// the selection dispatch made for it, with any `--path`,
+        /// `--component` and `--tag` added, recorded as a lookup. The
+        /// project, issue, provider and role come from your turn. Run it at
+        /// the start of a task, when the scope changes, and before you
+        /// repeat an approach that already failed.
+        #[arg(long, conflicts_with_all = ["issue", "project", "provider", "role"])]
+        turn: bool,
         /// Issue id — supplies component, tags, recorded-commit paths and
         /// the issue's validated declared planned paths, the same inputs
         /// dispatch selects with.

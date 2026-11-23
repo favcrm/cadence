@@ -335,3 +335,19 @@ exploration. Its inferred edges should carry provenance and must not replace
 the canonical text or the direct source fetch. Reviewed project memory remains
 a separate, short lesson workflow: use `cadence memory propose`, independent
 reviews, and acceptance when a fact should be injected into future dispatches.
+
+Every native agent can look up and propose lessons during a task through one
+daemon call. A managed Codex agent uses the `memory_match` and
+`memory_propose` tools on its Cadence MCP server, because its command sandbox
+cannot reach the daemon socket. Claude, Pi and OMP agents use the CLI from
+their shell: `cadence memory match --turn`, and `cadence memory propose`
+without `--project`. Their briefing says when to run them: at the start of a
+task, when the scope changes, and before repeating an approach that already
+failed. A lookup repeats dispatch's lesson selection for the issue the agent's
+running turn is bound to, with the same 12-entry and 4 KiB caps. It can add the
+paths, components or tags the agent is now working on. The project, role and
+provider come from that turn and cannot be passed. A stale or withheld lesson
+comes back as its slug and reason only. Each lookup records a
+`lessons_supplied` event on the agent. That row is separate from the dispatch
+`context_supplied` row and does not affect context restore. A proposal with no
+project goes into the turn's project, through the same review as any other.

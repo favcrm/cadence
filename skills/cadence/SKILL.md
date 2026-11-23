@@ -722,7 +722,10 @@ Before dispatch or resuming changed scope:
   ambiguity; proceed with reversible independent work under stated assumptions.
 - **Context and memory:** read relevant project design/ADRs and match memory in
   the explicit project (`cadence memory match --project <project> ...`; inspect
-  `--help` for issue/path/component axes). Inspect sources, scope and applicable
+  `--help` for issue/path/component axes). While you work an assigned task,
+  `cadence memory match --turn` (the `memory_match` tool on Codex) returns that
+  task's lessons; run it at the start, on a scope change, and before repeating
+  a failed approach. Inspect sources, scope and applicable
   versions before using accepted lessons. Proposed, stale or contradicted
   lessons are hypotheses, not instructions. Record missing or conflicting
   evidence without borrowing another project's memory implicitly.

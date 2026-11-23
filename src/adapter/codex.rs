@@ -1133,12 +1133,15 @@ impl ProviderAdapter for CodexAdapter {
             }
             instructions.push_str(
                 "Use the cadence MCP tools for Cadence identity, wiki search/read, issue reads, \
-                 assigned app dependency artifacts, and staged private app updates. wiki_search is \
+                 project lessons, assigned app dependency artifacts, and staged private app updates. wiki_search is \
                  lexical AND over at most 12 tokens: send scoped keywords (vendor, operation or \
                  field, exact version or identifier) in the collection the question is authorized \
                  for, at most 3 variants and 20 merged candidates per question, then wiki_read at \
                  most 8 sources and cite path and revision. Stop and state the evidence limit when \
-                 nothing authoritative is found. The command sandbox cannot reach Cadence's RPC \
+                 nothing authoritative is found. Call memory_match for the project lessons that \
+                 apply to your task at its start, whenever the scope changes, and before you repeat \
+                 an approach that already failed; call memory_propose when you resolve something a \
+                 later task would otherwise rediscover. The command sandbox cannot reach Cadence's RPC \
                  socket. For an app dependency, call self and then app_run_artifact with the \
                  kickoff artifact_id and that turn's id and turn_id; do not pass an alias or fetch \
                  it from a shell. For a private app install/update turn, use private_app_prepare, \
