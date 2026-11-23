@@ -158,15 +158,8 @@ fn cloud_intake_lane(
     base: &str,
 ) -> Result<(std::path::PathBuf, String, String)> {
     let root = crate::worktree::main_root(repo)?;
-    let branches: Vec<_> = front
-        .refs
-        .iter()
-        .filter(|r| r.kind == "branch" && r.closed != Some(true))
-        .collect();
     if !crate::issue::start::declared_repos(project).contains(&root)
-        || branches.len() != 1
-        || branches[0].path.as_deref() != Some(branch)
-        || branches[0].label.as_deref() != Some("cloud sandbox lane")
+        || crate::issue::cloud::open_lane_branch(front).ok().flatten() != Some(branch)
         || base.is_empty()
     {
         return Err(Error::invalid(

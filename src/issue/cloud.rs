@@ -22,7 +22,7 @@ use crate::adapter::sandbox::{
     SANDBOX_SPEC_BYTES,
 };
 use crate::error::{Error, Result, Structured};
-use crate::issue::{task_report, write, Pm};
+use crate::issue::{model, task_report, write, Pm};
 use crate::store::{Agent, Job, Message, Store, Task};
 
 /// Refusal code outside a hosted AgenticOS company context.
@@ -39,6 +39,7 @@ pub const STOPPED: &str = "cloud_sandbox_stopped";
 /// so the lane is unsupported for a private job — an explicit refusal, never
 /// a silent downgrade to a host dispatch and never a shared-effect attempt.
 pub const PRIVATE_JOB: &str = "cloud_sandbox_private_job";
+pub(crate) const CLOUD_BRANCH_LABEL: &str = "cloud sandbox lane";
 const COMPANY_ENV: &str = "AGENTICOS_COMPANY";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Consecutive transport errors tolerated while polling before the job is
@@ -46,6 +47,38 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const POLL_ERROR_RETRIES: u32 = 12;
 /// Polls before an unsettled job is stopped (about an hour).
 const MAX_POLLS: u32 = 720;
+
+/// One logical cloud branch. Older starts could record the same ref twice;
+/// different branches or a host branch do not establish a sandbox lane.
+pub(crate) fn open_lane_branch(front: &model::Front) -> Result<Option<&str>> {
+    let mut branches = front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "branch" && r.closed != Some(true));
+    let Some(recorded) = branches.next() else {
+        return Ok(None);
+    };
+    if recorded.label.as_deref() != Some(CLOUD_BRANCH_LABEL) {
+        return Err(Error::rejected(format!(
+            "{} has an open host branch, not a cloud sandbox lane",
+            front.id
+        )));
+    }
+    let branch = recorded
+        .path
+        .as_deref()
+        .ok_or_else(|| Error::rejected("open cloud branch has no path"))?;
+    model::check_ref_value(branch)?;
+    if branches.any(|r| {
+        r.path.as_deref() != Some(branch) || r.label.as_deref() != Some(CLOUD_BRANCH_LABEL)
+    }) {
+        return Err(Error::rejected(format!(
+            "{} has conflicting open branch refs — refusing to guess a cloud lane",
+            front.id
+        )));
+    }
+    Ok(Some(branch))
+}
 
 /// The company this process is bound to. Absent or malformed means the
 /// process is not hosted, so nothing is sent.

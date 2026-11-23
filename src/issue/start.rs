@@ -270,25 +270,10 @@ pub(crate) fn resolve_lane(
 /// A sandbox has a branch, not a host worktree. A replacement job keeps
 /// the sole open branch; branch history does not depend on the issue title.
 pub(super) fn resolve_cloud_branch(front: &Front, name: Option<&str>) -> Result<(String, bool)> {
-    let mut branches = front
-        .refs
-        .iter()
-        .filter(|r| r.kind == "branch" && r.closed != Some(true));
-    let Some(recorded) = branches.next() else {
+    let Some(branch) = crate::issue::cloud::open_lane_branch(front)? else {
         return layout::issue_names(&front.id, &front.title, name)
             .map(|(_, branch)| (branch, false));
     };
-    if branches.next().is_some() {
-        return Err(Error::rejected(format!(
-            "{} has multiple open branch refs — refusing to guess a cloud lane",
-            front.id
-        )));
-    }
-    let branch = recorded
-        .path
-        .as_deref()
-        .ok_or_else(|| Error::rejected("open cloud branch has no path"))?;
-    model::check_ref_value(branch)?;
     if let Some(name) = name {
         let (_, wanted) = layout::issue_names(&front.id, &front.title, Some(name))?;
         if wanted != branch {
@@ -755,7 +740,7 @@ pub(super) fn run_with_verified_job(
             claimed.refs.push(write::new_ref(
                 "branch",
                 &branch,
-                Some("cloud sandbox lane"),
+                Some(crate::issue::cloud::CLOUD_BRANCH_LABEL),
                 None,
                 None,
             ));
