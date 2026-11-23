@@ -19794,7 +19794,13 @@ depends_on: 1
     write::decide_plan(&pm, revised_epic, true, "operator", None).unwrap();
     drop(pm);
     let pm = Pm::at(&pm_path).unwrap();
-    plan::gate_id(&pm.dir, fresh).unwrap();
+    let refusal = plan::gate_id(&pm.dir, fresh).unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_dependency_unready"),
+        "{refusal:?}"
+    );
+    assert!(refusal.to_string().contains("CAD-1"), "{refusal:?}");
     let revised_text =
         std::fs::read_to_string(pm.dir.join("cadence").join(fresh).join("issue.md")).unwrap();
     let (revised_front, _) = cadence_agent::issue::parse::parse_issue(&revised_text).unwrap();
@@ -19835,7 +19841,13 @@ depends_on: 1
     let prerequisite = linked_plan["tickets"][0].as_str().unwrap();
     let dependent = linked_plan["tickets"][1].as_str().unwrap();
     write::decide_plan(&pm, linked_epic, true, "operator", None).unwrap();
-    plan::gate_id(&pm.dir, dependent).unwrap();
+    let refusal = plan::gate_id(&pm.dir, dependent).unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_dependency_unready"),
+        "{refusal:?}"
+    );
+    assert!(refusal.to_string().contains(prerequisite), "{refusal:?}");
     cadence_agent::issue::edit::edit(
         &pm,
         prerequisite,
@@ -19853,6 +19865,32 @@ depends_on: 1
         std::fs::read_to_string(pm.dir.join("cadence").join(dependent).join("issue.md")).unwrap();
     let (dependent_front, _) = cadence_agent::issue::parse::parse_issue(&dependent_text).unwrap();
     assert!(dependent_front.claim.is_none());
+
+    // The reused prerequisite is complete before testing source drift, so
+    // that later refusal cannot be the unrelated readiness gate.
+    let existing_text = std::fs::read_to_string(&existing).unwrap();
+    let (mut existing_front, existing_body) =
+        cadence_agent::issue::parse::parse_issue(&existing_text).unwrap();
+    existing_front.status = "done".into();
+    std::fs::write(
+        &existing,
+        cadence_agent::issue::parse::render(&existing_front, &existing_body).unwrap(),
+    )
+    .unwrap();
+    git(&pm.dir, &["add", "cadence/CAD-1/issue.md"]);
+    git(
+        &pm.dir,
+        &[
+            "-c",
+            "user.name=Acceptance",
+            "-c",
+            "user.email=acceptance@example.invalid",
+            "commit",
+            "-qm",
+            "Complete reused prerequisite",
+        ],
+    );
+    plan::gate_id(&pm.dir, fresh).unwrap();
 
     std::fs::write(repo.join("docs/scope.md"), "Revised scope\n").unwrap();
     git(&repo, &["add", "docs/scope.md"]);

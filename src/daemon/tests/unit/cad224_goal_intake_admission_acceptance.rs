@@ -57,6 +57,8 @@ fn approved_intake_after_restart_refuses_provider_attention_without_dispatch() {
     };
     opts.provider_env
         .set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    opts.provider_env.set("CADENCE_DEVIN_API_KEY", "");
+    opts.provider_env.set("CADENCE_DEVIN_ORG_ID", "");
     let shared = Shared::new(dir.path(), &opts).unwrap();
     let request = json!({"project": "cadence", "text": draft});
     let proposal = scoped(Asserted::Operator, || {
@@ -87,15 +89,50 @@ fn approved_intake_after_restart_refuses_provider_attention_without_dispatch() {
             },
         )
         .unwrap();
-    register(&shared, dir.path(), "worker-1");
     shared
         .store
-        .set_state_detached(
-            "worker-1",
-            "attention",
-            Some("Provider connection is closed"),
-        )
+        .register_agent(&NewAgent {
+            alias: "worker-1",
+            provider: "devin",
+            endpoint_kind: "cloud",
+            role: "worker",
+            cwd: dir.path().to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
         .unwrap();
+    // Take the real actor's join handle while its lifecycle lock is held;
+    // completion is deterministic and cannot race the fence assertion.
+    let actor = {
+        let mut lifecycle = shared.lifecycle.lock().unwrap();
+        assert!(shared
+            .start_actor_locked(&mut lifecycle, "worker-1", false)
+            .unwrap());
+        let handle = lifecycle
+            .agents
+            .get("worker-1")
+            .unwrap()
+            .thread
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        handle
+    };
+    actor.join().unwrap();
+    let failed = shared.store.agent("worker-1").unwrap();
+    assert_eq!(failed.state, "attention");
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("DEVIN_API_KEY"),
+        "{failed:?}"
+    );
     drop(shared);
     let shared = Shared::new(dir.path(), &opts).unwrap();
     let event_counts = || {
@@ -130,7 +167,16 @@ fn approved_intake_after_restart_refuses_provider_attention_without_dispatch() {
     assert_eq!(before.front.status, "ready");
     assert!(before.front.claim.is_none());
     plan::gate_id(&pm.dir, issue).unwrap();
-    assert_eq!(shared.store.agent("worker-1").unwrap().state, "attention");
+    let worker = shared.store.agent("worker-1").unwrap();
+    assert_eq!(worker.state, "attention");
+    assert!(
+        worker
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("DEVIN_API_KEY"),
+        "{worker:?}"
+    );
     let issue_file = pm.dir.join("cadence").join(issue).join("issue.md");
     let before_issue = std::fs::read(&issue_file).unwrap();
     let before_lanes = git(&repo, &["worktree", "list", "--porcelain"]);
@@ -281,6 +327,82 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
         lane.canonicalize().unwrap()
     );
 
+    let scope = plan::scope_digest(&front, &body).unwrap();
+    let accepted_message = "cad224accepteddispatch0000000001";
+    let accepted_request = json!({
+        "alias": "worker-1",
+        "issue": issue,
+        "text": "Begin the approved work",
+        "reply_to": "worker-1",
+        "message": accepted_message,
+        "intake_revision": epic,
+        "intake_scope": scope,
+    });
+    let accepted = scoped(Asserted::Operator, || {
+        shared.rpc_dispatch_send(&accepted_request, std::process::id())
+    })
+    .unwrap();
+    assert_eq!(accepted["duplicate"], false, "{accepted}");
+    assert!(shared.store.message_exists(accepted_message).unwrap());
+    let accepted_queue = shared.store.queued_count("worker-1").unwrap();
+    assert_eq!(accepted_queue, 1);
+
+    let spec = dir.path().join("intake-job.md");
+    std::fs::write(&spec, "Deliver the approved capability.\n").unwrap();
+    shared
+        .store
+        .create_job(
+            "cad224-job",
+            None,
+            spec.to_str().unwrap(),
+            &"0".repeat(64),
+            "worker-1",
+            Some(issue),
+            Some(repo.to_str().unwrap()),
+            None,
+            2,
+            None,
+            Some("Deliver the capability"),
+            Some(lane.to_str().unwrap()),
+            None,
+            None,
+            Some("worker-1"),
+            Some("Capability is available"),
+        )
+        .unwrap();
+    shared
+        .store
+        .create_task(
+            "cad224-job",
+            "cad224-fresh-task",
+            Some("Fresh work"),
+            Some("worker-1"),
+            None,
+            Some("Capability is available"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    shared
+        .store
+        .register_monitor(
+            "cad224-monitor",
+            repo.to_str().unwrap(),
+            "worker-1",
+            60,
+            &["cad224-job-t1".to_string(), "cad224-fresh-task".to_string()],
+            true,
+            true,
+        )
+        .unwrap();
+    let job_request =
+        json!({"task": "cad224-job-t1", "by": "worker-1", "message": "cad224-job-message"});
+    let accepted_job = shared.rpc_task_dispatch(&job_request).unwrap();
+    assert_eq!(accepted_job["duplicate"], false, "{accepted_job}");
+    let queue_with_job = shared.store.queued_count("worker-1").unwrap();
+    assert_eq!(queue_with_job, accepted_queue + 1);
+
     std::fs::write(repo.join("docs/scope.md"), "Changed scope\n").unwrap();
     git(&repo, &["add", "docs/scope.md"]);
     git(&repo, &["commit", "-qm", "Change cited scope"]);
@@ -288,6 +410,66 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     let before_issue = std::fs::read(&issue_file).unwrap();
     let before_queued = shared.store.queued_count("worker-1").unwrap();
     let before_delivery = serde_json::to_value(crate::delivery::load(dir.path()).unwrap()).unwrap();
+    let before_head = git(&pm_dir, &["rev-parse", "HEAD"]);
+    let before_lanes = git(&repo, &["worktree", "list", "--porcelain"]);
+    let replay = scoped(Asserted::Operator, || {
+        shared.rpc_dispatch_send(&accepted_request, std::process::id())
+    })
+    .unwrap();
+    assert_eq!(replay["duplicate"], true, "{replay}");
+    assert_eq!(replay["message"], accepted_message);
+    assert_eq!(
+        shared.store.queued_count("worker-1").unwrap(),
+        queue_with_job
+    );
+    let replay_job = shared.rpc_task_dispatch(&job_request).unwrap();
+    assert_eq!(replay_job["duplicate"], true, "{replay_job}");
+    assert_eq!(replay_job["message"], accepted_job["message"]);
+    let replay_monitor = scoped(Asserted::Operator, || {
+        shared.rpc_monitor_dispatch(
+            &json!({"monitor": "cad224-monitor", "task": "cad224-job-t1"}),
+            std::process::id(),
+        )
+    })
+    .unwrap();
+    assert_eq!(replay_monitor["duplicate"], true, "{replay_monitor}");
+    assert_eq!(replay_monitor["message"], accepted_job["message"]);
+    let replay_automatic = shared
+        .monitor_dispatch_task("cad224-monitor", "cad224-job-t1", true)
+        .unwrap();
+    assert_eq!(replay_automatic["duplicate"], true, "{replay_automatic}");
+    assert_eq!(replay_automatic["message"], accepted_job["message"]);
+    let before_fresh_task = shared.store.task("cad224-fresh-task").unwrap().to_json();
+    for automatic in [false, true] {
+        let refusal = shared
+            .monitor_dispatch_task("cad224-monitor", "cad224-fresh-task", automatic)
+            .unwrap_err();
+        assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+        assert!(shared
+            .store
+            .messages_for_task("cad224-fresh-task")
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(
+        shared.store.task("cad224-fresh-task").unwrap().to_json(),
+        before_fresh_task,
+    );
+    let refusal = shared
+        .rpc_task_dispatch(&json!({
+            "task": "cad224-fresh-task", "by": "worker-1", "message": "cad224-fresh-job"
+        }))
+        .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(!shared.store.message_exists("cad224-fresh-job").unwrap());
+    assert_eq!(
+        shared.store.task("cad224-fresh-task").unwrap().to_json(),
+        before_fresh_task,
+    );
+    assert_eq!(
+        shared.store.queued_count("worker-1").unwrap(),
+        queue_with_job
+    );
     let message = "cad224freshdispatch00000000000001";
     assert!(!shared.store.message_exists(message).unwrap());
     let result = scoped(Asserted::Operator, || {
@@ -298,6 +480,8 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
                 "text": "Begin the approved work",
                 "reply_to": "worker-1",
                 "message": message,
+                "intake_revision": epic,
+                "intake_scope": scope,
             }),
             std::process::id(),
         )
@@ -314,4 +498,9 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
         before_delivery
     );
     assert_eq!(std::fs::read(&issue_file).unwrap(), before_issue);
+    assert_eq!(git(&pm_dir, &["rev-parse", "HEAD"]), before_head);
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        before_lanes
+    );
 }
