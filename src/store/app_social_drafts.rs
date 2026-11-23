@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS app_social_image_jobs(\
  call_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL,\
  intent_digest TEXT NOT NULL, request_id TEXT NOT NULL UNIQUE,\
  state TEXT NOT NULL CHECK(state IN ('active','succeeded','uncertain','failed')),\
- reason TEXT, spec_json TEXT, created REAL NOT NULL, deadline REAL NOT NULL, updated REAL NOT NULL);\
+ reason TEXT, spec_json TEXT, created REAL NOT NULL, deadline REAL NOT NULL, updated REAL NOT NULL,\
+ authority_epoch INTEGER NOT NULL DEFAULT 0);\
 CREATE TABLE IF NOT EXISTS app_social_effects(\
  effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL,\
  draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE,\
@@ -93,7 +94,7 @@ pub struct GenerationStart<'a> {
 /// CAD-1315: one standalone image job (the AgenticOS call behind an intent).
 /// `spec` is the frozen authority the worker replays under the same key; it is
 /// dropped once the job is terminal.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ImageJob {
     pub call_id: String,
     pub context_id: String,
@@ -105,9 +106,23 @@ pub struct ImageJob {
     pub deadline: f64,
 }
 
+/// An active image job re-proved from this installation's record file.
+/// Its fields are private so a caller-built `ImageJob` is never authority.
+pub(crate) struct ImageJobAuthority {
+    install: String,
+    job: ImageJob,
+    epoch: i64,
+}
+
+impl ImageJobAuthority {
+    pub(crate) fn job(&self) -> &ImageJob {
+        &self.job
+    }
+}
+
 /// How a worker ends an active image job.
 #[derive(Clone, Copy)]
-pub enum ImageSettlement<'a> {
+pub(crate) enum ImageSettlement<'a> {
     Succeeded { receipt: &'a str },
     Failed { reason: &'a str },
     Uncertain { reason: &'a str },
@@ -568,6 +583,16 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
         // Only rows from that pre-column schema can be migrated this way.
         conn.execute("UPDATE app_social_generation_intents SET caller_input_digest=input_digest WHERE caller_input_digest=''",[])?;
     }
+    let image_columns = conn
+        .prepare("PRAGMA table_info(app_social_image_jobs)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !image_columns.iter().any(|c| c == "authority_epoch") {
+        conn.execute(
+            "ALTER TABLE app_social_image_jobs ADD COLUMN authority_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -861,22 +886,41 @@ impl RecordStore {
     /// is the AgenticOS idempotency key; a repeat is a no-op, so a job exists
     /// exactly once per key. The intent leaves `uncertain` for `pending` in
     /// the same transaction, and only for the request that owns it.
-    pub fn app_social_image_job_start(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn app_social_image_job_start(
         &self,
         context: &str,
         intent: &str,
         request: &str,
         call_id: &str,
         spec: &Value,
+        claim: &super::app_tools::AppToolClaimReceipt<'_>,
         deadline: f64,
     ) -> Result<()> {
+        if !claim.matches_image_job(self.install(), request, call_id, spec) {
+            return Err(Error::rejected(
+                "image job does not match its admitted claim",
+            ));
+        }
         let spec = serde_json::to_string(spec).map_err(|e| Error::internal(e.to_string()))?;
         self.write_tx(|tx| {
             let at = now();
             tx.execute("INSERT OR IGNORE INTO app_social_image_jobs(call_id,install_id,context_id,intent_digest,request_id,state,spec_json,created,deadline,updated) VALUES(?,?,?,?,?,'active',?,?,?,?)", params![call_id, self.install(), context, intent, request, spec, at, deadline, at])?;
+            let matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_social_image_jobs WHERE call_id=? AND install_id=?
+                 AND context_id=? AND intent_digest=? AND request_id=? AND spec_json=?)",
+                params![call_id, self.install(), context, intent, request, spec],
+                |r| r.get(0),
+            )?;
+            if !matches {
+                return Err(Error::rejected("image job key already names another operation"));
+            }
             let changed = tx.execute("UPDATE app_social_generation_intents SET state='pending',outcome=NULL,updated=? WHERE install_id=? AND context_id=? AND intent_digest=? AND request_id=? AND state IN ('pending','uncertain')", params![at, self.install(), context, intent, request])?;
             if changed != 1 {
                 return Err(Error::rejected("generation intent key changed"));
+            }
+            if self.image_job_authority_in(tx, call_id)?.is_none() {
+                return Err(Error::rejected("image job is not active"));
             }
             Ok(())
         })
@@ -906,6 +950,227 @@ impl RecordStore {
         .transpose()
     }
 
+    fn image_job_authority_in(
+        &self,
+        conn: &impl StoreConn,
+        call_id: &str,
+    ) -> Result<Option<ImageJobAuthority>> {
+        let Some(job) = Self::image_job_in(conn, "call_id", call_id)? else {
+            return Ok(None);
+        };
+        if job.state != "active" {
+            return Ok(None);
+        }
+        let epoch: i64 = conn.query_row(
+            "SELECT authority_epoch FROM app_social_image_jobs WHERE call_id=? AND install_id=?",
+            params![call_id, self.install()],
+            |r| r.get(0),
+        ).optional()?.ok_or_else(|| Error::rejected("image job belongs to another installation"))?;
+        let spec = job
+            .spec
+            .as_ref()
+            .ok_or_else(|| Error::rejected("image job spec is missing"))?;
+        let intent = conn
+            .query_row(
+                "SELECT alias,caller_input_digest,input_digest,input_json,scope_json,state
+             FROM app_social_generation_intents WHERE install_id=? AND context_id=?
+             AND intent_digest=? AND request_id=?",
+                params![
+                    self.install(),
+                    job.context_id,
+                    job.intent_digest,
+                    job.request_id
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("image job intent is unavailable"))?;
+        let plan: Value = serde_json::from_str(&intent.3)
+            .map_err(|_| Error::rejected("generation input is corrupt"))?;
+        let scope: Value = serde_json::from_str(&intent.4)
+            .map_err(|_| Error::rejected("generation scope is corrupt"))?;
+        let authority = &spec["authority"];
+        let text = |key: &str| spec[key].as_str().filter(|s| !s.is_empty());
+        let config = &authority["binding"]["config"];
+        let binding_context = match config.get("context") {
+            Some(Value::Null) => None,
+            Some(context) => Some(
+                context["id"]
+                    .as_str()
+                    .ok_or_else(|| Error::rejected("image binding context is invalid"))?,
+            ),
+            None => return Err(Error::rejected("image binding context is missing")),
+        };
+        if intent.5 != "pending"
+            || scope["operation"] != "image"
+            || text("alias") != Some(intent.0.as_str())
+            || text("slot").is_none()
+            || text("binding_digest").is_none()
+            || text("input_digest") != Some(intent.1.as_str())
+            || intent.1.is_empty()
+            || app_runs::material_digest(&spec["input"]) != intent.1
+            || app_runs::material_digest(&plan) != intent.2
+            || authority["inputs"] != plan
+            || authority["install_id"] != self.install()
+            || authority["context_id"] != job.context_id
+            || authority["call_id"] != job.call_id
+            || authority["invocation_id"] != job.call_id
+            || authority["slot"] != spec["slot"]
+            || config["install_id"] != self.install()
+            || binding_context.is_some_and(|context| context != job.context_id.as_str())
+            || super::app_bindings::config_digest(
+                self.install(),
+                binding_context,
+                text("slot").unwrap_or_default(),
+                config,
+            ) != text("binding_digest").unwrap_or_default()
+            || authority["binding"]["digest"] != spec["binding_digest"]
+        {
+            return Err(Error::rejected(
+                "image job no longer matches its persisted intent",
+            ));
+        }
+        Ok(Some(ImageJobAuthority {
+            install: self.install().to_owned(),
+            job,
+            epoch,
+        }))
+    }
+
+    pub(crate) fn app_social_image_job_authority(
+        &self,
+        call_id: &str,
+    ) -> Result<Option<ImageJobAuthority>> {
+        self.image_job_authority_in(&*self.conn(), call_id)
+    }
+
+    fn image_job_revalidate(
+        &self,
+        conn: &impl StoreConn,
+        authority: &ImageJobAuthority,
+    ) -> Result<()> {
+        let current = self.image_job_authority_in(conn, &authority.job.call_id)?;
+        if authority.install != self.install()
+            || !current.is_some_and(|current| {
+                current.job == authority.job && current.epoch == authority.epoch
+            })
+        {
+            return Err(Error::rejected("image job authority is stale or foreign"));
+        }
+        Ok(())
+    }
+
+    fn image_job_claim<'a>(
+        &'a self,
+        authority: &'a ImageJobAuthority,
+    ) -> super::app_tools::AppToolClaim<'a> {
+        let job = &authority.job;
+        let spec = job.spec.as_ref().expect("verified active job has a spec");
+        super::app_tools::AppToolClaim {
+            request: &job.request_id,
+            install: self.install(),
+            alias: spec["alias"].as_str().unwrap_or_default(),
+            slot: spec["slot"].as_str().unwrap_or_default(),
+            binding_digest: spec["binding_digest"].as_str().unwrap_or_default(),
+            input_digest: spec["input_digest"].as_str().unwrap_or_default(),
+            call_id: &job.call_id,
+        }
+    }
+
+    pub(crate) fn app_social_image_result_for_job(
+        &self,
+        store: &Store,
+        authority: &ImageJobAuthority,
+    ) -> Result<Option<Value>> {
+        self.write_tx(|tx| {
+            self.image_job_revalidate(tx, authority)?;
+            store.app_tool_result_for_claim(&self.image_job_claim(authority))
+        })
+    }
+
+    pub(crate) fn app_social_image_record_result(
+        &self,
+        store: &Store,
+        authority: &ImageJobAuthority,
+        result: &Value,
+        asset: Option<(&str, &[u8])>,
+    ) -> Result<Value> {
+        self.write_tx(|tx| {
+            self.image_job_revalidate(tx, authority)?;
+            let claim = self.image_job_claim(authority);
+            let spec = authority
+                .job
+                .spec
+                .as_ref()
+                .expect("verified active job has a spec");
+            store.app_tool_record_in(super::app_tools::AppToolRecord {
+                id: claim.call_id,
+                request: claim.request,
+                install: claim.install,
+                alias: claim.alias,
+                slot: claim.slot,
+                binding_digest: claim.binding_digest,
+                input_digest: claim.input_digest,
+                input: &spec["input"],
+                result,
+                asset,
+            })
+        })
+    }
+
+    /// Attach only the receipt proved by the active job and its claim, then
+    /// complete the job and intent in the same record-file transaction.
+    pub(crate) fn app_social_image_complete(
+        &self,
+        store: &Store,
+        authority: &ImageJobAuthority,
+    ) -> Result<()> {
+        self.write_tx(|tx| {
+            self.image_job_revalidate(tx, authority)?;
+            let receipt = store.app_tool_result_for_claim(&self.image_job_claim(authority))?
+                .ok_or_else(|| Error::rejected("image job receipt is unavailable"))?;
+            let id = receipt["id"].as_str()
+                .ok_or_else(|| Error::rejected("image job receipt id is missing"))?;
+            let created = receipt["created_at"].as_f64()
+                .ok_or_else(|| Error::rejected("image job receipt time is missing"))?;
+            let kind = receipt["result"]["kind"].as_str().unwrap_or("");
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO app_social_tool_receipts(install_id,context_id,receipt_id,completed_at,kind) VALUES(?,?,?,?,?)",
+                params![self.install(), authority.job.context_id, id, created, kind],
+            )?;
+            if changed == 1 && matches!(kind, "social.source.posts" | "") {
+                bump_source_revision(tx, &authority.job.context_id)?;
+            }
+            self.image_job_settle_in(tx, &authority.job.call_id, ImageSettlement::Succeeded { receipt: id })?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn app_social_image_job_settle_authorized(
+        &self,
+        authority: &ImageJobAuthority,
+        settlement: ImageSettlement<'_>,
+    ) -> Result<bool> {
+        if matches!(settlement, ImageSettlement::Succeeded { .. }) {
+            return Err(Error::rejected(
+                "image success requires its persisted receipt",
+            ));
+        }
+        self.write_tx(|tx| {
+            self.image_job_revalidate(tx, authority)?;
+            self.image_job_settle_in(tx, &authority.job.call_id, settlement)
+        })
+    }
+
     pub fn app_social_image_job_for_request(&self, request: &str) -> Result<Option<ImageJob>> {
         Self::image_job_in(&*self.conn(), "request_id", request)
     }
@@ -929,7 +1194,7 @@ impl RecordStore {
     pub fn app_social_image_job_resume(&self, call_id: &str, deadline: f64) -> Result<bool> {
         self.write_tx(|tx| {
             let at = now();
-            let changed = tx.execute("UPDATE app_social_image_jobs SET state='active',reason=NULL,deadline=?,updated=? WHERE call_id=? AND install_id=? AND state='uncertain'", params![deadline, at, call_id, self.install()])?;
+            let changed = tx.execute("UPDATE app_social_image_jobs SET state='active',reason=NULL,deadline=?,updated=?,authority_epoch=authority_epoch+1 WHERE call_id=? AND install_id=? AND state='uncertain'", params![deadline, at, call_id, self.install()])?;
             if changed == 1 {
                 tx.execute("UPDATE app_social_generation_intents SET state='pending',outcome=NULL,updated=? WHERE install_id=? AND state='uncertain' AND request_id=(SELECT request_id FROM app_social_image_jobs WHERE call_id=?)", params![at, self.install(), call_id])?;
             }
@@ -937,10 +1202,9 @@ impl RecordStore {
         })
     }
 
-    /// Settle an active job and its intent together. The job row is the
-    /// compare-and-set: a second settle (a replayed worker) changes nothing.
-    pub fn app_social_image_job_settle(
+    fn image_job_settle_in(
         &self,
+        tx: &rusqlite::Transaction<'_>,
         call_id: &str,
         settlement: ImageSettlement<'_>,
     ) -> Result<bool> {
@@ -951,15 +1215,13 @@ impl RecordStore {
             ImageSettlement::Failed { reason } => ("failed", "refused", None, Some(reason)),
             ImageSettlement::Uncertain { reason } => ("uncertain", "uncertain", None, Some(reason)),
         };
-        self.write_tx(|tx| {
-            let at = now();
-            let keep_spec = job_state == "uncertain";
-            let changed = tx.execute(&format!("UPDATE app_social_image_jobs SET state=?,reason=?,{}updated=? WHERE call_id=? AND install_id=? AND state='active'", if keep_spec { "" } else { "spec_json=NULL," }), params![job_state, reason, at, call_id, self.install()])?;
-            if changed == 1 {
-                tx.execute("UPDATE app_social_generation_intents SET state=?,receipt_id=?,outcome=?,updated=? WHERE install_id=? AND state IN ('pending','uncertain') AND request_id=(SELECT request_id FROM app_social_image_jobs WHERE call_id=?)", params![intent_state, receipt, reason, at, self.install(), call_id])?;
-            }
-            Ok(changed == 1)
-        })
+        let at = now();
+        let keep_spec = job_state == "uncertain";
+        let changed = tx.execute(&format!("UPDATE app_social_image_jobs SET state=?,reason=?,{}updated=? WHERE call_id=? AND install_id=? AND state='active'", if keep_spec { "" } else { "spec_json=NULL," }), params![job_state, reason, at, call_id, self.install()])?;
+        if changed == 1 {
+            tx.execute("UPDATE app_social_generation_intents SET state=?,receipt_id=?,outcome=?,updated=? WHERE install_id=? AND state IN ('pending','uncertain') AND request_id=(SELECT request_id FROM app_social_image_jobs WHERE call_id=?)", params![intent_state, receipt, reason, at, self.install(), call_id])?;
+        }
+        Ok(changed == 1)
     }
 
     pub fn app_social_generation_complete_request(

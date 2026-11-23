@@ -106,7 +106,12 @@ fn validate_config(install: &str, context: Option<&str>, config: &Value) -> Resu
     Ok(())
 }
 
-fn config_digest(install: &str, context: Option<&str>, slot: &str, config: &Value) -> String {
+pub(super) fn config_digest(
+    install: &str,
+    context: Option<&str>,
+    slot: &str,
+    config: &Value,
+) -> String {
     app_runs::material_digest(&json!({"kind":"app-binding-v1", "install_id":install,
         "context_id":context,"slot":slot,"config":config}))
 }
