@@ -515,9 +515,10 @@ impl Shared {
                 .map(|rows| post_entries(&rows, now)),
         )];
         // Routines are an operator surface: their native read admits the
-        // operator or the master only. A member's call does not attempt the
-        // source, so it is absent from `sources` rather than reported failed.
-        if !proof.is_member() {
+        // operator or the master only. Only an operator's call attempts the
+        // source (CAD-2717); for anyone else it is absent from `sources`
+        // rather than reported failed.
+        if proof.is_operator() {
             results.push(SourceResult::from_result(
                 "routine",
                 self.calendar_routines(from, to, now),

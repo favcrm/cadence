@@ -2,9 +2,12 @@
 //! installed package through the real daemon and board:
 //! 1. An operator read-only mount (the canvas mount) is admitted for
 //!    `works.query` and `works.get`.
-//! 2. A member read-only mount is refused for both reads, over the board and
+//! 2. A public operator-role (owner) session is admitted for both reads, over
+//!    the board and on a read-only mount over the daemon's own session proof
+//!    (CAD-2717: the guard admits a positive operator fact).
+//! 3. A member read-only mount is refused for both reads, over the board and
 //!    over the daemon's own session proof.
-//! 3. Works writes stay refused on a read-only mount for the operator and a
+//! 4. Works writes stay refused on a read-only mount for the operator and a
 //!    member, with the read-only refusal.
 
 #![cfg(all(test, feature = "test-seam"))]
@@ -121,10 +124,47 @@ fn cad2683_operator_read_only_mount_reads_works_and_member_is_refused() {
         );
     }
 
-    // Member read-only mount: both reads and every write are refused.
+    // Public operator-role (owner) session: admitted for both reads.
     let owner = session(&rig, "owner", "owner");
+    let (status, minted) = status_and_json(post(
+        &rig,
+        &format!("/api/app-installations/{install}/screens/main/mount"),
+        Some(&owner),
+        &json!({"context_id": context}),
+    ));
+    assert_eq!(status, 200, "owner mount failed: {minted}");
+    let action = consume(&rig, &minted);
+    let (status, body) = status_and_json(post(
+        &rig,
+        "/api/app-screen-services/call",
+        Some(&owner),
+        &json!({"action_token": action, "operation": "works.query", "args": args_for("works.query")}),
+    ));
+    assert_eq!(status, 200, "owner works.query over the board: {body}");
+    let owner_creds = (cookie_token(&owner), "", "public");
+    let minted = rpc_as(
+        &rig,
+        Asserted::Operator,
+        "app_screen_mint",
+        json!({"install_id": install, "context_id": context, "tag": "main",
+            "generation": 2, "token": owner_creds.0, "key": owner_creds.1,
+            "origin": "public", "read_only": true}),
+    )
+    .expect("owner read-only mint");
+    let action = consume(&rig, &minted);
+    call_rpc(&rig, &action, owner_creds, "works.query")
+        .expect("owner works.query is admitted on a read-only mount");
+    let text = call_rpc(&rig, &action, owner_creds, "works.get")
+        .expect_err("works.get of a missing id fails in the store")
+        .to_string();
+    assert!(
+        !text.contains("operator-role")
+            && (text.contains("not_found") || text.contains("not found")),
+        "owner works.get must reach the store: {text}"
+    );
+
+    // Member read-only mount: both reads and every write are refused.
     let member = session(&rig, "member", "member");
-    let _ = owner;
     let (status, minted) = status_and_json(post(
         &rig,
         &format!("/api/app-installations/{install}/screens/main/mount"),
