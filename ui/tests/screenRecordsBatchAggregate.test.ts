@@ -16,7 +16,9 @@ const assert = {
 
 const BATCH = "records.batch" as const;
 const AGGREGATE = "records.aggregate" as const;
-const VERBS: readonly string[] = [BATCH, AGGREGATE];
+const MERGE = "records.merge" as const;
+const MERGE_ARGS = { source_id: "duplicate", target_id: "keeper", expected_source_revision: 3, expected_target_revision: 5 };
+const VERBS: readonly string[] = [BATCH, AGGREGATE, MERGE];
 const TOKEN = "a".repeat(64);
 const receipt: MountReceipt = {
   mount: `/api/app-screen/${"b".repeat(64)}`,
@@ -40,7 +42,7 @@ for (const verb of VERBS) {
   assert.ok((RECORD_CALL_VERBS as readonly string[]).includes(verb), `${verb} is a CALL verb`);
   assert.equal((RECORD_SLOT_VERBS as readonly string[]).includes(verb), false, `${verb} is never a SLOT`);
 }
-assert.ok(parseMount(receipt, "app"), "a receipt listing both verbs parses");
+assert.ok(parseMount(receipt, "app"), "a receipt listing the hosted record calls parses");
 assert.equal(parseMount({ ...receipt, operations: [...VERBS, "records.truncate"] }, "app"), null, "an unknown verb still refuses the receipt");
 assert.equal(recordArgsLimit(BATCH), 49152, "records.batch shares the create/update argument limit");
 assert.equal(recordArgsLimit(AGGREGATE), 16384, "records.aggregate keeps the default limit");
@@ -48,6 +50,7 @@ for (const verb of VERBS) {
   const parsed = parseChild({ v: 2, op: "call", id: "k1", verb, args: { table: "t" } }, VERBS);
   assert.ok(parsed !== null && parsed.op === "call" && parsed.verb === verb, `${verb} parses as a granted call`);
 }
+assert.equal(parseChild({ v: 2, op: "call", id: "merge", verb: MERGE, args: MERGE_ARGS }, [BATCH]), null, "an undeclared merge never reaches the host");
 
 class Port {
   onmessage: ((event: { data: unknown }) => void) | null = null;
@@ -83,7 +86,8 @@ channel.receive({
 port.receive({ v: 1, op: "ready", accepts: ["screen.v2", "screen-records.v1"] });
 port.receive({ v: 2, op: "call", id: "life-1", verb: BATCH, args: { table: "t", rows: [] } });
 port.receive({ v: 2, op: "call", id: "life-2", verb: AGGREGATE, args: { table: "t" } });
-assert.equal(calls.join(","), `${BATCH},${AGGREGATE}`, "both verbs are handed to the host actions");
+port.receive({ v: 2, op: "call", id: "life-3", verb: MERGE, args: MERGE_ARGS });
+assert.equal(calls.join(","), VERBS.join(","), "declared verbs are handed to the host actions");
 assert.equal(port.closed, false, "an admitted call keeps the mount");
 // The limit is measured on the serialized args: just under forwards, over is refused.
 const closedBy = (verb: string, args: Record<string, unknown>): boolean => {
@@ -99,30 +103,33 @@ assert.equal(closedBy("records.update", {}), true, "a verb the receipt does not 
 const sized = (bytes: number) => ({ table: "t", pad: "x".repeat(bytes - JSON.stringify({ table: "t", pad: "" }).length) });
 assert.equal(JSON.stringify(sized(49152)).length, 49152, "fixture hits the limit exactly");
 port.receive({ v: 2, op: "call", id: "life-big", verb: BATCH, args: sized(49152) });
-assert.equal(calls.length, 3, "a batch at the limit is forwarded");
+assert.equal(calls.length, 4, "a batch at the limit is forwarded");
 assert.equal(port.closed, false, "a batch at the limit keeps the mount");
 assert.equal(closedBy(BATCH, sized(49152)), false, "a batch at the limit does not close a fresh mount");
 assert.equal(closedBy(BATCH, sized(49153)), true, "a batch over the limit is refused");
 port.receive({ v: 2, op: "call", id: "life-over", verb: BATCH, args: sized(49153) });
-assert.equal(calls.length, 3, "a batch over the limit is not forwarded");
+assert.equal(calls.length, 4, "a batch over the limit is not forwarded");
 assert.equal(port.closed, true, "a batch over the limit closes the mount");
 
 
 async function run(): Promise<void> {
-  const requests: { operation: string }[] = [];
+  const requests: { operation: string; args: Record<string, unknown>; action_token: string }[] = [];
   globalThis.fetch = ((url: string, init?: RequestInit) => {
     assert.equal(url, "/api/app-screen-services/call", "only the owned service-call route");
     if (!init) throw new Error("Missing request init");
     const body = JSON.parse(String(init.body));
-    requests.push({ operation: body.operation });
+    requests.push(body);
     return Promise.resolve(new Response(JSON.stringify({ rows: [] }), { status: 200, headers: { "Content-Type": "application/json" } }));
   }) as typeof fetch;
   let refused = 0;
   const services = recordServices(receipt, "records-domain", { current: () => true, refused: () => { refused += 1; }, command: () => {} });
   const batch = await services.call(BATCH, { table: "t", rows: [] });
   const aggregate = await services.call(AGGREGATE, { table: "t" });
-  assert.ok(batch.ok && aggregate.ok, "both verbs are served through the call route");
-  assert.equal(requests.map(r => r.operation).join(","), `${BATCH},${AGGREGATE}`, "both verbs reach the worker");
+  const merge = await services.call(MERGE, MERGE_ARGS);
+  assert.ok(batch.ok && aggregate.ok && merge.ok, "all three verbs are served through the call route");
+  assert.equal(requests.map(r => r.operation).join(","), VERBS.join(","), "all three verbs reach the worker");
+  assert.equal(requests[2]?.action_token, TOKEN, "merge uses the current mount's token");
+  assert.equal(JSON.stringify(requests[2]?.args), JSON.stringify(MERGE_ARGS), "merge preserves both revision guards");
   assert.equal(refused, 0, "the mount is not retired");
 }
 

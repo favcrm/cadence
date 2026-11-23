@@ -160,6 +160,14 @@ For a standalone source-backed draft, the receipt must still be attached to
 the context and the handle must remain a saved source. A run-backed draft
 instead proves the selected receipt and post against its own scoped run.
 
+### Hosted CRM record merge
+
+Declare `records.merge` with `records.call` on a `screen-records.v1` CRM screen
+to merge duplicate customer records on a hosted board. It is a write, not a
+confirmation slot or a read-only capability. The hosted worker requires a
+workspace owner and both the source and target record revisions. The native
+validator accepts the declaration, but the native daemon does not execute it.
+
 ### Dated items: `calendar.query`
 
 A `screen-records.v1` screen that declares `calendar.query` (with the

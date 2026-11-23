@@ -200,6 +200,9 @@ pub enum ScreenOperation {
     RecordsBatch,
     #[serde(rename = "records.aggregate")]
     RecordsAggregate,
+    // The hosted CRM merge is a write CALL; native execution refuses it.
+    #[serde(rename = "records.merge")]
+    RecordsMerge,
     // Hosted platform catalogue access; native execution remains unavailable.
     #[serde(rename = "catalog.call")]
     CatalogCall,
@@ -2155,6 +2158,23 @@ mod tests {
         let unknown = records_declaration(BODY, &[MAY_RECORDS_CALL], &["records.truncate"]);
         assert!(validate_map(&unknown, &bodies).is_err());
         assert!(validate_facts(&unknown, &facts(BODY)).is_err());
+    }
+
+    #[test]
+    fn hosted_records_merge_admits_a_write_call_but_not_a_slot() {
+        let operations = ["records.merge"];
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let call = records_declaration(BODY, &[MAY_RECORDS_CALL], &operations);
+        let checked = validate_map(&call, &bodies).expect("hosted merge declaration is valid");
+        let [operation] = checked.operations() else {
+            panic!("expected exactly the declared merge operation");
+        };
+        assert!(!operation.is_slot());
+        assert!(!operation.is_screen_read());
+        assert!(validate_facts(&call, &facts(BODY)).is_ok());
+
+        let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &operations);
+        assert!(validate_map(&slot_only, &bodies).is_err());
     }
 
     /// CAD-2379: `calendar.query` is a read CALL. A declaration listing it
