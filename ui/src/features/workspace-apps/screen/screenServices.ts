@@ -174,10 +174,20 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
   if (operation === "smtp.show" && error instanceof ApiError && status === 400 && (error.code === "smtp_sender_unbound" || error.code === "smtp_sender_revoked")) {
     return { code: error.code, text: "No live SMTP sender is bound. Configure a sender before sending." };
   }
-  // CAD-1634: a WhatsApp refusal keeps the host's typed reason (for example
-  // the door's `test_limit`), so the screen can name it.
-  if (operation?.startsWith("whatsapp.") && error instanceof ApiError && status === 400 && error.code && /^[A-Za-z0-9_-]{1,64}$/.test(error.code)) {
-    return { code: error.code, text: "Cadence refused this request. Inspect fresh status before retrying an effect." };
+  // CAD-1634 / CAD-2649: a WhatsApp refusal keeps the host's typed reason
+  // (for example the door's `test_limit`, `window_closed`, or `stale_approval`),
+  // so the screen and Official reply composer can name it.
+  if (operation?.startsWith("whatsapp.") && error instanceof ApiError && (status === 400 || status === 409) && error.code && /^[A-Za-z0-9_-]{1,64}$/.test(error.code)) {
+    const text = error.code === "window_closed"
+      ? "The WhatsApp 24-hour reply window is closed. Send an approved template instead."
+      : error.code === "stale_approval"
+        ? "This prepared reply expired. Prepare it again."
+        : error.code === "facts_changed"
+          ? "That changed. Refresh before trying again."
+          : error.code === "owner_required"
+            ? "Only a workspace owner can perform this action."
+            : "Cadence refused this request. Inspect fresh status before retrying an effect.";
+    return { code: error.code, text };
   }
   // Apart from explicit sender-state codes on smtp.show, the child consumes
   // canonical classes (a revision_conflict must still reach the editor as conflict).

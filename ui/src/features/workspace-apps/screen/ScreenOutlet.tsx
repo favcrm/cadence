@@ -22,7 +22,7 @@ import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { frameRoute, parseRoutePatch, type RoutePatch } from "./screenRoute";
 import { readOnlyReceipt } from "./screenReadOnly";
-import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize, type WhatsAppReplyBounds } from "./screenProtocol";
+import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenRoute, type ScreenPresentationMode, type ScreenDrawerSize, type WhatsAppComposeProvider, type WhatsAppReplyBounds } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
 import AppLoadingSurface from "../AppLoadingSurface";
@@ -378,26 +378,30 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           setRemoteImages(receipt.remote_images ?? []);
           services = recordServices(receipt, JSON.stringify([current.install_id, current.context_id]), { current: isCurrent, command, refused: () => { owned?.close(true); } });
         }
-        let selectedWhatsApp: string | null = null;
+        let selectedWhatsApp: { conversationId: string; provider: WhatsAppComposeProvider } | null = null;
         const composeServices = primary && !readOnly && current.installation.name === "waba" && admitsWhatsAppComposer(receipt)
           ? services : null;
         const mediaDownloadServices = current.installation.name === "waba" && admitsWhatsAppMediaDownload(receipt)
           ? services : null;
         const composeCurrent = () => isCurrent() && !!owned && channel.current === owned && mounted.current === receipt &&
           frameRoute(receipt.navigation, receipt.tag, navigationCallbacks.current).section === "inbox";
-        const selectWhatsApp = (conversationId: string | null, nomination: number | null) => {
-          if (!composeServices || !isCurrent() || !owned || channel.current !== owned || selectedWhatsApp === conversationId) return;
-          selectedWhatsApp = composeCurrent() ? conversationId : null;
+        const selectWhatsApp = (conversationId: string | null, nomination: number | null, provider: WhatsAppComposeProvider = "linked") => {
+          if (!composeServices || !isCurrent() || !owned || channel.current !== owned) return;
+          if (conversationId === null && selectedWhatsApp === null) return;
+          if (selectedWhatsApp?.conversationId === conversationId && selectedWhatsApp?.provider === provider) return;
+          selectedWhatsApp = composeCurrent() && conversationId !== null ? { conversationId, provider } : null;
           const revision = ++whatsappRevision.current;
           composerUnsaved = false;
           updateLeaveGuard();
           owned.whatsappComposeState(false, false);
           if (!selectedWhatsApp) { setWhatsAppReply(null); return; }
+          const selected = selectedWhatsApp;
           const currentSelection = () => composeCurrent() && revision === whatsappRevision.current;
           setWhatsAppReply({
             revision,
             selection: {
-              conversationId: selectedWhatsApp,
+              conversationId: selected.conversationId,
+              provider: selected.provider,
               receiptScope: `${generation}:${scope}`,
               services: composeServices,
               current: currentSelection,

@@ -66,6 +66,9 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                 let result = if is_private_app_tool(name) {
                     parse_private_app_call(name, &args)
                         .and_then(|call| execute_private_app_call(state_dir, &alias, call))
+                } else if is_hosted_app_tool(name) {
+                    parse_hosted_app_call(name, &args)
+                        .and_then(|call| execute_hosted_app_call(state_dir, &alias, call))
                 } else {
                     let list = discovered.get_or_insert_with(|| platform_tools(state_dir));
                     command_args(name, &args, &*list)
@@ -142,7 +145,29 @@ fn tools(platform_tools: &[PlatformTool]) -> Value {
         {"name":"private_app_reconcile","description":"Read the authoritative outcome of a private app review or apply without replaying it.",
          "inputSchema":{"type":"object","properties":{
              "id":{"type":"string","description":"Private app review ID (par_...)."}},
-             "required":["id"],"additionalProperties":false}}
+             "required":["id"],"additionalProperties":false}},
+        {"name":"app_describe","description":"Describe an installed workspace app's callable operations and skills in the hosted workspace.",
+         "inputSchema":{"type":"object","properties":{
+             "app":{"type":"string","description":"Installed app slug (for example 'waba')."}},
+             "required":["app"],"additionalProperties":false}},
+        {"name":"app_skill","description":"Read one named skill guide packaged in an installed workspace app.",
+         "inputSchema":{"type":"object","properties":{
+             "app":{"type":"string","description":"Installed app slug (for example 'waba')."},
+             "skill":{"type":"string","description":"Skill name listed by app_describe."}},
+             "required":["app","skill"],"additionalProperties":false}},
+        {"name":"app_call","description":"Invoke a callable operation on an installed hosted app (such as 'waba'). Read and draft verbs run directly when permitted; external sends and WhatsApp lifecycle mutations stage into the owner's Home queue (check board_pending_actions, and inspect status rather than retrying uncertain outcomes).",
+         "inputSchema":{"type":"object","properties":{
+             "app":{"type":"string","description":"Installed app slug (for example 'waba')."},
+             "operation":{"type":"string","description":"Callable operation name from app_describe."},
+             "args":{"type":"object","description":"Operation argument object (passed serialized to the app operation)."},
+             "reason":{"type":"string","description":"Optional short owner-facing reason when staging a write or send."},
+             "request_id":{"type":"string","description":"Optional idempotency key; deterministically derived when omitted."}},
+             "required":["app","operation"],"additionalProperties":false}},
+        {"name":"board_pending_actions","description":"List or inspect staged actions awaiting or decided by the owner in Home (read-only).",
+         "inputSchema":{"type":"object","properties":{
+             "id":{"type":"string","description":"Optional staged action id."},
+             "status":{"type":"string","enum":["pending","approved","denied"],"description":"Optional status filter."}},
+             "additionalProperties":false}}
     ]);
     if let Some(array) = tools.as_array_mut() {
         for tool in platform_tools {
@@ -184,7 +209,7 @@ struct PlatformTool {
     connected_read: bool,
 }
 
-const STATIC_TOOL_NAMES: [&str; 9] = [
+const STATIC_TOOL_NAMES: [&str; 13] = [
     "self",
     "wiki_search",
     "wiki_read",
@@ -194,6 +219,10 @@ const STATIC_TOOL_NAMES: [&str; 9] = [
     "private_app_status",
     "private_app_apply",
     "private_app_reconcile",
+    "app_describe",
+    "app_skill",
+    "app_call",
+    "board_pending_actions",
 ];
 
 /// MCP tool names allow only `[A-Za-z0-9_-]`; a platform slug such as
@@ -873,6 +902,27 @@ fn resolve_running_message_id(state_dir: &Path, alias: &str) -> Result<String> {
 }
 
 fn execute_private_app_call(state_dir: &Path, alias: &str, call: PrivateAppCall) -> Result<String> {
+    let (auth_dir, message_id, target, slot) = resolve_hosted_turn_context(state_dir, alias)?;
+    execute_private_app_call_with(
+        &auth_dir,
+        state_dir,
+        &message_id,
+        &target,
+        &slot,
+        call,
+        PRIVATE_APP_WAKE_TIMEOUT_SECS,
+    )
+}
+
+fn resolve_hosted_turn_context(
+    state_dir: &Path,
+    alias: &str,
+) -> Result<(
+    std::path::PathBuf,
+    String,
+    crate::remote_cli::RemoteTarget,
+    crate::remote_cli::AgentSlot,
+)> {
     let message_id = resolve_running_message_id(state_dir, alias)?;
     let binding =
         crate::local_assignment::reporting::hosted_binding_target(state_dir, &message_id)?
@@ -898,15 +948,313 @@ fn execute_private_app_call(state_dir: &Path, alias: &str, call: PrivateAppCall)
     let auth_dir = crate::remote_auth::auth_dir(None).map_err(|_| {
         Error::rejected("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
-    execute_private_app_call_with(
+    Ok((auth_dir, message_id, target, slot))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostedAppToolCall {
+    Describe {
+        app: String,
+    },
+    Skill {
+        app: String,
+        skill: String,
+    },
+    Call {
+        app: String,
+        operation: String,
+        args_json: String,
+        reason: Option<String>,
+        request_id: Option<String>,
+    },
+    PendingActions {
+        id: Option<String>,
+        status: Option<String>,
+    },
+}
+
+fn is_hosted_app_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "app_describe" | "app_skill" | "app_call" | "board_pending_actions"
+    )
+}
+
+fn valid_hosted_app_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().enumerate().all(|(idx, b)| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || (idx > 0 && matches!(b, b'-' | b'_'))
+        })
+}
+
+fn valid_hosted_app_operation(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().enumerate().all(|(idx, b)| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || (idx > 0 && matches!(b, b'.' | b'-' | b'_'))
+        })
+}
+
+fn valid_hosted_skill_name(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+fn valid_hosted_action_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn deterministic_app_call_request_id(
+    message_id: &str,
+    app: &str,
+    operation: &str,
+    args_json: &str,
+    reason: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    for part in [
+        "cadence-mcp-app-call.v1",
+        message_id,
+        app,
+        operation,
+        args_json,
+        reason.unwrap_or(""),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(7 + 32);
+    out.push_str("mcpapp_");
+    for byte in &digest[..16] {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn parse_hosted_app_call(name: &str, args: &Value) -> Result<HostedAppToolCall> {
+    match name {
+        "app_describe" => {
+            let object = fields(args, &["app"], &["app"])?;
+            let app = required_nonempty_str(object, "app")?;
+            if !valid_hosted_app_slug(app) {
+                return Err(Error::rejected("tool argument 'app' is invalid"));
+            }
+            Ok(HostedAppToolCall::Describe { app: app.into() })
+        }
+        "app_skill" => {
+            let object = fields(args, &["app", "skill"], &["app", "skill"])?;
+            let app = required_nonempty_str(object, "app")?;
+            let skill = required_nonempty_str(object, "skill")?;
+            if !valid_hosted_app_slug(app) {
+                return Err(Error::rejected("tool argument 'app' is invalid"));
+            }
+            if !valid_hosted_skill_name(skill) {
+                return Err(Error::rejected("tool argument 'skill' is invalid"));
+            }
+            Ok(HostedAppToolCall::Skill {
+                app: app.into(),
+                skill: skill.into(),
+            })
+        }
+        "app_call" => {
+            let object = args
+                .as_object()
+                .ok_or_else(|| Error::rejected("tool arguments must be an object"))?;
+            if let Some(key) = object.keys().find(|key| {
+                !matches!(
+                    key.as_str(),
+                    "app" | "operation" | "args" | "reason" | "request_id"
+                )
+            }) {
+                return Err(Error::rejected(format!("unexpected tool argument '{key}'")));
+            }
+            let app = required_nonempty_str(object, "app")?;
+            let operation = required_nonempty_str(object, "operation")?;
+            if !valid_hosted_app_slug(app) {
+                return Err(Error::rejected("tool argument 'app' is invalid"));
+            }
+            if !valid_hosted_app_operation(operation) {
+                return Err(Error::rejected("tool argument 'operation' is invalid"));
+            }
+            let op_args = match object.get("args") {
+                None => json!({}),
+                Some(Value::Object(map)) => Value::Object(map.clone()),
+                Some(_) => return Err(Error::rejected("tool argument 'args' must be an object")),
+            };
+            let args_json = serde_json::to_string(&op_args)
+                .map_err(|_| Error::rejected("tool argument 'args' could not be serialized"))?;
+            let reason = optional_nonempty_str(object, "reason")?;
+            if let Some(ref value) = reason {
+                if value.len() > 1000
+                    || value
+                        .bytes()
+                        .any(|b| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7f)
+                {
+                    return Err(Error::rejected("tool argument 'reason' is invalid"));
+                }
+            }
+            let request_id = optional_nonempty_str(object, "request_id")?;
+            if let Some(ref value) = request_id {
+                if !valid_request_id(value) {
+                    return Err(Error::rejected("tool argument 'request_id' is invalid"));
+                }
+            }
+            Ok(HostedAppToolCall::Call {
+                app: app.into(),
+                operation: operation.into(),
+                args_json,
+                reason,
+                request_id,
+            })
+        }
+        "board_pending_actions" => {
+            let object = fields(args, &["id", "status"], &[])?;
+            let id = optional_nonempty_str(object, "id")?;
+            if let Some(ref value) = id {
+                if !valid_hosted_action_id(value) {
+                    return Err(Error::rejected("tool argument 'id' is invalid"));
+                }
+            }
+            let status = optional_nonempty_str(object, "status")?;
+            if let Some(ref value) = status {
+                if !matches!(value.as_str(), "pending" | "approved" | "denied") {
+                    return Err(Error::rejected(
+                        "tool argument 'status' must be pending, approved, or denied",
+                    ));
+                }
+            }
+            Ok(HostedAppToolCall::PendingActions { id, status })
+        }
+        _ => Err(Error::rejected("unknown Cadence agent tool")),
+    }
+}
+
+fn execute_hosted_app_call(
+    state_dir: &Path,
+    alias: &str,
+    call: HostedAppToolCall,
+) -> Result<String> {
+    let (auth_dir, message_id, target, slot) = resolve_hosted_turn_context(state_dir, alias)?;
+    execute_hosted_app_call_with(
         &auth_dir,
-        state_dir,
         &message_id,
         &target,
         &slot,
         call,
         PRIVATE_APP_WAKE_TIMEOUT_SECS,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invoke_hosted_app_tool_with(
+    auth_dir: &Path,
+    message_id: &str,
+    target: &crate::remote_cli::RemoteTarget,
+    slot: &crate::remote_cli::AgentSlot,
+    name: &str,
+    args: &Value,
+    wake_timeout: u64,
+) -> Result<String> {
+    let call = parse_hosted_app_call(name, args)?;
+    execute_hosted_app_call_with(auth_dir, message_id, target, slot, call, wake_timeout)
+}
+
+fn execute_hosted_app_call_with(
+    auth_dir: &Path,
+    message_id: &str,
+    target: &crate::remote_cli::RemoteTarget,
+    slot: &crate::remote_cli::AgentSlot,
+    call: HostedAppToolCall,
+    wake_timeout: u64,
+) -> Result<String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| Error::rejected("invalid hosted app wake timeout"))?;
+    let mut arguments = Map::new();
+    arguments.insert("operation".into(), json!("call"));
+    let (tool_label, req_key) = match call {
+        HostedAppToolCall::Describe { app } => {
+            arguments.insert("tool".into(), json!("app_describe"));
+            arguments.insert("body".into(), json!({ "app": app }));
+            ("app_describe", None)
+        }
+        HostedAppToolCall::Skill { app, skill } => {
+            arguments.insert("tool".into(), json!("app_skill"));
+            arguments.insert("body".into(), json!({ "app": app, "skill": skill }));
+            ("app_skill", None)
+        }
+        HostedAppToolCall::Call {
+            app,
+            operation,
+            args_json,
+            reason,
+            request_id,
+        } => {
+            let key = request_id.unwrap_or_else(|| {
+                deterministic_app_call_request_id(
+                    message_id,
+                    &app,
+                    &operation,
+                    &args_json,
+                    reason.as_deref(),
+                )
+            });
+            let mut body = Map::new();
+            body.insert("app".into(), json!(app));
+            body.insert("operation".into(), json!(operation));
+            body.insert("args".into(), json!(args_json));
+            if let Some(reason) = reason {
+                body.insert("reason".into(), json!(reason));
+            }
+            arguments.insert("tool".into(), json!("app_call"));
+            arguments.insert("key".into(), json!(key));
+            arguments.insert("body".into(), Value::Object(body));
+            ("app_call", Some(key))
+        }
+        HostedAppToolCall::PendingActions { id, status } => {
+            let mut body = Map::new();
+            if let Some(id) = id {
+                body.insert("id".into(), json!(id));
+            }
+            if let Some(status) = status {
+                body.insert("status".into(), json!(status));
+            }
+            arguments.insert("tool".into(), json!("board_pending_actions"));
+            arguments.insert("body".into(), Value::Object(body));
+            ("board_pending_actions", None)
+        }
+    };
+    match crate::remote_cli::call_verb_for_slot(
+        auth_dir,
+        target,
+        "platform_call",
+        arguments,
+        deadline,
+        wake_timeout,
+        slot,
+        |_| {},
+    ) {
+        Ok(crate::remote_cli::RemoteAnswer::Ok(val)) => Ok(val.to_string()),
+        Ok(crate::remote_cli::RemoteAnswer::Conflict(body)) => {
+            Err(private_app_conflict_error(tool_label, &body))
+        }
+        Err(Error::OutcomeUnknown(_)) if tool_label == "app_call" => {
+            let key = req_key.unwrap_or_default();
+            Err(Error::unknown(format!(
+                "app_call outcome is uncertain for request_id '{key}'; inspect board_pending_actions or a read-only status verb (for example whatsapp.status, whatsapp.reply.status, or whatsapp.template.status) before retrying"
+            )))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -1343,9 +1691,15 @@ mod tests {
         .map(str::to_string)
         .collect();
         assert_eq!(argv, expected);
-        // The static nine stay reachable, and the listing grows by one.
-        assert_eq!(tools(&[]).as_array().unwrap().len(), 9);
-        assert_eq!(tools(&generated).as_array().unwrap().len(), 10);
+        // The static tools stay reachable, and the listing grows by one.
+        assert_eq!(
+            tools(&[]).as_array().unwrap().len(),
+            STATIC_TOOL_NAMES.len()
+        );
+        assert_eq!(
+            tools(&generated).as_array().unwrap().len(),
+            STATIC_TOOL_NAMES.len() + 1
+        );
         // A dotted tool slug survives as an MCP-safe name.
         assert_eq!(mcp_name_part("email.send"), "email_send");
         assert_eq!(mcp_name_part("account-images"), "account-images");
@@ -1634,6 +1988,276 @@ mod tests {
         );
         assert_eq!(req_call.1["body"]["expected_generation"], "c1:g1");
         assert_eq!(req_call.1["body"]["request_id"], expected_req_id);
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(handle);
+    }
+
+    #[test]
+    fn hosted_app_tools_advertise_strict_schemas_and_validate_inputs() {
+        let listed = tools(&[]);
+        let arr = listed.as_array().unwrap();
+        for name in [
+            "app_describe",
+            "app_skill",
+            "app_call",
+            "board_pending_actions",
+        ] {
+            let entry = arr
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert_eq!(entry["inputSchema"]["additionalProperties"], json!(false));
+        }
+
+        assert!(matches!(
+            parse_hosted_app_call("app_describe", &json!({"app": "waba"})).unwrap(),
+            HostedAppToolCall::Describe { .. }
+        ));
+        assert!(matches!(
+            parse_hosted_app_call("app_skill", &json!({"app": "waba", "skill": "waba-ops"}))
+                .unwrap(),
+            HostedAppToolCall::Skill { .. }
+        ));
+        assert!(matches!(
+            parse_hosted_app_call(
+                "app_call",
+                &json!({
+                    "app": "waba",
+                    "operation": "whatsapp.reply.stage",
+                    "args": {"provider": "official", "conversation_id": "conv_1", "text": "hi"},
+                    "reason": "reply to customer",
+                    "request_id": "req_1"
+                })
+            )
+            .unwrap(),
+            HostedAppToolCall::Call { .. }
+        ));
+        assert!(matches!(
+            parse_hosted_app_call("board_pending_actions", &json!({"status": "pending"})).unwrap(),
+            HostedAppToolCall::PendingActions { .. }
+        ));
+
+        for (name, bad_args) in [
+            ("app_describe", json!({})),
+            ("app_describe", json!({"app": "Bad_App"})),
+            ("app_skill", json!({"app": "waba"})),
+            ("app_skill", json!({"app": "waba", "skill": ""})),
+            ("app_call", json!({"app": "waba"})),
+            (
+                "app_call",
+                json!({"app": "waba", "operation": "whatsapp.status", "args": "not_object"}),
+            ),
+            ("app_call", json!({"app": "waba", "operation": "BadOp"})),
+            (
+                "app_call",
+                json!({"app": "waba", "operation": "whatsapp.status", "request_id": "bad id!"}),
+            ),
+            (
+                "app_call",
+                json!({"app": "waba", "operation": "whatsapp.status", "extra": true}),
+            ),
+            ("board_pending_actions", json!({"conversation": "home"})),
+            ("board_pending_actions", json!({"status": "executed"})),
+        ] {
+            assert!(
+                parse_hosted_app_call(name, &bad_args).is_err(),
+                "expected refusal for {name}: {bad_args}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_app_tools_loopback_end_to_end_qr_guard_and_uncertain() {
+        use crate::local_assignment::reporting;
+        use crate::private_app_update::test_helpers;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+
+        let root = std::env::temp_dir().join(format!("cad2649-mcp-app-{}", uuid::Uuid::new_v4()));
+        let state_dir = root.join("state");
+        let auth_dir = root.join("auth");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&auth_dir).unwrap();
+
+        let message_id = "msg-cad2649-mcp";
+        let mode = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let mode_srv = Arc::clone(&mode);
+        let recorded_srv = Arc::clone(&recorded);
+        let artifact_id = format!("art-{}", "1".repeat(32));
+        let dummy_hex = "0".repeat(64);
+
+        let (endpoint, handle) = test_helpers::spawn_platform_loopback(
+            32,
+            artifact_id,
+            dummy_hex,
+            move |path, req| match path {
+                "/__platform/cli/call" => {
+                    let args = req["arguments"].clone();
+                    let tool = args["tool"].as_str().unwrap_or("").to_string();
+                    recorded_srv
+                        .lock()
+                        .unwrap()
+                        .push((tool.clone(), args.clone()));
+                    match mode_srv.load(Ordering::SeqCst) {
+                        1 => (500, json!({"ok": false, "error": {"code": "internal"}})),
+                        2 => (
+                            200,
+                            json!({"ok": true, "data": {"state": "pairing", "qr": "SECRET-QR"}}),
+                        ),
+                        3 => (
+                            200,
+                            json!({"ok": true, "data": {"state": "pairing", "qrCode": "CAMEL-QR"}}),
+                        ),
+                        _ => (
+                            200,
+                            json!({
+                                "ok": true,
+                                "data": {
+                                    "tool": tool,
+                                    "staged": args["body"]["operation"] == "whatsapp.reply.stage",
+                                    "action_id": "0123456789abcdef0123456789abcdef"
+                                }
+                            }),
+                        ),
+                    }
+                }
+                _ => (404, json!({"error": {"code": "not_found"}})),
+            },
+        );
+
+        let ko = test_helpers::kickoff(
+            "waba-agent",
+            "CAD-2649",
+            "/tmp/wt",
+            message_id,
+            &endpoint,
+            None,
+        );
+        reporting::store_kickoff_binding(&state_dir, "acme", &endpoint, &ko, "handle waba")
+            .unwrap();
+        let target = test_helpers::remote_target(&endpoint);
+        let slot = test_helpers::write_agent_slot(&state_dir, message_id, &target);
+
+        let desc: Value = serde_json::from_str(
+            &invoke_hosted_app_tool_with(
+                &auth_dir,
+                message_id,
+                &target,
+                &slot,
+                "app_describe",
+                &json!({"app": "waba"}),
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(desc["data"]["tool"], "app_describe");
+
+        let skill: Value = serde_json::from_str(
+            &invoke_hosted_app_tool_with(
+                &auth_dir,
+                message_id,
+                &target,
+                &slot,
+                "app_skill",
+                &json!({"app": "waba", "skill": "waba-ops"}),
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(skill["data"]["tool"], "app_skill");
+
+        let staged: Value = serde_json::from_str(
+            &invoke_hosted_app_tool_with(
+                &auth_dir,
+                message_id,
+                &target,
+                &slot,
+                "app_call",
+                &json!({
+                    "app": "waba",
+                    "operation": "whatsapp.reply.stage",
+                    "args": {"provider": "official", "conversation_id": "conv_1", "text": "Hi"},
+                    "reason": "customer asked",
+                    "request_id": "req_stage_1"
+                }),
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staged["data"]["staged"], true);
+
+        let pending: Value = serde_json::from_str(
+            &invoke_hosted_app_tool_with(
+                &auth_dir,
+                message_id,
+                &target,
+                &slot,
+                "board_pending_actions",
+                &json!({"id": "0123456789abcdef0123456789abcdef"}),
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending["data"]["tool"], "board_pending_actions");
+
+        // QR payloads (including camelCase variants) are refused even if returned from app_call.
+        for qr_mode in [2, 3] {
+            mode.store(qr_mode, Ordering::SeqCst);
+            let qr_err = invoke_hosted_app_tool_with(
+                &auth_dir,
+                message_id,
+                &target,
+                &slot,
+                "app_call",
+                &json!({"app": "waba", "operation": "whatsapp.status", "args": {"provider": "linked"}}),
+                10,
+            )
+            .unwrap_err();
+            assert!(qr_err.to_string().contains("QR"), "{qr_err}");
+        }
+
+        // Uncertain app_call names exact request_id and board_pending_actions.
+        mode.store(1, Ordering::SeqCst);
+        let expected_req = deterministic_app_call_request_id(
+            message_id,
+            "waba",
+            "whatsapp.reply.stage",
+            r#"{"conversation_id":"conv_1","provider":"official","text":"Hi"}"#,
+            None,
+        );
+        let unc_err = invoke_hosted_app_tool_with(
+            &auth_dir,
+            message_id,
+            &target,
+            &slot,
+            "app_call",
+            &json!({
+                "app": "waba",
+                "operation": "whatsapp.reply.stage",
+                "args": {"provider": "official", "conversation_id": "conv_1", "text": "Hi"}
+            }),
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(unc_err, Error::OutcomeUnknown(_)), "{unc_err:?}");
+        let msg = unc_err.to_string();
+        assert!(
+            msg.contains(&expected_req) && msg.contains("board_pending_actions"),
+            "{msg}"
+        );
+
+        let log = recorded.lock().unwrap();
+        let app_call_req = log.iter().find(|(t, _)| t == "app_call").unwrap();
+        assert_eq!(app_call_req.1["key"], "req_stage_1");
+        assert!(app_call_req.1["body"]["args"].is_string());
 
         let _ = std::fs::remove_dir_all(&root);
         drop(handle);

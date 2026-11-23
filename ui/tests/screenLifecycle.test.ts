@@ -334,9 +334,13 @@ function replyLayoutMount(options: { layout?: boolean; drawer?: boolean; overlay
     ...actingPush, v: 2, tag: "waba",
     installation: { ...actingPush.installation, name: "waba" },
   };
+  const providers: (string | undefined)[] = [];
   const actions = {
     ...toolHost!,
-    onWhatsAppCompose: (_conversationId: string | null, nomination: number | null) => nominations.push(nomination),
+    onWhatsAppCompose: (_conversationId: string | null, nomination: number | null, provider?: string) => {
+      nominations.push(nomination);
+      providers.push(provider);
+    },
     onWhatsAppReplyLayout: (bounds: [number, number] | null) => layouts.push(bounds),
     onWhatsAppReplyInsetApplied: (px: number) => appliedInsets.push(px),
   };
@@ -347,7 +351,7 @@ function replyLayoutMount(options: { layout?: boolean; drawer?: boolean; overlay
     "screen.v2", "screen-records.v1", "screen-whatsapp-compose.v1", "screen-whatsapp-reply-availability.v1",
     ...(options.layout === false ? [] : [options.overlay ? "screen-whatsapp-reply-layout.v2" : "screen-whatsapp-reply-layout.v1"]),
   ] });
-  return { channel, port, nominations, layouts, appliedInsets, failed: () => failed };
+  return { channel, port, nominations, providers, layouts, appliedInsets, failed: () => failed };
 }
 const layout = replyLayoutMount();
 const layoutMessage = (nomination: number, bounds: unknown) => ({ v: 2, op: "whatsapp-reply-layout", nomination, bounds });
@@ -417,6 +421,9 @@ overlay.channel.whatsappReplyInset(2, 80);
 const replacementInset = insetMessages(overlay.port)[3] as { nomination: number; px: number; seq: number };
 check(replacementInset.nomination === 2 && replacementInset.px === 80 && replacementInset.seq === 1,
   "current replacement selection receives an inset with a reset sequence");
+overlay.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: "conv_official_1", provider: "official" });
+check(overlay.providers[overlay.providers.length - 1] === "official" && overlay.nominations[overlay.nominations.length - 1] === 3 && !overlay.port.closed,
+  "official whatsapp-compose provider is forwarded cleanly");
 overlay.port.receive({ v: 2, op: "whatsapp-compose", conversation_id: null });
 overlay.channel.whatsappReplyInset(2, 42);
 overlay.channel.whatsappReplyInset(3, 42);

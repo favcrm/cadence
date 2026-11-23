@@ -5,7 +5,7 @@ import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRef
   type ScreenSectionI18n,
   type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
   type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
-import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_MEDIA_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V2, WHATSAPP_REPLY_INSET_MAX, type WhatsAppMediaReply, type WhatsAppMediaRequest, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
+import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_MEDIA_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V2, WHATSAPP_REPLY_INSET_MAX, type WhatsAppComposeProvider, type WhatsAppMediaReply, type WhatsAppMediaRequest, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
 import type { WhatsAppMediaDownloadResult } from "./screenServices";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
@@ -65,7 +65,7 @@ export interface ScreenActions {
    *  drawer frame in the shell's own fixed overlay instead of promoting
    *  this frame. */
   onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown): void;
-  onWhatsAppCompose?(conversationId: string | null, nomination: number | null): void;
+  onWhatsAppCompose?(conversationId: string | null, nomination: number | null, provider?: WhatsAppComposeProvider): void;
   onWhatsAppReplyLayout?(bounds: WhatsAppReplyBounds | null): void;
   onWhatsAppReplyInsetApplied?(px: number, seq: number): void;
   onWhatsAppMediaDownload?(conversationId: string, messageId: string, signal: AbortSignal): Promise<WhatsAppMediaDownloadResult>;
@@ -255,7 +255,7 @@ export abstract class FrameChannel {
   protected state(_data: string): void {}
   /** screen.v2 unsaved-edit leave warning hint: a frame kind without it closes. */
   protected leave(_unsaved: boolean): void { this.close(true); }
-  protected whatsappCompose(_conversationId: string | null): void { this.close(true); }
+  protected whatsappCompose(_conversationId: string | null, _provider?: WhatsAppComposeProvider): void { this.close(true); }
   protected whatsappReplyLayout(_nomination: number, _bounds: WhatsAppReplyBounds | null): void { this.close(true); }
   protected whatsappReplyInsetReady(_nomination: number, _seq: number, _px: number): void { this.close(true); }
   protected whatsappMedia(_request: WhatsAppMediaRequest): void { this.close(true); }
@@ -305,7 +305,7 @@ export abstract class FrameChannel {
       }
       if (child.op === "whatsapp-compose") {
         if (!this.ready) { this.close(true); return; }
-        this.whatsappCompose(child.conversation_id);
+        this.whatsappCompose(child.conversation_id, child.provider);
       }
       if (child.op === "whatsapp-reply-layout") {
         if (!this.ready) { this.close(true); return; }
@@ -473,12 +473,12 @@ export class ScreenChannel extends FrameChannel {
     if (!this.ready || this.closed || this.shape !== "v2") { this.close(true); return; }
     this.onUnsaved?.(unsaved);
   }
-  protected whatsappCompose(conversationId: string | null): void {
+  protected whatsappCompose(conversationId: string | null, provider?: WhatsAppComposeProvider): void {
     if (!this.wantsWhatsAppCompose || !this.actions?.onWhatsAppCompose) { this.close(true); return; }
     this.whatsappSelected = conversationId !== null;
     this.replyInset = undefined;
     this.replyInsetSeq = 0;
-    this.actions.onWhatsAppCompose(conversationId, this.wantsReplyAvailability ? ++this.whatsappNomination : null);
+    this.actions.onWhatsAppCompose(conversationId, this.wantsReplyAvailability ? ++this.whatsappNomination : null, provider);
   }
   protected whatsappReplyLayout(nomination: number, bounds: WhatsAppReplyBounds | null): void {
     if (!this.wantsReplyLayout || !this.actions?.onWhatsAppReplyLayout) { this.close(true); return; }

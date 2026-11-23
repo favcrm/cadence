@@ -3,7 +3,14 @@ import { useLocale } from "../../../lib/locale";
 import { onPrivateSessionReset } from "../../../lib/privateSession";
 import Button from "../../../ui/Button";
 import { formatMediaBytes, object, type LinkedStagedAttachment, type recordServices } from "./screenServices";
-import { LINKED_MEDIA_MAX_BYTES, LINKED_MEDIA_MAX_IMAGE_BYTES, WHATSAPP_REPLY_INSET_MAX, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
+import {
+  LINKED_MEDIA_MAX_BYTES,
+  LINKED_MEDIA_MAX_IMAGE_BYTES,
+  WHATSAPP_REPLY_INSET_MAX,
+  type WhatsAppComposeProvider,
+  type WhatsAppReplyAvailability,
+  type WhatsAppReplyBounds,
+} from "./screenProtocol";
 import "./whatsAppReplyComposer.css";
 
 const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
@@ -45,6 +52,7 @@ function classifyLocalAttachment(file: File): "image" | "other" | null {
 
 export interface WhatsAppReplySelection {
   conversationId: string;
+  provider?: WhatsAppComposeProvider;
   receiptScope: string;
   services: ReturnType<typeof recordServices>;
   current(): boolean;
@@ -53,15 +61,23 @@ export interface WhatsAppReplySelection {
   announce(dirty: boolean, refresh?: boolean): void;
 }
 
-type Recipient = { workRef: string; label: string; reference: string | null };
-type RecipientCheck = { recipient: Recipient; retryable?: never; bound?: never } | { recipient: null; retryable?: boolean; bound?: Recipient };
+type Recipient = {
+  workRef: string;
+  label: string;
+  reference: string | null;
+  replyMode?: "freeform" | "template_only";
+  freeformUntil?: string | null;
+};
+type RecipientCheck =
+  | { recipient: Recipient; windowClosed?: boolean; retryable?: never; bound?: never }
+  | { recipient: null; windowClosed?: never; retryable?: boolean; bound?: Recipient };
 const sameRecipient = (left: Recipient | null, right: Recipient) =>
   left?.workRef === right.workRef && left.label === right.label;
 type Outcome = "unsent" | "failed" | "uncertain" | "accepted" | "sent";
 const PHONE = /^\+[1-9]\d{7,14}$/;
 const WORK_REF = /^lw_[0-9a-f]{32}_[0-9a-f]{64}$/;
 const EFFECT = /^wae_[0-9a-f]{32}$/;
-const provider = "linked";
+const OFFICIAL_EFFECT = /^[A-Za-z0-9_.:-]{1,128}$/;
 const AUTO_POLL_DELAYS_MS = [500, 1_000, 1_800, 2_700] as const;
 const SENT_BANNER_DISMISS_MS = 3_000;
 type StatusTone = "sending" | "confirming" | "sent" | "accepted" | "uncertain" | "failed";
@@ -69,7 +85,8 @@ type StatusTone = "sending" | "confirming" | "sent" | "accepted" | "uncertain" |
 // so a later failed send can't erase an earlier delivery check.
 const replyRecovery = new Map<string, { pending: string | null; accepted: string | null }>();
 onPrivateSessionReset(() => replyRecovery.clear());
-const receiptKey = (selection: WhatsAppReplySelection, recipient: Recipient) => `${selection.receiptScope}:${recipient.workRef}`;
+const receiptKey = (selection: WhatsAppReplySelection, recipient: Recipient) =>
+  `${selection.receiptScope}:${selection.provider ?? "linked"}:${recipient.workRef}`;
 
 function settleReceipt(key: string, effectId: string, outcome: Outcome, group: boolean): void {
   const receipts = replyRecovery.get(key);
@@ -85,14 +102,37 @@ function settleReceipt(key: string, effectId: string, outcome: Outcome, group: b
 
 async function recipientFor(selection: WhatsAppReplySelection, ref = selection.conversationId): Promise<RecipientCheck> {
   if (!selection.current()) return { recipient: null };
+  const provider: WhatsAppComposeProvider = selection.provider ?? "linked";
   const result = await selection.services.call("whatsapp.conversations.show", { provider, conversation_id: ref });
   if (!result.ok) return { recipient: null, retryable: result.refusal.code === "unavailable" };
   if (!selection.current() || !object(result.data)) return { recipient: null };
   const data = result.data;
   const id = selection.conversationId;
-  if (data.contract !== "agenticos.whatsapp-door.v1" || data.conversationId !== id ||
-      typeof data.workRef !== "string" || !WORK_REF.test(data.workRef) ||
-      !object(data.contact)) return { recipient: null };
+  if (data.contract !== "agenticos.whatsapp-door.v1" || data.conversationId !== id || !object(data.contact)) {
+    return { recipient: null };
+  }
+  if (provider === "official") {
+    const channelState = object(data.channelState) ? data.channelState : null;
+    const rawReplyMode = data.replyMode ?? channelState?.replyMode;
+    const replyMode = rawReplyMode === "freeform" || rawReplyMode === "template_only" ? rawReplyMode : undefined;
+    const rawUntil = data.freeformUntil ?? channelState?.freeformUntil;
+    const freeformUntil = typeof rawUntil === "string" ? rawUntil : null;
+    const untilMs = freeformUntil ? Date.parse(freeformUntil) : NaN;
+    const windowClosed = replyMode !== "freeform" || (Number.isFinite(untilMs) && untilMs <= Date.now());
+    const phone = typeof data.contact.phone === "string" && PHONE.test(data.contact.phone) ? data.contact.phone : null;
+    const name = typeof data.contact.name === "string" && data.contact.name.length <= 160 ? data.contact.name.trim() : "";
+    return {
+      recipient: {
+        workRef: id,
+        label: [name !== phone ? name : "", phone].filter(Boolean).join(" · "),
+        reference: phone ? null : id,
+        ...(replyMode ? { replyMode } : {}),
+        freeformUntil,
+      },
+      ...(windowClosed ? { windowClosed: true } : {}),
+    };
+  }
+  if (typeof data.workRef !== "string" || !WORK_REF.test(data.workRef)) return { recipient: null };
   const address = /^([1-9]\d{7,14})(?::\d{1,5})?@s\.whatsapp\.net$/.exec(id);
   const phone = id.endsWith("@g.us") ? null
     : address ? `+${address[1]}`
@@ -104,12 +144,16 @@ async function recipientFor(selection: WhatsAppReplySelection, ref = selection.c
 function recordedState(state: unknown): Outcome {
   // A status read can race a confirmation still in flight. Prepared alone is not a refusal.
   if (state === "expired") return "unsent";
+  if (state === "not_executed") return "failed";
+  if (state === "pending") return "accepted";
   return state === "sent" || state === "accepted" || state === "failed" ? state : "uncertain";
 }
 
 export default function WhatsAppReplyComposer({ selection, bounds, inset }: { selection: WhatsAppReplySelection; bounds?: WhatsAppReplyBounds | null; inset?: { px: number; seq: number } }) {
   const { locale } = useLocale();
   const zh = locale === "zh-TW";
+  const provider: WhatsAppComposeProvider = selection.provider ?? "linked";
+  const isOfficial = provider === "official";
   const [verification, setVerification] = useState<RecipientCheck>();
   const [retry, setRetry] = useState<{ bound?: Recipient }>();
   const [text, setText] = useState("");
@@ -118,6 +162,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const sending = pendingOp === "send";
   const checking = pendingOp === "check";
   const [staleRecipient, setStaleRecipient] = useState(false);
+  const [windowClosedError, setWindowClosedError] = useState(false);
   const [attempt, setAttempt] = useState<{ effectId: string | null; outcome: Outcome } | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [attachment, setAttachment] = useState<LinkedStagedAttachment | null>(null);
@@ -179,16 +224,17 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     observer.observe(node, { box: "border-box" });
     return () => observer.disconnect();
   }, [selection, inset, hidden]);
-  const group = selection.conversationId.endsWith("@g.us");
+  const group = !isOfficial && selection.conversationId.endsWith("@g.us");
   const recipient = verification?.recipient;
-  const availability = verification === undefined ? "checking" : recipient && !staleRecipient ? "verified" : "blocked";
+  const windowClosed = isOfficial && (windowClosedError || verification?.windowClosed === true);
+  const availability = verification === undefined ? "checking" : recipient && !staleRecipient && !windowClosed ? "verified" : "blocked";
   const resolvingConfirm = confirming && attempt?.outcome === "uncertain";
   const locked = attempt?.outcome === "uncertain" && !resolvingConfirm;
   const readOnly = busy || resolvingConfirm || locked || availability !== "verified";
-  const isAudio = attachment?.kind === "audio";
+  const isAudio = !isOfficial && attachment?.kind === "audio";
   const audioHasCaption = isAudio && text !== "";
   const textareaReadOnly = readOnly || (isAudio && text === "");
-  const disabled = readOnly || staging || audioHasCaption || (!text.trim() && !attachment);
+  const disabled = readOnly || staging || audioHasCaption || (!text.trim() && (isOfficial || !attachment));
 
   function replacePreview(next: string | null) {
     if (previewUrlRef.current && typeof URL.revokeObjectURL === "function") {
@@ -228,7 +274,8 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   useEffect(() => {
     let cancelled = false;
     const bound = retry?.bound;
-    void recipientFor(selection, bound?.workRef).then(check => {
+    setWindowClosedError(false);
+    void recipientFor(selection, bound && !isOfficial ? bound.workRef : selection.conversationId).then(check => {
       if (cancelled || !selection.current()) return;
       const value = check.recipient;
       if (bound && !sameRecipient(value, bound)) {
@@ -248,7 +295,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       setVerification(check);
     });
     return () => { cancelled = true; };
-  }, [selection, retry]);
+  }, [selection, retry, isOfficial]);
   useLayoutEffect(() => {
     if (bounds === null) return;
     const box = input.current;
@@ -335,7 +382,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         try {
           const res = await latestSelection.current.services.call("whatsapp.reply.status", { provider, effect_id: effectId });
           if (!mountedRef.current || !latestSelection.current.current()) return;
-          const recorded = recordedState(res.ok && object(res.data) ? res.data.state : null);
+          const recorded = recordedState(res.ok && object(res.data) ? (res.data.state ?? res.data.status) : null);
           if (recorded === "sent" || recorded === "accepted" || recorded === "failed") {
             settleReceipt(verifiedKey, effectId, recorded, group);
             setConfirming(false);
@@ -369,7 +416,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     setPendingOp("send");
     setAttempt(null);
     setAttachError(null);
-    const activeAttachment = attachment;
+    const activeAttachment = isOfficial ? null : attachment;
     const draftText = activeAttachment?.kind === "audio" ? "" : text;
     const args: Record<string, unknown> = {
       provider,
@@ -380,34 +427,51 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     let effectId: string | null = null;
     let submitted = false;
     let staleAttachmentHandled = false;
+    let windowClosedHandled = false;
     let outcome: Outcome = "unsent";
     try {
       const prepared = await selection.services.call("whatsapp.reply.prepare", args);
       if (!selection.current()) return;
       if (!prepared.ok) {
-        if (activeAttachment && (prepared.refusal.code === "facts_changed" || prepared.refusal.code === "not_found")) {
+        if (isOfficial && prepared.refusal.code === "window_closed") {
+          windowClosedHandled = true;
+          setWindowClosedError(true);
+        } else if (activeAttachment && (prepared.refusal.code === "facts_changed" || prepared.refusal.code === "not_found")) {
           staleAttachmentHandled = true;
           handleStaleAttachment();
         }
         return;
       }
-      if (!object(prepared.data) || prepared.data.decision !== "prepared" ||
-          typeof prepared.data.effect_id !== "string" || !EFFECT.test(prepared.data.effect_id)) return;
-      effectId = prepared.data.effect_id;
+      const prepData = object(prepared.data) ? prepared.data : null;
+      const decision = prepData?.decision ?? null;
+      const preparedOk = isOfficial
+        ? (decision === "approved" || decision === "prepared" || decision === "granted")
+        : decision === "prepared";
+      const rawEffectId = prepData && typeof prepData.effect_id === "string" ? prepData.effect_id : null;
+      if (!preparedOk || !rawEffectId || !(isOfficial ? OFFICIAL_EFFECT : EFFECT).test(rawEffectId)) return;
+      effectId = rawEffectId;
       // Re-read the exact account epoch after prepare. Since a re-pair changes
       // workRef, a prepared effect cannot be carried to a different account.
       const [live, plan] = await Promise.all([
-        recipientFor(selection, recipient.workRef),
+        recipientFor(selection, isOfficial ? selection.conversationId : recipient.workRef),
         selection.services.planner("whatsapp.reply.send", { ...args, effect_id: effectId }),
       ]);
       if (!selection.current()) return;
+      if (isOfficial && live.windowClosed) {
+        windowClosedHandled = true;
+        setWindowClosedError(true);
+        return;
+      }
       if (!sameRecipient(live.recipient, recipient)) {
         if (live.retryable) setVerification({ ...live, bound: recipient });
         else setStaleRecipient(true);
         return;
       }
       if (!("run" in plan)) {
-        if (activeAttachment && (plan.code === "facts_changed" || plan.code === "not_found")) {
+        if (isOfficial && plan.code === "window_closed") {
+          windowClosedHandled = true;
+          setWindowClosedError(true);
+        } else if (activeAttachment && (plan.code === "facts_changed" || plan.code === "not_found")) {
           staleAttachmentHandled = true;
           handleStaleAttachment();
         }
@@ -421,14 +485,30 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       // Only reached from the original trusted click or Enter, never a port callback.
       submitted = true;
       const result = await plan.run();
-      if (!result.ok && activeAttachment && (result.refusal.code === "facts_changed" || result.refusal.code === "not_found")) {
-        outcome = "failed";
-        staleAttachmentHandled = true;
-        handleStaleAttachment();
-        return;
+      if (!result.ok) {
+        if (isOfficial && result.refusal.code === "window_closed") {
+          outcome = "failed";
+          windowClosedHandled = true;
+          setWindowClosedError(true);
+          return;
+        }
+        if (activeAttachment && (result.refusal.code === "facts_changed" || result.refusal.code === "not_found")) {
+          outcome = "failed";
+          staleAttachmentHandled = true;
+          handleStaleAttachment();
+          return;
+        }
       }
-      const state = result.ok && object(result.data) && object(result.data.reply) ? result.data.reply.state : null;
-      outcome = state === "failed" || state === "accepted" || state === "sent" ? state : "uncertain";
+      const rawState = result.ok && object(result.data)
+        ? (object(result.data.reply) ? result.data.reply.state : result.data.status)
+        : null;
+      outcome = rawState === "failed" || rawState === "not_executed"
+        ? "failed"
+        : rawState === "accepted" || rawState === "pending"
+          ? "accepted"
+          : rawState === "sent"
+            ? "sent"
+            : "uncertain";
     } catch {
       if (submitted) outcome = "uncertain";
     } finally {
@@ -436,7 +516,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       if (submitted && effectId) settleReceipt(key, effectId, outcome, group);
       if (selection.current()) {
         const mayHaveSent = submitted && (outcome === "sent" || outcome === "accepted" || outcome === "uncertain");
-        if (!staleAttachmentHandled) setAttempt({ effectId, outcome });
+        if (!staleAttachmentHandled && !windowClosedHandled) setAttempt({ effectId, outcome });
         if (mayHaveSent) {
           setText("");
           if (activeAttachment) {
@@ -468,7 +548,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     try {
       const result = await selection.services.call("whatsapp.reply.status", { provider, effect_id: effectId });
       if (!selection.current()) return;
-      const recorded = recordedState(result.ok && object(result.data) ? result.data.state : null);
+      const recorded = recordedState(result.ok && object(result.data) ? (result.data.state ?? result.data.status) : null);
       // An inconclusive delivery check cannot un-confirm a known acceptance.
       const outcome = recorded === "uncertain" && attempt.outcome === "accepted" ? "accepted" : recorded;
       settleReceipt(receiptKey(selection, recipient), effectId, outcome, group);
@@ -484,17 +564,20 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const audioNote = audioHasCaption
     ? (zh ? "音訊回覆不可包含說明文字。請清除文字或移除音訊。" : "Audio replies can’t include a caption. Clear the text or remove the audio.")
     : null;
+  const windowClosedNote = windowClosed
+    ? (zh ? "24 小時自由回覆視窗已關閉，請改用已核准的範本訊息。" : "24-hour free-form reply window is closed. Send an approved template instead.")
+    : null;
   const sendingNote = sending
-    ? (attachment ? (zh ? "正在傳送附件…" : "Sending attachment…") : (zh ? "正在傳送回覆…" : "Sending reply…"))
+    ? (!isOfficial && attachment ? (zh ? "正在傳送附件…" : "Sending attachment…") : (zh ? "正在傳送回覆…" : "Sending reply…"))
     : null;
   const note = staleRecipient ? (zh ? "未有傳送。請清除草稿並重新開啟對話，以再次核對收件人。" : "Nothing sent. Clear the draft and reopen the conversation to verify the recipient again.")
-    : attachError ?? audioNote ?? sendingNote
+    : windowClosedNote ?? attachError ?? audioNote ?? sendingNote
     ?? (resolvingConfirm ? (zh ? "正在向 WhatsApp 確認傳送狀態…" : "Confirming send…")
     : attempt?.outcome === "sent" ? (group ? (zh ? "WhatsApp 已接收群組訊息。" : "WhatsApp accepted the group message.") : (zh ? "已確認送達。" : "Delivery confirmed."))
     : attempt?.outcome === "accepted" ? (zh ? "WhatsApp 已接收，等待送達確認。" : "Sent to WhatsApp · Delivery pending.")
     : attempt?.outcome === "uncertain" ? (zh ? "未能確認是否已傳送。請檢查狀態，不要重新傳送。" : "Send not confirmed. Check the status; don’t resend this reply.")
     : attempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null);
-  const statusTone: StatusTone | undefined = staleRecipient || !!attachError || audioHasCaption
+  const statusTone: StatusTone | undefined = staleRecipient || windowClosed || !!attachError || audioHasCaption
     ? "failed"
     : sending ? "sending"
     : resolvingConfirm ? "confirming"
@@ -502,8 +585,8 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     : attempt?.outcome === "accepted" ? "accepted"
     : attempt?.outcome === "uncertain" ? "uncertain"
     : attempt ? "failed" : undefined;
-  const statusAlert = staleRecipient || !!attachError || audioHasCaption || (!sending && !resolvingConfirm && (attempt?.outcome === "uncertain" || attempt?.outcome === "failed"));
-  const canCheckAction = !attachError && !audioHasCaption && !sending && !resolvingConfirm && (locked || (attempt?.outcome === "accepted" && !group));
+  const statusAlert = staleRecipient || windowClosed || !!attachError || audioHasCaption || (!sending && !resolvingConfirm && (attempt?.outcome === "uncertain" || attempt?.outcome === "failed"));
+  const canCheckAction = !windowClosed && !attachError && !audioHasCaption && !sending && !resolvingConfirm && (locked || (attempt?.outcome === "accepted" && !group));
   const showStatusSpinner = statusTone === "sending" || statusTone === "confirming";
   const sendSpinning = sending || resolvingConfirm;
   const status = note && <div className="wa-reply-status" data-tone={statusTone}>
@@ -529,7 +612,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       maxBlockSize: overlay ? `min(55%, ${WHATSAPP_REPLY_INSET_MAX}px, max(5rem, 100% - 12rem))` : undefined,
     } : undefined}>
     {status}
-    <form className="app-chat-composer wa-reply-card" data-locked={locked ? "true" : undefined} aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
+    <form className="app-chat-composer wa-reply-card" data-provider={provider} data-window-closed={windowClosed ? "true" : undefined} data-locked={locked ? "true" : undefined} aria-label={zh ? "傳送 WhatsApp 回覆" : "Send a WhatsApp reply"} onSubmit={e => e.preventDefault()}>
       {(!overlay || recipient) && <p className="wa-reply-to" role={!recipient && !selection.announceAvailability ? "status" : undefined}>
         {recipient ? <>{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
           {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</>
@@ -537,7 +620,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           : availability === "checking" ? <span className="wa-reply-hint-busy"><span className="wa-reply-spinner" aria-hidden="true" />{zh ? "正在核對收件人…" : "Verifying recipient…"}</span>
           : (zh ? "此對話暫時無法回覆，你仍可查看訊息。" : "Replies are unavailable for this chat. You can still read messages.")}
       </p>}
-      {attachment && <div className="wa-reply-attachment">
+      {!isOfficial && attachment && <div className="wa-reply-attachment">
         {previewUrl
           ? <img className="wa-reply-thumb" src={previewUrl} alt={attachment.file_name ?? attachment.kind} />
           : <span className="wa-reply-badge" aria-hidden="true">{attBadge}</span>}
@@ -551,6 +634,8 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       <textarea ref={input} className="app-chat-box" aria-label={zh ? "回覆" : "Reply"}
         placeholder={isAudio && text === ""
           ? (zh ? "音訊回覆不可包含說明文字" : "Audio replies can’t include a caption")
+          : windowClosed
+          ? (zh ? "24 小時自由回覆視窗已關閉" : "24-hour reply window closed")
           : overlay && availability !== "verified"
           ? (availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…") : (zh ? "此對話暫時無法回覆" : "Can’t reply in this conversation"))
           : (zh ? "輸入回覆…" : "Write a reply…")}
@@ -560,17 +645,17 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           e.preventDefault();
           if (e.nativeEvent.isTrusted && !e.repeat) void send();
         }} />
-      <input ref={fileInput} type="file" hidden accept={ATTACH_ACCEPT}
-        onChange={e => { void pickFile(e.target.files?.[0]); }} />
+      {!isOfficial && <input ref={fileInput} type="file" hidden accept={ATTACH_ACCEPT}
+        onChange={e => { void pickFile(e.target.files?.[0]); }} />}
       <div className="app-chat-composer-tools wa-reply-tools">
-        <button type="button" className="wa-reply-attach" aria-label={zh ? "附加檔案" : "Attach file"}
+        {!isOfficial && <button type="button" className="wa-reply-attach" aria-label={zh ? "附加檔案" : "Attach file"}
           data-loading={staging ? "true" : undefined} aria-busy={staging || undefined}
           disabled={readOnly || staging || !!attachment}
           onClick={() => fileInput.current?.click()}>
           {staging
             ? <span className="wa-reply-spinner" aria-hidden="true" />
             : <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>}
-        </button>
+        </button>}
         {(text || attachment) && !busy && !resolvingConfirm && !locked && !staging && <Button size="sm" variant="ghost" onClick={() => { setText(""); clearAttachment(true); input.current?.focus(); }}>{zh ? "清除草稿" : "Clear draft"}</Button>}
         {verification?.retryable && <Button size="sm" variant="ghost" onClick={() => { setRetry({ bound: verification.bound }); setVerification(undefined); input.current?.focus(); }}>{zh ? "重新核對" : "Retry verification"}</Button>}
         <span className="wa-reply-hint" aria-live="polite">

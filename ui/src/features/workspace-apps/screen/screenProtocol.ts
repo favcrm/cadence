@@ -48,12 +48,13 @@ export interface ScreenInit {
  *  else closes the port. `state` is the child's opaque draft snapshot
  *  (≤ 32 KiB string), held host-side in memory only; `leave` and `asset`
  *  are screen.v2. */
+export type WhatsAppComposeProvider = "linked" | "official";
 export type ChildToHost =
   | { v: 1; op: "ready"; accepts?: Accept[] | [typeof CHAT_DIRECTIVE_V1] }
   | { v: 1; op: "state"; data: string }
   | { v: 2; op: "leave"; unsaved: boolean }
   | { v: 2; op: "asset"; ref: string }
-  | { v: 2; op: "whatsapp-compose"; conversation_id: string | null }
+  | { v: 2; op: "whatsapp-compose"; conversation_id: string | null; provider?: WhatsAppComposeProvider }
   | { v: 2; op: "whatsapp-reply-layout"; nomination: number; bounds: WhatsAppReplyBounds | null }
   | { v: 2; op: "whatsapp-reply-inset-ready"; nomination: number; seq: number; px: number }
   | WhatsAppMediaRequest
@@ -243,6 +244,7 @@ export const SCREEN_WHATSAPP_REPLY_LAYOUT_V2 = "screen-whatsapp-reply-layout.v2"
 export const WHATSAPP_REPLY_INSET_MAX = 512;
 export type WhatsAppReplyBounds = [left: number, right: number];
 const LINKED_WHATSAPP_CHAT = /^[A-Za-z0-9._:-]{1,128}@(s\.whatsapp\.net|lid|g\.us)$/;
+const OFFICIAL_WHATSAPP_CHAT = /^[A-Za-z0-9._:@-]{1,128}$/;
 /** Bounded inbound WhatsApp media download bridge (`screen-whatsapp-media.v1`). */
 export const SCREEN_WHATSAPP_MEDIA_V1 = "screen-whatsapp-media.v1";
 export const LINKED_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
@@ -1038,9 +1040,20 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       typeof d.unsaved === "boolean") {
     return { v: 2, op: "leave", unsaved: d.unsaved };
   }
-  if (Object.keys(d).sort().join() === "conversation_id,op,v" && d.v === 2 && d.op === "whatsapp-compose" &&
-      (d.conversation_id === null || typeof d.conversation_id === "string" && LINKED_WHATSAPP_CHAT.test(d.conversation_id))) {
-    return { v: 2, op: "whatsapp-compose", conversation_id: d.conversation_id };
+  const keys = Object.keys(d).sort().join();
+  if (d.v === 2 && d.op === "whatsapp-compose" && (keys === "conversation_id,op,v" || keys === "conversation_id,op,provider,v")) {
+    const provider = d.provider === undefined ? undefined : (d.provider === "linked" || d.provider === "official" ? d.provider : null);
+    if (provider === null) return null;
+    const validId =
+      d.conversation_id === null ||
+      (typeof d.conversation_id === "string" &&
+        ((provider ?? "linked") === "official"
+          ? OFFICIAL_WHATSAPP_CHAT.test(d.conversation_id)
+          : LINKED_WHATSAPP_CHAT.test(d.conversation_id)));
+    if (!validId) return null;
+    return provider !== undefined
+      ? { v: 2, op: "whatsapp-compose", conversation_id: d.conversation_id as string | null, provider }
+      : { v: 2, op: "whatsapp-compose", conversation_id: d.conversation_id as string | null };
   }
   if (d.v === 2 && d.op === "whatsapp-reply-layout" && Object.keys(d).sort().join() === "bounds,nomination,op,v" &&
       isBoundedSafeInt(d.nomination, 1, Number.MAX_SAFE_INTEGER)) {
