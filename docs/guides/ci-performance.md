@@ -103,8 +103,15 @@ has saved both profiles and a later native consumer restores that entry.
 hashes change every merge (restoring them always misses). Workspace objects
 go through sccache instead — **but only where the job enables it**:
 
-- `cache-warm` legs run `READ_WRITE` under `sccache-writer` on main pushes.
+- The `ci`-profile `cache-warm` leg can write under `sccache-writer` on main pushes.
 - `build`, `ui` and `test-shards` run `READ_ONLY` via `ci-sccache enable`.
+
+CAD-2712 skips the `ci`-profile warm build on an exact GitHub dependency-cache
+hit. A miss or fallback restore still runs the full build. In the isolated
+successor comparison, neither the full nor library-only warmer yielded a
+Rust sccache hit on the next commit. Skipping saved 66.9s of combined build
+wall time in that run, with byte-identical successor binaries. This measures
+private disk caching in Boat, not production R2 latency.
 
 `test-shards` joined that list in CAD-1967. Six shards compile the same
 workspace crates, so the codegen was paid six times per run; with the cache
