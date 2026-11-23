@@ -1,4 +1,4 @@
-import { recordServices, SCREEN_READ_VERBS, type HostCommand } from "../src/features/workspace-apps/screen/screenServices";
+import { recordServices, SCREEN_READ_VERBS, type HostCommand, type ScreenRefusalReason } from "../src/features/workspace-apps/screen/screenServices";
 import type { MountReceipt } from "../src/features/workspace-apps/screen/screenLifecycle";
 import type { ActionArgs, RecordCallVerb } from "../src/features/workspace-apps/screen/screenProtocol";
 
@@ -48,6 +48,7 @@ function makeReceipt(): MountReceipt {
 function makeFixture(responder: (path: string, body: Record<string, unknown>) => { status: number; json: unknown }) {
   let current = true;
   let refused = 0;
+  const refusedReasons: (ScreenRefusalReason | undefined)[] = [];
   const commands: HostCommand[] = [];
   const requests: { path: string; body: Record<string, unknown> }[] = [];
 
@@ -67,8 +68,9 @@ function makeFixture(responder: (path: string, body: Record<string, unknown>) =>
 
   const services = recordServices(makeReceipt(), "write-refusal-domain", {
     current: () => current,
-    refused: () => {
+    refused: (reason) => {
       refused += 1;
+      refusedReasons.push(reason);
       current = false;
     },
     command: (cmd) => {
@@ -82,6 +84,7 @@ function makeFixture(responder: (path: string, body: Record<string, unknown>) =>
     commands,
     isCurrent: () => current,
     refusedCount: () => refused,
+    refusedReasons: () => refusedReasons,
   };
 }
 
@@ -267,6 +270,7 @@ async function main(): Promise<void> {
     // 6. Fail-closed fatal 403/401 matrix: every session/origin/proof/revocation or unrecognized 403 retires mount.
     for (const [label, status, payload, mode, op] of [
       ["screen_access_denied 403 on write", 403, { code: "screen_access_denied", error: "Access revoked." }, "call", "records.create"],
+      ["screen_access_denied 403 on read", 403, { code: "screen_access_denied", error: "Access revoked." }, "call", "records.list"],
       ["check board_session_required on write", 403, { check: "board_session_required", error: "sign in required" }, "call", "records.create"],
       ["check session_from_agent on write", 403, { check: "session_from_agent", error: "agent session refused" }, "call", "records.create"],
       ["check board_session_required on slot-prepare", 403, { check: "board_session_required", error: "sign in required" }, "slot-prepare", "content.approve"],
@@ -307,6 +311,13 @@ async function main(): Promise<void> {
 
       const expectedRequests = mode === "slot-confirm" ? 2 : 1;
       assert.equal(fx.refusedCount(), 1, `${label}: calls host.refused() once`);
+      assert.equal(fx.refusedReasons().length, 1, `${label}: records refusal reason once`);
+      assert.equal(fx.refusedReasons()[0]?.status, status, `${label}: records HTTP status`);
+      assert.equal(
+        fx.refusedReasons()[0]?.code,
+        "code" in payload ? payload.code : null,
+        `${label}: records structured refusal code`,
+      );
       const after = await fx.services.call("records.list", {});
       assert.equal(after.ok, false, `${label}: subsequent call blocked after retirement`);
       assert.equal(fx.requests.length, expectedRequests, `${label}: retired mount makes no extra fetch`);

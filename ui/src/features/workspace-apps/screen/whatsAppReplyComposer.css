@@ -112,8 +112,6 @@
   box-shadow: var(--board-composer-shadow);
 }
 
-.wa-reply-status[data-tone="sending"],
-.wa-reply-status[data-tone="confirming"],
 .wa-reply-status[data-tone="accepted"] {
   border-color: color-mix(in srgb, var(--color-info) 38%, transparent);
   background: color-mix(in srgb, var(--color-info) 11%, var(--color-ink-850));

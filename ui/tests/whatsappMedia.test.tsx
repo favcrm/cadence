@@ -835,15 +835,16 @@ async function testComposerInteractions(): Promise<void> {
       await flush();
     });
     assert(
-      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "confirming" &&
-        !!container.querySelector(".wa-reply-status[data-tone=\"confirming\"] .wa-reply-spinner") &&
+      !container.querySelector(".wa-reply-status") &&
         apSend.getAttribute("data-loading") === "true" &&
+        apSend.getAttribute("aria-busy") === "true" &&
+        apSend.getAttribute("aria-label") === "Confirming send" &&
         !!apSend.querySelector(".wa-reply-spinner") &&
-        container.textContent?.includes("Confirming send") &&
+        !container.textContent?.includes("Confirming send") &&
         !container.textContent?.includes("Send not confirmed") &&
         container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true" &&
         apSend.disabled,
-      "initial uncertain starts confirming state with spinner and without locking card or showing alert immediately",
+      "initial uncertain starts confirming state on send button without banner or locking card or showing alert immediately",
     );
     await React.act(async () => {
       await new Promise((r) => setTimeout(r, 700));
@@ -878,10 +879,14 @@ async function testComposerInteractions(): Promise<void> {
       await flush();
     });
     assert(
-      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "confirming" &&
+      !container.querySelector(".wa-reply-status") &&
+        esSend.getAttribute("data-loading") === "true" &&
+        esSend.getAttribute("aria-busy") === "true" &&
+        !!esSend.querySelector(".wa-reply-spinner") &&
+        !container.textContent?.includes("Confirming send") &&
         container.querySelector(".wa-reply-card")?.getAttribute("data-locked") !== "true" &&
         esSend.disabled,
-      "escalate scenario keeps data-locked off while disabling duplicate send during Confirming send",
+      "escalate scenario keeps data-locked off while showing loading spinner on Send button during auto-poll confirmation",
     );
     await React.act(async () => {
       await new Promise((r) => setTimeout(r, 6_400));
@@ -964,13 +969,14 @@ async function testComposerInteractions(): Promise<void> {
       await flush();
     });
     assert(
-      container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sending" &&
-        container.textContent?.includes("Sending reply") &&
-        !!container.querySelector('.wa-reply-status[data-tone="sending"] .wa-reply-spinner') &&
+      !container.querySelector(".wa-reply-status") &&
+        !container.textContent?.includes("Sending reply") &&
+        !container.textContent?.includes("Sending attachment") &&
         ldSend.getAttribute("data-loading") === "true" &&
         ldSend.getAttribute("aria-busy") === "true" &&
+        ldSend.getAttribute("aria-label") === "Sending" &&
         !!ldSend.querySelector(".wa-reply-spinner"),
-      "in-flight send renders sending status banner and send button spinner",
+      "in-flight send shows loading spinner on send button without status banner",
     );
     confirmOutcome = "accepted";
     await React.act(async () => {
