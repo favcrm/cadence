@@ -3,6 +3,7 @@ import { ApiError } from "../../lib/api";
 import { useLocaleTag, useTranslate } from "../../lib/locale";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 import { appViewId, sameRoute } from "../canvas/appView";
+import { effective, MAX_PANES } from "../canvas/canvasLayout";
 import { openAppView, useCanvas } from "../canvas/canvasStore";
 import { paramsLine } from "../canvas/viewParams";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
@@ -76,6 +77,10 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
   if (probe.sections !== null && !probe.sections.includes(model.section)) return line;
   const ref = viewCardAppView(model, scope);
   const tab = ref === null ? undefined : canvas.tabs.find((x) => x.id === appViewId(ref));
+  // CAD-2635: where a card that asked for a pane ended up, said on the card.
+  const stage = effective(canvas.layout, canvas.tabs.map((x) => x.id)).panes;
+  const asked = model.placement === "beside" || model.placement === "below";
+  const placed = tab === undefined || !asked ? null : stage.includes(tab.id) ? "pane" : stage.length >= MAX_PANES ? "full" : null;
   const moved = ref !== null && tab?.app !== undefined && !sameRoute(tab.app.route, ref.route);
   const where: ViewPlace = viewHere(model, scope) ? "here" : moved ? "moved" : ref !== null && canvas.open && canvas.active === appViewId(ref) ? "showing" : "closed";
   const state = viewState(probe.status, ref !== null, where);
@@ -109,7 +114,7 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
             {t("Shown in {app}").replace("{app}", model.appLabel)}
           </button>
         ) : state === "closed" || state === "moved" ? (
-          <button type="button" className="btn btn-primary" data-view-open onClick={() => openAppView(ref)}>
+          <button type="button" className="btn btn-primary" data-view-open onClick={() => openAppView(ref, model.placement === "tab" ? undefined : model.placement)}>
             {t("Open")}
           </button>
         ) : null
@@ -118,6 +123,7 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
       <p className="text-label text-ink-300 viewcard-place" title={`${model.appLabel} · ${place}`}>
         {model.appLabel} · {place}
       </p>
+      {placed === null ? null : <p className="text-label text-ink-300 viewcard-placed" data-view-placed={placed}>{placed === "pane" ? `◩ ${t("Opened in a pane")}` : t("All four panes are in use, so this opened as a background tab")}</p>}
       {params === "" ? null : <p className="text-label text-ink-300 viewcard-params" data-view-params title={params}>{params}</p>}
     </TurnCard>
   );

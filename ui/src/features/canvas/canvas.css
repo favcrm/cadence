@@ -43,7 +43,8 @@
 
 /* Tabs (only with more than one view open): the mark and the short title, the open one underlined in the accent. */
 .cv-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; container: cv-main / inline-size; }
-.cv-tabs { display: flex; min-width: 0; overflow-x: auto; gap: 4px; padding: 0 8px; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-875); scrollbar-width: thin; }
+.cv-tabrow { display: flex; align-items: center; min-width: 0; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-875); }
+.cv-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; gap: 4px; padding: 0 8px; scrollbar-width: thin; }
 .cv-tab { display: inline-flex; flex-shrink: 0; align-items: center; max-width: 14rem; border-bottom: 2px solid transparent; color: var(--color-ink-400); }
 .cv-tab[data-active] { border-bottom-color: var(--color-accent); color: var(--color-ink-100); }
 .cv-tab-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 8px 4px 8px 8px; font-size: var(--text-micro); }
@@ -214,7 +215,7 @@
 
 /* ---- CAD-2103: the Browser tab (session-backed; mockups/browser-canvas-tab) ----
    Kept at the end of the file, apart from the artifact rules above. */
-.cv-pane, .bz-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.bz-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .cv-pane[hidden], .bz-panel[hidden] { display: none; }
 .bz-panel { position: relative; }
 .bz-dot { flex: none; width: 7px; height: 7px; border-radius: 9999px; background: var(--c, var(--color-ink-500)); }
@@ -373,3 +374,44 @@
 @media (width >= 1024px) {
   [data-canvas-full][data-canvas-peek] .home-workspace { left: calc(64px + 48px); }
 }
+
+/* ---- CAD-2635: several views side by side ----
+   The stage is one 3x3 grid: the middle tracks are the dividers (0 where a layout has none).
+   Each view is one keyed child placed by its cell, so a move never reorders the DOM. Every pane is
+   its own container, so the header folds by the pane's width and not the canvas's. */
+.cv-panes { flex: 1; min-height: 0; min-width: 0; display: grid; position: relative; }
+.cv-panes[hidden] { display: none; }
+.cv-pane { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; container: cv-main / inline-size; }
+.cv-panes[data-panes] .cv-pane { border: 1px solid var(--color-ink-800); border-radius: 8px; }
+.cv-panes[data-panes] .cv-pane[data-focused] { border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700)); }
+.cv-divider-slot { position: relative; z-index: 2; min-width: 0; min-height: 0; }
+.cv-divider { position: absolute; inset: 0; touch-action: none; }
+.cv-divider[data-axis="cols"] { cursor: col-resize; }
+.cv-divider[data-axis="rows"] { cursor: row-resize; }
+.cv-divider::before { content: ""; position: absolute; inset: -4px; }
+.cv-divider::after { content: ""; position: absolute; border-radius: 9999px; background: var(--color-ink-600); transition: background 0.15s ease; }
+.cv-divider[data-axis="cols"]::after { top: 50%; left: 2px; width: 2px; height: 36px; margin-top: -18px; }
+.cv-divider[data-axis="rows"]::after { left: 50%; top: 2px; height: 2px; width: 36px; margin-left: -18px; }
+.cv-divider:hover::after, .cv-divider:focus-visible::after { background: var(--color-accent); }
+.cv-divider:focus-visible { outline: none; }
+.cv-tab[data-paned] .cv-tab-title::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 9999px; background: var(--color-accent); vertical-align: middle; }
+.cv-tab[draggable="true"] { cursor: grab; }
+.cv-layout { display: flex; flex: none; align-items: center; gap: 8px; padding: 0 8px; }
+.cv-switch { display: inline-flex; padding: 2px; gap: 2px; border: 1px solid var(--color-ink-700); border-radius: 8px; background: var(--color-ink-900); }
+.cv-switch-btn { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px; border-radius: 6px; color: var(--color-ink-400); font-size: var(--text-micro); }
+.cv-switch-btn:hover:not(:disabled) { color: var(--color-ink-100); }
+.cv-switch-btn[aria-pressed="true"] { background: var(--color-ink-800); color: var(--color-ink-100); }
+.cv-switch-btn:disabled { opacity: 0.45; cursor: default; }
+.cv-switch-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.cv-saved { padding: 1px 8px; border: 1px solid var(--color-ink-700); border-radius: 9999px; color: var(--color-ink-300); font-size: var(--text-micro); white-space: nowrap; }
+button.cv-saved:hover { color: var(--color-ink-100); border-color: var(--color-ink-500); }
+@container cv-main (max-width: 1100px) { .cv-switch-label { display: none; } }
+/* Drop zones sit above the frames (an iframe swallows a drop) and exist only while a tab is being dragged. */
+.cv-zones { position: absolute; inset: 0; z-index: 4; display: grid; grid-template-areas: "left replace right" "bottom bottom bottom"; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 7fr 3fr; gap: 6px; padding: 6px; background: color-mix(in srgb, var(--color-ink-900) 55%, transparent); }
+.cv-zone { display: grid; place-items: center; border: 1px dashed color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700)); border-radius: 10px; color: var(--color-ink-200); font-size: var(--text-label); text-align: center; }
+.cv-zone[data-over] { border-style: solid; background: color-mix(in srgb, var(--color-accent) 22%, transparent); color: var(--color-ink-100); }
+.cv-zone[data-disabled] { opacity: 0.35; border-color: var(--color-ink-700); }
+/* "Move to tab" lives in the "⋯" of a pane at every width. */
+.cv-fold[data-pane] { display: inline-flex; }
+.viewcard-placed { margin: 0; }
+@media (prefers-reduced-motion: reduce) { .cv-divider::after { transition: none; } }

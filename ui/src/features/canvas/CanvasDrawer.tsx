@@ -22,6 +22,9 @@ import AppViewBody from "./AppViewBody";
 import RecordViewBody from "./RecordViewBody";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
 import { canvasChrome, setCanvasFull, setChatPeek, useCanvasChrome } from "./canvasChrome";
+import { effective, MULTI_MIN_WIDTH } from "./canvasLayout";
+import LayoutSwitcher from "./LayoutSwitcher";
+import PaneStage, { TAB_DRAG_TYPE } from "./PaneStage";
 import { closeBrowserDrawer, focusBrowser, hideBrowser, isBrowserPanelShown, tabVisible, useBrowserTab } from "./browserStore";
 import {
   clampWidth,
@@ -32,6 +35,8 @@ import {
   focusTab,
   readWidth,
   selectVersion,
+  setLayoutMode,
+  unpane,
   useCanvas,
   writeWidth,
   isArtifactTab,
@@ -109,7 +114,7 @@ function isTextField(el: Element | null): boolean {
   return el instanceof HTMLElement && (el.isContentEditable || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el instanceof HTMLInputElement);
 }
 
-function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, htmlView, onHtmlView, hosted, templateReviewEnabled }: {
+function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, onPaneClose, htmlView, onHtmlView, hosted, templateReviewEnabled }: {
   conversation: string;
   tab: ArtifactTab;
   composerKey: string | null;
@@ -119,6 +124,8 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
   canExpand: boolean;
   onExpand: () => void;
   onClose: () => void;
+  /** In a pane: the × returns the view to its tab instead of closing the canvas. */
+  onPaneClose?: () => void;
   hosted: boolean;
   templateReviewEnabled: boolean;
   htmlView: HtmlView;
@@ -290,7 +297,7 @@ function Body({ conversation, tab, composerKey, working, sheet, expanded, canExp
                 {expanded ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
               </svg>
             </button>
-            <button type="button" className="cv-iconbtn" onClick={onClose} aria-label={t("Close canvas")}>
+            <button type="button" className="cv-iconbtn" onClick={onPaneClose ?? onClose} aria-label={t(onPaneClose ? "Close pane" : "Close canvas")} title={onPaneClose ? t("Close pane — the view stays in the tabs") : undefined}>
               <IconClose size={12} />
             </button>
           </>
@@ -433,9 +440,15 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   const browser = useBrowserTab();
   const viewport = useViewport();
   // The width the operator dragged to wins; until then each kind has its own.
-  const [dragged, setDragged] = useState(readWidth);
+  const [dragWidth, setDragWidth] = useState(readWidth);
   const [expanded, setExpanded] = useState(false);
   const [canExpand, setCanExpand] = useState(false);
+  // The canvas can be as wide as panes need (it asks for that width itself once panes are chosen); the layout switcher is off where it cannot.
+  const [fits, setFits] = useState(false);
+  // Expanding would make it wide enough (the "panes saved" chip then offers that).
+  const [expandFits, setExpandFits] = useState(false);
+  // A tab being dragged by its strip entry lights the stage's drop zones.
+  const [dragged, setDragged] = useState<string | null>(null);
   const chrome = useCanvasChrome();
   const railRef = useRef<HTMLButtonElement | null>(null);
   const pathname = useHref().split("?")[0];
@@ -480,8 +493,9 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
     closeDrawer();
     closeBrowserDrawer();
   }, [handFocusOn]);
-  const want = dragged !== null ? clampWidth(dragged, viewport) : defaultWidthFor(showBrowser ? "html" : (tab?.kind ?? "md"), viewport);
-  const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
+  const baseWant = dragWidth !== null ? clampWidth(dragWidth, viewport) : defaultWidthFor(showBrowser ? "html" : (tab?.kind ?? "md"), viewport);
+  const saved = effective(canvas.layout, canvas.tabs.map((x) => x.id));
+  const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: baseWant });
   const [canvasTop, setCanvasTop] = useState(0);
   const [, measureWorkspace] = useState(0);
 
@@ -500,10 +514,17 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
     if (!open) return;
     const surface: Surface = canvas.surface;
     const workspace = surface === "app" ? appWorkspaceBounds() : null;
-    const next = drawerLayout(viewport, want, surface, workspace, expanded);
+    // Saved panes ask for the width they need, but only where that width is really there: otherwise the canvas stays as it was.
+    const asked = drawerLayout(viewport, Math.max(baseWant, MULTI_MIN_WIDTH), surface, workspace, expanded);
+    const roomy = asked.mode !== "sheet" && asked.width >= MULTI_MIN_WIDTH;
+    const wanted = saved.panes.length >= 2 && roomy ? Math.max(baseWant, MULTI_MIN_WIDTH) : baseWant;
+    const next = drawerLayout(viewport, wanted, surface, workspace, expanded);
     setLayout((cur) => (cur.mode === next.mode && cur.width === next.width && cur.right === next.right && cur.full === next.full ? cur : next));
     setCanvasTop(surface === "app" && next.mode === "cover" && !next.full && workspace !== null ? Math.max(0, workspace.top) : 0);
-    setCanExpand(expanded || drawerLayout(viewport, want, surface, workspace, true).width > next.width);
+    const widest = drawerLayout(viewport, wanted, surface, workspace, true);
+    setCanExpand(expanded || widest.width > next.width);
+    setExpandFits(widest.mode !== "sheet" && widest.width >= MULTI_MIN_WIDTH);
+    setFits(roomy);
   });
 
   // The page makes room (push) or steps aside through these two attributes.
@@ -589,7 +610,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
 
   const commit = useCallback((px: number) => {
     const next = clampWidth(px, window.innerWidth);
-    setDragged(next);
+    setDragWidth(next);
     writeWidth(next);
   }, []);
 
@@ -600,7 +621,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   };
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!drag.current) return;
-    setDragged(clampWidth(drag.current.w + (drag.current.x - e.clientX), window.innerWidth));
+    setDragWidth(clampWidth(drag.current.w + (drag.current.x - e.clientX), window.innerWidth));
   };
   const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!drag.current) return;
@@ -635,6 +656,11 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
 
   if (!open || (!tab && !showBrowser) || conversation === null) return null;
   const sheet = layout.mode === "sheet";
+  // Narrower than this, or on a phone sheet, panes fall back to tabs; the arrangement stays saved.
+  const multi = !sheet && layout.width >= MULTI_MIN_WIDTH;
+  // Where panes can be had: now, or by the canvas asking for the width (a layout choice or a drop does).
+  const canSplit = !sheet && (multi || fits);
+
   const working = canvas.working;
   const tabbed = canvas.tabs.length + (hasBrowser ? 1 : 0) > 1;
   const toggleChat = () => {
@@ -680,11 +706,25 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
       ) : null}
       <div className="cv-main">
       {tabbed ? (
+        <div className="cv-tabrow">
         <div className="cv-tabs" role="tablist" aria-label={t("Artifacts")} onKeyDown={onTabListKeyDown}>
           {canvas.tabs.map((x) => {
             const on = !showBrowser && tab !== null && x.id === tab.id;
             return (
-              <span key={x.id} className="cv-tab" data-active={on || undefined}>
+              <span
+                key={x.id}
+                className="cv-tab"
+                data-active={on || undefined}
+                data-paned={(multi && saved.panes.includes(x.id)) || undefined}
+                draggable={canSplit}
+                onDragStart={(e) => {
+                  e.dataTransfer.setData(TAB_DRAG_TYPE, x.id);
+                  e.dataTransfer.setData("text/plain", x.title);
+                  e.dataTransfer.effectAllowed = "move";
+                  setDragged(x.id);
+                }}
+                onDragEnd={() => setDragged(null)}
+              >
                 <button type="button" role="tab" aria-selected={on} className="cv-tab-label" onClick={() => focusTab(x.id)}>
                   {x.app ? <span className="cv-mark"><AppGlyph name={x.app.appLabel ?? x.app.tag} size="xs" /></span> : null}
                   <span className="cv-tab-title">{x.title}</span>
@@ -718,54 +758,79 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
             </span>
           ) : null}
         </div>
+        {canvas.tabs.length >= 2 ? (
+          <LayoutSwitcher
+            mode={multi ? saved.mode : "tabs"}
+            enabled={canSplit}
+            saved={multi ? 0 : saved.panes.length}
+            canExpand={canExpand && !expanded && expandFits}
+            onChoose={setLayoutMode}
+            onExpand={() => setExpanded(true)}
+          />
+        ) : null}
+        </div>
       ) : null}
       {tab ? (
         // Kept mounted while the Browser tab is in front, so an artifact's
         // scroll position and frame survive the switch.
-        <div className="cv-pane" hidden={showBrowser}>
-          {isArtifactTab(tab) ? (
-            <Body
-              key={`${tab.id}@${tab.selected}`}
-              conversation={canvas.conversation ?? conversation}
-              tab={tab}
-              composerKey={canvas.composerKey}
-              working={working}
-              sheet={sheet}
-              expanded={expanded}
-              canExpand={canExpand}
-              onExpand={() => setExpanded((x) => !x)}
-              onClose={closeAll}
-              hosted={hosted}
-              templateReviewEnabled={templateReviewEnabled}
-              htmlView={htmlViews[tab.id] ?? "rendered"}
-              onHtmlView={(view) => setHtmlViews((views) => ({ ...views, [tab.id]: view }))}
-            />
-          ) : tab.app ? (
-            <AppViewBody
-              key={tab.id}
-              tab={tab}
-              app={tab.app}
-              sheet={sheet}
-              tabbed={tabbed}
-              expanded={expanded}
-              canExpand={canExpand}
-              onExpand={() => setExpanded((x) => !x)}
-              onClose={closeAll}
-            />
-          ) : tab.record ? (
-            <RecordViewBody
-              key={tab.id}
-              tab={tab}
-              view={tab.record}
-              composerKey={canvas.composerKey}
-              sheet={sheet}
-              expanded={expanded}
-              canExpand={canExpand}
-              onExpand={() => setExpanded((x) => !x)}
-              onClose={closeAll}
-            />
-          ) : null}
-        </div>
+        <PaneStage
+          tabs={canvas.tabs}
+          active={tab.id}
+          layout={canvas.layout}
+          multi={multi}
+          droppable={canSplit}
+          hidden={showBrowser}
+          dragged={dragged}
+          onDragDone={() => setDragged(null)}
+          renderBody={(x, paned) => {
+            const paneClose = paned ? () => unpane(x.id) : undefined;
+            return isArtifactTab(x) ? (
+              <Body
+                key={`${x.id}@${x.selected}`}
+                conversation={canvas.conversation ?? conversation}
+                tab={x}
+                composerKey={canvas.composerKey}
+                working={working}
+                sheet={sheet}
+                expanded={expanded}
+                canExpand={canExpand}
+                onExpand={() => setExpanded((v) => !v)}
+                onClose={closeAll}
+                onPaneClose={paneClose}
+                hosted={hosted}
+                templateReviewEnabled={templateReviewEnabled}
+                htmlView={htmlViews[x.id] ?? "rendered"}
+                onHtmlView={(view) => setHtmlViews((views) => ({ ...views, [x.id]: view }))}
+              />
+            ) : x.app ? (
+              <AppViewBody
+                key={x.id}
+                tab={x}
+                app={x.app}
+                sheet={sheet}
+                tabbed={tabbed}
+                expanded={expanded}
+                canExpand={canExpand}
+                onExpand={() => setExpanded((v) => !v)}
+                onClose={closeAll}
+                onPaneClose={paneClose}
+              />
+            ) : x.record ? (
+              <RecordViewBody
+                key={x.id}
+                tab={x}
+                view={x.record}
+                composerKey={canvas.composerKey}
+                sheet={sheet}
+                expanded={expanded}
+                canExpand={canExpand}
+                onExpand={() => setExpanded((v) => !v)}
+                onClose={closeAll}
+                onPaneClose={paneClose}
+              />
+            ) : null;
+          }}
+        />
       ) : null}
       {hasBrowser ? (
         <BrowserPanel
