@@ -896,7 +896,8 @@ fn validate_views(views: &[ScreenView], nav: Option<&ScreenNavigation>) -> Resul
                             || texts.len() > MAX_I18N_LOCALES
                             || !texts.iter().all(|(locale, text)| {
                                 valid_locale_tag(locale)
-                                    && !text.trim().is_empty()
+                                    // Blank = only Unicode White_Space or U+FEFF (`trim` keeps U+FEFF).
+                                    && !text.chars().all(|c| c.is_whitespace() || c == '\u{feff}')
                                     && text.encode_utf16().count() <= MAX_VIEW_OPTION_LABEL
                                     && !has_disallowed_ctrl(text)
                             })
@@ -2559,6 +2560,15 @@ mod tests {
             validate_map(&views_manifest(&format!("[{v}]")), &bodies)
         };
         assert!(long(40).is_ok() && long(41).is_err());
+        // Blank means only White_Space or U+FEFF (`trim` keeps U+FEFF); FEFF inside text is fine.
+        let text = |t: &str| {
+            let v = format!(
+                r#"{{"id":"v","label":{{"en":"V"}},"section":"reports","params":{{"a":{{"type":"enum","values":["x"],"labels":{{"x":{{"en":"{t}"}}}}}}}}}}"#
+            );
+            validate_map(&views_manifest(&format!("[{v}]")), &bodies)
+        };
+        assert!(text("\u{feff}").is_err() && text("\u{a0}\u{feff}\u{2003}").is_err());
+        assert!(text("a\u{feff}b").is_ok());
     }
 
     #[test]

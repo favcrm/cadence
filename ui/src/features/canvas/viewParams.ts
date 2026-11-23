@@ -5,7 +5,6 @@
  * reads better as one and that a raw value reads better humanized.
  */
 import type { RouteParams } from "../workspace-apps/screen/routeParams";
-import type { DeclaredView } from "../workspace-apps/workspaceApps";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -35,22 +34,30 @@ function humanize(value: string): string {
 export type OptionLabel = (param: string, value: string) => string | undefined;
 
 const own = (obj: object, key: string) => Object.prototype.hasOwnProperty.call(obj, key);
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 
 /** The exact locale, then its language, then `en`; undefined when the declaration has none of them. */
-function localeText(texts: Record<string, string>, locale: string): string | undefined {
+function localeText(texts: Record<string, unknown>, locale: string): string | undefined {
   const lower = new Map(Object.entries(texts).map(([k, v]) => [k.toLowerCase(), v]));
   const tag = locale.toLowerCase();
-  return lower.get(tag) ?? lower.get(tag.split("-")[0]) ?? lower.get("en");
+  const text = lower.get(tag) ?? lower.get(tag.split("-")[0]) ?? lower.get("en");
+  return typeof text === "string" && text !== "" ? text : undefined;
 }
 
-/** The declared labels of one view's enum params for a locale; undefined when the declaration has no such view. */
-export function declaredOptionLabel(views: readonly DeclaredView[] | null | undefined, viewId: string | undefined, locale: string): OptionLabel | undefined {
-  const params = viewId === undefined ? undefined : views?.find((v) => v.id === viewId)?.params;
+/**
+ * The declared labels of one view's enum params for a locale; undefined when the declaration has no such view.
+ * The installation read is outside input: any malformed shape reads as no label, never an error.
+ */
+export function declaredOptionLabel(views: unknown, viewId: string | undefined, locale: string): OptionLabel | undefined {
+  if (viewId === undefined || !Array.isArray(views)) return undefined;
+  const view = views.find((v) => isObject(v) && v.id === viewId);
+  const params = isObject(view) && isObject(view.params) ? view.params : undefined;
   if (!params) return undefined;
   return (param, value) => {
-    const labels = own(params, param) ? params[param]?.labels : undefined;
+    const decl = own(params, param) ? params[param] : undefined;
+    const labels = isObject(decl) && isObject(decl.labels) ? decl.labels : undefined;
     const texts = labels && own(labels, value) ? labels[value] : undefined;
-    return texts ? localeText(texts, locale) : undefined;
+    return isObject(texts) ? localeText(texts, locale) : undefined;
   };
 }
 

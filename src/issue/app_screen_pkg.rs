@@ -151,22 +151,35 @@ fn single_screen_package(files: &BTreeMap<String, String>, app: &str) -> Option<
     extract(files, tag).ok().filter(|pkg| pkg.app == app)
 }
 
+/// The declared `navigation` and (CAD-2710) `views` of the bundle's single
+/// valid screen package whose `app` matches `app`, as JSON; `Value::Null` for
+/// each the package does not declare or when there is no such package.
+pub fn single_screen_navigation_and_views(
+    files: &BTreeMap<String, String>,
+    app: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let json = |v: Option<serde_json::Result<serde_json::Value>>| {
+        v.and_then(std::result::Result::ok)
+            .unwrap_or(serde_json::Value::Null)
+    };
+    match single_screen_package(files, app) {
+        Some(pkg) => (
+            json(pkg.navigation.map(serde_json::to_value)),
+            json(pkg.views.map(serde_json::to_value)),
+        ),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    }
+}
+
 /// Extract declared `navigation` when the bundle carries a single valid screen
 /// package whose `app` matches `app`. Returns `Value::Null` otherwise.
 pub fn single_screen_navigation(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
-    single_screen_package(files, app)
-        .and_then(|pkg| pkg.navigation)
-        .and_then(|nav| serde_json::to_value(nav).ok())
-        .unwrap_or(serde_json::Value::Null)
+    single_screen_navigation_and_views(files, app).0
 }
 
-/// CAD-2710: the declared `views` of that same single screen package, so the
-/// board can show an enum value's declared label. `Value::Null` when none.
+/// CAD-2710: the declared `views` of that same single screen package.
 pub fn single_screen_views(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
-    single_screen_package(files, app)
-        .and_then(|pkg| pkg.views)
-        .and_then(|views| serde_json::to_value(views).ok())
-        .unwrap_or(serde_json::Value::Null)
+    single_screen_navigation_and_views(files, app).1
 }
 
 /// CAD-1827: how one installed bundle relates to the campaign-work contract.

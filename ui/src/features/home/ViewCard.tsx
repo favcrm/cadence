@@ -6,7 +6,7 @@ import { appViewId, sameRoute } from "../canvas/appView";
 import { effective, MAX_PANES } from "../canvas/canvasLayout";
 import { openAppView, useCanvas } from "../canvas/canvasStore";
 import { declaredOptionLabel, optionsLine } from "../canvas/viewParams";
-import { workspaceApps, type DeclaredView } from "../workspace-apps/workspaceApps";
+import { workspaceApps } from "../workspace-apps/workspaceApps";
 import { HOME_VIEW_SCOPE, parseViewRef, plainText, viewCardAppView, viewHere, type ViewScope } from "./chatCards";
 import type { ThreadEntry } from "./thread";
 
@@ -27,7 +27,7 @@ import type { ThreadEntry } from "./thread";
 /** Which install and context the surrounding conversation belongs to (the app pane sets it). */
 export const ViewScopeContext = createContext<ViewScope>(HOME_VIEW_SCOPE);
 
-type Probe = { status: "checking" | "ok" | "denied" | "missing"; sections: string[] | null; views: DeclaredView[] | null };
+type Probe = { status: "checking" | "ok" | "denied" | "missing"; sections: string[] | null; views: unknown };
 
 /** Reads the install once per card: its availability and the sections it declares. */
 function useInstallProbe(installId: string | null): Probe {

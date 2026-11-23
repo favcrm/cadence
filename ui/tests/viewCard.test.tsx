@@ -207,6 +207,22 @@ check(canvasSnapshot().tabs[0].app?.route.params === undefined, "empty params cl
 // CAD-2634: the params line wraps to two lines with the full text in a title; the app line stays one line.
 const cardParamsHtml = render(withParams);
 check(cardParamsHtml.includes("viewcard-params") && /data-view-params="true" title="[^"]+"/.test(cardParamsHtml), "the card's params line carries its full text as a title");
+// CAD-2710: two views can share a section and record; the open tab follows the view the card names.
+resetCanvas("c", "k", "app");
+const viewRef = (view: string, label: string, params: Record<string, string>) => viewCardAppView({ ...model!, view, viewLabel: label, params })!;
+openAppView(viewRef("pnl", "P&L", { compare: "prior_year" }));
+equal([canvasSnapshot().tabs[0].app?.viewId, canvasSnapshot().tabs[0].app?.viewLabel], ["pnl", "P&L"], "a card's view id and label reach the tab");
+openAppView(viewRef("balance", "Balance", { compare: "prior_year" }));
+equal([canvasSnapshot().tabs.length, canvasSnapshot().tabs[0].app?.viewId, canvasSnapshot().tabs[0].app?.viewLabel], [1, "balance", "Balance"], "the same tab, another view, same route: its labels follow");
+openAppView(viewCardAppView({ ...model!, params: { compare: "prior_year" } })!);
+equal([canvasSnapshot().tabs[0].app?.viewId, canvasSnapshot().tabs[0].app?.viewLabel], [undefined, undefined], "a card with no view clears them");
+openAppView(viewRef("pnl", "P&L", {}));
+patchAppViewRoute(canvasSnapshot().tabs[0].id, { params: { compare: "none" } });
+equal(canvasSnapshot().tabs[0].app?.viewId, "pnl", "a params-only change stays in the view");
+patchAppViewRoute(canvasSnapshot().tabs[0].id, { record_id: "other" });
+equal([canvasSnapshot().tabs[0].app?.viewId, canvasSnapshot().tabs[0].app?.viewLabel], [undefined, undefined], "moving to another record leaves the declared view");
+resetCanvas("c", "k", "app");
+
 const readCss = (path: string): string => require("fs").readFileSync(`${process.cwd()}/src/${path}`, "utf8");
 const rule = (css: string, selector: string): string => css.slice(css.indexOf(selector)).split("}")[0];
 check(rule(readCss("styles.css"), ".viewcard-params {").includes("-webkit-line-clamp: 2"), "card params clamp to two lines");

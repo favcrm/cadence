@@ -1,5 +1,5 @@
 {
-  "description": "AOS-714 / CAD-2710: shared valid and invalid cases for an enum view param's optional `labels`. Both readers wrap each `view` as the only entry of a screen's `views`, with navigation sections [customers, reports], and read it: Cadence cadence-core app_screen_decl validate_map, hosted apps/api readScreenViews. Keep this file byte-identical in both repos. Cases that need raw JSON (a repeated key) cannot be written here and are covered by the Cadence tests only.",
+  "description": "AOS-714 / CAD-2710: shared valid and invalid cases for an enum view param's optional `labels`. Both readers wrap each `view` as the only entry of a screen's `views`, with navigation sections [customers, reports], and read it: Cadence cadence-core app_screen_decl validate_map, hosted apps/api readScreenViews. Keep this file byte-identical in both repos. Option-label text is refused when empty after removing Unicode White_Space characters and U+FEFF, or when it holds a control character, U+2028 or U+2029. Cases that need raw JSON (a repeated key) cannot be written here and are covered by the Cadence tests only.",
   "version": "view-option-labels.v1",
   "sections": ["customers", "reports"],
   "valid": [
@@ -236,6 +236,90 @@
             "labels": {
               "x": {
                 "en": "vs prior year (%)"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "enum value named __proto__ keeps its labels",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["__proto__", "y"],
+            "labels": {
+              "__proto__": {
+                "en": "Proto"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "param named __proto__ with labels",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "__proto__": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "x": {
+                "en": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "U+FEFF inside real text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "x": {
+                "en": "a\ufeffb"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "non-blank text with surrounding spaces",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "x": {
+                "en": " X "
               }
             }
           }
@@ -756,6 +840,132 @@
               }
             },
             "extra": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "U+FEFF only",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "x": {
+                "en": "\ufeff"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "spaces and U+FEFF only",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "x": {
+                "en": " \ufeff "
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "no-break space only",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "x": {
+                "en": "\u00a0"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "ideographic space only",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "x": {
+                "en": "\u3000"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "em space and U+FEFF only",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "x": {
+                "en": "\u2003\ufeff\u2003"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "label key __proto__ is not a declared value",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "labels": {
+              "__proto__": {
+                "en": "P"
+              }
+            }
           }
         }
       }

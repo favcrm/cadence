@@ -220,7 +220,12 @@ const labelRef = (record: string, installId: string) => ref(record, { installId,
 const cardEntry = (installId: string) => asEntry({ seq: 1, role: "agent", kind: "view_ref", text: "Opened", payload: { v: 1, app: "accounting", app_label: "Accounting", install_id: installId, screen_tag: "accounting", section: "reports", record_id: "pnl", title: "Profit and loss", view: "pnl", view_label: "Profit and loss", params: { from: "2026-07-01", to: "2026-09-30", compare: "prior_year", columns: "monthly", basis: "cash" } } })!;
 // A fresh install id per case: the app scope read is cached per install.
 const cardRoot = createRoot(document.body.appendChild(document.createElement("div")));
-for (const [i, [views, line]] of ([[labelled, "1 Jul – 30 Sep 2026 · vs prior year · by month · Cash"], [[{ id: "pnl", params: { compare: {} } }], "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"], [null, "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"]] as const).entries()) {
+for (const [i, [views, line]] of ([[labelled, "1 Jul – 30 Sep 2026 · vs prior year · by month · Cash"], [[{ id: "pnl", params: { compare: {} } }], "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"], [null, "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"],
+  // A malformed installation read never blanks the page (QA): bad entries are skipped, bad shapes read as no label.
+  [[null, 7, "x", { id: "pnl", params: { compare: { labels: { prior_year: { en: "vs prior year" } } }, columns: null, basis: { labels: { cash: "Cash!" } } } }], "1 Jul – 30 Sep 2026 · vs prior year · Monthly · Cash"],
+  [{ id: "pnl", params: {} }, "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"],
+  [[{ id: "pnl", params: null }], "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"],
+  [[{ id: "pnl", params: { compare: { labels: null }, columns: { labels: { monthly: null } }, basis: { labels: { cash: { en: 5 } } } } }], "1 Jul – 30 Sep 2026 · Prior year · Monthly · Cash"]] as const).entries()) {
   const installId = `inst_lbl${i}`;
   serve(views);
   canvasStore.resetCanvas("c1", "k", "home");
