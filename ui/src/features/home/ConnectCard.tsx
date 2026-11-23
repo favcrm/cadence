@@ -1,5 +1,5 @@
 import { useContext, useState } from "react";
-import { api } from "../../lib/api";
+import { ApiError, api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { usingPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
@@ -208,24 +208,52 @@ function CustomMcpSetupCard({ entry, setup, density }: {
   const [drawer, setDrawer] = useState(false);
   const [busy, setBusy] = useState(false);
   const [resumed, setResumed] = useState(false);
+  const [cleared, setCleared] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const url = new URL(window.location.href);
-  const callback = url.searchParams.get("mcp_setup") === String(entry.seq)
+  const callback = !cleared && url.searchParams.get("mcp_setup") === String(entry.seq)
     ? customMcpReturn(url.search)
     : null;
-  const connId = callback?.connectionId;
   const key = `cadence:mcp-setup:${conversation}:${entry.seq}`;
-  let matches = false;
-  if (conversation && connId) {
+  let connId: string | null = null;
+  if (!cleared && conversation) {
     try {
-      matches = window.sessionStorage.getItem(key) === connId;
+      connId = window.sessionStorage.getItem(key);
     } catch {
       // No verified return without the local enrollment receipt.
     }
   }
-  const returned = matches ? callback : null;
+  const returned = connId && callback?.connectionId === connId ? callback : null;
   const ready = returned?.outcome === "connected" && !!conversation;
   const settings = `${routePath({ screen: "settings", section: "connections" })}?mcp_focus=${encodeURIComponent(connId ?? setup.label)}`;
+  const clearReturn = () => {
+    const clean = new URL(window.location.href);
+    clean.search = withoutConnectParams(clean.search);
+    clean.searchParams.delete("mcp_setup");
+    navigate(`${clean.pathname}${clean.search}${clean.hash}`, { replace: true });
+    setCleared(true);
+    window.sessionStorage.removeItem(key);
+  };
+
+  const retryOAuth = async () => {
+    if (busy || !connId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const started = await api.customMcpOAuthStart(connId, { return_to: url.href });
+      const authUrl = customMcpAuthorizationUrl(started);
+      if (started.connection_id !== connId || authUrl === null) {
+        setError("Server did not return a valid https:// authorization URL.");
+        return;
+      }
+      window.location.assign(authUrl);
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.status === 404) clearReturn();
+      setError(customMcpErrorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const continueReply = async () => {
     if (busy || !ready || !conversation || !connId) return;
@@ -235,7 +263,12 @@ function CustomMcpSetupCard({ entry, setup, density }: {
       await usingPrivateOperation(undefined, async (operation) => {
         const { connections } = await api.customMcpList(true, operation);
         const row = connections.find((item) => item.id === connId);
-        if (!row || row.status !== "active" || row.name !== setup.label ||
+        if (!row) {
+          clearReturn();
+          setError("This connection is no longer available. Start a new connection.");
+          return;
+        }
+        if (row.status !== "active" || row.name !== setup.label ||
             row.endpoint_host !== new URL(setup.endpointUrl).host ||
             (row.auth_kind !== "oauth" && row.auth_kind !== "oauth_static") ||
             (setup.requiredScopes && (row.oauth_scopes.length !== setup.requiredScopes.length ||
@@ -255,12 +288,8 @@ function CustomMcpSetupCard({ entry, setup, density }: {
           setError(sent.error);
           return;
         }
-        const clean = new URL(window.location.href);
-        clean.search = withoutConnectParams(clean.search);
-        clean.searchParams.delete("mcp_setup");
-        navigate(`${clean.pathname}${clean.search}${clean.hash}`, { replace: true });
+        clearReturn();
         setResumed(true);
-        window.sessionStorage.removeItem(key);
       });
     } catch (e: unknown) {
       setError(customMcpErrorText(e));
@@ -295,6 +324,10 @@ function CustomMcpSetupCard({ entry, setup, density }: {
               {t("Manage in Connections")}
             </a>
           </div>
+        ) : connId ? (
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void retryOAuth()}>
+            {busy ? t("Opening sign-in…") : t("Retry OAuth sign-in")}
+          </button>
         ) : (
           <button type="button" className="btn btn-primary" disabled={!conversation} onClick={openSetup}>
             {t("Connect {label}").replace("{label}", () => setup.label)}
@@ -313,7 +346,10 @@ function CustomMcpSetupCard({ entry, setup, density }: {
           setup={{ ...setup, returnTo: url.href }}
           onClose={() => setDrawer(false)}
           onConnected={() => setDrawer(false)}
-          onOAuthStarted={(id) => window.sessionStorage.setItem(key, id)}
+          onOAuthStarted={(id) => {
+            window.sessionStorage.setItem(key, id);
+            setCleared(false);
+          }}
         />
       )}
     </>

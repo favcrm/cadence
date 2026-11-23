@@ -135,6 +135,9 @@ export function CustomMcpConnectDrawer({
       .split(/[\s,]+/)
       .map((s) => s.trim())
       .filter(Boolean);
+    const requiredScopes = setup
+      ? setup.requiredScopes ?? (authKind === "oauth_static" && scopes.length ? scopes : undefined)
+      : undefined;
     const returnTo = setup?.returnTo ?? (
       typeof window !== "undefined"
         ? `${window.location.origin}/settings/connections`
@@ -147,7 +150,7 @@ export function CustomMcpConnectDrawer({
         endpoint_url: endpointUrl.trim(),
         auth_kind: setup && authKind === "auto" ? "oauth" : authKind,
         visibility,
-        ...(setup?.requiredScopes ? { required_scopes: setup.requiredScopes } : {}),
+        ...(requiredScopes ? { required_scopes: requiredScopes } : {}),
         ...(authKind === "bearer" ? { bearer_token: bearerToken.trim() } : {}),
         ...(authKind === "header" && parsedHeaders ? { custom_headers: parsedHeaders } : {}),
         ...(authKind === "oauth_static"
@@ -167,11 +170,11 @@ export function CustomMcpConnectDrawer({
           setError("Server did not return a valid https:// authorization URL.");
           return;
         }
-        if (setup?.requiredScopes) {
+        if (requiredScopes) {
           const requested = new URL(safeUrl).searchParams.getAll("scope");
           const scopes = requested[0]?.split(" ") ?? [];
-          if (requested.length !== 1 || scopes.length !== setup.requiredScopes.length ||
-              setup.requiredScopes.some((scope) => !scopes.includes(scope))) {
+          if (requested.length !== 1 || scopes.length !== requiredScopes.length ||
+              requiredScopes.some((scope) => !scopes.includes(scope))) {
             setError("The provider did not request exactly the required OAuth scopes.");
             return;
           }
