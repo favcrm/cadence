@@ -2450,6 +2450,7 @@ Object.assign(zhTW, {
   "More actions": "更多操作",
   "Collapse canvas": "收合畫布",
   "This screen could not be opened.": "無法開啟此畫面。",
+  "Only workspace owners can open {app}.": "只有工作區擁有者才能開啟 {app}。",
   "Retry": "重試",
   // CAD-2475: the canvas view card.
   "Canvas view card": "畫布檢視卡片",

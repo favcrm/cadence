@@ -171,6 +171,19 @@ async function main(): Promise<void> {
       assert.equal((await fx.services.call("records.list", {})).ok, true, "subsequent read succeeds after owner_required 403");
     }
 
+    // CAD-2691: an owner-only READ refusal is returned to the app; the mount stays.
+    {
+      let reads = 0;
+      const fx = makeFixture(() => reads++ === 0
+        ? { status: 403, json: { code: "owner_required", error: "Only an owner may read this table's records." } }
+        : { status: 200, json: { rows: [] } });
+      const res = await fx.services.call("records.list", {});
+      assert.equal(res.ok, false, "owner_required read returns refusal");
+      if (!res.ok) assert.equal(res.refusal.code, "owner_required");
+      assert.equal(fx.refusedCount(), 0, "owner_required read does not call host.refused()");
+      assert.equal((await fx.services.call("records.list", {})).ok, true, "mount still serves later reads");
+    }
+
     // 2. Explicit native read-only 403 on non-read RECORD_CALL_VERBS (including Works, Sends, WhatsApp) keeps mount active.
     for (const verb of ["records.update", "works.create", "sends.prepare", "whatsapp.reply.prepare"] as const satisfies readonly RecordCallVerb[]) {
       const fx = makeFixture((_path, body) => {

@@ -145,8 +145,12 @@ function isNonReadOperation(operation?: RecordCallVerb | RecordSlotVerb): boolea
 
 function classifyNonFatalForbidden(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal | null {
   if (!(error instanceof ApiError) || error.status !== 403) return null;
+  // CAD-2691: an owner-only refusal is the app's to present, on a read as on a write; the mount stays.
+  if (error.code === "owner_required" && !error.check) {
+    return { code: "owner_required", text: isNonReadOperation(operation) ? "Only a workspace owner can perform this action." : "Only a workspace owner can view this." };
+  }
   if (!isNonReadOperation(operation)) return null;
-  if ((error.code === "owner_required" && !error.check) || (!error.code && (error.check === "member_role" || error.check === "approver_not_allowed"))) {
+  if (!error.code && (error.check === "member_role" || error.check === "approver_not_allowed")) {
     return { code: "owner_required", text: "Only a workspace owner can perform this action." };
   }
   if ((!error.code && error.check === "read_only") || (error.code === "forbidden" && !error.check && error.message.trim().toLowerCase() === READ_ONLY_CALL_MESSAGE)) {

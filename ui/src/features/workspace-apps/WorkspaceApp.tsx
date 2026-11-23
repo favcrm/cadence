@@ -133,8 +133,9 @@ function AppVersion({ version }: { version?: string }) {
  * remount of the same projection); `onReinstall` exists only when the app has
  * a recorded install source and this viewer may write.
  */
-function ScreenFailurePane({ failure, onRetry, onReinstall, busy }: {
+function ScreenFailurePane({ failure, appName, onRetry, onReinstall, busy }: {
   failure: ScreenPaneState;
+  appName: string;
   onRetry: () => void;
   onReinstall?: () => void;
   busy?: boolean;
@@ -143,7 +144,7 @@ function ScreenFailurePane({ failure, onRetry, onReinstall, busy }: {
   const pane = screenFailurePane(failure, onReinstall !== undefined);
   const title = failure.kind === "needs_host_update"
     ? t(pane.title).replace("{required}", () => failure.required).replace("{current}", () => failure.current)
-    : t(pane.title);
+    : t(pane.title).replace("{app}", () => appName);
   return (
     <section className="card px-4 py-5" aria-label={t("Installed app screen")} data-screen-pane={failure.kind} role="status">
       <p className="wa-muted">{title}</p>
@@ -1222,7 +1223,7 @@ export default function WorkspaceApp({
     completeRequest(requestKey);
   });
   const renderScreenFailure = (failure: ScreenPaneState, retry: () => void) => (
-    <ScreenFailurePane failure={failure} onRetry={retry} busy={busy}
+    <ScreenFailurePane failure={failure} appName={data?.installation.title || data?.installation.name || t("App")} onRetry={retry} busy={busy}
       onReinstall={data && reinstallSource ? reinstall(data.installation, reinstallSource) : undefined} />
   );
   const screen = (fallback: React.ReactNode) => projection

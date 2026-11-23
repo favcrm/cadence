@@ -96,7 +96,11 @@ export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpa
   const openLabel = t("Open in {app}").replace("{app}", appName);
   const denied = <p className="cv-appview-note" role="alert">{t("No access")}</p>;
   const failure = (state: ScreenPaneState, retry: () => void) =>
-    state.kind === "refused" && isNoAccess(state.status) ? <FrameDenied onDenied={() => setFrameDenied(true)}>{denied}</FrameDenied> : (
+    state.kind === "refused" && state.code === "owner_required" ? (
+      <FrameDenied onDenied={() => setFrameDenied(true)}>
+        <p className="cv-appview-note" role="alert">{t("Only workspace owners can open {app}.").replace("{app}", () => appName)}</p>
+      </FrameDenied>
+    ) : state.kind === "refused" && isNoAccess(state.status) ? <FrameDenied onDenied={() => setFrameDenied(true)}>{denied}</FrameDenied> : (
       <div className="cv-appview-note" role="alert">
         <p>{t("This screen could not be opened.")}</p>
         <button type="button" className="btn btn-ghost" onClick={retry}>{t("Retry")}</button>
