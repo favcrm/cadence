@@ -44,11 +44,22 @@ pub(super) struct ScreenServiceProof {
     confirmed: Option<(Value, Value)>,
     csv_confirmation: Option<(String, String)>,
     command_args: Option<Value>,
-    /// CAD-2379: the project-policy spelling of the live session's person
-    /// (`operator` for an operator), and whether that is a member. Derived
-    /// from the live session, never from a frame field.
-    policy_actor: String,
-    member: bool,
+    /// CAD-2379, CAD-2717: who the live session is, derived from the live
+    /// session, never from a frame field.
+    actor: ScreenActor,
+}
+
+/// CAD-2717: the live session's person, decided once where the proof is
+/// built. `Operator` is a positive fact (a native operator origin, or a
+/// public session whose board user is an operator); operator-only
+/// operations admit it and nothing else.
+#[derive(Clone)]
+enum ScreenActor {
+    Operator,
+    /// A board member; carries its project-policy spelling (CAD-2379).
+    Member {
+        policy_actor: String,
+    },
 }
 
 impl ScreenServiceProof {
@@ -62,10 +73,13 @@ impl ScreenServiceProof {
             .ok_or_else(|| screen_access_denied("missing screen context"))
     }
     pub(super) fn policy_actor(&self) -> &str {
-        &self.policy_actor
+        match &self.actor {
+            ScreenActor::Operator => "operator",
+            ScreenActor::Member { policy_actor } => policy_actor,
+        }
     }
-    pub(super) fn is_member(&self) -> bool {
-        self.member
+    pub(super) fn is_operator(&self) -> bool {
+        matches!(self.actor, ScreenActor::Operator)
     }
     pub(super) fn csv_confirmation(&self) -> Option<(&str, &str)> {
         self.csv_confirmation
@@ -714,11 +728,20 @@ impl Shared {
         let (session, view) = self
             .tool_session(token, key, origin)
             .ok_or_else(|| screen_access_denied("screen service requires live operator session"))?;
-        let member = origin == Origin::Public
-            && !view
-                .user
-                .as_ref()
-                .is_some_and(crate::operator_auth::BoardUser::is_operator);
+        // CAD-2717: classify every origin explicitly, so a new kind of
+        // session must be placed here before it can be admitted at all.
+        let actor = match origin {
+            Origin::Loopback | Origin::Tailnet => ScreenActor::Operator,
+            Origin::Public => match view.user.as_ref() {
+                Some(user) if user.is_operator() => ScreenActor::Operator,
+                Some(user) => ScreenActor::Member {
+                    policy_actor: crate::project_policy::policy_user_actor(&user.sub),
+                },
+                None => ScreenActor::Member {
+                    policy_actor: "service/unresolved-member".to_string(),
+                },
+            },
+        };
         let context = self
             .tool_context_proven(action_token, &session)
             .map_err(|error| {
@@ -727,7 +750,7 @@ impl Shared {
         // CAD-1537: a member uses only a read-only mount, and a read-only
         // mount admits only the read allowlist — every write, SLOT
         // (prepare and confirm) and host command is refused here.
-        if member && !context.read_only {
+        if !matches!(actor, ScreenActor::Operator) && !context.read_only {
             return Err(screen_access_denied(
                 "screen service requires operator-role public session",
             ));
@@ -750,15 +773,7 @@ impl Shared {
             confirmed: None,
             csv_confirmation: None,
             command_args: None,
-            policy_actor: if member {
-                view.user
-                    .as_ref()
-                    .map(|user| crate::project_policy::policy_user_actor(&user.sub))
-                    .unwrap_or_else(|| "service/unresolved-member".to_string())
-            } else {
-                "operator".to_string()
-            },
-            member,
+            actor,
         })
     }
 
@@ -1057,9 +1072,9 @@ impl Shared {
         if matches!(proof.operation, WorksQuery | WorksGet) {
             // CAD-2683: the Works reads are in the read-only allowlist for the
             // operator's canvas mount. Members also hold read-only mounts and
-            // the read runs as the operator, so a member is refused here: every
-            // Works operation is for a verified operator session.
-            if proof.is_member() {
+            // the read runs as the operator, so only a verified operator
+            // session is admitted (CAD-2717).
+            if !proof.is_operator() {
                 return Err(screen_access_denied(
                     "screen service requires operator-role public session",
                 ));
@@ -1068,8 +1083,9 @@ impl Shared {
         if proof.operation == RoutinesList {
             // CAD-2402: routines are an operator read. A member session is
             // already refused at the proof (members hold read-only mounts,
-            // which admit only the read allowlist); this is the second wall.
-            if proof.is_member() {
+            // which admit only the read allowlist); this is the second wall,
+            // and it admits only a verified operator session (CAD-2717).
+            if !proof.is_operator() {
                 return Err(screen_access_denied(
                     "screen service requires operator-role public session",
                 ));
