@@ -44,6 +44,11 @@ import DocumentsScreen from "./features/documents/DocumentsScreen";
 import { documentsViewer } from "./features/documents/documentsAccess";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
+import {
+  formatCredits,
+  parseHostedBilling,
+  type HostedBillingSnapshot,
+} from "./features/settings/accountDisplay";
 import Connections from "./features/settings/Connections";
 import CredentialEntry from "./features/connections/CredentialEntry";
 import CredentialAuthorize from "./features/connections/CredentialAuthorize";
@@ -436,24 +441,49 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // hostname, user or project name. One nonblocking read per page load;
   // a failure or missing name leaves the fallback.
   const [orgName, setOrgName] = useState("Cadence");
+  const [billingSummary, setBillingSummary] = useState<HostedBillingSnapshot | null>(null);
   useEffect(() => {
     if (meta === null) return;
     if (meta.platform_account_configured !== true) {
       setOrgName("Cadence");
+      setBillingSummary(null);
       return;
     }
     const abort = new AbortController();
     void withPrivateOperation(async (operation) => {
+      if (meta.hosted === true) {
+        const response = await operation.fetch("/api/account/billing", { headers: sessionHeaders() });
+        const data: unknown = response.ok ? await response.json().catch(() => null) : null;
+        operation.assertCurrent();
+        const snapshot = parseHostedBilling(data);
+        if (!snapshot) {
+          setOrgName("Cadence");
+          setBillingSummary(null);
+          return;
+        }
+        setBillingSummary(snapshot);
+        return;
+      }
       const response = await operation.fetch("/api/platform-account", { headers: sessionHeaders() });
       const data: unknown = response.ok ? await response.json() : null;
       operation.assertCurrent();
       const account = data && typeof data === "object" && "account" in data ? data.account : null;
       const company = account && typeof account === "object" && "company" in account ? account.company : null;
       const name = company && typeof company === "object" && "name" in company && typeof company.name === "string" ? company.name.trim() : "";
+      setBillingSummary(null);
       setOrgName(name || "Cadence");
     }, abort.signal).catch(() => undefined);
     return () => abort.abort();
-  }, [meta?.platform_account_configured, meta === null]);
+  }, [meta?.platform_account_configured, meta?.hosted, meta?.session?.id, meta === null]);
+  const headerOrgName =
+    meta?.hosted === true && billingSummary
+      ? (locale === "zh-TW" && billingSummary.workspace.nameZh?.trim()
+          ? billingSummary.workspace.nameZh.trim()
+          : "") ||
+        billingSummary.account?.company.name.trim() ||
+        billingSummary.workspace.name.trim() ||
+        "Cadence"
+      : orgName;
 
   useEffect(() => {
     persistBrowserProjectView(view);
@@ -1122,6 +1152,44 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     />
   );
 
+  const billingHref = meta?.platform_account_configured === true
+    ? hrefFor({ screen: "settings", section: "account" })
+    : undefined;
+  const projectsLoaded = projectsState.status === "ok" || projectsState.status === "empty";
+  const agentsLoaded = agentsState.status === "ok" || agentsState.status === "empty";
+  const nonMasterAgents = (agents?.agents ?? []).filter((agent) => agent.alias !== "master");
+  const workspaceEmpty =
+    projectsLoaded &&
+    projects.length === 0 &&
+    agentsLoaded &&
+    nonMasterAgents.length === 0 &&
+    (agents?.profiles?.length ?? 0) === 0;
+  const sidebarBillingPill =
+    meta?.hosted === true &&
+    meta?.signed_in === true &&
+    billingHref &&
+    billingSummary?.canManage &&
+    billingSummary.account ? (
+      <Link
+        href={billingHref}
+        className="sidebar-billing-pill"
+        data-low={(billingSummary.account.balance.low || billingSummary.account.balance.zero) || undefined}
+      >
+        <span className="sidebar-billing-pill-plan">
+          {billingSummary.account.plan?.status === "active" || billingSummary.account.plan?.status === "past_due"
+            ? billingSummary.account.plan.name
+            : billingSummary.account.trial?.status === "active"
+              ? t("Free trial")
+              : t("Billing")}
+        </span>
+        <span className="sidebar-billing-pill-credits">
+          {formatCredits(billingSummary.account.balance.amount, locale === "zh-TW" ? "zh-Hant-HK" : "en-US") ??
+            billingSummary.account.balance.amount}{" "}
+          {t("credits")}
+        </span>
+      </Link>
+    ) : undefined;
+
   return (
     <WriteGate.Provider value={meta === null
       ? metaUnavailable
@@ -1156,6 +1224,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
         hosted={meta?.hosted === true}
         signedIn={meta?.signed_in ?? null}
+        billingPill={sidebarBillingPill}
         accountOpen={accountOpen}
         account={<AccountMenu
           onOpenChange={setAccountOpen}
@@ -1164,6 +1233,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           trigger="row"
           placement="above-start"
           settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+          billingHref={billingHref}
           securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
           footer={versionLine}
         />}
@@ -1197,7 +1267,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               <>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}
-            <span className="header-org hidden truncate font-medium text-ink-100 sm:inline" title={orgName}>{orgName}</span>
+            <span className="header-org hidden truncate font-medium text-ink-100 sm:inline" title={headerOrgName}>{headerOrgName}</span>
             <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
             {route.screen === "projects" && route.slug ? (
               <>
@@ -1239,6 +1309,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               trigger="avatar"
               placement="below-end"
               settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+              billingHref={billingHref}
               securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
               footer={versionLine}
             /></div> : <div className="header-local-preferences contents"><LocalLanguage /><ThemeToggle /></div>}
@@ -1301,6 +1372,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               trigger="row"
               placement="above-start"
               settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+              billingHref={billingHref}
               securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
               footer={versionLine}
             /></div>}
@@ -1345,6 +1417,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             decisions={decisionsOn}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
             resolveAppPath={resolveAppPath}
+            workspaceEmpty={workspaceEmpty}
             setupNotice={
               <SetupNudge
                 readOnly={meta ? boardReadOnly : null}
@@ -1738,7 +1811,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 ? { hosted: documentsHosted, viewer, viewerSub }
                 : undefined
             } />}
-            {route.section === "account" && <PlatformAccount />}
+            {route.section === "account" && (
+              <PlatformAccount
+                hosted={meta?.hosted === true}
+                onBillingSnapshot={setBillingSummary}
+              />
+            )}
             {route.section === "update" && (meta?.settings_sections
               ? <HostedStatus meta={meta} canReadConnections={viewer.operator === true} partialUpdates={partialUpdates} />
               : <Update viewer={viewer} health={health} />)}

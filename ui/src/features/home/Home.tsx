@@ -115,6 +115,12 @@ const EXAMPLES = [
   "Summarise what changed on the tracker since yesterday.",
 ];
 
+const DAY0_EXAMPLES = [
+  "Help me set up my first project and break down the initial milestones.",
+  "Draft a weekly operating plan for my team and turn the key tasks into tickets.",
+  "What can you help me organize, automate, and track in this workspace?",
+];
+
 
 /**
  * The in-flight turn line (CAD-551): the pulse and elapsed clock while a
@@ -541,15 +547,24 @@ function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean 
   );
 }
 
-function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabled: boolean }) {
+function Examples({
+  onPick,
+  disabled,
+  workspaceEmpty = false,
+}: {
+  onPick: (text: string) => void;
+  disabled: boolean;
+  workspaceEmpty?: boolean;
+}) {
   const t = useTranslate();
   const actor = useAssistantActor();
+  const list = workspaceEmpty ? DAY0_EXAMPLES : EXAMPLES;
   return (
     <div className="card px-4 py-4" data-empty="thread">
       <h2 className="text-cardtitle font-semibold text-ink-100">{`${t("Ask")} ${displayName(actor.read, actor.scope, t)}`}</h2>
       <p className="text-secondary text-ink-400 mt-1">{t("No conversation yet. Try one of these:")}</p>
       <div className="mt-3 grid gap-2">
-        {EXAMPLES.map((ex) => (
+        {list.map((ex) => (
           <button
             key={ex}
             disabled={disabled}
@@ -780,6 +795,7 @@ export default function Home({
   credentialRequestsEnabled = true,
   templateReviewEnabled = false,
   templateReviewCanApprove = false,
+  workspaceEmpty = false,
 }: {
   readOnly: boolean;
   privateChat?: boolean;
@@ -819,6 +835,8 @@ export default function Home({
    *  panel below the Assistant heading so the Needs-you rail beside it
    *  keeps the workspace's top edge. */
   setupNotice?: ReactNode;
+  /** True when the workspace has zero projects, agents, and profiles yet. */
+  workspaceEmpty?: boolean;
 }) {
   // `?chat=assistant` is a UI-mode selector only — it names the signed-in
   // user's OWN private assistant, never another actor. It changes no actor
@@ -885,6 +903,7 @@ export default function Home({
         templateRail={review.rail}
         templateCount={review.pendingCount}
         templateList={review.templateList}
+        workspaceEmpty={workspaceEmpty}
       />
       {review.drawer}
     </>
@@ -909,6 +928,7 @@ function MasterHome({
   templateRail,
   templateCount,
   templateList,
+  workspaceEmpty = false,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
@@ -926,6 +946,7 @@ function MasterHome({
   permissionsHref: string;
   resolveAppPath: (installId: string) => string | null;
   setupNotice?: ReactNode;
+  workspaceEmpty?: boolean;
 }) {
   const t = useTranslate();
   const thread = useQuery(resources.masterThread);
@@ -1763,7 +1784,11 @@ function MasterHome({
             )}
             {thread.data?.cloudWithheld == null && empty && !showNotStarted && bootstrapCardIdentity === null && (
               <div className="chat-empty">
-                <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
+                <Examples
+                  onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))}
+                  disabled={!!block}
+                  workspaceEmpty={workspaceEmpty}
+                />
               </div>
             )}
 
