@@ -36,6 +36,8 @@ import { setQueryParams } from "../workspace-apps/screen/routeParams";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
 import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
+import WhatsAppSettingsPanel from "../workspace-apps/WhatsAppSettingsPanel";
+import { isMarkedWhatsAppSettingsUnsupported } from "../workspace-apps/whatsappSettings";
 import "./app-shell.css";
 
 type ParsedConversationLink = Omit<ConversationLinkRequest, "visit"> & { key: string };
@@ -1161,6 +1163,19 @@ export default function AppShell({
   // The chat descriptor's screen id (D5): the mounted screen's declared
   // section when it declares navigation, else its screen tag.
   const section = effectiveNavigation ? sectionFromSearch(href.split("?")[1] ?? "", effectiveNavigation) : null;
+  const isWabaConnection =
+    installation?.name === "waba" &&
+    (section === "connection" || query.get("waba") === "connection");
+  const wabaInitialMode =
+    query.get("mode") === "official"
+      ? "official"
+      : query.get("mode") === "linked"
+        ? "linked"
+        : null;
+  const [wabaFallbackInstallId, setWabaFallbackInstallId] = useState<string | null>(null);
+  const [wabaScreenRevision, setWabaScreenRevision] = useState(0);
+  const wabaHostFallback =
+    wabaFallbackInstallId === installId || isMarkedWhatsAppSettingsUnsupported(installId);
   const chatScreen = chatScreenFor(installation, verified, section, view);
   const currentHeaderSection = verified && effectiveNavigation && section !== effectiveNavigation.default_section
     ? effectiveNavigation.sections.find((item) => item.id === section) ?? null
@@ -1399,13 +1414,27 @@ export default function AppShell({
                   exampleKey={previewKey}
                   installationKind={installation.name}
                 />
+              ) : isWabaConnection &&
+                !wabaHostFallback &&
+                contextAdoptionReady &&
+                ((viewer.operator === true && !viewer.readOnly) || viewer.screenReader === true) ? (
+                <WhatsAppSettingsPanel
+                  key={`waba-settings:${installId}`}
+                  installId={installId}
+                  initialMode={wabaInitialMode}
+                  inboxHref={section === "connection" || query.get("waba") === "connection" ? appParentHref : null}
+                  onUnsupported={() => setWabaFallbackInstallId(installId)}
+                  onSettingsChanged={() => setWabaScreenRevision((n) => n + 1)}
+                />
               ) : isSocial && children && contextAdoptionReady ? (
                 // Social keeps its legacy native workspace (and its
                 // `?screen=native` back door). Other apps mount the
                 // screen their package declares.
                 children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, restoreDrawer: canDriveScreen && screenViewer ? returnDrawer : null, onRestoreDrawerConsumed: consumeReturnDrawer, onScreenClosed: closeScreenDrawer })
               ) : (
-                <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
+                <InstalledScreenOutlet
+                  key={installation.name === "waba" ? `waba-screen:${wabaScreenRevision}` : undefined}
+                  installation={installation} contexts={contexts} contextId={scope.contextId}
                   onScreenDrawer={canDriveScreen ? onScreenDrawer : undefined} presentation={canDriveScreen && screenDrawer !== null ? "drawer" : "outlet"}
                   drawerTarget={independentOpen ? drawerTarget : null}
                   admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}

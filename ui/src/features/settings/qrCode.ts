@@ -1,7 +1,7 @@
 /**
- * Pure TypeScript ISO/IEC 18004 byte-mode QR encoder for Versions 1–10.
- * Zero external runtime dependencies: prefers EC level M (up to 213 UTF-8
- * bytes) and falls back to EC level L (up to 271 UTF-8 bytes) for longer URIs.
+ * Pure TypeScript ISO/IEC 18004 byte-mode QR encoder for Versions 1–20.
+ * Zero external runtime dependencies: prefers EC level M (up to 666 UTF-8
+ * bytes) and falls back to EC level L (up to 858 UTF-8 bytes) for longer URIs.
  */
 
 export type QrMatrix = {
@@ -16,7 +16,7 @@ type VersionEcSpec = readonly [
   groups: readonly BlockSpec[],
 ];
 
-// ISO/IEC 18004 Table 7 & Table 9 for Versions 1..10 (EC level M & L)
+// ISO/IEC 18004 Table 7 & Table 9 for Versions 1..20 (EC level M & L)
 const SPEC_M: readonly VersionEcSpec[] = [
   [16, 10, [[1, 16]]],
   [28, 16, [[1, 28]]],
@@ -28,6 +28,16 @@ const SPEC_M: readonly VersionEcSpec[] = [
   [154, 22, [[2, 38], [2, 39]]],
   [182, 22, [[3, 36], [2, 37]]],
   [216, 26, [[4, 43], [1, 44]]],
+  [254, 30, [[1, 50], [4, 51]]],
+  [290, 22, [[6, 36], [2, 37]]],
+  [334, 22, [[8, 37], [1, 38]]],
+  [365, 24, [[4, 40], [5, 41]]],
+  [415, 24, [[5, 41], [5, 42]]],
+  [453, 28, [[7, 45], [3, 46]]],
+  [507, 28, [[10, 46], [1, 47]]],
+  [563, 26, [[9, 43], [4, 44]]],
+  [627, 26, [[3, 44], [11, 45]]],
+  [669, 26, [[3, 41], [13, 42]]],
 ];
 
 const SPEC_L: readonly VersionEcSpec[] = [
@@ -41,6 +51,16 @@ const SPEC_L: readonly VersionEcSpec[] = [
   [194, 24, [[2, 97]]],
   [232, 30, [[2, 116]]],
   [274, 18, [[2, 68], [2, 69]]],
+  [324, 20, [[4, 81]]],
+  [370, 24, [[2, 92], [2, 93]]],
+  [428, 26, [[4, 107]]],
+  [461, 30, [[3, 115], [1, 116]]],
+  [523, 22, [[5, 87], [1, 88]]],
+  [589, 24, [[5, 98], [1, 99]]],
+  [647, 28, [[1, 107], [5, 108]]],
+  [721, 30, [[5, 120], [1, 121]]],
+  [795, 28, [[3, 113], [4, 114]]],
+  [861, 28, [[3, 107], [5, 108]]],
 ];
 
 const ALIGNMENT_POSITIONS: readonly (readonly number[])[] = [
@@ -54,6 +74,16 @@ const ALIGNMENT_POSITIONS: readonly (readonly number[])[] = [
   [6, 24, 42],
   [6, 26, 46],
   [6, 28, 50],
+  [6, 30, 54],
+  [6, 32, 58],
+  [6, 34, 62],
+  [6, 26, 46, 66],
+  [6, 26, 48, 70],
+  [6, 26, 50, 74],
+  [6, 30, 54, 78],
+  [6, 30, 56, 82],
+  [6, 30, 58, 86],
+  [6, 34, 62, 90],
 ];
 
 const GF_EXP = new Uint8Array(512);
@@ -404,14 +434,14 @@ function applyMask(modules: boolean[][], reserved: boolean[][], maskId: number):
 }
 
 /**
- * Encode UTF-8 text into a Version 1..10 QR matrix (EC level M, fallback EC L).
- * Returns `null` when the payload exceeds 271 UTF-8 bytes.
+ * Encode UTF-8 text into a Version 1..20 QR matrix (EC level M, fallback EC L).
+ * Returns `null` when the payload exceeds 858 UTF-8 bytes.
  */
 export function encodeQrMatrix(text: string): QrMatrix | null {
   const payload = new TextEncoder().encode(text);
   let chosen: { version: number; ecIndicator: 0 | 1; spec: VersionEcSpec } | null = null;
 
-  for (let v = 1; v <= 10; v += 1) {
+  for (let v = 1; v <= SPEC_M.length; v += 1) {
     const headerBits = v >= 10 ? 4 + 16 : 4 + 8;
     const neededBytes = Math.ceil((headerBits + payload.length * 8) / 8);
     const spec = SPEC_M[v - 1]!;
@@ -421,7 +451,7 @@ export function encodeQrMatrix(text: string): QrMatrix | null {
     }
   }
   if (!chosen) {
-    for (let v = 1; v <= 10; v += 1) {
+    for (let v = 1; v <= SPEC_L.length; v += 1) {
       const headerBits = v >= 10 ? 4 + 16 : 4 + 8;
       const neededBytes = Math.ceil((headerBits + payload.length * 8) / 8);
       const spec = SPEC_L[v - 1]!;
