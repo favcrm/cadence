@@ -167,20 +167,6 @@ pub fn valid_login(login: &str) -> bool {
         && !login.contains("--")
 }
 
-/// A PROJECT.md text whose frontmatter carries exactly the stored
-/// `delivery:` section, so the native [`delivery_policy::parse`] reads it.
-/// The text is the section's YAML value, or the section with its
-/// `delivery:` key.
-pub fn delivery_front(section: &str) -> String {
-    let section = section.trim_end();
-    if section.trim_start().starts_with("delivery:") {
-        format!("---\n{section}\n---\n")
-    } else {
-        let body: String = section.lines().map(|l| format!("  {l}\n")).collect();
-        format!("---\ndelivery:\n{body}---\n")
-    }
-}
-
 /// The tenant's `{state: …}` marker, if `value` is one.
 fn marker_state(value: Option<&Value>) -> Option<&str> {
     value?.get("state")?.as_str()
@@ -285,7 +271,7 @@ pub(crate) fn delivery_policy_answer(body: &Value, project: &str) -> Result<Proj
             // digest is the native digest of exactly that policy.
             let policy = delivery
                 .as_deref()
-                .map(|text| delivery_policy::parse(&delivery_front(text)))
+                .map(|text| delivery_policy::parse(&delivery_policy::section_front(text)))
                 .transpose()
                 .ok()
                 .flatten()
@@ -367,7 +353,11 @@ fn resolve(
         project,
         delivery_policy::parse_project(
             project,
-            answer.delivery.as_deref().map(delivery_front).as_deref(),
+            answer
+                .delivery
+                .as_deref()
+                .map(delivery_policy::section_front)
+                .as_deref(),
         )
         .map_err(|e| e.to_string()),
         approved.as_ref(),
@@ -467,7 +457,7 @@ pub fn set_delivery(
 ) -> Result<Value> {
     let repos = set_delivery_repos(repos)?;
     if let Some(section) = delivery {
-        if delivery_policy::parse(&delivery_front(section))?.is_none() {
+        if delivery_policy::parse(&delivery_policy::section_front(section))?.is_none() {
             return Err(refuse("the delivery file holds no delivery section"));
         }
     }
@@ -3154,7 +3144,7 @@ mod tests {
     fn a_hosted_approval_counts_only_with_the_native_policy_digest() {
         let text =
             "reviews: {r: {kind: agent, focus: general}}\nrisk: [{require: [r]}]\nmax_revise: 4\n";
-        let policy = delivery_policy::parse(&delivery_front(text))
+        let policy = delivery_policy::parse(&delivery_policy::section_front(text))
             .unwrap()
             .unwrap();
         let repos = json!({"state": "set", "repos": ["favcrm/cadence"]});
@@ -3189,6 +3179,92 @@ mod tests {
                 .unwrap_or("")
                 .starts_with("delivery_unapproved"));
         }
+    }
+
+    /// CAD-2708: the hosted readback answers the digest the core gives the
+    /// owner-saved section under `policy_owner_approved`, the call the
+    /// hosted gate makes. For every way the owner may write that section
+    /// (wrapped as the host wraps it), the CLI then
+    /// resolves the same approved policy at the same digest, and classifies
+    /// a PR into the same requirements the gate's core call returns —
+    /// here the floor review plus Browser QA for a shared-navigation change.
+    #[test]
+    fn the_cli_and_the_gate_agree_on_an_owner_saved_section() {
+        // Synthetic trusted lists: no path of the PR is in the repository's
+        // own `browser_qa` table, so Browser QA can come only from the policy.
+        const RISK: &str = "[schema]\npaths = [\"sys/schema.rs\"]\n[trigger1]\n\
+            paths = [\"sys/auth.rs\"]\n[trigger3]\npaths = [\"secrets/**\"]\n[trigger4]\n\
+            paths = [\"sys/supply.lock\"]\n[trigger6]\npaths = [\"sys/rollout.rs\"]\n\
+            [trigger7]\npaths = [\"sys/rules/**\"]\n[operator]\npaths = [\"deploy/**\"]\n\
+            [browser_qa]\npaths = [\"ui/**\"]\n[routine]\npaths = [\"docs/**/*.md\"]\n";
+        const ONE: &str =
+            "one_review_include = [\"src/**\", \"docs/**\"]\none_review_exclude = []\n";
+        let value = "reviews:\n  review: {kind: agent, focus: general}\n  \
+                     qa: {kind: agent, focus: browser-qa}\nrisk:\n  - require: [review]\n  \
+                     - when: {paths: [\"src/components/nav/**\"]}\n    require: [review, qa]\n";
+        let keyed: String = std::iter::once("delivery:\n".to_string())
+            .chain(value.lines().map(|l| format!("  {l}\n")))
+            .collect();
+        let changes = json!([{"status": "M", "old_mode": "100644", "new_mode": "100644",
+                              "path": "src/components/nav/SiteNav.tsx"}]);
+        let lists = cadence_core::delivery_requirements::TrustedLists {
+            risk_paths: Some(RISK),
+            one_review: Some(ONE),
+        };
+        let mut digests = Vec::new();
+        for stored in [
+            value.to_string(),
+            keyed.clone(),
+            format!("# Browser QA for shared navigation\n\n{keyed}"),
+            format!("\u{feff}# note\n{}", value.replace('\n', "\r\n")),
+        ] {
+            let request = json!({"v": 1, "op": "delivery.requirements.evaluate", "input": {
+                "policy": delivery_policy::section_front(&stored),
+                "policy_owner_approved": true,
+                "changes": changes, "lines": 12,
+                "risk_paths": RISK, "one_review_paths": ONE}});
+            let gate: Value = serde_json::from_slice(&cadence_core::evaluate(
+                &serde_json::to_vec(&request).unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(gate["ok"], true, "{gate}");
+            let gate = &gate["value"];
+            assert_eq!(gate["policy_source"], "approved", "{gate}");
+            let digest = gate["policy_digest"].as_str().unwrap().to_string();
+
+            let body = answer(
+                json!({"state": "set", "repos": ["favcrm/cadence"]}),
+                json!({"state": "set", "text": stored}),
+                json!({"state": "approved", "digest": digest,
+                       "recorded_via": "hosted-owner-login"}),
+            );
+            let (resolved, approval) = resolve(
+                "cadence",
+                &delivery_policy_answer(&body, "cadence").unwrap(),
+            );
+            assert_eq!(
+                (resolved.source, resolved.note.as_deref()),
+                ("approved", None)
+            );
+            assert!(approval.is_some());
+            assert_eq!(resolved.digest, digest);
+            let rows: Vec<cadence_core::delivery_requirements::Change> =
+                serde_json::from_value(changes.clone()).unwrap();
+            let cli = cadence_core::delivery_requirements::classify(&resolved, &rows, 12, &lists);
+            let cli = serde_json::to_value(&cli).unwrap();
+            assert_eq!(cli, gate["requirements"], "{stored:?}");
+            assert_eq!(cli["browser_qa"], true, "{cli}");
+            let names: Vec<&str> = cli["required_reviews"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["name"].as_str())
+                .collect();
+            assert!(names.contains(&"qa"), "{cli}");
+            digests.push(digest);
+        }
+        digests.dedup();
+        assert_eq!(digests.len(), 1, "one policy, one digest: {digests:?}");
     }
 
     #[test]

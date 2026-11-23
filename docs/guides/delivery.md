@@ -65,6 +65,11 @@ cadence --org acme issue project delivery <project-key> \
   --repo <owner>/<repo> --delivery-file delivery.yaml
 ```
 
+`delivery.yaml` holds the section's value or the whole section under its own
+top-level `delivery:` key. Comments, blank lines, indentation, key order, a
+BOM and CRLF line endings do not change the policy: the approval binds to the
+parsed policy, not to the text.
+
 The owner's save is the approval: the board accepts it only from the owner, so
 a hosted project's saved section is in force from the next gate read. On a
 native board the operator approves the section with

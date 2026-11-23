@@ -943,9 +943,12 @@ pub enum ProjectAction {
         /// A GitHub repo of the project, `owner/name` (repeatable).
         #[arg(long = "repo", required = true)]
         repos: Vec<String>,
-        /// A file holding the project's `delivery:` section (its YAML
-        /// value, or the section with its `delivery:` key). Omitted: no
-        /// section, so the default policy applies.
+        /// A file holding the project's `delivery:` section: its YAML
+        /// value, the section under its own top-level `delivery:` key, or a
+        /// `---` frontmatter block holding that key. Comments, blank lines,
+        /// a BOM and CRLF line endings are accepted;
+        /// the file is checked with the native parser before anything is
+        /// sent. Omitted: no section, so the default policy applies.
         #[arg(long)]
         delivery_file: Option<std::path::PathBuf>,
     },
