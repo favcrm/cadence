@@ -168,8 +168,15 @@ For hosted Standards and Spec/security, only eligible owner-attested verdicts
 or trusted workflow results count. A fresh OMP review is evidence, not a
 hosted verdict. See [Review evidence](docs/guides/delivery.md#review-evidence).
 If two source reviews are required, use a separate fresh session for each
-axis. Gate, security, schema and release PRs keep fresh-session Opus reviews;
-the workflow rows below are a cheap first pass on them.
+axis. CI changes that only change how an existing required check runs may use
+fresh, read-only OMP reviewers instead of Opus. The change must preserve the
+check's scope, coverage and refusal behavior, and must not change delivery
+rules, production security, schema or release behavior. Record the resolved
+model in each exact-head report.
+
+Other gate, security, schema and release PRs still require fresh-session Opus
+source reviews. The hosted workflow reviews below do not replace these source
+reviews. This does not change hosted verdict eligibility or operator approval.
 
 **The hosted route** is this repository's supported delivery route.
 
