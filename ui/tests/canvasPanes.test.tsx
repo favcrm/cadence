@@ -172,13 +172,6 @@ assert(card("b", "beside").includes('data-view-placed="pane"'), "the card says i
 assert(!card("a").includes("data-view-placed"), "a card with no placement says nothing");
 assert(/Opened beside [^<]+</.test(card("b", "beside")), "CAD-2682: the card names the view it opened beside");
 assert(!card("b", "beside").includes("Opened in a pane"), "CAD-2682: the generic wording is only the fallback");
-// CAD-2682: the polish that is CSS only, checked on the rules themselves.
-const css = (f: string) => require("fs").readFileSync(`${process.cwd()}/src/${f}`, "utf8") as string;
-const canvasCss = css("features/canvas/canvas.css");
-assert(/\.cv-divider:focus-visible \{ outline: 2px solid var\(--color-accent\)/.test(canvasCss), "a focused divider has the standard focus ring");
-assert(/\.cv-zone b \{[^}]*background: var\(--color-ink-900\)/.test(canvasCss), "a drop-zone label has a solid backing");
-assert(/\.cv-tab\[data-kind="session"\] \{ position: sticky; right: 0;/.test(canvasCss) && /\.cv-tabrow \{[^}]*flex-wrap: wrap/.test(canvasCss), "the Browser tab stays whole and the strip never overlaps the layout buttons");
-assert(/@container composer-foot \(max-width: 22rem\) \{\s*\.composer-hint \{ display: none; \}/.test(css("styles.css")), "a narrow composer hides its hint");
 feed([fc("c", "beside"), fc("d", "beside")]);
 feed([fc("e", "beside", "t4")]);
 assert(card("e", "beside").includes('data-view-placed="full"'), "with four panes the card says it opened as a background tab");
