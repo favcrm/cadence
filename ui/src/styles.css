@@ -3476,6 +3476,11 @@ button.project-focus-preview:hover { color: var(--color-accent); }
 .composer-foot .composer-hint {
   margin: 0;
 }
+/* CAD-2682: a narrow composer (the chat column beside panes) drops the keyboard hint rather than wrap it. */
+.composer-foot { container: composer-foot / inline-size; }
+@container composer-foot (max-width: 22rem) {
+  .composer-hint { display: none; }
+}
 .app-chat-attach-label {
   display: none;
 }
