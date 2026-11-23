@@ -136,7 +136,7 @@ pub(crate) trait ProtectedConsoleProvider: Send + Sync {
         &self,
         caller: &RuntimeCaller,
         client_message_id: &str,
-        server_message_id: &str,
+        claim: &crate::store::NativeTurnClaim,
         turn_token: &str,
     ) -> Result<Box<dyn NativeTaskGuard>>;
 

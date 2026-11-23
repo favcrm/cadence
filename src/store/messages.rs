@@ -6,11 +6,35 @@ use crate::proto::identifier;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::agents::Agent;
 use super::schema::Take;
 use super::StoreConn;
 use super::{now, Sender, Store};
+
+/// Proof of this Store's exact durable take, not merely a message id.
+/// Only the actor's take can produce this value; ordinary reads cannot.
+pub(crate) struct NativeTurnClaim {
+    store: Arc<super::seal::GuardState>,
+    agent_uid: String,
+    message_seq: i64,
+    submission_seq: i64,
+}
+
+impl NativeTurnClaim {
+    pub(super) fn belongs_to(&self, store: &Store, uid: &str, message_seq: i64) -> bool {
+        Arc::ptr_eq(&self.store, &store.seal_state)
+            && self.agent_uid == uid
+            && self.message_seq == message_seq
+    }
+
+    pub(super) fn submission_seq(&self) -> i64 {
+        self.submission_seq
+    }
+}
+
+pub(crate) type ActorTake = (Take, Option<NativeTurnClaim>);
 
 // Deterministic cost evidence for recurring read paths. Thread-local so
 // unrelated parallel tests cannot add to a caller's measurement.
@@ -2279,11 +2303,29 @@ impl Store {
         alias: &str,
         proof: Option<(&str, &str)>,
     ) -> Result<Take> {
+        self.take_queued_inner(alias, proof, false)
+            .map(|(take, _)| take)
+    }
+
+    pub(crate) fn take_queued_for_actor(
+        &self,
+        alias: &str,
+        proof: Option<(&str, &str)>,
+    ) -> Result<ActorTake> {
+        self.take_queued_inner(alias, proof, true)
+    }
+
+    fn take_queued_inner(
+        &self,
+        alias: &str,
+        proof: Option<(&str, &str)>,
+        actor: bool,
+    ) -> Result<ActorTake> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             if !agent.enabled {
-                return Ok(Take::Stop);
+                return Ok((Take::Stop, None));
             }
             // CAD-250: the actor serializes report-owing turns. While one is
             // `running` (delivered, its report still owed), only routed
@@ -2329,7 +2371,7 @@ impl Store {
                     // been failed as unresolved before the queue became empty.
                     // Commit that durable evidence even though no message is
                     // returned to the actor.
-                    return Ok(Take::Empty);
+                    return Ok((Take::Empty, None));
                 };
                 if message.source == "app_run_dispatch" {
                     let (expected, bundle) = proof.ok_or_else(|| {
@@ -2412,7 +2454,16 @@ impl Store {
                     params![now(), alias],
                 )?;
                 Self::event(&tx, alias, "submitting", json!({"message": message.id}))?;
-                return Ok(Take::Message(Box::new(message)));
+                let claim = (actor && agent.provider == "pi" && agent.endpoint_kind == "managed")
+                    .then(|| NativeTurnClaim {
+                        store: Arc::clone(&self.seal_state),
+                        agent_uid: agent.uid,
+                        message_seq: message.seq,
+                        // This is the submitting row just inserted above. It
+                        // distinguishes retries even at identical clock ticks.
+                        submission_seq: tx.last_insert_rowid(),
+                    });
+                return Ok((Take::Message(Box::new(message)), claim));
             }
         })
     }

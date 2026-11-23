@@ -1629,7 +1629,12 @@ impl ProviderAdapter for PiAdapter {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
-        self.run_turn_slotted(prompt, None, client_message_id, on_started)
+        self.run_turn_slotted(
+            prompt,
+            None,
+            super::TurnMessage::unclaimed(client_message_id),
+            on_started,
+        )
     }
 
     /// CAD-1009: the token is minted here, before the prompt is sent, so
@@ -1639,7 +1644,7 @@ impl ProviderAdapter for PiAdapter {
         &self,
         prompt: &str,
         slot: Option<&str>,
-        client_message_id: &str,
+        message: super::TurnMessage<'_>,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         if !self.shared.turn_images.lock().unwrap().is_empty() {
@@ -1660,7 +1665,7 @@ impl ProviderAdapter for PiAdapter {
         // CAD-1085 r7: bind the durable server-owned model task BEFORE any
         // prompt frame. No authority comes from prompt text or task args; the
         // guard is held for the turn and fences on drop/settle/interrupt.
-        let _native_task = self.bind_native_task(client_message_id, &turn_id)?;
+        let _native_task = self.bind_native_task(&message, &turn_id)?;
         let prompt = &super::with_turn_token(prompt, slot, &turn_id);
         *self.shared.interrupt_at.lock().unwrap() = None;
         // A settled-but-unconsumed turn is stale — it belongs to a
@@ -2003,17 +2008,23 @@ impl PiAdapter {
     /// Bind the durable model task before a protected turn's prompt.
     fn bind_native_task(
         &self,
-        client_message_id: &str,
+        message: &super::TurnMessage<'_>,
         turn_token: &str,
     ) -> Result<Option<Box<dyn crate::daemon::protected_runtime::NativeTaskGuard>>> {
         let Some(caller) = self.protected_caller.lock().unwrap().clone() else {
             return Ok(None);
         };
+        let claim = message.claim.ok_or_else(|| {
+            Error::invalid(
+                "principal_required",
+                "a durable actor message claim is required",
+            )
+        })?;
         let provider = crate::daemon::protected_runtime::console_provider()?;
         Ok(Some(provider.bind_native_task(
             &caller,
-            client_message_id,
-            client_message_id,
+            message.id(),
+            claim,
             turn_token,
         )?))
     }
