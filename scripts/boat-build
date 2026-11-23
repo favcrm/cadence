@@ -37,9 +37,8 @@ CREATE_TTL = '3600'
 IDLE_TTL = '1800'
 # Boat machine types: small 2 vCPU/4 GB, default 4/8 GB, large 8/16 GB (2x rate), xlarge 16/32 GB.
 MACHINE_TYPES = ('small', 'default', 'large', 'xlarge')
-GUARD_MARK = 'stopping this sandbox job: available memory below'
+GUARD_MARK = 'stopping this sandbox job: available memory below'  # printed by the sandbox script
 GUARD_EXIT = 75
-GUARD_STOPPED = False
 SANDBOX_ID = re.compile(r'bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}')
 SHA = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 REMOTE_HOME = '/home/user'
@@ -315,6 +314,11 @@ if prepare_ui:
             raise SystemExit('downloaded Bun version does not match packageManager')
     print('Installing locked UI dependencies', flush=True)
     subprocess.run(['bun', 'install', '--frozen-lockfile'], cwd=str(repo) + '/ui', env=env, check=True, timeout=300)
+# Test hook only: the floor can be raised to drive the guard, never lowered.
+try:
+    floor = max(768, int(os.environ.get('CADENCE_BOAT_MEMORY_FLOOR_MIB', '768')))
+except ValueError:
+    floor = 768
 start = time.monotonic()
 proc = subprocess.Popen(job['command'], cwd=repo, env=env, start_new_session=True)
 launched = read_identity(proc.pid)
@@ -327,7 +331,6 @@ if launched is None:
     'sid': launched['sid'],
     'pgid': launched['pgid'],
 }))
-floor = int(os.environ.get('CADENCE_BOAT_MEMORY_FLOOR_MIB', '768'))
 minimum = None
 peak_load = 0.0
 pressure = False
@@ -365,44 +368,69 @@ class Failure(Exception):
     pass
 
 
-def is_test_seam_lib_build(command):
-    """True for `cargo test` or `cargo nextest run` of the lib with the test-seam feature.
+# Arguments that turn on test-seam, and target selectors, as flat tables.
+SEAM_FLAGS = {'--all-features'}
+FEATURE_FLAGS = {'--features', '-F'}
+LIB_SELECTORS = {'--lib', '--tests', '--all-targets'}
+OTHER_SELECTORS = {'--test', '--bin', '--bins', '--example', '--examples', '--bench', '--benches', '--doc'}
+VALUE_SELECTORS = {'--test', '--bin', '--example', '--bench'}
+PACKAGE = 'cadence-agent'
 
-    Reads argv tokens only. Arguments after `--` belong to the test binary.
+
+def is_test_seam_lib_build(command):
+    """True for `cargo test` or `cargo nextest run|archive|list` that turns on
+    test-seam and builds this package's lib test binary. Reads argv tokens only;
+    `env`, `sh -c` and wrappers are not interpreted. Arguments after `--` belong
+    to the test binary.
     """
     argv = list(command)
-    if not argv or Path(argv[0]).name != 'cargo':
+    if not argv:
         return False
-    rest = argv[1:]
-    if rest and rest[0].startswith('+'):
-        rest = rest[1:]
-    if rest[:1] == ['test']:
+    if argv[0] == 'scripts/pre-push':
+        return '--tests' in argv[1:]  # the plan's tests step runs with test-seam
+    if Path(argv[0]).name != 'cargo':
+        return False
+    rest = [a for a in argv[1:]]
+    while rest and rest[0].startswith(('-', '+')):  # global flags, +toolchain
+        rest.pop(0)
+    if rest[:1] in (['test'], ['t']):
         rest = rest[1:]
     elif rest[:1] == ['nextest'] and rest[1:2] and rest[1] in {'run', 'archive', 'list'}:
         rest = rest[2:]
     else:
         return False
-    lib = seam = False
+    seam = lib = other = foreign = False
     i = 0
     while i < len(rest) and rest[i] != '--':
         arg = rest[i]
         value = None
-        if arg == '--lib':
+        if arg in LIB_SELECTORS:
             lib = True
-        elif arg == '--all-features':
+        elif arg in OTHER_SELECTORS:
+            other = True
+        elif arg in SEAM_FLAGS:
             seam = True
-        elif arg in ('--features', '-F'):
+        elif arg in FEATURE_FLAGS or arg in ('-p', '--package'):
             value = rest[i + 1] if i + 1 < len(rest) else ''
             i += 1
+            if arg in ('-p', '--package'):
+                foreign = foreign or value != PACKAGE
+                value = None
         elif arg.startswith('--features='):
             value = arg[len('--features='):]
         elif arg.startswith('-F') and len(arg) > 2:
             value = arg[2:]
+        elif arg.startswith('--package='):
+            foreign = foreign or arg[len('--package='):] != PACKAGE
+        if arg in VALUE_SELECTORS:
+            i += 1  # skip the target name
         if value is not None and any(
-                f.rsplit('/', 1)[-1] == 'test-seam' for f in re.split(r'[,\s]+', value)):
+                f.rsplit('/', 1)[-1] in {'test-seam', 'cli-runtime-test'}
+                for f in re.split(r'[,\s]+', value)):
             seam = True
         i += 1
-    return lib and seam
+    builds_lib = lib or not other
+    return seam and builds_lib and not foreign
 
 
 def choose_machine_type(requested, command):
@@ -413,6 +441,10 @@ def choose_machine_type(requested, command):
         return 'large', ('auto: a test-seam lib test build compiles the whole agent crate in one '
                          'rustc and does not fit the 8 GB default')
     return 'default', 'auto: no test-seam lib test build'
+
+
+def machine_rank(machine):
+    return MACHINE_TYPES.index(machine)
 
 
 def session_machine_type(session):
@@ -766,27 +798,18 @@ def stream_exec(sandbox):
     return exit_code
 
 
-def _note_guard(text):
-    global GUARD_STOPPED
-    if GUARD_MARK in text:
-        GUARD_STOPPED = True
-
-
 def _emit_exec_line(line, exit_code):
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
-        _note_guard(line)
         print(line, flush=True)
         return exit_code
     if not isinstance(event, dict):
-        _note_guard(line)
         print(line, flush=True)
         return exit_code
     kind = event.get('type')
     if kind in {'stdout', 'stderr'}:
         data = event.get('data') or ''
-        _note_guard(data)
         stream = sys.stderr if kind == 'stderr' else sys.stdout
         stream.write(data)
         stream.flush()
@@ -933,7 +956,7 @@ def main():
         elif session and session.get('worktree') != str(root.resolve()):
             retire(session, session_path)
             session = None
-        elif session and session_machine_type(session) != machine:
+        elif session and machine_rank(session_machine_type(session)) < machine_rank(machine):
             print(f"Boat session: {session['sandbox']} is type {session_machine_type(session)}, "
                   f'this run needs {machine}; replacing it', flush=True)
             retire(session, session_path)
@@ -951,8 +974,9 @@ def main():
                 OWNED = sandbox
                 if extend_sandbox(sandbox, CREATE_TTL):
                     reused = True
+                    machine = session_machine_type(session)  # a larger warm box is reused as is
                     save_session(session_path, sandbox, root, machine)
-                    print(f'Boat session: reusing {sandbox}', flush=True)
+                    print(f'Boat session: reusing {sandbox} (type {machine})', flush=True)
                 else:
                     life = 'dead'
             if not reused:
@@ -1037,9 +1061,7 @@ def main():
             lock.close()
         except OSError:
             pass
-        if GUARD_STOPPED:
-            if result == 0:
-                result = GUARD_EXIT
+        if result == GUARD_EXIT:
             print(guard_stop_line(machine), flush=True)
     if failure is not None:
         raise failure

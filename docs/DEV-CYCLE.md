@@ -219,15 +219,21 @@ sandboxes were created with snapshots off, so that stop erases the disk and
 the next command starts cold.
 
 The sandbox is `default` (4 vCPU, 8 GB) unless `--type {small,default,large,xlarge}`
-says otherwise. A `cargo test` or `cargo nextest run` of the lib with
-`--features test-seam` compiles the whole agent crate in one rustc and does not
-fit 8 GB, so the helper picks `large` (8 vCPU, 16 GB, twice the rate) for it
-when no `--type` is given, and prints one `Boat type:` line saying why. A warm
-sandbox of a different type is deleted and replaced, which costs one cold
-compile. If available memory in the sandbox falls below 768 MiB the helper
-kills the job, exits 75, and its last line says it was stopped by the memory
-guard and that no test result exists. Do not pipe the helper into `tail` or
-`head`: the pipe hides that exit status, so read the status itself.
+says otherwise. A `cargo test` (or `t`) or `cargo nextest run|archive|list` that
+turns on `test-seam` (`--features`/`-F` in any spelling, `--all-features`, or
+`cli-runtime-test`) and builds this package's lib tests (`--lib`, `--tests`,
+`--all-targets`, or no target selector) compiles the whole agent crate in one
+rustc and does not fit 8 GB. With no `--type` the helper picks `large` (8 vCPU,
+16 GB, twice the rate) for it, and for the default `scripts/boat-build --tests`
+plan, and prints one `Boat type:` line saying why. `--test X`, `--bin X` or
+`-p <other>` alone keep `default`. The rule reads argv only: `env`, `sh -c` and
+wrappers such as `scripts/cadence-nextest` are not interpreted, so pass
+`--type large` for those. Types rank small < default < large < xlarge: a warm
+sandbox is replaced only when it is smaller than the run needs, and a larger
+one is reused as is. If available memory in the sandbox falls below 768 MiB the
+helper kills the job and exits 75; its last stdout line says it was stopped by
+the memory guard and that no test result exists. Do not pipe the helper into
+`tail` or `head`: the pipe hides that exit status, so read the status itself.
 
 The copy is a shallow git snapshot of the candidate and the base, from their
 merge-base forward, plus a binary patch of tracked edits. It is not an rsync
