@@ -412,7 +412,7 @@ pub(super) fn branch_base(root: &Path, branch: &str, fallback: &str) -> String {
     .unwrap_or_else(|| fallback.to_string())
 }
 
-pub(super) fn resolve_existing_base(root: &Path, branch: &str) -> Result<(String, String)> {
+pub(crate) fn resolve_existing_base(root: &Path, branch: &str) -> Result<(String, String)> {
     let base = git(
         root,
         &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],

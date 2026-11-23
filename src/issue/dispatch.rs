@@ -587,12 +587,6 @@ fn preflight(
     // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let base = start::resolve_base(
-        &root,
-        args.base.as_deref(),
-        start::configured_integration(&project, &root)?,
-    )?;
-    let base_sha = base.sha.clone();
     let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;
     // CAD-1846: an accepted kickoff is answered from the daemon's own rows
     // before any source capture, contract render, lane setup or job creation.
@@ -625,6 +619,10 @@ fn preflight(
             task,
             kind,
         } => {
+            // An accepted row must not fetch, or depend on integration
+            // configuration remaining available. These are receipt facts,
+            // not a new base selection; an unprovable fact stays null.
+            let existing_base = start::resolve_existing_base(&root, &branch).ok();
             let mut out = json!({
                 "issue": front.id,
                 "worker": args.to,
@@ -632,7 +630,11 @@ fn preflight(
                 "note": note,
                 "worktree": wt_dir,
                 "branch": branch,
-                "base": {"ref": base.name, "sha": base.sha},
+                "base": {
+                    "ref": existing_base.as_ref().map(|base| &base.0),
+                    "sha": task.as_ref().and_then(|task| task["base_sha"].as_str())
+                        .or_else(|| existing_base.as_ref().map(|base| base.1.as_str())),
+                },
                 "acceptance": acceptance,
                 "claim": claim::json(&front, crate::issue::time::now_epoch()),
                 "dispatched": false,
@@ -647,7 +649,6 @@ fn preflight(
             if let Some(task) = task {
                 out["task"] = task["id"].clone();
                 out["task_revision"] = task["revision"].clone();
-                out["base"]["sha"] = task["base_sha"].clone();
             }
             if items.is_empty() {
                 out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
@@ -669,6 +670,12 @@ fn preflight(
             ))
         })
         .transpose()?;
+    let base = start::resolve_base(
+        &root,
+        args.base.as_deref(),
+        start::configured_integration(&project, &root)?,
+    )?;
+    let base_sha = base.sha.clone();
     // CAD-1822/CAD-1846: both entry points run the same mandatory pipeline.
     // The task contract and the project's required sources are validated
     // before `issue start`, so a refusal leaves no lane, branch, job or
@@ -767,6 +774,7 @@ fn preflight(
                     admission_scope: None,
                 },
                 args.no_lessons,
+                intake_scope.as_ref().map(|_| items.as_slice()),
             )?;
             if prepared.is_some() {
                 // The daemon re-selects and pins the same mandatory contract

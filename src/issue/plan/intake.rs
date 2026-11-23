@@ -1,6 +1,5 @@
 //! Versioned source and scope evidence for ordinary goal-intake plans.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -272,15 +271,7 @@ pub(crate) fn scope_digest(front: &Front, body: &str) -> Result<String> {
         areas::check_path(path)?;
     }
     // Checking off existing criteria does not amend the approved scope.
-    let mut acceptance = parse::acceptance_items(body);
-    let body = if acceptance.is_empty() {
-        Cow::Borrowed(body)
-    } else {
-        for item in &mut acceptance {
-            item.checked = false;
-        }
-        Cow::Owned(parse::replace_acceptance(body, &acceptance)?)
-    };
+    let body = parse::uncheck_acceptance(body);
     let scope = serde_json::to_vec(&(&front.title, &front.paths, &front.blocked_by, body.trim()))
         .map_err(|err| Error::internal(format!("could not encode issue scope: {err}")))?;
     Ok(sha256_hex(&scope))

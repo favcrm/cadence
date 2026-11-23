@@ -22,8 +22,10 @@ use crate::worktree::{self, layout};
 
 mod base;
 
-use base::{branch_base, resolve_existing_base, worktree_branch};
-pub(crate) use base::{configured_integration, declared_repos, resolve_base, resolve_repo};
+use base::{branch_base, worktree_branch};
+pub(crate) use base::{
+    configured_integration, declared_repos, resolve_base, resolve_existing_base, resolve_repo,
+};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
 /// [--assignee <alias>]`.
@@ -479,9 +481,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     }
     let lock = pm.lock()?;
     let (mut front, body) = write::load_front(&dir)?;
-    // An intake revision can retire this scope while we resolve the lane.
-    // Admit the current plan under the same tracker lock as the claim.
-    crate::issue::plan::gate_claim(&pm.dir, &front, &body, &base_sha)?;
     let front_id = front.id.clone();
     // CAD-383: a doing/review issue held by someone else refuses before
     // any lane is touched; a take-over is its own commit, made now.
@@ -494,22 +493,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "issue start",
         || claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2)),
     )?;
-    // A cloud start's admission is a read-only AOS probe, before the
-    // take-over commit and before the ordinary new-lane claim. A denied
-    // company leaves the tracker untouched.
-    if cloud {
-        client::rpc(state_dir, "cloud_probe", json!({}))?;
-    }
-    if let Some(t) = &checked.take_over {
-        let mut taken = front.clone();
-        taken.claim = Some(claim::new_claim(&requester, Some(t.reason.clone())));
-        taken.owner = Some(new_owner.clone().unwrap_or_else(|| requester.clone()));
-        let (text, subject) = claim::take_over_record(&requester, t);
-        write::commit_front_with_comment(
-            pm, &dir, &front, &taken, &body, &requester, "claim", &text, &subject, actor,
-        )?;
-        front = taken;
-    }
     // CAD-274: an open worktree ref IS the issue's lane — a re-start
     // reuses it (re-applying the cargo target) rather than minting a
     // second lane from the title.
@@ -533,13 +516,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             .refs
             .iter()
             .any(|r| r.kind == kind && r.path.as_deref() == Some(target))
-    };
-    let first_recorded = |kind: &str| {
-        front
-            .refs
-            .iter()
-            .find(|r| r.kind == kind)
-            .and_then(|r| r.path.clone())
     };
     let dir_exists = wt_dir.is_dir();
     let branch_exists = git(
@@ -570,6 +546,40 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             "the recorded lane changed while issue start was waiting; retry to refresh and pin the default base",
         ));
     }
+    let pinned_base = if reuse && initial_intake.is_some() {
+        match lifecycle_record.as_ref().and_then(|r| r.base_sha.as_ref()) {
+            Some(recorded) => recorded.clone(),
+            None => resolve_existing_base(&root, &branch)?.1,
+        }
+    } else if branch_exists {
+        branch_base(&root, &branch, &base_sha)
+    } else {
+        base_sha.clone()
+    };
+    let lane_base_sha = if reuse {
+        pinned_base.clone()
+    } else {
+        base_sha.clone()
+    };
+    // Validate the actual selected lane under the same tracker lock as
+    // claim, including a reused checkout that ignores an explicit --base.
+    crate::issue::plan::gate_claim(&pm.dir, &front, &body, &lane_base_sha)?;
+    // A cloud start's admission is a read-only AOS probe, before the
+    // take-over commit and before the ordinary new-lane claim. A denied
+    // company leaves the tracker untouched.
+    if cloud {
+        client::rpc(state_dir, "cloud_probe", json!({}))?;
+    }
+    if let Some(t) = &checked.take_over {
+        let mut taken = front.clone();
+        taken.claim = Some(claim::new_claim(&requester, Some(t.reason.clone())));
+        taken.owner = Some(new_owner.clone().unwrap_or_else(|| requester.clone()));
+        let (text, subject) = claim::take_over_record(&requester, t);
+        write::commit_front_with_comment(
+            pm, &dir, &front, &taken, &body, &requester, "claim", &text, &subject, actor,
+        )?;
+        front = taken;
+    }
     let repo_label = root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -579,15 +589,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         .clone()
         .or_else(|| new_owner.clone())
         .unwrap_or_else(|| requester.clone());
-    let pinned_base = if branch_exists {
-        branch_base(&root, &branch, &base_sha)
-    } else {
-        base_sha.clone()
-    };
-    let lane_base_sha = if reuse {
-        pinned_base.clone()
-    } else {
-        base_sha.clone()
+    let first_recorded = |kind: &str| {
+        front
+            .refs
+            .iter()
+            .find(|r| r.kind == kind)
+            .and_then(|r| r.path.clone())
     };
     let checkout_record = || {
         let mut record = worktree::lifecycle::new_record(worktree::lifecycle::CheckoutSpec {

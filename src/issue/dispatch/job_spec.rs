@@ -271,18 +271,17 @@ pub(crate) fn canonical_issue_spec_digest(
     )))
 }
 
-/// CAD-1846: the same mandatory pipeline for an issue-linked job task.
-/// The caller proves the job's issue binding and real lane from its own
-/// captured rows; this captures the complete effective spec once, the
-/// parent issue's complete prose and the task's own acceptance, and
-/// builds the contract at the job task's identity. `None` means the
-/// project has not opted in — the caller renders the legacy kickoff and
-/// never labels it a complete contract.
+/// CAD-1846: the mandatory pipeline for an issue-linked job task. The caller
+/// proves its captured issue binding and lane. Intake admissions supply the
+/// approved issue checklist; other tasks keep their recorded acceptance.
+/// `None` means the project has not opted in and the caller renders the
+/// legacy kickoff instead.
 pub(crate) fn job_context(
     pm: &Pm,
     gated: &GatedIssue,
     job: JobContext<'_>,
     no_lessons: bool,
+    approved_issue_items: Option<&[AcceptanceItem]>,
 ) -> Result<Option<PreparedContext<'static>>> {
     let GatedIssue {
         project,
@@ -356,11 +355,18 @@ pub(crate) fn job_context(
                 }
             }
         }
-        // Do not re-embed tracker frontmatter or criteria already represented
-        // by the native task. A task-specific checklist may differ from the
-        // canonical spec's checklist, whose other requirements remain mandatory.
+        // Keep tracker frontmatter out of the spec prose. An intake caller
+        // supplies the currently approved issue checklist instead of one
+        // inherited by the task before approval.
         let spec_is_issue = canonical_issue_spec || spec.as_bytes() == source.as_bytes();
-        let acceptance = task_acceptance(task);
+        let recorded_acceptance;
+        let acceptance = match approved_issue_items {
+            Some(items) => items,
+            None => {
+                recorded_acceptance = task_acceptance(task);
+                &recorded_acceptance
+            }
+        };
         let title = task
             .title
             .as_deref()
@@ -373,7 +379,7 @@ pub(crate) fn job_context(
             &task.id,
             title,
             source.as_bytes(),
-            &acceptance,
+            acceptance,
             String::new(),
         );
         contract.issue = front.id.clone();
@@ -423,6 +429,23 @@ pub(crate) fn job_context(
                 if !request.ends_with('\n') {
                     request.push('\n');
                 }
+            }
+        }
+        if let Some(items) = approved_issue_items {
+            let current = super::acceptance_listing(items);
+            if let Some(recorded) = task
+                .acceptance
+                .as_deref()
+                .filter(|s| !s.trim().is_empty() && Some(*s) != current.as_deref())
+            {
+                request.push_str(
+                    "\n## Recorded task acceptance\n\n\
+                     An earlier inherited issue checklist is historical where it differs \
+                     from the approved issue criteria; independent task requirements remain \
+                     applicable where compatible. Recorded task acceptance:\n\n",
+                );
+                request.push_str(recorded);
+                request.push('\n');
             }
         }
         contract.request = request;

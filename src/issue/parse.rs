@@ -221,7 +221,7 @@ fn acceptance_sections(body: &str) -> Vec<AcceptanceSection> {
 }
 
 /// Parse one Markdown checklist line. Empty checklist stubs are excluded.
-fn checkbox_item(line: &str) -> Option<AcceptanceItem> {
+fn checkbox_contents(line: &str) -> Option<(&str, bool)> {
     let line = markdown_line(line)?;
     let rest = line.strip_prefix("- [")?;
     let marked = match rest.as_bytes().first() {
@@ -234,15 +234,20 @@ fn checkbox_item(line: &str) -> Option<AcceptanceItem> {
         return None;
     }
     let text = suffix.trim();
-    (!text.is_empty()).then(|| AcceptanceItem {
+    (!text.is_empty()).then_some((text, marked))
+}
+
+fn checkbox_item(line: &str) -> Option<AcceptanceItem> {
+    let (text, checked) = checkbox_contents(line)?;
+    Some(AcceptanceItem {
         text: text.to_string(),
-        checked: marked,
+        checked,
     })
 }
 
 /// The canonical checklist rows and their original byte ranges. Both the
 /// acceptance reader and task-request projection use this one Markdown rule.
-fn acceptance_lines(body: &str) -> impl Iterator<Item = (LineRange, AcceptanceItem)> + '_ {
+fn acceptance_lines(body: &str) -> impl Iterator<Item = (LineRange, &str, bool)> {
     let sections = acceptance_sections(body);
     let section = (sections.len() == 1).then(|| sections[0]);
     section.into_iter().flat_map(move |section| {
@@ -255,14 +260,15 @@ fn acceptance_lines(body: &str) -> impl Iterator<Item = (LineRange, AcceptanceIt
                 if fences.is_code(text) {
                     return None;
                 }
-                checkbox_item(text).map(|item| {
+                checkbox_contents(text).map(|(text, checked)| {
                     (
                         LineRange {
                             start: section.heading_end + line.start,
                             content_end: section.heading_end + line.content_end,
                             end: section.heading_end + line.end,
                         },
-                        item,
+                        text,
+                        checked,
                     )
                 })
             })
@@ -273,7 +279,25 @@ fn acceptance_lines(body: &str) -> impl Iterator<Item = (LineRange, AcceptanceIt
 /// A duplicate heading is treated as malformed and produces no items on the
 /// read side; mutation uses `replace_acceptance` to report the error.
 pub fn acceptance_items(body: &str) -> Vec<AcceptanceItem> {
-    acceptance_lines(body).map(|(_, item)| item).collect()
+    acceptance_lines(body)
+        .map(|(_, text, checked)| AcceptanceItem {
+            text: text.to_string(),
+            checked,
+        })
+        .collect()
+}
+
+/// Ignore checkbox progress while retaining every byte of scope around it.
+pub(super) fn uncheck_acceptance(body: &str) -> std::borrow::Cow<'_, str> {
+    let mut normalized = std::borrow::Cow::Borrowed(body);
+    for (line, _, checked) in acceptance_lines(body) {
+        if checked {
+            let text = &body[line.start..line.content_end];
+            let marker = line.start + (text.len() - text.trim_start_matches(' ').len()) + 3;
+            normalized.to_mut().replace_range(marker..marker + 1, " ");
+        }
+    }
+    normalized
 }
 
 /// Split a canonical task body into its prose and complete criteria without
@@ -282,9 +306,12 @@ pub fn acceptance_items(body: &str) -> Vec<AcceptanceItem> {
 pub(crate) fn task_request(mut body: String) -> (String, Vec<AcceptanceItem>) {
     let mut removed = Vec::new();
     let mut items = Vec::new();
-    for (line, item) in acceptance_lines(&body) {
+    for (line, text, checked) in acceptance_lines(&body) {
         removed.push(line);
-        items.push(item);
+        items.push(AcceptanceItem {
+            text: text.to_string(),
+            checked,
+        });
     }
     if !removed.is_empty() {
         // Compact the already-owned UTF-8 body in place. Ranges name complete

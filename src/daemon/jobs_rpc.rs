@@ -2335,11 +2335,38 @@ impl Shared {
         no_lessons: bool,
         issue_snapshot: Option<&JobIssueSnapshot>,
     ) -> Result<(String, store::IssueSelection)> {
+        let approved_items = issue_snapshot
+            .filter(|snapshot| snapshot.intake.is_some())
+            .and_then(|snapshot| snapshot.gated.as_ref())
+            .map(|issue| issue.items.as_slice());
         let legacy = |reason: String| -> Result<(String, store::IssueSelection)> {
+            // This is a rendering-only copy: the durable task and its
+            // idempotency/provenance fences retain their original values.
+            let mut task = None;
+            if let Some(items) = approved_items {
+                let mut effective = plan.task.clone();
+                let current = crate::issue::dispatch::acceptance_listing(items)
+                    .ok_or_else(|| Error::internal("approved intake has no acceptance"))?;
+                let recorded = effective
+                    .acceptance
+                    .as_deref()
+                    .filter(|s| *s != current.as_str());
+                effective.acceptance = Some(match recorded {
+                    Some(recorded) => format!(
+                        "{current} (approved issue criteria). Recorded task acceptance: {}. \
+                         An earlier inherited issue checklist is historical where it differs; \
+                         independent task requirements remain applicable where compatible",
+                        serde_json::to_string(recorded)
+                            .map_err(|e| Error::internal(e.to_string()))?
+                    ),
+                    None => current,
+                });
+                task = Some(effective);
+            }
             Ok((
                 store::job_kickoff(
                     &plan.job,
-                    &plan.task,
+                    task.as_ref().unwrap_or(&plan.task),
                     plan.revision,
                     &plan.message_id,
                     &plan.worker.provider,
@@ -2464,6 +2491,7 @@ impl Shared {
                 admission_scope: Some(&scope),
             },
             no_lessons,
+            approved_items,
         )?;
         let Some(prepared) = prepared else {
             return legacy("the assigned project is not opted in to agent delivery".to_string());
