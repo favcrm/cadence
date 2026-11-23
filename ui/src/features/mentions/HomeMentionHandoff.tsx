@@ -1,3 +1,4 @@
+import { useCallback, useMemo, useRef, useState, type RefObject } from "react";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { startsWithNote, type MentionCandidate } from "./mentions";
@@ -45,7 +46,7 @@ export function HomeMentionHandoffCard({
   const names = teammates.map((m) => `@${m.handle}`).join(", ");
   return (
     <div
-      className="home-handoff-preview card p-2.5 mb-2"
+      className="home-handoff-preview card p-2.5 mt-2"
       role={sendBlockedForConsent ? "alert" : "status"}
       data-home-handoff-preview=""
     >
@@ -68,4 +69,59 @@ export function HomeMentionHandoffCard({
       </div>
     </div>
   );
+}
+
+/** Shared private-Home colleague mention detection + consent hold state. */
+export function useHomeMentionHandoff(
+  candidates: readonly MentionCandidate[],
+  dockRef: RefObject<HTMLDivElement | null>,
+) {
+  const [draftText, setDraftText] = useState("");
+  const [handoffHold, setHandoffHold] = useState(false);
+  const approvedPrivateDraftRef = useRef<string | null>(null);
+  const mentionedTeammates = useMemo(
+    () => findMentionedTeammates(draftText, candidates),
+    [draftText, candidates],
+  );
+  const onDraftChange = useCallback(
+    (next: string) => {
+      setDraftText(next);
+      if (next.trim() !== approvedPrivateDraftRef.current) {
+        approvedPrivateDraftRef.current = null;
+      }
+      if (findMentionedTeammates(next, candidates).length === 0) {
+        setHandoffHold(false);
+      }
+    },
+    [candidates],
+  );
+  const beforeSend = useCallback(
+    (outgoing: string) => {
+      const normalized = outgoing.trim();
+      if (
+        findMentionedTeammates(normalized, candidates).length > 0 &&
+        approvedPrivateDraftRef.current !== normalized
+      ) {
+        setHandoffHold(true);
+        return false;
+      }
+      approvedPrivateDraftRef.current = null;
+      setHandoffHold(false);
+      return true;
+    },
+    [candidates],
+  );
+  const onKeepPrivate = useCallback(() => {
+    approvedPrivateDraftRef.current = draftText.trim();
+    setHandoffHold(false);
+    dockRef.current?.querySelector<HTMLFormElement>("form[data-composer]")?.requestSubmit();
+  }, [draftText, dockRef]);
+
+  return {
+    mentionedTeammates,
+    handoffHold,
+    onDraftChange,
+    beforeSend,
+    onKeepPrivate,
+  };
 }

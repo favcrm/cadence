@@ -13,6 +13,7 @@ export default function MentionPicker({
   onHighlight,
   onSelect,
   ariaLabel = "Mention someone",
+  placement = "above",
 }: {
   candidates: readonly MentionCandidate[];
   /** Index into `candidates` of the currently highlighted active candidate, or `-1`. */
@@ -20,6 +21,7 @@ export default function MentionPicker({
   onHighlight: (index: number) => void;
   onSelect: (candidate: MentionCandidate) => void;
   ariaLabel?: string;
+  placement?: "above" | "below";
 }) {
   const t = useTranslate();
   if (candidates.length === 0) return null;
@@ -28,7 +30,12 @@ export default function MentionPicker({
   let lastActive: boolean | null = null;
 
   return (
-    <ul className="mention-picker" role="listbox" aria-label={t(ariaLabel)}>
+    <ul
+      className="mention-picker"
+      data-placement={placement}
+      role="listbox"
+      aria-label={t(ariaLabel)}
+    >
       {candidates.map((c, index) => {
         const showHeader = lastActive === null || lastActive !== c.active;
         lastActive = c.active;

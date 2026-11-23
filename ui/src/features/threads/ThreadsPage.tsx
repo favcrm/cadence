@@ -12,6 +12,7 @@ import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import NewHumanConversation from "./NewHumanConversation";
+import { isShareableAgent } from "../mentions/candidates";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 import { issuePath } from "../issues/model";
@@ -677,7 +678,7 @@ export default function ThreadsPage({
       <SheetDialog open={createOpen} title="New conversation" className="threads-create-sheet"
         busy={createBusy} onClose={() => setCreateOpen(false)}>
         {createOpen && <>
-          <div className="threads-create-modes" aria-label="Conversation type">
+          <div className="threads-create-modes" aria-label={t("Conversation type")}>
             {([
               ...(human.me ? [{ value: "direct" as const, label: "Direct message" }, { value: "group" as const, label: "Channel" }] : []),
               ...(operator || createMode === "project" || createMode === "agent" ? [{ value: "project" as const, label: "Project" }, { value: "agent" as const, label: "Agent" }] : []),
@@ -1906,7 +1907,7 @@ function ContextPanel({
   );
   const addableAgents = roster.status === "ready"
     ? (roster.agents ?? [])
-        .filter((a) => !a.inbox && a.provider !== "inbox" && !a.dead && !subscribedAliases.has(a.alias))
+        .filter((a) => isShareableAgent(a) && !subscribedAliases.has(a.alias))
         .map((a) => ({ value: a.alias, label: `@${a.alias}` }))
     : [];
 

@@ -641,13 +641,17 @@ export function HumanRoomTimeline({
         </div>
       </header>
       {denied ? (
-        <p className="threads-note px-6 py-3" role="status">You are not a member of this channel.</p>
+        <p className="threads-note px-6 py-3" role="status">{t("You are not a member of this channel.")}</p>
       ) : error !== null ? (
-        <p className="threads-note px-6 py-3" role="status">This channel could not load: {error}</p>
+        <p className="threads-note px-6 py-3" role="status">{t("This channel could not load: {error}").replace("{error}", error)}</p>
       ) : currentPage === null ? (
         <p className="threads-note px-6 py-3">{t("Loading…")}</p>
       ) : null}
-      {readError !== null && <p className="threads-note px-6 py-2" role="status">Read status could not be updated: {readError}</p>}
+      {readError !== null && (
+        <p className="threads-note px-6 py-2" role="status">
+          {t("Read status could not be updated: {error}").replace("{error}", readError)}
+        </p>
+      )}
       {cursorBlocked && (
         <div className="px-6 py-2">
           <Button variant="ghost" size="sm" onClick={() => {
@@ -656,7 +660,7 @@ export function HumanRoomTimeline({
             setError(null);
             void load();
           }}>
-            Reload channel
+            {t("Reload channel")}
           </Button>
         </div>
       )}
@@ -665,7 +669,7 @@ export function HumanRoomTimeline({
         {currentPage?.more_before && currentPage.posts.length > 0 && (
           <div className="flex justify-center py-2">
             <Button variant="ghost" size="sm" disabled={olderBusy} onClick={loadEarlier}>
-              Earlier
+              {t("Earlier")}
             </Button>
           </div>
         )}
@@ -695,7 +699,7 @@ export function HumanRoomTimeline({
           );
         })}
         {currentPage && timelineItems.length === 0 && (
-          <p className="threads-note py-6 text-center">No messages yet.</p>
+          <p className="threads-note py-6 text-center">{t("No messages yet.")}</p>
         )}
       </div>
       <div className="threads-composer-dock">
@@ -712,7 +716,7 @@ export function HumanRoomTimeline({
         <div className="threads-composer-card">
           <Composer
             density="full"
-            block={denied ? "You are not a member of this channel" : null}
+            block={denied ? t("You are not a member of this channel") : null}
             storeKey={`threads-human:${id}`}
             mentionCandidates={mentionCandidates}
             showSilentToggle={!isDm}
@@ -756,8 +760,13 @@ export function HumanRoomTimeline({
 }
 
 function PersonNote({ people, error }: { people: HumanPerson[] | null; error: string | null }) {
+  const t = useTranslate();
   if (people !== null) return null;
-  return <p className="threads-note" role="status">{error ? `People unavailable: ${error}` : "Loading people…"}</p>;
+  return (
+    <p className="threads-note" role="status">
+      {error ? t("People unavailable: {error}").replace("{error}", error) : t("Loading people…")}
+    </p>
+  );
 }
 
 /** The Details rail / sheet for a Channel or DM: Teammates, Shared Agents, Active Guardrails, and Remove ConfirmDialog. */
@@ -801,7 +810,7 @@ export function HumanContextPanel({
   if (members === null) {
     return (
       <div className="threads-context-body">
-        <p className="threads-note">{denied ? "No access to this channel." : "Loading participants…"}</p>
+        <p className="threads-note">{t(denied ? "No access to this channel." : "Loading participants…")}</p>
       </div>
     );
   }
@@ -848,7 +857,7 @@ export function HumanContextPanel({
       .filter((m) => m.kind === "human" && m.id !== me.id)
       .map((m) => people?.find((p) => p.id === m.id)?.subject);
     if (humans.some((s) => s === undefined)) {
-      setError("A member is not on the current roster");
+      setError(t("A member is not on the current roster"));
       return;
     }
     setError(null);
@@ -932,7 +941,7 @@ export function HumanContextPanel({
         {isGroup && mayManage && (
           <form
             className="threads-add"
-            aria-label="Invite teammate to channel"
+            aria-label={t("Invite teammate to channel")}
             data-invite-select=""
             onSubmit={(e) => {
               e.preventDefault();
@@ -979,7 +988,7 @@ export function HumanContextPanel({
           {mayManage && (
             <form
               className="threads-add"
-              aria-label="Add agent to channel"
+              aria-label={t("Add agent to channel")}
               onSubmit={(e) => {
                 e.preventDefault();
                 if (addAgentPick === "") return;

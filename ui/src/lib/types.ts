@@ -790,6 +790,8 @@ export type Agent = Omit<
   /** CAD-2353: hosted only. The `master` row says `"workspace"` (the company
    *  Master); absent on an older API and on native boards. */
   scope?: "workspace";
+  /** True when bound as a member personal assistant (`assistants` table). */
+  personal_assistant?: boolean;
   /** The workspace's own name for the company Master, when it has one. */
   name?: string | null;
 };

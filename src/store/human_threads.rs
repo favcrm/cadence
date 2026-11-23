@@ -161,6 +161,14 @@ pub struct HumanRoomAuditEvent {
     pub created: f64,
 }
 
+/// Provenance and originating channel topic binding for a running `@mention` agent turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningChannelTurn {
+    pub origin_actor: String,
+    pub authority_mode: String,
+    pub topic_id: Option<String>,
+}
+
 /// Stored mention outcomes and silent mode for a channel post.
 #[derive(Debug, Clone, Default)]
 pub struct HumanPostMeta {
@@ -494,7 +502,16 @@ fn insert_post(
 ) -> Result<(TopicPost, bool)> {
     let post = post_id(topic, client_id);
     if let Some(existing) = Store::human_post_in(conn, &post)? {
-        if existing.body != body || existing.sender_uid.as_deref() != Some(sender_uid) {
+        let meta_silent = conn.query_opt(
+            "SELECT silent FROM human_room_post_meta WHERE post_id=?",
+            [existing.id.as_str()],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )?;
+        let requested_silent = silent || super::mentions::starts_with_note(body);
+        if existing.body != body
+            || existing.sender_uid.as_deref() != Some(sender_uid)
+            || meta_silent.is_some_and(|s| s != requested_silent)
+        {
             return Err(Error::rejected(
                 "Post id was already used with different content",
             ));
@@ -1495,19 +1512,74 @@ impl Store {
         })
     }
 
-    /// If `alias` is currently running a turn triggered by a human-room
-    /// `@mention` or channel hop, return `(origin_actor, authority_mode)`.
-    pub fn running_channel_authority(&self, alias: &str) -> Result<Option<(String, String)>> {
+    /// If `alias` is currently running a turn triggered by a channel or ticket
+    /// `@mention` (or channel hop), return its provenance and originating channel `topic_id`.
+    pub fn running_channel_authority(&self, alias: &str) -> Result<Option<RunningChannelTurn>> {
         self.read_tx(|conn| {
             Ok(conn.query_opt(
-                "SELECT pr.origin_actor, pr.authority_mode
+                "SELECT pr.origin_actor, pr.authority_mode, tp.topic_id
                    FROM messages m
                    JOIN human_room_post_requests pr ON pr.message_id=m.id
+                   LEFT JOIN topic_posts tp ON tp.id=pr.post_id
                   WHERE m.alias=? AND m.state='running'
                   ORDER BY m.seq DESC LIMIT 1",
                 [alias],
+                |r| {
+                    Ok(RunningChannelTurn {
+                        origin_actor: r.get(0)?,
+                        authority_mode: r.get(1)?,
+                        topic_id: r.get(2)?,
+                    })
+                },
+            )?)
+        })
+    }
+
+    /// True if `human_id` is currently an active member of the channel owning `topic_id` in `org`.
+    pub fn human_is_active_member_of_topic(
+        &self,
+        org: &str,
+        human_id: &str,
+        topic_id: &str,
+    ) -> Result<bool> {
+        self.read_tx(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                     FROM human_room_members m
+                     JOIN human_rooms r ON r.id=m.room
+                    WHERE r.org=? AND r.topic_id=?
+                      AND m.kind='human' AND m.member=? AND m.removed IS NULL
+                 )",
+                params![org, topic_id, human_id],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    /// Known human principals `(id, name)` recorded for `org`.
+    pub fn org_human_principals(&self, org: &str) -> Result<Vec<(String, String)>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT id, COALESCE(name,'') FROM human_principals WHERE org=? ORDER BY id",
+                [org],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?)
+        })
+    }
+
+    /// Read stored mention metadata for one post id, if committed.
+    pub fn human_room_post_meta(&self, post_id: &str) -> Result<Option<HumanPostMeta>> {
+        self.read_tx(|conn| {
+            let row = conn.query_opt(
+                "SELECT silent, outcomes_json FROM human_room_post_meta WHERE post_id=?",
+                [post_id],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, String>(1)?)),
+            )?;
+            Ok(row.map(|(silent, raw)| HumanPostMeta {
+                silent,
+                outcomes: serde_json::from_str(&raw).unwrap_or_default(),
+            }))
         })
     }
 

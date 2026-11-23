@@ -212,6 +212,10 @@ dialog.notification-popover.notification-settings[open] { display: block; }
 .notification-toast p { margin-block: .25rem; color: var(--color-ink-400); font-size: var(--text-label); }
 .notification-toast .lnk { font-size: var(--text-label); }
 
+body:has(dialog.threads-context-sheet[open], dialog.threads-create-sheet[open]) .notification-toast-stack {
+  display: none;
+}
+
 @media (max-width: 640px) {
   .notification-anchor { position: static; }
   dialog.notification-popover:not(.notification-settings) {

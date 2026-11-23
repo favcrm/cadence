@@ -13,7 +13,8 @@ import { navigate } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import SectionTabs from "../../ui/SectionTabs";
-import { teammateMentionCandidates, useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
+import { buildMentionCandidates } from "../mentions/candidates";
+import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import "./issues.css";
 import KickoffDialog from "./KickoffDialog";
 import IdeaCard from "../home/IdeaCard";
@@ -364,26 +365,11 @@ function PageBody({
               onWrite={onWrite}
               onError={onError}
               onOpen={onOpen}
-              mentionCandidates={[
-                ...(agents?.agents ?? [])
-                  .filter(
-                    (a) =>
-                      !a.inbox &&
-                      a.provider !== "inbox" &&
-                      !a.dead &&
-                      a.alias !== "master" &&
-                      a.role !== "reviewer",
-                  )
-                  .map((a) => ({
-                    id: a.alias,
-                    handle: a.alias,
-                    label: a.alias,
-                    kind: "agent" as const,
-                    subtitle: a.role ?? undefined,
-                    active: true,
-                  })),
-                ...teammateMentionCandidates(teammates, t("Teammate · notify")),
-              ]}
+              mentionCandidates={buildMentionCandidates(
+                agents?.agents,
+                teammates,
+                t("Teammate · notify"),
+              )}
             />
           )}
           {activeTab === "conversation" &&

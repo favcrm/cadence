@@ -962,7 +962,6 @@ impl Shared {
         "message_list",
         "message_report",
         "agent_requests",
-        "agent_answer",
         "agent_inbox",
         "agent_inbox_ack",
         "memory_match",
@@ -989,15 +988,29 @@ impl Shared {
         }
         let check_member_authority = |who: &Who| -> Result<()> {
             if let Who::Agent(alias) = who {
-                if let Some((_, mode)) = self.store.running_channel_authority(alias)? {
-                    if mode == "member" && !Self::MEMBER_CHANNEL_TURN_ALLOWED_RPCS.contains(&method)
-                    {
-                        return Err(Error::invalid(
-                            "member_authority_refused",
-                            format!(
-                                "{method} refused: member channel turn cannot invoke privileged operations"
-                            ),
-                        ));
+                if let Some(turn) = self.store.running_channel_authority(alias)? {
+                    if turn.authority_mode == "member" {
+                        if !Self::MEMBER_CHANNEL_TURN_ALLOWED_RPCS.contains(&method) {
+                            return Err(Error::invalid(
+                                "member_authority_refused",
+                                format!(
+                                    "{method} refused: member channel turn cannot invoke privileged operations"
+                                ),
+                            ));
+                        }
+                        if matches!(method, "topic_read" | "topic_publish") {
+                            let same_channel = turn.topic_id.as_deref().is_some_and(|tid| {
+                                params.get("topic").and_then(Value::as_str) == Some(tid)
+                            });
+                            if !same_channel {
+                                return Err(Error::invalid(
+                                    "member_authority_refused",
+                                    format!(
+                                        "{method} refused: member channel turn is restricted to its originating channel"
+                                    ),
+                                ));
+                            }
+                        }
                     }
                 }
             }

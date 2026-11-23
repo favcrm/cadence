@@ -23,6 +23,7 @@ import {
   type RolesState,
 } from "./agentRoles";
 import { AGENT_TABS, type AgentTab } from "./agentTabModel";
+import { isShareableAgent } from "../mentions/candidates";
 import {
   agentHoldsWorkButDead,
   agentLocation,
@@ -393,7 +394,7 @@ export default function AgentPage({
         .join(" · ");
   const isMaster = companyMaster || alias === MASTER;
   const showHomeCta = isMaster && !hired && !mailbox;
-  const showChannelsCta = !isMaster && !hired && !mailbox && Boolean(profile);
+  const showChannelsCta = !isMaster && !mailbox && Boolean(profile && isShareableAgent(profile));
   const unknownOverview501 = section === "overview" && rosterLoaded && !hired && !profile && notServed;
 
   return (

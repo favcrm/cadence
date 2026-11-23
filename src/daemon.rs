@@ -3700,6 +3700,9 @@ impl Shared {
                         continue;
                     }
                     let mut j = agent.to_json();
+                    if self.store.assistant_for_alias(&agent.alias)?.is_some() {
+                        j["personal_assistant"] = json!(true);
+                    }
                     let mut tasks = open_tasks.remove(&agent.alias).unwrap_or_default();
                     tasks.retain(|task| {
                         identity::scope_allows_issue(
@@ -5482,6 +5485,7 @@ impl Shared {
             "human_room_remove" => self.rpc_human_room_remove(params, peer_pid),
             "human_agents_list" => self.rpc_human_agents_list(params, peer_pid),
             "human_room_ask" => self.rpc_human_room_ask(params, peer_pid),
+            "issue_comment_mentions" => self.rpc_issue_comment_mentions(params, peer_pid),
             "board_session_member" => self.rpc_board_session_member(params, peer_pid),
             "operator_session_logout" => self.rpc_operator_session_logout(params, peer_pid),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params, peer_pid),

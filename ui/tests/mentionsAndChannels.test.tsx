@@ -5,6 +5,7 @@ declare const process: { exitCode?: number };
 import type * as ReactModule from "react";
 import type { Root } from "react-dom/client";
 import type * as MentionsModule from "../src/features/mentions/mentions";
+import type * as CandidatesModule from "../src/features/mentions/candidates";
 import type * as PickerModule from "../src/features/mentions/MentionPicker";
 import type * as HumanThreadsModule from "../src/features/threads/HumanThreads";
 import type * as NewConvModule from "../src/features/threads/NewHumanConversation";
@@ -99,6 +100,7 @@ async function main(): Promise<void> {
     startsWithNote,
   } = require<typeof MentionsModule>("../src/features/mentions/mentions");
   const MentionPicker = require<typeof PickerModule>("../src/features/mentions/MentionPicker").default;
+  const { isShareableAgent } = require<typeof CandidatesModule>("../src/features/mentions/candidates");
   const { HumanContextPanel, HumanRoomTimeline } = require<typeof HumanThreadsModule>("../src/features/threads/HumanThreads");
   const NewHumanConversation = require<typeof NewConvModule>("../src/features/threads/NewHumanConversation").default;
   const { HomeMentionHandoffCard, findMentionedTeammates } = require<typeof HandoffModule>("../src/features/mentions/HomeMentionHandoff");
@@ -147,6 +149,7 @@ async function main(): Promise<void> {
     root.render(
       React.createElement(LocaleProvider, null,
         React.createElement(MentionPicker, {
+          placement: "below",
           candidates: filtered,
           highlighted: 0,
           onHighlight: () => {},
@@ -156,6 +159,7 @@ async function main(): Promise<void> {
     );
   });
   await flush();
+  assert(host.querySelector(".mention-picker")?.getAttribute("data-placement") === "below", "MentionPicker supports placement='below'");
   assert(host.textContent?.includes("In this channel") && host.textContent?.includes("Not in channel"), "MentionPicker groups active and unavailable candidates");
   const disabledOpt = host.querySelector<HTMLButtonElement>('[aria-disabled="true"] button');
   assert(disabledOpt?.disabled === true, "unavailable candidate button is disabled");
@@ -269,6 +273,19 @@ async function main(): Promise<void> {
     unread: 0,
   };
 
+  equal(
+    [
+      { alias: "dev", inbox: false, provider: "fake", dead: false, role: "worker", personal_assistant: false },
+      { alias: "personal", inbox: false, provider: "pi", dead: false, role: "worker", personal_assistant: true },
+      { alias: "assist-ana", inbox: false, provider: "pi", dead: false, role: "worker" },
+      { alias: "master", inbox: false, provider: "pi", dead: false, role: "worker" },
+      { alias: "rev-1", inbox: false, provider: "pi", dead: false, role: "reviewer" },
+      { alias: "mail", inbox: false, provider: "inbox", dead: false, role: "worker" },
+    ].filter((a) => isShareableAgent(a)).map((a) => a.alias),
+    ["dev"],
+    "isShareableAgent excludes personal_assistant, assist-*, master, reviewer, and inbox agents",
+  );
+
   await React.act(async () => {
     root.render(
       React.createElement(LocaleProvider, null,
@@ -279,6 +296,7 @@ async function main(): Promise<void> {
             refresh: 0,
             onState: () => {},
             onOpenContext: () => {},
+            detailsOpen: true,
             onInvite: () => {},
             onChanged: () => {},
             isDm: false,
@@ -313,6 +331,10 @@ async function main(): Promise<void> {
   for (let i = 0; i < 6; i += 1) await flush();
 
   assert(host.querySelectorAll("select").length === 0, "Channels and ThreadComposerFrame render zero native <select> elements");
+  assert(
+    host.querySelector(".threads-context-toggle")?.getAttribute("aria-expanded") === "true",
+    "Details button forwards aria-expanded to DOM Button element",
+  );
   assert(host.querySelector(".threads-composer-dock") !== null, "floating composer dock is rendered");
   assert(host.textContent?.includes("Silent note"), "silent post displays Silent note tag");
   assert(host.textContent?.includes("@dev · queued") && host.textContent?.includes("@maya · blocked in DM"), "renders server mention outcome pills");

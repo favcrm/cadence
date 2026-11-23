@@ -2671,3 +2671,5 @@ fn human_room_signed_owner_ask_has_opaque_idempotent_receipt() {
 
 #[path = "cad2711_channels_mentions_acceptance.rs"]
 mod cad2711_channels_mentions_acceptance;
+#[path = "cad2711_independent_gate_acceptance.rs"]
+mod cad2711_independent_gate_acceptance;

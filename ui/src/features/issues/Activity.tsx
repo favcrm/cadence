@@ -6,6 +6,7 @@ import type { IssueHistoryEntry } from "../../lib/types";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import MentionPicker from "../mentions/MentionPicker";
+import { handleMentionKeyDown } from "../mentions/candidates";
 import {
   applyMention,
   filterMentionCandidates,
@@ -208,6 +209,7 @@ export function Activity({
             <div className="relative">
               {mentionMatches.length > 0 && (
                 <MentionPicker
+                  placement="below"
                   candidates={mentionMatches}
                   highlighted={mentionHiClamped}
                   onHighlight={setMentionHi}
@@ -231,30 +233,15 @@ export function Activity({
                 onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
                 onKeyDown={(e) => {
                   if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
-                  if (mentionMatches.length === 0 || !activeMention) return;
-                  if (e.key === "ArrowDown" && selectableIndices.length > 0) {
-                    e.preventDefault();
-                    const cur = selectableIndices.indexOf(mentionHiClamped);
-                    setMentionHi(selectableIndices[cur < 0 ? 0 : Math.min(cur + 1, selectableIndices.length - 1)]!);
-                    return;
-                  }
-                  if (e.key === "ArrowUp" && selectableIndices.length > 0) {
-                    e.preventDefault();
-                    const cur = selectableIndices.indexOf(mentionHiClamped);
-                    setMentionHi(selectableIndices[cur <= 0 ? 0 : cur - 1]!);
-                    return;
-                  }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setMentionOffFor(mentionSpanKey);
-                    return;
-                  }
-                  if (mentionHiClamped >= 0 && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
-                    e.preventDefault();
-                    const picked = mentionMatches[mentionHiClamped];
-                    if (picked) completeMention(picked);
-                  }
+                  if (!activeMention) return;
+                  handleMentionKeyDown(e, {
+                    matches: mentionMatches,
+                    selectableIndices,
+                    highlightedIndex: mentionHiClamped,
+                    onHighlight: setMentionHi,
+                    onSelect: completeMention,
+                    onDismiss: () => setMentionOffFor(mentionSpanKey),
+                  });
                 }}
                 placeholder={t("Add an update or a question…")}
               />

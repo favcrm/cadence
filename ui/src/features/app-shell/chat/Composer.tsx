@@ -15,6 +15,7 @@ import { parseSlash, SLASH_COMMANDS, slashMatches, WORKSPACE_SKILLS_COMMAND, typ
 import type { PendingAttachment } from "../../home/thread";
 import WorkspaceSkillPicker from "../../home/WorkspaceSkillPicker";
 import MentionPicker from "../../mentions/MentionPicker";
+import { handleMentionKeyDown } from "../../mentions/candidates";
 import {
   applyMention,
   filterMentionCandidates,
@@ -764,36 +765,18 @@ export default function Composer({
   };
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
-    if (mentionMatches.length > 0 && activeMention) {
-      if (e.key === "ArrowDown" && selectableMentionIndices.length > 0) {
-        e.preventDefault();
-        const curPos = selectableMentionIndices.indexOf(mentionHiClamped);
-        const nextPos = curPos < 0 ? 0 : Math.min(curPos + 1, selectableMentionIndices.length - 1);
-        setMentionHi(selectableMentionIndices[nextPos]!);
-        return;
-      }
-      if (e.key === "ArrowUp" && selectableMentionIndices.length > 0) {
-        e.preventDefault();
-        const curPos = selectableMentionIndices.indexOf(mentionHiClamped);
-        const prevPos = curPos <= 0 ? 0 : curPos - 1;
-        setMentionHi(selectableMentionIndices[prevPos]!);
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        setMentionOffFor(mentionSpanKey);
-        return;
-      }
-      if (
-        mentionHiClamped >= 0 &&
-        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))
-      ) {
-        e.preventDefault();
-        const picked = mentionMatches[mentionHiClamped];
-        if (picked) completeMention(picked);
-        return;
-      }
+    if (
+      activeMention &&
+      handleMentionKeyDown(e, {
+        matches: mentionMatches,
+        selectableIndices: selectableMentionIndices,
+        highlightedIndex: mentionHiClamped,
+        onHighlight: setMentionHi,
+        onSelect: completeMention,
+        onDismiss: () => setMentionOffFor(mentionSpanKey),
+      })
+    ) {
+      return;
     }
     if (matches.length) {
       if (e.key === "ArrowDown") {

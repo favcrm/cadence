@@ -15,6 +15,11 @@
   overflow-y: auto;
 }
 
+.mention-picker[data-placement="below"] {
+  top: calc(100% + 0.375rem);
+  bottom: auto;
+}
+
 .mention-picker-group {
   padding: 0.3rem 0.55rem 0.2rem;
   font-size: var(--text-micro);

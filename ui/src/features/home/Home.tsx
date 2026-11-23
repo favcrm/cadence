@@ -11,8 +11,9 @@ import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview
 import Link from "../../ui/Link";
 import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
-import { HomeMentionHandoffCard, findMentionedTeammates } from "../mentions/HomeMentionHandoff";
-import { teammateMentionCandidates, useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
+import { buildMentionCandidates } from "../mentions/candidates";
+import { HomeMentionHandoffCard, useHomeMentionHandoff } from "../mentions/HomeMentionHandoff";
+import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import {
   composerBlock,
   kvRows,
@@ -964,36 +965,11 @@ function MasterHome({
   const dockRef = useRef<HTMLDivElement | null>(null);
   /** Older history just paged in above: not an arrival, never a pill. */
   const earlierLanded = useRef(false);
-  const [draftText, setDraftText] = useState("");
-  const [handoffHold, setHandoffHold] = useState(false);
-  const approvedPrivateDraftRef = useRef<string | null>(null);
   const homeMentionCandidates = useMemo(
-    () => [
-      ...(agents.data?.agents ?? [])
-        .filter(
-          (a) =>
-            !a.inbox &&
-            a.provider !== "inbox" &&
-            !a.dead &&
-            a.alias !== MASTER &&
-            a.role !== "reviewer",
-        )
-        .map((a) => ({
-          id: a.alias,
-          handle: a.alias,
-          label: a.alias,
-          kind: "agent" as const,
-          subtitle: a.role ?? undefined,
-          active: true,
-        })),
-      ...teammateMentionCandidates(teammates, t("Teammate · consent to share")),
-    ],
+    () => buildMentionCandidates(agents.data?.agents, teammates, t("Teammate · consent to share"), MASTER),
     [agents.data?.agents, teammates, t],
   );
-  const mentionedTeammates = useMemo(
-    () => findMentionedTeammates(draftText, homeMentionCandidates),
-    [draftText, homeMentionCandidates],
-  );
+  const mentionHandoff = useHomeMentionHandoff(homeMentionCandidates, dockRef);
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
@@ -1906,16 +1882,6 @@ function MasterHome({
                 resolveAppPath={resolveAppPath}
               />
             )}
-            <HomeMentionHandoffCard
-              teammates={mentionedTeammates}
-              sendBlockedForConsent={handoffHold}
-              onOpenChannels={() => navigate("/threads")}
-              onKeepPrivate={() => {
-                approvedPrivateDraftRef.current = draftText.trim();
-                setHandoffHold(false);
-                dockRef.current?.querySelector<HTMLFormElement>("form[data-composer]")?.requestSubmit();
-              }}
-            />
             <Composer
               block={block}
               seed={seed}
@@ -1927,35 +1893,21 @@ function MasterHome({
               onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
               mentionCandidates={homeMentionCandidates}
               allowNote
-              onDraftChange={(next) => {
-                setDraftText(next);
-                if (next.trim() !== approvedPrivateDraftRef.current) {
-                  approvedPrivateDraftRef.current = null;
-                }
-                if (findMentionedTeammates(next, homeMentionCandidates).length === 0) {
-                  setHandoffHold(false);
-                }
-              }}
-              beforeSend={(outgoing) => {
-                const normalized = outgoing.trim();
-                if (
-                  findMentionedTeammates(normalized, homeMentionCandidates).length > 0 &&
-                  approvedPrivateDraftRef.current !== normalized
-                ) {
-                  setHandoffHold(true);
-                  return false;
-                }
-                approvedPrivateDraftRef.current = null;
-                setHandoffHold(false);
-                return true;
-              }}
+              onDraftChange={mentionHandoff.onDraftChange}
+              beforeSend={mentionHandoff.beforeSend}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly
-                ? "The board is read-only."
+                ? t("The board is read-only.")
                 : missing
-                  ? "The Master conversation is unavailable."
-                  : "A Home conversation must be ready before attaching files."}
+                  ? t("The Master conversation is unavailable.")
+                  : t("A Home conversation must be ready before attaching files.")}
+            />
+            <HomeMentionHandoffCard
+              teammates={mentionHandoff.mentionedTeammates}
+              sendBlockedForConsent={mentionHandoff.handoffHold}
+              onOpenChannels={() => navigate("/threads")}
+              onKeepPrivate={mentionHandoff.onKeepPrivate}
             />
           </div>
         </div>
