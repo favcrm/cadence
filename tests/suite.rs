@@ -19624,6 +19624,18 @@ fn cad224_intake_replay_and_stale_source_blocks_dispatch() {
         "acceptance",
     )
     .unwrap();
+    cadence_agent::issue::edit::edit(
+        &pm,
+        "CAD-1",
+        &cadence_agent::issue::edit::EditSpec {
+            set: vec!["paths=src/module.rs".into()],
+            acceptance: Some("- [ ] Existing integration is accounted for\n".into()),
+            ..Default::default()
+        },
+        "acceptance",
+        None,
+    )
+    .unwrap();
     let existing = pm.dir.join("cadence/CAD-1/issue.md");
     let original = std::fs::read(&existing).unwrap();
     let draft = r#"---
@@ -19700,6 +19712,22 @@ depends_on: 1
     )
     .is_err());
     assert_eq!(issue_count(), count);
+    let mismatched = draft.replace(
+        "Existing integration is accounted for",
+        "A different integration is accounted for",
+    );
+    assert!(plan::propose(
+        &pm,
+        "cadence",
+        &mismatched,
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .is_err());
+    assert_eq!(issue_count(), count);
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
 
     let refusal = write::decide_plan(&pm, &epic, true, "operator", None).unwrap_err();
     assert_eq!(
@@ -19737,10 +19765,19 @@ depends_on: 1
     let fresh = revised_tickets[0];
     assert_eq!(std::fs::read(&existing).unwrap(), original);
     write::decide_plan(&pm, revised_epic, true, "operator", None).unwrap();
-    plan::gate_id(&pm.dir, &fresh).unwrap();
+    drop(pm);
+    let pm = Pm::at(&pm_path).unwrap();
+    plan::gate_id(&pm.dir, fresh).unwrap();
+    let revised_text =
+        std::fs::read_to_string(pm.dir.join("cadence").join(fresh).join("issue.md")).unwrap();
+    let (revised_front, _) = cadence_agent::issue::parse::parse_issue(&revised_text).unwrap();
+    let blocked = cadence_agent::issue::blocked::check_ready(&pm.dir, &revised_front)
+        .unwrap_err()
+        .to_string();
+    assert!(blocked.contains("CAD-1"), "{blocked}");
     std::fs::write(repo.join("docs/scope.md"), "Revised scope\n").unwrap();
     git(&repo, &["add", "docs/scope.md"]);
     git(&repo, &["commit", "-qm", "Revise scope"]);
-    let refusal = plan::gate_id(&pm.dir, &fresh).unwrap_err();
+    let refusal = plan::gate_id(&pm.dir, fresh).unwrap_err();
     assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
 }

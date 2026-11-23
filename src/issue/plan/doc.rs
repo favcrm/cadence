@@ -261,15 +261,14 @@ fn parse_ticket(n: usize, count: usize, heading: &str, text: &str, intake: bool)
                             "{label}: duplicate {key} item '{item}'"
                         )));
                     }
-                    if key == "paths" {
-                        crate::issue::areas::check_path(item)
-                            .map_err(|e| Error::rejected(format!("{label}: {e}")))?;
-                    }
                 }
                 if key == "sources" {
                     sources = Some(items);
                 } else {
-                    paths = Some(items);
+                    paths = Some(
+                        crate::issue::areas::parse_paths(list)
+                            .map_err(|e| Error::rejected(format!("{label}: {e}")))?,
+                    );
                 }
             }
             "reuse" if intake => {

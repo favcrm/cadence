@@ -487,18 +487,25 @@ fn unconfigured(project: &str, revision: Option<String>) -> PinnedContext {
 /// bounded readers and allowlist the board's context query uses; never
 /// accepts a caller-supplied path or revision.
 pub fn pin(selected: &project::Project, role: Option<&str>) -> PinnedContext {
-    pin_context(selected, role, false)
+    pin_context(selected, role, None)
 }
 
-/// Pin the registered project's sources for planning, independently of delivery opt-in.
-pub(crate) fn pin_for_plan(selected: &project::Project) -> PinnedContext {
-    pin_context(selected, None, true)
+/// Pin required and cited sources for planning, independently of delivery opt-in.
+pub(crate) fn pin_for_plan(
+    selected: &project::Project,
+    cited: impl Fn(&str) -> bool,
+) -> PinnedContext {
+    pin_context(selected, None, Some(&cited))
 }
 
-fn pin_context(selected: &project::Project, role: Option<&str>, plan: bool) -> PinnedContext {
+fn pin_context(
+    selected: &project::Project,
+    role: Option<&str>,
+    cited: Option<&dyn Fn(&str) -> bool>,
+) -> PinnedContext {
     let unavailable = |revision: Option<String>, message: String| {
         let mut context = unconfigured(&selected.key, revision);
-        if plan {
+        if cited.is_some() {
             context.errors.push(shorten(&message, MAX_REASON_BYTES).0);
         }
         context
@@ -556,7 +563,7 @@ fn pin_context(selected: &project::Project, role: Option<&str>, plan: bool) -> P
             )
         }
     };
-    if !plan && !manifest.agent_delivery {
+    if cited.is_none() && !manifest.agent_delivery {
         // Explicit opt-in is required. An existing Overview/Project Context
         // manifest without it must not change dispatch behavior, and the
         // board reader keeps using the manifest as before.
@@ -578,17 +585,27 @@ fn pin_context(selected: &project::Project, role: Option<&str>, plan: bool) -> P
     let canonical = role.map(canonical_role);
     let mut documents = Vec::new();
     for document in manifest.documents.iter().take(MAX_MANIFEST_ENTRIES) {
-        let selected_here = canonical.is_none()
-            || document.required
-            || document.roles.is_empty()
-            || canonical.is_some_and(|role| {
-                document
-                    .roles
-                    .iter()
-                    .any(|candidate| candidate.as_str() == role)
-            });
+        let selected_here = if let Some(cited) = cited {
+            document.required || cited(&document.id)
+        } else {
+            canonical.is_none()
+                || document.required
+                || document.roles.is_empty()
+                || canonical.is_some_and(|role| {
+                    document
+                        .roles
+                        .iter()
+                        .any(|candidate| candidate.as_str() == role)
+                })
+        };
         let selection_reason = if document.required {
             "required".to_string()
+        } else if cited.is_some() {
+            if selected_here {
+                "cited".to_string()
+            } else {
+                "excluded:not-cited".to_string()
+            }
         } else if let Some(role) = canonical {
             if document.roles.is_empty() {
                 "optional-default".to_string()
@@ -696,28 +713,16 @@ pub(crate) fn check_plan_paths<'a>(
             ));
         }
         let literal = path.strip_suffix('/').unwrap_or(path);
-        let parts: Vec<&str> = literal.split('/').collect();
-        for index in 0..parts.len() {
-            let prefix = parts[..=index].join("/");
-            let entry = tree_entry(&root, revision, &prefix)
-                .map_err(|error| refusal(error.state(), &error.reason()))?
-                .ok_or_else(|| refusal("missing", "not tracked at the pinned revision"))?;
-            let is_tree = entry.kind == "tree" && entry.mode == "040000";
-            let is_file =
-                entry.kind == "blob" && matches!(entry.mode.as_str(), "100644" | "100755");
-            if index + 1 < parts.len() {
-                if !is_tree {
-                    return Err(refusal(
-                        "invalid_path",
-                        "a parent is not a tracked directory",
-                    ));
-                }
-            } else if !is_tree && (!is_file || path.ends_with('/')) {
-                return Err(refusal(
-                    "invalid_path",
-                    "not a tracked regular file or directory",
-                ));
-            }
+        let entry = tree_entry(&root, revision, literal)
+            .map_err(|error| refusal(error.state(), &error.reason()))?
+            .ok_or_else(|| refusal("missing", "not tracked at the pinned revision"))?;
+        let is_tree = entry.kind == "tree" && entry.mode == "040000";
+        let is_file = entry.kind == "blob" && matches!(entry.mode.as_str(), "100644" | "100755");
+        if !is_tree && (!is_file || path.ends_with('/')) {
+            return Err(refusal(
+                "invalid_path",
+                "not a tracked regular file or directory",
+            ));
         }
     }
     Ok(())

@@ -1,13 +1,14 @@
 //! Versioned source and scope evidence for ordinary goal-intake plans.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use super::{PlanDoc, Ticket};
 use crate::delegation::sha256_hex;
 use crate::error::{Error, Result};
-use crate::issue::{areas, context, model::Front, project::Project};
+use crate::issue::{areas, context, model::Front, parse, project::Project};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct GoalIntake {
@@ -47,8 +48,8 @@ fn stale(detail: impl std::fmt::Display) -> Error {
     )
 }
 
-fn snapshot(project: &Project) -> Result<context::PinnedContext> {
-    let pinned = context::pin_for_plan(project);
+fn snapshot(project: &Project, cited: impl Fn(&str) -> bool) -> Result<context::PinnedContext> {
+    let pinned = context::pin_for_plan(project, cited);
     if pinned.state != "ready" || pinned.revision.is_none() {
         let detail = pinned.errors.join("; ");
         return Err(Error::invalid(
@@ -79,7 +80,12 @@ impl GoalIntake {
             .request_digest
             .as_ref()
             .ok_or_else(|| Error::internal("goal intake has no request digest"))?;
-        let pinned = snapshot(project)?;
+        let cited: BTreeSet<&str> = doc
+            .tickets
+            .iter()
+            .flat_map(|ticket| ticket.sources.iter().map(String::as_str))
+            .collect();
+        let pinned = snapshot(project, |id| cited.contains(id))?;
         let revision = pinned.revision.as_deref().unwrap_or_default();
         let mut sources = BTreeMap::new();
         for id in pinned
@@ -136,6 +142,23 @@ impl GoalIntake {
     }
 
     pub(crate) fn record(&mut self, front: &Front, body: &str, ticket: &Ticket) -> Result<()> {
+        if ticket.reuse.is_some() {
+            let acceptance = parse::acceptance_items(body);
+            let scope_matches = ticket.paths.iter().all(|path| front.paths.contains(path))
+                && ticket
+                    .acceptance
+                    .iter()
+                    .all(|item| acceptance.iter().any(|existing| existing.text == item.text));
+            if !scope_matches {
+                return Err(Error::invalid(
+                    "plan_reuse_scope",
+                    format!(
+                        "reused issue {} does not already declare the mapped paths and acceptance",
+                        front.id
+                    ),
+                ));
+            }
+        }
         self.outcomes.insert(
             front.id.clone(),
             Outcome {
@@ -174,7 +197,9 @@ impl GoalIntake {
             .outcomes
             .get(&front.id)
             .ok_or_else(|| stale(format!("{} has no recorded outcome", front.id)))?;
-        if outcome.scope_digest != scope_digest(front, body)? {
+        if (outcome.reused && front.status == "dropped")
+            || outcome.scope_digest != scope_digest(front, body)?
+        {
             return Err(stale(format!("{} scope or acceptance changed", front.id)));
         }
         Ok(())
@@ -182,17 +207,26 @@ impl GoalIntake {
 
     /// Required context applies to the entire plan; optional documents only
     /// invalidate the outcomes that cite them. Unrelated commits are safe.
-    pub(crate) fn require_sources(&self, project: &Project, issue: Option<&str>) -> Result<()> {
-        let pinned = snapshot(project).map_err(stale)?;
+    pub(crate) fn require_sources(&self, project: &Project, issue: Option<&Front>) -> Result<()> {
+        let affected = || {
+            self.outcomes.iter().filter(move |(id, outcome)| {
+                issue.is_none_or(|front| {
+                    &front.id == *id || (outcome.reused && front.blocked_by.contains(id))
+                })
+            })
+        };
+        let cited: BTreeSet<&str> = affected()
+            .flat_map(|(_, outcome)| outcome.sources.iter().map(String::as_str))
+            .collect();
+        let pinned = snapshot(project, |id| cited.contains(id)).map_err(stale)?;
         let revision = pinned.revision.as_deref().unwrap_or_default();
-        let outcome = issue.and_then(|id| self.outcomes.get(id));
         for doc in &pinned.documents {
             if doc.required && self.sources.get(&doc.id).is_none_or(|src| !src.required) {
                 return Err(stale(format!("new required context source '{}'", doc.id)));
             }
         }
         for (id, expected) in &self.sources {
-            if !expected.required && outcome.is_some_and(|o| !o.sources.contains(id)) {
+            if !expected.required && !cited.contains(id.as_str()) {
                 continue;
             }
             let matches = pinned.documents.iter().any(|doc| {
@@ -207,10 +241,7 @@ impl GoalIntake {
                 )));
             }
         }
-        let paths: std::collections::BTreeSet<&str> = self
-            .outcomes
-            .iter()
-            .filter(|(id, _)| issue.is_none_or(|expected| expected == id.as_str()))
+        let paths: std::collections::BTreeSet<&str> = affected()
             .flat_map(|(_, outcome)| outcome.paths.iter().map(String::as_str))
             .collect();
         context::check_plan_paths(project, revision, paths).map_err(|(_, detail)| stale(detail))
@@ -222,6 +253,16 @@ fn scope_digest(front: &Front, body: &str) -> Result<String> {
     for path in &front.paths {
         areas::check_path(path)?;
     }
+    // Checking off existing criteria does not amend the approved scope.
+    let mut acceptance = parse::acceptance_items(body);
+    let body = if acceptance.is_empty() {
+        Cow::Borrowed(body)
+    } else {
+        for item in &mut acceptance {
+            item.checked = false;
+        }
+        Cow::Owned(parse::replace_acceptance(body, &acceptance)?)
+    };
     let scope = serde_json::to_vec(&(&front.title, &front.paths, &front.blocked_by, body.trim()))
         .map_err(|err| Error::internal(format!("could not encode issue scope: {err}")))?;
     Ok(sha256_hex(&scope))

@@ -303,8 +303,11 @@ least one), and optional `unknowns`. Put `sources:` (registered project
 context document IDs) and `paths:` (tracked module paths) immediately under
 each ticket heading. Use the nearest tracked directory for a new file. Every
 outcome needs an Acceptance checklist; `reuse: ISSUE-ID` maps it to an
-existing issue in this project without editing that issue or its dependencies.
-Other outcomes can depend on it by section number or issue ID.
+existing issue in this project. It must already declare the mapped paths
+and acceptance criteria. Reuse counts toward progress but does not assign it,
+edit it, or grant permission to run it under this plan. A new outcome can
+depend on it by section number or issue ID; that dependency retains its own
+approval and dispatch rules.
 
 `cadence plan show EPIC` reports the pinned commit, document digests and
 outcome scopes, with the reason if evidence is blocked. Exact retries return

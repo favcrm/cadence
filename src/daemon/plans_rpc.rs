@@ -248,6 +248,9 @@ impl Shared {
     /// run's own resume kick now, identically to an operator's
     /// `plan approve` (bounded — dedupe uses `decided_at`).
     fn finish_plan_proposed(self: &Arc<Self>, out: Value, workflow: Option<&str>) -> Result<Value> {
+        if out["replayed"].as_bool() == Some(true) {
+            return Ok(out);
+        }
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "plan_proposed",

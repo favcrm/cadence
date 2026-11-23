@@ -50,7 +50,7 @@ pub fn create_plan(
             }));
         }
         if let Some(id) = &input.revises {
-            intake_predecessor(&issues, id)?;
+            intake_predecessor(&issues, &project.key, id)?;
         }
         issues
     } else {
@@ -153,7 +153,7 @@ pub fn create_plan(
             .depends_on
             .iter()
             .map(|d| match d {
-                Dep::Ticket(k) => outcome_ids[k].to_string(),
+                Dep::Ticket(k) => outcome_ids[*k].to_string(),
                 Dep::Issue(i) => i.clone(),
             })
             .collect();
@@ -237,10 +237,14 @@ pub fn create_plan(
     Ok(out)
 }
 
-fn intake_predecessor<'a>(issues: &'a [board::Issue], id: &str) -> Result<&'a board::Issue> {
+fn intake_predecessor<'a>(
+    issues: &'a [board::Issue],
+    project: &str,
+    id: &str,
+) -> Result<&'a board::Issue> {
     let issue = issues
         .iter()
-        .find(|issue| issue.front.id == id)
+        .find(|issue| issue.front.id == id && issue.project == project)
         .ok_or_else(|| Error::rejected(format!("{id} is not a goal intake in this project")))?;
     let intake = issue
         .front
@@ -254,6 +258,75 @@ fn intake_predecessor<'a>(issues: &'a [board::Issue], id: &str) -> Result<&'a bo
         )));
     }
     Ok(issue)
+}
+
+/// A revision must not strand retained work behind a prerequisite it retires.
+fn check_retained_dependencies(
+    issues: &[board::Issue],
+    previous: &board::Issue,
+    intake: &crate::issue::plan::GoalIntake,
+) -> Result<()> {
+    let by_id: HashMap<&str, &board::Issue> = issues
+        .iter()
+        .map(|issue| (issue.front.id.as_str(), issue))
+        .collect();
+    let mut ancestors = HashSet::new();
+    let mut retiring = HashSet::new();
+    let mut cursor = Some(previous);
+    while let Some(issue) = cursor {
+        if !ancestors.insert(issue.front.id.as_str()) {
+            return Err(Error::rejected("cyclic intake revision history"));
+        }
+        let plan = issue
+            .front
+            .plan
+            .as_ref()
+            .ok_or_else(|| Error::rejected("invalid intake revision history"))?;
+        retiring.extend(
+            plan.tickets
+                .iter()
+                .filter(|id| !intake.outcomes.contains_key(*id))
+                .map(String::as_str),
+        );
+        cursor = plan
+            .intake
+            .as_ref()
+            .and_then(|record| record.revises.as_deref())
+            .map(|id| {
+                by_id
+                    .get(id)
+                    .copied()
+                    .filter(|issue| issue.project == previous.project)
+                    .ok_or_else(|| Error::rejected(format!("intake ancestor {id} is missing")))
+            })
+            .transpose()?;
+    }
+    let mut pending: Vec<&str> = intake
+        .outcomes
+        .keys()
+        .filter_map(|id| by_id.get(id.as_str()))
+        .flat_map(|issue| issue.front.blocked_by.iter().map(String::as_str))
+        .collect();
+    let mut visited = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let dependency = by_id
+            .get(id)
+            .ok_or_else(|| Error::rejected(format!("intake dependency {id} is missing")))?;
+        if matches!(dependency.front.status.as_str(), "done" | "dropped") {
+            continue;
+        }
+        if retiring.contains(id) {
+            return Err(Error::invalid(
+                "plan_revision_strands_dependency",
+                format!("retain unfinished prerequisite {id} in this revision"),
+            ));
+        }
+        pending.extend(dependency.front.blocked_by.iter().map(String::as_str));
+    }
+    Ok(())
 }
 
 /// CAD-225: the canonical original semantics an unattended grant binds
@@ -667,7 +740,16 @@ pub fn decide_plan(
         )));
     }
     let issues = if approve {
-        board::load_all(&pm.dir, Some(&project.key))?
+        let scope = if plan
+            .intake
+            .as_ref()
+            .is_some_and(|intake| intake.revises.is_some())
+        {
+            None
+        } else {
+            Some(project.key.as_str())
+        };
+        board::load_all(&pm.dir, scope)?
     } else {
         Vec::new()
     };
@@ -691,7 +773,8 @@ pub fn decide_plan(
         }
         intake.require_sources(&project, None)?;
         if let Some(id) = &intake.revises {
-            let previous = intake_predecessor(&issues, id)?;
+            let previous = intake_predecessor(&issues, &project.key, id)?;
+            check_retained_dependencies(&issues, previous, intake)?;
             let mut prior = previous.front.clone();
             let previous_plan = prior
                 .plan

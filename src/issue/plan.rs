@@ -273,7 +273,18 @@ fn verify_intake_dispatch(pm_dir: &Path, epic: &str, front: &Front, body: &str) 
         let Some(next) = &intake.superseded_by else {
             intake.require_goal(&issue.body)?;
             intake.require_scope(front, body)?;
-            return intake.require_sources(&project, Some(front.id.as_str()));
+            for id in &front.blocked_by {
+                if intake
+                    .outcomes
+                    .get(id)
+                    .is_some_and(|outcome| outcome.reused)
+                {
+                    let dependency = board::load_issue(pm_dir, &project.key, id)
+                        .map_err(|e| unreadable(id, e))?;
+                    intake.require_scope(&dependency.front, &dependency.body)?;
+                }
+            }
+            return intake.require_sources(&project, Some(front));
         };
         let revision =
             board::load_issue(pm_dir, &project.key, next).map_err(|e| unreadable(next, e))?;
@@ -394,6 +405,15 @@ pub fn progress(tickets: &[(&str, Option<&str>)]) -> (u64, u64) {
         })
 }
 
+fn plan_outcome_ids(plan: &model::Plan) -> impl Iterator<Item = &String> {
+    plan.tickets.iter().chain(
+        plan.intake
+            .iter()
+            .flat_map(|intake| intake.outcomes.iter())
+            .filter_map(|(id, outcome)| outcome.reused.then_some(id)),
+    )
+}
+
 /// The plan block of an epic's JSON — `Value::Null` when the issue is
 /// not a plan. Tickets are the plan's own list and carry their derived status; progress is
 /// size-weighted ([`progress`]).
@@ -402,16 +422,14 @@ pub fn plan_json(epic: &board::View, views_by_id: &HashMap<String, &board::View>
         return Value::Null;
     };
     // The approved list, not whatever is parented today.
-    let kids: Vec<&&board::View> = plan
-        .tickets
-        .iter()
+    let kids: Vec<&&board::View> = plan_outcome_ids(plan)
         .filter_map(|id| views_by_id.get(id))
         .collect();
     let tickets: Vec<Value> = kids
         .iter()
         .map(|k| {
             let f = &k.issue.front;
-            json!({
+            let mut ticket = json!({
                 "id": f.id,
                 "title": f.title,
                 "status": k.status,
@@ -420,7 +438,16 @@ pub fn plan_json(epic: &board::View, views_by_id: &HashMap<String, &board::View>
                 "owner": f.owner,
                 "blocked_by": f.blocked_by,
                 "acceptance": parse::acceptance_items(&k.issue.body).len(),
-            })
+            });
+            if plan
+                .intake
+                .as_ref()
+                .and_then(|intake| intake.outcomes.get(&f.id))
+                .is_some_and(|outcome| outcome.reused)
+            {
+                ticket["reused"] = json!(true);
+            }
+            ticket
         })
         .collect();
     let pairs: Vec<(&str, Option<&str>)> = kids
@@ -502,7 +529,7 @@ pub fn ls(
             let f = &v.issue.front;
             let p = f.plan.as_ref().unwrap();
             let kids: Vec<&&board::View> =
-                p.tickets.iter().filter_map(|id| by_id.get(id)).collect();
+                plan_outcome_ids(p).filter_map(|id| by_id.get(id)).collect();
             let pairs: Vec<(&str, Option<&str>)> = kids
                 .iter()
                 .map(|k| (k.status.as_str(), k.issue.front.size.as_deref()))
