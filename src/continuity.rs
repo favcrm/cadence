@@ -81,7 +81,8 @@ pub const SOURCE_ENTRIES: i64 = 400;
 /// any script and any line length.
 pub const PREFERENCES_MAX_BYTES: usize = 4_500;
 
-// Section budgets, after quoting. Header (≤ 1,100) + preferences + plans
+// Section budgets, after quoting. Header (≤ 800, plus the thread search
+// line when there is one) + preferences + plans
 // + summary + turns + headings stay under [`PACK_MAX`], so assembly
 // never has to cut; it drops whole sections (summary, plans,
 // preferences, then the oldest turns — never the newest) if redaction
@@ -927,7 +928,10 @@ pub fn build(reason: Reason, sources: &Sources) -> Result<Option<Pack>> {
     // redaction ever grow a section past them, whole sections go —
     // summary, plans, preferences, then the oldest turns — never a cut
     // through the newest turn.
-    fit(&mut parts, PACK_MAX - HEADER_ROOM);
+    fit(
+        &mut parts,
+        PACK_MAX - HEADER_ROOM - search_line(sources.thread_search).len(),
+    );
     let body = render_body(&parts);
     let nonce: String = Sha256::digest(body.as_bytes())
         .iter()
@@ -971,9 +975,10 @@ pub fn build(reason: Reason, sources: &Sources) -> Result<Option<Pack>> {
     }))
 }
 
-/// Room the header and end line need: fixed text, a 64-byte alias, the
-/// reason's prose and the thread search line.
-const HEADER_ROOM: usize = 1_100;
+/// Room the header and end line need: fixed text, a 64-byte alias and
+/// the reason's prose. The thread search line, when there is one, is
+/// charged on top, so a pack without it keeps its whole body budget.
+const HEADER_ROOM: usize = 800;
 
 /// CAD-2663: the one line that tells the agent its own conversation can be
 /// searched, in its harness's form. Empty when the harness cannot reach it.

@@ -486,6 +486,21 @@ fn cad2663_answers_are_bounded() {
         .sum();
     assert!(bytes <= crate::thread_search::WINDOW_BYTES_MAX, "{bytes}");
     assert_eq!(window["truncated"], json!(true), "{window}");
+    // The budget never drops the hit itself, and what is kept is in order.
+    let entries = window["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e["hit"].as_bool().unwrap())
+            .count(),
+        1,
+        "{window}"
+    );
+    let created: Vec<f64> = entries
+        .iter()
+        .map(|e| e["created"].as_f64().unwrap())
+        .collect();
+    assert!(created.windows(2).all(|w| w[0] <= w[1]), "{created:?}");
 }
 
 #[test]

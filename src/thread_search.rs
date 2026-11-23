@@ -90,13 +90,21 @@ impl Query {
 
     /// Up to [`SNIPPET_MAX`] bytes of `text` around its first match.
     pub fn snippet(&self, text: &str) -> String {
-        let lower = text.to_lowercase();
-        // Lowercasing can change byte lengths outside ASCII; only an offset
-        // that is also a boundary of the original is used, else the start.
+        // Lowercase with a map from each lowercased byte back to the start
+        // of the original character, so an offset survives characters whose
+        // lowercase form has another byte length.
+        let mut lower = String::with_capacity(text.len());
+        let mut origin = Vec::with_capacity(text.len());
+        for (at, ch) in text.char_indices() {
+            for low in ch.to_lowercase() {
+                lower.push(low);
+                origin.resize(lower.len(), at);
+            }
+        }
         let at = std::iter::once(self.phrase.as_str())
             .chain(self.words.iter().map(String::as_str))
-            .filter_map(|needle| lower.find(needle))
-            .find(|at| text.is_char_boundary(*at))
+            .find_map(|needle| lower.find(needle))
+            .and_then(|at| origin.get(at).copied())
             .unwrap_or(0);
         window(text, at, SNIPPET_MAX)
     }
@@ -213,6 +221,10 @@ mod tests {
         assert!(snip.contains("needle"));
         assert!(snip.len() <= SNIPPET_MAX + 2 * '…'.len_utf8());
         assert!(snip.starts_with('…') && snip.ends_with('…'));
+        // Where lowercasing changes byte lengths, the match is still shown.
+        let q = Query::parse("Needle").unwrap();
+        let text = format!("{}Needle{}", "İ".repeat(300), "x".repeat(300));
+        assert!(q.snippet(&text).contains("Needle"), "{}", q.snippet(&text));
         let clipped = clip(&"ß".repeat(1000), 101);
         assert!(clipped.len() <= 101 + '…'.len_utf8());
         assert_eq!(clip("short", 100), "short");

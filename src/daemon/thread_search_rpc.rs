@@ -196,7 +196,7 @@ impl Shared {
                 let mut bytes = 0;
                 let mut truncated = false;
                 for (score, entry) in found.into_iter().take(limit) {
-                    let snippet = redact.text(&query.snippet(&entry.text));
+                    let snippet = query.snippet(&redact.text(&entry.text));
                     if bytes + snippet.len() > search::HITS_BYTES_MAX {
                         truncated = true;
                         break;
@@ -281,8 +281,10 @@ impl Shared {
         let mut anchor = i64::MAX;
         let complete = loop {
             let (visible, boundary, more) = self.search_batch(view, anchor, true, BATCH)?;
+            let mut skipped = false;
             for entry in visible {
                 if scanned == search::SCAN_MAX {
+                    skipped = true;
                     break;
                 }
                 scanned += 1;
@@ -291,6 +293,7 @@ impl Shared {
                 }
             }
             match boundary {
+                _ if skipped => break false,
                 Some(seq) if more && scanned < search::SCAN_MAX => anchor = seq,
                 Some(_) if more => break false,
                 _ => break true,
@@ -322,24 +325,44 @@ impl Shared {
         } else {
             (Vec::new(), None, false)
         };
-        let mut entries = Vec::new();
-        let mut bytes = 0;
-        let mut truncated = false;
-        for entry in older.into_iter().chain(newer) {
-            let text = redact.text(&search::clip(&entry.text, search::WINDOW_ENTRY_MAX));
-            if bytes + text.len() > search::WINDOW_BYTES_MAX {
-                truncated = true;
+        // The hit is charged first, then neighbours nearest first, one
+        // side then the other, so the budget never drops the hit itself.
+        let hit = older.pop().expect("the hit was checked above");
+        let mut order = vec![hit];
+        let (mut left, mut right) = (older.into_iter().rev(), newer.into_iter());
+        loop {
+            let (l, r) = (left.next(), right.next());
+            if l.is_none() && r.is_none() {
                 break;
             }
-            bytes += text.len();
-            entries.push(json!({
-                "hit": entry.seq == seq,
-                "role": entry.role,
-                "kind": entry.kind,
-                "created": entry.created,
-                "text": text,
-            }));
+            order.extend(l);
+            order.extend(r);
         }
+        let mut kept = Vec::new();
+        let mut bytes = 0;
+        let mut truncated = false;
+        for entry in order {
+            let text = search::clip(&redact.text(&entry.text), search::WINDOW_ENTRY_MAX);
+            if bytes + text.len() > search::WINDOW_BYTES_MAX {
+                truncated = true;
+                continue;
+            }
+            bytes += text.len();
+            kept.push((entry, text));
+        }
+        kept.sort_by_key(|(entry, _)| entry.seq);
+        let entries: Vec<Value> = kept
+            .into_iter()
+            .map(|(entry, text)| {
+                json!({
+                    "hit": entry.seq == seq,
+                    "role": entry.role,
+                    "kind": entry.kind,
+                    "created": entry.created,
+                    "text": text,
+                })
+            })
+            .collect();
         Ok(json!({
             "entries": entries,
             "more_before": more_before,
