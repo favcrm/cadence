@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { fmtBytes } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
@@ -20,6 +20,9 @@ import type { ArtifactKind } from "../canvas/canvasStore";
 import { Attach } from "./Attach";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { ManagedList } from "../wiki/ManagedFileViews";
+import DrawerShell from "../app-shell/shared/DrawerShell";
+import { CodeSurface } from "../../ui/Md";
+import "./evidence.css";
 
 export type DeliverablePreviewKind = Exclude<ArtifactKind, "image">;
 
@@ -240,86 +243,77 @@ function useLoadedArtifact(id: string, name: string, image: boolean) {
   };
 }
 
-function ImageArtifact({ id, name }: { id: string; name: string }) {
+function ImageArtifact({ id, name, size, open, onOpen, onClose }: {
+  id: string; name: string; size: number; open: boolean;
+  onOpen: (button: HTMLElement) => void; onClose: () => void;
+}) {
   const t = useTranslate();
   const displayName = deliverableDisplayName(name);
   const { ready, failed, setFailed, retry } = useLoadedArtifact(id, name, true);
   if (ready && !failed) {
     return (
-      <a
-        className="block min-w-0 truncate"
-        href={ready.url}
-        download={ready.preview ? undefined : displayName}
-        target={ready.preview ? "_blank" : undefined}
-        rel={ready.preview ? "noreferrer" : undefined}
-        title={name}
-      >
+      <>
         {ready.preview ? (
-          <img
-            src={ready.preview}
-            alt={displayName}
-            className="w-full h-28 object-cover bg-ink-900"
-            onError={() => setFailed(true)}
-          />
+          <button type="button" className="issue-evidence-image" aria-label={`${t("Preview")} ${displayName}`}
+            aria-haspopup="dialog" aria-expanded={open} onClick={(event) => onOpen(event.currentTarget)}>
+            <img src={ready.preview} alt={displayName} className="w-full h-28 object-cover bg-ink-900"
+              onError={() => setFailed(true)} />
+          </button>
         ) : (
-          displayName
+          <a className="block min-w-0 truncate" href={ready.url} download={displayName} title={name}>
+            {displayName}
+          </a>
         )}
-      </a>
+        {open && ready.preview && (
+          <DrawerShell kind="issue-evidence" label={`${t("Preview")} ${displayName}`} title={displayName}
+            subtitle={fmtBytes(size)} scrim="board" size="lg" modal trapFocus
+            className="issue-evidence-drawer" scrimClassName="issue-evidence-scrim"
+            closeLabel={t("Close")} onClose={onClose}>
+            <div className="issue-evidence-image-view" data-artifact-view="image">
+              <img src={ready.preview} alt={displayName} onError={() => setFailed(true)} />
+            </div>
+            <a className="lnk text-micro" href={ready.url} download={displayName}>{t("Download")}</a>
+          </DrawerShell>
+        )}
+      </>
     );
   }
   return (
     <div className="grid min-w-0 min-h-28 gap-2 p-2.5 text-label">
       {failed ? (
         <div role="alert">
-          <span>
-            {t("Could not load")} {displayName}.{" "}
-          </span>
-          <button
-            type="button"
-            className="lnk"
-            aria-label={`${t("Retry")} ${displayName}`}
-            onClick={retry}
-          >
+          <span>{t("Could not load")} {displayName}. </span>
+          <button type="button" className="lnk" aria-label={`${t("Retry")} ${displayName}`} onClick={retry}>
             {t("Retry")}
           </button>
         </div>
       ) : (
-        <span role="status">
-          {t("Loading")} {displayName}…
-        </span>
+        <span role="status">{t("Loading")} {displayName}…</span>
       )}
     </div>
   );
 }
 
-function FileArtifactRow({
-  id,
-  name,
-  size,
-}: {
-  id: string;
-  name: string;
-  size: number;
+function FileArtifactRow({ id, name, size, open, onOpen, onClose }: {
+  id: string; name: string; size: number; open: boolean;
+  onOpen: (button: HTMLElement) => void; onClose: () => void;
 }) {
   const t = useTranslate();
   const { ready, failed, retry } = useLoadedArtifact(id, name, false);
   const previewKind = deliverablePreviewKind(name);
   const displayName = deliverableDisplayName(name);
-  const [previewOpen, setPreviewOpen] = useState(false);
   const [htmlView, setHtmlView] = useState<HtmlView>("rendered");
   const [previewBytes, setPreviewBytes] = useState<ArrayBuffer | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
+  const sourceText = useMemo(
+    () => htmlView === "source" && previewBytes && (previewKind === "md" || previewKind === "csv")
+      ? new TextDecoder("utf-8", { ignoreBOM: true }).decode(previewBytes)
+      : null,
+    [htmlView, previewBytes, previewKind],
+  );
 
   useEffect(() => {
-    const stop = onPrivateReadsPaused(() => {
-      setPreviewOpen(false);
-      setPreviewBytes(null);
-    });
-    return stop;
-  }, []);
-
-  useEffect(() => {
-    if (!previewOpen || !ready || !previewKind) {
+    if (!open || !ready || !previewKind) {
       setPreviewBytes(null);
       return;
     }
@@ -338,12 +332,12 @@ function FileArtifactRow({
     return () => {
       cancelled = true;
     };
-  }, [previewOpen, ready, previewKind]);
+  }, [open, ready, previewKind]);
 
-  const showPreview = Boolean(previewOpen && ready && !failed && previewKind);
+  const showPreview = Boolean(open && ready && !failed && previewKind);
 
   return (
-    <li className="min-w-0 border-t border-ink-800">
+    <li className="issue-evidence-row min-w-0">
       <div className="flex min-w-0 items-center gap-3 px-3 py-2">
         {ready && !failed ? (
           <>
@@ -359,11 +353,12 @@ function FileArtifactRow({
               <button
                 type="button"
                 className="lnk text-micro shrink-0"
-                aria-expanded={previewOpen}
-                aria-label={`${t(previewOpen ? "Hide preview" : "Preview")} ${displayName}`}
-                onClick={() => setPreviewOpen((open) => !open)}
+                aria-haspopup="dialog"
+                aria-expanded={open}
+                aria-label={`${t("Preview")} ${displayName}`}
+                onClick={(event) => onOpen(event.currentTarget)}
               >
-                {t(previewOpen ? "Hide preview" : "Preview")}
+                {t("Preview")}
               </button>
             )}
           </>
@@ -398,26 +393,15 @@ function FileArtifactRow({
         </span>
       </div>
       {showPreview && previewKind && (
-        <div
-          className="issue-deliverable-preview"
-          role="region"
-          aria-label={`${t("Preview")} ${displayName}`}
-          data-deliverable-preview={previewKind}
-        >
-          <div className="cv-head">
-            <span className="arttype">{previewKind.toUpperCase()}</span>
-            <div className="cv-title">
-              <b title={displayName}>{displayName}</b>
-              <span>{fmtBytes(size)}</span>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {previewKind === "html" && (
-                <div
-                  className="vers cv-view"
-                  role="group"
-                  aria-label={t("Document view")}
-                >
-                  {HTML_VIEWS.map(([mode, label]) => (
+        <DrawerShell kind="issue-evidence" label={`${t("Preview")} ${displayName}`} title={displayName}
+          subtitle={`${previewKind.toUpperCase()} · ${fmtBytes(size)}`} scrim="board" size="lg" modal trapFocus
+          className="issue-evidence-drawer" scrimClassName="issue-evidence-scrim"
+          closeLabel={t("Close")} onClose={onClose}
+          dataAttributes={{ "data-deliverable-preview": previewKind }}>
+          <div className="issue-evidence-actions">
+              {(previewKind === "html" || previewKind === "md" || previewKind === "csv") && (
+                <div className="vers cv-view" role="group" aria-label={t("Document view")}>
+                  {(previewKind === "html" ? HTML_VIEWS : [["rendered", "Rendered"], ["source", "Source"]] as const).map(([mode, label]) => (
                     <button
                       key={mode}
                       type="button"
@@ -453,24 +437,20 @@ function FileArtifactRow({
                   {t("Download")}
                 </button>
               )}
-              <button
-                type="button"
-                className="lnk text-micro"
-                onClick={() => setPreviewOpen(false)}
-              >
-                {t("Close")}
-              </button>
-            </div>
           </div>
-          <div className="cv-body">
+          <div className="issue-evidence-content">
             {previewBytes ? (
-              <ArtifactView
-                kind={previewKind}
-                title={displayName}
-                data={{ bytes: previewBytes, mime: PREVIEW_MIME[previewKind] }}
-                contentRef={contentRef}
-                htmlView={htmlView}
-              />
+              sourceText !== null ? (
+                <div className="cv-source" data-artifact-view={`${previewKind}-source`}>
+                  <CodeSurface label={previewKind} code={sourceText}>
+                    <code>{sourceText}</code>
+                  </CodeSurface>
+                </div>
+              ) : (
+                <ArtifactView kind={previewKind} title={displayName}
+                  data={{ bytes: previewBytes, mime: PREVIEW_MIME[previewKind] }}
+                  contentRef={contentRef} htmlView={htmlView} />
+              )
             ) : (
               <span className="text-micro text-ink-400" role="status">
                 {t("Loading")} {displayName}…
@@ -478,7 +458,7 @@ function FileArtifactRow({
             )}
           </div>
           <div className="cv-foot">{t(PREVIEW_FOOT[previewKind])}</div>
-        </div>
+        </DrawerShell>
       )}
     </li>
   );
@@ -503,6 +483,20 @@ export function Evidence({
   onError?: Props["onError"];
 }) {
   const t = useTranslate();
+  const [selected, setSelected] = useState<string | null>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const openPreview = (key: string, button: HTMLElement) => {
+    button.focus({ preventScroll: true });
+    opener.current = button;
+    setSelected(key);
+  };
+  const closePreview = () => {
+    setSelected(null);
+    opener.current?.focus({ preventScroll: true });
+    opener.current = null;
+  };
+  useEffect(() => onPrivateReadsPaused(() => setSelected(null)), []);
+  useEffect(() => { setSelected(null); }, [id]);
   const empty = images.length === 0 && files.length === 0 ? (
     <div className="card min-w-0 px-4 py-8 text-center">
       <div className="text-cardtitle font-semibold text-ink-100">
@@ -530,8 +524,10 @@ export function Evidence({
             {images.map((f) => {
               const displayName = deliverableDisplayName(f.name);
               return (
-                <figure key={f.name} className="card min-w-0 overflow-hidden m-0">
-                  <ImageArtifact key={`${id}:${f.name}`} id={id} name={f.name} />
+                <figure key={f.name} className="min-w-0 overflow-hidden m-0">
+                  <ImageArtifact key={`${id}:${f.name}`} id={id} name={f.name} size={f.size}
+                    open={selected === `image:${f.name}`}
+                    onOpen={(button) => openPreview(`image:${f.name}`, button)} onClose={closePreview} />
                   <figcaption className="flex min-w-0 justify-between gap-2 px-2.5 py-2 text-label">
                     <span className="num truncate min-w-0" title={f.name}>
                       {displayName}
@@ -547,7 +543,7 @@ export function Evidence({
         </div>
       )}
       {files.length > 0 && (
-        <div className="card min-w-0 overflow-hidden">
+        <div className="min-w-0">
           <div className="slabel px-3 pt-2.5">{t("Artifacts")}</div>
           <ul className="list-none m-0 p-0 min-w-0">
             {files.map((f) => (
@@ -556,6 +552,9 @@ export function Evidence({
                 id={id}
                 name={f.name}
                 size={f.size}
+                open={selected === `file:${f.name}`}
+                onOpen={(button) => openPreview(`file:${f.name}`, button)}
+                onClose={closePreview}
               />
             ))}
           </ul>

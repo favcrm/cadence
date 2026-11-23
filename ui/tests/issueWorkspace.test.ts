@@ -532,8 +532,10 @@ async function run() {
       const image = host.querySelector("img");
       assert(image !== null, "Authenticated screenshot bytes mount a preview image");
       assert(image.src.startsWith("data:image/png;") && image.alt === "screen shot.png", "Screenshots retain CSP-compatible previews and their accessible filename");
-      const imageLink = image.closest("a");
-      assert(imageLink?.href.startsWith("blob:") && imageLink.target === "_blank" && !imageLink.hasAttribute("download"), "Only raster screenshot blobs retain inline view");
+      await click(image.closest('button[aria-label="Preview screen shot.png"]'));
+      const reader = win.document.querySelector('[role="dialog"][aria-label="Preview screen shot.png"]');
+      assert(reader?.querySelector("img")?.src === image.src, "The screenshot opens in the issue reader");
+      assert(reader?.querySelector('a[download="screen shot.png"]')?.getAttribute("href")?.startsWith("blob:"), "The reader downloads the original authenticated screenshot");
       const download = host.querySelector('a[download="report.html"]');
       assert(download?.getAttribute("href")?.startsWith("blob:") && download.textContent === "report.html" && !download.hasAttribute("target"), "Active attachments download authenticated bytes with the original filename");
 

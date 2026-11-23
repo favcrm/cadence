@@ -1,0 +1,25 @@
+.issue-evidence-row { min-width: 0; }
+.issue-evidence-row:hover { background: var(--color-ink-875); }
+.issue-evidence-image { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.issue-evidence-image:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.issue-evidence-drawer.s-drawer[data-scrim="board"] {
+  top: 0;
+  bottom: 0;
+  height: 100dvh;
+  max-height: 100dvh;
+  border-radius: 0;
+}
+.issue-evidence-drawer .s-drawer-grab { display: none; }
+.issue-evidence-drawer .s-drawer-body { min-width: 0; overscroll-behavior: contain; }
+.issue-evidence-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin-bottom: 1rem; }
+.issue-evidence-content, .issue-evidence-drawer .cv-csv-scroll,
+.issue-evidence-drawer .cv-source, .issue-evidence-drawer .cv-source .codeblock,
+.issue-evidence-drawer .cv-source pre { min-width: 0; max-width: 100%; }
+.issue-evidence-drawer .cv-source pre { overflow-x: auto; }
+.issue-evidence-drawer .canvas-frame { width: 100%; min-height: 28rem; max-width: 100%; }
+.issue-evidence-drawer .cv-foot { margin-top: 1rem; }
+.issue-evidence-image-view img { display: block; max-width: 100%; height: auto; margin: 0 auto 1rem; }
+.issue-evidence-scrim { overflow: hidden; overscroll-behavior: contain; }
+@media (max-width: 860px) {
+  .issue-evidence-drawer.s-drawer[data-scrim="board"] { left: 0; width: 100%; }
+}

@@ -63,6 +63,15 @@ const click = (el: Element | null) =>
     el.click();
   });
 
+const closeDrawer = async () => {
+  const drawer = document.querySelector('[data-drawer="issue-evidence"]');
+  assert(drawer !== null, "Evidence drawer is open");
+  await click(drawer.querySelector('button[aria-label="Close"]'));
+  await React.act(async () => {
+    drawer.dispatchEvent(new win.Event("transitionend", { bubbles: true }));
+  });
+};
+
 const host = document.createElement("div");
 document.body.appendChild(host);
 const root = createRoot(host);
@@ -144,6 +153,7 @@ async function run() {
       "%PDF-1.7\n%%EOF\n",
     "/api/issues/CAD-2277/artifacts/summary.md": "## Timeline\n- Contained in 12m",
     "/api/issues/CAD-2277/artifacts/bundle.zip": "PK\u0003\u0004",
+    "/api/issues/CAD-2277/artifacts/metrics.csv": "name,value\r\nalpha,\"one,two\"\r\n",
   };
 
   globalThis.fetch = async (input) => {
@@ -183,6 +193,7 @@ async function run() {
             },
             { name: "summary.md", size: 31 },
             { name: "bundle.zip", size: 4 },
+            { name: "metrics.csv", size: 29 },
           ],
           readOnly: true,
         }),
@@ -218,7 +229,7 @@ async function run() {
       "Opaque archive does not advertise inline preview",
     );
 
-    // Open HTML inline preview and verify strict iframe sandbox + source toggle.
+    // Open HTML in the drawer and verify strict iframe sandbox + source toggle.
     const htmlPreviewBtn = host.querySelector(
       'button[aria-label="Preview postmortem.html"]',
     );
@@ -226,7 +237,7 @@ async function run() {
     await click(htmlPreviewBtn);
     await flush();
 
-    const frame = host.querySelector('iframe[data-artifact-view="html"]');
+    const frame = document.querySelector('iframe[data-artifact-view="html"]');
     assert(frame !== null, "HTML deliverable renders inside sandboxed iframe");
     assert(
       frame.getAttribute("sandbox") === "",
@@ -239,17 +250,20 @@ async function run() {
     );
 
     const sourceToggle = Array.from(
-      host.querySelectorAll(".issue-deliverable-preview .vers button"),
+      document.querySelectorAll(".issue-evidence-drawer .vers button"),
     ).find((btn) => btn.textContent === "HTML") as HTMLElement | undefined;
     assert(sourceToggle !== undefined, "HTML preview offers source toggle");
     await click(sourceToggle);
     await flush();
     assert(
-      host.querySelector('[data-artifact-view="html-source"]')?.textContent?.includes(
+      document.querySelector('[data-artifact-view="html-source"]')?.textContent?.includes(
         "<h1>Incident Postmortem</h1>",
       ),
       "Source toggle displays raw HTML source safely",
     );
+    assert(document.querySelectorAll('[data-drawer="issue-evidence"]').length === 1, "Only one evidence drawer is open");
+    await closeDrawer();
+    assert(document.activeElement === htmlPreviewBtn, "Closing restores focus to the opener");
 
     // Open PDF preview and verify Open in new tab control.
     const pdfPreviewBtn = host.querySelector(
@@ -259,9 +273,10 @@ async function run() {
     await click(pdfPreviewBtn);
     await flush();
     assert(
-      host.querySelector('[data-artifact-view="pdf"]') !== null,
+      document.querySelector('[data-artifact-view="pdf"]') !== null,
       "PDF deliverable mounts PDF preview card",
     );
+    await closeDrawer();
 
     // Open Markdown preview.
     const mdPreviewBtn = host.querySelector(
@@ -270,11 +285,38 @@ async function run() {
     await click(mdPreviewBtn);
     await flush();
     assert(
-      host.querySelector('[data-artifact-view="md"]')?.textContent?.includes(
+      document.querySelector('[data-artifact-view="md"]')?.textContent?.includes(
         "Contained in 12m",
       ),
-      "Markdown deliverable renders inline via Md",
+      "Markdown deliverable renders via Md",
     );
+    const mdSource = Array.from(document.querySelectorAll(".issue-evidence-drawer .vers button"))
+      .find((button) => button.textContent === "Source");
+    assert(mdSource !== undefined, "Markdown offers source view");
+    await click(mdSource);
+    assert(document.querySelector('[data-artifact-view="md-source"]')?.textContent?.includes(
+      "## Timeline\n- Contained in 12m",
+    ), "Markdown source retains loaded text");
+    await closeDrawer();
+
+    await click(host.querySelector('button[aria-label="Preview metrics.csv"]'));
+    await flush();
+    assert(document.querySelector('[data-artifact-view="csv"]') !== null, "CSV renders as a table");
+    const csvSource = Array.from(document.querySelectorAll(".issue-evidence-drawer .vers button"))
+      .find((button) => button.textContent === "Source");
+    assert(csvSource !== undefined, "CSV offers source view");
+    await click(csvSource);
+    assert(document.querySelector('[data-artifact-view="csv-source"]')?.textContent?.includes(
+      'name,value\r\nalpha,"one,two"\r\n',
+    ), "CSV source retains loaded text");
+    await closeDrawer();
+
+    await click(host.querySelector('button[aria-label="Preview screenshot (v1).png"]'));
+    assert(document.querySelector('[data-artifact-view="image"] img')?.getAttribute("src")?.startsWith("data:image/png;"),
+      "Image drawer uses the existing verified raster preview");
+    await closeDrawer();
+    await click(mdPreviewBtn);
+    await flush();
 
     // Pausing private reads immediately tears down open previews.
     await React.act(async () => {
@@ -282,7 +324,7 @@ async function run() {
     });
     await flush();
     assert(
-      host.querySelector(".issue-deliverable-preview") === null,
+      document.querySelector('[data-drawer="issue-evidence"]') === null,
       "Pausing private reads closes open deliverable previews and drops bytes",
     );
   } finally {

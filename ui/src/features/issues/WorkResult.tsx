@@ -1,17 +1,16 @@
-import { useContext, type ReactNode } from "react";
+import { useContext, useId, useRef, type ReactNode } from "react";
 import SafeLink from "../../ui/SafeLink";
 import Button from "../../ui/Button";
+import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import { fmtTime } from "../../lib/fmt";
 import { useLocale } from "../../lib/locale";
 import type { IssueDetail, TaskReport } from "../../lib/types";
-import { stageLabel } from "../projects/work";
 import { composerBlocked, type LanePayload } from "./lane";
 import { WriteGate } from "../auth/WriteGate";
 import { isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
 import {
   deployRefs,
-  hasCodeDelivery,
   hostedAssignmentText,
   latestHostedAssignment,
   matchingStagedActions,
@@ -39,6 +38,7 @@ function nextAction({
   checksTotal,
   blocked,
   hosted,
+  inspectPr,
   t,
 }: {
   detail: IssueDetail;
@@ -49,6 +49,7 @@ function nextAction({
   checksTotal: number;
   blocked: string | null;
   hosted: boolean;
+  inspectPr: boolean;
   t: (s: string) => string;
 }): string {
   if (detail.status === "done" || detail.status === "dropped")
@@ -66,7 +67,7 @@ function nextAction({
     const latestAssign = latestHostedAssignment(detail);
     const runState = detail.agent_run?.state;
     if (detail.status === "review" || latestAssign?.state === "result" || runState === "finished")
-      return t("Review the deliverable and recorded checks below.");
+      return t("Review the available evidence and acceptance checks.");
     if (
       latestAssign &&
       (latestAssign.state === "blocked" || latestAssign.state === "failed" || latestAssign.state === "cancelled")
@@ -79,13 +80,19 @@ function nextAction({
     ) {
       return t("The latest agent run stopped — review Activity or reassign.");
     }
-    const hasAssignment =
-      Boolean(detail.owner) ||
-      Boolean(detail.agent_run?.agent || detail.agent_run?.agent_name) ||
-      Boolean(latestAssign);
-    if (hasAssignment)
-      return t("Assigned work is active — check Activity or Evidence for updates.");
-    return t("Assign an owner or update acceptance checks to move this item forward.");
+    if (latestAssign?.state === "running" || runState === "running")
+      return t("Check Activity or Evidence for updates on the assignment.");
+    if (latestAssign?.state === "queued" || latestAssign?.state === "waiting" || runState === "queued")
+      return t("Work is queued. Check Activity for updates.");
+    if (inspectPr)
+      return t("Inspect the linked pull request before starting new work.");
+    if (detail.local_assignment && !detail.local_assignment.available && detail.local_assignment.reason !== "not_supported")
+      return t("Assignment state unavailable");
+    if (checksTotal === 0)
+      return t("Add acceptance checks before starting work.");
+    if (!detail.owner && !latestAssign && !detail.agent_run?.agent && !detail.agent_run?.agent_name)
+      return t("Assign an owner before starting work.");
+    return t("Review the brief and acceptance checks before starting work.");
   }
   if (checksTotal === 0)
     return t("Add at least one acceptance check — kick off stays blocked until one exists.");
@@ -121,11 +128,11 @@ export function WorkResult({
   checksTotal,
   blocked,
   hosted = false,
-  codeDelivery = hasCodeDelivery(detail),
+  codeDelivery,
   stagedActions,
   tabHref,
   onCompose,
-  onKickoff,
+  children,
   onOpen,
 }: {
   detail: IssueDetail;
@@ -134,14 +141,16 @@ export function WorkResult({
   checksTotal: number;
   blocked: string | null;
   hosted?: boolean;
-  codeDelivery?: boolean;
+  codeDelivery: boolean;
   stagedActions?: readonly StagedWrite[];
   tabHref: (tab: IssueTab) => string;
   onCompose: (mode: "ask" | "instruct") => void;
-  onKickoff: () => void;
+  children: ReactNode;
   onOpen: (id: string) => void;
 }) {
   const { t, formatNumber } = useLocale();
+  const briefRef = useRef<HTMLDivElement>(null);
+  const verificationId = useId();
   const writeBlock = useContext(WriteGate);
   const view = reportView(detail.reports ?? []);
   const pr = prRef(detail.refs);
@@ -159,15 +168,28 @@ export function WorkResult({
   const inForceHeads = approvalHeads.filter((h) => h.state === "in-force");
   const stagedMatches = matchingStagedActions(detail.id, stagedActions);
   const linkedRows = shownLinks(detail.links, detail.relates);
+  const progress = checksTotal > 0
+    ? `${formatNumber(checksDone)} ${t("of")} ${formatNumber(checksTotal)} ${t("checked")}`
+    : null;
+  const openChecklist = () => {
+    const brief = briefRef.current;
+    if (!brief) return;
+    const heading = Array.from(brief.querySelectorAll<HTMLElement>(":scope > h2")).find(
+      (el) => el.textContent?.trim().toLowerCase() === "acceptance",
+    );
+    const target = heading ?? brief;
+    target.tabIndex = -1;
+    target.focus({ preventScroll: true });
+    target.scrollIntoView({ block: "start" });
+  };
 
   const rows: { title: string; detail: ReactNode; tone: keyof typeof TONE_DOT }[] = [
     {
       title: t("Acceptance checks"),
       tone: checksTotal === 0 || checksDone < checksTotal ? "wait" : "done",
-      detail:
-        checksTotal === 0
-          ? t("No acceptance checklist on the issue.")
-          : `${formatNumber(checksDone)} ${t("of")} ${formatNumber(checksTotal)} ${t("checked")}`,
+      detail: progress === null
+        ? t("No acceptance checklist on the issue.")
+        : <button type="button" className="lnk" onClick={openChecklist}>{t("Open checklist")}</button>,
     },
     {
       title: t("Worker report"),
@@ -339,18 +361,34 @@ export function WorkResult({
   }
 
   return (
-    <section className="grid gap-4" data-testid="work-result">
-      <div className="card p-4 grid gap-3">
-        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm m-0">
-          <dt className="text-ink-500">{t("Status")}</dt>
-          <dd className="min-w-0 m-0">
-            {t(detail.status)}
-            {detail.work?.stage && ` · ${stageLabel(detail.work.stage, t)}`}
-          </dd>
-          <dt className="text-ink-500">
-            {hosted && !laneView ? t("Assignment") : t("Lane")}
-          </dt>
-          <dd className="num min-w-0 m-0">
+    <div className="issue-overview grid grid-cols-[minmax(0,1fr)] gap-6" data-testid="work-result">
+      <section className="grid gap-1">
+        <h2 className="text-label font-medium text-ink-400 m-0">{t("Next action")}</h2>
+        <p className="text-cardtitle font-medium text-ink-100 m-0">
+          {nextAction({
+            detail,
+            lane,
+            questions: view.questions,
+            verdict,
+            checksTotal,
+            blocked,
+            hosted,
+            inspectPr: pr !== null && merge.kind !== "merged",
+            t,
+          })}
+        </p>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-label">
+          {progress !== null && (
+            <button type="button" className="lnk" aria-label={`${t("Acceptance checks")}: ${progress}`} onClick={openChecklist}>
+              {progress}
+            </button>
+          )}
+          <a className="lnk" href={`#${verificationId}`}>{t("Verification")}</a>
+          {pr && <Link className="lnk" href={tabHref("pr")}>{pr.label}</Link>}
+        </div>
+        <dl className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-label m-0">
+          <dt className="text-ink-400">{hosted && !laneView ? t("Assignment") : t("Lane")}</dt>
+          <dd className="m-0 text-ink-200">
             {laneView
               ? `${laneView.agent} · ${laneView.state}`
               : hosted
@@ -359,23 +397,14 @@ export function WorkResult({
                   ? t("Lane state unavailable")
                   : t("No lane yet")}
           </dd>
-          <dt className="text-ink-500">{t("Next action")}</dt>
-          <dd className="min-w-0 m-0">
-            {nextAction({
-              detail,
-              lane,
-              questions: view.questions,
-              verdict,
-              checksTotal,
-              blocked,
-              hosted,
-              t,
-            })}
-          </dd>
         </dl>
+      </section>
+
+      <div ref={briefRef} className="issue-description issue-reader min-w-0 max-w-[84ch] text-body text-ink-300">
+        {children}
       </div>
 
-      <article className="card p-4 grid gap-3">
+      <section className="grid grid-cols-[minmax(0,1fr)] gap-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-cardtitle font-semibold text-ink-100 m-0">
             {t("Result")}
@@ -451,10 +480,10 @@ export function WorkResult({
             {t("No worker report yet. The agent's own statement will appear here when it files one — it is not an operator approval.")}
           </p>
         )}
-        {(pr || latest?.pr || artifacts.length > 0 || deploys.length > 0) && (
+        {(pr || latest?.pr || deploys.length > 0) && (
           <ul className="issue-output-links m-0 p-0 grid gap-1.5">
             {pr?.href && (
-              <li className="num truncate">
+              <li className="num">
                 <SafeLink className="lnk" href={pr.href}>
                   {pr.label}
                 </SafeLink>
@@ -464,60 +493,47 @@ export function WorkResult({
               <li className="text-ink-400">{`${pr.label} — ${t("this reference has no URL")}`}</li>
             )}
             {latest?.pr && latest.pr !== pr?.href && (
-              <li className="num truncate">
+              <li className="num">
                 <SafeLink className="lnk" href={latest.pr}>
                   {`${t("Pull request")} (${t("from the worker report")})`}
                 </SafeLink>
               </li>
             )}
             {deploys.map((r, i) => (
-              <li key={`dep-${i}`} className="num truncate">
+              <li key={`dep-${i}`} className="num">
                 <SafeLink className="lnk" href={r.url}>
                   {r.label ?? r.url ?? r.kind}
                 </SafeLink>
               </li>
             ))}
-            {artifacts.length > 0 && (
-              <li>
-                <Button size="sm" variant="ghost" href={tabHref("evidence")}>
-                  {`${t("Evidence")} (${formatNumber(artifacts.length)})`}
-                </Button>
-              </li>
-            )}
           </ul>
         )}
-        <div className="flex flex-wrap gap-2">
-          {laneView ? (
+        <div className="flex flex-wrap items-center gap-2">
+          {laneView && (
             <Button variant="primary" disabled={feedbackBlocked} onClick={() => onCompose("instruct")}>
               {t("Leave feedback in the conversation")}
             </Button>
-          ) : (
-            !hosted &&
-            !blocked && (
-              <Button variant="primary" onClick={onKickoff}>
-                {t("Kick off")}
-              </Button>
-            )
           )}
-          {codeDelivery && <Button href={tabHref("pr")}>{t("Pull request")}</Button>}
-          <Button variant="ghost" href={tabHref("evidence")}>
-            {t("Open evidence")}
-          </Button>
+          <Link className="lnk text-secondary" href={tabHref("evidence")}>
+            {artifacts.length ? `${t("Evidence")} (${formatNumber(artifacts.length)})` : t("Open evidence")}
+          </Link>
         </div>
         {laneView && composerBlocked(laneView.state) && (
           <p className="text-secondary text-ink-400 m-0">
             {t("Feedback is unavailable for this lane state. Open Conversation to read its history; recovery controls, when available, are on the lane card.")}
           </p>
         )}
-        <p className="text-micro text-ink-500 m-0">
-          {codeDelivery
-            ? t("A worker report is the agent's own statement — not operator approval, not a merge, not a deployment.")
-            : t("A worker report is the agent's own statement — not operator approval.")}
-        </p>
-      </article>
+        {(latest || (latestAssignment && (latestAssignment.text || latestAssignment.deliverable))) && (
+          <p className="text-micro text-ink-500 m-0">
+            {codeDelivery
+              ? t("A worker report is the agent's own statement — not operator approval, not a merge, not a deployment.")
+              : t("A worker report is the agent's own statement — not operator approval.")}
+          </p>
+        )}
+      </section>
 
-      <section className="card p-4 grid gap-3" aria-label={t("Verification")}>
-        <h2 className="text-cardtitle font-semibold text-ink-100 m-0">
+      <section className="grid grid-cols-[minmax(0,1fr)] gap-3" aria-labelledby={verificationId}>
+        <h2 id={verificationId} tabIndex={-1} className="text-cardtitle font-semibold text-ink-100 m-0">
           {t("Verification")}
         </h2>
         <ul className="issue-checks m-0 p-0 grid gap-2.5">
@@ -535,6 +551,6 @@ export function WorkResult({
           ))}
         </ul>
       </section>
-    </section>
+    </div>
   );
 }
