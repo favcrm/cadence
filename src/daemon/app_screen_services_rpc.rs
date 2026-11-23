@@ -1054,6 +1054,17 @@ impl Shared {
             )?;
             return self.screen_calendar_query(proof, &params);
         }
+        if matches!(proof.operation, WorksQuery | WorksGet) {
+            // CAD-2683: the Works reads are in the read-only allowlist for the
+            // operator's canvas mount. Members also hold read-only mounts and
+            // the read runs as the operator, so a member is refused here: every
+            // Works operation is for a verified operator session.
+            if proof.is_member() {
+                return Err(screen_access_denied(
+                    "screen service requires operator-role public session",
+                ));
+            }
+        }
         if proof.operation == RoutinesList {
             // CAD-2402: routines are an operator read. A member session is
             // already refused at the proof (members hold read-only mounts,

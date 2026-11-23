@@ -35,7 +35,7 @@ const WORKFLOW: &str = "---\ntitle: \"Note: {{topic}}\"\ngoal: \"One short text 
 const SECRET_BODY: &str = "# Triage\nReview new alerts: cad2402-secret-playbook-text.\n";
 const WIKI_PATH: &str = "global/playbooks/triage.md";
 
-struct Rig {
+pub(super) struct Rig {
     _dir: tempfile::TempDir,
     state: PathBuf,
     board_port: u16,
@@ -55,7 +55,7 @@ impl Drop for Rig {
     }
 }
 
-fn start() -> Rig {
+pub(super) fn start() -> Rig {
     block_sigchld();
     let dir = tempfile::Builder::new()
         .prefix("c2402-guard")
@@ -187,7 +187,7 @@ fn agent() -> ureq::Agent {
     )
 }
 
-fn post(
+pub(super) fn post(
     rig: &Rig,
     path: &str,
     cookie: Option<&str>,
@@ -207,14 +207,14 @@ fn post(
     request.send_json(body).expect("real board POST failed")
 }
 
-fn status_and_json(mut response: ureq::http::Response<ureq::Body>) -> (u16, Value) {
+pub(super) fn status_and_json(mut response: ureq::http::Response<ureq::Body>) -> (u16, Value) {
     let status = response.status().as_u16();
     let raw = response.body_mut().read_to_string().unwrap_or_default();
     let parsed = serde_json::from_str(&raw).unwrap_or_else(|_| json!({"raw": raw}));
     (status, parsed)
 }
 
-fn session(rig: &Rig, sub: &str, role: &str) -> String {
+pub(super) fn session(rig: &Rig, sub: &str, role: &str) -> String {
     let now = crate::issue::time::now_epoch();
     let header = json!({"alg":"EdDSA","typ":"JWT","kid":KID});
     let claims = json!({
@@ -261,7 +261,7 @@ fn session(rig: &Rig, sub: &str, role: &str) -> String {
         .to_string()
 }
 
-fn rpc_as(rig: &Rig, who: Asserted, method: &str, params: Value) -> Result<Value> {
+pub(super) fn rpc_as(rig: &Rig, who: Asserted, method: &str, params: Value) -> Result<Value> {
     scoped(who, || crate::client::rpc(&rig.state, method, params))
 }
 
@@ -280,7 +280,7 @@ fn put(rig: &Rig, path: &str, cookie: &str, body: &Value) -> ureq::http::Respons
 }
 
 /// The loopback operator session `(token, key)` the daemon proves natively.
-fn operator_session(rig: &Rig) -> (String, String) {
+pub(super) fn operator_session(rig: &Rig) -> (String, String) {
     crate::operator_auth::ensure_secret(&rig.state).unwrap();
     let secret = crate::operator_auth::read_secret(&rig.state).unwrap();
     let nonce = rpc_as(
@@ -304,7 +304,7 @@ fn operator_session(rig: &Rig) -> (String, String) {
     )
 }
 
-fn cookie_token(cookie: &str) -> &str {
+pub(super) fn cookie_token(cookie: &str) -> &str {
     cookie.split_once('=').expect("name=value cookie").1
 }
 
@@ -341,7 +341,7 @@ fn seed_routines(rig: &Rig, owner: &str) -> [&'static str; 2] {
 
 /// Install and approve a one-screen `screen-records.v1` package declaring
 /// exactly `operations`, with `records.call`, and create its context.
-fn install_app(rig: &Rig, app: &str, operations: &[&str]) -> (String, String) {
+pub(super) fn install_app(rig: &Rig, app: &str, operations: &[&str]) -> (String, String) {
     let source = tempfile::tempdir().unwrap();
     let dir = source.path().join(app);
     std::fs::create_dir_all(dir.join("workflows")).unwrap();
@@ -403,7 +403,7 @@ fn install_app(rig: &Rig, app: &str, operations: &[&str]) -> (String, String) {
     (install, context)
 }
 
-fn consume(rig: &Rig, receipt: &Value) -> String {
+pub(super) fn consume(rig: &Rig, receipt: &Value) -> String {
     let nonce = receipt["mount"]
         .as_str()
         .unwrap()
@@ -423,7 +423,12 @@ fn consume(rig: &Rig, receipt: &Value) -> String {
 }
 
 /// An operator mount over the loopback session; returns its action token.
-fn operator_mount(rig: &Rig, session: &(String, String), install: &str, context: &str) -> String {
+pub(super) fn operator_mount(
+    rig: &Rig,
+    session: &(String, String),
+    install: &str,
+    context: &str,
+) -> String {
     let minted = rpc_as(
         rig,
         Asserted::Operator,

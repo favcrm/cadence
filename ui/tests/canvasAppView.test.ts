@@ -106,10 +106,13 @@ equal(resourceAppView("/apps/crm", "inst_crm", "ctx_1", "crm", { kind: "customer
 
 // Read-only: the mount keeps only read operations; a write the app declared is closed.
 const receipt = { mount: "/api/app-screen/n", bridge_nonce: "b", generation: 1, tag: "crm", action_token: "t", tools: [], host_contract: "screen-records.v1", operations: ["records.list", "records.show", "records.update", "records.create", "sends.approve", "screen.route.patch", "records.csv.import", "works.get"] } as unknown as MountReceipt;
-equal(readOnlyReceipt(receipt).operations, ["records.list", "records.show", "screen.route.patch"], "only reads and route patches survive");
+equal(readOnlyReceipt(receipt).operations, ["records.list", "records.show", "screen.route.patch", "works.get"], "only reads and route patches survive (works.get is a read since CAD-2683)");
 const aggregateReceipt = { ...receipt, operations: ["records.aggregate", "records.batch", "records.update", "records.list"] } as unknown as MountReceipt;
 equal(readOnlyReceipt(aggregateReceipt).operations, ["records.aggregate", "records.list"], "records.aggregate is kept, writes still dropped");
 equal([...READ_ONLY_OPERATIONS].sort(), [...SCREEN_READ_VERBS].sort(), "canvas read-only set matches the screen read set");
+// CAD-2683: a read-only mount keeps the Works reads and drops every Works write and slot.
+const worksReceipt = { ...receipt, operations: ["works.query", "works.get", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review", "works.review", "works.export"] } as unknown as MountReceipt;
+equal(readOnlyReceipt(worksReceipt).operations, ["works.query", "works.get"], "works reads survive; works writes and slots are dropped");
 equal(receipt.operations?.length, 8, "the original receipt is not mutated");
 
 // CAD-2555: a route's params. A route without them has its old shape; the board URL carries them as `p.<name>`.

@@ -111,7 +111,7 @@ export const SCREEN_READ_VERBS: ReadonlySet<string> = new Set([
   "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.status",
   "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.status",
   "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate",
-  "whatsapp.broadcast.results", "whatsapp.draft.show", "campaign-work.show", "calendar.query", "records.aggregate",
+  "whatsapp.broadcast.results", "whatsapp.draft.show", "campaign-work.show", "calendar.query", "records.aggregate", "works.query", "works.get",
 ]);
 const READ_ONLY_CALL_MESSAGE = "a read-only screen admits only read operations";
 
