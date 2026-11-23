@@ -252,6 +252,11 @@ fn form_check(input: &FormCheckInput) -> FormCheckValue {
 pub struct DeliveryRequirementsInput {
     /// The exact `delivery:` section text, or absent when the project has none.
     pub policy: Option<String>,
+    /// CAD-2715: a stored `delivery:` section as a hosted owner saved it —
+    /// its YAML value or the section with its `delivery:` key — which the
+    /// core wraps with `delivery::section_front`, the wrapper the CLI uses,
+    /// so a host keeps no wrapper of its own. Refused together with `policy`.
+    pub policy_section: Option<String>,
     /// The project's recorded work approval, when one exists.
     pub approval: Option<DeliveryApprovalInput>,
     /// `git diff --raw -z --no-renames <merge-base> <head>` rows.
@@ -268,8 +273,9 @@ pub struct DeliveryRequirementsInput {
     /// unreadable and fails closed. `true` with either text present refuses.
     #[serde(default)]
     pub lists_absent: bool,
-    /// CAD-2417: the host vouches that `policy` is owner-approved as sent (on
-    /// hosted Cadence only a live owner can save a project's delivery policy).
+    /// CAD-2417: the host vouches that `policy` (or `policy_section`) is
+    /// owner-approved as sent (on hosted Cadence only a live owner can save a
+    /// project's delivery policy).
     /// A policy that parses is then resolved as approved at its own digest,
     /// exactly as an `approval` of it would be; an absent or malformed text
     /// changes nothing. Absent or `false` keeps today's answers; `true` with an
@@ -697,9 +703,20 @@ fn valid_contract_name(name: &str) -> bool {
 /// names the resolved policy beside the requirements so a reader can see which
 /// policy produced the class.
 fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Value, Refusal> {
-    use crate::delivery::{effective, parse, Approved};
+    use crate::delivery::{effective, parse, section_front, Approved};
 
-    let file = match input.policy.as_deref() {
+    let text = match (&input.policy, &input.policy_section) {
+        (Some(_), Some(_)) => {
+            return Err(refuse(
+                Code::InvalidCommand,
+                "policy contradicts a supplied policy_section".to_string(),
+            ))
+        }
+        (Some(text), None) => Some(text.clone()),
+        (None, Some(section)) => Some(section_front(section)),
+        (None, None) => None,
+    };
+    let file = match text.as_deref() {
         None => Ok(None),
         Some(text) => parse(text).map_err(|error| error.to_string()),
     };

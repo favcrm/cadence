@@ -793,8 +793,9 @@ pub fn parse(text: &str) -> Result<Option<DeliveryPolicy>> {
 /// CAD-2708: the PROJECT.md text [`parse`] reads for a stored `delivery:`
 /// section. The CLI uses it, and a host that wraps a stored section itself
 /// must read every text the same way, so the CLI and the hosted gate parse,
-/// and digest, the same policy (CAD-2715 moves the wrapping into the core for
-/// every host).
+/// and digest, the same policy. A host can instead send the stored text as
+/// `policy_section` to `delivery.requirements.evaluate`, which wraps it with
+/// this function (CAD-2715).
 ///
 /// A hosted org stores the section as its owner wrote it: the section's YAML
 /// value, or the section with its own `delivery:` key. Either may start with
