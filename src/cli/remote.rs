@@ -3216,31 +3216,17 @@ where
             if matches!(
                 &command,
                 Commands::Connection {
-                    action: ConnectionAction::Whatsapp { .. }
-                }
-            ) {
-                if cadence_agent::remote_cli::contains_qr_key(&body) {
-                    return Err(Error::rejected(
-                        "refused unsafe WhatsApp response containing pairing QR material",
-                    ));
-                }
-                if matches!(
-                    &command,
-                    Commands::Connection {
-                        action: ConnectionAction::Whatsapp {
-                            action: super::connection::WhatsappAction::Connect { .. }
-                                | super::connection::WhatsappAction::Rescope { .. }
-                        }
+                    action: ConnectionAction::Whatsapp {
+                        action: super::connection::WhatsappAction::Connect { .. }
+                            | super::connection::WhatsappAction::Rescope { .. }
                     }
-                ) && (body.pointer("/data/pairing_url").is_some()
-                    || body.pointer("/data/signup_url").is_some()
-                    || body.pointer("/data/url").is_some())
-                {
-                    eprint_line(
-                        "Open this authenticated URL in your own browser; no browser was opened \
-                         here and no pairing QR secret is printed.",
-                    );
                 }
+            ) && body.pointer("/data/url").and_then(Value::as_str).is_some()
+            {
+                eprint_line(
+                    "Open this authenticated URL in your own browser; no browser was opened \
+                     here and no pairing QR secret is printed.",
+                );
             }
             if matches!(&command, Commands::Platform { .. }) {
                 for summary in super::platform::platform_human_summary(&body) {
@@ -6268,16 +6254,154 @@ mod read_contract_tests {
         .unwrap_err();
         assert!(bad_co.contains("--company-id"), "{bad_co}");
 
-        assert!(cadence_agent::remote_cli::contains_qr_key(
-            &json!({"ok": true, "data": {"qr": "secret"}})
-        ));
-        assert!(cadence_agent::remote_cli::contains_qr_key(
-            &json!({"nested": [{"QR_SVG": "<svg/>"}]})
-        ));
-        assert!(!cadence_agent::remote_cli::contains_qr_key(&json!({
-            "ok": true,
-            "data": {"provider": "linked", "state": "pairing", "pairing_url": "https://example.test/account#linked"}
-        })));
+        for payload in [
+            json!({"ok": true, "data": {"qr": "secret"}}),
+            json!({"ok": true, "data": {"qrCode": "secret"}}),
+            json!({"ok": true, "data": {"QRCode": "secret"}}),
+            json!({"nested": [{"QR_SVG": "<svg/>"}]}),
+            json!({"nested": [{"pairingQr": "raw"}]}),
+            json!({"nested": [{"pairingQR": "raw"}]}),
+            json!({"meta": {"qr-data": "raw"}}),
+        ] {
+            assert!(
+                cadence_agent::remote_cli::contains_qr_key(&payload),
+                "expected QR key detection for {payload}"
+            );
+        }
+        for safe in [
+            json!({"ok": true, "data": {"provider": "linked", "state": "pairing", "pairing_url": "https://example.test/account#linked"}}),
+            json!({"ok": true, "data": {"query": "ok", "square": 1, "require": true, "displayPhoneNumber": "+85290001111"}}),
+        ] {
+            assert!(
+                !cadence_agent::remote_cli::contains_qr_key(&safe),
+                "unexpected false positive QR key detection for {safe}"
+            );
+        }
+
+        let linked_status = cadence_agent::remote_cli::project_whatsapp_connection_answer(
+            "whatsapp_status",
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "connected": true,
+                "state": "connected",
+                "extraInternalToken": "strip-me"
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            linked_status,
+            json!({"ok": true, "data": {"provider": "linked", "connected": true, "state": "connected"}})
+        );
+
+        let official_status = cadence_agent::remote_cli::project_whatsapp_connection_answer(
+            "whatsapp_status",
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "connected": true,
+                "enabled": true,
+                "binding": {"status": "active", "workspaceName": "Acme", "favcrmToken": "secret"},
+                "displayPhoneNumber": "+852 9000 1111",
+                "verifiedName": "Acme Support",
+                "webhook": {"subscribed": true, "status": "verified", "rawSecret": "strip"},
+                "wabaId": "strip-me",
+                "phoneNumberId": "strip-me"
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            official_status,
+            json!({"ok": true, "data": {
+                "provider": "official",
+                "connected": true,
+                "enabled": true,
+                "binding": {"status": "active", "workspaceName": "Acme"},
+                "displayPhoneNumber": "+852 9000 1111",
+                "verifiedName": "Acme Support",
+                "webhook": {"subscribed": true, "status": "verified"}
+            }})
+        );
+
+        let inspect = cadence_agent::remote_cli::project_whatsapp_connection_answer(
+            "whatsapp_inspect",
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "inspect": {
+                    "favcrmCompanyId": "comp_42",
+                    "workspaceName": "Acme",
+                    "organisationName": "Acme Ltd",
+                    "role": "owner",
+                    "internalGrant": "strip-me"
+                },
+                "extraField": "strip-me"
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect,
+            json!({"ok": true, "data": {
+                "provider": "official",
+                "inspect": {
+                    "favcrmCompanyId": "comp_42",
+                    "workspaceName": "Acme",
+                    "organisationName": "Acme Ltd",
+                    "role": "owner"
+                }
+            }})
+        );
+        assert!(
+            cadence_agent::remote_cli::project_whatsapp_connection_answer(
+                "whatsapp_inspect",
+                &json!({"ok": true, "data": {
+                    "provider": "official",
+                    "inspect": {
+                        "favcrmCompanyId": "comp_42",
+                        "workspaceName": "Acme",
+                        "organisationName": "Acme Ltd",
+                        "role": "guest"
+                    }
+                }})
+            )
+            .is_none()
+        );
+
+        let connect_ok = cadence_agent::remote_cli::project_whatsapp_connection_answer(
+            "whatsapp_connect",
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "state": "pairing",
+                "url": "https://app.example.test/account#linked",
+                "expiresAt": "2026-11-23T02:00:00Z",
+                "extraRenamedSecret": "strip-me"
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            connect_ok,
+            json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "state": "pairing",
+                "url": "https://app.example.test/account#linked",
+                "expiresAt": "2026-11-23T02:00:00Z"
+            }})
+        );
+        for bad_connect in [
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "url": "http://insecure.example.test"}}),
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "url": "data:text/plain,abc"}}),
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "url": "https://user:pass@example.test/"}}),
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "qr": "raw"}}),
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "qrCode": "raw"}}),
+        ] {
+            assert!(
+                cadence_agent::remote_cli::project_whatsapp_connection_answer(
+                    "whatsapp_connect",
+                    &bad_connect
+                )
+                .is_none(),
+                "expected refusal for {bad_connect}"
+            );
+        }
     }
 
     #[test]

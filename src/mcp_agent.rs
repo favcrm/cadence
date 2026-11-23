@@ -1040,9 +1040,6 @@ fn deterministic_app_call_request_id(
 }
 
 fn parse_hosted_app_call(name: &str, args: &Value) -> Result<HostedAppToolCall> {
-    let object = args
-        .as_object()
-        .ok_or_else(|| Error::rejected("tool arguments must be an object"))?;
     match name {
         "app_describe" => {
             let object = fields(args, &["app"], &["app"])?;
@@ -1068,6 +1065,9 @@ fn parse_hosted_app_call(name: &str, args: &Value) -> Result<HostedAppToolCall> 
             })
         }
         "app_call" => {
+            let object = args
+                .as_object()
+                .ok_or_else(|| Error::rejected("tool arguments must be an object"))?;
             if let Some(key) = object.keys().find(|key| {
                 !matches!(
                     key.as_str(),
@@ -1243,14 +1243,7 @@ fn execute_hosted_app_call_with(
         slot,
         |_| {},
     ) {
-        Ok(crate::remote_cli::RemoteAnswer::Ok(val)) => {
-            if crate::remote_cli::contains_qr_key(&val) {
-                return Err(Error::rejected(
-                    "refused unsafe app response containing pairing QR material",
-                ));
-            }
-            Ok(val.to_string())
-        }
+        Ok(crate::remote_cli::RemoteAnswer::Ok(val)) => Ok(val.to_string()),
         Ok(crate::remote_cli::RemoteAnswer::Conflict(body)) => {
             Err(private_app_conflict_error(tool_label, &body))
         }
@@ -2115,6 +2108,10 @@ mod tests {
                             200,
                             json!({"ok": true, "data": {"state": "pairing", "qr": "SECRET-QR"}}),
                         ),
+                        3 => (
+                            200,
+                            json!({"ok": true, "data": {"state": "pairing", "qrCode": "CAMEL-QR"}}),
+                        ),
                         _ => (
                             200,
                             json!({
@@ -2211,19 +2208,21 @@ mod tests {
         .unwrap();
         assert_eq!(pending["data"]["tool"], "board_pending_actions");
 
-        // QR payloads are refused even if returned from app_call.
-        mode.store(2, Ordering::SeqCst);
-        let qr_err = invoke_hosted_app_tool_with(
-            &auth_dir,
-            message_id,
-            &target,
-            &slot,
-            "app_call",
-            &json!({"app": "waba", "operation": "whatsapp.status", "args": {"provider": "linked"}}),
-            10,
-        )
-        .unwrap_err();
-        assert!(qr_err.to_string().contains("QR"), "{qr_err}");
+        // QR payloads (including camelCase variants) are refused even if returned from app_call.
+        for qr_mode in [2, 3] {
+            mode.store(qr_mode, Ordering::SeqCst);
+            let qr_err = invoke_hosted_app_tool_with(
+                &auth_dir,
+                message_id,
+                &target,
+                &slot,
+                "app_call",
+                &json!({"app": "waba", "operation": "whatsapp.status", "args": {"provider": "linked"}}),
+                10,
+            )
+            .unwrap_err();
+            assert!(qr_err.to_string().contains("QR"), "{qr_err}");
+        }
 
         // Uncertain app_call names exact request_id and board_pending_actions.
         mode.store(1, Ordering::SeqCst);

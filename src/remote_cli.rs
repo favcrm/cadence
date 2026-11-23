@@ -894,19 +894,197 @@ pub fn connection_list_answer(answer: &Value) -> bool {
     connection_rows(answer, "connections", connection_row)
 }
 
+fn key_has_qr_token(key: &str) -> bool {
+    let chars: Vec<char> = key.chars().collect();
+    let mut token = String::new();
+    let mut matched = false;
+    let flush = |token: &mut String, matched: &mut bool| {
+        if token.eq_ignore_ascii_case("qr") {
+            *matched = true;
+        }
+        token.clear();
+    };
+    for (idx, &ch) in chars.iter().enumerate() {
+        if !ch.is_ascii_alphanumeric() {
+            flush(&mut token, &mut matched);
+            continue;
+        }
+        if !token.is_empty() && ch.is_ascii_uppercase() {
+            let prev = chars[idx - 1];
+            let next_is_lower = chars.get(idx + 1).is_some_and(|c| c.is_ascii_lowercase());
+            if prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_is_lower)
+            {
+                flush(&mut token, &mut matched);
+            }
+        }
+        token.push(ch);
+        if matched {
+            return true;
+        }
+    }
+    flush(&mut token, &mut matched);
+    matched
+}
+
 /// SEC-001: raw WhatsApp pairing QR payloads must never appear in CLI or MCP output.
 pub fn contains_qr_key(value: &Value) -> bool {
     match value {
-        Value::Object(map) => map.iter().any(|(key, child)| {
-            let lower = key.to_ascii_lowercase();
-            matches!(
-                lower.as_str(),
-                "qr" | "qr_code" | "qr_svg" | "qr_data" | "pairing_qr"
-            ) || contains_qr_key(child)
-        }),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, child)| key_has_qr_token(key) || contains_qr_key(child)),
         Value::Array(items) => items.iter().any(contains_qr_key),
         _ => false,
     }
+}
+
+fn copy_opt_str_or_null(
+    src: &Map<String, Value>,
+    dst: &mut Map<String, Value>,
+    key: &str,
+) -> Option<()> {
+    let Some(val) = src.get(key) else {
+        return Some(());
+    };
+    match val {
+        Value::Null | Value::String(_) => {
+            dst.insert(key.into(), val.clone());
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn copy_opt_bool(src: &Map<String, Value>, dst: &mut Map<String, Value>, key: &str) -> Option<()> {
+    let Some(val) = src.get(key) else {
+        return Some(());
+    };
+    let b = val.as_bool()?;
+    dst.insert(key.into(), Value::Bool(b));
+    Some(())
+}
+
+fn project_whatsapp_binding(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let obj = value.as_object()?;
+    let status = obj.get("status").and_then(Value::as_str)?;
+    let mut out = Map::new();
+    out.insert("status".into(), Value::String(status.to_owned()));
+    copy_opt_str_or_null(obj, &mut out, "workspaceName")?;
+    Some(Value::Object(out))
+}
+
+fn project_whatsapp_webhook(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let obj = value.as_object()?;
+    let subscribed = obj.get("subscribed").and_then(Value::as_bool)?;
+    let mut out = Map::new();
+    out.insert("subscribed".into(), Value::Bool(subscribed));
+    copy_opt_str_or_null(obj, &mut out, "status")?;
+    Some(Value::Object(out))
+}
+
+/// Strict allowlist projection for hosted `whatsapp_*` CLI answers: refuses any
+/// response carrying a QR key token and emits only reviewed `data` fields.
+pub fn project_whatsapp_connection_answer(operation: &str, answer: &Value) -> Option<Value> {
+    if contains_qr_key(answer) || answer.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let data = answer.get("data")?.as_object()?;
+    let provider = data.get("provider").and_then(Value::as_str)?;
+    if !matches!(provider, "linked" | "official") {
+        return None;
+    }
+    let mut projected = Map::new();
+    projected.insert("provider".into(), Value::String(provider.to_owned()));
+
+    match operation {
+        "whatsapp_status" => {
+            let connected = data.get("connected").and_then(Value::as_bool)?;
+            projected.insert("connected".into(), Value::Bool(connected));
+            if provider == "linked" {
+                copy_opt_str_or_null(data, &mut projected, "state")?;
+            } else {
+                copy_opt_bool(data, &mut projected, "enabled")?;
+                if let Some(binding) = data.get("binding") {
+                    projected.insert("binding".into(), project_whatsapp_binding(binding)?);
+                }
+                copy_opt_str_or_null(data, &mut projected, "displayPhoneNumber")?;
+                copy_opt_str_or_null(data, &mut projected, "verifiedName")?;
+                if let Some(webhook) = data.get("webhook") {
+                    projected.insert("webhook".into(), project_whatsapp_webhook(webhook)?);
+                }
+            }
+        }
+        "whatsapp_inspect" => {
+            if provider != "official" {
+                return None;
+            }
+            let inspect = data.get("inspect")?.as_object()?;
+            let company_id = inspect.get("favcrmCompanyId").and_then(Value::as_str)?;
+            let workspace_name = inspect.get("workspaceName").and_then(Value::as_str)?;
+            let org_name = inspect.get("organisationName").and_then(Value::as_str)?;
+            let role = inspect.get("role").and_then(Value::as_str)?;
+            if !matches!(role, "owner" | "admin") {
+                return None;
+            }
+            let mut out = Map::new();
+            out.insert(
+                "favcrmCompanyId".into(),
+                Value::String(company_id.to_owned()),
+            );
+            out.insert(
+                "workspaceName".into(),
+                Value::String(workspace_name.to_owned()),
+            );
+            out.insert(
+                "organisationName".into(),
+                Value::String(org_name.to_owned()),
+            );
+            out.insert("role".into(), Value::String(role.to_owned()));
+            projected.insert("inspect".into(), Value::Object(out));
+        }
+        "whatsapp_connect"
+        | "whatsapp_start"
+        | "whatsapp_stop"
+        | "whatsapp_disconnect"
+        | "whatsapp_link"
+        | "whatsapp_rescope" => {
+            let expected_action = operation.strip_prefix("whatsapp_")?;
+            if data.get("action").and_then(Value::as_str) != Some(expected_action) {
+                return None;
+            }
+            projected.insert("action".into(), Value::String(expected_action.to_owned()));
+            copy_opt_str_or_null(data, &mut projected, "state")?;
+            copy_opt_bool(data, &mut projected, "connected")?;
+            copy_opt_bool(data, &mut projected, "enabled")?;
+            copy_opt_bool(data, &mut projected, "alreadyConnected")?;
+            copy_opt_bool(data, &mut projected, "disconnected")?;
+            if let Some(binding) = data.get("binding") {
+                projected.insert("binding".into(), project_whatsapp_binding(binding)?);
+            }
+            copy_opt_str_or_null(data, &mut projected, "expiresAt")?;
+            if let Some(url) = data.get("url") {
+                match url {
+                    Value::Null => {
+                        projected.insert("url".into(), Value::Null);
+                    }
+                    Value::String(u) if https_authorization_url(u) => {
+                        projected.insert("url".into(), Value::String(u.clone()));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    Some(json!({ "ok": true, "data": Value::Object(projected) }))
 }
 
 /// The one-time provider authorization link, only when the answer carries one
@@ -6894,7 +7072,7 @@ fn call_verb_until_retry(
             reissued = true;
             continue;
         }
-        let (status, retry_after, body) = answered?;
+        let (status, retry_after, mut body) = answered?;
         if effect.is_mutation() {
             if let Some(code) = explicit_mutation_uncertainty(body.as_ref()) {
                 return Err(Error::unknown(format!(
@@ -6922,6 +7100,11 @@ fn call_verb_until_retry(
                         )));
                     }
                     return Err(reject("remote tool returned no usable response"));
+                }
+                Some("call") if body.as_ref().is_some_and(contains_qr_key) => {
+                    return Err(reject(
+                        "refused unsafe app response containing pairing QR material",
+                    ));
                 }
                 Some("connected_read")
                     if !body.as_ref().is_some_and(|answer| {
@@ -7010,13 +7193,26 @@ fn call_verb_until_retry(
                         effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
                     )));
                 }
-                Some(op)
-                    if op.starts_with("whatsapp_")
-                        && body.as_ref().is_some_and(contains_qr_key) =>
-                {
-                    return Err(reject(
-                        "refused unsafe WhatsApp response containing pairing QR material",
-                    ));
+                Some(op) if op.starts_with("whatsapp_") => {
+                    if body.as_ref().is_some_and(contains_qr_key) {
+                        return Err(reject(
+                            "refused unsafe WhatsApp response containing pairing QR material",
+                        ));
+                    }
+                    let Some(projected) = body
+                        .as_ref()
+                        .and_then(|raw| project_whatsapp_connection_answer(op, raw))
+                    else {
+                        if let Some(reconcile) = effect.reconciliation() {
+                            return Err(Error::unknown(format!(
+                                "remote WhatsApp lifecycle call returned no usable allowlisted answer — {reconcile}"
+                            )));
+                        }
+                        return Err(reject(
+                            "the hosted WhatsApp response is incomplete — nothing was emitted",
+                        ));
+                    };
+                    body = Some(projected);
                 }
                 _ => {}
             }
