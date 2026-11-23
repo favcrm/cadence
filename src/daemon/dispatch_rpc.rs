@@ -198,9 +198,9 @@ impl Shared {
         let prepared_intake = if already_accepted {
             None
         } else {
-            issue::plan::gate_snapshot(&pm.dir, &front, issue_body)?
+            issue::plan::gate_snapshot(&pm.dir, &front, &issue_body)?
                 .map(|revision| {
-                    Ok::<_, Error>((revision, issue::plan::scope_digest(&front, issue_body)?))
+                    Ok::<_, Error>((revision, issue::plan::scope_digest(&front, &issue_body)?))
                 })
                 .transpose()?
         };
