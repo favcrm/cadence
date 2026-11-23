@@ -944,8 +944,9 @@ pub enum ProjectAction {
         #[arg(long = "repo", required = true)]
         repos: Vec<String>,
         /// A file holding the project's `delivery:` section: its YAML
-        /// value, or the section under its own top-level `delivery:` key.
-        /// Comments, blank lines, a BOM and CRLF line endings are accepted;
+        /// value, the section under its own top-level `delivery:` key, or a
+        /// `---` frontmatter block holding that key. Comments, blank lines,
+        /// a BOM and CRLF line endings are accepted;
         /// the file is checked with the native parser before anything is
         /// sent. Omitted: no section, so the default policy applies.
         #[arg(long)]
