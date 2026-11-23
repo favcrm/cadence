@@ -86,7 +86,7 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
       const model = parseViewRef(item.entry);
       const ref = model && viewCardAppView(model, viewScope);
       const message = item.entry.message ?? null;
-      if (ref) views.push({ key: `view:${item.key}`, ref, ...(model && viewHere(model, viewScope) ? { here: true as const } : {}), live: item.entry.seq > liveAfter, operatorTurn: message !== null && operatorTurns.has(message), turn: message });
+      if (ref) views.push({ key: `view:${item.key}`, ref, ...(model?.placement ? { placement: model.placement } : {}), ...(model && viewHere(model, viewScope) ? { here: true as const } : {}), live: item.entry.seq > liveAfter, operatorTurn: message !== null && operatorTurns.has(message), turn: message });
       continue;
     }
     if (item.type !== "artifact") continue;

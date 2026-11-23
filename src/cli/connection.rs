@@ -92,6 +92,15 @@ pub(crate) enum ConnectionAction {
         /// Exact property identifier (`sc-domain:example.test` or a URL prefix).
         site_url: String,
     },
+    /// List selectable provider assets (Search Console properties, Meta ad accounts, Google Ads customers) on a hosted connection.
+    Assets { connection_id: String },
+    /// Pin one verified provider asset on a hosted connection.
+    #[command(name = "select-asset")]
+    SelectAsset {
+        connection_id: String,
+        /// Exact provider asset identifier (e.g. `act_1234567890`, `412-890-3310`, or `sc-domain:example.test`).
+        value: String,
+    },
     /// Show one durable connection incarnation.
     Show { connection_id: String },
     /// Enroll an explicitly supported scoped token; grants no workers.
@@ -399,6 +408,12 @@ pub(super) fn run(state_dir: PathBuf, action: ConnectionAction) -> Result<i32> {
         ConnectionAction::Sites { .. } | ConnectionAction::SelectSite { .. } => {
             return Err(Error::usage(
                 "connection sites/select-site are hosted-workspace operations; \
+                 pass --org <logged-in-workspace>",
+            ));
+        }
+        ConnectionAction::Assets { .. } | ConnectionAction::SelectAsset { .. } => {
+            return Err(Error::usage(
+                "connection assets/select-asset are hosted-workspace operations; \
                  pass --org <logged-in-workspace>",
             ));
         }

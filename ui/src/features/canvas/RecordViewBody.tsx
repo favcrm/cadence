@@ -12,7 +12,7 @@ import { composerDraftState, requestComposerFocus, setComposerDraft } from "../a
 import type { CanvasTab } from "./canvasStore";
 import type { RecordViewRef } from "./recordView";
 
-export default function RecordViewBody({ tab, view, composerKey, sheet, expanded, canExpand, onExpand, onClose }: {
+export default function RecordViewBody({ tab, view, composerKey, sheet, expanded, canExpand, onExpand, onClose, onPaneClose }: {
   tab: CanvasTab;
   view: RecordViewRef;
   composerKey: string | null;
@@ -21,6 +21,8 @@ export default function RecordViewBody({ tab, view, composerKey, sheet, expanded
   canExpand: boolean;
   onExpand: () => void;
   onClose: () => void;
+  /** In a pane (CAD-2635): its close returns the view to a tab. */
+  onPaneClose?: () => void;
 }) {
   const t = useTranslate();
   const { formatDate } = useLocale();
@@ -65,7 +67,7 @@ export default function RecordViewBody({ tab, view, composerKey, sheet, expanded
                 {expanded ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
               </svg>
             </button>
-            <button type="button" className="cv-iconbtn" onClick={onClose} aria-label={t("Close canvas")}>
+            <button type="button" className="cv-iconbtn" onClick={onPaneClose ?? onClose} aria-label={t(onPaneClose ? "Close pane" : "Close canvas")} title={onPaneClose ? t("Close pane — the view stays in the tabs") : undefined}>
               <IconClose size={12} />
             </button>
           </>

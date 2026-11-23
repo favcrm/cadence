@@ -24,13 +24,23 @@
  * - a record view (recordView.ts, CAD-2543) is a tab that reads one stored
  *   `detail` record card (an email). It holds the card's own content, never
  *   fetches, and follows the same rules: a tap opens it, the feed opens one
- *   only for a live card under the once-per-operator-turn rule.
+ *   only for a live card under the once-per-operator-turn rule;
+ * - the arrangement (canvasLayout.ts, CAD-2635): tabs, or 2-4 views on stage in
+ *   panes. `layout` is saved per conversation; a view's pane is its tab, so a
+ *   pane's close returns it to the strip and closing the tab closes the view.
+ *   A card's `placement` puts a view in a pane next to the focused one
+ *   (`beside`, `below`) or leaves it a tab, and an explicit placement is
+ *   the one thing the once-per-turn rule lets past.
  */
 import { useSyncExternalStore } from "react";
 import { onPrivateSessionReset } from "../../lib/privateSession";
 import { appViewId, appViewRef, appViewTitle, applyRoutePatch, sameRoute, type AppViewRef } from "./appView";
 import type { RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { RecordViewRef } from "./recordView";
+import {
+  addPane, chooseMode, clampShare, clearSavedLayouts, dropPane, livePanes, readLayout, removePane, replacePane, writeLayout,
+  MAX_PANES, type DropZone, type LayoutMode, type PaneLayout, type Placement,
+} from "./canvasLayout";
 
 export type ArtifactKind = "md" | "pdf" | "html" | "image" | "csv";
 /** A tab's kind: an artifact's, an app view's or a record view's. */
@@ -103,6 +113,10 @@ export interface CanvasState {
   tabs: CanvasTab[];
   active: string | null;
   working: Working | null;
+  /** The saved arrangement; read it through `canvasLayout.effective` (it may name tabs not open yet). */
+  layout: PaneLayout;
+  /** The last view opened: where `beside`/`below` land when nothing is focused. */
+  lastOpened: string | null;
 }
 
 /** One card in the conversation, as the feed describes it. */
@@ -123,6 +137,8 @@ export interface FeedView {
   /** Stable per entry. */
   key: string;
   ref: AppViewRef;
+  /** CAD-2635: where the card asks for the view; absent or unknown: today's behaviour. */
+  placement?: Placement;
   /** The card is for the app page already on screen: it moves that page (`showHere`), never a canvas tab. */
   here?: true;
   live: boolean;
@@ -171,7 +187,7 @@ function emptyState(
   composerKey: string | null = null,
   surface: Surface = "home",
 ): CanvasState {
-  return { conversation, surface, composerKey, open: false, tabs: [], active: null, working: null };
+  return { conversation, surface, composerKey, open: false, tabs: [], active: null, working: null, layout: readLayout(conversation), lastOpened: null };
 }
 
 /** An artifact took the active tab: "user" for a card or tab click, "auto"
@@ -192,8 +208,9 @@ export function onArtifactsEmptied(listener: () => boolean): void {
   emptiedListeners.add(listener);
 }
 
-function set(next: CanvasState): void {
+function set(next: CanvasState, save = true): void {
   if (next === state) return;
+  if (save && next.layout !== state.layout) writeLayout(next.conversation, next.layout);
   state = next;
   for (const l of [...listeners]) l();
 }
@@ -221,7 +238,7 @@ export function resetCanvas(
   closedTurns = new Set();
   autoOpened = new Set();
   currentTurn = null;
-  set(emptyState(conversation, composerKey, surface));
+  set(emptyState(conversation, composerKey, surface), false);
 }
 
 function sameWorking(a: Working | null, b: Working | null): boolean {
@@ -255,6 +272,45 @@ function withVersion(t: CanvasTab, ref: ArtifactRef, turn: string | null): Canva
   };
 }
 
+const idsOf = (tabs: CanvasTab[]): string[] => tabs.map((t) => t.id);
+
+interface Stage {
+  layout: PaneLayout;
+  active: string | null;
+}
+
+/**
+ * Bring tab `id` (already in `tabs`) on stage. `beside`/`below` anchor to the
+ * focused pane, else the last opened view; with four panes showing the view
+ * stays a background tab. With panes showing, a view with no placement takes
+ * the focused pane's place (the one that was there returns to its tab) and
+ * an explicit `tab` stays in the strip. With no panes it is simply the shown tab.
+ */
+function present(tabs: CanvasTab[], active: string | null, lastOpened: string | null, layout: PaneLayout, id: string, placement?: Placement): Stage {
+  const ids = idsOf(tabs);
+  const live = livePanes(layout, ids);
+  const focused = active !== null && live.includes(active) ? active : (live[0] ?? null);
+  if (placement === "beside" || placement === "below") {
+    if (live.includes(id)) return { layout, active: id };
+    if (live.length >= MAX_PANES) return { layout, active };
+    const others = ids.filter((x) => x !== id);
+    const anchor = [focused, active, lastOpened].find((x) => x !== null && others.includes(x)) ?? others[others.length - 1] ?? null;
+    const placed = addPane(layout, ids, id, anchor, placement === "beside" ? "split" : "stack");
+    return { layout: placed.layout, active: id };
+  }
+  if (live.length < 2) return { layout, active: id };
+  if (placement === "tab") return { layout, active };
+  if (live.includes(id)) return { layout, active: id };
+  const swapped = replacePane(layout, ids, focused, id);
+  return { layout: swapped.layout, active: swapped.placed ? id : active };
+}
+
+/** With panes showing, the active view is one of them. */
+function onStage(tabs: CanvasTab[], active: string | null, layout: PaneLayout): string | null {
+  const live = livePanes(layout, idsOf(tabs));
+  return live.length >= 2 && (active === null || !live.includes(active)) ? live[0] : active;
+}
+
 /**
  * Fold the conversation's cards and working state in. Idempotent: the
  * feed calls it on every render of the thread, so only a card never seen
@@ -266,7 +322,15 @@ export function feedCanvas(input: FeedInput): void {
   let tabs = state.tabs;
   let open = state.open;
   let active = state.active;
+  let layout = state.layout;
+  let lastOpened = state.lastOpened;
   let focused = false;
+  const show = (id: string, placement?: Placement) => {
+    ({ layout, active } = present(tabs, active, lastOpened, layout, id, placement));
+    lastOpened = id;
+    open = true;
+    focused = true;
+  };
   // CAD-2548: a live card of the turn still in flight waits for that turn to
   // end (the thread paints its cards with the answer); it is not "seen" yet.
   const held = (x: { live: boolean; turn: string | null }) => x.live && x.turn !== null && x.turn === (input.working?.turn ?? null);
@@ -282,15 +346,14 @@ export function feedCanvas(input: FeedInput): void {
     if (input.autoOpen !== false && card.live && !held(card) && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
       autoOpened.add(card.turn);
       if (!tabs.some((t) => t.id === ref.id)) tabs = [...tabs, newTab(ref, card.turn)];
-      open = true;
-      active = ref.id;
-      focused = true;
+      show(ref.id);
     }
   }
   for (const view of input.views ?? []) {
     if (seen.has(view.key) || held(view)) continue;
     seen.add(view.key);
-    if (input.autoOpen === false || !view.live || !view.operatorTurn || !view.turn || autoOpened.has(view.turn) || closedTurns.has(view.turn)) continue;
+    // An explicit placement is Nova opening that view on purpose, so it is not the turn's one auto-open.
+    if (input.autoOpen === false || !view.live || !view.operatorTurn || !view.turn || closedTurns.has(view.turn) || (autoOpened.has(view.turn) && view.placement === undefined)) continue;
     autoOpened.add(view.turn);
     if (view.here) {
       input.showHere?.(view.ref.route);
@@ -298,9 +361,7 @@ export function feedCanvas(input: FeedInput): void {
     }
     const id = appViewId(view.ref);
     if (!tabs.some((t) => t.id === id)) tabs = [...tabs, appTab(id, view.ref)];
-    open = true;
-    active = id;
-    focused = true;
+    show(id, view.placement);
   }
   for (const record of input.records ?? []) {
     if (seen.has(record.key) || held(record)) continue;
@@ -308,9 +369,7 @@ export function feedCanvas(input: FeedInput): void {
     if (input.autoOpen === false || !record.live || !record.operatorTurn || !record.turn || autoOpened.has(record.turn) || closedTurns.has(record.turn)) continue;
     autoOpened.add(record.turn);
     if (!tabs.some((t) => t.id === record.ref.id)) tabs = [...tabs, recordTab(record.ref)];
-    open = true;
-    active = record.ref.id;
-    focused = true;
+    show(record.ref.id);
   }
   if (tabs.length === 0) {
     open = false;
@@ -318,14 +377,15 @@ export function feedCanvas(input: FeedInput): void {
   } else if (active === null || !tabs.some((t) => t.id === active)) {
     active = tabs[0].id;
   }
+  active = onStage(tabs, active, layout);
   if (focused) artifactFocused("auto");
   const composerKey = input.composerKey;
   const working = sameWorking(input.working, state.working) ? state.working : input.working;
   if (
-    tabs === state.tabs && open === state.open && active === state.active &&
+    tabs === state.tabs && open === state.open && active === state.active && layout === state.layout && lastOpened === state.lastOpened &&
     composerKey === state.composerKey && working === state.working && input.surface === state.surface
   ) return;
-  set({ ...state, tabs, open, active, composerKey, working, surface: input.surface });
+  set({ ...state, tabs, open, active, layout, lastOpened, composerKey, working, surface: input.surface });
 }
 
 /** Open (or focus) an artifact from its card. */
@@ -342,7 +402,7 @@ export function openArtifact(ref: ArtifactRef): void {
             },
       )
     : [...state.tabs, newTab(ref, null)];
-  set({ ...state, tabs, active: ref.id, open: true });
+  set({ ...state, tabs, ...present(tabs, state.active, state.lastOpened, state.layout, ref.id), lastOpened: ref.id, open: true });
   artifactFocused("user");
 }
 
@@ -357,13 +417,13 @@ function recordTab(ref: RecordViewRef): CanvasTab {
 /** Open (or focus) a `detail` record card's reader from the card. */
 export function openRecordView(ref: RecordViewRef): void {
   const tabs = state.tabs.some((t) => t.id === ref.id) ? state.tabs : [...state.tabs, recordTab(ref)];
-  set({ ...state, tabs, active: ref.id, open: true });
+  set({ ...state, tabs, ...present(tabs, state.active, state.lastOpened, state.layout, ref.id), lastOpened: ref.id, open: true });
   artifactFocused("user");
 }
 
 /** Open (or focus) an installed app's screen from a resource link. A
  *  malformed reference opens nothing and says so. */
-export function openAppView(input: unknown): boolean {
+export function openAppView(input: unknown, placement?: Placement): boolean {
   const ref = appViewRef(input);
   if (!ref) return false;
   const id = appViewId(ref);
@@ -371,7 +431,7 @@ export function openAppView(input: unknown): boolean {
   const tabs = state.tabs.some((t) => t.id === id)
     ? state.tabs.map((t) => (t.id === id && t.app && !sameRoute(t.app.route, ref.route) ? { ...t, title: ref.title, app: { ...t.app, route: ref.route } } : t))
     : [...state.tabs, appTab(id, ref)];
-  set({ ...state, tabs, active: id, open: true });
+  set({ ...state, tabs, ...present(tabs, state.active, state.lastOpened, state.layout, id, placement), lastOpened: id, open: true });
   artifactFocused("user");
   return true;
 }
@@ -391,7 +451,8 @@ export function patchAppViewRoute(id: string, patch: RoutePatch): void {
 
 export function focusTab(id: string): void {
   if (!state.tabs.some((t) => t.id === id)) return;
-  if (state.active !== id || !state.open) set({ ...state, active: id, open: true });
+  const shown = present(state.tabs, state.active, state.lastOpened, state.layout, id);
+  if (shown.active !== state.active || shown.layout !== state.layout || !state.open) set({ ...state, ...shown, open: true });
   artifactFocused("user");
 }
 
@@ -399,14 +460,60 @@ export function closeTab(id: string): void {
   const index = state.tabs.findIndex((t) => t.id === id);
   if (index < 0) return;
   const tabs = state.tabs.filter((t) => t.id !== id);
+  // The view is closed, so its place in the arrangement goes too; fewer than two saved is no arrangement.
+  const saved = state.layout.panes.filter((p) => p !== id);
+  const layout = saved.length === state.layout.panes.length ? state.layout : saved.length < 2 ? { ...state.layout, mode: "tabs" as const, panes: [] } : { ...state.layout, panes: saved };
   if (tabs.length === 0) {
     const kept = [...emptiedListeners].some((l) => l());
     if (!kept) closeDrawerFor(currentTurn);
-    set({ ...state, tabs, active: null, open: false });
+    set({ ...state, tabs, layout, active: null, open: false });
     return;
   }
-  const active = state.active === id ? tabs[Math.min(index, tabs.length - 1)].id : state.active;
-  set({ ...state, tabs, active });
+  const before = livePanes(state.layout, idsOf(state.tabs));
+  const rest = before.filter((p) => p !== id);
+  // A pane that closes hands focus to the pane beside it, and the last one left becomes the shown view.
+  const next = before.includes(id) && rest.length > 0 && (rest.length === 1 || state.active === id) ? rest[Math.min(before.indexOf(id), rest.length - 1)] : null;
+  const active = next ?? (state.active === id ? tabs[Math.min(index, tabs.length - 1)].id : state.active);
+  set({ ...state, tabs, layout, active: onStage(tabs, active, layout) });
+}
+
+// ---- the arrangement (CAD-2635) ----
+
+/** The layout switcher. Tabs returns every pane to the strip; the others arrange the open views. */
+export function setLayoutMode(mode: LayoutMode): void {
+  const layout = chooseMode(state.layout, idsOf(state.tabs), state.active, mode);
+  if (layout === state.layout) return;
+  set({ ...state, layout, active: onStage(state.tabs, state.active, layout) });
+}
+
+/** A pane's close (and "Move to tab"): the view goes back to a tab. */
+export function unpane(id: string): void {
+  const ids = idsOf(state.tabs);
+  const before = livePanes(state.layout, ids);
+  if (!before.includes(id)) return;
+  const layout = removePane(state.layout, ids, id);
+  const rest = before.filter((p) => p !== id);
+  const active = rest.length === 1 || state.active === id ? rest[Math.min(before.indexOf(id), rest.length - 1)] : state.active;
+  set({ ...state, layout, active });
+}
+
+/** A tab dropped on the stage: left, right or bottom of the focused view, or in its place. */
+export function dropTab(id: string, zone: DropZone): boolean {
+  const anchor = state.active !== null && state.active !== id ? state.active : null;
+  const dropped = dropPane(state.layout, idsOf(state.tabs), id, anchor, zone);
+  if (!dropped.placed) return false;
+  set({ ...state, layout: dropped.layout, active: id, lastOpened: id });
+  return true;
+}
+
+/** A divider moved. `commit` false while a drag is under way: the share is shown, not yet saved. */
+export function setPaneShare(axis: "cols" | "rows", share: number, commit = true): void {
+  const next = clampShare(share);
+  if (next === state.layout[axis]) {
+    if (commit) writeLayout(state.conversation, state.layout);
+    return;
+  }
+  set({ ...state, layout: { ...state.layout, [axis]: next } }, commit);
 }
 
 function closeDrawerFor(turn: string | null): void {
@@ -428,7 +535,10 @@ export function showDrawer(): void {
 
 // A confirmed identity change drops this conversation's tabs: titles and
 // versions belong to the person who was signed in.
-onPrivateSessionReset(() => resetCanvas());
+onPrivateSessionReset(() => {
+  clearSavedLayouts();
+  resetCanvas();
+});
 
 export function selectVersion(id: string, version: number): void {
   set({

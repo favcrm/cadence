@@ -22,17 +22,17 @@ use runs::{derive_operation_id, parse_assistant_input, read_run_inputs, resolve_
 /// `workflow approve`.
 #[derive(Subcommand)]
 pub(crate) enum AppAction {
-    /// Configure exact publication connections for an installation or context.
+    /// [native daemon only] Configure exact publication connections for an installation or context.
     Binding {
         #[command(subcommand)]
         action: BindingAction,
     },
-    /// Stage and explicitly approve release of an independently reviewed artifact.
+    /// [native daemon only] Stage and explicitly approve release of an independently reviewed artifact.
     Effect {
         #[command(subcommand)]
         action: EffectAction,
     },
-    /// Optional app-owned content settings; creates no worker or provider authority.
+    /// [native daemon only] Optional app-owned content settings; creates no worker or provider authority.
     Context {
         #[command(subcommand)]
         action: ContextAction,
@@ -64,32 +64,36 @@ pub(crate) enum AppAction {
         #[arg(long)]
         json: bool,
     },
-    /// Host-managed per-installation customer records with scoped revisions.
+    /// [native daemon only] Host-managed per-installation customer records with scoped revisions.
+    /// For a hosted workspace (`--org`), use `app describe <app>` and `app call <app> records.*`.
     Record {
         #[command(subcommand)]
         action: RecordAction,
     },
-    /// Saved segments, exclusion lists, suppressions and frozen
+    /// [native daemon only] Saved segments, exclusion lists, suppressions and frozen
     /// audiences over customer records (CAD-780). No mail is sent.
+    /// For a hosted workspace (`--org`), use `app call <app> segments.*` or `audience.preview`.
     Audience {
         #[command(subcommand)]
         action: AudienceAction,
     },
-    /// Campaign email content — the scoped-chat inert assistant draft
+    /// [native daemon only] Campaign email content — the scoped-chat inert assistant draft
     /// (CAD-1014): drafts a pending proposal the operator applies or
     /// discards. Never edits, approves or sends.
+    /// For a hosted workspace (`--org`), use `app call <app> content.*` or `proposals.*`.
     Content {
         #[command(subcommand)]
         action: ContentAction,
     },
-    /// Works content (CAD-1662): native operator docs, decks and sheets over
+    /// [native daemon only] Works content (CAD-1662): native operator docs, decks and sheets over
     /// the durable store. Explicit install and context; no actor flags. Review
     /// needs two verified humans, and the daemon derives the actor.
     Works {
         #[command(subcommand)]
         action: WorksAction,
     },
-    /// CRM app assistant discovery, consented action invocation, and durable receipt reads.
+    /// [native daemon only] CRM app assistant discovery, consented action invocation, and durable receipt reads.
+    /// For a hosted workspace (`--org`), use `app describe <app>` and `app call <app> <operation>`.
     Assistant {
         #[command(subcommand)]
         action: AssistantAction,
@@ -120,7 +124,7 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: CatalogAction,
     },
-    /// App-owned local runs with separate execution approval.
+    /// [native daemon only] App-owned local runs with separate execution approval.
     Run {
         #[command(subcommand)]
         action: RunAction,

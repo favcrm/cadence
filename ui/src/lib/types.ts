@@ -2018,6 +2018,42 @@ export interface ConnectionSitePayload {
   site: ConnectionSite;
 }
 
+/** Provider asset kinds supported by `/api/connections/<id>/assets`. */
+export type ConnectionAssetKind =
+  | "search_console_site"
+  | "meta_ad_account"
+  | "google_ads_customer";
+
+/** One selectable provider asset returned by `GET /api/connections/<id>/assets`. */
+export interface ConnectionAsset {
+  value: string;
+  label: string;
+  permission: string;
+  selectable: boolean;
+  currency?: string;
+  timezone?: string;
+}
+
+/** `GET /api/connections/<id>/assets` — live assets and current connection-level pin. */
+export interface ConnectionAssetsPayload {
+  kind: ConnectionAssetKind;
+  assets: ConnectionAsset[];
+  selected: string | null;
+}
+
+/** One pinned provider asset returned by `POST /api/connections/<id>/asset`. */
+export interface ConnectionAssetSelection {
+  kind: ConnectionAssetKind;
+  value: string;
+  label: string;
+  permission: string | null;
+}
+
+/** `POST /api/connections/<id>/asset` — the newly pinned provider asset. */
+export interface ConnectionAssetPayload {
+  asset: ConnectionAssetSelection;
+}
+
 /**
  * CAD-1065/CAD-1085: the approved SMTP no-send login check's closed
  * failure code — the stage the check stopped at, never provider or

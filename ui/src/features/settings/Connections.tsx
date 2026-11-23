@@ -84,6 +84,7 @@ import { connectionLabel } from "../../lib/connections";
 import "./connections.css";
 import { hostedConnectError, hostedConnectUrl, UI_HOSTED_REFUSED } from "./hostedConnect";
 import { useTranslate } from "../../lib/locale";
+import { ConnectionAssetPicker, isAssetPinningProvider } from "./ConnectionAssetPicker";
 
 /**
  * CAD-1013 safe enrollment errors. A provider/daemon refusal can carry
@@ -1891,6 +1892,10 @@ export function ConnectionDetail({
         <SearchConsoleProperty row={row} canWrite={canWrite} />
       )}
 
+      {hostedBoard && isAssetPinningProvider(row.provider) && (
+        <ConnectionAssetPicker row={row} provider={row.provider} canWrite={canWrite} />
+      )}
+
       {note && (
         <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : note.warn ? "text-warn" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
           {t(note.text)}{note.suffix ? " " + t(note.suffix) : ""}
@@ -1918,7 +1923,11 @@ export function ConnectionDetail({
             {t("Disconnect…")}
           </Button>
           <span className="text-micro text-ink-500">
-            {t("Disconnecting also removes this account's grants and pinned property.")}
+            {row.provider === "google_search_console"
+              ? t("Disconnecting also removes this account's grants and pinned property.")
+              : isAssetPinningProvider(row.provider)
+                ? t("Disconnecting also removes this account's grants and pinned account.")
+                : t("Disconnecting also removes this account's grants.")}
           </span>
         </div>
       )}
@@ -2776,7 +2785,11 @@ function RevokeConfirm({
     <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={t("disconnect {connectionLabel}").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}>
       <p className="text-label text-ink-200 break-words">
         {hostedPlatform
-          ? t("Disconnecting disables this provider account and revokes its connection grants. The pinned Search Console property is removed. This cannot be undone — connecting the account again creates a new connection.")
+          ? row.provider === "google_search_console"
+            ? t("Disconnecting disables this provider account and revokes its connection grants. The pinned Search Console property is removed. This cannot be undone — connecting the account again creates a new connection.")
+            : isAssetPinningProvider(row.provider)
+              ? t("Disconnecting disables this provider account and revokes its connection grants. Any pinned ad account is removed. This cannot be undone — connecting the account again creates a new connection.")
+              : t("Disconnecting disables this provider account and revokes its connection grants. This cannot be undone — connecting the account again creates a new connection.")
           : t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}
       </p>
       <label className="flex items-start gap-2 text-label text-ink-300">
@@ -2789,7 +2802,11 @@ function RevokeConfirm({
         />
         <span>
           {hostedPlatform
-            ? t("I understand disconnecting {connectionLabel} disables the provider account and removes its pinned property.").replace("{connectionLabel}", () => connectionLabel(row))
+            ? row.provider === "google_search_console"
+              ? t("I understand disconnecting {connectionLabel} disables the provider account and removes its pinned property.").replace("{connectionLabel}", () => connectionLabel(row))
+              : isAssetPinningProvider(row.provider)
+                ? t("I understand disconnecting {connectionLabel} disables the provider account and removes its pinned account.").replace("{connectionLabel}", () => connectionLabel(row))
+                : t("I understand disconnecting {connectionLabel} disables the provider account and revokes its connection grants.").replace("{connectionLabel}", () => connectionLabel(row))
             : t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}
         </span>
       </label>

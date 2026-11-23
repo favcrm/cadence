@@ -68,7 +68,7 @@ function FrameDenied({ onDenied, children }: { onDenied: () => void; children: R
   return <>{children}</>;
 }
 
-export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpand, onExpand, onClose }: {
+export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpand, onExpand, onClose, onPaneClose }: {
   tab: CanvasTab;
   app: AppViewRef;
   sheet: boolean;
@@ -78,6 +78,8 @@ export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpa
   canExpand: boolean;
   onExpand: () => void;
   onClose: () => void;
+  /** In a pane (CAD-2635): its close returns the view to a tab. */
+  onPaneClose?: () => void;
 }) {
   const t = useTranslate();
   const locale = useLocaleTag();
@@ -104,8 +106,8 @@ export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpa
     <>
       <ViewHeader
         mark={sheet ? null : <span className="cv-mark"><AppGlyph name={load.status === "ready" ? load.installation.name : app.tag} title={appName} size="xs" /></span>}
-        back={sheet ? { onBack: onClose, expanded: false } : expanded ? { onBack: onExpand, expanded: true } : null}
-        title={tabbed ? null : tab.title}
+        back={onPaneClose ? null : sheet ? { onBack: onClose, expanded: false } : expanded ? { onBack: onExpand, expanded: true } : null}
+        title={tabbed && !onPaneClose ? null : tab.title}
         chips={chips}
         note={noAccess ? null : t("Read-only here — open in {app} to edit").replace("{app}", appName)}
         open={noAccess || href === null ? null : {
@@ -114,7 +116,8 @@ export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpa
           onOpen: sheet ? onClose : () => closeTab(tab.id),
         }}
         expand={sheet ? null : { expanded, enabled: canExpand, onToggle: onExpand }}
-        onClose={onClose}
+        pane={onPaneClose ? { onMoveToTab: onPaneClose } : null}
+        onClose={onPaneClose ?? onClose}
       />
       <div className="cv-body cv-appview-body" data-canvas-body data-app-view>
         {load.status === "loading" ? <AppLoadingSurface label={t("Loading…")} variant="canvas" /> : null}

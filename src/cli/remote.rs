@@ -1362,6 +1362,18 @@ fn verb_for(
                     args.insert("connectionId".into(), json!(connection_id));
                     args.insert("body".into(), json!({ "siteUrl": site_url }));
                 }
+                ConnectionAction::Assets { connection_id } => {
+                    args.insert("operation".into(), json!("connection_assets"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                }
+                ConnectionAction::SelectAsset {
+                    connection_id,
+                    value,
+                } => {
+                    args.insert("operation".into(), json!("connection_select_asset"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                    args.insert("body".into(), json!({ "value": value }));
+                }
                 ConnectionAction::Revoke { connection_id } => {
                     args.insert("operation".into(), json!("connection_revoke"));
                     args.insert("connectionId".into(), json!(connection_id));
@@ -6128,6 +6140,26 @@ mod read_contract_tests {
                     "operation": "connection_select_site",
                     "connectionId": "con_synthetic",
                     "body": {"siteUrl": "sc-domain:example.test"}
+                }),
+            ),
+            (
+                ConnectionAction::Assets {
+                    connection_id: "con_synthetic".into(),
+                },
+                json!({
+                    "operation": "connection_assets",
+                    "connectionId": "con_synthetic"
+                }),
+            ),
+            (
+                ConnectionAction::SelectAsset {
+                    connection_id: "con_synthetic".into(),
+                    value: "act_1234567890".into(),
+                },
+                json!({
+                    "operation": "connection_select_asset",
+                    "connectionId": "con_synthetic",
+                    "body": {"value": "act_1234567890"}
                 }),
             ),
         ];
