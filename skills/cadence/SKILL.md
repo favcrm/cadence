@@ -1,6 +1,6 @@
 ---
 name: cadence
-description: Work on a Cadence project as a hosted or native agent. Use for assignments, PR handoffs, artifact or task delivery, and reporting, or when CADENCE_ALIAS is set.
+description: Work on a Cadence project as a hosted or native agent. Use for assignments, PR review and approval handoffs, artifact or task delivery, and reporting, or when CADENCE_ALIAS is set.
 ---
 
 # Cadence agent protocol
@@ -801,59 +801,68 @@ checklist report for every trivial edit or spend model turns on empty retros.
 
 ## Review and delivery
 
-Use this path only for tickets with a PR. Each repo owns its checks, review
-and merge route. For a native Cadence gate, inspect
-`cadence delivery requirements --issue <ID> --pr <url> --head <full-sha>`.
-If the project uses hosted Cadence delivery, preflight the live PR head with
-`cadence --org <org> delivery check --project <p> --issue <ID> --repo
-<owner/name> --pr <n> --head <full-sha>`. The hosted gate counts
-`standards` and `spec-security` itself; CI or an advisory review can be
-green while the gate refuses.
+Use this path only for tickets with a PR. Follow the owning repo's approved
+merge route; a Cadence ticket alone does not require hosted delivery. On other
+routes, use the repo's own checks and handoff, not the hosted commands below.
 
-1. **Do the agent reviews the policy requires.** A reviewer is a fresh
-   session: not the author, inheriting no conversation or context from the work
-   (a subagent qualifies; a fork or a resumed authoring session does not).
-   Brief it with the PR, the exact head and the ticket, not your conclusions.
-   A reviewer is read-only and reports back; agents file no hosted verdict
-   unless the workspace owner has attested them as reviewers. Reviews bind to
-   the exact head: a new head voids them, so re-review after any push.
-2. **Post the reports.** Whoever dispatched the reviewer posts each report on
-   the PR or ticket, naming the head, the checks run and the limitations. For
-   Browser QA, the `deliverable-qa` skill has the comment format and routes.
-3. **Clear agent-owned blockers.** Read `delivery check` reasons, even on a
-   nonzero exit: approval may be the only pending requirement. For a
-   workflow REVISE, use hosted `audit verdicts --body` with the same
-   selectors; fix valid findings in the existing PR and recheck the new head.
-   Ask the operator to accept a REVISE only when the finding is wrong and say
-   why. Missing or stale review, CI or Browser QA is not an approval request.
-4. **Hand off through the CLI.** Once only the operator step remains, put the
-   ticket in Review and post one comment: PR, full head, CI and review links,
-   Browser QA report when required, and the exact decision or approval ID.
-   If a hosted Cadence merge still needs approval, give the operator one
-   paste-ready block. Replace the variables with shell-quoted values for the
-   actual selectors, full head, and truthful approval source. Keep `&&`:
-   enqueue must not run if approval fails.
+1. **Preflight before dispatch.** For a Cadence gate, run `cadence delivery
+   requirements --issue <ID> --pr <url> --head <full-sha>` (add `--org <org>`
+   for hosted). Confirm the project, repo, target branch and full head. On the
+   hosted route, the PR title's first issue token must match the delivery
+   ticket. Check `cadence --org <org> audit reviewers --project <p>` and the
+   workflow trust on the live base to identify who can file each required
+   verdict. Follow the policy's review kinds and distinct-principal rules,
+   not the review count from another repo.
+2. **Review the exact head.** Brief each fresh, read-only session with the PR,
+   head and ticket, not your conclusions. A subagent qualifies; a resumed or
+   forked authoring session does not. Whoever dispatched it posts the findings,
+   checks and limits on the PR or ticket. Use `deliverable-qa` for Browser QA.
+   Fresh-session reviews (including OMP) are not hosted verdicts by themselves.
+   For the hosted gate use one of its trusted routes:
+   - **Attested reviewer:** a non-author principal with an owner-attested
+     GitHub login and project eligibility files their own `audit verdict`.
+     Two sessions under one principal do not fill two required reviewer slots.
+   - **Trusted workflow:** run the review from the protected base the gate
+     verifies. A PR adding a workflow or its trust entry cannot use that new
+     trust to review itself. Use already-eligible independent reviewers for
+     bootstrap; if none can cover the required reviews, report the exact gap
+     and ask the owner to attest and admit the missing reviewers. Do not
+     substitute another merge route or ask for approval in lieu of a review.
+     After bootstrap merges, confirm the tenant rollout and workflow settings.
+     Dispatch for the dependent PR's current head and check that the verdicts count.
+3. **Clear the hosted gate.** Read `cadence --org <org> delivery check
+   --project <p> --issue <ID> --repo <owner/name> --pr <n> --head <full-sha>`
+   and its counted verdicts and reasons, even on nonzero exit. For a workflow
+   REVISE, read `audit verdicts --body` with the same selectors. Fix valid
+   findings in the existing PR; a new head needs new evidence. Ask the
+   operator to accept a REVISE only when the finding is wrong and explain
+   why. Missing review, CI or Browser QA is not an approval request.
+4. **Hand off through the CLI.** When only the operator step remains, put the
+   ticket in Review. Post one comment with PR, full head, CI and review links,
+   Browser QA when required, and the remaining decision or approval ID. Name
+   any release triggered by the merge and get its required authorization.
+   If approval is needed, prefer the supported combined command. Give the
+   operator a paste-ready block with literal selectors and a truthful
+   approval source (who decided and where), not shell variable names:
 
    ```bash
-   cadence --org "$org" audit approve --project "$project" --issue "$issue" \
-     --repo "$repo" --pr "$pr" --head "$head" --source "$source" &&
    cadence --org "$org" delivery enqueue --project "$project" --issue "$issue" \
-     --repo "$repo" --pr "$pr" --head "$head"
+     --repo "$repo" --pr "$pr" --head "$head" --approve "$source"
    ```
 
-   If approval is refused, stop and report why. If its outcome is uncertain,
-   read back the approval and queue before retrying. If a matching author-posted
-   Browser QA pass needs exact-head approval, ask the operator to read it first.
-   If approval is already in force or not required, give only enqueue; if
-   already queued, give neither. Use the UI if requested or if the CLI
-   route is unavailable; it authenticates the human, not bypasses a refusal.
-   Approval, `delivery enqueue`/`delivery merge` and `audit accept-revise`
-   are operator actions. Agents don't run them or switch identities.
-5. **Verify the outcome.** After enqueue, read the queue and merged PR from
-   GitHub. Close the ticket only after the merge commit is on the target
-   branch and the ticket's finish line is met. If the reply was lost, inspect
-   the existing queue entry or merge before anyone retries. Merged is not
-   deployed.
+   If the CLI lacks `--approve`, give `audit approve --source` with the same
+   selectors followed by `&&` and `delivery enqueue` without `--approve`.
+   If approval is already in force or not required, give only enqueue.
+   Check the actual GitHub queue entry, not just `autoMergeRequest`. If
+   queued or merged, give neither command. If the outcome is uncertain,
+   read back the approval and queue before retrying. For an author-posted
+   Browser QA pass that needs approval, ask the operator to read the report.
+   Use the UI only if requested or the CLI is unavailable, not to bypass a
+   refusal. Only the operator approves, enqueues, or accepts a REVISE.
+5. **Verify the outcome.** Check the actual merge commit on the target branch
+   and the ticket's finish line before closing. For a workflow bootstrap that
+   promises counted verdicts downstream, the merge alone is not completion.
+   Merged is not deployed.
 
 Do not restart the daemon. `cadence update` is operator-only. Reread this
 skill at a task boundary; an existing session does not reload guidance.
