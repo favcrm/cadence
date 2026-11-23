@@ -321,11 +321,7 @@ impl Shared {
                 )
             })?;
             let permit = witness.witness(super::custody_rpc::CustodyUse::OperatorSmtp, &record)?;
-            crate::platform::load_credential_witnessed(
-                &self.store,
-                &self.platform_custody,
-                &permit,
-            )?
+            self.load_credential_witnessed(&permit)?
         } else {
             zeroize::Zeroizing::new(crate::platform::load_credential(
                 &self.store,

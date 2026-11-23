@@ -74,7 +74,66 @@ impl CustodyOperation<'_> {
     }
 }
 
+pub(super) struct DaemonCustody {
+    inner: crate::platform::Custody,
+    vault: Option<std::sync::Arc<EncryptedVault>>,
+}
+
+impl DaemonCustody {
+    pub(super) fn new(
+        inner: crate::platform::Custody,
+        vault: Option<std::sync::Arc<EncryptedVault>>,
+    ) -> Self {
+        let inner = match &vault {
+            Some(vault) => inner.with_encrypted(std::sync::Arc::clone(vault)),
+            None => inner,
+        };
+        Self { inner, vault }
+    }
+
+    pub(super) fn encrypted(&self) -> Option<&std::sync::Arc<EncryptedVault>> {
+        self.vault.as_ref()
+    }
+
+    pub(super) fn load_encrypted(
+        &self,
+        witness: &CustodyWitness<'_>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        self.vault
+            .as_ref()
+            .ok_or_else(|| {
+                Error::invalid(
+                    "unsupported_custody_use",
+                    "this daemon is not configured for encrypted custody",
+                )
+            })?
+            .read_exact(&witness.record().custody, witness.expected())
+    }
+}
+
+impl std::ops::Deref for DaemonCustody {
+    type Target = crate::platform::Custody;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl Shared {
+    pub(super) fn load_credential_witnessed(
+        &self,
+        witness: &CustodyWitness<'_>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        witness.validate(&self.store)?;
+        let bytes = self.platform_custody.load_encrypted(witness)?;
+        if crate::secret::fingerprint(&bytes) != witness.record().fingerprint {
+            return Err(Error::invalid(
+                "integrity_failure",
+                "custody fingerprint mismatch",
+            ));
+        }
+        Ok(bytes)
+    }
     pub(super) fn custody_operation(&self) -> Result<CustodyOperation<'_>> {
         let guard = if self.platform_custody.encrypted().is_some() {
             match self.platform_custody_lock.try_lock() {
@@ -183,11 +242,7 @@ impl Shared {
                     let inspected = (|| -> Result<()> {
                         for record in references {
                             let witness = _operation.witness(CustodyUse::Connections, &record)?;
-                            let _bytes = crate::platform::load_credential_witnessed(
-                                &self.store,
-                                &self.platform_custody,
-                                &witness,
-                            )?;
+                            let _bytes = self.load_credential_witnessed(&witness)?;
                         }
                         Ok(())
                     })();
