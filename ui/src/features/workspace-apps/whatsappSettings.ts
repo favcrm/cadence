@@ -75,7 +75,7 @@ export type WhatsAppProviderSaveResult = {
 };
 
 export type OfficialConnectResult = {
-  url: string | null;
+  url: string;
   expires_at: string | null;
 };
 
@@ -171,12 +171,17 @@ export function parseLinkedSnapshot(
       error_code: typeof raw.error_code === "string" ? raw.error_code : "capability_unavailable",
     };
   }
-  const state =
-    typeof raw.state === "string" && LINKED_STATES.has(raw.state)
-      ? (raw.state as LinkedWhatsAppState)
-      : "idle";
-  const granted = raw.granted === true;
-  const connected = raw.connected === true;
+  if (
+    typeof raw.state !== "string" ||
+    !LINKED_STATES.has(raw.state) ||
+    typeof raw.granted !== "boolean" ||
+    typeof raw.connected !== "boolean"
+  ) {
+    throw new Error("Invalid Linked WhatsApp status payload.");
+  }
+  const state = raw.state as LinkedWhatsAppState;
+  const granted = raw.granted;
+  const connected = raw.connected;
   const qr =
     viewerRole === "owner" &&
     granted &&
@@ -234,14 +239,18 @@ export function parseOfficialSnapshot(raw: unknown): OfficialWhatsAppSnapshot {
 }
 
 function parseSettingsSnapshot(raw: unknown): WhatsAppSettingsSnapshot {
-  if (!isRecord(raw)) {
+  if (
+    !isRecord(raw) ||
+    (raw.viewer_role !== "owner" && raw.viewer_role !== "member") ||
+    (raw.active_provider !== null &&
+      raw.active_provider !== undefined &&
+      raw.active_provider !== "linked" &&
+      raw.active_provider !== "official")
+  ) {
     throw new Error("Invalid WhatsApp settings response.");
   }
-  const viewerRole = raw.viewer_role === "owner" ? "owner" : "member";
-  const activeProvider =
-    raw.active_provider === "linked" || raw.active_provider === "official"
-      ? raw.active_provider
-      : null;
+  const viewerRole = raw.viewer_role;
+  const activeProvider = raw.active_provider ?? null;
   const replyMode = raw.reply_mode === "human-only" ? "human-only" : "copilot";
   const settingsRevision =
     typeof raw.settings_revision === "number" &&
@@ -345,10 +354,9 @@ export async function runOfficialWhatsAppAction(
     (body) => {
       if (!isRecord(body)) throw new Error("Invalid Official WhatsApp response.");
       if (action === "connect") {
-        const rawUrl = body.url;
-        const safeUrl = rawUrl === null || rawUrl === undefined ? null : parseHttpsUrl(rawUrl);
-        if (rawUrl !== null && rawUrl !== undefined && safeUrl === null) {
-          throw new Error("Received an unsafe Official WhatsApp authorization link.");
+        const safeUrl = parseHttpsUrl(body.url);
+        if (!safeUrl) {
+          throw new Error("Missing or unsafe Official WhatsApp authorization link.");
         }
         return {
           connect: {

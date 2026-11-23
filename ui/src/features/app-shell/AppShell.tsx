@@ -37,7 +37,10 @@ import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/scree
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
 import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
 import WhatsAppSettingsPanel from "../workspace-apps/WhatsAppSettingsPanel";
-import { isMarkedWhatsAppSettingsUnsupported } from "../workspace-apps/whatsappSettings";
+import {
+  isMarkedWhatsAppSettingsUnsupported,
+  parseWhatsAppModeParam,
+} from "../workspace-apps/whatsappSettings";
 import "./app-shell.css";
 
 type ParsedConversationLink = Omit<ConversationLinkRequest, "visit"> & { key: string };
@@ -1166,12 +1169,7 @@ export default function AppShell({
   const isWabaConnection =
     installation?.name === "waba" &&
     (section === "connection" || query.get("waba") === "connection");
-  const wabaInitialMode =
-    query.get("mode") === "official"
-      ? "official"
-      : query.get("mode") === "linked"
-        ? "linked"
-        : null;
+  const wabaInitialMode = parseWhatsAppModeParam(query.get("mode"));
   const [wabaFallbackInstallId, setWabaFallbackInstallId] = useState<string | null>(null);
   const [wabaScreenRevision, setWabaScreenRevision] = useState(0);
   const wabaHostFallback =

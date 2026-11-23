@@ -49,6 +49,25 @@ async function main() {
   );
   assert(ownerParsed.available && ownerParsed.qr === "OWNER_SECRET_QR", "owner pairing keeps QR");
 
+  let bogusStateRejected = false;
+  try {
+    parseLinkedSnapshot(
+      { available: true, granted: true, state: "bogus_state", connected: false, qr: null },
+      "owner",
+    );
+  } catch {
+    bogusStateRejected = true;
+  }
+  assert(bogusStateRejected, "unknown linked state fails closed");
+
+  let missingLinkedBooleansRejected = false;
+  try {
+    parseLinkedSnapshot({ available: true, state: "idle" }, "owner");
+  } catch {
+    missingLinkedBooleansRejected = true;
+  }
+  assert(missingLinkedBooleansRejected, "linked snapshot missing booleans fails closed");
+
   // 2. Host read/write transport guarantees + 404/501 detection + timeout uncertain recovery
   const seenRequests: Array<{ url: string; method: string; cache?: RequestCache; credentials?: RequestCredentials; contentType?: string; body?: string }> = [];
   const originalFetch = globalThis.fetch;
@@ -127,6 +146,19 @@ async function main() {
       if (url.endsWith("/api/apps/install_unsafe_official/whatsapp-settings/official/connect")) {
         return jsonResponse({ url: "javascript:alert(1)", expires_at: null });
       }
+      if (url.endsWith("/api/apps/install_null_official/whatsapp-settings/official/connect")) {
+        return jsonResponse({ url: null, expires_at: null });
+      }
+      if (url.endsWith("/api/apps/install_bad_role/whatsapp-settings")) {
+        return jsonResponse({
+          viewer_role: "admin",
+          active_provider: "linked",
+          reply_mode: "copilot",
+          settings_revision: 1,
+          linked: { available: false, error_code: "not_granted" },
+          official: { available: false, error_code: "not_found" },
+        });
+      }
       if (url.endsWith("/api/apps/install_waba/whatsapp-settings/official/connect")) {
         return jsonResponse({ url: "https://portal.favcrm.example.test/wa/connect?token=ok", expires_at: "2026-11-23T12:00:00Z" });
       }
@@ -182,6 +214,22 @@ async function main() {
       unsafeUrlRejected = true;
     }
     assert(unsafeUrlRejected, "non-HTTPS Official connect link is rejected");
+
+    let nullUrlRejected = false;
+    try {
+      await runOfficialWhatsAppAction("install_null_official", "connect");
+    } catch {
+      nullUrlRejected = true;
+    }
+    assert(nullUrlRejected, "missing/null Official connect link fails closed");
+
+    let badRoleRejected = false;
+    try {
+      await readWhatsAppSettings("install_bad_role");
+    } catch {
+      badRoleRejected = true;
+    }
+    assert(badRoleRejected, "malformed viewer_role fails closed");
 
     const officialOk = await runOfficialWhatsAppAction("install_waba", "connect");
     assert(officialOk.connect?.url === "https://portal.favcrm.example.test/wa/connect?token=ok", "valid HTTPS Official connect URL accepted");

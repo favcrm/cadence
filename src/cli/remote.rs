@@ -1801,7 +1801,10 @@ fn whatsapp_connection_stderr_hint(
     body: &Value,
 ) -> Option<String> {
     use super::connection::{WhatsappAction, WhatsappProviderArg};
-    let url = body.pointer("/data/url").and_then(Value::as_str)?;
+    let url = body
+        .pointer("/data/url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("https://"))?;
     match action {
         WhatsappAction::Connect {
             provider: WhatsappProviderArg::Linked,
@@ -1820,12 +1823,6 @@ fn whatsapp_connection_stderr_hint(
                 ))
             }
         }
-        WhatsappAction::Connect {
-            provider: WhatsappProviderArg::Official,
-        }
-        | WhatsappAction::Rescope { .. } => Some(format!(
-            "Open this authenticated URL in your browser to finish Official WhatsApp setup (no browser was opened here):\n  {url}"
-        )),
         _ => None,
     }
 }
@@ -6683,7 +6680,19 @@ mod read_contract_tests {
         assert!(linked_connected_hint.contains("already connected"));
         assert!(linked_connected_hint.contains("$0/mo"));
 
-        let official_hint = whatsapp_connection_stderr_hint(
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "url": "http://insecure.example.test/apps/waba"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
             &WhatsappAction::Connect {
                 provider: WhatsappProviderArg::Official,
             },
@@ -6693,9 +6702,17 @@ mod read_contract_tests {
                 "url": "https://portal.favcrm.example.test/wa/connect?token=tok"
             }}),
         )
-        .unwrap();
-        assert!(official_hint.contains("Official WhatsApp setup"));
-        assert!(official_hint.contains("https://portal.favcrm.example.test/wa/connect?token=tok"));
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Rescope { request: None },
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "action": "rescope",
+                "url": "https://portal.favcrm.example.test/wa/connect?token=tok"
+            }}),
+        )
+        .is_none());
 
         assert!(whatsapp_connection_stderr_hint(
             &WhatsappAction::Status {
