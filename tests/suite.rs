@@ -19971,7 +19971,6 @@ fn cad224_completed_plain_dispatch_compares_full_approved_scope() {
         &[],
         &[],
         None,
-        None,
     )
     .unwrap();
 
@@ -20053,13 +20052,13 @@ fn cad224_completed_plain_dispatch_compares_full_approved_scope() {
     let issue = proposed["tickets"][0].as_str().unwrap();
     write::decide_plan(&pm, first_epic, true, "operator", None).unwrap();
     let (_, issue_dir) = write::issue_dir(&pm, issue).unwrap();
-    let (front, body) = write::load_front(&issue_dir).unwrap();
+    let body = std::fs::read_to_string(issue_dir.join("issue.md")).unwrap();
     let qualified = body.replace(
         &format!("- [ ] {criterion}\n"),
         &format!("- [ ] {criterion}\n  Under normal traffic\n"),
     );
     assert_ne!(qualified, body);
-    write::save_front(&issue_dir, &front, &qualified).unwrap();
+    std::fs::write(issue_dir.join("issue.md"), qualified).unwrap();
     pm.commit(&[issue_dir.join("issue.md")], "Qualify capability")
         .unwrap();
     let revision = |previous: &str| {
@@ -20174,10 +20173,10 @@ fn cad224_completed_plain_dispatch_compares_full_approved_scope() {
     assert_eq!(replay["dispatched"], false, "{replay}");
     assert_eq!(store.queued_count("worker").unwrap(), 0);
 
-    let (front, body) = write::load_front(&issue_dir).unwrap();
+    let body = std::fs::read_to_string(issue_dir.join("issue.md")).unwrap();
     let changed = body.replace("Under normal traffic", "Under exceptional traffic");
     assert_ne!(changed, body);
-    write::save_front(&issue_dir, &front, &changed).unwrap();
+    std::fs::write(issue_dir.join("issue.md"), changed).unwrap();
     pm.commit(&[issue_dir.join("issue.md")], "Change capability qualifier")
         .unwrap();
     let third = plan::propose(

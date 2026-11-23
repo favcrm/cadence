@@ -1228,3 +1228,92 @@ fn cad224_legacy_cloud_relative_default_spec_is_pinned_before_enqueue() {
     );
     assert_eq!(fx.snapshot(issue), before);
 }
+
+#[test]
+fn cad224_fresh_sandbox_start_reuses_terminal_jobs_branch() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::{Arc, Mutex};
+
+    let fx = IntakeFixture::new();
+    let proposal = fx.propose(LINKED_INTAKE);
+    let issue = proposal["tickets"][0].as_str().unwrap();
+    fx.approve(proposal["epic"].as_str().unwrap());
+    let spec = fx._dir.path().join("cad224-sandbox-spec.md");
+    std::fs::write(&spec, "Implement the approved prerequisite.\n").unwrap();
+    let socket = crate::client::socket_path(fx._dir.path());
+    let listener = UnixListener::bind(&socket).unwrap();
+    let jobs = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let recorded = Arc::clone(&jobs);
+    let daemon = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let response = match request["method"].as_str() {
+                Some("stop") => break,
+                Some("agent_show") => json!({"agent": {
+                    "enabled": true, "endpoint_kind": "sandbox",
+                    "params": {"upstream": "cad224-pm"}
+                }}),
+                Some("cloud_probe") => json!({}),
+                Some("job_new") => {
+                    let mut jobs = recorded.lock().unwrap();
+                    jobs.push(request["params"].clone());
+                    json!({"job": {"id": format!("cad224-job-{}", jobs.len())}})
+                }
+                other => panic!("unexpected start RPC {other:?}"),
+            };
+            writeln!(stream, "{}", json!({"ok": true, "result": response})).unwrap();
+        }
+    });
+    let args = crate::issue::start::StartArgs {
+        repo: Some(fx.repo.clone()),
+        name: None,
+        base: None,
+        owner: None,
+        job: Some(crate::issue::start::JobArgs {
+            id: None,
+            pm: "cad224-pm".into(),
+            spec,
+            assignee: Some("cad224-worker".into()),
+            force: false,
+        }),
+        by: Some("cad224-pm".into()),
+        take_over: None,
+    };
+    let first =
+        crate::issue::start::run(&fx.pm, issue, &args, "acceptance", fx._dir.path()).unwrap();
+    // Lower start seam: the loopback job_new server admits the next fresh
+    // job as if the first job had reached a terminal state.
+    let second =
+        crate::issue::start::run(&fx.pm, issue, &args, "acceptance", fx._dir.path()).unwrap();
+    let mut stop = UnixStream::connect(&socket).unwrap();
+    writeln!(stop, "{}", json!({"method": "stop"})).unwrap();
+    daemon.join().unwrap();
+    let branch = first["branch"].as_str().unwrap();
+    assert_eq!(second["branch"], branch);
+    let jobs = jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0]["task_branch"], branch);
+    assert_eq!(jobs[1]["task_branch"], branch);
+    let front = board::find_issue(&fx.pm.dir, issue).unwrap().front;
+    let branches: Vec<_> = front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "branch" && r.closed != Some(true))
+        .collect();
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].path.as_deref(), Some(branch));
+    assert!(!front
+        .refs
+        .iter()
+        .any(|r| r.kind == "worktree" && r.closed != Some(true)));
+    assert_eq!(
+        git(&fx.repo, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1
+    );
+}
