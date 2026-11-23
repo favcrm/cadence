@@ -1,0 +1,137 @@
+use super::*;
+use crate::issue::{board, plan, write, Pm};
+use crate::secret::Allowlist;
+use crate::test_seam::{scoped, Asserted};
+
+#[test]
+fn approved_intake_after_restart_refuses_provider_attention_without_dispatch() {
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(repo).args(args);
+        let output = crate::reaper::output(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("source");
+    std::fs::create_dir_all(repo.join("docs/cadence")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.name", "Acceptance"]);
+    git(
+        &repo,
+        &["config", "user.email", "acceptance@example.invalid"],
+    );
+    std::fs::write(repo.join("docs/scope.md"), "Approved scope\n").unwrap();
+    std::fs::write(repo.join("src/module.rs"), "// module\n").unwrap();
+    std::fs::write(
+        repo.join("docs/cadence/project-context.yaml"),
+        "schema: 1\nproject: cadence\ndocuments:\n  - id: scope\n    kind: scope\n    path: docs/scope.md\n    title: Scope\n    required: true\n    roles: []\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "Initial source"]);
+
+    let pm_dir = dir.path().join("pm");
+    let pm = Pm::init(&pm_dir).unwrap();
+    write::project_add(
+        &pm,
+        "cadence",
+        "CAD",
+        &[repo.to_string_lossy().into_owned()],
+        &[],
+        &[],
+        None,
+    )
+    .unwrap();
+    let draft = "---\ntitle: Deliver capability\ngoal: Deliver the scoped capability\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Capability available]\n  unknowns: []\n---\n\n## Implement capability\nagent: worker-1\nsources: scope\npaths: src/module.rs\n\n### Acceptance\n- [ ] Capability is available\n";
+    let proposal = plan::propose(
+        &pm,
+        "cadence",
+        draft,
+        None,
+        &Allowlist::default(),
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap();
+    let epic = proposal["epic"].as_str().unwrap();
+    let issue = proposal["tickets"][0].as_str().unwrap();
+    write::decide_plan(&pm, epic, true, "operator", None).unwrap();
+    drop(pm);
+
+    let opts = ServeOptions {
+        test_seam: true,
+        ..Default::default()
+    };
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let shared = Shared::new(dir.path(), &opts).unwrap();
+    let master = crate::master::ALIAS;
+    register(&shared, dir.path(), master);
+    shared
+        .store
+        .set_identity(
+            master,
+            &adapter::Identity {
+                thread_id: "master-thread".into(),
+                session_id: "master-session".into(),
+                model: None,
+                effort: None,
+                pid: std::process::id(),
+                endpoint: None,
+                generation: Some("224aabbccddeeff0224aabbccddeeff0".into()),
+                attach: None,
+            },
+        )
+        .unwrap();
+    register(&shared, dir.path(), "worker-1");
+    shared
+        .store
+        .set_state_detached(
+            "worker-1",
+            "attention",
+            Some("Provider connection is closed"),
+        )
+        .unwrap();
+    drop(shared);
+    let shared = Shared::new(dir.path(), &opts).unwrap();
+    let pm = Pm::at(&pm_dir).unwrap();
+    let before = board::find_issue(&pm.dir, issue).unwrap();
+    assert_eq!(before.front.status, "ready");
+    assert!(before.front.claim.is_none());
+    plan::gate_id(&pm.dir, issue).unwrap();
+    assert_eq!(shared.store.agent("worker-1").unwrap().state, "attention");
+    let issue_file = pm.dir.join("cadence").join(issue).join("issue.md");
+    let before_issue = std::fs::read(&issue_file).unwrap();
+    let before_lanes = git(&repo, &["worktree", "list", "--porcelain"]);
+    let before_queued = shared.store.queued_count("worker-1").unwrap();
+    let before_delivery = crate::delivery::load(dir.path()).unwrap();
+    assert_eq!(before_queued, 0);
+    let result = scoped(Asserted::Agent(master.into()), || {
+        shared.rpc_master_dispatch(&json!({"issue": issue}), std::process::id())
+    });
+    let refusal = result.unwrap_err().to_string();
+    assert!(refusal.contains("fenced"), "{refusal}");
+    assert_eq!(std::fs::read(&issue_file).unwrap(), before_issue);
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        before_lanes
+    );
+    assert_eq!(
+        shared.store.queued_count("worker-1").unwrap(),
+        before_queued
+    );
+    assert_eq!(
+        crate::delivery::load(dir.path()).unwrap().len(),
+        before_delivery.len()
+    );
+    let after = board::find_issue(&pm.dir, issue).unwrap();
+    assert_eq!(after.front.status, "ready");
+    assert!(after.front.claim.is_none());
+}
