@@ -141,7 +141,7 @@ export default function MemberChat({
   const [liveTurn, setLiveTurn] = useState<{
     conversation: string;
     message: string | null;
-    sendSeq?: number;
+    sendMessage?: string;
     state: "working" | "reconnecting" | "stopped";
   } | null>(null);
   const retryActivity = useRef<(() => void) | null>(null);
@@ -499,29 +499,35 @@ export default function MemberChat({
 
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   const activity = liveTurn?.conversation === conversationId ? liveTurn : null;
+  const followedMessage = activity?.message ?? activity?.sendMessage ?? null;
   const sendIndex = activity === null ? -1 : shown.findLastIndex((item) => {
     if (item.type === "operator") {
-      if (activity.message !== null) return itemMessage(item) === activity.message;
-      return activity.sendSeq === undefined
+      return followedMessage === null
         ? available && activity.state === "working"
-        : item.entry.seq === activity.sendSeq;
+        : itemMessage(item) === followedMessage;
     }
     return item.type === "pending" && item.pending.state !== "failed" &&
       activity.message !== null && item.pending.message === activity.message;
   });
-  // A stored result wins over an older working frame. An unnamed turn can
-  // only follow a stored send, never the latest optimistic message.
-  const activeItem = sendIndex < 0 || shown.some((item, index) =>
-    index > sendIndex && item.type === "answer" &&
-      (activity?.message == null || item.entry.message == null || item.entry.message === activity.message),
-  ) ? null : shown[sendIndex];
+  const send = sendIndex < 0 ? null : shown[sendIndex];
+  const message = followedMessage ?? (send === null ? null : itemMessage(send));
+  // A saved result wins even outside the display window. Legacy untagged
+  // results can only settle work when they follow its visible send.
+  const replied =
+    (message !== null && items.some((item) => item.type === "answer" && item.entry.message === message)) ||
+    (sendIndex >= 0 && shown.some((item, index) =>
+      index > sendIndex && item.type === "answer" && item.entry.message == null,
+    ));
+  const activeItem = replied ? null : send;
   const progress = activity?.state === "working" && !available ? "reconnecting" : activity?.state;
   const workingItem = progress === "working" ? activeItem : null;
   const interrupted = activeItem !== null && progress !== "working" ? progress : undefined;
-  // Pin an unnamed turn to the stored send we actually followed. Its
-  // interruption cannot become the next queued send's progress.
-  if (workingItem?.type === "operator" && activity?.message === null && activity.sendSeq === undefined) {
-    setLiveTurn({ ...activity, sendSeq: workingItem.entry.seq });
+  if (replied && followedMessage !== null) {
+    // Only a later verified working snapshot can pick up another send.
+    setLiveTurn(null);
+  } else if (workingItem?.type === "operator" && activity?.message === null && activity.sendMessage === undefined && message) {
+    // The saved message id survives even when member history renumbers rows.
+    setLiveTurn({ ...activity, sendMessage: message });
   }
   const running = workingItem === null ? null : itemMessage(workingItem);
   const runningUnnamed = workingItem !== null && running === null;
