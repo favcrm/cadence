@@ -30,6 +30,7 @@ export interface ScreenPane { title: string; actions: ScreenPaneAction[] }
 const SESSION_ENDED = "Your session ended. Sign in again.";
 const FILES_MISSING = "This app's files are not on this board yet.";
 const SCREEN_MISSING = "This app's screen is not available on this board.";
+const OWNERS_ONLY = "Only workspace owners can open {app}.";
 const DID_NOT_LOAD = "The app did not finish loading.";
 const UNSUPPORTED = "This installation has no supported board workspace yet. Use its installed guide and the app commands to inspect supported workflows.";
 const NEEDS_NEWER = "This app needs a newer board (needs {required}, this board is {current}).";
@@ -40,6 +41,8 @@ function refusedPane(status: number, code: string | null, installable: boolean):
   if (status === 401 || code === "board_session_required" || code === "operator_session_required") {
     return { title: SESSION_ENDED, actions: ["sign_in"] };
   }
+  // CAD-2691: a mount refused for role. `{app}` is filled by the pane; Retry cannot change it.
+  if (code === "owner_required") return { title: OWNERS_ONLY, actions: [] };
   if (code === "app_bundle_missing") {
     return { title: FILES_MISSING, actions: installable ? ["retry", "reinstall"] : ["retry"] };
   }
