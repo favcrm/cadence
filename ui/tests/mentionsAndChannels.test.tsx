@@ -107,7 +107,7 @@ async function main(): Promise<void> {
   const { NotificationToastProvider } = require<typeof NotificationToastModule>("../src/features/threads/NotificationToast");
   const { HomeMentionHandoffCard, findMentionedTeammates } = require<typeof HandoffModule>("../src/features/mentions/HomeMentionHandoff");
   const { ThreadComposerFrame } = require<typeof PartsModule>("../src/features/threads/ThreadChatParts");
-  const { LocaleProvider } = require<typeof LocaleModule>("../src/lib/locale");
+  const { LocaleProvider, translateUiText } = require<typeof LocaleModule>("../src/lib/locale");
   const { allowPrivateReads, resetPrivateSession } = require<typeof SessionModule>("../src/lib/privateSession");
   const { setSessionKey } = require<typeof SessionKeyModule>("../src/lib/sessionKey");
 
@@ -583,6 +583,17 @@ async function main(): Promise<void> {
     const toastStack = host.querySelector<HTMLElement>(".notification-toast-stack");
     assert(toastStack !== null && toastStack.style.display === "", "NotificationToastStack delegates display to CSS without inline display override");
   }
+
+  // 7. CAD-2736 Channels zh-TW locale entries
+  equal(
+    [
+      translateUiText("Close new conversation", "zh-TW"),
+      translateUiText("Channels", "zh-TW"),
+      translateUiText("Channels are unavailable for this sign-in.", "zh-TW"),
+    ],
+    ["關閉新對話", "頻道", "此登入帳號無法使用頻道。"],
+    "zh-TW Channels and modal close copy translate cleanly",
+  );
 
   await React.act(async () => root.unmount());
   host.remove();

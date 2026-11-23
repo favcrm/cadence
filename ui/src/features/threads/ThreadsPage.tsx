@@ -542,9 +542,9 @@ export default function ThreadsPage({
               ))}
             </ul>
           )}
-          {human.error !== null && <p className="threads-note">Human rooms are unavailable for this sign-in.</p>}
+          {human.error !== null && <p className="threads-note">{t("Channels are unavailable for this sign-in.")}</p>}
           {human.me && url.kind === "all" && humanRooms.rooms !== null && humanRooms.rooms.length > 0 && (
-            <ul className="threads-rows" aria-label="Human rooms">
+            <ul className="threads-rows" aria-label={t("Channels")}>
               <HumanRoomRows
                 rooms={humanRooms.rooms.filter((r) => query.trim() === "" || r.title.toLowerCase().includes(query.trim().toLowerCase()))}
                 openId={humanId}
