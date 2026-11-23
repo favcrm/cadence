@@ -101,6 +101,8 @@ disconnects during that turn, the indicator clears and a reconnect notice
 appears for that send. A saved reply clears the notice even while progress is
 offline. **Retry** rechecks the assistant's binding if needed and reopens the
 progress feed without resending the message.
+If the last working update did not identify the send, Home asks the same feed
+for its current state before showing activity for another message.
 
 In hosted Home, type `/skills` and press Enter to browse approved workspace
 skills without sending a message. Selecting a skill inserts `/skill:<name>`

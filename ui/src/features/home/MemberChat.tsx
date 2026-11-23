@@ -92,6 +92,13 @@ interface MemberSurface {
   identity: IdentityRead;
 }
 
+interface MemberLiveTurn {
+  conversation: string;
+  message: string | null;
+  sendMessage?: string;
+  state: "working" | "reconnecting" | "stopped";
+}
+
 const LOADING_IDENTITY: IdentityRead = { state: "loading" };
 
 
@@ -138,12 +145,11 @@ export default function MemberChat({
     [store],
   );
   const [surface, setSurface] = useState<MemberSurface | null>(null);
-  const [liveTurn, setLiveTurn] = useState<{
-    conversation: string;
-    message: string | null;
-    sendMessage?: string;
-    state: "working" | "reconnecting" | "stopped";
-  } | null>(null);
+  const [activityFeed, setActivityFeed] = useState<{ revision: number; turn: MemberLiveTurn | null }>({
+    revision: 0,
+    turn: null,
+  });
+  const { revision: feedRevision, turn: liveTurn } = activityFeed;
   const retryActivity = useRef<(() => void) | null>(null);
   const resumeActivity = useRef<{ conversation: string; after: string } | null>(null);
   const [pendingLook, setPendingLook] = useState<AvatarLook | null>(null);
@@ -279,9 +285,17 @@ export default function MemberChat({
   const conversationId = surface?.conversation ?? null;
   const available = surface?.ok === true;
   useEffect(() => {
+    const updateTurn = (update: (turn: MemberLiveTurn | null) => MemberLiveTurn | null) => {
+      setActivityFeed((current) => {
+        // A retired stream may still have state updates queued in React.
+        if (current.revision !== feedRevision) return current;
+        const turn = update(current.turn);
+        return turn === current.turn ? current : { revision: feedRevision, turn };
+      });
+    };
     const resume = resumeActivity.current;
     if (resume?.conversation !== conversationId) resumeActivity.current = null;
-    setLiveTurn((turn) => {
+    updateTurn((turn) => {
       if (turn === null || turn.conversation !== conversationId) return null;
       return !available && turn.state === "working" ? { ...turn, state: "reconnecting" } : turn;
     });
@@ -293,7 +307,7 @@ export default function MemberChat({
         previous = message;
         void store.invalidate();
       }
-      setLiveTurn((turn) => {
+      updateTurn((turn) => {
         if (message === undefined) return null;
         if (turn?.conversation === conversationId && turn.message === message) {
           return turn.state === "working" ? turn : { ...turn, state: "working" };
@@ -302,7 +316,7 @@ export default function MemberChat({
       });
     };
     const interrupt = (state: "reconnecting" | "stopped") => {
-      setLiveTurn((turn) =>
+      updateTurn((turn) =>
         turn?.conversation === conversationId && turn.state !== state ? { ...turn, state } : turn,
       );
     };
@@ -348,7 +362,7 @@ export default function MemberChat({
       if (after !== null) resumeActivity.current = { conversation: conversationId, after };
       stream.close();
     };
-  }, [conversationId, store, available]);
+  }, [conversationId, store, available, feedRevision]);
   // Auto-open is off here: an artifact opens the drawer when the person asks,
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
@@ -523,11 +537,14 @@ export default function MemberChat({
   const workingItem = progress === "working" ? activeItem : null;
   const interrupted = activeItem !== null && progress !== "working" ? progress : undefined;
   if (replied && followedMessage !== null) {
-    // Only a later verified working snapshot can pick up another send.
-    setLiveTurn(null);
+    // An unnamed working frame may have described the successor before
+    // history reported this reply. Ask the same feed for a fresh snapshot
+    // instead of attaching that ambiguous frame to the next stored send.
+    const recheck = available && activity?.message === null && activity.state === "working";
+    setActivityFeed({ revision: recheck ? feedRevision + 1 : feedRevision, turn: null });
   } else if (workingItem?.type === "operator" && activity?.message === null && activity.sendMessage === undefined && message) {
     // The saved message id survives even when member history renumbers rows.
-    setLiveTurn({ ...activity, sendMessage: message });
+    setActivityFeed({ revision: feedRevision, turn: { ...activity, sendMessage: message } });
   }
   const running = workingItem === null ? null : itemMessage(workingItem);
   const runningUnnamed = workingItem !== null && running === null;
