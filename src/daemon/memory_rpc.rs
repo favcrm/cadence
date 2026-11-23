@@ -316,8 +316,9 @@ impl Shared {
                     "{purpose} needs a running issue turn, and this agent holds none"
                 ))),
                 many => Err(Error::rejected(format!(
-                    "{purpose}: this agent holds {} running turns; pass message and \
-                     token from `self`",
+                    "{purpose}: this agent holds {} running turns; name one with the \
+                     `message` and `token` from `self` (the MCP tools take both), or \
+                     finish the others first",
                     many.len()
                 ))),
             },

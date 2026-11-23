@@ -303,6 +303,13 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             if *as_json {
                 crate::issue::cli::print_json(&out);
             } else {
+                // Unreadable lesson files are named, so an empty answer is
+                // never mistaken for "nothing applies".
+                for error in out["load_errors"].as_array().into_iter().flatten() {
+                    if let Some(error) = error.as_str() {
+                        eprintln!("memory: {error}");
+                    }
+                }
                 match out["lessons"].as_str().filter(|text| !text.is_empty()) {
                     Some(text) => print!("{text}"),
                     None => println!("No project lessons apply to this task."),

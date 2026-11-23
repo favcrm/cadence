@@ -195,10 +195,17 @@ pub fn briefing_body(
     } else {
         String::new()
     };
-    // CAD-2662: every harness gets the same lesson lookup and proposal.
-    // Codex's command sandbox cannot reach the daemon socket, so it uses
-    // the MCP tools; every other harness uses the CLI from its shell.
-    let lessons = if provider_s == "codex" {
+    // CAD-2662: every native harness gets the same lesson lookup and
+    // proposal. Codex's command sandbox cannot reach the daemon socket, so
+    // it uses the MCP tools; every other harness uses the CLI from its
+    // shell. Only a native PM or worker holds the issue turn the lookup is
+    // bound to, and hosted/cloud harnesses are out of scope, so nobody else
+    // is told to call a guard that would refuse them.
+    let lesson_caller = matches!(agent["role"].as_str(), Some("pm" | "worker"))
+        && !matches!(provider_s, "devin" | "cursor" | "agenticos-cloud");
+    let lessons = if !lesson_caller {
+        ""
+    } else if provider_s == "codex" {
         "- Project lessons: call the `memory_match` tool at the start of a\n\
          \x20 task, whenever the scope changes, and before you repeat an\n\
          \x20 approach that already failed; `memory_propose` files a lesson\n\

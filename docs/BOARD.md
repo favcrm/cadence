@@ -1653,8 +1653,18 @@ cadence memory feedback <slug> --project demo --digest <sha256> \
     --message <own-running-message> --token <current-turn> --kind used
 cadence memory ls [--project k]... [--status s]... [--type t]... [--json]
 cadence memory match --issue <ID> [--provider p] [--role dev] [--json]
+cadence memory match --turn [--path p]... [--component c]... [--tag t]... [--json]
 cadence memory lint [--project k]
 ```
+
+`memory match --turn` is a native agent's own-task lookup (CAD-2662). The daemon
+reruns dispatch's lesson selection for the issue the caller's running turn is
+bound to, adds any `--path`, `--component` and `--tag`, and records a
+`lessons_supplied` event. The project, issue, provider and role come from that
+turn, so `--turn` refuses `--issue`, `--project`, `--provider` and `--role`.
+Codex agents get the same lookup as the `memory_match` and `memory_propose` MCP
+tools. A native agent may omit `--project` on `propose`; the proposal then goes
+into its turn's project. Anyone else must pass it.
 
 `propose` refuses a blank or omitted `--source`, and it refuses a scope
 with no retrieval axis. `--scope-project`, `--scope-component`,
