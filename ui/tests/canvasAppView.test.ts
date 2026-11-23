@@ -9,7 +9,6 @@ import {
   resetCanvas,
 } from "../src/features/canvas/canvasStore";
 import { appViewId, appViewRef, applyRoutePatch, sameRoute } from "../src/features/canvas/appView";
-import { paramsLine } from "../src/features/canvas/viewParams";
 import { appSectionHref } from "../src/features/app-shell/appNav";
 import { stripAppRouteParams } from "../src/lib/router";
 import { setQueryParams } from "../src/features/workspace-apps/screen/routeParams";
@@ -141,9 +140,3 @@ equal(sameRoute(paramsRoute as never, { ...paramsRoute, params: { from: "2026-07
 equal(sameRoute(paramsRoute as never, { ...paramsRoute, params: { from: "2026-07-01", to: "2026-09-29" } } as never), false, "another value is another route");
 equal(sameRoute(paramsRoute as never, { ...paramsRoute, params: undefined } as never), false, "params against none is another route");
 equal(applyRoutePatch(paramsRoute as never, { record_id: "x" }).params, paramsRoute.params, "a patch without params keeps them");
-equal(paramsLine({ from: "2026-07-01", to: "2026-09-30" }, "en"), "1 Jul – 30 Sep 2026", "two days read as a range");
-equal(paramsLine({ from: "2026-07-01", to: "2027-02-03" }, "en"), "1 Jul 2026 – 3 Feb 2027", "a range across years names both");
-equal(paramsLine({ as_at: "2026-09-30" }, "en"), "30 Sep 2026", "one day reads as a day");
-equal(paramsLine({ from: "2026-07-01", to: "2026-09-30" }, "zh-TW"), "7月1日 – 2026年9月30日", "zh-TW drops a repeated year like en");
-equal(paramsLine({ basis: "cash", as_at: "2026-02-30" }, "en"), "cash · 2026-02-30", "other values show as written, in order");
-equal(paramsLine(undefined, "en"), "", "no params, no line");

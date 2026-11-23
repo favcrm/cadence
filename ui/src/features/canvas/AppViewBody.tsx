@@ -17,7 +17,7 @@ import { readAppScopeFresh, type AppContext, type Installation } from "../worksp
 import { closeTab, patchAppViewRoute, type CanvasTab } from "./canvasStore";
 import type { AppViewRef } from "./appView";
 import { setQueryParams } from "../workspace-apps/screen/routeParams";
-import { paramChips } from "./viewParams";
+import { optionsLine } from "./viewParams";
 import ViewHeader from "./ViewHeader";
 
 type Load =
@@ -68,12 +68,14 @@ function FrameDenied({ onDenied, children }: { onDenied: () => void; children: R
   return <>{children}</>;
 }
 
-export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpand, onExpand, onClose, onPaneClose }: {
+export default function AppViewBody({ tab, app, sheet, tabbed, tabRow, expanded, canExpand, onExpand, onClose, onPaneClose }: {
   tab: CanvasTab;
   app: AppViewRef;
   sheet: boolean;
   /** The tab strip is showing, so it names the view and the header does not. */
   tabbed: boolean;
+  /** The tab bar's action slot (null until it mounts); the header docks its actions there. */
+  tabRow: HTMLElement | null;
   expanded: boolean;
   canExpand: boolean;
   onExpand: () => void;
@@ -92,7 +94,7 @@ export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpa
   // The frame's own navigation stays on this tab; it never reaches the board URL.
   const onRoute = useCallback((patch: RoutePatch) => patchAppViewRoute(tab.id, patch), [tab.id]);
   const href = app.fromCard === true ? (load.status === "ready" ? installationHref(load.installation, app) : null) : app.href;
-  const chips = paramChips(app.route.params, locale);
+  const options = optionsLine(app.route.params, locale, t);
   const openLabel = t("Open in {app}").replace("{app}", appName);
   const denied = <p className="cv-appview-note" role="alert">{t("No access")}</p>;
   const failure = (state: ScreenPaneState, retry: () => void) =>
@@ -105,10 +107,11 @@ export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpa
   return (
     <>
       <ViewHeader
-        mark={sheet ? null : <span className="cv-mark"><AppGlyph name={load.status === "ready" ? load.installation.name : app.tag} title={appName} size="xs" /></span>}
+        mark={sheet || (tabbed && !onPaneClose) ? null : <span className="cv-mark"><AppGlyph name={load.status === "ready" ? load.installation.name : app.tag} title={appName} size="xs" /></span>}
         back={onPaneClose ? null : sheet ? { onBack: onClose, expanded: false } : expanded ? { onBack: onExpand, expanded: true } : null}
         title={tabbed && !onPaneClose ? null : tab.title}
-        chips={chips}
+        appName={appName}
+        options={options}
         note={noAccess ? null : t("Read-only here — open in {app} to edit").replace("{app}", appName)}
         open={noAccess || href === null ? null : {
           label: openLabel,
@@ -118,6 +121,7 @@ export default function AppViewBody({ tab, app, sheet, tabbed, expanded, canExpa
         expand={sheet ? null : { expanded, enabled: canExpand, onToggle: onExpand }}
         pane={onPaneClose ? { onMoveToTab: onPaneClose } : null}
         onClose={onPaneClose ?? onClose}
+        tabRow={tabbed && !onPaneClose ? tabRow : undefined}
       />
       <div className="cv-body cv-appview-body" data-canvas-body data-app-view>
         {load.status === "loading" ? <AppLoadingSurface label={t("Loading…")} variant="canvas" /> : null}

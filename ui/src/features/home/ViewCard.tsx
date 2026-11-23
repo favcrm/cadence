@@ -5,7 +5,7 @@ import { TurnCard, type CardDensity } from "../../ui/TurnCard";
 import { appViewId, sameRoute } from "../canvas/appView";
 import { effective, MAX_PANES } from "../canvas/canvasLayout";
 import { openAppView, useCanvas } from "../canvas/canvasStore";
-import { paramsLine } from "../canvas/viewParams";
+import { optionsLine } from "../canvas/viewParams";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
 import { HOME_VIEW_SCOPE, parseViewRef, plainText, viewCardAppView, viewHere, type ViewScope } from "./chatCards";
 import type { ThreadEntry } from "./thread";
@@ -94,7 +94,7 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
   }[state];
   // A declared view names its place by its label (CAD-2555) and shows its params on a line of their own.
   const place = model.viewLabel ?? (model.recordId === null ? model.section : `${model.section} / ${model.recordId}`);
-  const params = paramsLine(model.params, locale);
+  const params = optionsLine(model.params, locale, t);
   return (
     <TurnCard
       kind="view"

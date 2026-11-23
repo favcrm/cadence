@@ -1,19 +1,19 @@
 /**
- * CAD-2657: the one header row of an app view in the canvas. Left: a way back
- * (the phone sheet, or an expanded canvas) or the app's mark, the view's title
- * (the tab strip already says it when there are two or more) and the view's
- * params as chips. Right: the read-only lock, "Open in <App>", expand, close.
- * Width is the pane's own (a container query in canvas.css): the chips fold
- * into the first one and "+N" and "Open in" goes icon-only, then the actions
- * fold into "⋯". Chips never shrink: they show whole or fold, and the title is
- * what truncates. Every part keeps its full text in a title.
+ * CAD-2657 / CAD-2690: an app view's header. Its own row (a way back or the
+ * app's mark, the view's title, then "Open in <App>", expand and close) exists
+ * only where no tab bar carries them: with a tab bar the actions dock at the
+ * right of that row and the mark stays on the tab. Under it, one quiet line:
+ * "<App> · <options> · Read-only". Width is the pane's own (a container query in
+ * canvas.css): "Open in" goes icon-only, then the actions fold into "⋯". The line
+ * truncates with an ellipsis and keeps its full text in a title.
  */
-import { useRef, type ReactNode } from "react";
+import { useId, useRef, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useTranslate } from "../../lib/locale";
 import { navigate } from "../../lib/useLocation";
 import Link from "../../ui/Link";
 import RowMenu, { type RowMenuItem } from "../../ui/RowMenu";
-import { IconClose, IconLock } from "../../ui/icons";
+import { IconClose } from "../../ui/icons";
 
 export interface ViewHeaderProps {
   /** The app's mark; omitted while a back control leads. */
@@ -22,8 +22,10 @@ export interface ViewHeaderProps {
   back: { onBack: () => void; expanded: boolean } | null;
   /** Null when the tab strip names the view. */
   title: string | null;
-  chips: string[];
-  /** The read-only note, shown by the lock; null when the viewer has no access. */
+  appName: string;
+  /** The view's options in words (viewParams.ts); "" when it has none. */
+  options: string;
+  /** The read-only note, the "Read-only" word's tooltip; null when the viewer has no access. */
   note: string | null;
   /** The "Open in <App>" link; null when the viewer cannot open the app. */
   open: { label: string; href: string; onOpen: () => void } | null;
@@ -32,6 +34,8 @@ export interface ViewHeaderProps {
   /** In a pane (CAD-2635): "Move to tab" sits in the "⋯", and the close returns the view to its tab. */
   pane?: { onMoveToTab: () => void } | null;
   onClose: () => void;
+  /** The tab bar's action slot: undefined when no tab bar leads (the actions stay here); null until it mounts. */
+  tabRow?: HTMLElement | null;
 }
 
 /** Leaving the expanded canvas removes the focused "Back to chat": hand focus to the expand control (or the "⋯" that holds it) rather than the page. */
@@ -44,44 +48,19 @@ function focusExpand(root: HTMLElement | null): void {
   });
 }
 
-export default function ViewHeader({ mark, back, title, chips, note, open, expand, pane = null, onClose }: ViewHeaderProps) {
+export default function ViewHeader({ mark, back, title, appName, options, note, open, expand, pane = null, onClose, tabRow }: ViewHeaderProps) {
   const t = useTranslate();
   const head = useRef<HTMLElement | null>(null);
-  const more = chips.slice(1);
+  const tip = useId();
+  const docked = tabRow !== undefined && back === null && pane === null;
+  const line = [appName, ...(options === "" ? [] : [options]), ...(note === null ? [] : [t("Read-only")])].join(" · ");
   const expandLabel = t(expand?.expanded ? "Collapse canvas" : "Expand canvas");
   const folded: RowMenuItem[] = [];
   if (pane) folded.push({ key: "tab", label: t("Move to tab"), onSelect: pane.onMoveToTab });
   if (open) folded.push({ key: "open", label: open.label, hint: note ?? undefined, onSelect: () => { open.onOpen(); navigate(open.href); } });
   if (expand?.enabled) folded.push({ key: "expand", label: expandLabel, onSelect: expand.onToggle });
-  return (
-    <header ref={head} className="cv-head cv-vhead" data-view-header>
-      {back ? (
-        <>
-          <button type="button" className="cv-iconbtn cv-back" data-expanded={back.expanded || undefined} onClick={() => { back.onBack(); if (back.expanded) focusExpand(head.current); }} aria-label={t("Back to chat")}>
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="m15 18-6-6 6-6" />
-            </svg>
-            {back.expanded ? <><span>{t("Back to chat")}</span><kbd>Esc</kbd></> : null}
-          </button>
-          {back.expanded ? <span className="cv-sep" aria-hidden /> : null}
-        </>
-      ) : null}
-      {back?.expanded ? null : mark}
-      {title === null ? null : <b className="cv-vtitle" title={title}>{title}</b>}
-      {chips.length === 0 ? null : (
-        <span className="cv-chips" data-view-params title={chips.join(" · ")}>
-          {chips.map((chip) => <span key={chip} className="cv-chip" title={chip}>{chip}</span>)}
-          {more.length === 0 ? null : <span className="cv-chip cv-chip-more" data-chips-more title={more.join(" · ")}>{`+${more.length}`}</span>}
-        </span>
-      )}
-      <span className="cv-gap" />
-      {note === null ? null : (
-        <span className="cv-lock cv-wide" tabIndex={0} role="img" aria-label={note} data-read-only>
-          <IconLock size={14} />
-          <span className="cv-tip" role="tooltip">{note}</span>
-        </span>
-      )}
-      {note !== null && open ? <span className="cv-sep cv-wide" aria-hidden /> : null}
+  const actions = (
+    <>
       {open ? (
         // Navigating away leaves the tab behind: the caller closes it (the sheet closes the drawer).
         <Link className="btn btn-ghost cv-open cv-wide" href={open.href} title={open.label} aria-label={open.label} onClick={open.onOpen}>
@@ -94,7 +73,7 @@ export default function ViewHeader({ mark, back, title, chips, note, open, expan
       {expand ? (
         <button type="button" className="cv-iconbtn cv-wide" onClick={expand.onToggle} disabled={!expand.enabled} data-expand aria-pressed={expand.expanded} aria-label={expandLabel} title={expandLabel}>
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            {expand.expanded ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
+            {expand.expanded ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v-5h5" />}
           </svg>
         </button>
       ) : null}
@@ -104,6 +83,41 @@ export default function ViewHeader({ mark, back, title, chips, note, open, expan
           <IconClose size={12} />
         </button>
       )}
+    </>
+  );
+  return (
+    <header ref={head} className="cv-head cv-vhead" data-view-header data-docked={docked || undefined}>
+      {docked ? (tabRow ? createPortal(actions, tabRow) : null) : (
+        <div className="cv-vrow">
+          {back ? (
+            <>
+              <button type="button" className="cv-iconbtn cv-back" data-expanded={back.expanded || undefined} onClick={() => { back.onBack(); if (back.expanded) focusExpand(head.current); }} aria-label={t("Back to chat")}>
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d="m15 18-6-6 6-6" />
+                </svg>
+                {back.expanded ? <><span>{t("Back to chat")}</span><kbd>Esc</kbd></> : null}
+              </button>
+              {back.expanded ? <span className="cv-sep" aria-hidden /> : null}
+            </>
+          ) : null}
+          {back?.expanded ? null : mark}
+          {title === null ? null : <b className="cv-vtitle" title={title}>{title}</b>}
+          <span className="cv-gap" />
+          {actions}
+        </div>
+      )}
+      <p className="cv-meta" data-view-options>
+        <span className="cv-meta-text" title={line}>{appName}{options === "" ? null : ` · ${options}`}</span>
+        {note === null ? null : (
+          <>
+            <span className="cv-meta-dot" aria-hidden>·</span>
+            <span className="cv-ro" tabIndex={0} aria-describedby={tip} data-read-only>
+              {t("Read-only")}
+              <span id={tip} className="cv-tip" role="tooltip">{note}</span>
+            </span>
+          </>
+        )}
+      </p>
     </header>
   );
 }
