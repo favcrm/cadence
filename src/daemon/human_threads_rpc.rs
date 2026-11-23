@@ -210,7 +210,7 @@ impl HumanRoomCursors {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 fn inject_page_fault(shared: &Shared, page: &mut Value) {
     if let Some(fault) = &shared.human_room_page_fault {
         match fault.load(std::sync::atomic::Ordering::Acquire) {
@@ -418,7 +418,7 @@ impl Shared {
             "duplicate": duplicate,
         });
         result[READER_SCOPE_FIELD] = json!(HUMAN_ROOM_SCOPE_ACK);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         inject_page_fault(self, &mut result);
         Ok(result)
     }
@@ -523,7 +523,7 @@ impl Shared {
             "more_before": more_before,
         });
         page[READER_SCOPE_FIELD] = json!(HUMAN_ROOM_SCOPE_ACK);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         inject_page_fault(self, &mut page);
         Ok(page)
     }
@@ -548,7 +548,7 @@ impl Shared {
             "created": created,
         });
         result[READER_SCOPE_FIELD] = json!(HUMAN_ROOM_SCOPE_ACK);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         inject_page_fault(self, &mut result);
         Ok(result)
     }

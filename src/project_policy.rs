@@ -13,7 +13,8 @@ use crate::issue::{project, Pm};
 
 /// Noncanonical subjects can collide after sanitization; they receive only
 /// workspace-visible access until the project grant identity is migrated.
-pub(crate) fn policy_user_actor(subject: &str) -> String {
+#[doc(hidden)]
+pub fn policy_user_actor(subject: &str) -> String {
     if crate::ident::is_handle(subject, crate::ident::HANDLE_MAX) {
         format!("users/{subject}")
     } else {
@@ -27,7 +28,8 @@ pub(crate) fn policy_user_actor(subject: &str) -> String {
 /// refused rather than guessed at. The reserved `agents/` and `service/`
 /// kinds map to their own variants so a restricted project refuses them
 /// explicitly.
-pub(crate) fn caller_of(actor: &str) -> Option<project::ProjectCaller<'_>> {
+#[doc(hidden)]
+pub fn caller_of(actor: &str) -> Option<project::ProjectCaller<'_>> {
     use project::ProjectCaller;
     if actor == "operator" {
         return Some(ProjectCaller::Operator);
@@ -110,7 +112,8 @@ impl<'a> Access<'a> {
 /// Fail closed: an unknown spelling or an unreadable tracker yields an
 /// empty set, so a listing contributes no row, count or placeholder for a
 /// project the caller may not see.
-pub(crate) fn readable(pm: &Pm, actor: &str) -> BTreeSet<String> {
+#[doc(hidden)]
+pub fn readable(pm: &Pm, actor: &str) -> BTreeSet<String> {
     Access::of(pm, actor).readable()
 }
 
@@ -118,13 +121,15 @@ pub(crate) fn readable(pm: &Pm, actor: &str) -> BTreeSet<String> {
 ///
 /// An absent project returns false, so the caller's verb keeps its own
 /// unknown-project answer. An unreadable tracker refuses.
-pub(crate) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
+#[doc(hidden)]
+pub fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
     Access::of(pm, actor).refused(key)
 }
 
 /// True when `actor` may read every registered project. An unreadable
 /// tracker or unknown caller spelling is not complete.
-pub(crate) fn reads_every_project(pm: &Pm, actor: &str) -> bool {
+#[doc(hidden)]
+pub fn reads_every_project(pm: &Pm, actor: &str) -> bool {
     Access::of(pm, actor).reads_every_project()
 }
 
@@ -136,7 +141,8 @@ pub(crate) fn reads_every_project(pm: &Pm, actor: &str) -> bool {
 /// section added later fails closed instead of leaking. A row with no
 /// project identity is not project-scoped and stays — except in
 /// `projects`, where an unnamed row is dropped.
-pub(crate) fn retain_overview(payload: &mut serde_json::Value, readable: &BTreeSet<String>) {
+#[doc(hidden)]
+pub fn retain_overview(payload: &mut serde_json::Value, readable: &BTreeSet<String>) {
     let Some(root) = payload.as_object_mut() else {
         return;
     };

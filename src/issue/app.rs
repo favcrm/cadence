@@ -62,7 +62,8 @@ pub(crate) use validate::{
     inspect_texts, validate, validate_storage_members, validate_texts, Validated,
 };
 
-pub(crate) use grammar::{bundle_path_ok, file_cap, root_member, skill_subdir_ok, MAX_APP_BYTES};
+#[doc(hidden)]
+pub use grammar::{bundle_path_ok, file_cap, root_member, skill_subdir_ok, MAX_APP_BYTES};
 // Preserve existing crate-internal re-exports from `issue::app` verbatim.
 #[cfg(test)]
 #[allow(unused_imports)]

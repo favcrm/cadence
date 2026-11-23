@@ -1,8 +1,10 @@
 //! CAD-630 foundation: explicit single-workspace installation catalog.
 //! No daemon/HTTP routing, execution or grant translation is enabled here.
 pub mod builtin;
-pub(crate) mod catalogue;
-pub(crate) mod client;
+#[doc(hidden)]
+pub mod catalogue;
+#[doc(hidden)]
+pub mod client;
 pub(super) mod fs;
 pub mod workspace;
 

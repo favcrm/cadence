@@ -3,7 +3,8 @@
 //! External tokens stay in custody; the upstream door derives their company.
 //! Trusted hosted media and source reads (CAD-868, CAD-1060) instead use the
 //! fixed lease-owned door with no bearer; the Worker derives the company.
-pub(crate) mod image;
+#[doc(hidden)]
+pub mod image;
 pub mod media_import;
 pub mod publish;
 pub mod publish_sender;

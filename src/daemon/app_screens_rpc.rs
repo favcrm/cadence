@@ -840,7 +840,8 @@ pub fn render_frame_html(
 
 /// Render an already-validated package without repeating declaration
 /// validation or script/style end-token scans (CAD-2534).
-pub(crate) fn render_checked_package_frame_html(
+#[doc(hidden)]
+pub fn render_checked_package_frame_html(
     csp_nonce: &str,
     tag: &str,
     bridge_nonce: &str,

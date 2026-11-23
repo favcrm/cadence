@@ -577,7 +577,7 @@ impl Shared {
             ));
         }
         // Acceptance seam: mutate authority between selection and response.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(hook) = &self.monitor_read_snapshot_hook {
             hook("list");
         }
@@ -621,7 +621,7 @@ impl Shared {
         let reader = self.monitor_reader(params, peer_pid, verb)?;
         let view = self.monitor_view_for(&reader, params, peer_pid, id)?;
         // Acceptance seam: mutate authority between selection and response.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(hook) = &self.monitor_read_snapshot_hook {
             hook("show");
         }
@@ -771,7 +771,7 @@ impl Shared {
             .filter(|alert| coverage.contains(alert.task_id.as_str()))
             .collect::<Vec<_>>();
         // Acceptance seam: mutate authority between selection and response.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(hook) = &self.monitor_read_snapshot_hook {
             hook("alerts");
         }
@@ -965,7 +965,7 @@ impl Shared {
             .open(token, &ack_binding(&principal, &resource))
             .map_err(|_| invalid_ack(verb))?;
         // Acceptance seam: mutate authority between selection and response.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(hook) = &self.monitor_read_snapshot_hook {
             hook("ack");
         }
@@ -975,7 +975,7 @@ impl Shared {
         let scope = self.project_scope_for_actor(&actor)?;
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         // Main's test seam: no store connection/tx is held here.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(hook) = &self.monitor_ack_writer_hook {
             hook();
         }

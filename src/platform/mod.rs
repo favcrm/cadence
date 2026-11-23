@@ -25,7 +25,8 @@ pub(crate) use encrypted_fs::Directories as ControlledDirectories;
 /// CAD-1128: the encrypted-SQLite custody vault. `pub(crate)` — the
 /// manager and its key material are daemon-internal; no public
 /// platform/custody re-export exposes them.
-pub(crate) mod encrypted_sqlite;
+#[doc(hidden)]
+pub mod encrypted_sqlite;
 pub mod hosted_email;
 pub mod hosted_whatsapp;
 pub mod local;
@@ -158,7 +159,8 @@ pub struct AppCapabilityAsset {
 use crate::error::{Error, Result};
 use crate::store::{Grant, Store};
 
-pub(crate) use custody::{Custody, Key};
+#[doc(hidden)]
+pub use custody::{Custody, Key};
 
 pub(crate) use crate::daemon::custody_rpc::CustodyWitness;
 

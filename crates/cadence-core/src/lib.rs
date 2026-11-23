@@ -12,9 +12,11 @@ pub mod error;
 pub mod evaluate;
 pub mod frontmatter;
 pub mod issue;
+pub mod public_board;
 pub use error::{Error, Result};
 pub use evaluate::evaluate;
 pub use frontmatter::split_front;
+pub use public_board::PublicBoard;
 // CAD-1085: the extracted canonical material digest is a drop-in for the
 // historical `crate::store::app_runs::material_digest`.
 pub use connection_dispatch::{material_digest, material_digest_for_domain};

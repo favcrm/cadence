@@ -596,9 +596,9 @@ pub(crate) fn daemon_restart(
         std::thread::sleep(Duration::from_millis(500));
     };
     if let Some(ui_pid) = ui_was_running {
-        cadence_agent::ui::run_cli(
+        cadence_ui::run_cli(
             state_dir,
-            &cadence_agent::ui::UiAction::Stop {
+            &cadence_ui::UiAction::Stop {
                 tailscale_off: false,
                 as_identity: None,
             },
@@ -635,9 +635,9 @@ pub(crate) fn daemon_restart(
                     .to_string(),
             );
         }
-        cadence_agent::ui::run_cli(
+        cadence_ui::run_cli(
             state_dir,
-            &cadence_agent::ui::UiAction::Start {
+            &cadence_ui::UiAction::Start {
                 flags,
                 reset: false,
                 as_identity: None,

@@ -256,7 +256,8 @@ pub(crate) fn unmatched_caller(
 /// caller is the operator" weakness that operator-by-positive-proof
 /// (CAD-280) designs out. Reconcile only frees holds the daemon itself
 /// proves dead, so that residual cannot free work.
-pub(crate) fn operator_proof(
+#[doc(hidden)]
+pub fn operator_proof(
     peer_pid: u32,
     uid: u32,
     daemon_pid: u32,
@@ -605,13 +606,15 @@ pub(crate) struct AgentPid {
 ///   ancestry refuses the call outright: it is neither that agent nor
 ///   provably anyone else.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct AgentPids {
+#[doc(hidden)]
+pub struct AgentPids {
     rows: Vec<AgentPid>,
 }
 
 impl AgentPids {
     /// Classify `(alias, pid, recorded start)` rows against `/proc` now.
-    pub(crate) fn classify(rows: impl IntoIterator<Item = (String, u32, Option<u64>)>) -> Self {
+    #[doc(hidden)]
+    pub fn classify(rows: impl IntoIterator<Item = (String, u32, Option<u64>)>) -> Self {
         Self::from_proofs(
             rows.into_iter()
                 .map(|(alias, pid, start)| (alias, pid, pid_proof(pid, start))),
@@ -630,7 +633,8 @@ impl AgentPids {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
@@ -691,19 +695,23 @@ pub(crate) fn unproven_row(alias: &str, pid: u32) -> String {
 /// process the daemon recorded for it and checked against its recorded
 /// start time ([`AgentPids`], CAD-385).
 #[derive(Default)]
-pub(crate) struct AgentRoots {
+#[doc(hidden)]
+pub struct AgentRoots {
     /// Registered pty panes by pane pid. A peer is tied by ancestry or
     /// by the pane's pty on its stdio ([`PeerTies::attributed_agents`]).
-    pub(crate) panes: AgentPids,
+    #[doc(hidden)]
+    pub panes: AgentPids,
     /// Live managed endpoints (CAD-335) by provider pid: the
     /// claude/codex process the daemon launched with no pane, whose
     /// tool shells descend from it. A peer is tied by ancestry only —
     /// the provider's stdio is pipes and log files, never a pty.
-    pub(crate) managed: AgentPids,
+    #[doc(hidden)]
+    pub managed: AgentPids,
 }
 
 impl AgentRoots {
-    pub(crate) fn is_empty(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
         self.panes.is_empty() && self.managed.is_empty()
     }
 
@@ -713,7 +721,8 @@ impl AgentRoots {
     /// recorded start keeps denying — panes and managed providers alike.
     /// The one way the board runs operator proof, so no call site builds
     /// a deny list from bare pids.
-    pub(crate) fn operator_proof(&self, pid: u32, uid: u32, daemon_pid: u32) -> Result<(), String> {
+    #[doc(hidden)]
+    pub fn operator_proof(&self, pid: u32, uid: u32, daemon_pid: u32) -> Result<(), String> {
         let panes = self.panes.fenced();
         let managed = self.managed.fenced();
         operator_proof(pid, uid, daemon_pid, &panes, |hop| {
@@ -738,7 +747,8 @@ impl AgentRoots {
 /// be attributed at all (unreadable ancestry, several agents, a tie to
 /// a row whose process cannot be proven): callers must fail closed,
 /// never read it as "no agent".
-pub(crate) fn tcp_peer_agent(
+#[doc(hidden)]
+pub fn tcp_peer_agent(
     server: SocketAddr,
     peer: SocketAddr,
     roots: &AgentRoots,
@@ -818,7 +828,8 @@ pub(crate) fn tcp_peer_agent(
 /// process in this pid namespace is reported separately by
 /// [`loopback_ownerless`]; the board accepts that only after an
 /// operator session.
-pub(crate) fn tcp_peer_operator_proof(
+#[doc(hidden)]
+pub fn tcp_peer_operator_proof(
     server: SocketAddr,
     peer: SocketAddr,
     uid: u32,
@@ -850,7 +861,8 @@ pub(crate) fn tcp_peer_operator_proof(
 /// (`client_socket_exact` is `None`), which stays unprovable. The board
 /// treats this as the operator's tunnel only after a live operator
 /// session.
-pub(crate) fn loopback_ownerless(server: SocketAddr, peer: SocketAddr) -> bool {
+#[doc(hidden)]
+pub fn loopback_ownerless(server: SocketAddr, peer: SocketAddr) -> bool {
     let peer = canonical(peer);
     if !peer.ip().is_loopback() {
         return false;
@@ -863,7 +875,8 @@ pub(crate) fn loopback_ownerless(server: SocketAddr, peer: SocketAddr) -> bool {
 
 /// A v4-mapped v6 address (`::ffff:127.0.0.1`, what a dual-stack
 /// listener reports) compares as the v4 address the kernel lists.
-pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
+#[doc(hidden)]
+pub fn canonical(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
@@ -883,7 +896,8 @@ pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
 /// no single destination and must be refused by the caller before
 /// invoking this lookup. `Ok(None)` when no table lists it; `Err` only
 /// when neither table could be read.
-pub(crate) fn client_socket_exact(
+#[doc(hidden)]
+pub fn client_socket_exact(
     server: SocketAddr,
     peer: SocketAddr,
 ) -> Result<Option<(u64, u32)>, String> {

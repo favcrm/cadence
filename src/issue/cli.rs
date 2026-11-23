@@ -999,7 +999,8 @@ pub enum PolicyVisibility {
 }
 
 impl PolicyVisibility {
-    pub(crate) fn recorded(self) -> crate::issue::project::Visibility {
+    #[doc(hidden)]
+    pub fn recorded(self) -> crate::issue::project::Visibility {
         match self {
             Self::WorkspaceVisible => crate::issue::project::Visibility::WorkspaceVisible,
             Self::Private => crate::issue::project::Visibility::Private,
@@ -1018,7 +1019,8 @@ impl PolicyVisibility {
 
     /// Parse the wire spelling. `None` for anything else — the daemon then
     /// refuses rather than guessing a visibility.
-    pub(crate) fn from_wire(raw: &str) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn from_wire(raw: &str) -> Option<Self> {
         match raw {
             "workspace-visible" => Some(Self::WorkspaceVisible),
             "private" => Some(Self::Private),

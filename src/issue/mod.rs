@@ -242,7 +242,8 @@ impl Pm {
     /// CAD-1374: attach the server-prepared human context for this handle's
     /// commits. Only the allowlisted canonical fields are stored; a malformed
     /// context is refused here, before any write.
-    pub(crate) fn with_activity_receipt(mut self, receipt: &serde_json::Value) -> Result<Self> {
+    #[doc(hidden)]
+    pub fn with_activity_receipt(mut self, receipt: &serde_json::Value) -> Result<Self> {
         self.activity_receipt = Some(canonical_receipt(receipt)?);
         Ok(self)
     }
@@ -1037,7 +1038,8 @@ fn git_cancellable(
 }
 
 /// Run a git subcommand in `dir`; rejected error carries stderr.
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
+#[doc(hidden)]
+pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
         .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
     if !out.status.success() {

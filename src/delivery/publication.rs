@@ -34,7 +34,7 @@ use crate::issue::Pm;
 
 /// Test-only deterministic interleaving seam for the publication claim.
 /// Production is compiled without this module.
-#[cfg(all(test, feature = "test-seam"))]
+#[cfg(feature = "test-seam")]
 pub mod race_seam {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -293,20 +293,22 @@ pub mod race_seam {
     }
 }
 
-#[cfg(all(test, feature = "test-seam"))]
+#[cfg(feature = "test-seam")]
 pub use race_seam::{
     arm_member_delivery_post_projection, arm_member_job_list_response, arm_post_pending,
     arm_pre_tracker, arm_publication_race, MemberDeliverySeam, MemberJobListSeam, PostPendingSeam,
     PublicationRaceSeam, PublicationStageSeam,
 };
 
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn member_delivery_seam_fire(state_dir: &std::path::Path) {
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub fn member_delivery_seam_fire(state_dir: &std::path::Path) {
     race_seam::fire_member_delivery(state_dir);
 }
 
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn member_job_list_seam_fire(state_dir: &std::path::Path, out: &mut serde_json::Value) {
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub fn member_job_list_seam_fire(state_dir: &std::path::Path, out: &mut serde_json::Value) {
     race_seam::fire_member_job_list(state_dir, out);
 }
 
@@ -604,7 +606,7 @@ pub fn publish(
     let body_digest = body_digest(&body);
     // Test-only interleaving point: after the real stale-read checks and
     // immediately before the ledger lock, with no lock held here.
-    #[cfg(all(test, feature = "test-seam"))]
+    #[cfg(feature = "test-seam")]
     race_seam::fire(state_dir);
     let pending = private::begin_publication(state_dir, &grant.delivery_id, |delivery| {
         if delivery.state != PrivateState::Completed
@@ -672,7 +674,7 @@ pub fn publish(
     })?;
     // The pending receipt is durable. No ledger lock is held here; the
     // keyed tracker write is exactly-once and safe to retry.
-    #[cfg(all(test, feature = "test-seam"))]
+    #[cfg(feature = "test-seam")]
     race_seam::fire_post_pending(state_dir, &pending, &body);
     let written = crate::issue::write::add_comment_keyed(
         pm,
@@ -832,7 +834,7 @@ pub fn reconcile(
         return Ok(json!({"state": "published", "attempt": attempt,
                          "comment": comment, "published": receipt}));
     }
-    #[cfg(all(test, feature = "test-seam"))]
+    #[cfg(feature = "test-seam")]
     race_seam::fire_pre_tracker(state_dir);
     let written = crate::issue::write::add_comment_keyed(
         pm,

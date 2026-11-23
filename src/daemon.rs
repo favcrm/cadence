@@ -165,12 +165,7 @@ mod board_producer_golden;
 mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
-#[cfg(all(
-    test,
-    feature = "test-seam",
-    target_os = "linux",
-    target_arch = "x86_64"
-))]
+#[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
 mod credential_entry_fixture;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod credential_entry_rpc;
@@ -179,13 +174,9 @@ pub(crate) mod custody_rpc;
 pub(crate) mod native_model_turn;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod protected_connections;
-#[cfg(all(
-    test,
-    feature = "test-seam",
-    target_os = "linux",
-    target_arch = "x86_64"
-))]
-pub(crate) use credential_entry_fixture::configure_credential_entry_fixture;
+#[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub use credential_entry_fixture::configure_credential_entry_fixture;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod protected_management_rpc;
 // the frozen acceptance check and its genuine fixture.
@@ -230,7 +221,8 @@ mod human_current;
 mod human_threads_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_enrolled;
-pub(crate) mod jobs_rpc;
+#[doc(hidden)]
+pub mod jobs_rpc;
 mod lane_rpc;
 mod master_rpc;
 mod master_session_rpc;
@@ -255,12 +247,14 @@ pub(crate) mod protected_runtime;
 #[path = "daemon/protected_runtime_stub.rs"]
 pub(crate) mod protected_runtime;
 mod public_membership;
-#[cfg(test)]
-pub(crate) use public_membership::MembershipMode as TestMembershipMode;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub use public_membership::MembershipMode as TestMembershipMode;
 /// Read by the `test-seam` HTTP acceptance fixtures only, which is why the
 /// re-export carries the same gate as the modules that import it.
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) use public_membership::NativeContext as TestNativeMembershipContext;
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub use public_membership::NativeContext as TestNativeMembershipContext;
 /// CAD-2215: opaque agent-event positions for every non-operator reader.
 mod agent_events_opaque;
 /// CAD-2215: opaque job-event positions for every non-operator reader.
@@ -282,6 +276,53 @@ mod social_publish_start;
 #[cfg(target_os = "linux")]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod supervisor_grant;
+#[cfg(any(test, feature = "test-seam"))]
+static ASSISTANT_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds `HOSTED_CADENCE_ASSISTANT_ENABLED="true"` under
+/// [`ASSISTANT_FLAG_LOCK`] for the guard's lifetime, restoring the prior
+/// value (or absence) on drop.
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub struct AssistantFlagOn {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+impl AssistantFlagOn {
+    /// Arms the rollout flag for ONE enabled-path test. Panics on poison
+    /// would hide a failing sibling's report — recover and still fail.
+    #[doc(hidden)]
+    pub fn arm() -> Self {
+        let lock = ASSISTANT_FLAG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOSTED_CADENCE_ASSISTANT_ENABLED");
+        std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", "true");
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+impl Drop for AssistantFlagOn {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", v),
+            None => std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED"),
+        }
+    }
+}
+
+#[cfg(all(not(test), feature = "test-seam"))]
+#[doc(hidden)]
+pub mod team_assistants_refusal {
+    pub use super::AssistantFlagOn;
+}
+
 #[cfg(all(test, feature = "test-seam"))]
 pub(crate) mod team_assistants_refusal;
 mod test_queue_rpc;
@@ -346,10 +387,12 @@ pub use master_rpc::MASTER_ALLOWED;
 // CAD-1006: the frame-document renderer the board's consume route uses.
 // `pub(crate)` — the UI frame route calls it; unit tests live in the
 // module, not as a public API.
-pub(crate) use app_capabilities_rpc::operator_price_refusal;
+#[doc(hidden)]
+pub use app_capabilities_rpc::operator_price_refusal;
 #[cfg(test)]
 pub(crate) use app_screens_rpc::render_package_frame_html;
-pub(crate) use app_screens_rpc::{
+#[doc(hidden)]
+pub use app_screens_rpc::{
     render_checked_package_frame_html, render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION,
 };
 
@@ -570,59 +613,70 @@ type ShutdownFacts = HashMap<String, (String, u32, String)>;
 /// `current_public_hash_from` calls when `membership_lookup_for_test` is
 /// set — hash, subject, company, instance in, the fresh role answer or an
 /// outage error out. Never constructed outside `#[cfg(test)]`.
-#[cfg(test)]
-type MembershipLookupForTest = Box<
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type MembershipLookupForTest = Box<
     dyn Fn(&str, &str, &str, &str) -> Result<Option<crate::board_identity::Role>> + Send + Sync,
 >;
-#[cfg(test)]
-pub(crate) type MembershipLookupForFixture = Arc<
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type MembershipLookupForFixture = Arc<
     dyn Fn(&str, &str, &str, &str) -> Result<Option<crate::board_identity::Role>> + Send + Sync,
 >;
 
 /// Test-only witness for outcomes from the real joined request worker.
-#[cfg(test)]
-pub(crate) type AssistRequestSweepObserver = Arc<dyn Fn(&str, &str) + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type AssistRequestSweepObserver = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Test-only witness for a granted forward read's admission snapshot.
-#[cfg(test)]
-pub(crate) type AppGrantForwardSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type AppGrantForwardSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Test-only witness after a scoped job-event page is selected.
-#[cfg(test)]
-pub(crate) type JobEventsSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type JobEventsSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Test-only witness after a scoped agent-event page's visible rows are
 /// selected and before the reader is re-proved.
-#[cfg(test)]
-pub(crate) type AgentEventsSelectedHook = Arc<dyn Fn(&str, &[crate::store::Event]) + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type AgentEventsSelectedHook = Arc<dyn Fn(&str, &[crate::store::Event]) + Send + Sync>;
 
 /// Test-only witness after monitor rows are selected and before reproof.
-#[cfg(test)]
-pub(crate) type MonitorReadSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type MonitorReadSnapshotHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Test-only witness inside the scoped acknowledgement critical section:
 /// after the tracker and enrollment guards are held and immediately before
 /// the authoritative store write transaction opens (no store mutex/tx held).
-#[cfg(test)]
-pub(crate) type MonitorAckWriterHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type MonitorAckWriterHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Test-only witness at a job or task detail's selected snapshot. `job_show`
 /// and `task_show` pass their own id after assembly; `task_show` also reports
 /// `task_show_kickoff` between admitting a kickoff and reading that task's
 /// messages, which is the only window where the kickoff is in hand alone.
-#[cfg(test)]
-pub(crate) type JobDetailSnapshotHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type JobDetailSnapshotHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Test-only witness after a scoped `agent_list` page's rows, profiles and
 /// visible-running set are built and before the post-selection reproof.
-#[cfg(test)]
-pub(crate) type AgentListSelectedHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type AgentListSelectedHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Test-only witness after a scoped `agent_show` projection is complete —
 /// agent row, messages, `context_message` digest and task bindings — and
 /// before the authority and cloud reproof; receives the resolved alias.
-#[cfg(test)]
-pub(crate) type AgentShowSelectedHook = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub type AgentShowSelectedHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Shared {
     pub store: Arc<Store>,
@@ -636,42 +690,42 @@ pub struct Shared {
     wait_scan_observer: Option<WaitBaselineObserver>,
     /// CAD-2215 acceptance scaffolding (see
     /// [`ServeOptions::master_state_ignore_relay`]); test builds only.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     master_state_ignore_relay: bool,
     /// CAD-2215 acceptance scaffolding for `job_list` (see
     /// [`ServeOptions::job_list_ignore_relay`]); test builds only.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     job_list_ignore_relay: bool,
     /// CAD-2215 acceptance scaffolding for `thread_read` (see
     /// [`ServeOptions::thread_read_ignore_relay`]); test builds only.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     thread_read_ignore_relay: Option<Arc<AtomicBool>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     member_history_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     human_room_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
     /// Test-only bitmask: LIST=1, SHOW=2, EVENTS=4 ignore relay proof.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     agent_reads_ignore_relay: Option<Arc<std::sync::atomic::AtomicU8>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     assist_request_sweep_observer: Option<AssistRequestSweepObserver>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     app_grant_forward_snapshot_hook: Option<AppGrantForwardSnapshotHook>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     job_events_snapshot_hook: Option<JobEventsSnapshotHook>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     agent_events_selected_hook: Option<AgentEventsSelectedHook>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     monitor_read_snapshot_hook: Option<MonitorReadSnapshotHook>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     monitor_ack_writer_hook: Option<MonitorAckWriterHook>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     job_detail_snapshot_hook: Option<JobDetailSnapshotHook>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     job_list_snapshot_hook: Option<JobDetailSnapshotHook>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     agent_list_selected_hook: Option<AgentListSelectedHook>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     agent_show_selected_hook: Option<AgentShowSelectedHook>,
     /// Wakes the request worker without coupling it to unrelated daemon events.
     assist_requests_changed: Notify,
@@ -828,7 +882,7 @@ pub struct Shared {
     /// through this closure instead of the private `api.internal` POST, so a
     /// `#[cfg(test)]` driver can route a synthetic outage or answer through
     /// the real authority mapping. Production never sets it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seam"))]
     membership_lookup_for_test: Option<MembershipLookupForTest>,
     /// CAD-366: where enrolled platform credential bytes live — the
     /// host's keychain when usable, else the daemon-owned `0600`
@@ -968,12 +1022,7 @@ pub struct Shared {
     agenticos_provider_fixture_origin: Option<String>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     protected: std::sync::OnceLock<Arc<protected_connections::ProtectedConnections>>,
-    #[cfg(all(
-        test,
-        feature = "test-seam",
-        target_os = "linux",
-        target_arch = "x86_64"
-    ))]
+    #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
     credential_entry_fixture: Option<Arc<credential_entry_fixture::Fixture>>,
     protected_runtime: std::sync::OnceLock<Arc<protected_runtime::ProtectedRuntimeCoordinator>>,
     #[cfg_attr(
@@ -1076,8 +1125,9 @@ fn pinned_manifest(pin: &Value) -> Option<crate::context_pack::Manifest> {
 
 impl Shared {
     /// Exercise the production delivery guard from the signed-board fixture.
-    #[cfg(all(test, feature = "test-seam"))]
-    pub(crate) fn delivery_start_for_acceptance(
+    #[cfg(feature = "test-seam")]
+    #[doc(hidden)]
+    pub fn delivery_start_for_acceptance(
         &self,
         issue: &str,
         project: &str,
@@ -1161,7 +1211,7 @@ impl Shared {
         if seam.is_some() {
             opts.provider_env.isolate_for_test()?;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         let membership = opts.membership_mode_for_test.clone().unwrap_or(membership);
         let HotStart {
             instance,
@@ -1183,19 +1233,9 @@ impl Shared {
         // The OCI custody profile uses the permitted coordination store, not
         // the separate sealed-store constructor. Its recovery waits for the
         // authenticated external ledger floor and checkpoint transport.
-        #[cfg(all(
-            test,
-            feature = "test-seam",
-            target_os = "linux",
-            target_arch = "x86_64"
-        ))]
+        #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
         let fixture_active = opts.credential_entry_fixture.is_some();
-        #[cfg(not(all(
-            test,
-            feature = "test-seam",
-            target_os = "linux",
-            target_arch = "x86_64"
-        )))]
+        #[cfg(not(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64")))]
         let fixture_active = false;
         let (mut store, mut recovered) = if prepared.is_some() || fixture_active {
             Store::open_unrecovered_mode(&db_path, crate::store::OpenMode::Legacy)?
@@ -1220,12 +1260,7 @@ impl Shared {
                 }
             }
         }
-        #[cfg(all(
-            test,
-            feature = "test-seam",
-            target_os = "linux",
-            target_arch = "x86_64"
-        ))]
+        #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
         if let Some(fixture) = &opts.credential_entry_fixture {
             if prepared.is_some() || execution_mode.fenced() {
                 return Err(Error::rejected(
@@ -1381,37 +1416,37 @@ impl Shared {
             wait_baseline_observer: opts.wait_baseline_observer.clone(),
             #[cfg(feature = "test-seam")]
             wait_scan_observer: opts.wait_scan_observer.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             master_state_ignore_relay: opts.master_state_ignore_relay,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             job_list_ignore_relay: opts.job_list_ignore_relay,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             thread_read_ignore_relay: opts.thread_read_ignore_relay.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             member_history_page_fault: opts.member_history_page_fault.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             human_room_page_fault: opts.human_room_page_fault.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             agent_reads_ignore_relay: opts.agent_reads_ignore_relay.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             assist_request_sweep_observer: opts.assist_request_sweep_observer.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             app_grant_forward_snapshot_hook: opts.app_grant_forward_snapshot_hook.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             job_events_snapshot_hook: opts.job_events_snapshot_hook.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             agent_events_selected_hook: opts.agent_events_selected_hook.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             monitor_read_snapshot_hook: opts.monitor_read_snapshot_hook.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             monitor_ack_writer_hook: opts.monitor_ack_writer_hook.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             job_detail_snapshot_hook: opts.job_detail_snapshot_hook.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             job_list_snapshot_hook: opts.job_list_snapshot_hook.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             agent_list_selected_hook: opts.agent_list_selected_hook.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             agent_show_selected_hook: opts.agent_show_selected_hook.clone(),
             open_attach: Mutex::new(HashMap::new()),
             loaded_skills: Mutex::new(HashMap::new()),
@@ -1463,7 +1498,7 @@ impl Shared {
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
             board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
             membership_mode: membership,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seam"))]
             membership_lookup_for_test: opts.membership_lookup_for_test.clone().map(|lookup| {
                 Box::new(
                     move |hash: &str, sub: &str, company: &str, instance: &str| {
@@ -1536,12 +1571,7 @@ impl Shared {
             agenticos_provider_fixture_origin: opts.agenticos_provider_fixture_origin.clone(),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             protected: std::sync::OnceLock::new(),
-            #[cfg(all(
-                test,
-                feature = "test-seam",
-                target_os = "linux",
-                target_arch = "x86_64"
-            ))]
+            #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
             credential_entry_fixture: opts.credential_entry_fixture.clone(),
             protected_runtime: std::sync::OnceLock::new(),
             native_model: std::sync::OnceLock::new(),
@@ -1559,12 +1589,7 @@ impl Shared {
                 wiki_pm_lease,
             ),
         });
-        #[cfg(all(
-            test,
-            feature = "test-seam",
-            target_os = "linux",
-            target_arch = "x86_64"
-        ))]
+        #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
         if let Some(fixture) = &opts.credential_entry_fixture {
             shared.install_protected(Some(fixture.owner()?))?;
         }
@@ -3280,7 +3305,7 @@ impl Shared {
         // Simulate a rolling-version daemon that ignores this read's relay
         // proof. The actual request has already passed the test daemon's
         // caller/target guard; only the chosen response is made unscoped.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         let legacy_params = {
             let bit = match method {
                 "agent_list" => 1,
@@ -3308,7 +3333,7 @@ impl Shared {
                 None
             }
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         let params = legacy_params.as_ref().unwrap_or(params);
         let answer = self.dispatch_method(method, params, peer_pid)?;
         Ok(self.withhold_turn_tokens(answer, peer_pid))
@@ -3821,7 +3846,7 @@ impl Shared {
                 if private_denials.is_some() || public_principal.is_some() {
                     // The scoped page is complete; a test may now commit a real
                     // authority change that the reproof below must observe.
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-seam"))]
                     if let Some(hook) = &self.agent_list_selected_hook {
                         hook();
                     }
@@ -4497,7 +4522,7 @@ impl Shared {
                 if private_denials.is_some() || public_principal.is_some() {
                     // The scoped page is complete; a test may now commit a real
                     // authority change that the reproof below must observe.
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-seam"))]
                     if let Some(hook) = &self.agent_show_selected_hook {
                         hook(&alias);
                     }
@@ -4807,7 +4832,7 @@ impl Shared {
                 // relayed proof removed, exactly as a pre-CAD-2215 daemon that
                 // ignored relayed proofs would answer. Nothing else changes,
                 // and production has no such switch.
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-seam"))]
                 if self.job_list_ignore_relay
                     && (params.get("public_session").is_some()
                         || params.get("read_as").is_some()
@@ -6366,73 +6391,83 @@ pub type WaitBaselineObserver = Arc<dyn Fn(&str, i64) + Send + Sync>;
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
-    #[cfg(all(
-        test,
-        feature = "test-seam",
-        target_os = "linux",
-        target_arch = "x86_64"
-    ))]
-    pub(crate) credential_entry_fixture: Option<Arc<credential_entry_fixture::Fixture>>,
+    #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
+    #[doc(hidden)]
+    pub credential_entry_fixture: Option<Arc<credential_entry_fixture::Fixture>>,
     #[cfg(test)]
     pub(crate) custody_acceptance_shared: Option<Arc<Mutex<Option<Arc<Shared>>>>>,
-    #[cfg(test)]
-    pub(crate) membership_mode_for_test: Option<TestMembershipMode>,
-    #[cfg(test)]
-    pub(crate) membership_lookup_for_test: Option<MembershipLookupForFixture>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub membership_mode_for_test: Option<TestMembershipMode>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub membership_lookup_for_test: Option<MembershipLookupForFixture>,
     /// Observes each real autonomous request outcome; never supplied by RPC.
-    #[cfg(test)]
-    pub(crate) assist_request_sweep_observer: Option<AssistRequestSweepObserver>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub assist_request_sweep_observer: Option<AssistRequestSweepObserver>,
     /// Observes the admitted grant before a forward read; never supplied by RPC.
-    #[cfg(test)]
-    pub(crate) app_grant_forward_snapshot_hook: Option<AppGrantForwardSnapshotHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub app_grant_forward_snapshot_hook: Option<AppGrantForwardSnapshotHook>,
     /// Observes the selected job-event page before reproof; never supplied by RPC.
-    #[cfg(test)]
-    pub(crate) job_events_snapshot_hook: Option<JobEventsSnapshotHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub job_events_snapshot_hook: Option<JobEventsSnapshotHook>,
     /// Observes the selected scoped agent-event rows before reproof; never
     /// supplied by RPC.
-    #[cfg(test)]
-    pub(crate) agent_events_selected_hook: Option<AgentEventsSelectedHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub agent_events_selected_hook: Option<AgentEventsSelectedHook>,
     /// Observes monitor reads before reproof; never supplied by RPC.
-    #[cfg(test)]
-    pub(crate) monitor_read_snapshot_hook: Option<MonitorReadSnapshotHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub monitor_read_snapshot_hook: Option<MonitorReadSnapshotHook>,
     /// CAD-2215 acceptance scaffolding only: called inside the native scoped
     /// acknowledgement critical section, after the tracker/enrollment guards
     /// are held and immediately before the authoritative store write opens.
     /// The callback must not be used to inject authority; it only lets a test
     /// commit a real revocation in the exact remaining window.
-    #[cfg(test)]
-    pub(crate) monitor_ack_writer_hook: Option<MonitorAckWriterHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub monitor_ack_writer_hook: Option<MonitorAckWriterHook>,
     /// Observes a job/task detail before reproof; never supplied by RPC.
-    #[cfg(test)]
-    pub(crate) job_detail_snapshot_hook: Option<JobDetailSnapshotHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub job_detail_snapshot_hook: Option<JobDetailSnapshotHook>,
     /// Observes a scoped `job_list` after selection and before its reproof, so
     /// a test can commit a real interleaving; never supplied by RPC.
-    #[cfg(test)]
-    pub(crate) job_list_snapshot_hook: Option<JobDetailSnapshotHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub job_list_snapshot_hook: Option<JobDetailSnapshotHook>,
     /// Observes the selected scoped `agent_list` rows before reproof; never
     /// supplied by RPC.
-    #[cfg(test)]
-    pub(crate) agent_list_selected_hook: Option<AgentListSelectedHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub agent_list_selected_hook: Option<AgentListSelectedHook>,
     /// Observes a completed scoped `agent_show` projection before the
     /// authority and cloud reproof; never supplied by RPC.
-    #[cfg(test)]
-    pub(crate) agent_show_selected_hook: Option<AgentShowSelectedHook>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub agent_show_selected_hook: Option<AgentShowSelectedHook>,
     /// CAD-2215 acceptance scaffolding only: a PROVEN relayed
     /// `master_state` request is answered with the real unscoped document
     /// and NO relay ack, exactly as a pre-CAD-2215 daemon that ignored the
     /// relayed proof would. Session verification, the thread scope and the
     /// operator path stay real, so this can only simulate a rolling-version
     /// daemon — it is not a production switch (compiled only in tests).
-    #[cfg(test)]
-    pub(crate) master_state_ignore_relay: bool,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub master_state_ignore_relay: bool,
     /// CAD-2215 acceptance scaffolding only, `job_list` only: strip a
     /// supplied `public_session`/`read_as` proof before the real handler, so
     /// the daemon answers with the genuine unscoped job list and no scope
     /// acknowledgement — what a pre-CAD-2215 daemon that ignored relayed
     /// proofs would produce. Every other RPC (and every signed session) stays
     /// real; compiled only in tests.
-    #[cfg(test)]
-    pub(crate) job_list_ignore_relay: bool,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub job_list_ignore_relay: bool,
     /// CAD-2215 acceptance scaffolding only, `thread_read` only and
     /// dynamic: after the real session/proof admission, an armed flag makes
     /// a relayed non-operator page come back as the genuine unscoped page
@@ -6440,23 +6475,27 @@ pub struct ServeOptions {
     /// proof). Toggleable while a member SSE polls, so refusal/EOF before any
     /// unscoped page is forwarded can be exercised. Operator reads and every
     /// other RPC are untouched; compiled only in tests.
-    #[cfg(test)]
-    pub(crate) thread_read_ignore_relay: Option<Arc<AtomicBool>>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub thread_read_ignore_relay: Option<Arc<AtomicBool>>,
     /// Test-only response corruption after genuine member-history selection:
     /// 1 removes the acknowledgement, 2 makes the cursor numeric, 3 changes
     /// the acknowledgement, and 4 adds private conversation metadata.
     /// No mode bypasses the member admission.
-    #[cfg(test)]
-    pub(crate) member_history_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub member_history_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
     /// Test-only corruption of an already-authorized human-room page or
     /// receipt: 1 removes its scope acknowledgement, 2 adds a numeric post
     /// position, and 3 substitutes a wrong acknowledgement.
-    #[cfg(test)]
-    pub(crate) human_room_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub human_room_page_fault: Option<Arc<std::sync::atomic::AtomicU8>>,
     /// Test-only rolling-version simulation. Bits 1, 2 and 4 strip only the
     /// selected agent-list, agent-show or agent-events relay proof.
-    #[cfg(test)]
-    pub(crate) agent_reads_ignore_relay: Option<Arc<std::sync::atomic::AtomicU8>>,
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub agent_reads_ignore_relay: Option<Arc<std::sync::atomic::AtomicU8>>,
     #[cfg(feature = "test-seam")]
     pub cloud_projection_observer: Option<CloudProjectionObserver>,
     #[cfg(feature = "test-seam")]
@@ -6911,21 +6950,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     let (shared, prepared) = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
     // Two-phase init: the backend/coordinator holds a Weak back-reference, so
     // it is installed only after the Arc exists and before the listener binds.
-    #[cfg(all(
-        test,
-        feature = "test-seam",
-        target_os = "linux",
-        target_arch = "x86_64"
-    ))]
+    #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
     if opts.credential_entry_fixture.is_none() {
         protected_runtime::initialize(&shared, prepared)?;
     }
-    #[cfg(not(all(
-        test,
-        feature = "test-seam",
-        target_os = "linux",
-        target_arch = "x86_64"
-    )))]
+    #[cfg(not(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64")))]
     protected_runtime::initialize(&shared, prepared)?;
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);

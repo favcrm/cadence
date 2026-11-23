@@ -46,7 +46,8 @@ const UPGRADE_PENDING: &str = ".apps/upgrade-pending.yaml";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UpgradeJournal {
+#[doc(hidden)]
+pub struct UpgradeJournal {
     schema: u32,
     id: InstallationId,
     request_id: String,
@@ -211,15 +212,16 @@ fn declared_access_changes(old: Option<&app::Manifest>, new: &app::Manifest) -> 
     ]))
 }
 
-pub(crate) struct UpgradeRequest<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) source: &'a str,
-    pub(crate) expected_digest: &'a str,
-    pub(crate) expected_generation: &'a str,
-    pub(crate) expected_new_digest: &'a str,
-    pub(crate) request_id: &'a str,
-    pub(crate) catalogue: &'a CatalogueClaim,
-    pub(crate) directory: CatalogueDirectory<'a>,
+#[doc(hidden)]
+pub struct UpgradeRequest<'a> {
+    pub id: &'a str,
+    pub source: &'a str,
+    pub expected_digest: &'a str,
+    pub expected_generation: &'a str,
+    pub expected_new_digest: &'a str,
+    pub request_id: &'a str,
+    pub catalogue: &'a CatalogueClaim,
+    pub directory: CatalogueDirectory<'a>,
 }
 
 fn committed_upgrade_repeat(
@@ -352,7 +354,8 @@ fn journal_path(id: &InstallationId) -> PathBuf {
 /// CAD-1129: the bundle digest the explorer's catalog check and
 /// update-check compute — `pub(crate)` so the daemon's explorer RPC
 /// shares it.
-pub(crate) fn bundle_digest(files: &BTreeMap<String, String>) -> String {
+#[doc(hidden)]
+pub fn bundle_digest(files: &BTreeMap<String, String>) -> String {
     let mut digest = Sha256::new();
     for (name, body) in files {
         digest.update((name.len() as u64).to_be_bytes());
@@ -706,7 +709,8 @@ fn check_expected_digest(expected: &str, actual: &str) -> Result<()> {
 ///
 /// CAD-1422: `builtin:<catalog_id>` was the host built-in source form; the
 /// catalog is retired, so a `builtin:` source is refused here.
-pub(crate) fn install_check(pm: &Pm, source: &str, catalogue: &CatalogueClaim) -> Result<Value> {
+#[doc(hidden)]
+pub fn install_check(pm: &Pm, source: &str, catalogue: &CatalogueClaim) -> Result<Value> {
     install_check_from(pm, source, catalogue, CatalogueDirectory::Configured)
 }
 
@@ -966,7 +970,8 @@ fn check_package(source: &str, inspection: bool) -> Result<Value> {
     }
 }
 
-pub(crate) fn install(
+#[doc(hidden)]
+pub fn install(
     pm: &Pm,
     state: &Path,
     source: &str,
@@ -1148,7 +1153,8 @@ fn install_resolved(
 }
 
 /// Read-only proposal. The returned new digest is required by `upgrade`.
-pub(crate) fn upgrade_check(
+#[doc(hidden)]
+pub fn upgrade_check(
     pm: &Pm,
     id: &str,
     source: &str,
@@ -1244,7 +1250,8 @@ pub(super) fn upgrade_check_from(
 /// and writes those carries in the upgrade's one store transaction — a row
 /// that changed since preflight loses its CAS and is skipped, leaving its old
 /// receipt on the rebind/drift path.
-pub(crate) fn upgrade(
+#[doc(hidden)]
+pub fn upgrade(
     pm: &Pm,
     request: &UpgradeRequest<'_>,
     preflight: impl FnOnce(

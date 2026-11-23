@@ -187,7 +187,7 @@ use workflow::WorkflowAction;
     about = "Local controller for coding agents",
     // `0.1.0+<build commit>` — semver build metadata, `unknown` when
     // the build ran outside a git checkout.
-    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CADENCE_BUILD_COMMIT"))
+    version = cadence_agent::overview::BUILD_ID
 )]
 pub(crate) struct Cli {
     /// Runtime state directory (socket, database, logs).

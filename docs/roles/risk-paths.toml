@@ -31,7 +31,7 @@ paths = ["src/issue/blocked.rs", "src/issue/cli.rs", "src/issue/context.rs",
 [trigger1]
 paths = ["src/peer.rs", "src/daemon.rs", "src/daemon/identity.rs",
   "src/daemon/caller_rule.rs", "src/daemon/slots_rpc.rs", "src/adapter/pty/**",
-  "src/ui.rs", "src/ui/**", "ui/**", "src/operator_auth.rs", "src/tailnet_proof.rs",
+  "src/ui.rs", "src/ui/**", "crates/cadence-ui/**", "ui/**", "src/operator_auth.rs", "src/tailnet_proof.rs",
   "src/test_seam.rs", "src/master_perm.rs", "src/agent_uid/**", "src/cli/agent_uid.rs",
   "src/daemon/operator_rpc.rs", "src/daemon/supervisor_grant.rs",
   "src/daemon/installer_enrollment_wire.rs", "src/platform/custody.rs",

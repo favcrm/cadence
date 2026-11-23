@@ -135,7 +135,7 @@ impl Shared {
         // verified above; answer with the real unscoped document and no ack,
         // exactly as a pre-CAD-2215 daemon that ignored relayed proofs
         // would. The board must refuse this answer as unavailable.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if relayed && self.master_state_ignore_relay {
             return self.master_state_document();
         }

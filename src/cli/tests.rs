@@ -2165,7 +2165,7 @@ fn payload_keys(value: &serde_json::Value) -> Vec<String> {
 fn documented_self_payload_keys_match_the_builders() {
     let doc = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/skills/cadence/SKILL.md"
+        "/../../skills/cadence/SKILL.md"
     ))
     .expect("skills/cadence/SKILL.md");
 

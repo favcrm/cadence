@@ -67,13 +67,15 @@ pub mod filter;
 pub mod gh_guard;
 pub mod github_connect;
 pub mod home;
-mod ident;
+#[doc(hidden)]
+pub mod ident;
 pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;
 pub mod issue;
-pub(crate) mod issuer_transport;
+#[doc(hidden)]
+pub mod issuer_transport;
 pub mod lease;
 pub mod local_assignment;
 pub(crate) mod managed_section;
@@ -93,7 +95,8 @@ pub mod platform;
 pub(crate) mod printed_command;
 pub mod private_app_update;
 pub mod proc;
-pub(crate) mod project_policy;
+#[doc(hidden)]
+pub mod project_policy;
 pub(crate) mod protected_pi_profile;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod protected_runtime;
@@ -138,8 +141,9 @@ pub mod worktree;
 // from every non-test build.
 #[cfg(test)]
 extern crate self as cadence_agent;
-#[cfg(test)]
-mod test_web_issuer_tls;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub mod test_web_issuer_tls;
 #[cfg(test)]
 mod web_cli_test_harness;
 

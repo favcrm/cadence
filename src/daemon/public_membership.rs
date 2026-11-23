@@ -26,7 +26,8 @@ const ENV_VERIFIER_FILE: &str = "AGENTICOS_DEDICATED_BOARD_VERIFIER_FILE";
 
 /// The platform-placed membership context, captured once at startup.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum MembershipMode {
+#[doc(hidden)]
+pub enum MembershipMode {
     /// No platform placement: the operator's local sessions only. A public
     /// row still needs a saved realm that matches the current board config.
     Standalone,
@@ -40,14 +41,16 @@ pub(crate) enum MembershipMode {
 
 /// The immutable native binding: the paired core identity and the board realm.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NativeContext {
+#[doc(hidden)]
+pub struct NativeContext {
     pub company: String,
     pub instance: String,
     pub realm: PublicRealm,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct DedicatedContext {
+#[doc(hidden)]
+pub struct DedicatedContext {
     pub deployment: String,
     pub realm: PublicRealm,
     verifier: String,
@@ -235,10 +238,8 @@ impl MembershipMode {
     /// Capture the mode from the same `Hosted` value the lease was acquired
     /// with, plus the daemon's env reader. Read once; never refreshed.
     /// Any PRESENT core marker signals native, even an empty one.
-    pub(crate) fn capture(
-        hosted: &crate::lease::Hosted,
-        read: &dyn Fn(&str) -> Option<String>,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn capture(hosted: &crate::lease::Hosted, read: &dyn Fn(&str) -> Option<String>) -> Self {
         let raw_company = read(ENV_COMPANY);
         let raw_instance = read(ENV_INSTANCE);
         let raw_dedicated = read(ENV_DEDICATED);
@@ -408,7 +409,7 @@ impl Shared {
         }
         let fresh = match &self.membership_mode {
             MembershipMode::Native(ctx) if dedicated.is_none() && saved == ctx.realm => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-seam"))]
                 let result = match &self.membership_lookup_for_test {
                     Some(lookup) => lookup(&hash, &user.sub, &ctx.company, &ctx.instance),
                     None => crate::board_membership::lookup_current_membership_by_digest(
@@ -419,7 +420,7 @@ impl Shared {
                         &self.board_jwks,
                     ),
                 };
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "test-seam")))]
                 let result = crate::board_membership::lookup_current_membership_by_digest(
                     &hash,
                     &user.sub,

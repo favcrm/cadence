@@ -21,7 +21,8 @@ use crate::store::connection_dispatch::{
 };
 use crate::store::Store;
 
-pub(crate) struct Fixture {
+#[doc(hidden)]
+pub struct Fixture {
     pub(super) origin: String,
     owner: OnceLock<Arc<Owner>>,
 }
@@ -224,7 +225,8 @@ impl crate::platform::PlatformAdapter for TokenDescriptor {
     }
 }
 
-pub(crate) fn configure_credential_entry_fixture(
+#[doc(hidden)]
+pub fn configure_credential_entry_fixture(
     opts: &mut ServeOptions,
     root: &Path,
     entry_origin: &str,

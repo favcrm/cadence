@@ -58,14 +58,16 @@ pub fn accepted_until(exp: i64) -> i64 {
     exp + SKEW_SECS
 }
 
-pub(crate) fn dedicated_deployment_ok(s: &str) -> bool {
+#[doc(hidden)]
+pub fn dedicated_deployment_ok(s: &str) -> bool {
     (1..=64).contains(&s.len())
         && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-pub(crate) fn dedicated_issuer_ok(s: &str) -> bool {
+#[doc(hidden)]
+pub fn dedicated_issuer_ok(s: &str) -> bool {
     let Ok(uri) = s.parse::<ureq::http::Uri>() else {
         return false;
     };

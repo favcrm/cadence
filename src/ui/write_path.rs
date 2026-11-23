@@ -40,7 +40,7 @@ pub(crate) const JSON_CAP: u64 = 256 * 1024;
 /// The actor an operator write commits as — visible in `git log`
 /// subjects. A pane's write commits as its alias
 /// ([`operator::board_caller`]).
-pub(crate) const UI_ACTOR: &str = "operator (ui)";
+pub(crate) use super::UI_ACTOR;
 
 pub(crate) type HttpResp = Response<std::io::Cursor<Vec<u8>>>;
 

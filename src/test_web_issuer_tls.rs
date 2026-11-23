@@ -22,7 +22,8 @@ use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 /// The only issuer origin the fixture ever maps.
-pub(crate) const ISSUER: &str = "https://web-publish-issuer.test";
+#[doc(hidden)]
+pub const ISSUER: &str = "https://web-publish-issuer.test";
 const HOST: &str = "web-publish-issuer.test";
 
 struct Installed {
@@ -36,6 +37,10 @@ fn slot() -> std::sync::MutexGuard<'static, Option<Installed>> {
     INSTALLED
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
+}
+
+pub(crate) fn is_installed() -> bool {
+    slot().is_some()
 }
 
 /// Maps exactly the virtual issuer host to the fixture socket; everything
@@ -64,7 +69,8 @@ impl Resolver for VirtualIssuer {
 
 /// Keeps the fixture installed; dropping it restores the production path.
 #[must_use]
-pub(crate) struct TestWebIssuerTlsGuard;
+#[doc(hidden)]
+pub struct TestWebIssuerTlsGuard;
 
 impl Drop for TestWebIssuerTlsGuard {
     fn drop(&mut self) {
@@ -73,14 +79,16 @@ impl Drop for TestWebIssuerTlsGuard {
 }
 
 /// Test-only fixture entry point.
-pub(crate) struct TestWebIssuerTls;
+#[doc(hidden)]
+pub struct TestWebIssuerTls;
 
 impl TestWebIssuerTls {
     /// Installs the virtual issuer. `issuer` must be exactly
     /// [`ISSUER`], `loopback` a non-zero `127.0.0.1` socket, and `ca_pem` a
     /// PEM certificate that becomes the only trusted root. Refused while another
     /// fixture is installed (tests that install must run serially).
-    pub(crate) fn install(
+    #[doc(hidden)]
+    pub fn install(
         issuer: &str,
         loopback: SocketAddr,
         ca_pem: &[u8],
@@ -106,7 +114,8 @@ impl TestWebIssuerTls {
 
 /// The cfg(test) branch of `remote_enrollment::issuer_agent`. With no fixture
 /// installed this is byte-for-byte the production construction.
-pub(crate) fn agent(builder: ConfigBuilder<AgentScope>) -> ureq::Agent {
+#[doc(hidden)]
+pub fn agent(builder: ConfigBuilder<AgentScope>) -> ureq::Agent {
     match slot().as_ref() {
         None => ureq::Agent::new_with_config(builder.build()),
         Some(installed) => ureq::Agent::with_parts(

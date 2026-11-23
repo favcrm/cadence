@@ -150,16 +150,16 @@ fn staging_refresh(
         out["daemon"] = json!({"stopped": true, "start": started["state"]});
         if !no_ui {
             // ui stop + ui start — `ui::run_cli`'s delegate gate.
-            cadence_agent::ui::run_cli(
+            cadence_ui::run_cli(
                 state_dir,
-                &cadence_agent::ui::UiAction::Stop {
+                &cadence_ui::UiAction::Stop {
                     tailscale_off: false,
                     as_identity: Some(as_identity.to_string()),
                 },
             )?;
-            cadence_agent::ui::run_cli(
+            cadence_ui::run_cli(
                 state_dir,
-                &cadence_agent::ui::UiAction::Start {
+                &cadence_ui::UiAction::Start {
                     flags: cadence_agent::ui::UiFlags::default(),
                     reset: false,
                     as_identity: Some(as_identity.to_string()),

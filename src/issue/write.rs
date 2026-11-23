@@ -45,9 +45,9 @@ pub use new::{master_issue_new_limits, new_issue};
 pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, GrantedPreview};
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
-pub(crate) use projects::{
-    check_tags, checked_project_dirs, issue_dir, load_front, save_front, split_tags,
-};
+pub(crate) use projects::{check_tags, load_front, save_front, split_tags};
+#[doc(hidden)]
+pub use projects::{checked_project_dirs, issue_dir};
 pub use projects::{
     private_available, project_add, read_project_policy, set_acceptance, set_project_policy,
     set_project_remote, PRIVATE_UNAVAILABLE,

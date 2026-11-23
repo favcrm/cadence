@@ -60,7 +60,7 @@ fn version_of(layout: &Layout, sha: &str) -> Option<String> {
     let text = std::fs::read_to_string(layout.release_dir(sha).join(upgrade::MANIFEST)).ok()?;
     let manifest: Value = serde_json::from_str(&text).ok()?;
     (manifest["source_sha"].as_str() == Some(sha))
-        .then(|| format!("{}+{sha}", env!("CARGO_PKG_VERSION")))
+        .then(|| format!("{}+{sha}", crate::overview::BUILD_VERSION))
 }
 
 /// The linked release, as the card's "current version".

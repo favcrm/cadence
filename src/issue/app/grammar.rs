@@ -16,7 +16,8 @@ pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = MAX_APP_BYTES;
 
 /// The per-member safety bound. Screen assets share the app budget; screen
 /// declarations, workflows and other files retain their own smaller bounds.
-pub(crate) fn file_cap(rel: &str) -> u64 {
+#[doc(hidden)]
+pub fn file_cap(rel: &str) -> u64 {
     if let Some((tag, leaf)) = rel
         .strip_prefix("screens/")
         .and_then(|rest| rest.split_once('/'))
@@ -54,7 +55,8 @@ pub(crate) const ROOT_MEMBERS: &[&str] = &[
     "app-storage.json",
 ];
 
-pub(crate) fn root_member(name: &str) -> bool {
+#[doc(hidden)]
+pub fn root_member(name: &str) -> bool {
     ROOT_MEMBERS.contains(&name)
 }
 
@@ -188,7 +190,8 @@ pub(super) fn skill_nested_ext(directory: &str) -> Option<&'static [&'static str
 /// Whether `directory` is one of the package's two nested directories. The
 /// bundle walkers ask this before descending, so `skills/<tag>/<dir>/` can only
 /// ever be `scripts/` or `references/`.
-pub(crate) fn skill_subdir_ok(directory: &str) -> bool {
+#[doc(hidden)]
+pub fn skill_subdir_ok(directory: &str) -> bool {
     skill_nested_ext(directory).is_some()
 }
 
@@ -228,7 +231,8 @@ pub fn skill_member_ok(member: &str) -> bool {
 /// segments matters for the upload transport: `Path::components` folds `a//b`,
 /// `a/./b` and `a/../b` onto one staged file and would defeat duplicate
 /// detection.
-pub(crate) fn bundle_path_ok(path: &str) -> bool {
+#[doc(hidden)]
+pub fn bundle_path_ok(path: &str) -> bool {
     if path.is_empty() || !path.is_ascii() || path.contains('\\') || path.contains('\0') {
         return false;
     }
@@ -385,7 +389,8 @@ pub(super) const MAX_FILES: usize = 128;
 /// stated once in `cadence_core::app_screen_decl::MAX_TOTAL_BYTES` (a screen's
 /// assets share this budget); this alias keeps the native name without a
 /// second literal that could drift.
-pub(crate) const MAX_APP_BYTES: u64 = cadence_core::app_screen_decl::MAX_TOTAL_BYTES;
+#[doc(hidden)]
+pub const MAX_APP_BYTES: u64 = cadence_core::app_screen_decl::MAX_TOTAL_BYTES;
 
 #[cfg(test)]
 mod bundle_grammar_tests {

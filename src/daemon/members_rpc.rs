@@ -123,7 +123,8 @@ pub(super) const ASSIST_REQUEST_BATCH: usize = 20;
 /// elapsed-time assumptions. This is the production trigger's return
 /// value, not a test-only side channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AssistPromotion {
+#[doc(hidden)]
+pub struct AssistPromotion {
     pub request_id: String,
     /// `created`, `pending`, `refused` or `failed`.
     pub outcome: &'static str,
@@ -1961,7 +1962,7 @@ impl Shared {
             "more_after": (!backwards).then_some(more),
         });
         page[READER_SCOPE_FIELD] = json!(MEMBER_ASSIST_HISTORY_SCOPE_ACK);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if let Some(fault) = &self.member_history_page_fault {
             match fault.load(std::sync::atomic::Ordering::Acquire) {
                 1 => {
@@ -2609,8 +2610,9 @@ impl Shared {
     /// the real guard and receive the per-request `(request_id, outcome)`
     /// witness. It fabricates no job, skips no re-proof and changes no
     /// authority — it is a call into the production sweep.
-    #[cfg(all(test, feature = "test-seam"))]
-    pub(crate) fn sweep_member_job_requests_for_test(&self) -> Result<Vec<AssistPromotion>> {
+    #[cfg(feature = "test-seam")]
+    #[doc(hidden)]
+    pub fn sweep_member_job_requests_for_test(&self) -> Result<Vec<AssistPromotion>> {
         self.route_member_job_requests()
     }
 
@@ -2996,7 +2998,7 @@ impl Shared {
             self.member_private_deliveries(&member, readable, projects, &jobs)?;
         // Test-only observation point: rows projected, no lock held, final
         // authority/project reproof not yet run.
-        #[cfg(all(test, feature = "test-seam"))]
+        #[cfg(feature = "test-seam")]
         crate::delivery::publication::member_delivery_seam_fire(&self.state_dir);
         // Re-prove the current caller credential, project and ownership
         // after projection: a revocation between the two reads
@@ -3027,7 +3029,7 @@ impl Shared {
         out[cadence_core::board_api::READER_SCOPE_FIELD] =
             json!(cadence_core::board_api::MEMBER_JOB_SCOPE_ACK);
         // Test-only: observe/mutate the real response after the handler ran.
-        #[cfg(all(test, feature = "test-seam"))]
+        #[cfg(feature = "test-seam")]
         crate::delivery::publication::member_job_list_seam_fire(&self.state_dir, &mut out);
         Ok(out)
     }

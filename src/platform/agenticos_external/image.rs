@@ -151,7 +151,8 @@ pub(super) fn image_prompt_for(
 
 /// Why downloaded bytes are not a retainable image (CAD-1315).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImageFault {
+#[doc(hidden)]
+pub enum ImageFault {
     Unsupported,
     NotSquare,
     Aspect,
@@ -160,7 +161,8 @@ pub(crate) enum ImageFault {
     TooLarge,
 }
 
-type Fault = (ImageFault, &'static str);
+#[doc(hidden)]
+pub type Fault = (ImageFault, &'static str);
 
 #[cfg(test)]
 pub(crate) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
@@ -339,7 +341,8 @@ fn upload_limits() -> image::Limits {
 /// Instagram aspect range — the upload door normalises dimensions before
 /// custody — while still refusing non-JPEG/PNG, a mismatched stored media
 /// type, corrupt payloads and oversized decodes.
-pub(crate) fn uploaded_image_mime(bytes: &[u8], media_type: &str) -> Result<&'static str, Fault> {
+#[doc(hidden)]
+pub fn uploaded_image_mime(bytes: &[u8], media_type: &str) -> Result<&'static str, Fault> {
     if bytes.is_empty() || bytes.len() > ASSET_LIMIT {
         return Err((
             ImageFault::TooLarge,

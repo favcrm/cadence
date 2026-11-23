@@ -23,7 +23,8 @@ pub use validate::validate_scoped_monitor_alert_response;
 use validate::{
     validate_monitor_alert_response, validate_monitor_rows, validate_scoped_monitor_rows,
 };
-pub(crate) use view::monitoring_unavailable;
+#[doc(hidden)]
+pub use view::monitoring_unavailable;
 use view::monitoring_view;
 
 /// Read monitor health and durable alerts through the daemon socket.  The
@@ -39,7 +40,8 @@ pub fn monitoring(state_dir: &Path) -> Value {
 /// operator-proven `read_as` identity the daemon re-verifies. Without one the
 /// projection fails closed with an explicit unavailable state — the board
 /// never falls back to the operator's numeric monitor document.
-pub(crate) fn monitoring_for_tasks(
+#[doc(hidden)]
+pub fn monitoring_for_tasks(
     state_dir: &Path,
     allowed: &HashSet<String>,
     relay_params: &Value,

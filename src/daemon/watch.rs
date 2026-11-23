@@ -334,7 +334,7 @@ impl Shared {
             }
             match self.route_member_job_requests() {
                 Ok(outcomes) => {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-seam"))]
                     if let Some(observer) = &self.assist_request_sweep_observer {
                         for outcome in &outcomes {
                             observer(&outcome.request_id, outcome.outcome);

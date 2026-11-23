@@ -209,7 +209,8 @@ thread_local! {
 }
 
 /// How many issue folders [`load_all`] has parsed on this thread.
-pub(crate) fn collection_parses() -> u64 {
+#[doc(hidden)]
+pub fn collection_parses() -> u64 {
     COLLECTION_PARSES.with(Cell::get)
 }
 
@@ -270,7 +271,8 @@ fn load_all_with(
 }
 
 /// `CAD-16` → ("CAD", 16) so CAD-9 sorts before CAD-16.
-pub(crate) fn natural_key(id: &str) -> (String, u64) {
+#[doc(hidden)]
+pub fn natural_key(id: &str) -> (String, u64) {
     let (p, n) = id.rsplit_once('-').unwrap_or((id, "0"));
     (p.to_string(), n.parse().unwrap_or(0))
 }

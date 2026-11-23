@@ -202,7 +202,7 @@ impl Shared {
         // genuine unscoped page, no ack. It is read on every call, so a live
         // member SSE can be toggled into refusal/EOF before any unscoped page
         // is forwarded. Operator reads never reach it (scope is None).
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if member_relay
             && self
                 .thread_read_ignore_relay
@@ -460,7 +460,7 @@ impl Shared {
         // re-proof must refuse the stale page. Test builds only, scoped member
         // forward reads only, and only for a genuinely admitted selected app
         // conversation.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seam"))]
         if member_relay {
             if let Some(thread) = conversation
                 .as_ref()

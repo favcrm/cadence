@@ -27,7 +27,8 @@ fn catalog_origin_from(catalog: Option<&str>, issuer: Option<&str>) -> Option<St
     Some(raw.to_string())
 }
 
-pub(crate) fn catalog_origin() -> Option<String> {
+#[doc(hidden)]
+pub fn catalog_origin() -> Option<String> {
     catalog_origin_from(
         std::env::var("AGENTICOS_BOARD_CATALOG_ORIGIN")
             .ok()
@@ -36,7 +37,8 @@ pub(crate) fn catalog_origin() -> Option<String> {
     )
 }
 
-pub(crate) fn catalog_id(id: &str) -> bool {
+#[doc(hidden)]
+pub fn catalog_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && !id.starts_with('.')

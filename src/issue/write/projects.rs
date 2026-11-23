@@ -3,7 +3,8 @@
 use super::*;
 
 /// Resolve the tracker project roots without following a forged key or link.
-pub(crate) fn checked_project_dirs(pm: &Pm) -> Result<Vec<(project::Project, PathBuf)>> {
+#[doc(hidden)]
+pub fn checked_project_dirs(pm: &Pm) -> Result<Vec<(project::Project, PathBuf)>> {
     let projects = project::list_checked(&pm.dir)?;
     let mut keys = std::collections::HashSet::with_capacity(projects.len());
     let mut dirs = Vec::with_capacity(projects.len());
@@ -30,7 +31,8 @@ pub(crate) fn checked_project_dirs(pm: &Pm) -> Result<Vec<(project::Project, Pat
 /// never followed: a linked folder or issue.md does not exist as far
 /// as the writer is concerned. An id found under two projects names no
 /// single project, so it is refused rather than taken from the first.
-pub(crate) fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
+#[doc(hidden)]
+pub fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
     model::check_id(id)?;
     let mut found: Vec<(project::Project, PathBuf)> = Vec::new();
     for (project, root) in checked_project_dirs(pm)? {
