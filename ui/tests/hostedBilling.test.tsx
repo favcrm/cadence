@@ -294,7 +294,7 @@ async function run(): Promise<void> {
   assert(host.textContent?.includes("$17"), "monthly USD price shown by default");
   assert(!host.textContent?.includes("$163"), "yearly price hidden until toggled");
 
-  const yearlyBtn = Array.from(host.querySelectorAll("button")).find((b: any) => b.textContent === "Yearly") as HTMLButtonElement;
+  const yearlyBtn = Array.from(host.querySelectorAll("button")).find((b: any) => b.textContent === "Yearly billing") as HTMLButtonElement;
   assert(yearlyBtn, "yearly toggle button present");
   await React.act(async () => yearlyBtn.click());
   assert(host.textContent?.includes("$163"), "yearly USD price shown after toggle");
@@ -334,6 +334,9 @@ async function run(): Promise<void> {
   };
   unmount = await mountView();
   assert(host.textContent?.includes("帳單與方案"), "zh-TW billing heading rendered");
+  assert(host.textContent?.includes("訂閱方案"), "zh-TW Subscription plans label rendered without Plans collision");
+  assert(host.textContent?.includes("月繳") && host.textContent?.includes("年繳"), "zh-TW Monthly/Yearly billing labels rendered without collision");
+  assert(!host.textContent?.includes("計畫") && !host.textContent?.includes("按月"), "zh-TW avoids collided native task strings");
   assert(host.textContent?.includes("≈ HK$"), "zh-TW secondary HKD reference shown");
   assert(host.textContent?.includes("以美元 (USD) 經 Stripe 結算，港幣金額僅供參考。"), "zh-TW disclosure shown");
   const portalBtn = Array.from(host.querySelectorAll("button")).find((b: any) => b.textContent === "管理帳單") as HTMLButtonElement;

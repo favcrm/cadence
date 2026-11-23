@@ -196,7 +196,12 @@ export default function AccountMenu({
                 <div className="flex flex-col gap-0.5">
                   {workspacesPayload.workspaces.map((ws) => {
                     const label = locale === "zh-TW" && ws.nameZh?.trim() ? ws.nameZh.trim() : ws.name;
-                    const wsUrl = ws.current ? null : safeWorkspaceUrl(ws.boardUrl);
+                    const wsUrl =
+                      ws.current || ws.boardState !== "active"
+                        ? null
+                        : safeWorkspaceUrl(ws.boardUrl);
+                    const roleText =
+                      ws.role === "owner" ? t("Workspace owner") : t("Workspace member");
                     if (ws.current) {
                       return (
                         <div
@@ -207,7 +212,7 @@ export default function AccountMenu({
                           <span className="truncate font-medium">{label}</span>
                           <span className="inline-flex items-center gap-1 shrink-0 text-micro text-accent">
                             <IconCheck size={11} />
-                            <span>{t("Current")}</span>
+                            <span>{t("Current workspace")}</span>
                           </span>
                         </div>
                       );
@@ -219,6 +224,7 @@ export default function AccountMenu({
                           className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-secondary text-ink-400"
                         >
                           <span className="truncate">{label}</span>
+                          <span className="text-micro text-ink-500 shrink-0">{roleText}</span>
                         </div>
                       );
                     }
@@ -229,7 +235,7 @@ export default function AccountMenu({
                         className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-secondary text-ink-200 hover:bg-ink-800"
                       >
                         <span className="truncate">{label}</span>
-                        <span className="text-micro text-ink-500 shrink-0">{t(ws.role)}</span>
+                        <span className="text-micro text-ink-500 shrink-0">{roleText}</span>
                       </a>
                     );
                   })}

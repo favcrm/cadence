@@ -462,16 +462,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           return;
         }
         setBillingSummary(snapshot);
-        const localizedWs =
-          locale === "zh-TW" && snapshot.workspace.nameZh?.trim()
-            ? snapshot.workspace.nameZh.trim()
-            : "";
-        setOrgName(
-          localizedWs ||
-          snapshot.account?.company.name.trim() ||
-          snapshot.workspace.name.trim() ||
-          "Cadence",
-        );
         return;
       }
       const response = await operation.fetch("/api/platform-account", { headers: sessionHeaders() });
@@ -484,7 +474,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       setOrgName(name || "Cadence");
     }, abort.signal).catch(() => undefined);
     return () => abort.abort();
-  }, [meta?.platform_account_configured, meta?.hosted, meta?.session?.id, meta === null, locale]);
+  }, [meta?.platform_account_configured, meta?.hosted, meta?.session?.id, meta === null]);
+  const headerOrgName =
+    meta?.hosted === true && billingSummary
+      ? (locale === "zh-TW" && billingSummary.workspace.nameZh?.trim()
+          ? billingSummary.workspace.nameZh.trim()
+          : "") ||
+        billingSummary.account?.company.name.trim() ||
+        billingSummary.workspace.name.trim() ||
+        "Cadence"
+      : orgName;
 
   useEffect(() => {
     persistBrowserProjectView(view);
@@ -1268,7 +1267,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               <>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}
-            <span className="header-org hidden truncate font-medium text-ink-100 sm:inline" title={orgName}>{orgName}</span>
+            <span className="header-org hidden truncate font-medium text-ink-100 sm:inline" title={headerOrgName}>{headerOrgName}</span>
             <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
             {route.screen === "projects" && route.slug ? (
               <>

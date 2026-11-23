@@ -96,6 +96,17 @@ async function main(): Promise<void> {
         current: false,
       },
       {
+        workspaceId: "ws_prep",
+        slug: "prep",
+        name: "Prep Co",
+        nameZh: null,
+        role: "owner",
+        boardHost: "prep.cadencecloud.app",
+        boardUrl: "https://prep.cadencecloud.app",
+        boardState: "prepared",
+        current: false,
+      },
+      {
         workspaceId: "ws_bad",
         slug: "evil",
         name: "Unsafe Link Co",
@@ -180,9 +191,11 @@ async function main(): Promise<void> {
 
     const switcher = panel()?.querySelector("[data-workspace-switcher]");
     assert(switcher, "workspace switcher renders when hosted response succeeds");
-    assert(switcher.textContent?.includes("Acme Lab") && switcher.textContent.includes("Current"), "active workspace marked Current");
+    assert(switcher.textContent?.includes("Acme Lab") && switcher.textContent.includes("Current workspace"), "active workspace marked Current workspace");
     const betaLink = switcher.querySelector('a[href="https://beta.cadencecloud.app/"]') as HTMLAnchorElement | null;
     assert(betaLink && betaLink.textContent?.includes("Beta Studio"), "safe peer workspace renders link");
+    assert(betaLink.textContent?.includes("Workspace member"), "peer role shows Workspace member");
+    assert(switcher.textContent.includes("Prep Co") && !switcher.querySelector('a[href="https://prep.cadencecloud.app/"]'), "non-active workspace is non-clickable");
     assert(!switcher.querySelector('a[href^="javascript:"]'), "unsafe javascript workspace URL never rendered as anchor");
     const createLink = switcher.querySelector('a[href="https://app-v2.agenticos.hk/register?mode=new"]');
     assert(createLink && createLink.textContent?.includes("Create another workspace"), "create workspace link rendered");
@@ -196,6 +209,24 @@ async function main(): Promise<void> {
     await flush();
     equal(fetches.filter((p) => p === "/api/account/workspaces").length, 1, "cached across open/close");
     done();
+  }
+
+  // 2b. zh-TW locale uses non-colliding translations
+  {
+    win.localStorage.setItem("cadence-locale", "zh-TW");
+    const { trigger, panel, done } = mount(
+      { ...baseHosted, session: { ...baseHosted.session, id: "sess-ws-zh" } } as unknown as Meta,
+      "/settings/account",
+    );
+    await React.act(async () => trigger().click());
+    await flush();
+    const switcher = panel()?.querySelector("[data-workspace-switcher]");
+    assert(switcher, "zh-TW workspace switcher renders");
+    assert(switcher.textContent?.includes("目前工作區"), "zh-TW Current workspace label shown");
+    assert(switcher.textContent?.includes("工作區成員"), "zh-TW Workspace member label shown");
+    assert(!switcher.textContent?.includes("進行中"), "zh-TW avoids collided Current='進行中'");
+    done();
+    win.localStorage.removeItem("cadence-locale");
   }
 
   // 3. 404 omits workspace switcher cleanly without errors

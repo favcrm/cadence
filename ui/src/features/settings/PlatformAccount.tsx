@@ -548,7 +548,7 @@ function HostedBilling({
 
                 <article className="card account-summary-card">
                   <div className="billing-card-head">
-                    <h2>{t("Plan")}</h2>
+                    <h2>{t("Billing plan")}</h2>
                     {account.trial?.status === "active" && (
                       <span className="chip bg-accent/15 text-accent">{t("Free trial")}</span>
                     )}
@@ -575,18 +575,6 @@ function HostedBilling({
                       {account.trial.tokensUsed.toLocaleString()} / {account.trial.tokenCap.toLocaleString()} {t("tokens")}
                     </p>
                   )}
-                  {subActive && !isIapManaged && (
-                    <div className="billing-card-actions">
-                      <Button
-                        size="sm"
-                        loading={busyAction === "portal"}
-                        disabled={busyAction !== null}
-                        onClick={() => void runAction("portal", "/api/account/billing/portal", {})}
-                      >
-                        {t("Manage subscription")}
-                      </Button>
-                    </div>
-                  )}
                   {openCheckoutUrl && (
                     <div className="billing-card-actions">
                       <a className="btn btn-primary btn-sm" href={openCheckoutUrl}>
@@ -600,7 +588,7 @@ function HostedBilling({
               {allPlans.length > 0 && (
                 <section className="billing-section" aria-labelledby="billing-plans-title">
                   <div className="account-section-heading">
-                    <h2 id="billing-plans-title">{t("Plans")}</h2>
+                    <h2 id="billing-plans-title">{t("Subscription plans")}</h2>
                     {showIntervalToggle && (
                       <div className="billing-interval-toggle" role="group" aria-label={t("Billing interval")}>
                         <button
@@ -609,7 +597,7 @@ function HostedBilling({
                           aria-pressed={interval === "month"}
                           onClick={() => setInterval("month")}
                         >
-                          {t("Monthly")}
+                          {t("Monthly billing")}
                         </button>
                         <button
                           type="button"
@@ -617,7 +605,7 @@ function HostedBilling({
                           aria-pressed={interval === "year"}
                           onClick={() => setInterval("year")}
                         >
-                          {t("Yearly")}
+                          {t("Yearly billing")}
                         </button>
                       </div>
                     )}
