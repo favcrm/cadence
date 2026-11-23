@@ -1522,7 +1522,7 @@ impl Store {
                    JOIN human_room_post_requests pr ON pr.message_id=m.id
                    LEFT JOIN topic_posts tp ON tp.id=pr.post_id
                   WHERE m.alias=? AND m.state='running'
-                  ORDER BY m.seq DESC LIMIT 1",
+                  ORDER BY (pr.authority_mode = 'member') DESC, m.seq DESC LIMIT 1",
                 [alias],
                 |r| {
                     Ok(RunningChannelTurn {

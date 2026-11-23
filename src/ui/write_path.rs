@@ -202,6 +202,12 @@ pub(crate) fn write_reply(
             if let Some(route) = out.get("route") {
                 body["route"] = route.clone();
             }
+            if let Some(silent) = out.get("silent") {
+                body["silent"] = silent.clone();
+            }
+            if let Some(outcomes) = out.get("mention_outcomes") {
+                body["mention_outcomes"] = outcomes.clone();
+            }
             let body = serde_json::to_vec_pretty(&body).unwrap_or_default();
             let mut resp = Response::from_data(body).with_status_code(StatusCode(if created {
                 201
@@ -2443,11 +2449,24 @@ pub(crate) fn write_route(
                                     | (operator::Caller::Agent(_), _) => false,
                                 };
                                 if can_dispatch {
-                                    if let Ok(res) =
-                                        client::rpc(state_dir, "issue_comment_mentions", params)
-                                    {
-                                        reply["silent"] = res["silent"].clone();
-                                        reply["mention_outcomes"] = res["outcomes"].clone();
+                                    match client::rpc(state_dir, "issue_comment_mentions", params) {
+                                        Ok(res) => {
+                                            reply["silent"] = res["silent"].clone();
+                                            reply["mention_outcomes"] = res["outcomes"].clone();
+                                        }
+                                        Err(err) => {
+                                            let note = Value::String(format!(
+                                                "mention dispatch skipped: {err}"
+                                            ));
+                                            if let Some(arr) = reply
+                                                .get_mut("warnings")
+                                                .and_then(Value::as_array_mut)
+                                            {
+                                                arr.push(note);
+                                            } else {
+                                                reply["warnings"] = json!([note]);
+                                            }
+                                        }
                                     }
                                 }
                             }

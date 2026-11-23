@@ -130,6 +130,7 @@ pub(super) fn retain_scoped_agent_fields(
         "endpoint_kind",
         "role",
         "team_role",
+        "personal_assistant",
         "state",
         "enabled",
         "archived",
@@ -951,6 +952,8 @@ impl Shared {
     /// Safe non-escalating RPCs an agent may invoke while executing a
     /// non-owner member's `@mention` channel turn (`authority_mode == "member"`).
     const MEMBER_CHANNEL_TURN_ALLOWED_RPCS: &'static [&'static str] = &[
+        "health",
+        "daemon_info",
         "agent_identity",
         "agent_list",
         "agent_show",
@@ -958,6 +961,8 @@ impl Shared {
         "topic_read",
         "topic_publish",
         "request_open",
+        "request_wait",
+        "request_close",
         "message_read",
         "message_list",
         "message_report",
@@ -983,9 +988,6 @@ impl Shared {
         let Some(rule) = caller_rule::rule_of(method) else {
             return Ok(None);
         };
-        if matches!(rule, Rule::Read | Rule::Bearer) {
-            return Ok(None);
-        }
         let check_member_authority = |who: &Who| -> Result<()> {
             if let Who::Agent(alias) = who {
                 if let Some(turn) = self.store.running_channel_authority(alias)? {

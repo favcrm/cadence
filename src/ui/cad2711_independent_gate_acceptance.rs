@@ -1200,3 +1200,154 @@ fn cad2711_indep_ticket_comment_mentions_silent_note_human_isolation_and_agent_g
         .unwrap();
     assert_eq!(count_after_forged, 1);
 }
+
+#[test]
+fn cad2711_indep_member_turn_blocks_disallowed_read_rpcs_and_concurrent_owner_shadow() {
+    let roster = Arc::new(Mutex::new(GrantRoster {
+        target_present: true,
+        ..GrantRoster::default()
+    }));
+    let (observer, _events) = queue_observer();
+    let rig = grant_rig(
+        Arc::new(AtomicBool::new(true)),
+        roster.clone(),
+        observer,
+        None,
+        None,
+    );
+    seed(&rig);
+    let _keys = initialize_queue_keyring(&rig);
+    let owner = login(&rig, "grant-owner", "owner");
+    let ana = login(&rig, "ana", "member");
+    {
+        let mut guard = roster.lock().unwrap();
+        guard.owner_cookie = owner.clone();
+        guard.allowed_cookies = vec![owner.clone(), ana.clone()];
+    }
+
+    let worker_uid = indep_register_agent(&rig, "indep-read-worker");
+    let _bystander_uid = indep_register_agent(&rig, "indep-read-bystander");
+
+    let room = room_ok(
+        &rig,
+        &owner,
+        "POST",
+        "/api/human-threads/groups",
+        Some(json!({
+            "kind": "mixed_group",
+            "title": "Read Gate & Shadow Precedence",
+            "client_id": "indep-read-gate-room",
+            "humans": ["ana"],
+            "agents": [worker_uid]
+        })),
+    )["room"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mem_post = room_post(
+        &rig,
+        &ana,
+        &room,
+        "read-gate-mem-1",
+        "Member request @indep-read-worker",
+    );
+    assert_room_post(&mem_post["post"]);
+    assert_eq!(mem_post["post"]["outcomes"][0]["kind"], "queued");
+
+    let db = room_fixture_db(&rig);
+    let (mem_msg_id, mem_seq, mem_mode): (String, i64, String) = db
+        .query_row(
+            "SELECT m.id, m.seq, pr.authority_mode
+               FROM human_room_post_requests pr
+               JOIN messages m ON m.id=pr.message_id
+              WHERE pr.post_id=?1",
+            [mem_post["post"]["id"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(mem_mode, "member");
+
+    db.execute(
+        "UPDATE messages SET state='running' WHERE id=?1",
+        [mem_msg_id.as_str()],
+    )
+    .unwrap();
+
+    // 1. Disallowed Rule::Read RPCs must be refused during a running member turn.
+    for (method, params) in [
+        ("platform_accounts", json!({})),
+        ("endpoint_list", json!({})),
+        ("tracker_recovery_review", json!({})),
+        ("delivery_list", json!({})),
+        ("thread_read", json!({ "alias": "indep-read-worker" })),
+        ("agent_events", json!({ "alias": "indep-read-worker" })),
+    ] {
+        let err = indep_agent_rpc(&rig, "indep-read-worker", method, params)
+            .expect_err("member turn must refuse disallowed Rule::Read RPC");
+        assert_eq!(
+            err.code(),
+            Some("member_authority_refused"),
+            "{method} returned unexpected error: {err:?}"
+        );
+    }
+
+    // 2. Positive controls: allowlisted `health` succeeds for the running member-turn agent,
+    // and `platform_accounts` succeeds for `Asserted::Operator`.
+    indep_agent_rpc(&rig, "indep-read-worker", "health", json!({}))
+        .expect("allowlisted health RPC must succeed during member turn");
+    scoped(Asserted::Operator, || {
+        crate::client::rpc(rig._dir.path(), "platform_accounts", json!({}))
+    })
+    .expect("platform_accounts must succeed for operator");
+
+    // 3. Concurrent running owner turn with a higher seq for the same alias must never
+    // shadow or unlock active member confinement.
+    let owner_post = room_post(
+        &rig,
+        &owner,
+        &room,
+        "read-gate-owner-1",
+        "Owner follow-up @indep-read-worker",
+    );
+    assert_room_post(&owner_post["post"]);
+    assert_eq!(owner_post["post"]["outcomes"][0]["kind"], "queued");
+
+    let (owner_msg_id, owner_seq, owner_mode): (String, i64, String) = db
+        .query_row(
+            "SELECT m.id, m.seq, pr.authority_mode
+               FROM human_room_post_requests pr
+               JOIN messages m ON m.id=pr.message_id
+              WHERE pr.post_id=?1",
+            [owner_post["post"]["id"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(owner_mode, "owner");
+    assert!(
+        owner_seq > mem_seq,
+        "expected concurrent owner turn seq ({owner_seq}) > member turn seq ({mem_seq})"
+    );
+
+    db.execute(
+        "UPDATE messages SET state='running' WHERE id=?1",
+        [owner_msg_id.as_str()],
+    )
+    .unwrap();
+
+    for (method, params) in [
+        ("platform_accounts", json!({})),
+        (
+            "agent_answer",
+            json!({ "alias": "indep-read-bystander", "choice": "1" }),
+        ),
+    ] {
+        let err = indep_agent_rpc(&rig, "indep-read-worker", method, params)
+            .expect_err("concurrent running owner turn must not shadow member confinement");
+        assert_eq!(
+            err.code(),
+            Some("member_authority_refused"),
+            "{method} unlocked under concurrent owner shadow: {err:?}"
+        );
+    }
+}
