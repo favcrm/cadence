@@ -605,16 +605,26 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   // Moving to another page puts the board back as it was.
   useEffect(() => setExpanded(false), [pathname]);
 
-  // The active tab scrolls into view when it changes, clear of the
-  // Browser tab pinned at the strip's right edge (CAD-2682).
+  // The active tab stays in view, clear of the Browser tab pinned at the
+  // strip's right edge (CAD-2682): when it changes, and whenever the strip
+  // resizes (viewport, layout switch, first paint).
   useEffect(() => {
-    const tab = rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.closest<HTMLElement>(".cv-tab");
-    if (!tab) return;
-    tab.scrollIntoView({ block: "nearest", inline: "nearest" });
-    const pinned = tab.parentElement?.querySelector<HTMLElement>('.cv-tab[data-kind="session"]');
-    if (!pinned || pinned === tab || !tab.parentElement) return;
-    const hidden = tab.getBoundingClientRect().right - pinned.getBoundingClientRect().left;
-    if (hidden > 0) tab.parentElement.scrollLeft += hidden;
+    const strip = rootRef.current?.querySelector<HTMLElement>(".cv-tabs");
+    if (!strip) return;
+    const reveal = () => {
+      const tab = strip.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.closest<HTMLElement>(".cv-tab");
+      if (!tab) return;
+      tab.scrollIntoView({ block: "nearest", inline: "nearest" });
+      const pinned = strip.querySelector<HTMLElement>('.cv-tab[data-kind="session"]');
+      if (!pinned || pinned === tab) return;
+      const hidden = tab.getBoundingClientRect().right - pinned.getBoundingClientRect().left;
+      if (hidden > 0) strip.scrollLeft += hidden;
+    };
+    reveal();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(reveal);
+    observer.observe(strip);
+    return () => observer.disconnect();
   }, [canvas.active, canvas.tabs.length, showBrowser, open]);
 
   const commit = useCallback((px: number) => {
