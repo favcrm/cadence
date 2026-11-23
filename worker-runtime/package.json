@@ -24,7 +24,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "bun test",
     "build": "rm -rf dist && bun scripts/gen-company-outputs.mjs && tsc -p tsconfig.build.json && bun scripts/build.mjs",
-    "verify": "bun run typecheck && bun run test && bun run build"
+    "verify": "bun run typecheck && bun run test && bun run build",
+    "eval:compaction": "bun evals/compaction-retention.eval.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.5.2",
