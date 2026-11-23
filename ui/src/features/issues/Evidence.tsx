@@ -251,17 +251,32 @@ function EvidenceDrawer({ filename, subtitle, previewKind, children, onClose }: 
   onClose: () => void;
 }) {
   const t = useTranslate();
-  const background = useRef<HTMLElement | null>(null);
+  const releaseBoard = useRef<(() => void) | null>(null);
   const restoreBoard = useCallback(() => {
-    if (background.current) background.current.inert = false;
-    background.current = null;
+    releaseBoard.current?.();
+    releaseBoard.current = null;
   }, []);
   useLayoutEffect(() => {
     // The board drawer portals to document.body, outside the app root.
     const app = document.getElementById("root");
     if (!app || app.inert) return;
+    const root = document.documentElement;
+    const body = document.body;
+    const gutter = Math.max(0, window.innerWidth - root.clientWidth);
+    const rootOverflow = root.style.overflow;
+    const bodyOverflow = body.style.overflow;
+    const bodyPadding = body.style.paddingRight;
     app.inert = true;
-    background.current = app;
+    root.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+    if (gutter > 0)
+      body.style.paddingRight = `${(Number.parseFloat(getComputedStyle(body).paddingRight) || 0) + gutter}px`;
+    releaseBoard.current = () => {
+      app.inert = false;
+      root.style.overflow = rootOverflow;
+      body.style.overflow = bodyOverflow;
+      body.style.paddingRight = bodyPadding;
+    };
     return restoreBoard;
   }, [restoreBoard]);
 

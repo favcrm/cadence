@@ -220,15 +220,15 @@ export default function HeaderSearch({
   const rows = [...issueRows, ...hitRows];
 
   const selectionKey = `${query}\u0000${projectKey ?? ""}`;
-  const selected = selection?.key === selectionKey && (!ambiguous || selection.explicit) ? selection : null;
-  const waitingForCompactId = compactQuery && issues.data === null && issues.status !== "failed";
-  const defaultActive = rows.length > 0 && !ambiguous && !waitingForCompactId ? 0 : -1;
+  const requiresExplicit = ambiguous || (compactQuery && issues.data === null && issues.status !== "failed");
+  const selected = selection?.key === selectionKey && (!requiresExplicit || selection.explicit) ? selection : null;
+  const defaultActive = rows.length > 0 && !requiresExplicit ? 0 : -1;
   const active = selected ? rows.findIndex((row) => row.href === selected.href) : defaultActive;
   const setActive = (index: number, explicit = true) => {
     const row = rows[index];
     if (row) setSelection({ key: selectionKey, href: row.href, explicit });
   };
-  const hoverRow = ambiguous ? undefined : (index: number) => setActive(index, false);
+  const hoverRow = requiresExplicit ? undefined : (index: number) => setActive(index, false);
 
   const close = () => {
     returnFocusRef.current = true;

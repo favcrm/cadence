@@ -107,7 +107,8 @@ function CsvView({ text, contentRef }: { text: string; contentRef: React.RefObje
   if (!table) {
     return (
       <div ref={contentRef} className="canvas-doc min-w-0" data-artifact-view="csv">
-        <pre className="num text-micro text-ink-200 whitespace-pre overflow-auto">{text}</pre>
+        <pre className="num text-micro text-ink-200 whitespace-pre overflow-auto"
+          role="region" aria-label={t("CSV text")} tabIndex={0}>{text}</pre>
       </div>
     );
   }

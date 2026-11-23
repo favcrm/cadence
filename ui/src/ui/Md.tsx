@@ -386,6 +386,15 @@ function IdCode({ className, children }: { className?: string; children?: ReactN
   );
 }
 
+function MarkdownTable({ children }: { children?: ReactNode }) {
+  const t = useTranslate();
+  return (
+    <div className="md-table-wrap" role="region" aria-label={t("Markdown table")} tabIndex={0}>
+      <table>{children}</table>
+    </div>
+  );
+}
+
 function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids = false, knownIssue?: (id: string) => boolean): Components {
   return {
     ...(ids
@@ -395,11 +404,7 @@ function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids =
           code: ({ className, children }) => <IdCode className={className}>{children}</IdCode>,
         }
       : {}),
-    table: ({ children }) => (
-      <div className="md-table-wrap">
-        <table>{children}</table>
-      </div>
-    ),
+    table: MarkdownTable,
     blockquote: (props) => (
       <CalloutBlockquote callout={(props as { "data-callout"?: string })["data-callout"]}>
         {props.children}

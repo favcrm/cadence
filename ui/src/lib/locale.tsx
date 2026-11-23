@@ -2917,6 +2917,8 @@ Object.assign(zhTW, {
   "Artifacts": "交付檔案",
   "Document view": "文件檢視模式",
   "CSV table": "CSV 表格",
+  "CSV text": "CSV 文字",
+  "Markdown table": "Markdown 表格",
   "Source is unavailable for this encoding. Download the original file.": "無法預覽此編碼的原始內容。請下載原始檔案。",
   "sandboxed frame · no scripts · no network": "沙盒頁框 · 不執行腳本 · 不連線網路",
   "board Markdown renderer · no raw HTML": "看板 Markdown 檢視器 · 不載入原始 HTML",

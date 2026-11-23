@@ -89,7 +89,7 @@
 .canvas-doc { min-width: 0; }
 .cv-csv { display: flex; flex: 1; flex-direction: column; gap: 6px; min-height: 0; }
 .cv-csv-scroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--color-ink-800); border-radius: 6px; }
-.cv-csv-scroll:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+[data-artifact-view="csv"] :is(.cv-csv-scroll, pre):focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
 .cv-csv table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font: var(--text-micro) var(--font-mono); color: var(--color-ink-200); }
 .cv-csv th, .cv-csv td { padding: 4px 10px; border-bottom: 1px solid var(--color-ink-800); text-align: left; white-space: nowrap; max-width: 28rem; overflow: hidden; text-overflow: ellipsis; }
 .cv-csv th { position: sticky; top: 0; z-index: 1; background: var(--color-ink-850); color: var(--color-ink-100); font-weight: 600; }
