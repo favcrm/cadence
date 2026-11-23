@@ -1040,11 +1040,13 @@ export function HumanContextPanel({
             <li>
               <strong>{t("Human-Turn Brake")}</strong>
               <span>
-                {agentChainLimit > 0
-                  ? t("Agent hops: {count}/{limit} before human turn required.")
-                      .replace("{count}", String(agentChainCount))
-                      .replace("{limit}", String(agentChainLimit))
-                  : t("Paused after consecutive agent turns until a human posts.")}
+                {agentChainLimit <= 0
+                  ? t("Inactive until a shared agent joins this channel.")
+                  : agentChainCount >= agentChainLimit
+                    ? t("Paused after consecutive agent turns until a human posts.")
+                    : t("Agent hops: {count}/{limit} before human turn required.")
+                        .replace("{count}", String(agentChainCount))
+                        .replace("{limit}", String(agentChainLimit))}
               </span>
             </li>
           )}

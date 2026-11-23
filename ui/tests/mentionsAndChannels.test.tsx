@@ -9,6 +9,7 @@ import type * as CandidatesModule from "../src/features/mentions/candidates";
 import type * as PickerModule from "../src/features/mentions/MentionPicker";
 import type * as HumanThreadsModule from "../src/features/threads/HumanThreads";
 import type * as NewConvModule from "../src/features/threads/NewHumanConversation";
+import type * as NotificationToastModule from "../src/features/threads/NotificationToast";
 import type * as HandoffModule from "../src/features/mentions/HomeMentionHandoff";
 import type * as PartsModule from "../src/features/threads/ThreadChatParts";
 import type * as ClientModule from "../src/features/threads/humanThreadsClient";
@@ -103,6 +104,7 @@ async function main(): Promise<void> {
   const { isShareableAgent } = require<typeof CandidatesModule>("../src/features/mentions/candidates");
   const { HumanContextPanel, HumanRoomTimeline } = require<typeof HumanThreadsModule>("../src/features/threads/HumanThreads");
   const NewHumanConversation = require<typeof NewConvModule>("../src/features/threads/NewHumanConversation").default;
+  const { NotificationToastProvider } = require<typeof NotificationToastModule>("../src/features/threads/NotificationToast");
   const { HomeMentionHandoffCard, findMentionedTeammates } = require<typeof HandoffModule>("../src/features/mentions/HomeMentionHandoff");
   const { ThreadComposerFrame } = require<typeof PartsModule>("../src/features/threads/ThreadChatParts");
   const { LocaleProvider } = require<typeof LocaleModule>("../src/lib/locale");
@@ -344,7 +346,12 @@ async function main(): Promise<void> {
   // Split Context sections: Teammates, Shared Agents, and Active Guardrails
   assert(host.querySelector('[data-roster-humans]') !== null && host.querySelector('[data-roster-agents]') !== null, "HumanContextPanel separates Teammates and Shared Agents");
   const guardrailsText = host.querySelector("[data-active-guardrails]")?.textContent ?? "";
-  assert(guardrailsText.includes("Membership ACL") && guardrailsText.includes("Agent hops: 2/2 before human turn required."), "Active Guardrails shows ACL and Human-Turn Brake counters");
+  assert(
+    guardrailsText.includes("Membership ACL")
+      && guardrailsText.includes("Paused after consecutive agent turns until a human posts.")
+      && !guardrailsText.includes("Agent hops: 2/2"),
+    "Active Guardrails shows paused state when agent chain hits limit",
+  );
 
   // Searchable member filter (>= 5 human members)
   const filterInput = host.querySelector<HTMLInputElement>(".threads-member-filter");
@@ -531,6 +538,51 @@ async function main(): Promise<void> {
   const keepPrivateBtn = Array.from(host.querySelectorAll<HTMLButtonElement>("[data-home-handoff-preview] button")).find((b) => b.textContent?.includes("Keep private in Home"));
   await React.act(async () => { openChannelsBtn?.click(); keepPrivateBtn?.click(); });
   assert(handoffClicks === 1 && keepPrivateClicks === 1, "HomeMentionHandoffCard wires Open in Channels and Keep private in Home actions");
+
+  // 6. Human-Turn Brake 3-state branch in HumanContextPanel + NotificationToast CSS stacking
+  for (const [chainCount, chainLimit, expectedText, forbiddenText] of [
+    [0, 0, "Inactive until a shared agent joins this channel.", "Paused after consecutive agent turns until a human posts."],
+    [1, 2, "Agent hops: 1/2 before human turn required.", "Paused after consecutive agent turns until a human posts."],
+    [2, 2, "Paused after consecutive agent turns until a human posts.", "Agent hops: 2/2"],
+  ] as const) {
+    await React.act(async () => {
+      root.render(
+        React.createElement(LocaleProvider, null,
+          React.createElement(NotificationToastProvider, null,
+            React.createElement(HumanContextPanel, {
+              room: {
+                id: "room-brake",
+                kind: chainLimit === 0 ? "human_group" : "mixed_group",
+                title: "Brake State",
+                created: 1,
+                creator: "human-me",
+                unread: 0,
+              },
+              me: { id: "human-me", name: "Mei" },
+              members: [
+                { kind: "human", id: "human-me", label: "Mei" },
+                ...(chainLimit > 0 ? [{ kind: "agent" as const, id: "uid-dev", label: "dev" }] : []),
+              ],
+              denied: false,
+              canManage: true,
+              agentChainCount: chainCount,
+              agentChainLimit: chainLimit,
+              people,
+              peopleError: null,
+              agents,
+              onChanged: () => {},
+              onOpened: () => {},
+            }),
+          ),
+        ),
+      );
+    });
+    await flush();
+    const brakeText = host.querySelector("[data-active-guardrails]")?.textContent ?? "";
+    assert(brakeText.includes(expectedText) && !brakeText.includes(forbiddenText), `Human-Turn Brake renders expected state for (${chainCount}/${chainLimit})`);
+    const toastStack = host.querySelector<HTMLElement>(".notification-toast-stack");
+    assert(toastStack !== null && toastStack.style.display === "", "NotificationToastStack delegates display to CSS without inline display override");
+  }
 
   await React.act(async () => root.unmount());
   host.remove();

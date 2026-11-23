@@ -442,8 +442,8 @@ export default function ThreadsPage({
   if (!operator && human.me === null && human.loading) {
     return (
       <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
-        <h1 id="threads-title" className="sr-only">Channels</h1>
-        <p className="threads-note" role="status">Checking your access…</p>
+        <h1 id="threads-title" className="sr-only">{t("Channels")}</h1>
+        <p className="threads-note" role="status">{t("Checking your access…")}</p>
       </section>
     );
   }
@@ -582,7 +582,7 @@ export default function ThreadsPage({
               />
             ) : (
               <div className="threads-empty">
-                <p>Channels are unavailable for this sign-in.</p>
+                <p>{t("Channels are unavailable for this sign-in.")}</p>
               </div>
             )
           ) : open ? (
