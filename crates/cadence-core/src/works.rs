@@ -139,8 +139,7 @@ fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, Violation> 
 /// The exact string a material digest covers: the app-material domain line
 /// and the canonical JSON. Hosts apply SHA-256 to these UTF-8 bytes.
 fn material(value: &Value) -> String {
-    String::from_utf8(canonical_bytes(APP_MATERIAL_DOMAIN, value))
-        .expect("canonical JSON is UTF-8")
+    String::from_utf8(canonical_bytes(APP_MATERIAL_DOMAIN, value)).expect("canonical JSON is UTF-8")
 }
 
 /// The material a revision's `contentDigest` covers.
