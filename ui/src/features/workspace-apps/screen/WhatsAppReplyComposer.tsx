@@ -616,6 +616,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       ? attachment.mime_type === "application/pdf" ? "PDF" : "DOC"
       : attachment.kind.toUpperCase()
     : "";
+  const verifyingLabel = zh ? "正在核對收件人…" : "Verifying recipient…";
 
   return <div ref={dock} className="wa-reply-dock" hidden={hidden} data-positioned={bounds || overlay ? "" : undefined} data-overlay={overlay ? "" : undefined}
     style={bounds ? {
@@ -629,7 +630,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         {recipient ? <>{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
           {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</>
           : selection.announceAvailability ? (zh ? "WhatsApp 回覆" : "WhatsApp reply")
-          : availability === "checking" ? (showCheckingHint ? <span className="wa-reply-hint-busy"><span className="wa-reply-spinner" aria-hidden="true" />{zh ? "正在核對收件人…" : "Verifying recipient…"}</span> : (zh ? "WhatsApp 回覆" : "WhatsApp reply"))
+          : availability === "checking" ? (showCheckingHint ? <span className="wa-reply-hint-busy"><span className="wa-reply-spinner" aria-hidden="true" />{verifyingLabel}</span> : (zh ? "WhatsApp 回覆" : "WhatsApp reply"))
           : (zh ? "此對話暫時無法回覆，你仍可查看訊息。" : "Replies are unavailable for this chat. You can still read messages.")}
       </p>}
       {!isOfficial && attachment && <div className="wa-reply-attachment">
@@ -651,7 +652,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           : overlay && availability === "blocked"
           ? (zh ? "此對話暫時無法回覆" : "Can’t reply in this conversation")
           : overlay && availability === "checking" && showCheckingHint
-          ? (zh ? "正在核對收件人…" : "Verifying recipient…")
+          ? verifyingLabel
           : (zh ? "輸入回覆…" : "Write a reply…")}
         value={text} rows={1} maxLength={4096} readOnly={textareaReadOnly}
         onChange={e => setText(e.target.value)} onKeyDown={e => {

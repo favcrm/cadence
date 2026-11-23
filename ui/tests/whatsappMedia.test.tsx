@@ -1010,8 +1010,8 @@ async function testComposerInteractions(): Promise<void> {
       "resolved Recheck settles to sent",
     );
 
-    // 9. Overlay mode delays 'Verifying recipient…' placeholder by 300ms while keeping read-only safety;
-    //    blocked conversations announce immediately without waiting 300ms.
+    // 9. Overlay mode delays 'Verifying recipient…' placeholder by 300ms deterministically while keeping
+    //    read-only safety; fast (<300ms) and blocked conversations cancel the timer and settle cleanly.
     let showGate: { promise: Promise<void>; resolve: () => void } | null = defer();
     let showBlocked = false;
     const delayServices = {
@@ -1026,57 +1026,112 @@ async function testComposerInteractions(): Promise<void> {
         return mockServices.call(op, args);
       },
     };
-    const delaySelection: WhatsAppReplySelection = {
-      ...selection,
-      receiptScope: "scope-verify-delay",
-      services: delayServices as unknown as WhatsAppReplySelection["services"],
-      announceInset: () => 96,
-    };
-    await React.act(async () => {
-      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-delay", selection: delaySelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
-      await flush();
-    });
-    const vdText = container.querySelector("textarea") as HTMLTextAreaElement;
-    const vdSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
-    assert(
-      vdText.getAttribute("placeholder") === "Write a reply…" && vdText.readOnly && vdSend.disabled,
-      "<300ms recipient check keeps quiet placeholder while staying readOnly with Send disabled",
-    );
-    await React.act(async () => {
-      await new Promise((r) => setTimeout(r, 350));
-      await flush();
-    });
-    assert(
-      vdText.getAttribute("placeholder") === "Verifying recipient…" && vdText.readOnly && vdSend.disabled,
-      ">=300ms recipient check reveals Verifying recipient placeholder while remaining readOnly",
-    );
-    await React.act(async () => {
-      showGate!.resolve();
-      showGate = null;
-      await flush();
-    });
-    assert(
-      vdText.getAttribute("placeholder") === "Write a reply…" && !vdText.readOnly,
-      "resolved recipient verification restores editable reply composer",
-    );
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const delayTimers = new Map<number, () => void>();
+    const timerCount = () => delayTimers.size;
+    let nextTimerId = 1_000_000;
+    globalThis.setTimeout = ((handler: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      if (delay === 300 && typeof handler === "function") {
+        const id = nextTimerId++;
+        delayTimers.set(id, () => handler(...args));
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return realSetTimeout(handler as (...a: never[]) => void, delay, ...(args as never[]));
+    }) as unknown as typeof setTimeout;
+    globalThis.clearTimeout = ((id?: ReturnType<typeof setTimeout>) => {
+      if (typeof id === "number" && delayTimers.delete(id)) return;
+      realClearTimeout(id);
+    }) as typeof clearTimeout;
+    try {
+      const delaySelection: WhatsAppReplySelection = {
+        ...selection,
+        receiptScope: "scope-verify-delay",
+        services: delayServices as unknown as WhatsAppReplySelection["services"],
+        announceInset: () => 96,
+      };
+      await React.act(async () => {
+        root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-delay", selection: delaySelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+        await flush();
+      });
+      const vdText = container.querySelector("textarea") as HTMLTextAreaElement;
+      const vdSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+      assert(
+        timerCount() === 1 &&
+          vdText.getAttribute("placeholder") === "Write a reply…" &&
+          vdText.readOnly &&
+          vdSend.disabled,
+        "<300ms recipient check schedules delay timer and keeps quiet placeholder with readOnly and Send disabled",
+      );
+      const fireDelay = [...delayTimers.values()][0]!;
+      delayTimers.clear();
+      await React.act(async () => {
+        fireDelay();
+        await flush();
+      });
+      assert(
+        vdText.getAttribute("placeholder") === "Verifying recipient…" && vdText.readOnly && vdSend.disabled,
+        ">=300ms timer firing reveals Verifying recipient placeholder while remaining readOnly",
+      );
+      await React.act(async () => {
+        showGate!.resolve();
+        showGate = null;
+        await flush();
+      });
+      assert(
+        vdText.getAttribute("placeholder") === "Write a reply…" && !vdText.readOnly,
+        "resolved recipient verification restores editable reply composer",
+      );
 
-    showBlocked = true;
-    const blockedDelaySelection: WhatsAppReplySelection = {
-      ...selection,
-      receiptScope: "scope-verify-blocked",
-      services: delayServices as unknown as WhatsAppReplySelection["services"],
-      announceInset: () => 96,
-    };
-    await React.act(async () => {
-      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-blocked", selection: blockedDelaySelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
-      await flush();
-    });
-    const vbText = container.querySelector("textarea") as HTMLTextAreaElement;
-    const vbSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
-    assert(
-      vbText.placeholder === "Can’t reply in this conversation" && vbText.readOnly && vbSend.disabled,
-      "blocked recipient state shows Can't reply placeholder immediately without 300ms delay",
-    );
+      // Fast (<300ms) verification cancels the pending timer cleanly without showing the verifying hint.
+      showGate = defer();
+      const fastSelection: WhatsAppReplySelection = {
+        ...selection,
+        receiptScope: "scope-verify-fast",
+        services: delayServices as unknown as WhatsAppReplySelection["services"],
+        announceInset: () => 96,
+      };
+      await React.act(async () => {
+        root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-fast", selection: fastSelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+        await flush();
+      });
+      assert(timerCount() === 1, "pending fast check arms one 300ms timer");
+      await React.act(async () => {
+        showGate!.resolve();
+        showGate = null;
+        await flush();
+      });
+      const vfText = container.querySelector("textarea") as HTMLTextAreaElement;
+      assert(
+        timerCount() === 0 && vfText.getAttribute("placeholder") === "Write a reply…" && !vfText.readOnly,
+        "fast resolution cancels 300ms timer and avoids Verifying recipient placeholder",
+      );
+
+      // Blocked state displays immediately and cancels the 300ms timer.
+      showBlocked = true;
+      const blockedDelaySelection: WhatsAppReplySelection = {
+        ...selection,
+        receiptScope: "scope-verify-blocked",
+        services: delayServices as unknown as WhatsAppReplySelection["services"],
+        announceInset: () => 96,
+      };
+      await React.act(async () => {
+        root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-blocked", selection: blockedDelaySelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+        await flush();
+      });
+      const vbText = container.querySelector("textarea") as HTMLTextAreaElement;
+      const vbSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+      assert(
+        timerCount() === 0 &&
+          vbText.getAttribute("placeholder") === "Can’t reply in this conversation" &&
+          vbText.readOnly &&
+          vbSend.disabled,
+        "blocked recipient state cancels timer and shows Can't reply placeholder immediately",
+      );
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
   } finally {
     React.act(() => { root.unmount(); });
     container.remove();
