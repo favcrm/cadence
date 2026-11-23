@@ -142,11 +142,13 @@ const TONE: Record<StagedOutcome, CardTone> = {
 
 function StagedActionCard({ write, source, density }: { write: StagedWrite; source: StagedSource; density: CardDensity }) {
   const t = useTranslate();
-  // "Not now" folds the card to its header for this view; it decides nothing.
+  // "Not now" folds a pending preview for this view; it decides nothing.
   const [folded, setFolded] = useState(false);
   // "Show full message" lifts the body's clamp; the body is already plain text.
   const [fullBody, setFullBody] = useState(false);
   const view = stagedChipView(write);
+  const receipt = view.outcome === "applied" || view.outcome === "denied";
+  const collapsed = view.pending && folded;
   const { fields, more, body } = stagedFields(write);
   const preview = write.connected?.preview ?? write.customMcp?.preview;
   const title = preview?.title ?? view.title;
@@ -155,44 +157,13 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
   const outside = outsideDomainRecipients(write);
   const status = stagedStatus(write, view.outcome, view.status);
   const clampable = body !== null && bodyNeedsClamp(body);
-  return (
-    <TurnCard
-      kind="staged"
-      density={density}
-      className="card turncard-staged"
-      data-kind="staged-action"
-      data-staged-id={write.id}
-      data-outcome={view.outcome}
-      label={`${t("Staged action")}: ${title}`}
-      icon={
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <path d="M4 14V2.5M4 3h7.5l-1.5 2.5L11.5 8H4" />
-        </svg>
-      }
-      kindLabel={[app, t(view.kind)].filter(Boolean).join(" · ")}
-      status={{ text: t(status), tone: TONE[view.outcome] }}
-      data-folded={folded || undefined}
-      footer={
-        view.pending ? (
-          <>
-            <button type="button" className="btn btn-sm" data-staged-later aria-expanded={!folded} onClick={() => setFolded((v) => !v)}>
-              {folded ? t("Show") : t("Not now")}
-            </button>
-            <button type="button" className="btn btn-sm btn-primary" data-staged-review onClick={(e) => source.requestReview(write.id, e.currentTarget)}>
-              {t("Review")}
-            </button>
-          </>
-        ) : undefined
-      }
-    >
-      <p className="turncard-title"><bdi>{title}</bdi></p>
-      {account && (
-        <p className="turncard-from">
-          {t("from")} <bdi>{account}</bdi>
-        </p>
-      )}
-      {!folded && (
-        <>
+  const from = account && (
+    <p className="turncard-from">
+      {t("from")} <bdi>{account}</bdi>
+    </p>
+  );
+  const details = !collapsed && (
+    <>
       {fields.length > 0 && (
         <dl className="turncard-fields">
           {fields.map((field, i) => (
@@ -234,9 +205,58 @@ function StagedActionCard({ write, source, density }: { write: StagedWrite; sour
         </p>
       )}
       {more > 0 && <p className="text-micro text-ink-500">{t("More on the review card")} (+{more})</p>}
+      {!view.pending && <p className="text-micro text-ink-500">{t("Decided on the board")}</p>}
+    </>
+  );
+  return (
+    <TurnCard
+      kind="staged"
+      density={density}
+      className="card turncard-staged"
+      data-kind="staged-action"
+      data-staged-id={write.id}
+      data-outcome={view.outcome}
+      label={`${t("Staged action")}: ${title}`}
+      icon={
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M4 14V2.5M4 3h7.5l-1.5 2.5L11.5 8H4" />
+        </svg>
+      }
+      kindLabel={[app, t(view.kind)].filter(Boolean).join(" · ")}
+      status={{ text: t(status), tone: TONE[view.outcome] }}
+      data-folded={collapsed || undefined}
+      footer={
+        view.pending ? (
+          <>
+            <button type="button" className="btn btn-sm" data-staged-later aria-expanded={!collapsed} onClick={() => setFolded((v) => !v)}>
+              {collapsed ? t("Show") : t("Not now")}
+            </button>
+            <button type="button" className="btn btn-sm btn-primary" data-staged-review onClick={(e) => source.requestReview(write.id, e.currentTarget)}>
+              {t("Review")}
+            </button>
+          </>
+        ) : undefined
+      }
+    >
+      {receipt ? (
+        <details className="turncard-receipt">
+          <summary>
+            <span className="turncard-title"><bdi>{title}</bdi></span>
+            <span className="turncard-receipt-toggle">
+              <span className="turncard-receipt-show">{t("Show details")}</span>
+              <span className="turncard-receipt-hide">{t("Hide details")}</span>
+              <span className="turncard-receipt-caret" aria-hidden>›</span>
+            </span>
+          </summary>
+          <div className="turncard-receipt-details">{from}{details}</div>
+        </details>
+      ) : (
+        <>
+          <p className="turncard-title"><bdi>{title}</bdi></p>
+          {from}
+          {details}
         </>
       )}
-      {!view.pending && <p className="text-micro text-ink-500">{t("Decided on the board")}</p>}
     </TurnCard>
   );
 }

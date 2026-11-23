@@ -282,6 +282,7 @@
 .bz-card-host { display: flex; flex-direction: column-reverse; line-height: 1.4; max-height: 2.8em; overflow: hidden; white-space: normal; overflow-wrap: anywhere; color: var(--color-ink-200); }
 .bz-card-wrap { padding: 4px 0; }
 .bz-card { grid-template-columns: auto minmax(0, 1fr); width: 100%; text-align: left; }
+.bz-card:has(> .artopen) { grid-template-columns: auto minmax(0, 1fr) auto; }
 .bz-card:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 
 @media (prefers-reduced-motion: reduce) {

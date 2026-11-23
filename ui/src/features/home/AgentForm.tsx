@@ -99,6 +99,10 @@ export default function AgentForm({
     );
   }
   const order = walk(surface.comps);
+  const inputs = order.filter((c) => INPUTS.has(c.component));
+  // Keep mixed forms and answers without recorded choices in the full form view.
+  const choiceReceipt = answered?.known && inputs.length > 0 &&
+    inputs.every((c) => c.component === "ChoicePicker" && asList(displayed(c, data)).length > 0);
   const title = order.find((c) => c.component === "Text" && typeof c.text === "string");
   const disabled = status.state !== "open" || block !== null;
 
@@ -140,7 +144,6 @@ export default function AgentForm({
     const context: Data = {};
     // Each context binding names an input's value (the daemon checks it);
     // send what that input shows, never the raw data behind it.
-    const inputs = order.filter((c) => INPUTS.has(c.component));
     if (event.context && typeof event.context === "object") {
       for (const [k, v] of Object.entries(event.context as Data)) {
         const input = inputs.find((c) => binding(c.value) !== null && binding(c.value) === binding(v));
@@ -239,20 +242,42 @@ export default function AgentForm({
         const one = c.variant === "mutuallyExclusive";
         const picked = asList(resolve(c.value, data));
         const pick = (v: string) => update(binding(c.value), one ? [v] : picked.includes(v) ? picked.filter((x) => x !== v) : [...picked, v]);
-        // `displayStyle` is a hint: both chips and checkbox draw as the board's chips.
+        const choices = opts.map((o) => {
+          const value = asText(o.value);
+          return { value, text: asText(resolve(o.label, data)) || value };
+        });
+        // Chips suit short labels; longer choices need room to wrap on a phone.
+        if (choices.some(({ text }) => text.length > 24)) {
+          return field(
+            c,
+            <div className="agentform-opts agentform-opts-rows">
+              {choices.map(({ value, text }) => (
+                <label key={value} className="agentform-option">
+                  <input
+                    type={one ? "radio" : "checkbox"}
+                    name={`form-${entry.seq}-${c.id}`}
+                    checked={picked.includes(value)}
+                    disabled={disabled}
+                    onChange={() => pick(value)}
+                  />
+                  <span>{text}</span>
+                </label>
+              ))}
+            </div>,
+          );
+        }
         const keys = (e: KeyboardEvent<HTMLButtonElement>, i: number) => {
           if (!one || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
           e.preventDefault();
-          const next = (i + (e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 1) + opts.length) % opts.length;
-          pick(asText(opts[next].value));
+          const next = (i + (e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 1) + choices.length) % choices.length;
+          pick(choices[next].value);
           (e.currentTarget.parentElement?.children[next] as HTMLElement | undefined)?.focus();
         };
-        const focusIndex = Math.max(0, opts.findIndex((o) => picked.includes(asText(o.value))));
+        const focusIndex = Math.max(0, choices.findIndex(({ value }) => picked.includes(value)));
         return field(
           c,
           <div className="agentform-opts" role={one ? "radiogroup" : "group"} aria-label={label(c) || undefined}>
-            {opts.map((o, i) => {
-              const v = asText(o.value);
+            {choices.map(({ value: v, text }, i) => {
               const on = picked.includes(v);
               return (
                 <button
@@ -267,7 +292,7 @@ export default function AgentForm({
                   onClick={() => pick(v)}
                   onKeyDown={(e) => keys(e, i)}
                 >
-                  {asText(resolve(o.label, data)) || v}
+                  {text}
                 </button>
               );
             })}
@@ -299,9 +324,10 @@ export default function AgentForm({
     }
   };
 
+  const sentAt = status.state === "sent" ? clock(status.at) : "";
   const chip: { tone: CardTone; text: string } =
     status.state === "sent"
-      ? { tone: "ok", text: `✓ ${t("Sent")}${clock(status.at) ? ` · ${clock(status.at)}` : ""}` }
+      ? { tone: "ok", text: `✓ ${t("Sent")}${sentAt ? ` · ${sentAt}` : ""}` }
       : status.state === "closed"
         ? { tone: "muted", text: t("Closed") }
         : status.state === "failed"
@@ -331,7 +357,19 @@ export default function AgentForm({
       kindLabel={t("Form")}
       status={{ text: chip.text, tone: chip.tone, attrs: { "data-form-status": status.state } }}
     >
-      {render(surface.comps.get("root"))}
+      {choiceReceipt ? (
+        <>
+          {render(title)}
+          <dl className="turncard-fields agentform-receipt">
+            {inputs.map((c) => (
+              <div key={c.id} className="turncard-field">
+                <dt><bdi>{label(c) || t("Answer")}</bdi></dt>
+                <dd><bdi>{shown(c)}</bdi></dd>
+              </div>
+            ))}
+          </dl>
+        </>
+      ) : render(surface.comps.get("root"))}
       {status.state === "closed" && <p className="text-micro text-ink-500">{t("A newer message closed this form.")}</p>}
       {answered && !answered.known && <p className="text-micro text-ink-500">{t("Sent. Your answer is the message below.")}</p>}
     </TurnCard>

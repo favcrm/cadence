@@ -28,7 +28,7 @@ import {
   sendToAssistant,
 } from "./memberThread";
 import { initialFollow, motionBehavior, onSend, type Follow } from "./scrollFollow";
-import { ThreadTurn } from "./ThreadView";
+import { StreamBanner, ThreadTurn } from "./ThreadView";
 import {
   inFlightTurnKey,
   itemMessage,
@@ -138,7 +138,12 @@ export default function MemberChat({
     [store],
   );
   const [surface, setSurface] = useState<MemberSurface | null>(null);
-  const [liveTurn, setLiveTurn] = useState<{ conversation: string; message: string | null } | null>(null);
+  const [liveTurn, setLiveTurn] = useState<{
+    conversation: string;
+    message: string | null;
+    state: "working" | "reconnecting" | "stopped";
+  } | null>(null);
+  const retryActivity = useRef<(() => void) | null>(null);
   const [pendingLook, setPendingLook] = useState<AvatarLook | null>(null);
   const alive = useRef(true);
   const identityGate = useRef<{ inflight: boolean; again: boolean; timer: number | null }>({
@@ -272,44 +277,62 @@ export default function MemberChat({
   const conversationId = surface?.conversation ?? null;
   useEffect(() => {
     if (conversationId === null || surface?.ok !== true) return;
-    // An absent message means the runtime confirmed activity but couldn't
-    // name the send. Undefined means there is no verified running turn.
+    // Null names a verified but unnamed turn. Undefined means no verified turn.
     let previous: string | null | undefined;
-    const publish = (message?: string | null) => {
+    const publish = (message?: string | null, confirmed = true) => {
       if (previous !== message) {
         previous = message;
         void store.invalidate();
       }
+      setLiveTurn((turn) => {
+        if (message === undefined) return confirmed || turn?.state === "working" ? null : turn;
+        if (turn?.conversation === conversationId && turn.message === message && turn.state === "working") return turn;
+        return { conversation: conversationId, message, state: "working" };
+      });
+    };
+    const interrupt = (state: "reconnecting" | "stopped") => {
       setLiveTurn((turn) =>
-        message === undefined ? null
-          : turn?.conversation === conversationId && turn.message === message ? turn
-          : { conversation: conversationId, message },
+        turn?.conversation === conversationId && turn.state !== state ? { ...turn, state } : turn,
       );
     };
-    const stream = subscribeSse({
+    const connect = (lastEventId?: string | null) => subscribeSse({
       url: `/api/threads/master/stream?${new URLSearchParams({ conversation: conversationId })}`,
       // Entry ids advance the reconnect cursor, but member history keeps
       // its own opaque cursor. Don't merge entries or subscribe to previews.
+      lastEventId,
       events: ["master", "entry"],
       onEvent: ({ type, data }) => {
         if (type !== "master") return;
         try {
           const snapshot = JSON.parse(data) as MasterState | null;
-          const turn = snapshot?.turn;
           if (snapshot?.session?.id === conversationId &&
-              (!Object.hasOwn(snapshot, "actor_identity") || snapshot.actor_identity?.conversation_id === conversationId) &&
-              turn?.conversation === conversationId && turn.state === "working") {
-            publish(typeof turn.message === "string" && turn.message !== "" ? turn.message : null);
+              (!Object.hasOwn(snapshot, "actor_identity") || snapshot.actor_identity?.conversation_id === conversationId)) {
+            const turn = snapshot.turn;
+            if (turn?.conversation === conversationId && turn.state === "working") {
+              publish(typeof turn.message === "string" && turn.message !== "" ? turn.message : null);
+            } else {
+              publish();
+            }
             return;
           }
         } catch {
           // An unusable frame is not evidence that the agent is working.
         }
-        publish();
+        // Don't resume on an unusable frame. Keep the notice until a
+        // conversation snapshot or the saved result can settle it.
+        publish(undefined, false);
       },
-      onError: () => setLiveTurn(null),
+      onError: (state) => interrupt(state === "stopped" ? "stopped" : "reconnecting"),
     });
+    let stream = connect();
+    retryActivity.current = () => {
+      const after = stream.lastEventId();
+      stream.close();
+      interrupt("reconnecting");
+      stream = connect(after);
+    };
     return () => {
+      retryActivity.current = null;
       stream.close();
       setLiveTurn(null);
     };
@@ -463,19 +486,21 @@ export default function MemberChat({
   );
 
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
-  const working = liveTurn?.conversation === conversationId ? liveTurn : null;
-  const sendIndex = working === null ? -1 : shown.findLastIndex((item) =>
+  const activity = surface?.ok && liveTurn?.conversation === conversationId ? liveTurn : null;
+  const sendIndex = activity === null ? -1 : shown.findLastIndex((item) =>
     item.type === "operator"
-      ? working.message === null || itemMessage(item) === working.message
+      ? activity.message === null || itemMessage(item) === activity.message
       : item.type === "pending" && item.pending.state !== "failed" &&
-        working.message !== null && item.pending.message === working.message,
+        activity.message !== null && item.pending.message === activity.message,
   );
   // A stored result wins over an older working frame. An unnamed turn can
   // only follow a stored send, never the latest optimistic message.
-  const workingItem = sendIndex < 0 || shown.some((item, index) =>
+  const activeItem = sendIndex < 0 || shown.some((item, index) =>
     index > sendIndex && item.type === "answer" &&
-      (working?.message == null || item.entry.message == null || item.entry.message === working.message),
+      (activity?.message == null || item.entry.message == null || item.entry.message === activity.message),
   ) ? null : shown[sendIndex];
+  const workingItem = activity?.state === "working" ? activeItem : null;
+  const interrupted = activeItem !== null && activity?.state !== "working" ? activity?.state : undefined;
   const running = workingItem === null ? null : itemMessage(workingItem);
   const runningUnnamed = workingItem !== null && running === null;
   const openingItem = workingItem !== null && inFlightTurnKey(shown, running, runningUnnamed) === null
@@ -553,6 +578,11 @@ export default function MemberChat({
           )}
           {!loaded && history.error?.kind !== "failed" && (
             <p className="text-label text-ink-500 pt-3">{t("Reading the thread…")}</p>
+          )}
+          {interrupted && (
+            <div className="pt-2">
+              <StreamBanner progress={interrupted} onRetry={() => retryActivity.current?.()} />
+            </div>
           )}
 
           <div className="chat-scroll min-h-0 flex-1 overflow-y-auto pt-3" ref={scrollRef} data-chat-scroll>

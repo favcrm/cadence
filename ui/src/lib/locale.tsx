@@ -117,6 +117,8 @@ const zhTW: Record<string, string> = {
   "Workspace waking or unreachable": "工作區正在啟動或無法連線", "Workspace waking or unreachable.": "工作區正在啟動或無法連線。", "Workspace waking": "工作區啟動中", "Retry when ready.": "準備就緒後重試。", "Checking again for up to 60 seconds…": "正在重新檢查，最長 60 秒…", "Retry workspace": "重試工作區",
   "Retry uploads": "重試上傳",
   "Thinking": "思考過程", "Reasoning withheld — it contained a request token.": "思考內容已隱藏 — 其中含有請求權杖。", "Reconnecting — showing the last saved turn": "正在重新連線 — 顯示上次儲存的回合",
+  "Live progress unavailable": "無法顯示即時進度",
+  "Live progress unavailable — reconnecting": "無法顯示即時進度 — 正在重新連線",
   "This ticket proposal is unavailable. Ask the assistant to try again.": "此工作單提案無法顯示。請要求助理重新提出。",
   "All projects": "所有專案", "Search projects": "搜尋專案", "Search issues": "搜尋議題", "New issue": "新增議題", "Create issue": "建立議題", "Issue": "議題", "Issues": "議題", "Project": "專案", "Status": "狀態", "Priority": "優先級", "Owner": "負責人", "Title": "標題", "Description": "描述", "Tags": "標籤", "Save changes": "儲存變更", "Cancel": "取消", "Close": "關閉", "Open": "開啟", "Edit": "編輯", "Delete": "刪除", "Refresh": "重新整理", "Loading…": "載入中…", "Retry": "重試", "No projects yet": "尚無專案", "No issues found": "找不到議題", "No results": "沒有結果", "Try again": "再試一次", "Something went wrong": "發生錯誤",
   "Edit description": "編輯描述",
@@ -3468,6 +3470,8 @@ Object.assign(zhTW, {
 Object.assign(zhTW, {
   "Open its review card": "開啟審查卡",
   "Decided on the board": "已在看板上決定",
+  "Show details": "顯示詳情",
+  "Hide details": "隱藏詳情",
 });
 
 // CAD-2022 / CAD-2316: HTML templates and Canvas Save as Template.

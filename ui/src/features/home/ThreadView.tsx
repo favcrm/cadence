@@ -1147,12 +1147,18 @@ export function CloudContentNotice({ withheld }: { withheld: string | null | und
  * saved turn stays readable exactly as it was — no stale answer border, no
  * relabelled card, no warning fill. Retry reopens the page's stream.
  */
-export function StreamBanner({ onRetry }: { onRetry: () => void }) {
+export function StreamBanner({ onRetry, progress }: {
+  onRetry: () => void;
+  progress?: "reconnecting" | "stopped";
+}) {
   const t = useTranslate();
+  const message = progress === undefined
+    ? t("Reconnecting — showing the last saved turn")
+    : t(progress === "stopped" ? "Live progress unavailable" : "Live progress unavailable — reconnecting");
   return (
-    <div className="streambanner" role="status" data-kind="stale">
-      <span className="banner-spinner" aria-hidden />
-      <span>{t("Reconnecting — showing the last saved turn")}</span>
+    <div className="streambanner" role="status" data-kind={progress === undefined ? "stale" : "live-progress"}>
+      {progress !== "stopped" && <span className="banner-spinner" aria-hidden />}
+      <span>{message}</span>
       <button type="button" className="lnk streambanner-retry" onClick={onRetry}>
         {t("Retry")}
       </button>
