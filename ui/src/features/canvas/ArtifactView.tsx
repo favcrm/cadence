@@ -113,7 +113,7 @@ function CsvView({ text, contentRef }: { text: string; contentRef: React.RefObje
   }
   return (
     <div ref={contentRef} className="canvas-doc cv-csv" data-artifact-view="csv" data-csv-table>
-      <div className="cv-csv-scroll">
+      <div className="cv-csv-scroll" role="region" aria-label={t("CSV table")} tabIndex={0}>
         <table>
           <thead>
             <tr>

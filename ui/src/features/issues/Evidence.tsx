@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
 import { fmtBytes } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
@@ -243,6 +243,39 @@ function useLoadedArtifact(id: string, name: string, image: boolean) {
   };
 }
 
+function EvidenceDrawer({ filename, subtitle, previewKind, children, onClose }: {
+  filename: string;
+  subtitle: string;
+  previewKind?: DeliverablePreviewKind;
+  children: ReactNode;
+  onClose: () => void;
+}) {
+  const t = useTranslate();
+  const background = useRef<HTMLElement | null>(null);
+  const restoreBoard = useCallback(() => {
+    if (background.current) background.current.inert = false;
+    background.current = null;
+  }, []);
+  useLayoutEffect(() => {
+    // The board drawer portals to document.body, outside the app root.
+    const app = document.getElementById("root");
+    if (!app || app.inert) return;
+    app.inert = true;
+    background.current = app;
+    return restoreBoard;
+  }, [restoreBoard]);
+
+  return (
+    <DrawerShell kind="issue-evidence" label={`${t("Preview")} ${filename}`} title={filename}
+      subtitle={subtitle} scrim="board" size="lg" modal trapFocus
+      className="issue-evidence-drawer" scrimClassName="issue-evidence-scrim"
+      closeLabel={t("Close")} onClose={() => { restoreBoard(); onClose(); }}
+      dataAttributes={previewKind ? { "data-deliverable-preview": previewKind } : undefined}>
+      {children}
+    </DrawerShell>
+  );
+}
+
 function ImageArtifact({ id, name, size, open, onOpen, onClose }: {
   id: string; name: string; size: number; open: boolean;
   onOpen: (button: HTMLElement) => void; onClose: () => void;
@@ -265,15 +298,12 @@ function ImageArtifact({ id, name, size, open, onOpen, onClose }: {
           </a>
         )}
         {open && ready.preview && (
-          <DrawerShell kind="issue-evidence" label={`${t("Preview")} ${displayName}`} title={displayName}
-            subtitle={fmtBytes(size)} scrim="board" size="lg" modal trapFocus
-            className="issue-evidence-drawer" scrimClassName="issue-evidence-scrim"
-            closeLabel={t("Close")} onClose={onClose}>
+          <EvidenceDrawer filename={displayName} subtitle={fmtBytes(size)} onClose={onClose}>
             <div className="issue-evidence-image-view" data-artifact-view="image">
               <img src={ready.preview} alt={displayName} onError={() => setFailed(true)} />
             </div>
             <a className="lnk text-micro" href={ready.url} download={displayName}>{t("Download")}</a>
-          </DrawerShell>
+          </EvidenceDrawer>
         )}
       </>
     );
@@ -305,12 +335,15 @@ function FileArtifactRow({ id, name, size, open, onOpen, onClose }: {
   const [htmlView, setHtmlView] = useState<HtmlView>("rendered");
   const [previewBytes, setPreviewBytes] = useState<ArrayBuffer | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
-  const sourceText = useMemo(
-    () => htmlView === "source" && previewBytes && (previewKind === "md" || previewKind === "csv")
-      ? new TextDecoder("utf-8", { ignoreBOM: true }).decode(previewBytes)
-      : null,
-    [htmlView, previewBytes, previewKind],
-  );
+  const textSource = htmlView === "source" && (previewKind === "md" || previewKind === "csv");
+  const sourceText = useMemo(() => {
+    if (!textSource || !previewBytes) return null;
+    try {
+      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(previewBytes);
+    } catch {
+      return null;
+    }
+  }, [textSource, previewBytes]);
 
   useEffect(() => {
     if (!open || !ready || !previewKind) {
@@ -393,11 +426,8 @@ function FileArtifactRow({ id, name, size, open, onOpen, onClose }: {
         </span>
       </div>
       {showPreview && previewKind && (
-        <DrawerShell kind="issue-evidence" label={`${t("Preview")} ${displayName}`} title={displayName}
-          subtitle={`${previewKind.toUpperCase()} · ${fmtBytes(size)}`} scrim="board" size="lg" modal trapFocus
-          className="issue-evidence-drawer" scrimClassName="issue-evidence-scrim"
-          closeLabel={t("Close")} onClose={onClose}
-          dataAttributes={{ "data-deliverable-preview": previewKind }}>
+        <EvidenceDrawer filename={displayName} subtitle={`${previewKind.toUpperCase()} · ${fmtBytes(size)}`}
+          previewKind={previewKind} onClose={onClose}>
           <div className="issue-evidence-actions">
               {(previewKind === "html" || previewKind === "md" || previewKind === "csv") && (
                 <div className="vers cv-view" role="group" aria-label={t("Document view")}>
@@ -439,26 +469,30 @@ function FileArtifactRow({ id, name, size, open, onOpen, onClose }: {
               )}
           </div>
           <div className="issue-evidence-content">
-            {previewBytes ? (
-              sourceText !== null ? (
-                <div className="cv-source" data-artifact-view={`${previewKind}-source`}>
-                  <CodeSurface label={previewKind} code={sourceText}>
-                    <code>{sourceText}</code>
-                  </CodeSurface>
-                </div>
-              ) : (
-                <ArtifactView kind={previewKind} title={displayName}
-                  data={{ bytes: previewBytes, mime: PREVIEW_MIME[previewKind] }}
-                  contentRef={contentRef} htmlView={htmlView} />
-              )
+            {previewBytes && !textSource && (
+              <ArtifactView kind={previewKind} title={displayName}
+                data={{ bytes: previewBytes, mime: PREVIEW_MIME[previewKind] }}
+                contentRef={contentRef} htmlView={htmlView} />
+            )}
+            {previewBytes && textSource && (sourceText === null ? (
+              <p className="text-secondary" role="status">
+                {t("Source is unavailable for this encoding. Download the original file.")}
+              </p>
             ) : (
+              <div className="cv-source" data-artifact-view={`${previewKind}-source`}>
+                <CodeSurface label={previewKind} code={sourceText}>
+                  <code>{sourceText}</code>
+                </CodeSurface>
+              </div>
+            ))}
+            {!previewBytes && (
               <span className="text-micro text-ink-400" role="status">
                 {t("Loading")} {displayName}…
               </span>
             )}
           </div>
           <div className="cv-foot">{t(PREVIEW_FOOT[previewKind])}</div>
-        </DrawerShell>
+        </EvidenceDrawer>
       )}
     </li>
   );

@@ -82,7 +82,9 @@ function nextAction({
     }
     if (latestAssign?.state === "running" || runState === "running")
       return t("Check Activity or Evidence for updates on the assignment.");
-    if (latestAssign?.state === "queued" || latestAssign?.state === "waiting" || runState === "queued")
+    if (latestAssign?.state === "waiting")
+      return t("Choose who should take this assignment.");
+    if (latestAssign?.state === "queued" || runState === "queued")
       return t("Work is queued. Check Activity for updates.");
     if (inspectPr)
       return t("Inspect the linked pull request before starting new work.");

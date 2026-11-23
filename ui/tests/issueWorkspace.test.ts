@@ -542,6 +542,7 @@ async function run() {
       await renderEvidence("CAD-2");
       assert(created.every((url) => revoked.includes(url)), "Navigating between issues revokes every previous object URL");
       assert(!host.querySelector("img, a[href]"), "New issue never displays the previous issue's bytes");
+      assert(!win.document.querySelector('[role="dialog"][aria-label="Preview screen shot.png"]'), "Changing issues removes the previous screenshot reader from the document");
       await React.act(async () => {
         requests[2].resolve(artifactResponse("image/svg+xml"));
         requests[3].resolve(new Response(null, { status: 503 }));

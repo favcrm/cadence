@@ -154,6 +154,7 @@ async function run() {
     "/api/issues/CAD-2277/artifacts/summary.md": "## Timeline\n- Contained in 12m",
     "/api/issues/CAD-2277/artifacts/bundle.zip": "PK\u0003\u0004",
     "/api/issues/CAD-2277/artifacts/metrics.csv": "name,value\r\nalpha,\"one,two\"\r\n",
+    "/api/issues/CAD-2277/artifacts/legacy.csv": new Uint8Array([0x78, 0x0a, 0xe9, 0x0a]),
   };
 
   globalThis.fetch = async (input) => {
@@ -194,6 +195,7 @@ async function run() {
             { name: "summary.md", size: 31 },
             { name: "bundle.zip", size: 4 },
             { name: "metrics.csv", size: 29 },
+            { name: "legacy.csv", size: 4 },
           ],
           readOnly: true,
         }),
@@ -309,6 +311,20 @@ async function run() {
     assert(document.querySelector('[data-artifact-view="csv-source"]')?.textContent?.includes(
       'name,value\r\nalpha,"one,two"\r\n',
     ), "CSV source retains loaded text");
+    await closeDrawer();
+
+    await click(host.querySelector('button[aria-label="Preview legacy.csv"]'));
+    await flush();
+    const legacySource = Array.from(document.querySelectorAll(".issue-evidence-drawer .vers button"))
+      .find((button) => button.textContent === "Source");
+    assert(legacySource !== undefined, "Legacy CSV offers a source action");
+    await click(legacySource);
+    assert(!document.querySelector('[data-artifact-view="csv-source"]'), "Source does not display altered bytes as original text");
+    assert(
+      document.querySelector('.issue-evidence-drawer [role="status"]')?.textContent?.includes("Download the original file") &&
+        Array.from(document.querySelectorAll(".issue-evidence-actions > button")).some((button) => button.textContent === "Download"),
+      "Unsupported source encoding explains the fallback and retains the original download",
+    );
     await closeDrawer();
 
     await click(host.querySelector('button[aria-label="Preview screenshot (v1).png"]'));

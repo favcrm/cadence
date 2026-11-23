@@ -41,9 +41,9 @@ interface Row {
 }
 
 /** Rank scoped card-field matches while preserving their original order within a rank. */
-function rankIssues(issues: IssueCard[], query: string, project: string | null): { matches: IssueCard[]; ambiguous: boolean } {
+function rankIssues(issues: IssueCard[], query: string, project: string | null): { matches: IssueCard[]; ambiguous: boolean; compactQuery: boolean } {
   const q = query.trim().toLowerCase();
-  if (!q) return { matches: [], ambiguous: false };
+  if (!q) return { matches: [], ambiguous: false, compactQuery: false };
   const separated = /^([a-z][a-z0-9]{0,15})(?:[\t\n\v\f\r ]+|[\t\n\v\f\r ]*[-\u2010-\u2014][\t\n\v\f\r ]*)([0-9]{1,9})$/.exec(q);
   const candidate = separated ? `${separated[1]}-${separated[2]}` : null;
   const compact = /^[a-z][a-z0-9]*[0-9]$/.test(q);
@@ -62,7 +62,7 @@ function rankIssues(issues: IssueCard[], query: string, project: string | null):
     else if ([card.owner ?? "", ...(card.tags ?? [])].join(" ").toLowerCase().includes(q)) rank = 5;
     if (rank) scored.push([rank, card]);
   }
-  return { matches: scored.sort((a, b) => a[0] - b[0]).map(([, card]) => card), ambiguous: compactExact > 1 };
+  return { matches: scored.sort((a, b) => a[0] - b[0]).map(([, card]) => card), ambiguous: compactExact > 1, compactQuery: compact };
 }
 
 /** The project the route is in, or null where none applies. */
@@ -101,7 +101,7 @@ export default function HeaderSearch({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [choice, setChoice] = useState<Choice>("all");
-  const [selection, setSelection] = useState<{ key: string; href: string } | null>(null);
+  const [selection, setSelection] = useState<{ key: string; href: string; explicit: boolean } | null>(null);
   const [wikiState, setWikiState] = useState<WikiState>({ status: "idle", key: "" });
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const mobileTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -125,10 +125,11 @@ export default function HeaderSearch({
   // Cmd/Ctrl+K opens the dialog, or refocuses it when already open.
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+      if (!e.defaultPrevented && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
         if (open) inputRef.current?.focus();
-        else {
+        // A modal already owns the board's keyboard focus.
+        else if (!document.querySelector("dialog:modal, [aria-modal='true']")) {
           setChoice(defaultChoice);
           setSelection(null);
           setOpen(true);
@@ -187,7 +188,7 @@ export default function HeaderSearch({
     return () => window.clearTimeout(timer);
   }, [open, trimmed, wikiRoot, wikiKey, noWiki]);
 
-  const { matches: issueMatches, ambiguous } = useMemo(
+  const { matches: issueMatches, ambiguous, compactQuery } = useMemo(
     () => rankIssues(issues.data ?? [], trimmed, projectKey),
     [issues.data, trimmed, projectKey],
   );
@@ -219,14 +220,15 @@ export default function HeaderSearch({
   const rows = [...issueRows, ...hitRows];
 
   const selectionKey = `${query}\u0000${projectKey ?? ""}`;
-  const selected = selection?.key === selectionKey ? selection : null;
-  const active = selected
-    ? rows.findIndex((row) => row.href === selected.href)
-    : !ambiguous && rows.length > 0 && (issues.data !== null || issues.status === "failed") ? 0 : -1;
-  const setActive = (index: number) => {
+  const selected = selection?.key === selectionKey && (!ambiguous || selection.explicit) ? selection : null;
+  const waitingForCompactId = compactQuery && issues.data === null && issues.status !== "failed";
+  const defaultActive = rows.length > 0 && !ambiguous && !waitingForCompactId ? 0 : -1;
+  const active = selected ? rows.findIndex((row) => row.href === selected.href) : defaultActive;
+  const setActive = (index: number, explicit = true) => {
     const row = rows[index];
-    if (row) setSelection({ key: selectionKey, href: row.href });
+    if (row) setSelection({ key: selectionKey, href: row.href, explicit });
   };
+  const hoverRow = ambiguous ? undefined : (index: number) => setActive(index, false);
 
   const close = () => {
     returnFocusRef.current = true;
@@ -376,7 +378,7 @@ export default function HeaderSearch({
                       {issueMatches.length === 0 ? (
                         <p className="text-label text-ink-400">{projectKey ? <>{fill(t("No issues match “{q}” in {p}."), { q: trimmed, p: projectKey })}{" "}{t("Try All projects.")}</> : fill(t("No issues match “{q}”."), { q: trimmed })}</p>
                       ) : (
-                        <ResultList rows={issueRows} offset={0} active={active} onHover={ambiguous ? undefined : setActive} onFocus={setActive} onPick={choose} />
+                        <ResultList rows={issueRows} offset={0} active={active} onHover={hoverRow} onFocus={setActive} onPick={choose} />
                       )}
                     </>
                   )}
@@ -393,7 +395,7 @@ export default function HeaderSearch({
                   ) : hitCount === 0 ? (
                     <p className="text-label text-ink-400">{fill(t("No knowledge matches “{q}”."), { q: trimmed })}</p>
                   ) : (
-                    <ResultList rows={hitRows} offset={issueRows.length} active={active} onHover={ambiguous ? undefined : setActive} onFocus={setActive} onPick={choose} />
+                    <ResultList rows={hitRows} offset={issueRows.length} active={active} onHover={hoverRow} onFocus={setActive} onPick={choose} />
                   )}
                 </section>}
 
