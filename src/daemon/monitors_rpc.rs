@@ -1095,7 +1095,7 @@ impl Shared {
                 .map(|snapshot| snapshot.lock())
                 .transpose()?;
             if let Some(snapshot) = &issue_snapshot {
-                snapshot.revalidate()?;
+                snapshot.revalidate(self)?;
             }
             let pending = self.pending.lock().unwrap();
             let pending_aliases: HashSet<String> = pending
@@ -1293,7 +1293,7 @@ impl Shared {
             .map(|snapshot| snapshot.lock())
             .transpose()?;
         if let Some(snapshot) = &issue_snapshot {
-            snapshot.revalidate()?;
+            snapshot.revalidate(self)?;
         }
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task_planned(
             &plan,

@@ -250,29 +250,44 @@ fn checkbox_item(line: &str) -> Option<AcceptanceItem> {
 fn acceptance_lines(body: &str) -> impl Iterator<Item = (LineRange, &str, bool)> {
     let sections = acceptance_sections(body);
     let section = (sections.len() == 1).then(|| sections[0]);
-    section.into_iter().flat_map(move |section| {
-        let section_body = &body[section.heading_end..section.end];
-        let mut fences = Fences::default();
-        line_ranges(section_body)
-            .into_iter()
-            .filter_map(move |line| {
-                let text = &section_body[line.start..line.content_end];
-                if fences.is_code(text) {
-                    return None;
-                }
-                checkbox_contents(text).map(|(text, checked)| {
-                    (
-                        LineRange {
-                            start: section.heading_end + line.start,
-                            content_end: section.heading_end + line.content_end,
-                            end: section.heading_end + line.end,
-                        },
-                        text,
-                        checked,
-                    )
-                })
+    section
+        .into_iter()
+        .flat_map(move |section| checklist_rows(body, section))
+}
+
+fn checklist_rows(
+    body: &str,
+    section: AcceptanceSection,
+) -> impl Iterator<Item = (LineRange, &str, bool)> {
+    let section_body = &body[section.heading_end..section.end];
+    let mut fences = Fences::default();
+    line_ranges(section_body)
+        .into_iter()
+        .filter_map(move |line| {
+            let text = &section_body[line.start..line.content_end];
+            if fences.is_code(text) {
+                return None;
+            }
+            checkbox_contents(text).map(|(text, checked)| {
+                (
+                    LineRange {
+                        start: section.heading_end + line.start,
+                        content_end: section.heading_end + line.content_end,
+                        end: section.heading_end + line.end,
+                    },
+                    text,
+                    checked,
+                )
             })
-    })
+        })
+}
+
+/// The full approved checklist section, including Markdown qualifiers.
+pub(crate) fn acceptance_scope(body: &str) -> Option<&str> {
+    match acceptance_sections(body).as_slice() {
+        [section] => Some(&body[section.heading_end..section.end]),
+        _ => None,
+    }
 }
 
 /// Read acceptance items from the unique level-two `Acceptance` section.
@@ -292,12 +307,42 @@ pub(super) fn uncheck_acceptance(body: &str) -> std::borrow::Cow<'_, str> {
     let mut normalized = std::borrow::Cow::Borrowed(body);
     for (line, _, checked) in acceptance_lines(body) {
         if checked {
-            let text = &body[line.start..line.content_end];
-            let marker = line.start + (text.len() - text.trim_start_matches(' ').len()) + 3;
+            let marker = checkbox_marker(body, line);
             normalized.to_mut().replace_range(marker..marker + 1, " ");
         }
     }
     normalized
+}
+
+fn checkbox_marker(body: &str, line: LineRange) -> usize {
+    let text = &body[line.start..line.content_end];
+    line.start + (text.len() - text.trim_start_matches(' ').len()) + 3
+}
+
+fn update_checkmarks(
+    body: &str,
+    section: AcceptanceSection,
+    items: &[AcceptanceItem],
+) -> Option<String> {
+    let mut rows = checklist_rows(body, section);
+    let mut changes = Vec::new();
+    for item in items {
+        let (line, text, checked) = rows.next()?;
+        if item.text.trim() != text {
+            return None;
+        }
+        if checked != item.checked {
+            changes.push((checkbox_marker(body, line), item.checked));
+        }
+    }
+    if rows.next().is_some() {
+        return None;
+    }
+    let mut out = body.to_owned();
+    for (marker, checked) in changes {
+        out.replace_range(marker..marker + 1, if checked { "x" } else { " " });
+    }
+    Some(out)
 }
 
 /// Split a canonical task body into its prose and complete criteria without
@@ -445,6 +490,12 @@ pub fn replace_acceptance(body: &str, items: &[AcceptanceItem]) -> Result<String
         return Err(Error::rejected(
             "Issue has duplicate level-two Acceptance sections — remove the duplicate before authoring acceptance",
         ));
+    }
+    if let Some(section) = sections.first().filter(|_| !items.is_empty()) {
+        // Progress-only writes must not move any prose to another item.
+        if let Some(updated) = update_checkmarks(body, *section, items) {
+            return Ok(updated);
+        }
     }
     let newline = preferred_newline(body);
     let checklist = rendered_acceptance(items, newline)?;

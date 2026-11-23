@@ -220,6 +220,42 @@ impl ContextFacts {
     }
 }
 
+/// The lane's creation base, never the current branch tip. A lifecycle
+/// record is authoritative when present; legacy lanes need a surviving
+/// branch-creation reflog entry.
+pub(crate) fn original_lane_base(
+    root: &Path,
+    lane: &Path,
+    branch: &str,
+    issue: &str,
+) -> Result<Option<String>> {
+    let managed = crate::worktree::lifecycle::managed_record(root, lane)?;
+    if managed.is_some() {
+        let record = crate::worktree::lifecycle::recoverable_record(
+            root,
+            lane,
+            "development",
+            "cadence issue start",
+            Some(branch),
+            Some(issue),
+        )?
+        .ok_or_else(|| Error::rejected("the lane's lifecycle binding does not match this issue"))?;
+        if record.base_sha.is_some() {
+            return Ok(record.base_sha);
+        }
+    }
+    Ok(Some(start::intake_branch_creation_base(root, branch)?))
+}
+
+/// Check whether a saved generated checklist differs only in progress.
+pub(crate) fn same_checklist(recorded: &str, items: &[AcceptanceItem]) -> bool {
+    parse_acceptance_listing(recorded).is_some_and(|(saved, rest)| {
+        rest.is_empty()
+            && saved.len() == items.len()
+            && saved.iter().zip(items).all(|(a, b)| a.text == b.text)
+    })
+}
+
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
 ///
 /// `dispatch_pm`: `Some(alias)` when the daemon itself dispatches
@@ -622,7 +658,9 @@ fn preflight(
             // An accepted row must not fetch, or depend on integration
             // configuration remaining available. These are receipt facts,
             // not a new base selection; an unprovable fact stays null.
-            let existing_base = start::resolve_existing_base(&root, &branch).ok();
+            let existing_base = original_lane_base(&root, &wt_dir, &branch, &front.id)
+                .ok()
+                .flatten();
             let mut out = json!({
                 "issue": front.id,
                 "worker": args.to,
@@ -631,9 +669,11 @@ fn preflight(
                 "worktree": wt_dir,
                 "branch": branch,
                 "base": {
-                    "ref": existing_base.as_ref().map(|base| &base.0),
-                    "sha": task.as_ref().and_then(|task| task["base_sha"].as_str())
-                        .or_else(|| existing_base.as_ref().map(|base| base.1.as_str())),
+                    "ref": Value::Null,
+                    "sha": existing_base.as_deref().filter(|base| {
+                        task.as_ref()
+                            .is_none_or(|task| task["base_sha"].as_str() == Some(*base))
+                    }),
                 },
                 "acceptance": acceptance,
                 "claim": claim::json(&front, crate::issue::time::now_epoch()),

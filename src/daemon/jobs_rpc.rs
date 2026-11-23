@@ -60,6 +60,7 @@ pub(super) struct JobIssueSnapshot {
     issue: String,
     gated: Option<crate::issue::dispatch::GatedIssue>,
     intake: Option<(String, String)>,
+    lane_binding: Option<(std::path::PathBuf, String, String)>,
 }
 
 impl JobIssueSnapshot {
@@ -70,12 +71,29 @@ impl JobIssueSnapshot {
         self.pm.lock()
     }
 
-    pub(super) fn revalidate(&self) -> Result<()> {
+    pub(super) fn revalidate(&self, shared: &Shared) -> Result<()> {
         let live = crate::issue::dispatch::capture_issue(&self.pm, &self.issue)?;
         let live_intake = match &live {
             Some(issue) => {
                 let (_, body) = crate::issue::parse::split_front(&issue.source)?;
-                crate::issue::plan::gate_snapshot(&self.pm.dir, &issue.front, body)?
+                let revision = if let Some(binding) = &self.lane_binding {
+                    let current = shared.intake_lane_base(&issue.project, &issue.front)?;
+                    if &current != binding {
+                        return Err(Error::invalid(
+                            "plan_evidence_stale",
+                            "task dispatch refused: issue lane or base changed while preparing the kickoff",
+                        ));
+                    }
+                    crate::issue::plan::gate_snapshot_at_base(
+                        &self.pm.dir,
+                        &issue.front,
+                        body,
+                        &binding.2,
+                    )?
+                } else {
+                    crate::issue::plan::gate_snapshot(&self.pm.dir, &issue.front, body)?
+                };
+                revision
                     .map(|revision| {
                         Ok::<_, Error>((
                             revision,
@@ -2012,11 +2030,51 @@ impl Shared {
             }
             None => None,
         };
+        let lane_binding = if intake.is_some() {
+            let gated = gated
+                .as_ref()
+                .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+            let binding = self.intake_lane_base(&gated.project, &gated.front)?;
+            let root = crate::worktree::main_root(&binding.0)?;
+            let worktree = plan.task.worktree.as_deref().ok_or_else(|| {
+                Error::invalid("plan_evidence_stale", "intake task has no bound worktree")
+            })?;
+            let task_lane = crate::worktree::layout::worktree_dir(&root, worktree)
+                .canonicalize()
+                .map_err(|e| {
+                    Error::invalid(
+                        "plan_evidence_stale",
+                        format!("intake task worktree cannot be resolved: {e}"),
+                    )
+                })?;
+            if task_lane != binding.0
+                || plan.task.branch.as_deref() != Some(binding.1.as_str())
+                || plan.task.base_sha.as_deref() != Some(binding.2.as_str())
+            {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "intake task worktree, branch or base does not match the issue's bound lane",
+                ));
+            }
+            if let Some(repo) = plan.job.repo.as_deref() {
+                let job_root = crate::worktree::main_root(std::path::Path::new(repo))?;
+                if job_root != root {
+                    return Err(Error::invalid(
+                        "plan_evidence_stale",
+                        "intake job repository does not match the issue's bound lane",
+                    ));
+                }
+            }
+            Some(binding)
+        } else {
+            None
+        };
         Ok(Some(JobIssueSnapshot {
             pm,
             issue: issue.to_string(),
             gated,
             intake,
+            lane_binding,
         }))
     }
 
@@ -2225,7 +2283,7 @@ impl Shared {
                     pm.lock_for_paths(&[issue_dir.clone(), policy])?
                 };
                 if let Some(snapshot) = &issue_snapshot {
-                    snapshot.revalidate()?;
+                    snapshot.revalidate(self)?;
                 }
                 let issue = plan.job.issue_id.as_deref().ok_or_else(|| {
                     Error::rejected("task dispatch refused: the private job has no issue")
@@ -2272,7 +2330,7 @@ impl Shared {
                     .map(JobIssueSnapshot::lock)
                     .transpose()?;
                 if let Some(snapshot) = &issue_snapshot {
-                    snapshot.revalidate()?;
+                    snapshot.revalidate(self)?;
                 }
                 self.store.dispatch_task_planned(
                     &plan,
@@ -2339,6 +2397,19 @@ impl Shared {
             .filter(|snapshot| snapshot.intake.is_some())
             .and_then(|snapshot| snapshot.gated.as_ref())
             .map(|issue| issue.items.as_slice());
+        let approved_scope = if let Some(snapshot) = issue_snapshot.filter(|s| s.intake.is_some()) {
+            let issue = snapshot
+                .gated
+                .as_ref()
+                .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+            let (_, body) = crate::issue::parse::split_front(&issue.source)?;
+            Some(
+                crate::issue::parse::acceptance_scope(body)
+                    .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?,
+            )
+        } else {
+            None
+        };
         let legacy = |reason: String| -> Result<(String, store::IssueSelection)> {
             // This is a rendering-only copy: the durable task and its
             // idempotency/provenance fences retain their original values.
@@ -2347,20 +2418,27 @@ impl Shared {
                 let mut effective = plan.task.clone();
                 let current = crate::issue::dispatch::acceptance_listing(items)
                     .ok_or_else(|| Error::internal("approved intake has no acceptance"))?;
-                let recorded = effective
-                    .acceptance
-                    .as_deref()
-                    .filter(|s| *s != current.as_str());
-                effective.acceptance = Some(match recorded {
-                    Some(recorded) => format!(
-                        "{current} (approved issue criteria). Recorded task acceptance: {}. \
-                         An earlier inherited issue checklist is historical where it differs; \
-                         independent task requirements remain applicable where compatible",
+                let scope = serde_json::to_string(
+                    approved_scope
+                        .ok_or_else(|| Error::internal("approved intake has no scope"))?,
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+                let mut acceptance = format!(
+                    "{current} (approved issue criteria). Complete approved acceptance Markdown, \
+                     including qualifiers: {scope}"
+                );
+                if let Some(recorded) = effective.acceptance.as_deref().filter(|s| {
+                    !s.trim().is_empty() && !crate::issue::dispatch::same_checklist(s, items)
+                }) {
+                    acceptance.push_str(&format!(
+                        ". Recorded task acceptance: {}. An earlier inherited issue checklist \
+                         is historical where it differs; independent task requirements remain \
+                         applicable where compatible",
                         serde_json::to_string(recorded)
                             .map_err(|e| Error::internal(e.to_string()))?
-                    ),
-                    None => current,
-                });
+                    ));
+                }
+                effective.acceptance = Some(acceptance);
                 task = Some(effective);
             }
             Ok((

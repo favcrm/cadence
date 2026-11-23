@@ -224,8 +224,17 @@ pub(crate) fn gate_snapshot(pm_dir: &Path, front: &Front, body: &str) -> Result<
     admit(pm_dir, front, body, None)
 }
 
+pub(crate) fn gate_snapshot_at_base(
+    pm_dir: &Path,
+    front: &Front,
+    body: &str,
+    base: &str,
+) -> Result<Option<String>> {
+    admit(pm_dir, front, body, Some(base))
+}
+
 pub(super) fn gate_claim(pm_dir: &Path, front: &Front, body: &str, base: &str) -> Result<()> {
-    admit(pm_dir, front, body, Some(base)).map(drop)
+    gate_snapshot_at_base(pm_dir, front, body, base).map(drop)
 }
 
 fn admit(

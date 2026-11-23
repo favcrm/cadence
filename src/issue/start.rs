@@ -22,9 +22,9 @@ use crate::worktree::{self, layout};
 
 mod base;
 
-use base::{branch_base, worktree_branch};
+use base::{branch_base, resolve_existing_base, worktree_branch};
 pub(crate) use base::{
-    configured_integration, declared_repos, resolve_base, resolve_existing_base, resolve_repo,
+    configured_integration, declared_repos, intake_branch_creation_base, resolve_base, resolve_repo,
 };
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
@@ -549,7 +549,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     let pinned_base = if reuse && initial_intake.is_some() {
         match lifecycle_record.as_ref().and_then(|r| r.base_sha.as_ref()) {
             Some(recorded) => recorded.clone(),
-            None => resolve_existing_base(&root, &branch)?.1,
+            None => intake_branch_creation_base(&root, &branch)?,
         }
     } else if branch_exists {
         branch_base(&root, &branch, &base_sha)

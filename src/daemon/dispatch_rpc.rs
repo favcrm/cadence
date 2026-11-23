@@ -307,7 +307,15 @@ impl Shared {
                 ));
             }
             let (live_front, live_body) = issue::write::load_front(&live_dir)?;
-            let live_revision = issue::plan::gate_snapshot(&pm.dir, &live_front, &live_body)?;
+            let (live_lane, _, base) = self.intake_lane_base(&live_project, &live_front)?;
+            if live_lane != worktree {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "dispatch send refused: issue lane changed while the kickoff was being prepared",
+                ));
+            }
+            let live_revision =
+                issue::plan::gate_snapshot_at_base(&pm.dir, &live_front, &live_body, &base)?;
             let live_intake = live_revision
                 .map(|revision| {
                     Ok::<_, Error>((
@@ -377,6 +385,31 @@ impl Shared {
             receipt["warning"] = json!(warning);
         }
         Ok(receipt)
+    }
+
+    /// Prove the exact issue lane and its original bound base without fetching
+    /// or inferring a base from a branch's current tip.
+    pub(super) fn intake_lane_base(
+        &self,
+        project: &issue::project::Project,
+        front: &issue::model::Front,
+    ) -> Result<(PathBuf, String, String)> {
+        let lane = self.dispatch_lane("intake dispatch", project, front)?;
+        let root = crate::worktree::main_root(&lane)?;
+        let branch = issue::finish::git_branch(&lane)?.ok_or_else(|| {
+            Error::invalid(
+                "plan_evidence_stale",
+                "intake dispatch refused: issue lane has no attached branch",
+            )
+        })?;
+        let base = issue::dispatch::original_lane_base(&root, &lane, &branch, &front.id)?
+            .ok_or_else(|| {
+                Error::invalid(
+                    "plan_evidence_stale",
+                    "intake dispatch refused: issue lane's original base cannot be proven",
+                )
+            })?;
+        Ok((lane, branch, base))
     }
 
     /// The lane a dispatch binds, resolved daemon-side: the issue's

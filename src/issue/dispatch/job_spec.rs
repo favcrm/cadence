@@ -335,10 +335,10 @@ pub(crate) fn job_context(
             captured_spec.as_str()
         };
         let spec_digest = content_digest(spec.as_bytes());
-        // The job's recorded digest still gates its own spec. The working
-        // bytes may be dirty; this digest is the captured data revision, not
-        // a claim that the file matches HEAD.
-        if task.spec_path.is_none() {
+        // Independent specs and ordinary jobs retain their byte pin. For an
+        // intake's canonical issue file the admitted scope supersedes the old
+        // raw body digest, which can change when a criterion is checked off.
+        if task.spec_path.is_none() && !(canonical_issue_spec && approved_issue_items.is_some()) {
             if let Some(expected) = job_row.spec_sha256.as_deref() {
                 let canonical_digest = if canonical_issue_spec {
                     Some(content_digest(parse::split_front(spec)?.1.as_bytes()))
@@ -431,12 +431,19 @@ pub(crate) fn job_context(
                 }
             }
         }
+        if approved_issue_items.is_some() {
+            let (_, issue_body) = parse::split_front(source)?;
+            let scope = parse::acceptance_scope(issue_body)
+                .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?;
+            request.push_str("\n## Approved issue acceptance (including qualifiers)\n\n");
+            request.push_str(scope);
+            request.push('\n');
+        }
         if let Some(items) = approved_issue_items {
-            let current = super::acceptance_listing(items);
             if let Some(recorded) = task
                 .acceptance
                 .as_deref()
-                .filter(|s| !s.trim().is_empty() && Some(*s) != current.as_deref())
+                .filter(|s| !s.trim().is_empty() && !super::same_checklist(s, items))
             {
                 request.push_str(
                     "\n## Recorded task acceptance\n\n\
