@@ -1061,3 +1061,170 @@ fn cad224_opted_in_relative_job_spec_refuses_drift_before_enqueue() {
     );
     assert_eq!(fx.snapshot(issue), before);
 }
+
+#[test]
+fn cad224_legacy_cloud_relative_default_spec_is_pinned_before_enqueue() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let fx = IntakeFixture::new();
+    let spec = fx.repo.join("specs/cad224-cloud.md");
+    std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+    let original = "cad224 sentinel from the tracked repository spec";
+    std::fs::write(&spec, original).unwrap();
+    git(&fx.repo, &["add", "specs/cad224-cloud.md"]);
+    git(&fx.repo, &["commit", "-qm", "Add independent cloud spec"]);
+    let proposal = fx.propose(LINKED_INTAKE);
+    let issue = proposal["tickets"][0].as_str().unwrap();
+    fx.approve(proposal["epic"].as_str().unwrap());
+    let started = fx.start(issue, None).unwrap();
+    let lane = started["worktree"].as_str().unwrap();
+    let branch = started["branch"].as_str().unwrap();
+    let base = started["base"]["sha"].as_str().unwrap();
+
+    let opts = ServeOptions {
+        test_seam: true,
+        ..Default::default()
+    };
+    opts.provider_env
+        .set("CADENCE_PM_DIR", fx.pm.dir.to_str().unwrap());
+    opts.provider_env.set("CADENCE_DEVIN_API_KEY", "");
+    opts.provider_env.set("CADENCE_DEVIN_ORG_ID", "");
+    let shared = Shared::new(fx._dir.path(), &opts).unwrap();
+    shared
+        .store
+        .register_agent(&NewAgent {
+            alias: "cad224-cloud",
+            provider: "devin",
+            endpoint_kind: "cloud",
+            role: "worker",
+            cwd: fx._dir.path().to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let sha = crate::delegation::sha256_hex(original.as_bytes());
+    shared
+        .store
+        .create_job(
+            "cad224-legacy-cloud",
+            None,
+            "specs/cad224-cloud.md",
+            &sha,
+            "cad224-cloud",
+            Some(issue),
+            Some(fx.repo.to_str().unwrap()),
+            None,
+            2,
+            None,
+            Some("Implement prerequisite"),
+            Some(lane),
+            Some(branch),
+            Some(base),
+            Some("cad224-cloud"),
+            None,
+        )
+        .unwrap();
+    for task in ["cad224-cloud-drift", "cad224-cloud-unpinned"] {
+        shared
+            .store
+            .create_task(
+                "cad224-legacy-cloud",
+                task,
+                None,
+                Some("cad224-cloud"),
+                None,
+                None,
+                Some(lane),
+                Some(branch),
+                Some(base),
+            )
+            .unwrap();
+    }
+    let accepted = shared
+        .rpc_task_dispatch(&json!({
+            "task": "cad224-legacy-cloud-t1", "by": "acceptance",
+            "message": "cad224-cloud-accepted",
+        }))
+        .unwrap();
+    assert_eq!(accepted["duplicate"], false);
+    let message = shared
+        .store
+        .message("cad224-cloud-accepted")
+        .unwrap()
+        .unwrap();
+    assert!(message.body.contains(original), "{}", message.body);
+
+    let before = fx.snapshot(issue);
+    let queue = shared.store.queued_count("cad224-cloud").unwrap();
+    let before_task = shared.store.task("cad224-cloud-drift").unwrap().to_json();
+    let seen = Rc::new(Cell::new(false));
+    let observed = Rc::clone(&seen);
+    let changed = spec.clone();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        if point == "intake-pre-enqueue" {
+            assert!(!observed.replace(true));
+            std::fs::write(&changed, "cad224 changed spec\n").unwrap();
+        }
+    })));
+    let result = shared.rpc_task_dispatch(&json!({
+        "task": "cad224-cloud-drift", "by": "acceptance",
+        "message": "cad224-cloud-stale",
+    }));
+    crate::issue::lockseam::set_hook(None);
+    assert!(seen.get(), "enqueue seam not reached: {result:?}");
+    let refusal = result.unwrap_err();
+    assert!(
+        refusal
+            .to_string()
+            .contains("independent spec changed while preparing"),
+        "{refusal:?}"
+    );
+    assert!(!shared.store.message_exists("cad224-cloud-stale").unwrap());
+    assert_eq!(shared.store.queued_count("cad224-cloud").unwrap(), queue);
+    assert_eq!(
+        shared.store.task("cad224-cloud-drift").unwrap().to_json(),
+        before_task
+    );
+    assert_eq!(fx.snapshot(issue), before);
+
+    std::fs::write(&spec, original).unwrap();
+    let db = rusqlite::Connection::open(fx._dir.path().join("cadence.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE jobs SET spec_sha256=NULL WHERE id='cad224-legacy-cloud'",
+        [],
+    )
+    .unwrap();
+    let before_task = shared
+        .store
+        .task("cad224-cloud-unpinned")
+        .unwrap()
+        .to_json();
+    let refusal = shared
+        .rpc_task_dispatch(&json!({
+            "task": "cad224-cloud-unpinned", "by": "acceptance",
+            "message": "cad224-cloud-unpinned-message",
+        }))
+        .unwrap_err();
+    assert!(
+        refusal.to_string().contains("no immutable digest"),
+        "{refusal:?}"
+    );
+    assert!(!shared
+        .store
+        .message_exists("cad224-cloud-unpinned-message")
+        .unwrap());
+    assert_eq!(shared.store.queued_count("cad224-cloud").unwrap(), queue);
+    assert_eq!(
+        shared
+            .store
+            .task("cad224-cloud-unpinned")
+            .unwrap()
+            .to_json(),
+        before_task
+    );
+    assert_eq!(fx.snapshot(issue), before);
+}
