@@ -1151,8 +1151,9 @@ fn cad2711_indep_ticket_comment_mentions_silent_note_human_isolation_and_agent_g
         .unwrap();
     assert_eq!(count_after_human, 1);
 
-    // 4. Direct agent call to issue_comment_mentions (even claiming local_operator: true) is refused.
-    let forged_err = indep_agent_rpc(
+    // 4a. Direct agent call to issue_comment_mentions with valid schema fields (no `actor`)
+    // is refused by the operator connection gate and queues 0 messages.
+    let agent_err = indep_agent_rpc(
         &rig,
         "indep-ticket-worker",
         "issue_comment_mentions",
@@ -1160,14 +1161,39 @@ fn cad2711_indep_ticket_comment_mentions_silent_note_human_isolation_and_agent_g
             "issue_id": "VIS-1",
             "comment_key": "forged-key",
             "body": "Forged @indep-ticket-worker wake",
+            "local_operator": true
+        }),
+    )
+    .expect_err("agent caller must never invoke issue_comment_mentions");
+    assert_eq!(agent_err.kind(), "rejected", "{agent_err:?}");
+    assert!(
+        agent_err.to_string().contains("operator"),
+        "unexpected error for agent issue_comment_mentions: {agent_err:?}"
+    );
+    let count_after_agent: i64 = db
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count_after_agent, 1);
+
+    // 4b. Supplying a forged `actor` field is refused as connection-bound and queues 0 messages.
+    let forged_actor_err = indep_agent_rpc(
+        &rig,
+        "indep-ticket-worker",
+        "issue_comment_mentions",
+        json!({
+            "issue_id": "VIS-1",
+            "comment_key": "forged-actor-key",
+            "body": "Forged @indep-ticket-worker actor wake",
             "local_operator": true,
             "actor": "operator"
         }),
     )
-    .expect_err("agent caller must never invoke issue_comment_mentions");
+    .expect_err("forged actor field on issue_comment_mentions must be refused");
+    assert_eq!(forged_actor_err.kind(), "rejected", "{forged_actor_err:?}");
+    let forged_msg = forged_actor_err.to_string();
     assert!(
-        forged_err.to_string().contains("operator") || forged_err.code() == Some("rejected"),
-        "unexpected error for agent issue_comment_mentions: {forged_err:?}"
+        forged_msg.contains("actor") && forged_msg.contains("connection-bound"),
+        "unexpected error for forged actor on issue_comment_mentions: {forged_actor_err:?}"
     );
     let count_after_forged: i64 = db
         .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
