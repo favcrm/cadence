@@ -31,7 +31,8 @@ Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
 // The real outlet mints a mount and loads a frame; record what the page asks of it instead.
 type Mounted = { readOnly?: boolean; route: any; contextId: string; admitted: boolean; installation: { install_id: string }; onNavigation?: (n: unknown) => void };
 const mounted: Mounted[] = [];
-let outletBehaviour: "ready" | "silent" | "fails" = "ready";
+let outletBehaviour: "ready" | "silent" | "fails" | "nullOnly" = "ready";
+const NAVIGATION = { section: "pnl" };
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -43,7 +44,10 @@ loader.prototype.require = function (this: unknown, id: string) {
       InstalledScreenOutlet: (props: Mounted & { renderFailure: (s: unknown, retry: () => void) => unknown; fallback: unknown }) => {
         React.useEffect(() => {
           mounted.push(props);
-          if (outletBehaviour === "ready") props.onNavigation?.(null);
+          if (outletBehaviour === "ready") props.onNavigation?.(NAVIGATION);
+          // The real outlet reports null on a failed mount and on effect cleanup.
+          if (outletBehaviour === "nullOnly") props.onNavigation?.(null);
+          return () => props.onNavigation?.(null);
         }, []);
         return outletBehaviour === "fails"
           ? props.renderFailure({ kind: "refused", status: 403, code: "owner_required" }, () => undefined)
@@ -81,13 +85,14 @@ const { isPrintPath, parsePrintQuery, printRefusal, printRoute } = require("../s
 
 // ---- the board: the installation scope ----
 let scope: "ok" | "denied" = "ok";
+let contexts: { id: string; install_id: string; state: string; config: { label: string } }[] = [{ id: "default", install_id: "inst_acc", state: "active", config: { label: "Default" } }];
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
 const installation = { install_id: "inst_acc", name: "accounting", title: "Accounting", digest: "d", files: ["screens/accounting/screens.json"], navigation: { sections: [{ id: "pnl" }], default_section: "pnl", section_query: "acc" } };
 globalThis.fetch = (async (input: unknown) => {
   const url = new URL(String(input), "http://localhost");
   if (scope === "denied") return json({ error: { code: "owner_required" } }, 403);
   if (url.pathname === "/api/app-installations/inst_acc") return json(installation);
-  if (url.pathname === "/api/app-installations/inst_acc/contexts") return json({ contexts: [{ id: "default", install_id: "inst_acc", state: "active", config: { label: "Default" } }] });
+  if (url.pathname === "/api/app-installations/inst_acc/contexts") return json({ contexts });
   return json({}, 404);
 }) as typeof fetch;
 
@@ -101,12 +106,12 @@ async function settle(check: () => void) {
   check();
 }
 const w = win as unknown as { __printReady?: boolean };
-async function page(search: string, settleMs = 0) {
+async function page(search: string, settleMs = 0, strict = false) {
   mounted.length = 0;
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  await React.act(async () => { root.render(React.createElement(LocaleProvider, null, React.createElement(PrintView, { search, settleMs }))); });
+  await React.act(async () => { root.render(React.createElement(strict ? React.StrictMode : React.Fragment, null, React.createElement(LocaleProvider, null, React.createElement(PrintView, { search, settleMs })))); });
   const state = () => host.querySelector("[data-print-view]")?.getAttribute("data-print-state");
   const done = async () => { await React.act(async () => { root.unmount(); }); host.remove(); };
   return { host, state, done };
@@ -131,7 +136,7 @@ const REQUEST = "?install=inst_acc&screen=accounting&section=pnl&view=pnl&params
 async function neverReady(why: string, search: string, behaviour: typeof outletBehaviour, access: typeof scope) {
   outletBehaviour = behaviour; scope = access;
   const p = await page(search);
-  await settle(() => assert(p.state() === "refused" || (behaviour === "silent" && mounted.length === 1), `${why}: settled`));
+  await settle(() => assert(p.state() === "refused" || ((behaviour === "silent" || behaviour === "nullOnly") && mounted.length === 1), `${why}: settled`));
   await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
   assert(w.__printReady === false, `${why}: __printReady stays false`);
   await p.done();
@@ -142,6 +147,56 @@ await neverReady("another screen than the installation declares", REQUEST.replac
 await neverReady("a section the installation does not declare", REQUEST.replace("section=pnl", "section=cash"), "ready", "ok");
 await neverReady("a frame that was refused", REQUEST, "fails", "ok");
 await neverReady("a frame that never reports ready", REQUEST, "silent", "ok");
+await neverReady("a frame that only reports a null navigation", REQUEST, "nullOnly", "ok");
+
+// ---- readiness is withdrawn when the frame goes ----
+{
+  outletBehaviour = "ready"; scope = "ok";
+  const p = await page(REQUEST);
+  await settle(() => assert(w.__printReady === true, "ready first"));
+  await React.act(async () => { mounted[0]!.onNavigation?.(null); });
+  assert(w.__printReady === false, "the frame failing after it settled withdraws ready");
+  await p.done();
+}
+{
+  outletBehaviour = "ready"; scope = "ok";
+  const p = await page(REQUEST);
+  await settle(() => assert(w.__printReady === true, "ready before unmount"));
+  await p.done();
+  assert(w.__printReady === false, "unmounting withdraws ready");
+}
+{
+  outletBehaviour = "ready"; scope = "ok";
+  const p = await page(REQUEST, 0, true);
+  await settle(() => assert(w.__printReady === true, "StrictMode's double mount still ends ready"));
+  await p.done();
+  outletBehaviour = "nullOnly";
+  const q = await page(REQUEST, 0, true);
+  await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+  assert(w.__printReady === false, "StrictMode's mount and cleanup never leave ready set");
+  await q.done();
+}
+
+// ---- the context is the install's own, not a hardcoded one ----
+{
+  outletBehaviour = "ready"; scope = "ok";
+  const ctx = (id: string, state = "active") => ({ id, install_id: "inst_acc", state, config: { label: id } });
+  contexts = [ctx("ctx_q3")];
+  const p = await page(REQUEST);
+  await settle(() => assert(w.__printReady === true, "a sole non-default context is drawn"));
+  assert(mounted[0]!.contextId === "ctx_q3", `the sole active context (got ${mounted[0]!.contextId})`);
+  await p.done();
+  contexts = [ctx("ctx_a"), ctx("default"), ctx("ctx_b")];
+  const d = await page(REQUEST);
+  await settle(() => assert(mounted.length === 1, "mounted"));
+  assert((mounted[0]!.contextId as string) === "default", "among several, the default one");
+  await d.done();
+  for (const none of [[], [ctx("ctx_a", "archived")], [ctx("ctx_a"), ctx("ctx_b")]]) {
+    contexts = none;
+    await neverReady(`contexts ${JSON.stringify(none.map((c) => [c.id, c.state]))}`, REQUEST, "ready", "ok");
+  }
+  contexts = [ctx("default")];
+}
 console.log("printView ok");
 }
 main().then(() => process.exit(0), (error) => { console.error(error); process.exit(1); });

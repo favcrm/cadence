@@ -4,7 +4,7 @@ import { useTranslate } from "../../lib/locale";
 import { isNoAccess } from "../canvas/AppViewBody";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import { readAppScopeFresh, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
-import { parsePrintQuery, printRefusal, printRoute, PRINT_SETTLE_MS } from "./printRequest";
+import { parsePrintQuery, printContextId, printRefusal, printRoute, PRINT_SETTLE_MS } from "./printRequest";
 import "./print.css";
 
 declare global {
@@ -16,8 +16,8 @@ declare global {
 
 type Load =
   | { status: "loading" }
-  | { status: "refused"; why: "request" | "access" | "screen" | "section" | "failed" }
-  | { status: "ready"; installation: Installation; contexts: AppContext[] };
+  | { status: "refused"; why: "request" | "access" | "screen" | "section" | "context" | "failed" }
+  | { status: "ready"; installation: Installation; contexts: AppContext[]; contextId: string };
 
 /** The frame did not come up: say so, and keep the page from ever reading as ready. */
 function Failed({ onFailed, text }: { onFailed: () => void; text: string }) {
@@ -46,7 +46,8 @@ export default function PrintView({ search, settleMs = PRINT_SETTLE_MS }: { sear
       ([installation, contexts]) => {
         if (controller.signal.aborted) return;
         const refusal = printRefusal(spec, installation);
-        setLoad(refusal === null ? { status: "ready", installation, contexts } : { status: "refused", why: refusal });
+        const contextId = printContextId(contexts, installation.install_id);
+        setLoad(refusal !== null ? { status: "refused", why: refusal } : contextId === null ? { status: "refused", why: "context" } : { status: "ready", installation, contexts, contextId });
       },
       (error: unknown) => {
         if (!controller.signal.aborted) setLoad({ status: "refused", why: error instanceof ApiError && isNoAccess(error.status) ? "access" : "failed" });
@@ -57,11 +58,14 @@ export default function PrintView({ search, settleMs = PRINT_SETTLE_MS }: { sear
   }, [installId]);
 
   const [framed, setFramed] = useState(false);
+  const live = load.status === "ready" && framed && !frameFailed;
+  // Ready only while the frame is alive: any failure, unmount or refusal withdraws it.
   useEffect(() => {
-    if (!framed || frameFailed) return;
+    window.__printReady = false;
+    if (!live) return;
     const timer = setTimeout(() => { window.__printReady = true; }, settleMs);
-    return () => clearTimeout(timer);
-  }, [framed, frameFailed, settleMs]);
+    return () => { clearTimeout(timer); window.__printReady = false; };
+  }, [live, settleMs]);
 
   const note = (text: string) => <p className="print-view-note" role="alert">{text}</p>;
   const refused = load.status === "refused" ? load.why : frameFailed ? "failed" : null;
@@ -69,18 +73,19 @@ export default function PrintView({ search, settleMs = PRINT_SETTLE_MS }: { sear
     <main className="print-view" data-print-view data-print-state={refused ? "refused" : framed ? "ready" : "loading"}>
       {refused === "request" ? note(t("This print request is not valid.")) : null}
       {refused === "access" ? note(t("No access")) : null}
-      {refused === "screen" || refused === "section" ? note(t("This view is not available.")) : null}
+      {refused === "screen" || refused === "section" || refused === "context" ? note(t("This view is not available.")) : null}
       {refused === "failed" && load.status === "refused" ? note(t("This screen could not be opened.")) : null}
       {load.status === "ready" && spec !== null ? (
         <div className="print-view-frame">
           <InstalledScreenOutlet
             installation={load.installation}
             contexts={load.contexts}
-            contextId="default"
+            contextId={load.contextId}
             admitted
             readOnly
             route={printRoute(spec)}
-            onNavigation={() => setFramed(true)}
+            // A null navigation is the outlet failing or unmounting, never a drawn view.
+            onNavigation={(navigation) => setFramed(navigation !== null)}
             // A refused or failed mount is never ready: the renderer times out and nothing is shared.
             renderFailure={() => <Failed onFailed={() => setFrameFailed(true)} text={t("This screen could not be opened.")} />}
             fallback={<Failed onFailed={() => setFrameFailed(true)} text={t("No access")} />}

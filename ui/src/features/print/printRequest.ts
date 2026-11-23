@@ -71,3 +71,15 @@ export function printRefusal(spec: PrintSpec, installation: { files: readonly st
   const sections = installation.navigation?.sections;
   return sections && !sections.some((s) => s.id === spec.section) ? "section" : null;
 }
+
+/**
+ * The context the canvas would draw this install under: its one active
+ * context (the canvas adopts a sole context), else the active one named
+ * "default". Several others with no "default" is ambiguous, and none means
+ * nothing to draw: both are refused rather than guessed.
+ */
+export function printContextId(contexts: readonly { id: string; install_id: string; state: string }[], installId: string): string | null {
+  const active = contexts.filter((c) => c.install_id === installId && c.state === "active");
+  if (active.length === 1) return active[0]!.id;
+  return active.find((c) => c.id === "default")?.id ?? null;
+}
