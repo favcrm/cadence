@@ -324,6 +324,60 @@ fn intake_unapproved_start_refuses_before_resolving_invalid_base() {
     assert_eq!(refusal.code(), Some("plan_not_approved"), "{refusal:?}");
     assert!(refusal.to_string().contains("proposed"), "{refusal:?}");
     assert_eq!(fx.snapshot(issue), before);
+
+    // The real plain-dispatch preflight still has to refuse the proposed
+    // plan before attempting to resolve the deliberately nonexistent base.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let socket = crate::client::socket_path(fx._dir.path());
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let response = match request["method"].as_str() {
+                Some("stop") => break,
+                Some("agent_show") => json!({"agent": {
+                    "alias": "worker", "state": "idle", "enabled": true,
+                    "provider": "fake", "endpoint_kind": "fake"
+                }}),
+                Some("job_list") => json!({"jobs": []}),
+                other => panic!("unexpected preflight RPC {other:?}"),
+            };
+            writeln!(stream, "{}", json!({"ok": true, "result": response})).unwrap();
+        }
+    });
+    let args = crate::issue::dispatch::DispatchArgs {
+        to: "worker".into(),
+        note: None,
+        name: None,
+        base: Some("missing-base-for-acceptance".into()),
+        repo: Some(fx.repo.clone()),
+        reply_to: Some("dispatcher".into()),
+        summary: None,
+        job_spec: None,
+        no_lessons: false,
+        force: false,
+        take_over: None,
+    };
+    let result = crate::issue::dispatch::run(
+        &fx.pm,
+        issue,
+        &args,
+        "acceptance",
+        fx._dir.path(),
+        None,
+        crate::issue::dispatch::DispatchOrigin::Explicit,
+    );
+    let mut stop = UnixStream::connect(&socket).unwrap();
+    writeln!(stop, "{}", json!({"method": "stop"})).unwrap();
+    daemon.join().unwrap();
+    let refusal = result.unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_not_approved"), "{refusal:?}");
+    assert!(refusal.to_string().contains("proposed"), "{refusal:?}");
+    assert_eq!(fx.snapshot(issue), before);
     assert!(board::find_issue(&fx.pm.dir, issue)
         .unwrap()
         .front
@@ -376,6 +430,7 @@ fn intake_reused_lane_checks_its_old_base_even_with_newer_explicit_base() {
 
     let started = fx.start(issue, Some(fx.old_base.clone())).unwrap();
     let lane = std::path::PathBuf::from(started["worktree"].as_str().unwrap());
+    let lane_branch = started["branch"].as_str().unwrap();
     assert!(lane.join("README").is_file());
     assert!(!lane.join("src/module.rs").exists());
     let (_, dir) = write::issue_dir(&fx.pm, issue).unwrap();
@@ -389,13 +444,105 @@ fn intake_reused_lane_checks_its_old_base_even_with_newer_explicit_base() {
         "---\ntitle: Revise prerequisite\ngoal: Deliver the prerequisite\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Prerequisite available]\n  unknowns: []\n  revises: {epic}\n---\n\n## Prerequisite\nsources: scope\npaths: src/module.rs\nreuse: {issue}\n\n### Acceptance\n- [ ] Prerequisite is available\n"
     );
     let revised = fx.propose(&revision);
-    fx.approve(revised["epic"].as_str().unwrap());
+    let revised_epic = revised["epic"].as_str().unwrap();
+    fx.approve(revised_epic);
     plan::gate_id(&fx.pm.dir, issue).unwrap();
+    let (live_front, live_body) = write::load_front(&dir).unwrap();
+    assert_eq!(
+        plan::gate_snapshot(&fx.pm.dir, &live_front, &live_body).unwrap(),
+        Some(revised_epic.to_string())
+    );
+    let scope = plan::scope_digest(&live_front, &live_body).unwrap();
+
+    let opts = ServeOptions {
+        test_seam: true,
+        ..Default::default()
+    };
+    opts.provider_env
+        .set("CADENCE_PM_DIR", fx.pm.dir.to_str().unwrap());
+    let shared = Shared::new(fx._dir.path(), &opts).unwrap();
+    register(&shared, fx._dir.path(), "acceptance");
+    register(&shared, fx._dir.path(), "dispatch-pm");
+    let before = fx.snapshot(issue);
+    let direct_message = "cad224-old-lane-direct";
+    let refusal = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
+        shared.rpc_dispatch_send(
+            &json!({
+                "alias": "acceptance",
+                "issue": issue,
+                "text": "Begin the revised work",
+                "reply_to": "dispatch-pm",
+                "message": direct_message,
+                "intake_revision": revised_epic,
+                "intake_scope": scope,
+            }),
+            std::process::id(),
+        )
+    })
+    .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(
+        refusal.to_string().contains("execution base"),
+        "{refusal:?}"
+    );
+    assert!(!shared.store.message_exists(direct_message).unwrap());
+    assert_eq!(shared.store.queued_count("acceptance").unwrap(), 0);
+    assert_eq!(fx.snapshot(issue), before);
+
+    let spec = fx._dir.path().join("old-lane-job.md");
+    std::fs::write(&spec, "Deliver the revised prerequisite.\n").unwrap();
+    let spec_sha = crate::delegation::sha256_hex(b"Deliver the revised prerequisite.\n");
+    shared
+        .store
+        .create_job(
+            "cad224-old-lane",
+            None,
+            spec.to_str().unwrap(),
+            &spec_sha,
+            "acceptance",
+            Some(issue),
+            Some(fx.repo.to_str().unwrap()),
+            None,
+            2,
+            None,
+            Some("Deliver the revised prerequisite"),
+            Some(lane.to_str().unwrap()),
+            Some(lane_branch),
+            Some(&fx.old_base),
+            Some("acceptance"),
+            Some("Prerequisite is available"),
+        )
+        .unwrap();
+    let before_task = shared.store.task("cad224-old-lane-t1").unwrap().to_json();
+    let job_message = "cad224-old-lane-job";
+    let refusal = shared
+        .rpc_task_dispatch(&json!({
+            "task": "cad224-old-lane-t1",
+            "by": "acceptance",
+            "message": job_message,
+        }))
+        .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(
+        refusal.to_string().contains("execution base"),
+        "{refusal:?}"
+    );
+    assert!(!shared.store.message_exists(job_message).unwrap());
+    assert_eq!(shared.store.queued_count("acceptance").unwrap(), 0);
+    assert_eq!(
+        shared.store.task("cad224-old-lane-t1").unwrap().to_json(),
+        before_task
+    );
+    assert_eq!(fx.snapshot(issue), before);
 
     let newer_base = git(&fx.repo, &["rev-parse", "HEAD"]).trim().to_string();
     let before = fx.snapshot(issue);
     let refusal = fx.start(issue, Some(newer_base)).unwrap_err();
     assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(
+        refusal.to_string().contains("execution base"),
+        "{refusal:?}"
+    );
     assert_eq!(fx.snapshot(issue), before);
     assert!(!lane.join("src/module.rs").exists());
 }
@@ -435,14 +582,15 @@ fn intake_start_rechecks_changed_scope_before_locked_claim() {
         "- [ ] Prerequisite is available",
         "- [x] Prerequisite is available",
     );
-    assert_ne!(checked, qualified);
-    write::save_front(&issue_dir, &front, &checked).unwrap();
-    fx.pm
-        .commit(
-            &[issue_dir.join("issue.md")],
-            "Check prerequisite criterion",
-        )
-        .unwrap();
+    let criteria_file = fx._dir.path().join("criteria.md");
+    std::fs::write(
+        &criteria_file,
+        "- [x] Prerequisite is available\n- [ ] Additional property\n",
+    )
+    .unwrap();
+    write::set_acceptance(&fx.pm, issue, &criteria_file, "acceptance").unwrap();
+    let (_, actual_body) = write::load_front(&issue_dir).unwrap();
+    assert_eq!(actual_body, checked);
     plan::gate_id(&fx.pm.dir, issue).unwrap();
     let before = fx.snapshot(issue);
     let changed = Rc::new(RefCell::new(None));

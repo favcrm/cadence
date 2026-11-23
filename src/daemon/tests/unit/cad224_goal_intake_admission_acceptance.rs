@@ -308,6 +308,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             lane.to_str().unwrap(),
         ],
     );
+    let lane_base = git(&lane, &["rev-parse", "HEAD"]).trim().to_string();
     let pm = Pm::at(&pm_dir).unwrap();
     let (_, issue_dir) = write::issue_dir(&pm, issue).unwrap();
     let (mut front, body) = write::load_front(&issue_dir).unwrap();
@@ -369,13 +370,14 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
 
     let spec = dir.path().join("intake-job.md");
     std::fs::write(&spec, "Deliver the approved capability.\n").unwrap();
+    let spec_sha = crate::delegation::sha256_hex(b"Deliver the approved capability.\n");
     shared
         .store
         .create_job(
             "cad224-job",
             None,
             spec.to_str().unwrap(),
-            &"0".repeat(64),
+            &spec_sha,
             "worker-1",
             Some(issue),
             Some(repo.to_str().unwrap()),
@@ -384,8 +386,8 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             None,
             Some("Deliver the capability"),
             Some(lane.to_str().unwrap()),
-            None,
-            None,
+            Some("acceptance-lane"),
+            Some(&lane_base),
             Some("worker-1"),
             Some("Retired criterion"),
         )
@@ -399,9 +401,9 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             Some("worker-2"),
             None,
             Some("Capability is available"),
-            None,
-            None,
-            None,
+            Some(lane.to_str().unwrap()),
+            Some("acceptance-lane"),
+            Some(&lane_base),
         )
         .unwrap();
     shared
@@ -448,11 +450,27 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
 
     // The source moves only after each route has prepared its fresh
     // payload. The live fence must refuse before its enqueue transaction.
+    let lane_inventory = || {
+        let root = format!("worktree {}", repo.canonicalize().unwrap().display());
+        let listing = git(&repo, &["worktree", "list", "--porcelain"]);
+        let mut in_root = false;
+        listing
+            .lines()
+            .filter(|line| {
+                if line.starts_with("worktree ") {
+                    in_root = *line == root;
+                }
+                !(in_root && line.starts_with("HEAD "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let exercise_race = |attempt: &dyn Fn() -> crate::error::Result<Value>,
                          message: Option<&str>| {
         let before_head = git(&pm_dir, &["rev-parse", "HEAD"]);
         let before_issue = std::fs::read(issue_dir.join("issue.md")).unwrap();
-        let before_lanes = git(&repo, &["worktree", "list", "--porcelain"]);
+        let before_lanes = lane_inventory();
+        let before_lane_head = git(&lane, &["rev-parse", "HEAD"]);
         let before_task = shared.store.task("cad224-fresh-task").unwrap().to_json();
         let queues =
             ["worker-1", "worker-2"].map(|alias| shared.store.queued_count(alias).unwrap());
@@ -500,10 +518,8 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             std::fs::read(issue_dir.join("issue.md")).unwrap(),
             before_issue
         );
-        assert_eq!(
-            git(&repo, &["worktree", "list", "--porcelain"]),
-            before_lanes
-        );
+        assert_eq!(lane_inventory(), before_lanes);
+        assert_eq!(git(&lane, &["rev-parse", "HEAD"]), before_lane_head);
         std::fs::write(repo.join("docs/scope.md"), "Approved scope\n").unwrap();
         git(&repo, &["add", "docs/scope.md"]);
         git(&repo, &["commit", "-qm", "Restore approved scope"]);
