@@ -1,8 +1,9 @@
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslate } from "../../lib/locale";
 import { onPrivateReadsPaused, privateReadsAllowed } from "../../lib/privateSession";
-import { navigate } from "../../lib/useLocation";
-import { IconClose } from "../../ui/icons";
+import { navigate, useHref } from "../../lib/useLocation";
+import { IconClose, IconThreads } from "../../ui/icons";
+import { AppGlyph } from "../explorer/shared";
 import { WriteGate } from "../auth/WriteGate";
 import { requestComposerFocus, setComposerRefs } from "../app-shell/chat/composerStore";
 import {
@@ -20,6 +21,7 @@ import { makeAskRef } from "./askRefs";
 import AppViewBody from "./AppViewBody";
 import RecordViewBody from "./RecordViewBody";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
+import { canvasChrome, setCanvasFull, setChatPeek, useCanvasChrome } from "./canvasChrome";
 import { closeBrowserDrawer, focusBrowser, hideBrowser, isBrowserPanelShown, tabVisible, useBrowserTab } from "./browserStore";
 import {
   clampWidth,
@@ -100,6 +102,11 @@ function focusFallback(fallbackArtifactId?: string | null): void {
     ?? (fallbackArtifactId ? document.querySelector<HTMLElement>(`[data-artifact="${cssEscape(fallbackArtifactId)}"]`) : null)
     ?? document.querySelector<HTMLElement>("main button, main a, main input, nav a, button");
   target?.focus();
+}
+
+/** A control that takes typed text: Esc leaves it before it leaves anything else. */
+function isTextField(el: Element | null): boolean {
+  return el instanceof HTMLElement && (el.isContentEditable || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el instanceof HTMLInputElement);
 }
 
 function Body({ conversation, tab, composerKey, working, sheet, expanded, canExpand, onExpand, onClose, htmlView, onHtmlView, hosted, templateReviewEnabled }: {
@@ -429,6 +436,9 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   const [dragged, setDragged] = useState(readWidth);
   const [expanded, setExpanded] = useState(false);
   const [canExpand, setCanExpand] = useState(false);
+  const chrome = useCanvasChrome();
+  const railRef = useRef<HTMLButtonElement | null>(null);
+  const pathname = useHref().split("?")[0];
   // Per artifact, held here because Body remounts when the version changes.
   const [htmlViews, setHtmlViews] = useState<Record<string, HtmlView>>({});
   // The session tab (browserStore.ts) is not an artifact: it can open the drawer
@@ -491,8 +501,8 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
     const surface: Surface = canvas.surface;
     const workspace = surface === "app" ? appWorkspaceBounds() : null;
     const next = drawerLayout(viewport, want, surface, workspace, expanded);
-    setLayout((cur) => (cur.mode === next.mode && cur.width === next.width && cur.right === next.right ? cur : next));
-    setCanvasTop(surface === "app" && next.mode === "cover" && workspace !== null ? Math.max(0, workspace.top) : 0);
+    setLayout((cur) => (cur.mode === next.mode && cur.width === next.width && cur.right === next.right && cur.full === next.full ? cur : next));
+    setCanvasTop(surface === "app" && next.mode === "cover" && !next.full && workspace !== null ? Math.max(0, workspace.top) : 0);
     setCanExpand(expanded || drawerLayout(viewport, want, surface, workspace, true).width > next.width);
   });
 
@@ -512,13 +522,55 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
     };
   }, [open, layout.mode, layout.width]);
 
+  // The board makes room for a full-width canvas: its sidebar folds, the chat steps out of sight.
+  const full = open && layout.full === true;
+  useEffect(() => {
+    setCanvasFull(full);
+    return () => setCanvasFull(false);
+  }, [full]);
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    if (full) root.setAttribute("data-canvas-full", "");
+    if (full && chrome.peek) root.setAttribute("data-canvas-peek", "");
+    return () => {
+      root.removeAttribute("data-canvas-full");
+      root.removeAttribute("data-canvas-peek");
+    };
+  }, [full, chrome.peek]);
+  useEffect(() => {
+    if (chrome.peek && canvas.composerKey !== null) requestComposerFocus(canvas.composerKey);
+  }, [chrome.peek, canvas.composerKey]);
+  // The peek is a drawer over the canvas: leaving the chat for the canvas (a click or the frame taking focus) shuts it.
+  useEffect(() => {
+    if (!chrome.peek) return;
+    const away = (e: PointerEvent) => {
+      const target = e.target as Element | null;
+      if (target?.closest(".home-workspace, .cv-rail")) return;
+      setChatPeek(false);
+    };
+    const leave = () => setChatPeek(false);
+    document.addEventListener("pointerdown", away, true);
+    window.addEventListener("blur", leave);
+    return () => {
+      document.removeEventListener("pointerdown", away, true);
+      window.removeEventListener("blur", leave);
+    };
+  }, [chrome.peek]);
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || e.defaultPrevented) return;
-      // Esc first restores the width, then closes.
-      if (expanded) setExpanded(false);
-      else closeAll();
+      if (!expanded) {
+        closeAll();
+        return;
+      }
+      // Expanded: Esc leaves a focused field, then shuts the chat peek, then restores the split.
+      if (isTextField(document.activeElement)) {
+        (document.activeElement as HTMLElement).blur();
+        e.preventDefault();
+      } else if (canvasChrome().peek) setChatPeek(false);
+      else setExpanded(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -527,6 +579,8 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   useEffect(() => {
     if (!open) setExpanded(false);
   }, [open]);
+  // Moving to another page puts the board back as it was.
+  useEffect(() => setExpanded(false), [pathname]);
 
   // The active tab scrolls into view when it changes.
   useEffect(() => {
@@ -582,6 +636,11 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   if (!open || (!tab && !showBrowser) || conversation === null) return null;
   const sheet = layout.mode === "sheet";
   const working = canvas.working;
+  const tabbed = canvas.tabs.length + (hasBrowser ? 1 : 0) > 1;
+  const toggleChat = () => {
+    setChatPeek(!chrome.peek);
+    if (chrome.peek) railRef.current?.focus();
+  };
   return (
     <aside
       ref={rootRef}
@@ -591,6 +650,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
       data-surface={canvas.surface}
       aria-label={t("Canvas")}
       tabIndex={-1}
+      data-full={layout.full || undefined}
       style={sheet ? undefined : { width: layout.width, right: layout.right ?? 0, top: canvasTop }}
     >
       {!sheet && !expanded ? (
@@ -610,14 +670,24 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
           onKeyDown={onResizeKey}
         />
       ) : null}
-      {canvas.tabs.length + (hasBrowser ? 1 : 0) > 1 ? (
+      {layout.full ? (
+        <div className="cv-rail" data-chat-rail>
+          <button ref={railRef} type="button" className="cv-iconbtn cv-rail-chat" aria-label={t("Assistant chat")} title={t("Assistant chat")} aria-expanded={chrome.peek} onClick={toggleChat}>
+            <IconThreads size={16} />
+            {chrome.unread ? <span className="cv-dot" role="status" aria-label={t("New reply waiting")} /> : null}
+          </button>
+        </div>
+      ) : null}
+      <div className="cv-main">
+      {tabbed ? (
         <div className="cv-tabs" role="tablist" aria-label={t("Artifacts")} onKeyDown={onTabListKeyDown}>
           {canvas.tabs.map((x) => {
             const on = !showBrowser && tab !== null && x.id === tab.id;
             return (
               <span key={x.id} className="cv-tab" data-active={on || undefined}>
                 <button type="button" role="tab" aria-selected={on} className="cv-tab-label" onClick={() => focusTab(x.id)}>
-                  {x.title}
+                  {x.app ? <span className="cv-mark"><AppGlyph name={x.app.appLabel ?? x.app.tag} size="xs" /></span> : null}
+                  <span className="cv-tab-title">{x.title}</span>
                 </button>
                 <button type="button" className="cv-tab-close" aria-label={`${t("Close")} ${x.title}`} onClick={() => {
                     handFocusOn();
@@ -676,6 +746,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
               tab={tab}
               app={tab.app}
               sheet={sheet}
+              tabbed={tabbed}
               expanded={expanded}
               canExpand={canExpand}
               onExpand={() => setExpanded((x) => !x)}
@@ -708,6 +779,7 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
           onClose={closeAll}
         />
       ) : null}
+      </div>
     </aside>
   );
 }

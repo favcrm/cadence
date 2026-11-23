@@ -18,6 +18,7 @@ import {
   type Surface,
   type Working,
 } from "./canvasStore";
+import { noteChatActivity } from "./canvasChrome";
 
 /** A stored artifact card's payload, validated; null when malformed. */
 export function artifactRef(payload: Record<string, unknown> | null | undefined): ArtifactRef | null {
@@ -153,6 +154,14 @@ export function useCanvasFeed(opts: {
   const scopeContext = opts.viewScope?.contextId ?? HOME_VIEW_SCOPE.contextId;
   const showHere = opts.viewScope?.showHere;
   const mark = useRef<{ conversation: string | null; seq: number | null }>({ conversation: null, seq: null });
+  // The newest stored seq this host has shown, so a later one can light the chat rail while the canvas is expanded.
+  const seen = useRef<{ conversation: string | null; seq: number }>({ conversation: null, seq: 0 });
+  useEffect(() => {
+    if (!loaded || conversation === null) return;
+    const top = topSeq(items);
+    if (seen.current.conversation === conversation && top > seen.current.seq) noteChatActivity();
+    seen.current = { conversation, seq: top };
+  }, [conversation, items, loaded]);
   useEffect(() => {
     if (mark.current.conversation !== conversation) mark.current = { conversation, seq: null };
     if (!loaded || conversation === null) return;

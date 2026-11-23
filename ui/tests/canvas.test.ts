@@ -106,8 +106,9 @@ equal(drawerLayout(1100, 660, "app", null), { mode: "cover", width: 544 }, "app,
 // Default widths scale with the viewport, wider for html/csv/pdf, within their clamps.
 equal([defaultWidth("md", 1835), defaultWidth("md", 1000), defaultWidth("md", 800)], [760, 480, 480], "default width 45%, 480..760");
 equal([defaultWidth("html", 1835), defaultWidth("csv", 1280), defaultWidth("pdf", 900)], [960, 704, 560], "document kinds 55%, 560..960");
-// Home expansion keeps its chat strip; app expansion fills only the workspace.
-equal(drawerLayout(1440, 480, "home", null, true), { mode: "cover", width: 1136 }, "home expands beside a chat strip");
+// Home expansion covers the chat, beside the board's folded sidebar (the chat keeps a rail inside the canvas); app expansion fills only the workspace.
+equal(drawerLayout(1440, 480, "home", null, true), { mode: "cover", width: 1376, full: true }, "home expands over the chat, beside the sidebar rail");
+equal(drawerLayout(800, 480, "home", null, true), { mode: "cover", width: 800, full: true }, "without a sidebar the canvas takes the whole window");
 equal(drawerLayout(1440, 480, "app", { left: 208, right: 1100 }, true), { mode: "cover", width: 892, right: 340 }, "expanded app canvas leaves the full assistant accessible");
 equal(drawerLayout(900, 480, "app", null, true).mode, "sheet", "narrow app expansion retains the sheet");
 equal(drawerLayout(500, 480, "home", null, true).mode, "sheet", "a phone is a sheet either way");

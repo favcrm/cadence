@@ -14,6 +14,7 @@ import AppShell, { type ActiveInstallation, type AppShellHeaderTargets } from ".
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
+import { useCanvasChrome } from "./features/canvas/canvasChrome";
 import { noteAppScreen, updateSidebarPrefs, useSidebarPrefs } from "./features/app-shell/sidebarPrefs";
 import { parseAppDisplayI18n } from "./features/workspace-apps/appLocale";
 import { parseNavigation } from "./features/workspace-apps/screen/screenLifecycle";
@@ -55,6 +56,7 @@ import { settingsLabel, settingsNavGroups, settingsRedirect } from "./features/s
 import Preferences from "./features/settings/Preferences";
 import Security from "./features/settings/Security";
 import Templates from "./features/templates/Templates";
+import { useHostedTemplatePendingCount } from "./features/templates/HostedTemplateReview";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
@@ -278,9 +280,19 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // CAD-2186: the owner's staged decisions count here too. Only a signed-in
   // viewer of a hosted board who is not a member is asked; every other board
   // is never queried.
+  const viewerSub = meta?.session?.user?.sub ?? null;
+  const viewerIsMember = meta?.session?.user?.role === "member";
+  const privateAssistantView = Boolean(
+    hostedBoard && viewerSub !== null && (viewerIsMember || (route.screen === "home" && route.privateChat === true)),
+  );
   const decisionsOn = ownerDecisionsOn(meta);
   const decisions = useDecisions(decisionsOn);
-  const otherHomeCount = useHomeCount(overviewState.data?.needs_me, decisions.pending.length);
+  const otherHomeCount = useHomeCount(
+    privateAssistantView ? undefined : overviewState.data?.needs_me,
+    decisions.pending.length,
+    privateAssistantView ? undefined : overviewState.data,
+  );
+  const templatePendingCount = useHostedTemplatePendingCount();
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
@@ -347,7 +359,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
-  const { collapsed: sidebarCollapsed } = useSidebarPrefs();
+  // A full-width canvas folds the sidebar to its rail without touching the person's own preference (CAD-2657).
+  const { collapsed: sidebarPref } = useSidebarPrefs();
+  const canvasFull = useCanvasChrome().full;
+  const sidebarCollapsed = sidebarPref || canvasFull;
   const sidebarCollapseRef = useRef<HTMLButtonElement>(null);
   const setSidebarCollapsed = (collapsed: boolean) => {
     updateSidebarPrefs((prefs) => ({ ...prefs, collapsed }));
@@ -371,14 +386,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       : overviewState.data?.document_follow_ups ??
         (overviewState.data ? { status: "unavailable" } : { status: "loading" })
     : undefined;
-  const homeCount = otherHomeCount + (!readOnly && documentFollowUps?.status === "ready" ? documentFollowUps.pending.length : 0);
-  const actor = meta?.actor ?? "operator (ui)";
-  // Hosted boards upload with one multipart POST to the tenant Worker's wiki (AOS-418, which
-  // also produces `Meta.wiki`); local boards use transfer jobs.
   const hosted = meta ? meta.hosted === true : undefined;
-  const viewerSub = meta?.session?.user?.sub ?? null;
   const templateReviewEnabled = Boolean(hostedBoard && meta?.signed_in === true && meta.session?.origin === "public" && sessionAdmissible(meta.session) && viewerSub && !viewerSub.startsWith("operator-token:"));
   const templateReviewCanApprove = templateReviewEnabled && meta?.session?.user?.role === "operator" && meta?.operator === true && !readOnly;
+  const homeCount =
+    otherHomeCount +
+    (!readOnly && documentFollowUps?.status === "ready" ? documentFollowUps.pending.length : 0) +
+    (templateReviewCanApprove ? templatePendingCount : 0);
+  const actor = meta?.actor ?? "operator (ui)";
   // Platform operator sessions do not own a private app-agent setting.
   const appAgentSession = hosted && meta?.signed_in && meta.session?.id && viewerSub && !viewerSub.startsWith("operator-token:")
     ? JSON.stringify([meta.session.id, viewerSub])
@@ -1309,11 +1324,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             privateChat={route.screen === "home" && route.privateChat === true}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             credentialRequestsEnabled={credentialRequestsOn}
-            viewerSub={meta?.session?.user?.sub ?? null}
-            viewerIsMember={meta?.session?.user?.role === "member"}
+            viewerSub={viewerSub}
+            viewerIsMember={viewerIsMember}
             sessionId={meta?.session?.id ?? null}
             operator={meta?.operator === true}
-            consultationSession={meta?.session?.user?.role === "operator" ? appAgentSession : null}
             templateReviewEnabled={templateReviewEnabled}
             templateReviewCanApprove={templateReviewCanApprove}
             overview={overviewState}

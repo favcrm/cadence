@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useLocale, useTranslate } from "../../lib/locale";
-import { onPrivateReadsPaused, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import Button from "../../ui/Button";
 import DrawerShell from "../app-shell/shared/DrawerShell";
 import Field from "../app-shell/shared/Field";
@@ -36,6 +36,33 @@ function matches(template: TemplateSummary | undefined, target: HostedTemplateRe
 
 function targetOf(version: TemplateSummary): HostedTemplateReviewTarget {
   return { name: version.name, version: version.version, digest: version.content_sha256 };
+}
+
+let publishedPendingTemplates = 0;
+const templatePendingListeners = new Set<() => void>();
+
+function setPublishedPendingTemplates(next: number) {
+  if (publishedPendingTemplates === next) return;
+  publishedPendingTemplates = next;
+  for (const listener of templatePendingListeners) listener();
+}
+
+function resetPublishedPendingTemplates() {
+  setPublishedPendingTemplates(0);
+}
+
+onPrivateReadsPaused(resetPublishedPendingTemplates);
+onPrivateSessionReset(resetPublishedPendingTemplates);
+
+/** Latest hosted draft template count published while Home's template review is active. */
+export function useHostedTemplatePendingCount(): number {
+  return useSyncExternalStore(
+    (listener) => {
+      templatePendingListeners.add(listener);
+      return () => templatePendingListeners.delete(listener);
+    },
+    () => publishedPendingTemplates,
+  );
 }
 
 /** One Home-owned review surface. Every continuation is bound to its selection and private session. */
@@ -415,6 +442,14 @@ export function useHostedTemplateReview({ enabled, canApprove, onCompose }: {
       </>}
     </div>
   </DrawerShell> : null;
+
+  useEffect(() => {
+    if (!enabled || !canApprove) {
+      setPublishedPendingTemplates(0);
+    } else if (directory !== null) {
+      setPublishedPendingTemplates(pendingCount);
+    }
+  }, [enabled, canApprove, directory, pendingCount]);
 
   return { rail, templateList, drawer, pendingCount: directory === null ? undefined : pendingCount, open, refresh };
 }

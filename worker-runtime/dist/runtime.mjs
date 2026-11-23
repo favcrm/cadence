@@ -55252,6 +55252,21 @@ function withSummaryBudget(input) {
     return input;
   return { ...input, [field]: SUMMARY_MAX_OUTPUT_TOKENS };
 }
+var SUMMARY_INSTRUCTION = "Keep the user's goals, decisions, preferences, facts about their business and open tasks. " + `Do not record tool errors, refusals, retries or "X doesn't work" as lasting facts or as instructions; ` + "at most say that an earlier attempt to do X failed and to try again normally. " + "Do not copy tool-call argument shapes into the summary.";
+function withSummaryInstruction(input) {
+  const source = summarySource(input);
+  if (source === null)
+    return input;
+  const system = source.system;
+  const content = system.content;
+  const extra = `
+
+` + SUMMARY_INSTRUCTION;
+  const next = typeof content === "string" ? content + extra : Array.isArray(content) ? [...content, { type: "text", text: extra.trimStart() }] : null;
+  if (next === null)
+    return input;
+  return { ...input, messages: [{ ...system, content: next }, input.messages[1]] };
+}
 var LEGACY_MODEL_IDS = ["@cf/zai-org/glm-5.3-flash", "z-ai/glm-5.3-flash"];
 function defaultModel(alias, acceptsImages = false) {
   return {
@@ -55626,7 +55641,7 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
         }, { status: 409 });
       }
       const compacting = isCompaction?.(options?.signal) === true;
-      const summary = compacting ? withSummaryBudget(splitSummaryMessages(input)) : input;
+      const summary = compacting ? withSummaryBudget(splitSummaryMessages(withSummaryInstruction(input))) : input;
       const shaped = boundImageHistory(boundToolHistory(summary), maxImagesPerRequest);
       const bounded = compacting ? shaped : boundActiveToolResults(shaped);
       if (compacting && requestBytes(bounded) > SUMMARY_BODY_BYTES) {

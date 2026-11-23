@@ -2069,7 +2069,7 @@ fn wiki_for(
             "enumerate"
         }
         WikiAction::Search { q, path, .. } => {
-            args.insert("q".into(), json!(q));
+            args.insert("q".into(), json!(q.join(" ")));
             args.insert("path".into(), json!(path.clone().unwrap_or_default()));
             "enumerate"
         }

@@ -30,7 +30,7 @@ import {
   type UnifiedTodoItem,
 } from "./railModel";
 import { decisionReviewHead, nextDecisionToken, type HomeDecisionOpen } from "../../lib/workItems";
-import { beginTodoVisit, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
+import { beginTodoVisit, decideRoutine, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
 import { resources } from "../../lib/resources";
 import type { HostedTemplateList, HostedTemplateRail } from "../templates/HostedTemplateReview";
 import DrawerShell from "../app-shell/shared/DrawerShell";
@@ -122,10 +122,12 @@ export default function NeedsRail({
   const split = todoSplit(overviewData?.needs_me);
   const { updates, decided } = split;
   const staged = useDecisions(decisionsOn);
-  const [decidedRoutineIds, setDecidedRoutineIds] = useState<Record<string, boolean>>({});
-  const waitingRoutines = (overviewData?.routine_needs ?? []).filter((r) => !decidedRoutineIds[r.id]);
-  const routineProposals = (overviewData?.routine_proposals ?? []).filter((p) => !decidedRoutineIds[p.id]);
-  const routineStepHolds = (overviewData?.routine_step_holds ?? []).filter((run) => !decidedRoutineIds[run.id]);
+  const local = useTodoLocal();
+  // A new visit to Home: earlier decided and sent marks stop applying.
+  useLayoutEffect(() => { if (!privateHome) beginTodoVisit(); }, [privateHome]);
+  const waitingRoutines = (overviewData?.routine_needs ?? []).filter((r) => !local.decidedRoutines.has(r.id));
+  const routineProposals = (overviewData?.routine_proposals ?? []).filter((p) => !local.decidedRoutines.has(p.id));
+  const routineStepHolds = (overviewData?.routine_step_holds ?? []).filter((run) => !local.decidedRoutines.has(run.id));
 
   const stagedCards = useMemo(() => staged.pending.map((w) => stagedNeed(w, t)), [staged.pending, t]);
   const todo = useMemo(() => withStaged(split.todo, stagedCards), [split.todo, stagedCards]);
@@ -140,9 +142,6 @@ export default function NeedsRail({
     setDrawerToken(drawerSeq.current);
   };
   const closeDrawerImmediate = () => setDrawerToken(null);
-  const local = useTodoLocal();
-  // A new visit to Home: earlier decided and sent marks stop applying.
-  useLayoutEffect(() => { if (!privateHome) beginTodoVisit(); }, [privateHome]);
 
   // The floating button that owns the slide-over's focus on the way out.
   const needBtn = useRef<HTMLButtonElement | null>(null);
@@ -880,7 +879,7 @@ export default function NeedsRail({
           closeDrawerImmediate();
           onSent?.();
         }}
-        onRoutineDecided={(id) => setDecidedRoutineIds((prev) => ({ ...prev, [id]: true }))}
+        onRoutineDecided={decideRoutine}
         onClose={closeTodoDetail}
       />
       <RailFeedDrawer
