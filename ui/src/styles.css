@@ -2200,9 +2200,7 @@ textarea.agentform-input { height: auto; width: 100%; }
 }
 
 /* CAD-1216: the To do rail — tabs, one-line cards, the decided history. */
-/* CAD-1312: the rail's tab strip compacts to a 36px row; labels drop
-   to 12px and the tools align vertically with the tabs — the 2px active
-   underline still sits flush on the border. */
+/* CAD-1312: the 36px tab strip keeps a 2px underline on the active tab. */
 .todo-tabs {
   display: flex;
   flex: none;
@@ -2210,7 +2208,6 @@ textarea.agentform-input { height: auto; width: 100%; }
   gap: .25rem;
   min-height: 2.25rem;
   padding: 0 .75rem;
-  border-bottom: 1px solid var(--color-ink-700);
 }
 .todo-tabs > button {
   display: inline-flex;
@@ -2218,7 +2215,6 @@ textarea.agentform-input { height: auto; width: 100%; }
   gap: .35rem;
   min-height: 2.25rem;
   padding: 0 .5rem;
-  margin-bottom: -1px;
   border-bottom: 2px solid transparent;
   color: var(--color-ink-400);
   font-size: var(--text-label);
@@ -2245,7 +2241,6 @@ textarea.agentform-input { height: auto; width: 100%; }
   align-items: center;
   min-height: 2.5rem;
   padding: .4375rem .75rem;
-  border-bottom: 1px solid var(--color-ink-700);
 }
 .seg-pills {
   display: flex;
