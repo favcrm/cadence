@@ -119,6 +119,25 @@ pub(crate) enum AppAction {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Read one skill package shipped by an installed hosted app.
+    Skill {
+        /// Installed app name.
+        app: String,
+        /// Skill name from `app describe`.
+        skill: String,
+    },
+    /// List or inspect staged writes held in a hosted workspace conversation.
+    Pending {
+        /// Filter by decision status.
+        #[arg(long, value_enum)]
+        status: Option<PendingStatus>,
+        /// Inspect one staged action by id.
+        #[arg(long)]
+        id: Option<String>,
+        /// Conversation id (defaults to your Home conversation; people only).
+        #[arg(long)]
+        conversation: Option<String>,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -307,6 +326,32 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: AccessAction,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PendingStatus {
+    Pending,
+    Approved,
+    Denied,
+}
+
+impl PendingStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+impl AppAction {
+    pub(crate) const fn is_hosted_action(&self) -> bool {
+        matches!(
+            self,
+            Self::Describe { .. } | Self::Call { .. } | Self::Skill { .. } | Self::Pending { .. }
+        )
+    }
 }
 
 #[derive(Subcommand)]

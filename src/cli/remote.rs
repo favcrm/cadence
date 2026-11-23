@@ -1294,6 +1294,46 @@ fn verb_for(
             args.insert("body".into(), body);
             "platform_call"
         }
+        Commands::App {
+            action: AppAction::Skill { app, skill },
+        } => {
+            let body = json!({
+                "app": app,
+                "skill": skill,
+            });
+            let key = platform_request_key("app_skill", None, Some(&body), None, None)?;
+            args.insert("operation".into(), json!("call"));
+            args.insert("tool".into(), json!("app_skill"));
+            args.insert("key".into(), json!(key));
+            args.insert("body".into(), body);
+            "platform_call"
+        }
+        Commands::App {
+            action:
+                AppAction::Pending {
+                    status,
+                    id,
+                    conversation,
+                },
+        } => {
+            let mut body = serde_json::Map::new();
+            if let Some(status) = status {
+                body.insert("status".into(), json!(status.as_str()));
+            }
+            if let Some(id) = id {
+                body.insert("id".into(), json!(id));
+            }
+            if let Some(conversation) = conversation {
+                body.insert("conversation".into(), json!(conversation));
+            }
+            let body = Value::Object(body);
+            let key = platform_request_key("board_pending_actions", None, Some(&body), None, None)?;
+            args.insert("operation".into(), json!("call"));
+            args.insert("tool".into(), json!("board_pending_actions"));
+            args.insert("key".into(), json!(key));
+            args.insert("body".into(), body);
+            "platform_call"
+        }
         // CAD-2226: the three owner-enrollment acts ride the existing
         // `platform_call` relay. The hosted workspace owns its stored login,
         // its provider consent and every account it links, so a local flag
@@ -2770,7 +2810,7 @@ where
         }
     }
     if let Commands::App { action } = &command {
-        if !matches!(action, AppAction::Describe { .. } | AppAction::Call { .. }) {
+        if !action.is_hosted_action() {
             return super::hosted_app::run(&target, action);
         }
     }
@@ -3032,7 +3072,7 @@ where
         .flatten();
     let app_action = matches!(
         args.get("tool").and_then(Value::as_str),
-        Some("app_call" | "app_describe")
+        Some("app_call" | "app_describe" | "app_skill" | "board_pending_actions")
     );
     if verb == "platform_call" {
         use std::fmt::Write as _;
@@ -3066,6 +3106,37 @@ where
                 ),
                 false,
             ),
+            Commands::App {
+                action: AppAction::Skill { app, skill },
+            } => (
+                format!(
+                    "cadence app org={} operation=skill app={app:?} skill={skill:?}",
+                    target.org
+                ),
+                false,
+            ),
+            Commands::App {
+                action:
+                    AppAction::Pending {
+                        status,
+                        id,
+                        conversation,
+                    },
+            } => {
+                let mut summary = format!("cadence app org={} operation=pending", target.org);
+                if let Some(status) = status {
+                    write!(&mut summary, " status={}", status.as_str())
+                        .expect("writing to a string cannot fail");
+                }
+                if let Some(id) = id {
+                    write!(&mut summary, " id={id:?}").expect("writing to a string cannot fail");
+                }
+                if let Some(conversation) = conversation {
+                    write!(&mut summary, " conversation={conversation:?}")
+                        .expect("writing to a string cannot fail");
+                }
+                (summary, false)
+            }
             _ => (
                 format!("cadence platform org={} operation={op}", target.org),
                 true,
@@ -4353,6 +4424,129 @@ mod read_contract_tests {
             original, changed_body,
             "changing only the body must not replay a call with different content"
         );
+    }
+
+    #[test]
+    fn hosted_app_skill_maps_to_app_skill_platform_call() {
+        use clap::Parser;
+
+        let parse_skill = |app: &str, skill: &str| {
+            let cli = Cli::try_parse_from(["cadence", "app", "skill", app, skill])
+                .expect("app skill parses cleanly");
+            outcome(&cli.command).expect("app skill maps to platform_call")
+        };
+
+        let (verb, args) = parse_skill("accounting", "bookkeeping");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args["operation"], json!("call"));
+        assert_eq!(args["tool"], json!("app_skill"));
+        assert_eq!(
+            args["body"],
+            json!({
+                "app": "accounting",
+                "skill": "bookkeeping",
+            })
+        );
+        let key = args["key"]
+            .as_str()
+            .expect("app skill carries a replay handle");
+        assert!(valid_platform_handle(key), "{key}");
+
+        let (_, repeated) = parse_skill("accounting", "bookkeeping");
+        assert_eq!(repeated["key"], json!(key));
+
+        let (_, other) = parse_skill("accounting", "tax");
+        assert_ne!(other["key"], json!(key));
+
+        assert!(
+            Cli::try_parse_from([
+                "cadence",
+                "app",
+                "skill",
+                "accounting",
+                "bookkeeping",
+                "--ref",
+                "x"
+            ])
+            .is_err(),
+            "app skill must not accept an unsupported --ref flag"
+        );
+    }
+
+    #[test]
+    fn hosted_app_pending_maps_to_board_pending_actions_with_optional_filters() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["cadence", "app", "pending"])
+            .expect("bare app pending parses cleanly");
+        let (verb, args) = outcome(&cli.command).expect("app pending maps to platform_call");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args["operation"], json!("call"));
+        assert_eq!(args["tool"], json!("board_pending_actions"));
+        assert_eq!(args["body"], json!({}));
+        let key = args["key"]
+            .as_str()
+            .expect("app pending carries a replay handle");
+        assert!(valid_platform_handle(key), "{key}");
+
+        let filtered = Cli::try_parse_from([
+            "cadence",
+            "app",
+            "pending",
+            "--status",
+            "pending",
+            "--id",
+            "act_123",
+            "--conversation",
+            "conv_456",
+        ])
+        .expect("filtered app pending parses cleanly");
+        let (_, filtered_args) = outcome(&filtered.command).expect("filtered app pending maps");
+        assert_eq!(
+            filtered_args["body"],
+            json!({
+                "status": "pending",
+                "id": "act_123",
+                "conversation": "conv_456",
+            })
+        );
+
+        for status in ["approved", "denied"] {
+            let cli = Cli::try_parse_from(["cadence", "app", "pending", "--status", status])
+                .unwrap_or_else(|e| panic!("status {status} should parse: {e}"));
+            let (_, parsed) = outcome(&cli.command).expect("status filter maps");
+            assert_eq!(parsed["body"], json!({ "status": status }));
+        }
+
+        assert!(
+            Cli::try_parse_from(["cadence", "app", "pending", "--status", "invalid"]).is_err(),
+            "app pending must reject unknown --status values"
+        );
+    }
+
+    #[test]
+    fn hosted_app_skill_and_pending_require_org_and_stay_off_local_daemon() {
+        use super::super::app::{run as run_local_app, PendingStatus};
+
+        let skill = AppAction::Skill {
+            app: "accounting".into(),
+            skill: "bookkeeping".into(),
+        };
+        let pending = AppAction::Pending {
+            status: Some(PendingStatus::Pending),
+            id: None,
+            conversation: None,
+        };
+        assert!(skill.is_hosted_action());
+        assert!(pending.is_hosted_action());
+        assert!(!AppAction::Ls { project: None }.is_hosted_action());
+
+        for action in [skill, pending] {
+            let err =
+                run_local_app(PathBuf::from("/nonexistent-cadence-state-dir"), action).unwrap_err();
+            assert_eq!(err.kind(), "usage", "{err}");
+            assert!(err.to_string().contains("--org"), "{err}");
+        }
     }
 
     struct AgentLs {

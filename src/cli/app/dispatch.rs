@@ -30,9 +30,12 @@ use super::{
 fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
     use cadence_agent::issue::app;
     let result = match &action {
-        AppAction::Describe { .. } | AppAction::Call { .. } => {
+        AppAction::Describe { .. }
+        | AppAction::Call { .. }
+        | AppAction::Skill { .. }
+        | AppAction::Pending { .. } => {
             return Err(Error::usage(
-                "app describe/call require a hosted workspace; pass --org <workspace>",
+                "app describe/call/skill/pending require a hosted workspace; pass --org <workspace>",
             ));
         }
         AppAction::Binding { action } => {

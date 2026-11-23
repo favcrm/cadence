@@ -50,7 +50,7 @@ fn unsupported_remote_app_action(org: &str, action: &AppAction) -> Error {
             "selected-remote `app assistant` is unsupported (project, record and execution commands remain native and were not run locally). For hosted `--org {org}`, discover actions with `cadence --org {org} app describe <app>` and run them with `cadence --org {org} app call <app> <operation> --args '{{...}}'`"
         ),
         _ => format!(
-            "selected-remote app supports only bounded catalog published-release lifecycle; project, record and execution commands remain native and were not run locally (use `cadence --org {org} app catalog ...`, `app describe`, or `app call`)"
+            "selected-remote app supports only bounded catalog published-release lifecycle; project, record and execution commands remain native and were not run locally (use `cadence --org {org} app catalog ...`, `app describe`, `app call`, `app skill`, or `app pending`)"
         ),
     };
     Error::usage(guidance)
