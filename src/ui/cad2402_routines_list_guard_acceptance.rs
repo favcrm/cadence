@@ -634,3 +634,127 @@ fn cad2402_owner_session_over_the_board_is_the_positive_control_for_the_member_r
     assert_eq!(status, 200, "owner call over the board failed: {body}");
     assert_served(&body, &names);
 }
+
+#[test]
+fn cad224_http_approval_refuses_noncontinuous_revision_without_tracker_mutation() {
+    use crate::issue::{plan, write, Pm};
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    let rig = start();
+    let repo = rig.state.join("cad224-source");
+    std::fs::create_dir_all(repo.join("docs/cadence")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.name", "Acceptance"]);
+    git(
+        &repo,
+        &["config", "user.email", "acceptance@example.invalid"],
+    );
+    std::fs::write(repo.join("docs/scope.md"), "Approved context\n").unwrap();
+    std::fs::write(repo.join("src/module.rs"), "// tracked module\n").unwrap();
+    std::fs::write(
+        repo.join("docs/cadence/project-context.yaml"),
+        "schema: 1\nproject: cadence\ndocuments:\n  - id: scope\n    kind: scope\n    path: docs/scope.md\n    title: Scope\n    required: true\n    roles: []\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "Source"]);
+
+    let pm = Pm::at(&rig.state.join("pm")).unwrap();
+    write::project_add(
+        &pm,
+        "cadence",
+        "CAD",
+        &[repo.to_string_lossy().into_owned()],
+        &[],
+        &[],
+        None,
+    )
+    .unwrap();
+    let draft = "---\ntitle: Outcome A\ngoal: Deliver capability\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Capability available]\n  unknowns: []\n---\n\n## Implement\nsources: scope\npaths: src/module.rs\n\n### Acceptance\n- [ ] Capability is available\n";
+    let propose = |text: &str| {
+        plan::propose(
+            &pm,
+            "cadence",
+            text,
+            None,
+            &crate::secret::Allowlist::default(),
+            "acceptance",
+            &|| Ok(Default::default()),
+        )
+        .unwrap()
+    };
+    let a = propose(draft);
+    let a_id = a["epic"].as_str().unwrap();
+    let revision = |previous: &str, title: &str| {
+        draft
+            .replace("title: Outcome A", &format!("title: {title}"))
+            .replace(
+                "  unknowns: []",
+                &format!("  unknowns: []\n  revises: {previous}"),
+            )
+    };
+    let b = propose(&revision(a_id, "Outcome B"));
+    let b_id = b["epic"].as_str().unwrap();
+    let c = propose(&revision(b_id, "Outcome C"));
+    let epic = c["epic"].as_str().unwrap();
+    let ids = [
+        a_id,
+        b_id,
+        epic,
+        a["tickets"][0].as_str().unwrap(),
+        b["tickets"][0].as_str().unwrap(),
+        c["tickets"][0].as_str().unwrap(),
+    ];
+    let files: Vec<_> = ids
+        .iter()
+        .map(|id| pm.dir.join("cadence").join(id).join("issue.md"))
+        .collect();
+    let before: Vec<_> = files
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let before_head = git(&pm.dir, &["rev-parse", "HEAD"]);
+    let before_status = git(&pm.dir, &["status", "--porcelain", "--untracked-files=all"]);
+    let owner = session(&rig, "cad224-owner", "owner");
+    let (status, response) = status_and_json(post(
+        &rig,
+        &format!("/api/plans/{epic}/approve"),
+        Some(&owner),
+        &json!({}),
+    ));
+    assert_eq!(status, 400, "{response}");
+    assert_eq!(
+        response["code"], "plan_revision_noncontinuous",
+        "{response}"
+    );
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unapproved revision cannot be replaced"),
+        "{response}"
+    );
+    assert_eq!(git(&pm.dir, &["rev-parse", "HEAD"]), before_head);
+    assert_eq!(
+        git(&pm.dir, &["status", "--porcelain", "--untracked-files=all"]),
+        before_status
+    );
+    for (path, expected) in files.iter().zip(before) {
+        assert_eq!(std::fs::read(path).unwrap(), expected, "{}", path.display());
+    }
+}

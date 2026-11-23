@@ -274,6 +274,32 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
         shared.rpc_plan_decide(&json!({"epic": epic}), std::process::id(), true)
     })
     .unwrap();
+    let pm = Pm::at(&pm_dir).unwrap();
+    let (_, issue_dir) = write::issue_dir(&pm, issue).unwrap();
+    let (front, body) = write::load_front(&issue_dir).unwrap();
+    let qualified = body.replace(
+        "- [ ] Capability is available\n",
+        "- [ ] Capability is available\n  Under production traffic\n",
+    );
+    assert_ne!(qualified, body);
+    write::save_front(&issue_dir, &front, &qualified).unwrap();
+    pm.commit(&[issue_dir.join("issue.md")], "Qualify approved capability")
+        .unwrap();
+    let revised_text = format!(
+        "---\ntitle: Qualify capability\ngoal: Deliver the scoped capability\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Capability available]\n  unknowns: []\n  revises: {epic}\n---\n\n## Implement capability\nsources: scope\npaths: src/module.rs\nreuse: {issue}\n\n### Acceptance\n- [ ] Capability is available\n"
+    );
+    let revised = plan::propose(
+        &pm,
+        "cadence",
+        &revised_text,
+        None,
+        &crate::secret::Allowlist::default(),
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap();
+    let epic = revised["epic"].as_str().unwrap();
+    write::decide_plan(&pm, epic, true, "operator", None).unwrap();
     register(&shared, dir.path(), "worker-1");
     register(&shared, dir.path(), "dispatcher");
     shared
@@ -349,11 +375,16 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     );
 
     let scope = plan::scope_digest(&front, &body).unwrap();
+    let source = std::fs::read_to_string(issue_dir.join("issue.md")).unwrap();
+    let dispatch_text = format!(
+        "Begin the approved work {}",
+        crate::issue::dispatch::intake_legacy_suffix(&source).unwrap()
+    );
     let accepted_message = "cad224accepteddispatch0000000001";
     let accepted_request = json!({
         "alias": "worker-1",
         "issue": issue,
-        "text": "Begin the approved work",
+        "text": dispatch_text,
         "reply_to": "dispatcher",
         "message": accepted_message,
         "intake_revision": epic,
@@ -365,8 +396,65 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     .unwrap();
     assert_eq!(accepted["duplicate"], false, "{accepted}");
     assert!(shared.store.message_exists(accepted_message).unwrap());
+    let direct_body = shared
+        .store
+        .message(accepted_message)
+        .unwrap()
+        .unwrap()
+        .body;
+    let criterion_at = direct_body.find("Capability is available").unwrap();
+    let qualifier_at = direct_body.find("Under production traffic").unwrap();
+    assert!(criterion_at < qualifier_at, "{direct_body}");
+    assert!(direct_body.contains("Approved issue acceptance Markdown (including qualifiers):"));
     let accepted_queue = shared.store.queued_count("worker-1").unwrap();
     assert_eq!(accepted_queue, 1);
+
+    // A directory below the worktree root inherits the main checkout's
+    // Git identity but is not itself a registered linked worktree.
+    let bogus = repo.join(".cadence/wt/unregistered");
+    std::fs::create_dir_all(&bogus).unwrap();
+    let mut bogus_front = front.clone();
+    let worktree = bogus_front
+        .refs
+        .iter_mut()
+        .find(|reference| reference.kind == "worktree")
+        .unwrap();
+    worktree.path = Some(bogus.to_string_lossy().into_owned());
+    write::save_front(&issue_dir, &bogus_front, &body).unwrap();
+    pm.commit(&[issue_dir.join("issue.md")], "Record unregistered lane")
+        .unwrap();
+    let before_bogus_head = git(&pm_dir, &["rev-parse", "HEAD"]);
+    let before_bogus_issue = std::fs::read(issue_dir.join("issue.md")).unwrap();
+    let before_bogus_lanes = git(&repo, &["worktree", "list", "--porcelain"]);
+    let bogus_message = "cad224-unregistered-lane";
+    let mut bogus_request = accepted_request.clone();
+    bogus_request["message"] = json!(bogus_message);
+    let refusal = scoped(Asserted::Operator, || {
+        shared.rpc_dispatch_send(&bogus_request, std::process::id())
+    })
+    .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(
+        refusal.to_string().contains("registered worktree"),
+        "{refusal:?}"
+    );
+    assert!(!shared.store.message_exists(bogus_message).unwrap());
+    assert_eq!(
+        shared.store.queued_count("worker-1").unwrap(),
+        accepted_queue
+    );
+    assert_eq!(git(&pm_dir, &["rev-parse", "HEAD"]), before_bogus_head);
+    assert_eq!(
+        std::fs::read(issue_dir.join("issue.md")).unwrap(),
+        before_bogus_issue
+    );
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        before_bogus_lanes
+    );
+    write::save_front(&issue_dir, &front, &body).unwrap();
+    pm.commit(&[issue_dir.join("issue.md")], "Restore registered lane")
+        .unwrap();
 
     let spec = dir.path().join("intake-job.md");
     std::fs::write(&spec, "Deliver the approved capability.\n").unwrap();
@@ -400,7 +488,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             Some("Fresh work"),
             Some("worker-2"),
             None,
-            Some("Capability is available"),
+            Some("Original draft criterion"),
             Some(lane.to_str().unwrap()),
             Some("acceptance-lane"),
             Some(&lane_base),
@@ -430,7 +518,15 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     let accepted_job_id = accepted_job["message"].as_str().unwrap();
     let accepted_body = shared.store.message(accepted_job_id).unwrap().unwrap().body;
     assert!(
-        accepted_body.contains("1) [ ] \"Capability is available\" (approved issue criteria)"),
+        accepted_body.contains("Approved issue acceptance Markdown (including qualifiers):"),
+        "{accepted_body}"
+    );
+    assert!(
+        accepted_body.contains("Capability is available"),
+        "{accepted_body}"
+    );
+    assert!(
+        accepted_body.contains("Under production traffic"),
         "{accepted_body}"
     );
     assert!(
@@ -448,8 +544,14 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             .unwrap()
             .acceptance
             .as_deref(),
-        Some("Retired criterion")
+        Some("1) [ ] \"Capability is available\"")
     );
+    let steering = shared
+        .store
+        .compose_task_message("cad224-job-t1", "worker-1", "Continue", 4000)
+        .unwrap();
+    assert!(steering.contains("Capability is available"), "{steering}");
+    assert!(!steering.contains("Retired criterion"), "{steering}");
     let queue_with_job = shared.store.queued_count("worker-1").unwrap();
     assert_eq!(queue_with_job, accepted_queue + 1);
 
@@ -477,6 +579,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             let before_lanes = lane_inventory();
             let before_lane_head = git(&lane, &["rev-parse", "HEAD"]);
             let before_task = shared.store.task("cad224-fresh-task").unwrap().to_json();
+            assert_eq!(before_task["acceptance"], "Original draft criterion");
             let queues =
                 ["worker-1", "worker-2"].map(|alias| shared.store.queued_count(alias).unwrap());
             let seen = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -538,7 +641,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
                     &json!({
                         "alias": "worker-1",
                         "issue": issue,
-                        "text": "Begin the approved work",
+                        "text": dispatch_text,
                         "reply_to": "dispatcher",
                         "message": direct_message,
                         "intake_revision": epic,
@@ -612,7 +715,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     let old_proof_request = json!({
         "alias": "worker-1",
         "issue": issue,
-        "text": "Begin the approved work",
+        "text": dispatch_text,
         "reply_to": "dispatcher",
         "message": revision_message,
         "intake_revision": epic,
@@ -707,7 +810,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             .unwrap()
             .acceptance
             .as_deref(),
-        Some("Retired criterion")
+        Some("1) [ ] \"Capability is available\"")
     );
     let replay_monitor = scoped(Asserted::Operator, || {
         shared.rpc_monitor_dispatch(
@@ -761,7 +864,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             &json!({
                 "alias": "worker-1",
                 "issue": issue,
-                "text": "Begin the approved work",
+                "text": dispatch_text,
                 "reply_to": "dispatcher",
                 "message": message,
                 "intake_revision": epic,

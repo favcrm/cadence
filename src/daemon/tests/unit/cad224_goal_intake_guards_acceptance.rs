@@ -441,18 +441,24 @@ fn intake_reused_lane_checks_its_old_base_even_with_newer_explicit_base() {
         .commit(&[dir.join("issue.md")], "Map module in revised scope")
         .unwrap();
     let revision = format!(
-        "---\ntitle: Revise prerequisite\ngoal: Deliver the prerequisite\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Prerequisite available]\n  unknowns: []\n  revises: {epic}\n---\n\n## Prerequisite\nsources: scope\npaths: src/module.rs\nreuse: {issue}\n\n### Acceptance\n- [ ] Prerequisite is available\n"
+        "---\ntitle: Revise prerequisite\ngoal: Deliver the prerequisite\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Prerequisite available]\n  unknowns: []\n  revises: {epic}\n---\n\n## Prerequisite\nsources: scope\npaths: README\nreuse: {issue}\n\n### Acceptance\n- [ ] Prerequisite is available\n"
     );
     let revised = fx.propose(&revision);
     let revised_epic = revised["epic"].as_str().unwrap();
     fx.approve(revised_epic);
     plan::gate_id(&fx.pm.dir, issue).unwrap();
     let (live_front, live_body) = write::load_front(&dir).unwrap();
+    assert!(live_front.paths.iter().any(|path| path == "src/module.rs"));
     assert_eq!(
         plan::gate_snapshot(&fx.pm.dir, &live_front, &live_body).unwrap(),
         Some(revised_epic.to_string())
     );
     let scope = plan::scope_digest(&live_front, &live_body).unwrap();
+    let source = std::fs::read_to_string(dir.join("issue.md")).unwrap();
+    let text = format!(
+        "Begin the revised work {}",
+        crate::issue::dispatch::intake_legacy_suffix(&source).unwrap()
+    );
 
     let opts = ServeOptions {
         test_seam: true,
@@ -470,7 +476,7 @@ fn intake_reused_lane_checks_its_old_base_even_with_newer_explicit_base() {
             &json!({
                 "alias": "acceptance",
                 "issue": issue,
-                "text": "Begin the revised work",
+                "text": text,
                 "reply_to": "dispatch-pm",
                 "message": direct_message,
                 "intake_revision": revised_epic,
