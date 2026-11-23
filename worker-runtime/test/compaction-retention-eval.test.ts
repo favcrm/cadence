@@ -44,6 +44,34 @@ describe("compaction retention scorer", () => {
     expect(score(GOOD)).toEqual({ kept: ALL_FACTS, dropped: [], leaks: [] });
   });
 
+  // Paraphrases count the same as the scripted wording, so the arm told to
+  // drop codes is not credited for rewording the same standing claim.
+  it.each([
+    "canvas_open failed repeatedly.",
+    "canvas_open failed every time with a conflict.",
+    "Repeated attempts to open the canvas failed.",
+    "Do not retry opening the canvas.",
+    "Don't try to open the canvas again.",
+    "The canvas tool is unavailable; skip it.",
+    "### Blocked\n- canvas_open is blocked: another canvas holds it.",
+    "### Blocked\n- The launch canvas cannot be opened.",
+    "canvas_open keeps refusing.",
+    "Avoid calling canvas_open until it is fixed.",
+  ])("flags a standing failure claim: %p", (summary) => {
+    expect(score(summary).leaks).toContain("standing failure claim");
+  });
+
+  it.each([
+    "Do not work on the pastry box until the sourdough box ships.",
+    "No emoji: always reject copy that contains emoji.",
+    "Always err on the side of caution with the budget.",
+    "An earlier attempt to open the canvas failed; try again normally.",
+    "Next: open the launch canvas and lay out the sourdough box page.",
+    "### Blocked\n- (none)",
+  ])("does not flag the brief's own facts or the allowed wording: %p", (summary) => {
+    expect(score(summary).leaks).toEqual([]);
+  });
+
   it("names every leak and the dropped facts in a leaky summary", () => {
     const result = score(LEAKY);
     expect(result.leaks).toEqual(ALL_LEAKS);

@@ -30,22 +30,45 @@ const REFUSAL_CODE = "canvas_slot_conflict_4c";
 const REFUSAL_TEXT = "Slot quartz-9 is held by another canvas";
 const ARGUMENTS = { board: "orchid-ledger-7731", layout: "split-heron" } as const;
 
+/** A sentence that names the failing tool: its name, or the canvas it opens. */
+const TOOL_MENTION = /canvas/i;
+
+/**
+ * Wording that turns a failure into a standing fact or an instruction. It
+ * counts only inside a sentence that names the tool, so the brief's own
+ * facts ("do not work on the pastry box", "always reject copy with emoji")
+ * are not leaks, and the form the instruction allows ("an earlier attempt to
+ * open the canvas failed; try again normally") is not one either.
+ */
+const STANDING_CLAIM = new RegExp(
+  [
+    // A failure said to repeat: "keeps refusing", "failed repeatedly", "repeated attempts ... failed".
+    String.raw`\b(keeps?|kept|repeatedly|consistently|always|persistent(ly)?|continu(es|ally|ously))\b\W+(\w+\W+){0,3}(fail|refus|error|reject)`,
+    String.raw`\b(fail|refus|error|reject)\w*\W+(\w+\W+){0,3}(repeatedly|consistently|every time|each time|again and again|multiple times|several times|\d+ times)`,
+    String.raw`\b(repeated|multiple|several|all|every)\b\W+(\w+\W+){0,6}(fail|refus|error|reject)`,
+    // A failure said to be the tool's state.
+    String.raw`(does ?n[o']t|do ?n[o']t|can ?n[o']t|cannot|won'?t|will not)\W+(work|open|be opened|be used)`,
+    String.raw`\b(broken|not working|unusable|unavailable|blocked|refuses|refusing|is down)\b`,
+    // An instruction not to use it.
+    String.raw`\b(avoid|stop|skip|do not|don'?t|never)\b\W+(\w+\W+){0,3}(us|call|retry|try|open|attempt)`,
+    String.raw`\buntil\b\W+(\w+\W+){0,3}(fixed|resolved|works)`,
+  ].join("|"),
+  "i",
+);
+
+/** The summary's sentences: split on line breaks and sentence ends. */
+function sentences(text: string): string[] {
+  return text.split(/\n+|(?<=[.;!?])\s+/).filter((sentence) => sentence.trim() !== "");
+}
+
 /** Text from the failing calls that must not become a lasting fact. */
-export const LEAK_MARKERS: readonly { name: string; pattern: RegExp }[] = [
-  { name: "refusal code", pattern: /canvas_slot_conflict/i },
-  { name: "refusal text", pattern: /quartz-9|held by another canvas|loop guard/i },
-  { name: "argument value", pattern: /orchid-ledger|split-heron/i },
+export const LEAK_MARKERS: readonly { name: string; test: (summary: string) => boolean }[] = [
+  { name: "refusal code", test: (summary) => /canvas_slot_conflict/i.test(summary) },
+  { name: "refusal text", test: (summary) => /quartz-9|held by another canvas|slot conflict|loop guard/i.test(summary) },
+  { name: "argument value", test: (summary) => /orchid-ledger|split-heron/i.test(summary) },
   {
     name: "standing failure claim",
-    pattern: new RegExp(
-      [
-        String.raw`(keeps?|kept|repeatedly|consistently|always|persistent(ly)?|continu(es|ally|ously))\W+(\w+\W+){0,2}(fail|refus|error|reject)`,
-        String.raw`(does ?n[o']t|do ?n[o']t|can ?n[o']t|cannot|won'?t|will not)\W+work`,
-        String.raw`\b(broken|not working|unusable)\b`,
-        String.raw`(avoid|stop|do not|don'?t|never)\W+(\w+\W+){0,2}(us|call|retry|try)\w*\W+(\w+\W+){0,1}canvas`,
-      ].join("|"),
-      "i",
-    ),
+    test: (summary) => sentences(summary).some((sentence) => TOOL_MENTION.test(sentence) && STANDING_CLAIM.test(sentence)),
   },
 ];
 
@@ -166,6 +189,6 @@ export function score(summary: string): Score {
   const dropped: string[] = [];
   for (const fact of FACTS)
     (fact.variants.some((variant) => lower.includes(variant.toLowerCase())) ? kept : dropped).push(fact.name);
-  const leaks = LEAK_MARKERS.filter((marker) => marker.pattern.test(summary)).map((marker) => marker.name);
+  const leaks = LEAK_MARKERS.filter((marker) => marker.test(summary)).map((marker) => marker.name);
   return { kept, dropped, leaks };
 }

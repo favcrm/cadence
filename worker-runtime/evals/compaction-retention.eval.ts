@@ -22,15 +22,17 @@ type Arm = "instruction" | "control";
 type Run = { arm: Arm; model: string | null; usage: unknown; summary: string; score: Score };
 
 function config() {
+  // Each problem is named on its own line, and only the ones that apply.
+  const problems: string[] = [];
   const missing = REQUIRED.filter((name) => !process.env[name]);
-  if (process.env.CADENCE_EVAL_LIVE && process.env.CADENCE_EVAL_LIVE !== "1") missing.push("CADENCE_EVAL_LIVE");
+  if (missing.length > 0) problems.push(`Missing or empty: ${missing.join(", ")}.`);
+  const live = process.env.CADENCE_EVAL_LIVE;
+  if (live && live !== "1") problems.push("CADENCE_EVAL_LIVE must be 1.");
   const runs = Number(process.env.CADENCE_EVAL_RUNS ?? RUNS_DEFAULT);
-  if (missing.length > 0 || !Number.isSafeInteger(runs) || runs < 1 || runs > RUNS_MAX) {
+  if (!Number.isSafeInteger(runs) || runs < 1 || runs > RUNS_MAX) problems.push(`CADENCE_EVAL_RUNS must be 1..${RUNS_MAX}.`);
+  if (problems.length > 0) {
     console.error(
-      "compaction eval refused: it calls a paid model and runs only when asked.\n" +
-        (missing.length > 0 ? `Missing or invalid: ${[...new Set(missing)].join(", ")} (CADENCE_EVAL_LIVE must be 1).\n` : "") +
-        (Number.isSafeInteger(runs) && runs >= 1 && runs <= RUNS_MAX ? "" : `CADENCE_EVAL_RUNS must be 1..${RUNS_MAX}.\n`) +
-        "Nothing was sent.",
+      ["compaction eval refused: it calls a paid model and runs only when asked.", ...problems, "Nothing was sent."].join("\n"),
     );
     process.exit(2);
   }
