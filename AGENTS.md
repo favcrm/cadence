@@ -516,7 +516,7 @@ are in `docs/DEV-CYCLE.md`; the rules are these.
   host.
 - Run `cargo check`, `cargo test`, `cargo clippy` and `cargo build` through
   `scripts/boat-build -- cargo …`, for example `scripts/boat-build -- cargo test
-  --locked --features test-seam --test daemon <FILTER> -- --test-threads 1`. The
+  --locked --features test-seam --lib <FILTER> -- --test-threads 1`. The
   lane `cargo` shim only queues a host build slot; it does not send the compile
   to Boat. Stay on this host only for a binary that has to run here (`cargo run`,
   a board smoke, a release artifact), and then take a build slot with
