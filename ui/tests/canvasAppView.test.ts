@@ -116,6 +116,7 @@ equal(receipt.operations?.length, 8, "the original receipt is not mutated");
 const paramsRoute = { section: "reports", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-07-01", to: "2026-09-30" } };
 equal(appViewRef(ref("pnl", { route: paramsRoute }))?.route, paramsRoute, "a route with params is a reference");
 equal(appViewRef(ref("pnl", { route: { ...paramsRoute, params: {} } }))?.route.params, undefined, "empty params are no params");
+equal([appViewRef(ref("pnl", { viewId: "pnl" }))?.viewId, appViewRef(ref("pnl", { viewId: "Bad Id" }))?.viewId, appViewRef(ref("pnl"))?.viewId], ["pnl", undefined, undefined], "a declared view id is kept only in its grammar (CAD-2710)");
 for (const params of [[], "x", { From: "a" }, { from: "" }, { from: "x".repeat(201) }, { from: "a\u0007" }, { from: 1 }, Object.fromEntries("abcdefg".split("").map((k) => [k, "x"]))]) {
   equal(appViewRef(ref("pnl", { route: { ...paramsRoute, params } })), null, `refused params ${JSON.stringify(params)?.slice(0, 40)}`);
 }

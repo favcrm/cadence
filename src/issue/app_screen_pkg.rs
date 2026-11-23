@@ -57,6 +57,8 @@ pub struct ScreenPackage {
     pub tools: BTreeMap<String, String>,
     pub operations: Vec<app_screen_decl::ScreenOperation>,
     pub navigation: Option<app_screen_decl::ScreenNavigation>,
+    /// CAD-2710: the declared app views, so the board can read their option labels.
+    pub views: Option<Vec<app_screen_decl::ScreenView>>,
 }
 
 /// `true` when `tag` is a legal screen tag (the bundle's tag grammar).
@@ -140,25 +142,31 @@ pub fn declares_whatsapp_door(files: &BTreeMap<String, String>, app: &str) -> bo
     })
 }
 
+/// The bundle's one valid screen package whose `app` matches `app`.
+fn single_screen_package(files: &BTreeMap<String, String>, app: &str) -> Option<ScreenPackage> {
+    let tags = tags_in(files).ok()?;
+    let [tag] = tags.as_slice() else {
+        return None;
+    };
+    extract(files, tag).ok().filter(|pkg| pkg.app == app)
+}
+
 /// Extract declared `navigation` when the bundle carries a single valid screen
 /// package whose `app` matches `app`. Returns `Value::Null` otherwise.
 pub fn single_screen_navigation(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
-    let Ok(tags) = tags_in(files) else {
-        return serde_json::Value::Null;
-    };
-    let [tag] = tags.as_slice() else {
-        return serde_json::Value::Null;
-    };
-    let Ok(pkg) = extract(files, tag) else {
-        return serde_json::Value::Null;
-    };
-    if pkg.app != app {
-        return serde_json::Value::Null;
-    }
-    match pkg.navigation {
-        Some(nav) => serde_json::to_value(nav).unwrap_or(serde_json::Value::Null),
-        None => serde_json::Value::Null,
-    }
+    single_screen_package(files, app)
+        .and_then(|pkg| pkg.navigation)
+        .and_then(|nav| serde_json::to_value(nav).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// CAD-2710: the declared `views` of that same single screen package, so the
+/// board can show an enum value's declared label. `Value::Null` when none.
+pub fn single_screen_views(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
+    single_screen_package(files, app)
+        .and_then(|pkg| pkg.views)
+        .and_then(|views| serde_json::to_value(views).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// CAD-1827: how one installed bundle relates to the campaign-work contract.
@@ -351,6 +359,7 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
         tools: checked.tools().clone(),
         operations: checked.operations().to_vec(),
         navigation: checked.navigation().cloned(),
+        views: checked.views().map(<[_]>::to_vec),
     })
 }
 
@@ -706,6 +715,15 @@ mod tests {
             (&json!("customers"), &json!("客戶"))
         );
         assert!(single_screen_navigation(&files, "other").is_null());
+        assert!(single_screen_views(&files, "crm").is_null());
+        let mut with_views = with_nav.clone();
+        with_views["views"] = json!([{"id":"pnl","label":{"en":"P&L"},"section":"customers","params":{"compare":{"type":"enum","values":["prior_year"],"labels":{"prior_year":{"zh-TW":"對比去年"}}}}}]);
+        let viewed = bundle_with("main", &with_views.to_string(), &[("client.js", js)]);
+        assert_eq!(
+            single_screen_views(&viewed, "crm")[0]["params"]["compare"]["labels"]["prior_year"]["zh-TW"],
+            json!("對比去年")
+        );
+        assert!(single_screen_views(&viewed, "other").is_null());
         assert!(single_screen_navigation(
             &bundle_with("main", &decl(&[("client.js", js)]), &[("client.js", js)]),
             "crm"

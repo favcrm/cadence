@@ -20,6 +20,8 @@ export interface AppViewRef {
   appLabel?: string;
   /** A declared view's label (CAD-2555); the header names the place from it. */
   viewLabel?: string;
+  /** The declared view's id (CAD-2555); the header reads its option labels (CAD-2710) from it. */
+  viewId?: string;
   /** Set by a view card: its `href` is only a placeholder, and the tab builds the
    *  full-page link from the installation it reads (canonical key and section query). */
   fromCard?: true;
@@ -31,6 +33,7 @@ export interface AppViewRef {
 // the frame would refuse is not a tab.
 const FRAME_ID = /^[a-z0-9_-]{1,64}$/;
 const SCREEN_TAG = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const VIEW_ID = /^[a-z0-9_-]{1,32}$/;
 const HOST_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const APP_HREF = /^\/apps\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}(\?[A-Za-z0-9=&_%.-]{0,512})?$/;
 
@@ -40,7 +43,7 @@ const nullableFrameId = (value: unknown): value is string | null => value === nu
 /** A validated reference, or null: a malformed one opens no tab. */
 export function appViewRef(input: unknown): AppViewRef | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
-  const { installId, tag, contextId, route, title, href, appLabel, viewLabel, fromCard } = input as Record<string, unknown>;
+  const { installId, tag, contextId, route, title, href, appLabel, viewLabel, viewId, fromCard } = input as Record<string, unknown>;
   if (typeof installId !== "string" || !HOST_ID.test(installId)) return null;
   if (typeof tag !== "string" || !SCREEN_TAG.test(tag)) return null;
   if (typeof contextId !== "string" || (contextId !== "" && !HOST_ID.test(contextId))) return null;
@@ -50,7 +53,7 @@ export function appViewRef(input: unknown): AppViewRef | null {
   const { section, view, record_id, segment_id, params } = route as Record<string, unknown>;
   if (!frameId(section) || (view !== "list" && view !== "new") || !nullableFrameId(record_id) || !nullableFrameId(segment_id)) return null;
   if (params !== undefined && !routeParams(params)) return null;
-  return { installId, tag, contextId, route: { section, view, record_id, segment_id, ...withParams(params) }, title: title.trim(), ...(typeof viewLabel === "string" && viewLabel.trim() !== "" && viewLabel.length <= 60 ? { viewLabel: viewLabel.trim() } : {}), ...(typeof appLabel === "string" && appLabel.trim() !== "" && appLabel.length <= 60 ? { appLabel: appLabel.trim() } : {}), ...(fromCard === true ? { fromCard } : {}), href };
+  return { installId, tag, contextId, route: { section, view, record_id, segment_id, ...withParams(params) }, title: title.trim(), ...(typeof viewLabel === "string" && viewLabel.trim() !== "" && viewLabel.length <= 60 ? { viewLabel: viewLabel.trim() } : {}), ...(typeof viewId === "string" && VIEW_ID.test(viewId) ? { viewId } : {}), ...(typeof appLabel === "string" && appLabel.trim() !== "" && appLabel.length <= 60 ? { appLabel: appLabel.trim() } : {}), ...(fromCard === true ? { fromCard } : {}), href };
 }
 
 /** One tab per install, screen and record; opening it again focuses it. The

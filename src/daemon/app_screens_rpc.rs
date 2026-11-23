@@ -1240,6 +1240,7 @@ mod tests {
             host_contract: checked.host_contract().map(str::to_string),
             operations: checked.operations().to_vec(),
             navigation: checked.navigation().cloned(),
+            views: checked.views().map(<[_]>::to_vec),
         };
         let from_checked = render_checked_package_frame_html(
             "cspnonce",

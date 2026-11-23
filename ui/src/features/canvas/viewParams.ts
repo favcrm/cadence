@@ -5,6 +5,7 @@
  * reads better as one and that a raw value reads better humanized.
  */
 import type { RouteParams } from "../workspace-apps/screen/routeParams";
+import type { DeclaredView } from "../workspace-apps/workspaceApps";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -30,12 +31,36 @@ function humanize(value: string): string {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
+/** The app's own words for one param value, or undefined (CAD-2710). */
+export type OptionLabel = (param: string, value: string) => string | undefined;
+
+const own = (obj: object, key: string) => Object.prototype.hasOwnProperty.call(obj, key);
+
+/** The exact locale, then its language, then `en`; undefined when the declaration has none of them. */
+function localeText(texts: Record<string, string>, locale: string): string | undefined {
+  const lower = new Map(Object.entries(texts).map(([k, v]) => [k.toLowerCase(), v]));
+  const tag = locale.toLowerCase();
+  return lower.get(tag) ?? lower.get(tag.split("-")[0]) ?? lower.get("en");
+}
+
+/** The declared labels of one view's enum params for a locale; undefined when the declaration has no such view. */
+export function declaredOptionLabel(views: readonly DeclaredView[] | null | undefined, viewId: string | undefined, locale: string): OptionLabel | undefined {
+  const params = viewId === undefined ? undefined : views?.find((v) => v.id === viewId)?.params;
+  if (!params) return undefined;
+  return (param, value) => {
+    const labels = own(params, param) ? params[param]?.labels : undefined;
+    const texts = labels && own(labels, value) ? labels[value] : undefined;
+    return texts ? localeText(texts, locale) : undefined;
+  };
+}
+
 /**
  * CAD-2690: the view's options in words on one line ("" when there are none), in the card's own order.
  * `from` + `to` days read as one range ("1 Jul – 30 Sep 2026"), any other day as "as at <day>",
  * and every other value humanized (`prior_year` → "Prior year"). `t` is the catalogue.
+ * CAD-2710: `label` supplies the app's declared words for a value; one it has none for is humanized as before.
  */
-export function optionsLine(params: RouteParams | undefined, locale: string, t: (english: string) => string): string {
+export function optionsLine(params: RouteParams | undefined, locale: string, t: (english: string) => string, label?: OptionLabel): string {
   const entries = Object.entries(params ?? {});
   const days = entries.map(([, value]) => day(value));
   const at = (key: string) => days[entries.findIndex(([k]) => k === key)] ?? null;
@@ -48,7 +73,7 @@ export function optionsLine(params: RouteParams | undefined, locale: string, t: 
     if (range !== null && (key === "from" || key === "to")) {
       if (!ranged) parts.push(range);
       ranged = true;
-    } else parts.push(d ? t("as at {date}").replace("{date}", format(d, locale)) : t(humanize(value)));
+    } else parts.push(label?.(key, value) ?? (d ? t("as at {date}").replace("{date}", format(d, locale)) : t(humanize(value))));
   });
   return parts.join(" · ");
 }

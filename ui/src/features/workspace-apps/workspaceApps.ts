@@ -48,6 +48,8 @@ export interface Installation {
   smtp_custody?: boolean;
   /** Declared screen navigation (`app-screens/v1|v2` single-screen package). */
   navigation?: ScreenNavigation | null;
+  /** CAD-2710: the screen's declared app views, as far as enum option labels go. Absent on an older daemon. */
+  views?: DeclaredView[] | null;
   /** Display translations merged from `listing.i18n` and top-level `i18n`. */
   i18n?: AppDisplayI18n | null;
   listing?: Listing | null;
@@ -62,6 +64,11 @@ export interface Installation {
    * daemon that omits the field means) keeps the worker path.
    */
   workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; ask?: string | null; optional?: boolean; kind?: string | null; example?: string | null; default?: string | null; context_default?: boolean }[] }[];
+}
+/** One declared app view: an enum param's `labels` are value -> locale -> text (CAD-2710). */
+export interface DeclaredView {
+  id: string;
+  params?: Record<string, { labels?: Record<string, Record<string, string>> }>;
 }
 /** A write acknowledgement, distinct from a later installation read. */
 export type CommittedInstallation = Installation & { committed: true };

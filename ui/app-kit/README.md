@@ -226,6 +226,16 @@ A view names a navigation section, optionally a record, and the params it takes:
   characters) or `{ "type": "enum", "values": [...] }` (up to 20 strings). Add
   `"required": true` to refuse a call without it; every param is optional
   otherwise.
+- An `enum` param may add `labels`, the words the canvas header and the view card
+  show for a value instead of the humanized id:
+  `"labels": { "prior_year": { "en": "vs prior year", "zh-TW": "對比去年" } }`.
+  Keys must be listed `values`; each value takes 1 to 8 locales, each up to 40
+  characters with no control characters; `labels` on a non-enum param is refused.
+  The board picks its own locale, then its language (`zh` for `zh-TW`), then `en`,
+  and a value without a usable label keeps the humanized id. Values are never
+  renamed, so routes and chat cards are unchanged. A daemon older than the one
+  that adds `labels` refuses a manifest that carries it: ship it only after
+  the daemon and the packager's `CADENCE_TARGET_VERSION` include it.
 - Unknown keys, an undeclared section, a repeated id or param, or a value over
   a limit refuse the whole declaration at install.
 

@@ -185,6 +185,7 @@ emptyParams.payload.params = {};
 equal(parseViewRef(entryOf(emptyParams))?.params, {}, "an empty params object is accepted");
 const paramsRef = viewCardAppView(paramsModel!);
 equal([paramsRef?.route, paramsRef?.viewLabel], [{ section: "reports", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-01-01", to: "2026-03-31" } }, "Profit and loss"], "the card's route and label carry the view");
+equal([paramsRef?.viewId, viewCardAppView(model!)?.viewId], ["pnl", undefined], "the card passes its declared view id to the tab (CAD-2710)");
 const paramsHtml = render(withParams);
 check(paramsHtml.includes("Books · Profit and loss") && paramsHtml.includes("data-view-params") && paramsHtml.includes("1 Jan – 31 Mar 2026"), "the card shows the view label and a compact params line");
 check(!render(valid).includes("data-view-params"), "a card without params has no params line");

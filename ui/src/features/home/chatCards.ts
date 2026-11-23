@@ -670,6 +670,7 @@ export function viewCardAppView(model: ViewCardModel, scope: ViewScope = HOME_VI
     title: model.title,
     appLabel: model.appLabel,
     ...(model.viewLabel ? { viewLabel: model.viewLabel } : {}),
+    ...(model.view ? { viewId: model.view } : {}),
     // A placeholder: the tab builds the real link from the installation it reads.
     fromCard: true,
     href: `/apps/${model.app}`,
