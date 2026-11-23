@@ -327,28 +327,37 @@ impl Shared {
         };
         // The hit is charged first, then neighbours nearest first, one
         // side then the other, so the budget never drops the hit itself.
+        // A side stops at its first entry that does not fit, so the window
+        // never shows a farther entry with a gap before it.
         let hit = older.pop().expect("the hit was checked above");
-        let mut order = vec![hit];
-        let (mut left, mut right) = (older.into_iter().rev(), newer.into_iter());
-        loop {
-            let (l, r) = (left.next(), right.next());
-            if l.is_none() && r.is_none() {
-                break;
-            }
-            order.extend(l);
-            order.extend(r);
-        }
-        let mut kept = Vec::new();
         let mut bytes = 0;
         let mut truncated = false;
-        for entry in order {
+        let mut kept = Vec::new();
+        let mut charge = |entry: store::ThreadEntry| -> bool {
             let text = search::clip(&redact.text(&entry.text), search::WINDOW_ENTRY_MAX);
             if bytes + text.len() > search::WINDOW_BYTES_MAX {
                 truncated = true;
-                continue;
+                return false;
             }
             bytes += text.len();
             kept.push((entry, text));
+            true
+        };
+        charge(hit);
+        let mut sides = [
+            Some(older.into_iter().rev().collect::<Vec<_>>().into_iter()),
+            Some(newer.into_iter()),
+        ];
+        while sides.iter().any(Option::is_some) {
+            for side in sides.iter_mut() {
+                let fits = side
+                    .as_mut()
+                    .and_then(Iterator::next)
+                    .is_some_and(&mut charge);
+                if !fits {
+                    *side = None;
+                }
+            }
         }
         kept.sort_by_key(|(entry, _)| entry.seq);
         let entries: Vec<Value> = kept
