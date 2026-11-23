@@ -1,7 +1,7 @@
 import SafeLink from "../../ui/SafeLink";
 import { useEffect, useRef, useState } from "react";
 import { Resource, type ResourceState } from "../../lib/cache";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useMaybeResource, useQuery } from "../../lib/useResource";
 import type {
@@ -195,6 +195,10 @@ function PageBody({
   const images = detail.artifacts.filter((f) => IMG.test(f.name));
   const files = detail.artifacts.filter((f) => !IMG.test(f.name));
   const [compose, setCompose] = useState<"ask" | "instruct">("ask");
+  const [descriptionDraft, setDescriptionDraft] = useState<{ body: string; rev: string } | null>(null);
+  const [savingDescription, setSavingDescription] = useState(false);
+  const [descriptionConflict, setDescriptionConflict] = useState(false);
+  const descriptionStale = descriptionConflict || (descriptionDraft !== null && descriptionDraft.rev !== detail.rev);
   const reloadLane = () => {
     void resources.issue(id).invalidate();
     if (!hosted) void resources.lane(id).invalidate();
@@ -220,6 +224,24 @@ function PageBody({
       .patch(id, body, detail.rev)
       .then((r) => onWrite(r, verb))
       .catch((e) => onError(e, verb));
+  };
+  const saveDescription = async () => {
+    if (!descriptionDraft || descriptionStale || savingDescription || readOnly) return;
+    setSavingDescription(true);
+    try {
+      const result = await api.patch(id, { body: descriptionDraft.body }, descriptionDraft.rev);
+      onWrite(result, t("Description"));
+      setDescriptionDraft(null);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        setDescriptionConflict(true);
+        void resources.issue(id).invalidate();
+      } else {
+        onError(error, t("Description"));
+      }
+    } finally {
+      setSavingDescription(false);
+    }
   };
 
   return (
@@ -345,9 +367,51 @@ function PageBody({
                   </strong>
                 </div>
               )}
-              <div className="issue-reader max-w-[84ch] text-secondary text-ink-300">
-                <Md text={detail.body} onOpen={onOpen} />
-              </div>
+              {hosted && !readOnly && descriptionDraft ? (
+                <form className="grid gap-2" onSubmit={(event) => {
+                  event.preventDefault();
+                  void saveDescription();
+                }}>
+                  <label className="slabel" htmlFor="issue-description-draft">{t("Description")}</label>
+                  <textarea
+                    id="issue-description-draft"
+                    name="body"
+                    className="field w-full !h-auto py-2"
+                    rows={10}
+                    value={descriptionDraft.body}
+                    readOnly={savingDescription}
+                    onChange={(event) => setDescriptionDraft({ ...descriptionDraft, body: event.target.value })}
+                    autoFocus
+                  />
+                  {descriptionStale && (
+                    <p role="alert" className="text-secondary text-warn">
+                      {t("The issue changed while you were editing. Copy your draft, then reopen the editor to use the latest version.")}
+                    </p>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="submit" variant="primary" loading={savingDescription} disabled={descriptionStale}>
+                      {t("Save changes")}
+                    </Button>
+                    <Button disabled={savingDescription} onClick={() => setDescriptionDraft(null)}>{t("Cancel")}</Button>
+                  </div>
+                </form>
+              ) : (
+                <>
+                  {hosted && !readOnly && detail.rev && (
+                    <div>
+                      <Button size="sm" onClick={() => {
+                        setDescriptionConflict(false);
+                        setDescriptionDraft({ body: detail.body, rev: detail.rev });
+                      }}>
+                        {t("Edit description")}
+                      </Button>
+                    </div>
+                  )}
+                  <div className="issue-reader max-w-[84ch] text-secondary text-ink-300">
+                    <Md text={detail.body} onOpen={onOpen} />
+                  </div>
+                </>
+              )}
             </section>
           )}
           {activeTab === "activity" && (

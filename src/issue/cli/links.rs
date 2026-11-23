@@ -84,10 +84,12 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             refs,
             unrefs,
             attach,
+            body,
             acceptance,
             comment_file,
             author,
             force,
+            if_rev,
         } => {
             // The master has no stdin and no free file reads (CAD-614),
             // and `edit` is not on its allowlist; refuse here too so a
@@ -95,6 +97,11 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             if crate::master::caller_is_master() {
                 return Err(Error::rejected(
                     "issue edit is not available to the master — use the single-purpose verbs",
+                ));
+            }
+            if body.is_some() || if_rev.is_some() {
+                return Err(Error::usage(
+                    "issue edit --body and --if-rev are hosted-only",
                 ));
             }
             let is_stdin = |f: &Option<PathBuf>| f.as_ref().is_some_and(|p| p.as_os_str() == "-");

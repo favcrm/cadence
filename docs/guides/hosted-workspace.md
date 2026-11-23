@@ -908,6 +908,35 @@ read the actual page and cite its canonical path and revision. Wiki and CLI
 scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
 
+### Edit a hosted issue's description or acceptance
+
+On the issue's Overview tab, choose **Edit description** to edit the Markdown,
+including the `## Acceptance` section. A signed-in project writer can save it;
+if the issue changed after the editor opened, the save refuses and keeps the
+draft available to copy.
+
+In a plain human CLI session with `cli.write`, take `<rev>` from
+`cadence --org acme issue show <issue-id> --json`. Use one of:
+
+```sh
+cadence --org acme issue edit <issue-id> --body description.md --if-rev <rev>
+cadence --org acme issue edit <issue-id> --acceptance checklist.md --if-rev <rev>
+cadence --org acme issue acceptance <issue-id> --from checklist.md --if-rev <rev>
+cadence --org acme issue set <issue-id> 'acceptance=- [ ] Verify the amended result' --if-rev <rev>
+```
+
+Use `-` for stdin instead of a filename. `--body` replaces the whole body.
+The acceptance forms read the current body, replace only the checklist in the
+level-two Acceptance section with explicit `- [ ]` or `- [x]` rows, and save under the
+same revision guard. They require `cli.read` as well as `cli.write`. A stale
+revision never overwrites another edit. If an older host refuses the CLI
+edit, use its issue-page editor if available or upgrade the host; nothing
+falls back to a comment or an unguarded write.
+
+Review workflows read the issue body, not activity comments. Amending the
+contract does not replace a verdict already filed at the same head; the owner
+can [accept an incorrect workflow REVISE for that head](delivery.md#what-the-human-approval-does).
+
 `wiki cp` copies a file or a folder into the hosted wiki and out of it on a
 board that supports it; see "Recursive copy" in
 `docs/guides/wiki-knowledge.md` for the board's limits, the timeout and what each

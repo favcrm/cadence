@@ -7674,6 +7674,14 @@ fn call_verb_until_retry(
                 ));
             }
             Verdict::Done(Err(e)) => {
+                // Older tenant builds reject the new body field as invalid_request.
+                // Preserve that safe code so the CLI can explain the version boundary.
+                if verb == "issue_set"
+                    && status == 400
+                    && refusal_code.as_deref() == Some("invalid_request")
+                {
+                    return Err(Error::invalid("invalid_request", e.to_string()));
+                }
                 if let Some(error) = skill_refusal(
                     verb,
                     status,

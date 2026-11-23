@@ -6,8 +6,8 @@ name: review-spec # per axis
 # token and any step of the model job can read the model key, so no job holds
 # both:
 #   prepare  id-token, no secret, no model: reads the context and the diff.
-#   review   the model key and the seal private key, no id-token, no checkout: one
-#            fresh model call on the diff, whose only output is a JSON schema.
+#   review   the model key and the seal private key, no id-token, no checkout:
+#            obtains and validates a schema-shaped review, then seals it.
 #   file     id-token and the seal private key (to open the sealed review output
 #            only), never the model key: validates that output and files the verdict.
 # No model-derived, PR-derived or tenant-derived text is ever logged: messages are
@@ -21,9 +21,8 @@ name: review-spec # per axis
 # review-standards.yml is the same file: it may differ from this one ONLY in this
 # leading comment block and in lines containing the text "per axis" (the name,
 # run-name and concurrency group, KIND, CHECKS and the AXIS prompt). Delete those
-# lines from both files and the rest must be byte-identical. The sealing and
-# parseDiff helpers are repeated inside the jobs that use them (prepare: seal,
-# parseDiff; review: seal, unseal; file: unseal, parseDiff).
+# lines from both files and the rest must be byte-identical. The review and
+# filing jobs share a validator from this file, never from a checkout or artifact.
 #
 # Sealing: the private ticket (title, status, body) and the model's output are
 # never uploaded in the clear. prepare seals them (RSA-OAEP-SHA256 wrapping an
@@ -330,7 +329,7 @@ jobs:
   review:
     needs: prepare
     runs-on: ubuntu-24.04
-    # One generation of at most 15 minutes (a second request only after an explicit 429 or 5xx), plus start-up.
+    # Up to two requests of at most 15 minutes each, plus start-up.
     timeout-minutes: 40
     environment: cadence-review
     permissions: {}
@@ -339,6 +338,102 @@ jobs:
         with:
           name: review-input
           path: ${{ runner.temp }}/in
+      - &review_validator
+        name: Write the trusted review validator
+        run: |
+          cat >"$RUNNER_TEMP/review-validator.mjs" <<'JS'
+          const { CHECKS, PR, HEAD, KIND, PROJECT } = process.env;
+          const names = CHECKS.split(',');
+          // The new-side line numbers each file's hunks show (and the number of file sections). Every hunk is
+          // walked by its declared line counts, whether or not its file is known, so no diff content line can
+          // pass for a header. `+++` counts as a header only directly after `---`. A quoted file name is not
+          // decoded: its lines are walked but recorded nowhere, so nothing can cite it. Anything incomplete or
+          // binary is refused, as in prepare.
+          class Refusal extends Error {}
+          function parseDiff(text) {
+            if (!text.endsWith('\n')) throw new Refusal('the diff is incomplete');
+            const lines = text.split('\n'); lines.pop();
+            const files = new Map();
+            let sections = 0, cur = null, o = 0, n = 0, nl = 0, old = false, m;
+            for (const line of lines) {
+              if (o > 0 || n > 0) {
+                const c = line[0];
+                if (c === '\\') {
+                  if (line !== '\\ No newline at end of file') throw new Refusal('the diff has unexpected text');
+                  continue;
+                }
+                if (c === '+') { cur?.add(nl); nl++; n--; continue; }
+                if (c === '-') { o--; continue; }
+                if (c === ' ' || line === '') { cur?.add(nl); nl++; o--; n--; continue; }
+                throw new Refusal('the diff has an incomplete hunk');
+              }
+              if (line.startsWith('diff --git ')) { sections++; cur = null; old = false; continue; }
+              if (line.startsWith('--- ')) { old = true; continue; }
+              if (old && line.startsWith('+++ ')) {
+                old = false; cur = null;
+                const name = line.slice(4).replace(/\t$/, '');
+                if (name.startsWith('b/')) { cur = files.get(name.slice(2)) ?? new Set(); files.set(name.slice(2), cur); }
+                continue;
+              }
+              old = false;
+              if (line.startsWith('Binary files ') || line === 'GIT binary patch') throw new Refusal('the diff has a binary section the reviewer cannot see');
+              if ((m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
+                o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
+                continue;
+              }
+              if (line === '\\ No newline at end of file' ||
+                  /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}|(?:similarity|dissimilarity) index \d+%|(?:rename|copy) (?:from|to) .+)$/.test(line)) continue;
+              throw new Refusal('the diff has unexpected text');
+            }
+            if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
+            return { files, sections };
+          }
+          // Notes and paths go into a board-rendered body: no HTML, no link or image syntax, no bare URLs.
+          const san = (s, n = 300) => String(s).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff<>`]/g, ' ').replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, '(url)').replace(/\b(?:www\.|(?:mailto|javascript|vbscript|data|file|tel|sms):)\S*/gi, '(url)').replace(/\[/g, '(').replace(/\]/g, ')').replace(/!(?=\()/g, '').replace(/\s+/g, ' ').trim().slice(0, n);
+
+          // Everything the verdict says comes from this function: the schema-shaped output, checked
+          // field by field. The reason is never printed (the caller prints one fixed line); the messages
+          // below only document each rule.
+          function validate(review, input, diffFiles) {
+            const { output } = review;
+            const bad = (m) => { throw new Refusal(m); };
+            const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+            const only = (o, keys) => Object.keys(o).length === keys.length && keys.every((k) => k in o);
+            if (!isObj(output) || !only(output, ['outcome', 'risk_level', 'risk_triggers', 'checks'])) bad('output has the wrong shape');
+            if (!Array.isArray(output.checks) || output.checks.length !== names.length) bad('output must hold each required check exactly once');
+            const seen = new Set(); const lines = []; const results = {}; let fails = 0, passes = 0;
+            for (const c of output.checks) {
+              if (!isObj(c) || !only(c, ['name', 'result', 'note', 'citations'])) bad('a check has the wrong shape');
+              if (typeof c.name !== 'string' || !names.includes(c.name) || seen.has(c.name)) bad('a check name is unknown or repeated');
+              seen.add(c.name);
+              if (!['pass', 'fail', 'na'].includes(c.result) || typeof c.note !== 'string' || !Array.isArray(c.citations)) bad(`check ${c.name} has bad fields`);
+              c.citations.forEach((k, i) => {
+                if (!isObj(k) || !only(k, ['file', 'line']) || typeof k.file !== 'string' || !Number.isInteger(k.line)) bad(`check ${c.name} citation ${i + 1} is malformed`);
+                if (!diffFiles.get(k.file)?.has(k.line)) bad(`check ${c.name} citation ${i + 1} is not a line of the diff`);
+              });
+              if (c.result === 'na' ? c.citations.length !== 0 : c.citations.length === 0) bad(`check ${c.name} has the wrong number of citations for its result`);
+              results[c.name] = c.result;
+              if (c.result === 'fail') fails++;
+              if (c.result === 'pass') passes++;
+              const note = san(c.note);
+              lines.push(`- ${c.name}: ${c.result.toUpperCase()}${note ? ` - ${note}` : ''}${c.citations.length ? ` [${c.citations.map((k) => `${san(k.file, 200)}:${k.line}`).join(', ')}]` : ''}`);
+            }
+            const outcome = fails > 0 ? 'revise' : 'pass';
+            if (output.outcome !== outcome) bad('outcome contradicts the checks');
+            if (outcome === 'pass' && passes < 2) bad('a pass needs at least two checks that pass with citations');
+            if (outcome === 'pass' && results['ticket-requirements'] === 'na') bad('a pass needs ticket-requirements judged, not na');
+            let risk;
+            if (output.risk_level === 'auto' && Array.isArray(output.risk_triggers) && output.risk_triggers.length === 0) risk = 'auto';
+            else if (output.risk_level === 'human' && Array.isArray(output.risk_triggers) && output.risk_triggers.length > 0
+              && output.risk_triggers.every((t) => Number.isInteger(t) && t >= 1 && t <= 7) && new Set(output.risk_triggers).size === output.risk_triggers.length)
+              risk = `human (${[...output.risk_triggers].sort((a, b) => a - b).join(', ')})`;
+            else bad('risk is not auto or human with trigger numbers 1 to 7');
+            const body = [`Workflow review (${KIND}) of PR ${PR} at head ${HEAD}, model ${san(review.model, 60)}.`, '', ...lines, '', `Risk: ${risk}`].join('\n');
+            return { project: PROJECT, issue: input.issue, outcome, title_outcome: outcome, section_outcome: outcome, risk, body };
+          }
+
+          export { parseDiff, validate };
+          JS
       - name: Review the diff with a fresh model session
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -348,6 +443,7 @@ jobs:
           node --input-type=module - <<'JS'
           import fs from 'node:fs';
           import crypto from 'node:crypto';
+          import { pathToFileURL } from 'node:url';
           const E = process.env, { PR, HEAD, REPO } = E;
           if (Number(process.versions.node.split('.')[0]) < 20) { console.log('::error::Node 20 or newer is required'); process.exit(1); }
           // Log hygiene: only fixed text, numbers and enum-checked names are printed; nothing taken from
@@ -395,6 +491,9 @@ jobs:
           }
           const input = JSON.parse(fs.readFileSync(`${E.RUNNER_TEMP}/in/review-input.json`, 'utf8'));
           if (input.head !== HEAD || String(input.pr) !== PR) die('review input is not for this dispatch');
+          const { parseDiff, validate } = await import(pathToFileURL(`${E.RUNNER_TEMP}/review-validator.mjs`));
+          let diffFiles;
+          try { diffFiles = parseDiff(input.diff).files; } catch { die('the review diff cannot be read; no model called'); }
           // Fail closed before spending on the model: the pair must work, and the ticket must open.
           const pub = publicKey(), priv = privateKey();
           try { if (unseal(priv, 'selftest', seal(pub, 'selftest', { ok: 1 })).ok !== 1) throw 0; } catch { die('REVIEW_SEAL_PUBLIC_KEY and REVIEW_SEAL_PRIVATE_KEY are not a pair; no model called'); }
@@ -426,7 +525,7 @@ jobs:
           const schema = { type: 'object', additionalProperties: false, required: ['outcome', 'risk_level', 'risk_triggers', 'checks'], properties: {
             outcome: { type: 'string', enum: ['pass', 'revise'] }, risk_level: { type: 'string', enum: ['auto', 'human'] },
             risk_triggers: { type: 'array', items: { type: 'integer' } }, checks: { type: 'array', items: check } } };
-          // No tools, no shell, no checkout: one request, structured output only. OpenRouter routes only to
+          // No tools, no shell, no checkout: structured output only. OpenRouter routes only to
           // providers that accept every parameter sent (require_parameters, so json_schema is enforced or the call
           // is refused), that do not retain or train on prompts (data_collection deny, zdr); with no such
           // provider the call fails with a 404 and nothing is filed.
@@ -439,10 +538,9 @@ jobs:
             response_format: { type: 'json_schema', json_schema: { name: 'review', strict: true, schema } },
             messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
           });
-          // Streamed, so headers arrive at once and Node's 300 s headers timeout cannot fire; the whole call
-          // has one 15-minute deadline. A second request is made only after an explicit 429 or 5xx status
-          // (nothing was generated); a timeout, a dropped stream or a mid-stream error fails closed, so one
-          // run never pays for two generations.
+          // Streamed to keep the header deadline separate from the 15-minute call deadline.
+          // Retry only an explicit 429/5xx or a complete answer that fails verdict validation.
+          // A timeout, dropped stream or provider refusal remains terminal.
           const streamProblems = new Set();
           async function ask() {
             streamProblems.clear();
@@ -454,7 +552,6 @@ jobs:
             let sawModel = false;
             let sawAccounting = false, nativeStop = null;
             let text = '', stop = null, buf = '', failed = false, big = false, refused = false;
-            let nonStringContent = false;
             let sawMetadata = false, sawDone = false;
             const dec = new TextDecoder();
             const fail = (category) => { failed = true; streamProblems.add(category); };
@@ -559,7 +656,6 @@ jobs:
                   if (c.delta?.refusal != null && typeof c.delta.refusal !== 'string') { fail('choice'); continue; }
                   if (largeInput && c.delta?.content != null && typeof c.delta.content !== 'string') { fail('choice'); continue; }
                   if (typeof c.delta?.content === 'string') { text += c.delta.content; if (text.length > 60000) big = true; }
-                  else if (c.delta?.content != null) nonStringContent = true;
                   if (typeof c.delta?.refusal === 'string' && c.delta.refusal !== '') refused = true;
                   if (typeof c.finish_reason === 'string') {
                     if (stop === null) { stop = c.finish_reason; if (largeInput && c.native_finish_reason != null) nativeStop = c.native_finish_reason; }
@@ -577,25 +673,30 @@ jobs:
               }
             }
             if (largeInput && (!sawMetadata || !sawDone || (buf + dec.decode()).trim() !== '')) failed = true;
-            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop, nonStringContent };
+            return big ? { status: 200, big: true } : failed || stop === 'error' ? { status: 200, broken: true } : { status: 200, text, stop: refused ? 'refusal' : stop };
           }
-          let res = null;
+          let parsed;
           for (let i = 1; i <= 2; i++) {
             let r;
             try { r = await ask(); } catch { die('the model call failed or timed out; nothing filed'); }
-            if (r.status === 200 && r.big) die('model output is too large to file; nothing filed');
-            if (r.status === 200 && !r.broken) { res = r; break; }
+            if (r.status === 200 && !r.broken) {
+              if (r.big || Buffer.byteLength(r.text) > 60000) die('model output is too large to file; nothing filed');
+              if (r.stop !== 'stop') die(['refusal', 'content_filter', 'length'].includes(r.stop) ? `model stopped with ${r.stop}; nothing filed` : 'model stopped early; nothing filed');
+              let problem = 'model output is not JSON';
+              try {
+                parsed = JSON.parse(r.text);
+                problem = 'model output failed validation';
+                validate({ model: E.REVIEW_MODEL, output: parsed }, input, diffFiles);
+                break;
+              } catch {
+                if (i === 2) die(`${problem}; nothing filed`);
+                out(`model attempt ${i}: ${problem}; retrying`);
+                continue;
+              }
+            }
             if (r.status === 429 || r.status >= 500) { if (i < 2) { out(`model attempt ${i}: HTTP ${r.status}`); await sleep(20000); continue; } }
             if (r.status === 200 && r.broken) out(`stream validation: ${[...streamProblems].sort().join(',') || 'incomplete'}`);
             die(r.broken ? 'the model stream failed; nothing filed' : `model request failed: HTTP ${r.status}; nothing filed`);
-          }
-          if (Buffer.byteLength(res.text) > 60000) die('model output is too large to file; nothing filed');
-          if (res.stop !== 'stop') die(['refusal', 'content_filter', 'length'].includes(res.stop) ? `model stopped with ${res.stop}; nothing filed` : 'model stopped early; nothing filed');
-          let parsed;
-          try { parsed = JSON.parse(res.text); } catch {
-            out(`model text empty: ${res.text === '' ? 'yes' : 'no'}`);
-            out(`non-string model content observed: ${res.nonStringContent ? 'yes' : 'no'}`);
-            die('model output is not JSON; nothing filed');
           }
           fs.mkdirSync(`${E.RUNNER_TEMP}/out`, { recursive: true });
           // The output may quote the ticket, so it is sealed like the ticket.
@@ -623,6 +724,7 @@ jobs:
         with:
           pattern: '{file-input,review-output}'
           path: ${{ runner.temp }}/in
+      - *review_validator
       - name: Validate the output and file the verdict
         env:
           REVIEW_SEAL_PRIVATE_KEY: ${{ secrets.REVIEW_SEAL_PRIVATE_KEY }}
@@ -630,7 +732,8 @@ jobs:
           node --input-type=module - <<'JS'
           import fs from 'node:fs';
           import crypto from 'node:crypto';
-          const E = process.env, { PR, HEAD, REPO, PROJECT, TENANT, KIND } = E;
+          import { pathToFileURL } from 'node:url';
+          const E = process.env, { PR, HEAD, REPO, TENANT, KIND } = E;
           if (Number(process.versions.node.split('.')[0]) < 20) { console.log('::error::Node 20 or newer is required'); process.exit(1); }
           // Log hygiene: only fixed text, numbers and enum-checked names are printed; nothing taken from
           // the model output, the PR, the ticket or a response body reaches a log. clean() is a last guard.
@@ -658,102 +761,17 @@ jobs:
           function privateKey() {
             try { return crypto.createPrivateKey(E.REVIEW_SEAL_PRIVATE_KEY || ''); } catch { die('environment secret REVIEW_SEAL_PRIVATE_KEY is missing or malformed; nothing filed'); }
           }
-          // The new-side line numbers each file's hunks show (and the number of file sections). Every hunk is
-          // walked by its declared line counts, whether or not its file is known, so no diff content line can
-          // pass for a header. `+++` counts as a header only directly after `---`. A quoted file name is not
-          // decoded: its lines are walked but recorded nowhere, so nothing can cite it. Anything incomplete or
-          // binary is refused. The same function runs in prepare and in file.
-          class Refusal extends Error {}
-          function parseDiff(text) {
-            if (!text.endsWith('\n')) throw new Refusal('the diff is incomplete');
-            const lines = text.split('\n'); lines.pop();
-            const files = new Map();
-            let sections = 0, cur = null, o = 0, n = 0, nl = 0, old = false, m;
-            for (const line of lines) {
-              if (o > 0 || n > 0) {
-                const c = line[0];
-                if (c === '\\') {
-                  if (line !== '\\ No newline at end of file') throw new Refusal('the diff has unexpected text');
-                  continue;
-                }
-                if (c === '+') { cur?.add(nl); nl++; n--; continue; }
-                if (c === '-') { o--; continue; }
-                if (c === ' ' || line === '') { cur?.add(nl); nl++; o--; n--; continue; }
-                throw new Refusal('the diff has an incomplete hunk');
-              }
-              if (line.startsWith('diff --git ')) { sections++; cur = null; old = false; continue; }
-              if (line.startsWith('--- ')) { old = true; continue; }
-              if (old && line.startsWith('+++ ')) {
-                old = false; cur = null;
-                const name = line.slice(4).replace(/\t$/, '');
-                if (name.startsWith('b/')) { cur = files.get(name.slice(2)) ?? new Set(); files.set(name.slice(2), cur); }
-                continue;
-              }
-              old = false;
-              if (line.startsWith('Binary files ') || line === 'GIT binary patch') throw new Refusal('the diff has a binary section the reviewer cannot see');
-              if ((m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line))) {
-                o = m[1] === undefined ? 1 : Number(m[1]); n = m[3] === undefined ? 1 : Number(m[3]); nl = Number(m[2]);
-                continue;
-              }
-              if (line === '\\ No newline at end of file' ||
-                  /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|(?:old mode|new mode|new file mode|deleted file mode) [0-7]{6}|(?:similarity|dissimilarity) index \d+%|(?:rename|copy) (?:from|to) .+)$/.test(line)) continue;
-              throw new Refusal('the diff has unexpected text');
-            }
-            if (o > 0 || n > 0) throw new Refusal('the diff has an incomplete hunk');
-            return { files, sections };
-          }
           const rd = (p) => JSON.parse(fs.readFileSync(`${E.RUNNER_TEMP}/in/${p}`, 'utf8'));
           const input = rd('file-input/file-input.json');
           let review;
           try { review = unseal(privateKey(), 'review-output', rd('review-output/review-output.json')); } catch { die('the sealed review output does not open (tampered or sealed to another key); nothing filed'); }
           if (input.head !== HEAD || String(input.pr) !== PR || input.repo !== REPO) die('file input is not for this dispatch');
           if (!/^[A-Za-z][A-Za-z0-9]{1,15}-[0-9]{1,9}$/.test(input.issue || '')) die('file input has no valid ticket id');
-          const names = E.CHECKS.split(',');
-          // Notes and paths go into a board-rendered body: no HTML, no link or image syntax, no bare URLs.
-          const san = (s, n = 300) => String(s).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff<>`]/g, ' ').replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, '(url)').replace(/\b(?:www\.|(?:mailto|javascript|vbscript|data|file|tel|sms):)\S*/gi, '(url)').replace(/\[/g, '(').replace(/\]/g, ')').replace(/!(?=\()/g, '').replace(/\s+/g, ' ').trim().slice(0, n);
-
-          // Everything the verdict says comes from this function: the schema-shaped output, checked
-          // field by field. The reason is never printed (the caller prints one fixed line); the messages
-          // below only document each rule.
-          function validate(output, diffFiles) {
-            const bad = (m) => { throw new Refusal(m); };
-            const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
-            const only = (o, keys) => Object.keys(o).length === keys.length && keys.every((k) => k in o);
-            if (!isObj(output) || !only(output, ['outcome', 'risk_level', 'risk_triggers', 'checks'])) bad('output has the wrong shape');
-            if (!Array.isArray(output.checks) || output.checks.length !== names.length) bad('output must hold each required check exactly once');
-            const seen = new Set(); const lines = []; const results = {}; let fails = 0, passes = 0;
-            for (const c of output.checks) {
-              if (!isObj(c) || !only(c, ['name', 'result', 'note', 'citations'])) bad('a check has the wrong shape');
-              if (typeof c.name !== 'string' || !names.includes(c.name) || seen.has(c.name)) bad('a check name is unknown or repeated');
-              seen.add(c.name);
-              if (!['pass', 'fail', 'na'].includes(c.result) || typeof c.note !== 'string' || !Array.isArray(c.citations)) bad(`check ${c.name} has bad fields`);
-              c.citations.forEach((k, i) => {
-                if (!isObj(k) || !only(k, ['file', 'line']) || typeof k.file !== 'string' || !Number.isInteger(k.line)) bad(`check ${c.name} citation ${i + 1} is malformed`);
-                if (!diffFiles.get(k.file)?.has(k.line)) bad(`check ${c.name} citation ${i + 1} is not a line of the diff`);
-              });
-              if (c.result === 'na' ? c.citations.length !== 0 : c.citations.length === 0) bad(`check ${c.name} has the wrong number of citations for its result`);
-              results[c.name] = c.result;
-              if (c.result === 'fail') fails++;
-              if (c.result === 'pass') passes++;
-              const note = san(c.note);
-              lines.push(`- ${c.name}: ${c.result.toUpperCase()}${note ? ` - ${note}` : ''}${c.citations.length ? ` [${c.citations.map((k) => `${san(k.file, 200)}:${k.line}`).join(', ')}]` : ''}`);
-            }
-            const outcome = fails > 0 ? 'revise' : 'pass';
-            if (output.outcome !== outcome) bad('outcome contradicts the checks');
-            if (outcome === 'pass' && passes < 2) bad('a pass needs at least two checks that pass with citations');
-            if (outcome === 'pass' && results['ticket-requirements'] === 'na') bad('a pass needs ticket-requirements judged, not na');
-            let risk;
-            if (output.risk_level === 'auto' && Array.isArray(output.risk_triggers) && output.risk_triggers.length === 0) risk = 'auto';
-            else if (output.risk_level === 'human' && Array.isArray(output.risk_triggers) && output.risk_triggers.length > 0
-              && output.risk_triggers.every((t) => Number.isInteger(t) && t >= 1 && t <= 7) && new Set(output.risk_triggers).size === output.risk_triggers.length)
-              risk = `human (${[...output.risk_triggers].sort((a, b) => a - b).join(', ')})`;
-            else bad('risk is not auto or human with trigger numbers 1 to 7');
-            const body = [`Workflow review (${KIND}) of PR ${PR} at head ${HEAD}, model ${san(review.model, 60)}.`, '', ...lines, '', `Risk: ${risk}`].join('\n');
-            return { project: PROJECT, issue: input.issue, outcome, title_outcome: outcome, section_outcome: outcome, risk, body };
-          }
-
           let payload;
-          try { payload = validate(review.output, parseDiff(input.diff).files); } catch { die('model output failed validation; nothing filed'); }
+          try {
+            const { parseDiff, validate } = await import(pathToFileURL(`${E.RUNNER_TEMP}/review-validator.mjs`));
+            payload = validate(review, input, parseDiff(input.diff).files);
+          } catch { die('model output failed validation; nothing filed'); }
 
           // A fresh token for every attempt; the identical payload each time, so a retry
           // after a lost response reads back as a duplicate of the same run attempt.

@@ -346,6 +346,11 @@ cadence --org acme audit accept-revise --project <project-key> --issue <issue-id
 This lifts that one refusal. An owner's own `revise`, a missing check, a scope or
 a missing merge approval still refuse.
 
+Both review workflows retry once within the same run if a complete model
+answer is malformed JSON or fails verdict validation. A valid `revise` is
+filed as-is. If neither attempt yields a valid answer, nothing is filed and
+the gate still requires that review.
+
 ## Hosted operator commands
 
 These are the owner's, run in a plain terminal. An agent never runs them: the
