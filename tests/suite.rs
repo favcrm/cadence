@@ -19091,3 +19091,469 @@ mod cad2457_doctor_acceptance {
         assert_eq!(disabled["discovery"], "disabled");
     }
 }
+
+// CAD-2494 acceptance, authored from the ticket by someone other than the implementer;
+// the implementer must not edit or weaken it. The real `scripts/enqueue-reviewed --dry-run`
+// against an owner-approved custom policy answer, on an exact head.
+mod cad2494_acceptance {
+    use serde_json::{json, Value};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const BASE_STUB: &str = include_str!("fixtures/cad2100_gate_stub.py");
+    const POLICY_STUB: &str = include_str!("fixtures/cad2494_policy_stub.py");
+    const REPO: &str = "favcrm/cadence";
+    const T0: &str = "2026-11-03T10:00:00Z";
+    const T1: &str = "2026-11-03T10:05:00Z";
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = cadence_agent::reaper::output(
+            Command::new("git")
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn put(dir: &Path, path: &str, text: &str) {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, text).unwrap();
+    }
+
+    fn install(bin: &Path, name: &str, text: &str, mode: u32) {
+        std::fs::create_dir_all(bin).unwrap();
+        std::fs::write(bin.join(name), text).unwrap();
+        std::fs::set_permissions(bin.join(name), PermissionsExt::from_mode(mode)).unwrap();
+    }
+
+    /// One repository: `main` holds the trusted lists and two source files, and each
+    /// PR head adds or changes one file on top of it.
+    struct Repo {
+        dir: tempfile::TempDir,
+        base: String,
+    }
+
+    impl Repo {
+        fn new() -> Repo {
+            let dir = tempfile::Builder::new()
+                .prefix("c2494")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let work = dir.path().join("work");
+            std::fs::create_dir(&work).unwrap();
+            git(&work, &["init", "-q", "-b", "main"]);
+            put(
+                &work,
+                ".github/workflows/ci.yml",
+                "jobs:\n  ci:\n    runs-on: x\n",
+            );
+            for list in [
+                "docs/roles/risk-paths.toml",
+                "docs/roles/one-review-paths.toml",
+            ] {
+                let text =
+                    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(list))
+                        .unwrap();
+                put(&work, list, &text);
+            }
+            put(&work, "src/area/lib.rs", "old\n");
+            put(&work, "src/peer.rs", "old\n");
+            git(&work, &["add", "-A"]);
+            git(&work, &["commit", "-q", "-m", "base"]);
+            let base = git(&work, &["rev-parse", "HEAD"]);
+            Repo { dir, base }
+        }
+
+        fn work(&self) -> PathBuf {
+            self.dir.path().join("work")
+        }
+
+        fn head(&self, name: &str, file: &str) -> String {
+            let work = self.work();
+            git(&work, &["checkout", "-q", "-B", name, &self.base]);
+            put(&work, file, "new\n");
+            git(&work, &["add", "-A"]);
+            git(&work, &["commit", "-q", "-m", name]);
+            let sha = git(&work, &["rev-parse", "HEAD"]);
+            git(&work, &["checkout", "-q", "main"]);
+            sha
+        }
+    }
+
+    fn owner(name: &str, id: &str, login: &str, kind: &str) -> Value {
+        json!({"name": name, "stamp": "20261103-000100", "reviewer": login, "reviewer_id": id,
+               "github_login": login, "repo": REPO, "kind": kind, "outcome": "pass",
+               "title_outcome": "pass", "section_outcome": "pass", "risk": "auto",
+               "identity_source": "owner-attested"})
+    }
+
+    fn agent(name: &str, focus: &str) -> Value {
+        json!({"name": name, "kind": "agent", "focus": focus})
+    }
+
+    fn check(name: &str, app: &str) -> Value {
+        json!({"name": name, "kind": "check", "app": app, "mode": "required"})
+    }
+
+    fn required(name: &str, app: &str) -> Value {
+        json!({"name": name, "app": app})
+    }
+
+    /// The answer's fields: `reviews` is the policy's `required_reviews`.
+    fn policy(
+        class: &str,
+        reviews: u32,
+        kind: &str,
+        named: Vec<Value>,
+        checks: Vec<Value>,
+    ) -> Value {
+        json!({"class": class, "activation": "no_profile", "reviews": reviews,
+               "review_kind": kind, "required_reviews": named, "required_checks": checks})
+    }
+
+    struct Gate<'a> {
+        repo: &'a Repo,
+        head: String,
+        class: &'static str,
+        rows: Vec<Value>,
+        patch: Value,
+        runs: Value,
+    }
+
+    fn gate<'a>(repo: &'a Repo, head: &str, patch: Value, rows: Vec<Value>) -> Gate<'a> {
+        let class = if patch["class"] == "strict" {
+            "strict"
+        } else {
+            "consequential"
+        };
+        Gate {
+            repo,
+            head: head.into(),
+            class,
+            rows,
+            patch,
+            runs: json!({}),
+        }
+    }
+
+    impl Gate<'_> {
+        fn runs(mut self, runs: Value) -> Self {
+            self.runs = runs;
+            self
+        }
+
+        /// (exit code, everything the script said)
+        fn run(&self) -> (i32, String) {
+            let root = self.repo.dir.path();
+            let bin = root.join(".stubs");
+            install(&bin, "gh", POLICY_STUB, 0o755);
+            install(&bin, "cadence", POLICY_STUB, 0o755);
+            let base_dir = root.join(".base");
+            install(&base_dir, "gh", BASE_STUB, 0o755);
+            install(&base_dir, "cadence", BASE_STUB, 0o755);
+            let comment = root.join(".comment");
+            let _ = std::fs::remove_file(&comment);
+            let changed = git(
+                &self.repo.work(),
+                &[
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    &self.repo.base,
+                    &self.head,
+                ],
+            )
+            .lines()
+            .count();
+            let scenario = json!({
+                "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": self.head,
+                "base": "main", "base_oid": self.repo.base, "tip": self.repo.base,
+                "repo_dir": self.repo.work(), "changed_files": changed,
+                "verdicts": self.rows, "class": self.class, "approved": true,
+                "comment_out": comment, "req_patch": self.patch, "policy_check_runs": self.runs,
+                "identities": [{"github_login": "authorlogin", "subject_id": "usr_author"},
+                               {"github_login": "alice", "subject_id": "usr_alice"},
+                               {"github_login": "bob", "subject_id": "usr_bob"}],
+            });
+            let scenario_path = root.join(".scenario.json");
+            std::fs::write(&scenario_path, serde_json::to_vec(&scenario).unwrap()).unwrap();
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/enqueue-reviewed");
+            let out = cadence_agent::reaper::output(
+                Command::new("python3")
+                    .arg(script)
+                    .args(["7", "--head", &self.head, "--repo", REPO])
+                    .args([
+                        "--notes-dir",
+                        "/nonexistent",
+                        "--gate-key",
+                        "/nonexistent/key",
+                        "--dry-run",
+                    ])
+                    .current_dir(self.repo.work())
+                    .env_clear()
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("HOME", root)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("CADENCE_BIN", bin.join("cadence"))
+                    .env("CAD2494_BASE_DIR", &base_dir)
+                    .env("CAD2100_SCENARIO", &scenario_path),
+            )
+            .unwrap();
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.code().unwrap_or(-1), said)
+        }
+
+        fn passes(&self) {
+            let (code, said) = self.run();
+            assert_eq!(code, 0, "{said}");
+            assert!(said.contains("every rule holds"), "{said}");
+        }
+
+        fn refused(&self, why: &str) {
+            let (code, said) = self.run();
+            assert_eq!(code, 1, "expected a refusal for {why:?}\n{said}");
+            assert!(said.contains(why), "no {why:?}\n{said}");
+            assert!(!said.contains("every rule holds"), "{said}");
+        }
+    }
+
+    fn pair() -> Vec<Value> {
+        vec![
+            owner("20261103-000100-a.md", "usr_alice", "alice", "standards"),
+            owner("20261103-000100-b.md", "usr_bob", "bob", "spec-security"),
+        ]
+    }
+
+    fn std_row() -> Vec<Value> {
+        vec![owner(
+            "20261103-000100-a.md",
+            "usr_alice",
+            "alice",
+            "standards",
+        )]
+    }
+
+    fn spec_row() -> Vec<Value> {
+        vec![owner(
+            "20261103-000100-b.md",
+            "usr_bob",
+            "bob",
+            "spec-security",
+        )]
+    }
+
+    fn comb_row() -> Vec<Value> {
+        vec![owner(
+            "20261103-000100-c.md",
+            "usr_alice",
+            "alice",
+            "combined",
+        )]
+    }
+
+    fn kind(reviews: u32, kind: &str, focus: Option<&str>) -> Value {
+        policy(
+            "consequential",
+            reviews,
+            kind,
+            focus.map(|f| vec![agent("r", f)]).unwrap_or_default(),
+            vec![],
+        )
+    }
+
+    fn scan_policy(class: &str, reviews: u32, review_kind: &str) -> Value {
+        policy(
+            class,
+            reviews,
+            review_kind,
+            vec![check("scan", "scanner")],
+            vec![required("scan", "scanner")],
+        )
+    }
+
+    fn scan_run(app: &str, status: &str, conclusion: Value, at: &str) -> Value {
+        json!([app, status, conclusion, at])
+    }
+
+    #[test]
+    fn review_kind_none_needs_no_verdict() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        gate(&repo, &head, kind(0, "none", None), vec![]).passes();
+    }
+
+    #[test]
+    fn review_kind_standards_needs_a_standards_verdict() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || kind(1, "standards", Some("standards"));
+        gate(&repo, &head, p(), std_row()).passes();
+        gate(&repo, &head, p(), vec![]).refused("Standards");
+        gate(&repo, &head, p(), spec_row()).refused("Standards");
+    }
+
+    #[test]
+    fn review_kind_spec_security_needs_a_spec_security_verdict() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || kind(1, "spec_security", Some("spec-security"));
+        gate(&repo, &head, p(), spec_row()).passes();
+        gate(&repo, &head, p(), vec![]).refused("Spec/security");
+        gate(&repo, &head, p(), std_row()).refused("Spec/security");
+    }
+
+    #[test]
+    fn review_kind_combined_needs_one_review() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || kind(1, "combined", Some("general"));
+        gate(&repo, &head, p(), comb_row()).passes();
+        gate(&repo, &head, p(), vec![]).refused("review");
+    }
+
+    #[test]
+    fn review_kind_standards_and_spec_needs_both_axes() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || {
+            policy(
+                "consequential",
+                2,
+                "standards_and_spec",
+                vec![agent("s", "standards"), agent("p", "spec-security")],
+                vec![],
+            )
+        };
+        gate(&repo, &head, p(), pair()).passes();
+        gate(&repo, &head, p(), std_row()).refused("Spec/security");
+        gate(&repo, &head, p(), comb_row()).refused("Standards");
+    }
+
+    #[test]
+    fn required_check_must_succeed_from_the_named_app_on_the_head() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let p = || scan_policy("consequential", 0, "none");
+        let ok = scan_run("scanner", "completed", json!("success"), T0);
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [ok.clone()]}))
+            .passes();
+        // No required checks listed: nothing to run, still passes.
+        gate(&repo, &head, kind(0, "none", None), vec![]).passes();
+        // Absent, failed, pending, wrong App.
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": []}))
+            .refused("scan");
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [scan_run("scanner", "completed", json!("failure"), T0)]}))
+            .refused("failure");
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [scan_run("scanner", "in_progress", Value::Null, T0)]}))
+            .refused("scan");
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [scan_run("intruder", "completed", json!("success"), T0)]}))
+            .refused("scanner");
+        // The latest run from the App decides, in either order.
+        let bad = |at| scan_run("scanner", "completed", json!("failure"), at);
+        let good = |at| scan_run("scanner", "completed", json!("success"), at);
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [good(T0), bad(T1)]}))
+            .refused("failure");
+        gate(&repo, &head, p(), vec![])
+            .runs(json!({"scan": [bad(T0), good(T1)]}))
+            .passes();
+    }
+
+    #[test]
+    fn the_strict_floor_carrying_policy_checks_enforces_them() {
+        let repo = Repo::new();
+        let head = repo.head("peer", "src/peer.rs");
+        let p = || scan_policy("strict", 2, "standards_and_spec");
+        let ok = json!({"scan": [scan_run("scanner", "completed", json!("success"), T0)]});
+        gate(&repo, &head, p(), pair()).runs(ok.clone()).passes();
+        gate(&repo, &head, p(), pair())
+            .runs(json!({"scan": [scan_run("scanner", "completed", json!("failure"), T0)]}))
+            .refused("failure");
+        gate(&repo, &head, p(), pair())
+            .runs(json!({"scan": []}))
+            .refused("scan");
+        gate(&repo, &head, p(), vec![]).runs(ok).refused("review");
+    }
+
+    #[test]
+    fn unrecognized_or_unusable_policy_evidence_fails_closed() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let ok = json!({"scan": [scan_run("scanner", "completed", json!("success"), T0)]});
+        // An unrecognized field.
+        let mut unknown = kind(0, "none", None);
+        unknown["gate_version"] = json!(2);
+        gate(&repo, &head, unknown, vec![]).refused("unrecognized");
+        // A required check with no App identity.
+        let no_app = policy(
+            "consequential",
+            0,
+            "none",
+            vec![check("scan", "")],
+            vec![required("scan", "")],
+        );
+        gate(&repo, &head, no_app, vec![])
+            .runs(ok.clone())
+            .refused("scan");
+        // An unknown review kind.
+        gate(&repo, &head, kind(0, "everything", None), vec![]).refused("");
+        // A required check the policy never named as a review is not silently dropped.
+        let checks_only = json!({"class": "consequential", "activation": "no_profile",
+            "reviews": 0, "review_kind": "none",
+            "required_checks": [required("scan", "scanner")]});
+        gate(&repo, &head, checks_only, vec![]).runs(ok).refused("");
+    }
+
+    #[test]
+    fn a_consequential_answer_cannot_waive_the_trusted_list_floor() {
+        let repo = Repo::new();
+        let ordinary = repo.head("code", "src/area/new.rs");
+        let boundary = repo.head("peer", "src/peer.rs");
+        let p = || kind(0, "none", None);
+        gate(&repo, &ordinary, p(), vec![]).passes();
+        let (code, said) = gate(&repo, &boundary, p(), vec![]).run();
+        assert_eq!(code, 1, "{said}");
+        assert!(
+            said.contains("consequential") || said.contains("floor"),
+            "{said}"
+        );
+        assert!(!said.contains("every rule holds"), "{said}");
+    }
+
+    #[test]
+    fn a_default_answer_is_unchanged() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        gate(&repo, &head, json!({}), comb_row()).passes();
+        gate(&repo, &head, json!({}), vec![]).refused("review");
+    }
+}

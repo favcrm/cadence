@@ -950,7 +950,7 @@ def unbound_reason(n, hosted):
 
 
 def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
-                  exception=False, accepted=None):
+                  exception=False, accepted=None, policy_kind=None):
     """(reasons, counted notes).
 
     `exception` (CAD-1946) drops only the counts of missing verdicts. A filed
@@ -1177,7 +1177,14 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
     two = bool(std) and bool(spec) and any(a != b for a in std for b in spec)
     if exception:
         return reasons, counted
-    if qualifies_one:
+    if policy_kind in ("none", "standards", "spec_security"):
+        # CAD-2494: an approved policy asks one axis, or no code review. A combined
+        # verdict covers both axes.
+        if policy_kind == "standards" and not (std or combined):
+            reasons.append(f"no pass Standards verdict for {issue} pinned to this head{REVIEW_STANDARD_HINT}")
+        if policy_kind == "spec_security" and not (spec or combined):
+            reasons.append(f"no pass Spec/security verdict for {issue} pinned to this head{REVIEW_STANDARD_HINT}")
+    elif qualifies_one:
         if not (combined or two):
             reasons.append(f"no pass verdict for {issue} pinned to this head (one review is required){REVIEW_STANDARD_HINT}")
     else:
@@ -1311,6 +1318,140 @@ def check_comment(comments, head, counted, base_ref, required=()):
             + (f" ({', '.join(names)})" if names else "")]
 
 
+# An approved custom delivery policy's answer (CAD-2494, CAD-2424): the answer
+# lists the reviews and GitHub App checks the policy names. Anything this gate
+# does not recognise in it refuses instead of being ignored.
+REQUIREMENT_KEYS = frozenset((
+    "class", "reviews", "review_kind", "security_capable", "browser_qa", "operator_approval",
+    "full_checks", "reasons", "policy_digest", "activation", "required_reviews", "required_checks"))
+BASE_REVIEW_KINDS = ("none", "combined", "standards_and_spec")
+POLICY_REVIEW_KINDS = BASE_REVIEW_KINDS + ("standards", "spec_security")
+POLICY_REVIEW_COUNT = {"none": 0, "combined": 1, "standards": 1, "spec_security": 1,
+                       "standards_and_spec": 2}
+AGENT_FOCI = ("standards", "spec-security", "browser-qa", "general")
+REVIEW_ENTRY_KEYS = frozenset(("name", "kind", "focus", "app", "mode"))
+
+
+def review_join(a, b):
+    """The review satisfying both kinds. A single axis never stands in for combined."""
+    if a == "none":
+        return b
+    return a if b == "none" or a == b else "standards_and_spec"
+
+
+def policy_evidence(req):
+    """None for an answer with no policy evidence, else the parsed policy.
+
+    The answer carries `required_reviews` and `required_checks` only for an
+    approved custom policy. Either one alone, an unknown field, an unknown
+    review shape or checks that do not match the reviews refuse."""
+    reviews, checks = req.get("required_reviews"), req.get("required_checks")
+    if reviews is None and checks is None:
+        return None
+    if not isinstance(reviews, list) or not isinstance(checks, list):
+        raise ValueError("policy evidence needs both required_reviews and required_checks as lists")
+    unknown = sorted(set(req) - REQUIREMENT_KEYS)
+    if unknown:
+        raise ValueError(f"policy answer carries unrecognized fields {unknown}")
+
+    def text(value):
+        return isinstance(value, str) and value != "" and not any(
+            unicodedata.category(char) == "Cc" for char in value)
+
+    names, required, axes = set(), [], {"standards": False, "spec-security": False, "general": False}
+    qa = operator = False
+    for r in reviews:
+        if not isinstance(r, dict) or set(r) - REVIEW_ENTRY_KEYS or not text(r.get("name")):
+            raise ValueError("policy review entry is malformed or carries unrecognized fields")
+        if r["name"] in names:
+            raise ValueError(f"policy review '{r['name']}' is listed twice")
+        names.add(r["name"])
+        kind, focus, app, mode = (r.get("kind"), r.get("focus"), r.get("app"), r.get("mode"))
+        if kind == "agent" and focus in AGENT_FOCI and app is None and mode is None:
+            if focus == "browser-qa":
+                qa = True
+            else:
+                axes[focus] = True
+        elif kind == "check" and text(app) and mode in ("required", "advisory") and focus is None:
+            if mode == "required":
+                required.append((r["name"], app))
+        elif kind == "operator" and focus is None and app is None and mode is None:
+            operator = True
+        else:
+            raise ValueError(f"policy review '{r['name']}' has an unrecognized shape")
+    listed = []
+    for c in checks:
+        if not isinstance(c, dict) or set(c) != {"name", "app"} or not text(c["name"]) or not text(c["app"]):
+            raise ValueError("policy required check is malformed or names no GitHub App")
+        listed.append((c["name"], c["app"]))
+    if len({name for name, _ in listed}) != len(listed) or sorted(listed) != sorted(required):
+        raise ValueError("policy required checks do not match the required check reviews")
+    if axes["standards"] and axes["spec-security"]:
+        kind = "standards_and_spec"
+    elif axes["standards"]:
+        kind = "standards"
+    elif axes["spec-security"]:
+        kind = "spec_security"
+    else:
+        kind = "combined" if axes["general"] else "none"
+    return {"names": sorted(names), "checks": sorted(listed), "kind": kind,
+            "browser_qa": qa, "operator": operator}
+
+
+def policy_floor_reasons(changes, lines, risk, never):
+    """Why a policy `consequential` answer understates this script's own diff.
+
+    The approved policy may lower the reviews only on ordinary paths: a change
+    that is not a plain add or modify, a human-class or trust-boundary path, a
+    path the one-review list excludes, or a diff over the size limit keeps the
+    strict floor, and an unreadable list cannot show it does not apply."""
+    out = []
+    if risk is None or never is None:
+        out.append("the trusted path lists cannot be read at the diff's anchor")
+        risk, never = (), ()
+    if any(not (s in ("A", "M") and new in ("100644", "100755") and (old == new or s == "A"))
+           for s, old, new, _ in changes):
+        out.append("a change is not a plain add or modify of a regular file")
+    if any(is_human_path(path, risk) or any(glob_match(g, path) for g in never)
+           for _, _, _, path in changes):
+        out.append("a path is human-class, a trust boundary or excluded from one review")
+    if lines > HUMAN_LINES:
+        out.append(f"{lines} changed lines is over {HUMAN_LINES}")
+    return ([f"the approved policy's consequential class does not hold for this script's diff: "
+             f"{'; '.join(out)} (the trusted-list floor applies; refusing rather than merging "
+             "on the policy's reviews alone)"] if out else [])
+
+
+def policy_check_reasons(repo, head, checks):
+    """Refusals for each required policy check: the latest run of that name from
+    that GitHub App (matched by slug) on the exact head must have succeeded. A
+    run from another App never counts."""
+    reasons = []
+    for name, app in checks:
+        try:
+            runs = check_runs_at(repo, head, name)
+        except RuntimeError as e:
+            reasons.append(str(e))
+            continue
+        mine = [r for r in runs if r["app"]["slug"] == app]
+        if not mine:
+            others = sorted({r["app"]["slug"] for r in runs})
+            reasons.append(f"policy check '{name}' from app '{app}' has no run at head {head[:12]}"
+                           + (f" (only from {', '.join(others)})" if others else ""))
+            continue
+        newest = max(r["started_at"] for r in mine)
+        latest = [r for r in mine if r["started_at"] == newest]
+        if len({(r["status"], r.get("conclusion")) for r in latest}) > 1:
+            reasons.append(f"policy check '{name}' from app '{app}' has ambiguous newest runs at head {head[:12]}")
+            continue
+        check = max(latest, key=lambda r: r["id"])
+        if check["status"] != "completed":
+            reasons.append(f"policy check '{name}' from app '{app}' is pending ({check['status']}) at head {head[:12]}")
+        elif check.get("conclusion") != "success":
+            reasons.append(f"policy check '{name}' from app '{app}' is not successful ({check.get('conclusion')}) at head {head[:12]}")
+    return reasons
+
+
 def requirements_inspection(issue, repo, pr, head):
     """Read the daemon's trusted, policy-aware requirements decision."""
     pr_url = f"https://github.com/{repo}/pull/{pr}"
@@ -1321,6 +1462,7 @@ def requirements_inspection(issue, repo, pr, head):
         req = result["requirements"]
         if rc != 0 or not isinstance(result, dict) or not isinstance(req, dict):
             raise ValueError("unexpected response shape")
+        policy = policy_evidence(req)
         if (result.get("issue") != issue or result.get("repo") != repo.lower()
                 or result.get("pr") != pr or result.get("head") != head
                 or not isinstance(result.get("base_ref"), str) or not result["base_ref"]
@@ -1332,7 +1474,7 @@ def requirements_inspection(issue, repo, pr, head):
                 or req.get("class") not in ("routine", "consequential", "sensitive", "strict")
                 or req.get("activation") not in ("active", "no_profile", "not_approved", "malformed")
                 or type(req.get("reviews")) is not int or req["reviews"] not in (0, 1, 2)
-                or req.get("review_kind") not in ("none", "combined", "standards_and_spec")
+                or req.get("review_kind") not in (POLICY_REVIEW_KINDS if policy else BASE_REVIEW_KINDS)
                 or type(req.get("security_capable")) is not bool
                 or type(req.get("operator_approval")) is not bool
                 or type(req.get("browser_qa")) is not bool
@@ -1344,7 +1486,18 @@ def requirements_inspection(issue, repo, pr, head):
             "routine": (0, "none", False, False, False),
             "consequential": (1, "combined", False, False, True),
         }
-        if req["class"] in expected and req["activation"] == "active":
+        if policy is not None:
+            # An approved custom policy: only consequential (the policy decides) or strict
+            # (the trusted-list floor), never lean, with every floor intact.
+            if (req["activation"] != "no_profile" or req["class"] not in ("consequential", "strict")
+                    or not req["full_checks"] or req["security_capable"]
+                    or req["reviews"] != POLICY_REVIEW_COUNT[req["review_kind"]]
+                    or review_join(req["review_kind"], policy["kind"]) != req["review_kind"]
+                    or (policy["browser_qa"] and not req["browser_qa"])
+                    or (policy["operator"] and not req["operator_approval"])
+                    or (req["class"] == "strict" and req["review_kind"] not in ("combined", "standards_and_spec"))):
+                raise ValueError("policy answer does not match its named reviews or the trusted floor")
+        elif req["class"] in expected and req["activation"] == "active":
             reviews, kind, security, approval, full = expected[req["class"]]
             if (req["reviews"], req["review_kind"], req["security_capable"],
                     req["operator_approval"], req["full_checks"]) != (
@@ -1388,7 +1541,7 @@ def requirements_inspection(issue, repo, pr, head):
                     or any(unicodedata.category(char) == "Cc" for char in readiness["outcome_report"])):
                 raise ValueError("routine readiness does not bind to this issue, PR, head, base and policy")
         return {"binding": binding, "requirements": req, "readiness": readiness,
-                "origin": origin}
+                "origin": origin, "policy": policy}
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise RuntimeError(f"cannot use authoritative `cadence delivery requirements` result: {e}; {(err or out).strip()[:200]}")
 
@@ -1778,10 +1931,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         authors.add(str(ticket["claim"]["by"]).lower())
 
     authority = None
+    policy = None
     required_comment_evidence = []
     if issue:
         try:
             authority = requirements_inspection(issue, repo, pr, head)
+            policy = authority["policy"]
             if (authority["binding"]["base"] != base_oid
                     or authority["binding"]["base_ref"] != base
                     or authority["binding"]["repo"] != repo.lower()
@@ -1791,6 +1946,11 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             need_qa = need_qa or req["browser_qa"]
             report.append(f"delivery requirements: {req['class']} ({req['activation']}); policy {authority['binding']['policy_digest']}")
             report.extend(f"delivery reason: {reason}" for reason in req["reasons"])
+            if policy is not None:
+                report.append("approved policy reviews: " + (", ".join(policy["names"]) or "none")
+                              + "; required checks: "
+                              + (", ".join(f"{n} ({a})" for n, a in policy["checks"]) or "none"))
+                reasons += policy_check_reasons(repo, head, policy["checks"])
             if req["activation"] == "active":
                 required_comment_evidence.extend((f"Delivery class: {req['class']}",
                                                   f"Policy digest: {authority['binding']['policy_digest']}"))
@@ -1928,6 +2088,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             required_comment_evidence.append(f"Review exception until: {ends}")
             required_comment_evidence.extend(f"Advisory review: {k} = {v}"
                                              for k, v in sorted(args.advisory.items()))
+        elif policy is not None and klass == "consequential":
+            # CAD-2494: the approved policy names the reviews. Its kind is the answer's.
+            policy_kind = authority["requirements"]["review_kind"]
+            rs, counted = check_reviews(verdicts, policy_kind == "combined", row_qa, authors, issue,
+                                        hosted, accepted=accepted_revise, policy_kind=policy_kind)
+            reasons += rs
         elif not active or klass == "strict":
             native_one = bool(authority and authority["requirements"]["reviews"] == 1)
             effective_one = one and native_one
@@ -2012,6 +2178,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     if authority is not None and authority["requirements"]["activation"] == "active":
         reasons += lean_class_reasons(authority["requirements"]["class"], changes, one,
                                       [p for p in paths if is_human_path(p, risk or ())], lines)
+    if policy is not None and authority["requirements"]["class"] == "consequential":
+        reasons += policy_floor_reasons(changes, lines, risk, workflow_never_globs(one_text, risk_text))
     if has_workflow:
         auto_text = None
         if main_tip:
