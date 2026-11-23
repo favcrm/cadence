@@ -347,6 +347,23 @@ async function main() {
   messageMode = "ok";
   resolveMessage = undefined;
 
+  win.localStorage.setItem(receiptKey, attemptReceipt);
+  messageWrites.length = 0;
+  messageMode = "deferred";
+  await openSetup("unrelated-query");
+  await settle(() => assert(byText("button", "Continue in chat"), "same callback has verified connection"));
+  await act(async () => byText("button", "Continue in chat")!.click());
+  await settle(() => assert(resolveMessage && messageWrites.length === 1, "same-route send is in flight"));
+  const unrelated = "&mcp_focus=other&aos_publish=pending";
+  win.history.replaceState({}, "", `/home${win.location.search}${unrelated}#new`);
+  await act(async () => { resolveMessage!(jsonRes({ ok: true })); });
+  const kept = new URLSearchParams(win.location.search);
+  assert(kept.get("mcp_focus") === "other" && kept.get("aos_publish") === "pending" &&
+    !kept.has("mcp_setup") && !kept.has("mcp_attempt") && win.location.hash === "#new",
+  "cleanup removes only the matched callback and preserves unrelated integration state");
+  messageMode = "ok";
+  resolveMessage = undefined;
+
   win.localStorage.setItem(receiptKey, newerReceipt);
   await openSetup("old-callback", "connected", "thread-20", "attempt-one");
   assert(!byText("button", "Continue in chat"), "old callback cannot adopt a newer nonce for the same connection");

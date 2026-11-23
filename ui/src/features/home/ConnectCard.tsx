@@ -336,9 +336,9 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     }
     if (cleanRoute) {
       const live = new URL(window.location.href);
-      live.search = withoutConnectParams(live.search);
-      live.searchParams.delete("mcp_setup");
-      live.searchParams.delete("mcp_attempt");
+      for (const param of ["aos_connect", "toolkit", "connection_id", "mcp_setup", "mcp_attempt"]) {
+        live.searchParams.delete(param);
+      }
       navigate(`${live.pathname}${live.search}${live.hash}`, { replace: true });
     }
   }
