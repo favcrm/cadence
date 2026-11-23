@@ -743,8 +743,11 @@ pub struct ScreenViewParam {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "unique_option_labels"
     )]
-    pub labels: Option<BTreeMap<String, BTreeMap<String, String>>>,
+    pub labels: Option<OptionLabelMap>,
 }
+
+/// An enum param's `labels`: value → locale → text.
+pub type OptionLabelMap = BTreeMap<String, BTreeMap<String, String>>;
 
 /// One value's locale → text map, a repeated locale refused.
 struct LocaleLabels(BTreeMap<String, String>);
@@ -766,9 +769,16 @@ impl<'de> Deserialize<'de> for OptionLabels {
 
 fn unique_option_labels<'de, D: Deserializer<'de>>(
     d: D,
-) -> std::result::Result<Option<BTreeMap<String, BTreeMap<String, String>>>, D::Error> {
-    Ok(Option::<OptionLabels>::deserialize(d)?
-        .map(|labels| labels.0.into_iter().map(|(value, l)| (value, l.0)).collect()))
+) -> std::result::Result<Option<OptionLabelMap>, D::Error> {
+    // Absent is `None` (serde `default`); a present `labels` must be an object, so `null` is refused.
+    let labels = OptionLabels::deserialize(d)?;
+    Ok(Some(
+        labels
+            .0
+            .into_iter()
+            .map(|(value, l)| (value, l.0))
+            .collect(),
+    ))
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2600,6 +2610,7 @@ mod tests {
             r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":{"en":" "}}}}}"#,
             r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":{"en":"X\n"}}}}}"#,
             r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":{"x":"X"}}}}"#,
+            r#"{"id":"v","label":{"en":"V"},"section":"reports","params":{"a":{"type":"enum","values":["x"],"labels":null}}}"#, // null labels
             r#"{"id":"v","label":{"en":"V","en":"W"},"section":"reports"}"#,
         ];
         for view in bad {

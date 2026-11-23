@@ -1,0 +1,825 @@
+{
+  "description": "AOS-714 / CAD-2710: shared valid and invalid cases for an enum view param's optional `labels`. Both readers wrap each `view` as the only entry of a screen's `views`, with navigation sections [customers, reports], and read it: Cadence cadence-core app_screen_decl validate_map, hosted apps/api readScreenViews. Keep this file byte-identical in both repos. Cases that need raw JSON (a repeated key) cannot be written here and are covered by the Cadence tests only.",
+  "version": "view-option-labels.v1",
+  "sections": ["customers", "reports"],
+  "valid": [
+    {
+      "name": "no labels, as before",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"]
+          }
+        }
+      }
+    },
+    {
+      "name": "one value labelled, the other left to the board",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "every value, two locales",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X",
+                "zh-TW": "對比去年"
+              },
+              "y": {
+                "en": "Y",
+                "zh-HK": "Y"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "required enum with labels",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X"
+              }
+            },
+            "required": true
+          }
+        }
+      }
+    },
+    {
+      "name": "eight locales",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X",
+                "fr": "X",
+                "de": "X",
+                "es": "X",
+                "it": "X",
+                "pt": "X",
+                "ja": "X",
+                "ko": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "40 BMP units",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "40 UTF-16 units from 20 astral characters",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "40 CJK units",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "zh-TW": "客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客客"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "three-letter language, two subtags",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "fil-Latn-PH": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "20-byte locale tag",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en-abcdefgh-abcdef": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "text with inner spaces and punctuation",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "vs prior year (%)"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "key is not a declared value",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "z": {
+                "en": "Z"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "empty locale map",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {}
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "empty labels",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {}
+          }
+        }
+      }
+    },
+    {
+      "name": "labels on a string param",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "string",
+            "labels": {
+              "x": {
+                "en": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "labels on a date param",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "date",
+            "labels": {
+              "x": {
+                "en": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "value maps to a bare string",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": "X"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "labels is a list",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": []
+          }
+        }
+      }
+    },
+    {
+      "name": "labels is null",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": null
+          }
+        }
+      }
+    },
+    {
+      "name": "locale is not a tag (underscore)",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "zh_TW": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "locale is one letter",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "e": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "locale tag over 20 bytes",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "abc-12345678-12345678": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "nine locales",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X",
+                "fr": "X",
+                "de": "X",
+                "es": "X",
+                "it": "X",
+                "pt": "X",
+                "ja": "X",
+                "ko": "X",
+                "nl": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "blank text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": " "
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "empty text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": ""
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "text is not a string",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "newline in text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X\n"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "tab in text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X\tY"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "DEL in text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "C1 control in text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "line separator in text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X "
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "paragraph separator in text",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X "
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "41 BMP units",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "41 UTF-16 units (20 astral + 1)",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀x"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "42 UTF-16 units (21 astral)",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "unknown key beside labels",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X"
+              }
+            },
+            "extra": 1
+          }
+        }
+      }
+    }
+  ],
+  "projection": {
+    "description": "The installation read's `views` for a bundle declaring `views_in`: the same views, `params` left out when a view declares none; `views` is null when the bundle declares no valid views.",
+    "views_in": [
+      {
+        "id": "labelled",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X",
+                "zh-TW": "客"
+              }
+            },
+            "required": true
+          }
+        }
+      },
+      {
+        "id": "plain",
+        "label": {
+          "en": "Plain"
+        },
+        "section": "customers"
+      }
+    ],
+    "views_out": [
+      {
+        "id": "labelled",
+        "label": {
+          "en": "V"
+        },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x", "y"],
+            "labels": {
+              "x": {
+                "en": "X",
+                "zh-TW": "客"
+              }
+            },
+            "required": true
+          }
+        }
+      },
+      {
+        "id": "plain",
+        "label": {
+          "en": "Plain"
+        },
+        "section": "customers"
+      }
+    ]
+  }
+}

@@ -720,7 +720,8 @@ mod tests {
         with_views["views"] = json!([{"id":"pnl","label":{"en":"P&L"},"section":"customers","params":{"compare":{"type":"enum","values":["prior_year"],"labels":{"prior_year":{"zh-TW":"對比去年"}}}}}]);
         let viewed = bundle_with("main", &with_views.to_string(), &[("client.js", js)]);
         assert_eq!(
-            single_screen_views(&viewed, "crm")[0]["params"]["compare"]["labels"]["prior_year"]["zh-TW"],
+            single_screen_views(&viewed, "crm")[0]["params"]["compare"]["labels"]["prior_year"]
+                ["zh-TW"],
             json!("對比去年")
         );
         assert!(single_screen_views(&viewed, "other").is_null());
@@ -736,5 +737,46 @@ mod tests {
         );
         two.insert("screens/second/client.js".to_string(), js.to_string());
         assert!(single_screen_navigation(&two, "crm").is_null());
+    }
+    /// AOS-714 / CAD-2710: the cases shared byte-for-byte with agenticos-v2's
+    /// hosted reader (`apps/api/src/tenant-board/cad2710-view-option-labels.fixture.json`).
+    #[test]
+    fn cad2710_shared_view_label_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/cad2710-view-option-labels.fixture.json"
+        ))
+        .unwrap();
+        let js = "console.log(1);";
+        let bundle = |views: &serde_json::Value| {
+            let mut decl: serde_json::Value =
+                serde_json::from_str(&decl_records(&[("client.js", js)], &[])).unwrap();
+            let sections: Vec<_> = fixture["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| json!({"id": id, "label": "S"}))
+                .collect();
+            decl["navigation"] = json!({"section_query":"section","default_section":"customers","sections":sections});
+            decl["views"] = views.clone();
+            bundle_with("main", &decl.to_string(), &[("client.js", js)])
+        };
+        let mut disagree = Vec::new();
+        for (key, accepted) in [("valid", true), ("invalid", false)] {
+            for case in fixture[key].as_array().unwrap() {
+                let files = bundle(&json!([case["view"]]));
+                if extract(&files, "main").is_ok() != accepted {
+                    disagree.push(format!("{key}: {}", case["name"]));
+                }
+            }
+        }
+        let projection = &fixture["projection"];
+        assert_eq!(
+            single_screen_views(&bundle(&projection["views_in"]), "crm"),
+            projection["views_out"]
+        );
+        assert!(
+            disagree.is_empty(),
+            "cases the Rust reader disagrees on: {disagree:?}"
+        );
     }
 }
