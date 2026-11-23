@@ -1009,6 +1009,74 @@ async function testComposerInteractions(): Promise<void> {
       container.querySelector(".wa-reply-status")?.getAttribute("data-tone") === "sent",
       "resolved Recheck settles to sent",
     );
+
+    // 9. Overlay mode delays 'Verifying recipient…' placeholder by 300ms while keeping read-only safety;
+    //    blocked conversations announce immediately without waiting 300ms.
+    let showGate: { promise: Promise<void>; resolve: () => void } | null = defer();
+    let showBlocked = false;
+    const delayServices = {
+      ...mockServices,
+      async call(op: string, args: Record<string, unknown>) {
+        if (op === "whatsapp.conversations.show") {
+          if (showGate) await showGate.promise;
+          if (showBlocked) {
+            return { ok: false as const, refusal: { code: "unavailable", text: "Unavailable" } };
+          }
+        }
+        return mockServices.call(op, args);
+      },
+    };
+    const delaySelection: WhatsAppReplySelection = {
+      ...selection,
+      receiptScope: "scope-verify-delay",
+      services: delayServices as unknown as WhatsAppReplySelection["services"],
+      announceInset: () => 96,
+    };
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-delay", selection: delaySelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+      await flush();
+    });
+    const vdText = container.querySelector("textarea") as HTMLTextAreaElement;
+    const vdSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+    assert(
+      vdText.getAttribute("placeholder") === "Write a reply…" && vdText.readOnly && vdSend.disabled,
+      "<300ms recipient check keeps quiet placeholder while staying readOnly with Send disabled",
+    );
+    await React.act(async () => {
+      await new Promise((r) => setTimeout(r, 350));
+      await flush();
+    });
+    assert(
+      vdText.getAttribute("placeholder") === "Verifying recipient…" && vdText.readOnly && vdSend.disabled,
+      ">=300ms recipient check reveals Verifying recipient placeholder while remaining readOnly",
+    );
+    await React.act(async () => {
+      showGate!.resolve();
+      showGate = null;
+      await flush();
+    });
+    assert(
+      vdText.getAttribute("placeholder") === "Write a reply…" && !vdText.readOnly,
+      "resolved recipient verification restores editable reply composer",
+    );
+
+    showBlocked = true;
+    const blockedDelaySelection: WhatsAppReplySelection = {
+      ...selection,
+      receiptScope: "scope-verify-blocked",
+      services: delayServices as unknown as WhatsAppReplySelection["services"],
+      announceInset: () => 96,
+    };
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "verify-blocked", selection: blockedDelaySelection, bounds: [0, 10000], inset: { px: 96, seq: 1 } })));
+      await flush();
+    });
+    const vbText = container.querySelector("textarea") as HTMLTextAreaElement;
+    const vbSend = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
+    assert(
+      vbText.placeholder === "Can’t reply in this conversation" && vbText.readOnly && vbSend.disabled,
+      "blocked recipient state shows Can't reply placeholder immediately without 300ms delay",
+    );
   } finally {
     React.act(() => { root.unmount(); });
     container.remove();

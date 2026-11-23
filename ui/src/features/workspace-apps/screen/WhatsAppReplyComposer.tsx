@@ -80,6 +80,7 @@ const EFFECT = /^wae_[0-9a-f]{32}$/;
 const OFFICIAL_EFFECT = /^[A-Za-z0-9_.:-]{1,128}$/;
 const AUTO_POLL_DELAYS_MS = [300, 700, 1_200, 1_600, 2_200] as const;
 const SENT_BANNER_DISMISS_MS = 3_000;
+const VERIFY_HINT_DELAY_MS = 300;
 type StatusTone = "sent" | "accepted" | "uncertain" | "failed";
 // Keep the uncertain attempt and latest unconfirmed acceptance separately,
 // so a later failed send can't erase an earlier delivery check.
@@ -155,6 +156,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const provider: WhatsAppComposeProvider = selection.provider ?? "linked";
   const isOfficial = provider === "official";
   const [verification, setVerification] = useState<RecipientCheck>();
+  const [showCheckingHint, setShowCheckingHint] = useState(false);
   const [retry, setRetry] = useState<{ bound?: Recipient }>();
   const [text, setText] = useState("");
   const [pendingOp, setPendingOp] = useState<"send" | "check" | null>(null);
@@ -314,6 +316,17 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   }, [bounds, text, recipient, attachment]);
   useLayoutEffect(() => { selection.announce(!!text || !!attachment || busy || staging); }, [selection, text, attachment, busy, staging]);
   useEffect(() => { selection.announceAvailability?.(availability); }, [selection, availability]);
+  useEffect(() => {
+    if (availability !== "checking") {
+      setShowCheckingHint(false);
+      return;
+    }
+    setShowCheckingHint(false);
+    const timer = setTimeout(() => {
+      if (mountedRef.current) setShowCheckingHint(true);
+    }, VERIFY_HINT_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [availability, selection]);
 
   async function pickFile(file: File | undefined) {
     if (!file || readOnly || staging || attachment || !selection.current()) return;
@@ -616,7 +629,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         {recipient ? <>{zh ? "收件人：" : "To: "}<bdi>{recipient.label || (group ? (zh ? "WhatsApp 群組" : "WhatsApp group") : (zh ? "未有電話號碼" : "Phone not available"))}</bdi>
           {recipient.reference && <> · {zh ? "對話編號：" : "Chat ID: "}<bdi>{recipient.reference}</bdi></>}</>
           : selection.announceAvailability ? (zh ? "WhatsApp 回覆" : "WhatsApp reply")
-          : availability === "checking" ? <span className="wa-reply-hint-busy"><span className="wa-reply-spinner" aria-hidden="true" />{zh ? "正在核對收件人…" : "Verifying recipient…"}</span>
+          : availability === "checking" ? (showCheckingHint ? <span className="wa-reply-hint-busy"><span className="wa-reply-spinner" aria-hidden="true" />{zh ? "正在核對收件人…" : "Verifying recipient…"}</span> : (zh ? "WhatsApp 回覆" : "WhatsApp reply"))
           : (zh ? "此對話暫時無法回覆，你仍可查看訊息。" : "Replies are unavailable for this chat. You can still read messages.")}
       </p>}
       {!isOfficial && attachment && <div className="wa-reply-attachment">
@@ -635,8 +648,10 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           ? (zh ? "音訊回覆不可包含說明文字" : "Audio replies can’t include a caption")
           : windowClosed
           ? (zh ? "24 小時自由回覆視窗已關閉" : "24-hour reply window closed")
-          : overlay && availability !== "verified"
-          ? (availability === "checking" ? (zh ? "正在核對收件人…" : "Verifying recipient…") : (zh ? "此對話暫時無法回覆" : "Can’t reply in this conversation"))
+          : overlay && availability === "blocked"
+          ? (zh ? "此對話暫時無法回覆" : "Can’t reply in this conversation")
+          : overlay && availability === "checking" && showCheckingHint
+          ? (zh ? "正在核對收件人…" : "Verifying recipient…")
           : (zh ? "輸入回覆…" : "Write a reply…")}
         value={text} rows={1} maxLength={4096} readOnly={textareaReadOnly}
         onChange={e => setText(e.target.value)} onKeyDown={e => {
