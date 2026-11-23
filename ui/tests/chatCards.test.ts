@@ -1,5 +1,5 @@
 /** CAD-2443: connect_ref / record_ref parsing and layout, against the shared agenticos-v2 fixtures. */
-import { CELL_MAX_CHARS, cellText, dayKey, parseConnectRef, stripToolkitPrefix, parseInstant, parseRecordRef, plainText, recordLayout, splitAddress } from "../src/features/home/chatCards";
+import { CELL_MAX_CHARS, cellText, dayKey, parseConnectRef, parseCustomMcpSetup, stripToolkitPrefix, parseInstant, parseRecordRef, plainText, recordLayout, splitAddress } from "../src/features/home/chatCards";
 import { asEntry, mergePage, threadItems, threadRuns } from "../src/features/home/thread";
 
 export {};
@@ -41,6 +41,31 @@ for (const [what, mutate] of [
 equal(parseConnectRef(entryOf({ ...connect, role: "operator" })), null, "connect rejects a non-agent role");
 equal(parseConnectRef(entryOf({ ...connect, payload: null })), null, "connect rejects no payload");
 equal(parseRecordRef(entryOf(connect)), null, "a connect entry is not a record");
+
+const setup = {
+  v: 2,
+  toolkit: "custom_mcp",
+  toolkit_label: "Wine catalog",
+  endpoint_url: "https://mcp.example.com/tools",
+  required_scopes: ["catalog:read"],
+};
+const setupEntry = entryOf({ ...connect, payload: setup });
+equal(parseConnectRef(setupEntry), null, "legacy path never treats first-time setup as reconnect");
+equal(parseCustomMcpSetup(setupEntry), {
+  label: "Wine catalog",
+  endpointUrl: "https://mcp.example.com/tools",
+  requiredScopes: ["catalog:read"],
+}, "first-time setup preserves the endpoint and exact scopes");
+for (const invalid of [
+  { endpoint_url: "https://login:secret@mcp.example.com/tools" },
+  { endpoint_url: "https://mcp.example.com/tools?token=secret" },
+  { endpoint_url: "https://127.0.0.1/tools" },
+  { authorization_url: "https://oauth.example.com/authorize" },
+  { required_scopes: ["catalog:read catalog:write"] },
+  { required_scopes: ["catalog:read", "catalog:read"] },
+]) {
+  equal(parseCustomMcpSetup(entryOf({ ...connect, payload: { ...setup, ...invalid } })), null, "invalid setup falls back to text");
+}
 
 // record_ref list
 const list = parseRecordRef(entryOf(fixture("record-ref-list")));
