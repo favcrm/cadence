@@ -35,6 +35,10 @@ ONCE = False
 LOG_FILE = None
 CREATE_TTL = '3600'
 IDLE_TTL = '1800'
+# Boat machine types: small 2 vCPU/4 GB, default 4/8 GB, large 8/16 GB (2x rate), xlarge 16/32 GB.
+MACHINE_TYPES = ('small', 'default', 'large', 'xlarge')
+GUARD_MARK = 'stopping this sandbox job: available memory below'  # printed by the sandbox script
+GUARD_EXIT = 75
 SANDBOX_ID = re.compile(r'bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}')
 SHA = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 REMOTE_HOME = '/home/user'
@@ -310,6 +314,11 @@ if prepare_ui:
             raise SystemExit('downloaded Bun version does not match packageManager')
     print('Installing locked UI dependencies', flush=True)
     subprocess.run(['bun', 'install', '--frozen-lockfile'], cwd=str(repo) + '/ui', env=env, check=True, timeout=300)
+# Test hook only: the floor can be raised to drive the guard, never lowered.
+try:
+    floor = max(768, int(os.environ.get('CADENCE_BOAT_MEMORY_FLOOR_MIB', '768')))
+except ValueError:
+    floor = 768
 start = time.monotonic()
 proc = subprocess.Popen(job['command'], cwd=repo, env=env, start_new_session=True)
 launched = read_identity(proc.pid)
@@ -331,9 +340,9 @@ while proc.poll() is None:
     available = values['MemAvailable'] // 1024
     minimum = available if minimum is None else min(minimum, available)
     peak_load = max(peak_load, os.getloadavg()[0])
-    if available < 768:
+    if available < floor:
         pressure = True
-        print('stopping this sandbox job: available memory below 768 MiB', flush=True)
+        print('stopping this sandbox job: available memory below %d MiB' % floor, flush=True)
         os.killpg(proc.pid, signal.SIGTERM)
         try:
             proc.wait(timeout=15)
@@ -351,12 +360,102 @@ try:
     (home / 'boat-command.pid').unlink()
 except OSError:
     pass
-sys.exit(1 if pressure else (proc.returncode if proc.returncode is not None and proc.returncode >= 0 else 1))
+sys.exit(75 if pressure else (proc.returncode if proc.returncode is not None and proc.returncode >= 0 else 1))
 '''
 
 
 class Failure(Exception):
     pass
+
+
+# Arguments that turn on test-seam, and target selectors, as flat tables.
+SEAM_FLAGS = {'--all-features'}
+FEATURE_FLAGS = {'--features', '-F'}
+LIB_SELECTORS = {'--lib', '--tests', '--all-targets'}
+OTHER_SELECTORS = {'--test', '--bin', '--bins', '--example', '--examples', '--bench', '--benches', '--doc'}
+VALUE_SELECTORS = {'--test', '--bin', '--example', '--bench'}
+PACKAGE = 'cadence-agent'
+
+
+def is_test_seam_lib_build(command):
+    """True for `cargo test` or `cargo nextest run|archive|list` that turns on
+    test-seam and builds this package's lib test binary. Reads argv tokens only;
+    `env`, `sh -c` and wrappers are not interpreted. Arguments after `--` belong
+    to the test binary.
+    """
+    argv = list(command)
+    if not argv:
+        return False
+    if argv[0] == 'scripts/pre-push':
+        return '--tests' in argv[1:]  # the plan's tests step runs with test-seam
+    if Path(argv[0]).name != 'cargo':
+        return False
+    rest = [a for a in argv[1:]]
+    while rest and rest[0].startswith(('-', '+')):  # global flags, +toolchain
+        rest.pop(0)
+    if rest[:1] in (['test'], ['t']):
+        rest = rest[1:]
+    elif rest[:1] == ['nextest'] and rest[1:2] and rest[1] in {'run', 'archive', 'list'}:
+        rest = rest[2:]
+    else:
+        return False
+    seam = lib = other = foreign = False
+    i = 0
+    while i < len(rest) and rest[i] != '--':
+        arg = rest[i]
+        value = None
+        if arg in LIB_SELECTORS:
+            lib = True
+        elif arg in OTHER_SELECTORS:
+            other = True
+        elif arg in SEAM_FLAGS:
+            seam = True
+        elif arg in FEATURE_FLAGS or arg in ('-p', '--package'):
+            value = rest[i + 1] if i + 1 < len(rest) else ''
+            i += 1
+            if arg in ('-p', '--package'):
+                foreign = foreign or value != PACKAGE
+                value = None
+        elif arg.startswith('--features='):
+            value = arg[len('--features='):]
+        elif arg.startswith('-F') and len(arg) > 2:
+            value = arg[2:]
+        elif arg.startswith('--package='):
+            foreign = foreign or arg[len('--package='):] != PACKAGE
+        if arg in VALUE_SELECTORS:
+            i += 1  # skip the target name
+        if value is not None and any(
+                f.rsplit('/', 1)[-1] in {'test-seam', 'cli-runtime-test'}
+                for f in re.split(r'[,\s]+', value)):
+            seam = True
+        i += 1
+    builds_lib = lib or not other
+    return seam and builds_lib and not foreign
+
+
+def choose_machine_type(requested, command):
+    """Return (type, reason). An explicit --type wins; a test-seam lib build needs large."""
+    if requested:
+        return requested, 'requested with --type'
+    if is_test_seam_lib_build(command):
+        return 'large', ('auto: a test-seam lib test build compiles the whole agent crate in one '
+                         'rustc and does not fit the 8 GB default')
+    return 'default', 'auto: no test-seam lib test build'
+
+
+def machine_rank(machine):
+    return MACHINE_TYPES.index(machine)
+
+
+def session_machine_type(session):
+    # Sessions written before --type always created a default sandbox.
+    value = session.get('type')
+    return value if value in MACHINE_TYPES else 'default'
+
+
+def guard_stop_line(machine):
+    return (f'boat-build: STOPPED BY THE MEMORY GUARD (type={machine}): the job was killed and '
+            'NO TEST RESULT EXISTS. Re-run with a larger --type; do not read this as a pass.')
 
 
 class Tee:
@@ -400,9 +499,9 @@ def git(root, *args, binary=False):
         stderr=subprocess.PIPE, text=not binary)
 
 
-def create_sandbox(name):
+def create_sandbox(name, machine='default'):
     command = ['boat', '--no-update', 'new', '--no-env', '--no-snapshots', '--ttl', CREATE_TTL,
-               '--type', 'default', '--name', name, '--json']
+               '--type', machine, '--name', name, '--json']
     proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
     created = None
     ready = False
@@ -504,13 +603,14 @@ def load_session(path):
     return payload
 
 
-def save_session(path, sandbox, root):
+def save_session(path, sandbox, root, machine='default'):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.json.tmp')
     temporary.write_text(json.dumps({
         'version': 1,
         'sandbox': sandbox,
         'worktree': str(root.resolve()),
+        'type': machine,
     }, indent=2) + '\n')
     os.replace(temporary, path)
     global PUBLISHED
@@ -771,10 +871,13 @@ def main():
                         help='delete the sandbox when the command exits')
     parser.add_argument('--down', action='store_true',
                         help='delete this worktree sandbox and exit')
+    parser.add_argument('--type', choices=MACHINE_TYPES,
+                        help='sandbox machine size (default: large for a cargo test or nextest '
+                             'lib build with --features test-seam, else default)')
     parser.add_argument('command', nargs=argparse.REMAINDER,
                         help='command and arguments after --; default: scripts/pre-push')
     args = parser.parse_args()
-    if args.down and (args.fresh or args.once or args.tests or args.artifact or args.command):
+    if args.down and (args.fresh or args.once or args.tests or args.artifact or args.command or args.type):
         parser.error('--down does not take a command or another run mode')
     if bool(args.artifact) != bool(args.output):
         parser.error('--artifact and --output must be supplied together')
@@ -794,6 +897,7 @@ def main():
     global ONCE, OWNED
     ONCE = args.once
     sandbox = None
+    machine = 'default'
     result = 1
     failure = None
     reused = False
@@ -840,6 +944,8 @@ def main():
         if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != current_head:
             raise Failure('HEAD changed while preparing the sandbox')
         patch_sha = hashlib.sha256(patch).hexdigest()
+        machine, why = choose_machine_type(args.type, command)
+        print(f'Boat type: {machine} ({why})', flush=True)
         print(f'Boat execution: head={head} base={base}; command={command!r}', flush=True)
         print(f'tracked_patch_sha256={patch_sha} applied={apply_patch}', flush=True)
 
@@ -848,6 +954,11 @@ def main():
             retire(session, session_path)
             session = None
         elif session and session.get('worktree') != str(root.resolve()):
+            retire(session, session_path)
+            session = None
+        elif session and machine_rank(session_machine_type(session)) < machine_rank(machine):
+            print(f"Boat session: {session['sandbox']} is type {session_machine_type(session)}, "
+                  f'this run needs {machine}; replacing it', flush=True)
             retire(session, session_path)
             session = None
         if session and args.fresh:
@@ -863,8 +974,9 @@ def main():
                 OWNED = sandbox
                 if extend_sandbox(sandbox, CREATE_TTL):
                     reused = True
-                    save_session(session_path, sandbox, root)
-                    print(f'Boat session: reusing {sandbox}', flush=True)
+                    machine = session_machine_type(session)  # a larger warm box is reused as is
+                    save_session(session_path, sandbox, root, machine)
+                    print(f'Boat session: reusing {sandbox} (type {machine})', flush=True)
                 else:
                     life = 'dead'
             if not reused:
@@ -886,9 +998,9 @@ def main():
                 archive = write_snapshot(root, directory, head, base)
                 if git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != current_head:
                     raise Failure('HEAD changed while preparing the sandbox')
-                sandbox = create_sandbox(sandbox_name(root))
+                sandbox = create_sandbox(sandbox_name(root), machine)
                 OWNED = sandbox
-                save_session(session_path, sandbox, root)
+                save_session(session_path, sandbox, root, machine)
                 print(f'Boat session: new {sandbox} (cold compile; later commands reuse it for {int(IDLE_TTL) // 60} min)',
                       flush=True)
             else:
@@ -949,6 +1061,8 @@ def main():
             lock.close()
         except OSError:
             pass
+        if result == GUARD_EXIT:
+            print(guard_stop_line(machine), flush=True)
     if failure is not None:
         raise failure
     return result
