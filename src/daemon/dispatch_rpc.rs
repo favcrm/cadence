@@ -292,7 +292,12 @@ impl Shared {
         // Grant→tracker order. A fresh intake send re-resolves the
         // admitted snapshot under the tracker lock held through enqueue.
         let revalidate_intake = prepared_intake.is_some();
-        let _tracker = (gated || revalidate_intake).then(|| pm.lock()).transpose()?;
+        if revalidate_intake {
+            issue::lockseam::outside_lock("intake-pre-enqueue");
+        }
+        let _tracker = (gated || revalidate_intake)
+            .then(|| pm.lock())
+            .transpose()?;
         if revalidate_intake {
             let (live_project, live_dir) = issue::write::issue_dir(&pm, &id)?;
             if live_dir != dir || live_project.key != project.key {

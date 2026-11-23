@@ -64,6 +64,9 @@ pub(super) struct JobIssueSnapshot {
 
 impl JobIssueSnapshot {
     pub(super) fn lock(&self) -> Result<crate::issue::PmLock> {
+        if self.intake.is_some() {
+            crate::issue::lockseam::outside_lock("intake-pre-enqueue");
+        }
         self.pm.lock()
     }
 
