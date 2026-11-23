@@ -5,53 +5,17 @@ use super::*;
 impl Shared {
     pub(super) fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = required_str(params, "alias")?;
-        // CAD-1752: a hire from the role catalogue. The install, not the
-        // caller, picks the runtime: Pi on its launch-default endpoint.
-        // The role is resolved here so the flag cannot be set by naming
-        // an id the daemon does not know.
-        let hired = match optional_str(params, "catalogue") {
-            Some(id) => {
-                // A hire is the operator's act, whatever group the caller
-                // sits in: no agent may recruit, and nothing is written
-                // (no row, no home dir) before that is proven.
-                self.operator_connection_on_agent("catalogue hire", params, peer_pid)
-                    .map_err(|e| {
-                        Error::rejected(format!(
-                            "agent register refused: a catalogue hire is the operator's act ({e})"
-                        ))
-                    })?;
-                if self.store.agent_opt(alias)?.is_some() {
-                    return Err(Error::rejected(format!(
-                        "Agent '{alias}' already exists - pick another alias"
-                    )));
-                }
-                Some(catalogue_hire(params, id)?)
-            }
-            None => None,
-        };
-        if hired.is_none() && !matches!(params.get("look"), None | Some(Value::Null)) {
-            return Err(Error::rejected(
-                "'look' only applies to a catalogue hire - send 'catalogue' with it",
-            ));
-        }
-        let provider = match &hired {
-            Some(_) => "pi",
-            None => required_str(params, "provider")?,
-        };
-        let endpoint = match &hired {
-            Some(_) => registry::default_kind("pi")?,
-            None => {
-                optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND)
-            }
-        };
+        crate::agent_settings::refuse_profile_alias(&self.store, alias)?;
+        let provider = required_str(params, "provider")?;
+        let endpoint =
+            optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
         let role = optional_str(params, "role").unwrap_or("worker");
-        let caller_team_role = optional_text(params, "team_role")?
-            .or_else(|| hired.as_ref().map(|hire| hire.role.team_role));
+        registry::refuse_reviewer_pane(provider, endpoint, role)?;
+        let caller_team_role = optional_text(params, "team_role")?;
         let model_policy = optional_text(params, "model_policy")?;
         let cwd = optional_str(params, "cwd");
         let sandbox = optional_str(params, "sandbox").unwrap_or("read-only");
-        let caller_instructions = optional_str(params, "instructions")
-            .or_else(|| hired.as_ref().map(|hire| hire.instructions.as_str()));
+        let caller_instructions = optional_str(params, "instructions");
         let agent_params = optional_str(params, "params");
         if registry::is_inbox_kind(endpoint) != registry::is_inbox_provider(provider) {
             return Err(Error::rejected(
@@ -68,17 +32,10 @@ impl Shared {
         }
         // A mailbox never runs a process — its cwd is bookkeeping only,
         // so direct socket callers may omit it (the CLI defaults cwd).
-        // A catalogue hire without a cwd gets a home dir under state,
-        // created below once every refusal has passed.
-        let mut needs_home = false;
-        let mut cwd = match (cwd, endpoint) {
+        let cwd = match (cwd, endpoint) {
             (Some(cwd), _) => std::fs::canonicalize(cwd)
                 .map_err(|_| Error::rejected("Working directory must exist"))?,
             (None, e) if !registry::has_actor(provider, e) => self.state_dir.clone(),
-            (None, _) if hired.is_some() => {
-                needs_home = true;
-                std::path::PathBuf::new()
-            }
             (None, _) => return Err(Error::rejected("Missing 'cwd'")),
         };
         // Enumerated launch params are validated at the door — a bad
@@ -101,32 +58,6 @@ impl Shared {
             ));
         }
         let mut defaulted = false;
-        if let Some(hire) = &hired {
-            let mut obj = match parsed {
-                Value::Object(obj) => obj,
-                Value::Null => serde_json::Map::new(),
-                _ => return Err(Error::rejected("'params' must be a JSON object")),
-            };
-            for key in ["catalogue", "look", "kind"] {
-                if obj.contains_key(key) {
-                    return Err(Error::rejected(format!(
-                        "params '{key}' is set from the catalogue role, not the caller"
-                    )));
-                }
-            }
-            obj.insert("catalogue".to_string(), json!(hire.role.id));
-            obj.insert("look".to_string(), json!(hire.look));
-            obj.insert("kind".to_string(), json!(hire.role.kind));
-            parsed = Value::Object(obj);
-            defaulted = true;
-            // A hire that Pi would refuse at launch is refused here, with
-            // the reason `GET /api/agent-roles` shows, before any home dir or
-            // row exists. An explicit model in params takes the ordinary
-            // path below, which applies the allowlist itself.
-            if parsed.get("model").is_none() {
-                self.role_model(endpoint, caller_team_role.unwrap_or(hire.role.team_role))?;
-            }
-        }
         // CAD-556: `pm.yaml [host] confine_pi_workers` is the pm-level
         // default a bare `join … pi` picks up — an explicit `confine`
         // param (`--confine`/`--no-confine`, or a caller's own params)
@@ -355,14 +286,6 @@ impl Shared {
             parsed
         };
         self.authorize_register(alias, &parsed, peer_pid)?;
-        // The alias was checked free above; should the insert still fail
-        // (a racing register, a params cap), the empty home is removed.
-        let mut new_home = None;
-        if needs_home {
-            let home = crate::adapter::pi::pi_agent_home(&self.state_dir, alias)?;
-            cwd = std::fs::canonicalize(&home)?;
-            new_home = Some(home);
-        }
         let registered = self.store.register_agent(&crate::store::NewAgent {
             alias,
             provider,
@@ -375,14 +298,7 @@ impl Shared {
             team_role,
             model_policy,
         });
-        if let Err(err) = registered {
-            if let Some(home) = new_home {
-                if !matches!(self.store.agent_opt(alias), Ok(Some(_))) {
-                    let _ = std::fs::remove_dir(home);
-                }
-            }
-            return Err(err);
-        }
+        registered?;
         // CAD-559: when `[pi].models.default` filled the launch model,
         // `register_agent` labeled it `explicit` — restamp the real
         // provenance before the row can be read or launched.
@@ -448,23 +364,143 @@ impl Shared {
         }))
     }
 
-    /// CAD-1752: the role catalogue plus what a hire registers on this
-    /// install and the model each role would launch on. A read: the
-    /// catalogue is static and the model rows come from the same settings
-    /// `model_defaults_get` already serves to any viewer.
+    /// CAD-2092: replace an agent's per-agent bundled skill allowlist
+    /// (`params.skills`). Operator only, by connection — no agent (neither
+    /// the target nor its PM) may change its own skills. Never restarts a
+    /// running session; changes apply on the next launch.
+    pub(super) fn rpc_skills_set(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection_on_agent("agent skills", params, peer_pid)?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "the master's skills are fixed by its runtime posture",
+            ));
+        }
+        let raw = params
+            .get("skills")
+            .ok_or_else(|| Error::rejected("missing 'skills' array"))?;
+        let agent = self.store.agent(&alias)?;
+        if !registry::supports_per_agent_skills(&agent.provider, &agent.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "per-agent skills are only enforced on managed Pi/OMP runtimes, not {}/{}",
+                agent.provider, agent.endpoint_kind
+            )));
+        }
+        let selected = crate::skill::validate_skills_param(raw)?;
+        let audit = json!({"by": "operator", "by_kind": "operator", "caller_pid": peer_pid});
+        self.store
+            .set_params_by(&alias, &json!({"skills": selected}), &audit)?;
+        self.wake();
+        Ok(json!({
+            "alias": alias,
+            "state": "updated",
+            "applies": "next_launch",
+            "skills": selected,
+        }))
+    }
+
+    /// CAD-2092: replace an agent's disabled built-in tools list
+    /// (`params.disabled_tools`). Operator only, by connection — no agent
+    /// may change its own tools. Required `cadence` cannot be turned off.
+    /// Never restarts a running session; changes apply on the next launch.
+    pub(super) fn rpc_tools_set(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection_on_agent("agent tools", params, peer_pid)?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "the master's tools are fixed by its runtime posture",
+            ));
+        }
+        let agent = self.store.agent(&alias)?;
+        let raw = params
+            .get("disabled_tools")
+            .ok_or_else(|| Error::rejected("missing 'disabled_tools' array"))?;
+        let disabled =
+            registry::validate_disabled_tools_param(&agent.provider, &agent.endpoint_kind, raw)?;
+        let audit = json!({"by": "operator", "by_kind": "operator", "caller_pid": peer_pid});
+        self.store
+            .set_params_by(&alias, &json!({"disabled_tools": disabled}), &audit)?;
+        self.wake();
+        Ok(json!({
+            "alias": alias,
+            "state": "updated",
+            "applies": "next_launch",
+            "disabled_tools": disabled,
+        }))
+    }
+
+    /// CAD-1989: `POST /api/agent-profiles` - a catalogue hire saves a settings
+    /// profile and launches nothing. Operator only, by the connection.
+    pub(super) fn rpc_agent_profile_create(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection_on_agent("agent profile create", params, peer_pid)
+            .map_err(|e| {
+                Error::rejected(format!(
+                    "agent profile create refused: a hire is the operator's act ({e})"
+                ))
+            })?;
+        let alias = required_str(params, "alias")?;
+        let id = required_str(params, "catalogue")?;
+        let role = crate::agent_roles::find(id).ok_or_else(|| {
+            Error::rejected(format!(
+                "Unknown catalogue role '{id}' - one of: {}",
+                crate::agent_roles::ids()
+            ))
+        })?;
+        crate::agent_settings::create_catalogue_profile(
+            &self.store,
+            alias,
+            role,
+            role.look,
+            optional_text(params, "job")?,
+            optional_text(params, "model")?,
+        )
+    }
+
+    /// CAD-1989: the hosted `agent_profile_context` envelope for a settings
+    /// profile. The job is the operator's: the operator, or an agent whose
+    /// own runtime row is registered against this profile, may read it;
+    /// every other caller is refused.
+    pub(super) fn rpc_agent_profile_context(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let id = required_str(params, "id")?;
+        if self.operator_evidence(peer_pid).is_err() {
+            let own = match self.caller_identity(peer_pid)? {
+                Caller::Agent(verified) => {
+                    verified
+                        .agent
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("profile"))
+                        .and_then(Value::as_str)
+                        == Some(id)
+                }
+                Caller::NoAgentIdentity => false,
+            };
+            if !own {
+                return Err(Error::rejected(
+                    "agent profile context is the operator's, or the context of a runtime \
+                     registered against that profile",
+                ));
+            }
+        }
+        crate::agent_settings::profile_context(&self.store, &self.store.agents()?, id)
+    }
+
+    /// CAD-1752: the role catalogue and what this install registers on. A
+    /// read: the catalogue is static and carries no model (CAD-1989).
     pub(super) fn rpc_agent_roles(self: &Arc<Self>) -> Result<Value> {
         let provider = "pi";
         let endpoint = registry::default_kind(provider)?;
         let roles: Vec<Value> = crate::agent_roles::ROLES
             .iter()
-            .map(|role| {
-                let mut row = role.to_json();
-                row["model"] = match self.role_model(endpoint, role.team_role) {
-                    Ok((id, source)) => json!({"id": id, "source": source}),
-                    Err(err) => json!({"error": err.to_string()}),
-                };
-                row
-            })
+            .map(|role| role.to_json())
             .collect();
         Ok(json!({
             "categories": crate::agent_roles::CATEGORIES
@@ -480,64 +516,23 @@ impl Shared {
         }))
     }
 
-    /// The model a worker of `team_role` launches on: the same two steps
-    /// `rpc_register` takes for pi — the defaults layer, else `[pi]` policy.
-    fn role_model(&self, endpoint: &str, team_role: &str) -> Result<(String, String)> {
-        let defaults = self.store.model_defaults()?;
-        let resolved = crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
-            provider: "pi",
-            endpoint_kind: endpoint,
-            runtime_role: "worker",
-            team_role: Some(team_role),
-            model_policy: None,
-            params: None,
-            config: &defaults.config,
-            revision: defaults.revision,
-        })?;
-        let policy = self.stored_pi_policy()?;
-        let selection = resolved.model_selection.as_ref();
-        let picked = selection
-            .and_then(|sel| sel.get("model"))
-            .and_then(Value::as_str);
-        let (model, source) = match picked {
-            Some(model) => {
-                let source = selection
-                    .and_then(|sel| sel.get("source"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_default");
-                (model.to_string(), source.to_string())
-            }
-            None => {
-                let (model, platform) =
-                    crate::pi_policy::resolve_model_with_source(policy.as_ref(), "worker", None)?;
-                let source = if platform {
-                    "platform_default"
-                } else {
-                    "pi_policy_default"
-                };
-                (model, source.to_string())
-            }
-        };
-        // The launch admits a worker only on the operator's allowlist - the
-        // platform fallback is exempt at register but not when Pi opens -
-        // and refuses Devin models for a confined worker. Apply both here
-        // so a role that would register and then fence shows its reason.
-        crate::pi_policy::require_allowed(policy.as_ref(), "worker", &model)?;
-        let confined = self
-            .pm_dir()
-            .ok()
-            .filter(|dir| dir.is_dir())
-            .map(|dir| crate::doctor::host::read_host_overrides(&dir))
-            .transpose()
-            .map_err(Error::rejected)?
-            .flatten()
-            .and_then(|overrides| overrides.confine_pi_workers)
-            == Some(true);
-        crate::adapter::pi::refuse_confined_devin("a catalogue hire", confined, &model)?;
-        Ok((model, source))
-    }
+    /// The visible agent-event page size. An operator's numeric page keeps its
+    /// existing bound; a scoped page is filled with visible rows only.
+    const EVENTS_PAGE: usize = 100;
+    /// The newest scoped tail page.
+    const EVENTS_TAIL_PAGE: usize = 50;
+    /// One raw store window of a scoped scan. A page continues past rows the
+    /// reader may not see, so a window may contribute nothing.
+    const EVENTS_SCAN_CHUNK: i64 = 100;
 
     pub(super) fn rpc_events(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        // CAD-2215: the request shape is settled BEFORE any agent is named or
+        // any event is read, so a downgrade attempt learns nothing.
+        let format = agent_events_opaque::requested_format(params, "agent events")?;
+        if format.is_some_and(|format| format != agent_events_opaque::FORMAT) {
+            return Err(agent_events_opaque::format_required("agent events"));
+        }
+        let after = agent_events_opaque::supplied_after(params);
         let raw = required_str(params, "alias")?;
         // The daemon stream has no agents row — read-only, so a plain
         // match suffices; every other RPC keeps resolving to an agent.
@@ -547,63 +542,623 @@ impl Shared {
         } else {
             self.resolve_alias(raw)?
         };
-        // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
-        // the operator reads them from the shared stream; every other caller gets
-        // the same page with those rows removed, cursors unchanged.
-        let hide_intents = daemon
-            && !matches!(
-                self.connection_caller(peer_pid)?,
-                caller_rule::Who::Operator
-            );
-        let visible = |events: Vec<crate::store::Event>| -> Vec<crate::store::Event> {
-            if hide_intents {
-                events
-                    .into_iter()
-                    .filter(|e| e.kind != "assist_intent")
-                    .collect()
-            } else {
-                events
-            }
+        let reader = self.verified_agent_event_reader(params, peer_pid, "agent events")?;
+        if !daemon
+            && self.member_agent_row_withheld_for_relay(
+                &alias,
+                params,
+                reader.cli.as_ref(),
+                reader.public.as_ref(),
+                peer_pid,
+            )?
+        {
+            return Err(Error::rejected("Unknown managed agent"));
+        }
+        // CAD-2215: a scoped reader must continue with a token and must name
+        // the opaque format. A number is a downgrade, and an unknown/absent
+        // format is refused — never coerced and never served as numeric
+        // positions. A proven operator keeps the legacy numeric document.
+        let scoped = reader.principal.is_some();
+        // CAD-2215: a scoped cursor is bound to the reader's readable project
+        // set (length-framed and sorted), not to the dynamic issue map or the
+        // private-job denial rows. A withdrawal or grant changes the
+        // authorization set, so a token minted under the old set refuses and
+        // resumes when the same set is restored; ordinary work and hidden
+        // event/issue insertion never move it. A genuinely projectless reader
+        // still gets an empty page.
+        let filters = if scoped {
+            Some(reader.readable_filters())
+        } else {
+            None
         };
-        let after = optional_i64(params, "after").unwrap_or(0);
-        if after < 0 {
+        let supplied = if scoped {
+            if format.is_none() {
+                return Err(agent_events_opaque::format_required("agent events"));
+            }
+            match after {
+                agent_events_opaque::SuppliedAfter::Absent => None,
+                agent_events_opaque::SuppliedAfter::Text(token) => Some(token),
+                agent_events_opaque::SuppliedAfter::Number => {
+                    return Err(agent_events_opaque::numeric_cursor("agent events"))
+                }
+                agent_events_opaque::SuppliedAfter::Unsupported => {
+                    return Err(agent_events_opaque::invalid_after("agent events"))
+                }
+            }
+        } else {
+            // The legacy numeric continuation, preserved exactly for the
+            // operator. An opaque token, a non-integer number or any other
+            // shape is not a position, and is never coerced to zero.
+            match after {
+                agent_events_opaque::SuppliedAfter::Absent => {}
+                agent_events_opaque::SuppliedAfter::Number => {
+                    if params.get("after").and_then(Value::as_i64).is_none() {
+                        return Err(agent_events_opaque::invalid_after("agent events"));
+                    }
+                }
+                agent_events_opaque::SuppliedAfter::Text(_)
+                | agent_events_opaque::SuppliedAfter::Unsupported => {
+                    return Err(agent_events_opaque::invalid_after("agent events"))
+                }
+            }
+            None
+        };
+        let numeric_after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
+        if numeric_after < 0 {
             return Err(Error::rejected("Event cursor must be nonnegative"));
         }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
+        // Missing key material refuses a scoped read before any content; it
+        // never downgrades to numeric positions. The stream identity (durable
+        // `uid` for a registered agent, a fixed resource for the daemon) is
+        // bound into every token.
+        let token_material = if scoped {
+            Some((
+                self.scoped_cursor_codec()?,
+                reader.principal.clone().ok_or_else(|| {
+                    Error::rejected("agent events refused: reader access changed")
+                })?,
+                self.agent_event_stream(&alias, daemon, "agent events")?,
+            ))
+        } else {
+            None
+        };
+        let position = match (token_material.as_ref(), supplied) {
+            (Some((codec, principal, stream)), Some(token)) => Some(agent_events_opaque::open(
+                codec,
+                principal,
+                stream,
+                filters.as_deref().unwrap_or_default(),
+                token,
+                "agent events",
+            )?),
+            _ => None,
+        };
+        let private_denials = if reader.scope.is_some() {
+            self.private_job_denials_for_read(
+                params,
+                reader.cli.as_ref(),
+                reader.public.as_ref(),
+                peer_pid,
+            )?
+        } else {
+            Default::default()
+        };
+        let allowed_issues = reader.scope.as_ref().map(|(readable, issues)| {
+            issues
+                .iter()
+                .filter(|(_, project)| readable.contains(*project))
+                .map(|(issue, _)| issue.as_str())
+                .collect::<Vec<_>>()
+        });
+        // CAD-2215: the alias each row's `message` binding resolved to when
+        // that row was SELECTED. The post-selection cloud reproof re-uses that
+        // attribution instead of re-reading the message table, so a row is
+        // always judged against the alias its admission was proven for and a
+        // message that disappears after selection cannot re-point it.
+        let selected_message_alias: std::cell::RefCell<std::collections::HashMap<String, String>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        let revalidate = |selected: &[crate::store::Event]| -> Result<()> {
+            let current = self.verified_agent_event_reader(params, peer_pid, "agent events")?;
+            let changed = || Error::rejected("agent events refused: reader access changed");
+            if !reader.same_authority(&current) {
+                return Err(changed());
+            }
+            // The durable stream identity is re-read after selection: a
+            // re-registered alias (new uid) can never inherit this page.
+            if let Some((_, _, stream)) = token_material.as_ref() {
+                let current_stream = self
+                    .agent_event_stream(&alias, daemon, "agent events")
+                    .map_err(|_| changed())?;
+                if !stream.same_identity(&current_stream) {
+                    return Err(changed());
+                }
+            }
+            if !daemon
+                && self.member_agent_row_withheld_for_relay(
+                    &alias,
+                    params,
+                    current.cli.as_ref(),
+                    current.public.as_ref(),
+                    peer_pid,
+                )?
+            {
+                return Err(changed());
+            }
+            // CAD-2215: re-admit exactly the rows this page returns against
+            // the CURRENT task/job/message -> issue/project/denial bindings.
+            // An issue can move, or a row's task/job can become denied, while
+            // the readable project set stays the same. Comparing whole
+            // issue/denial sets instead would make an unrelated hidden
+            // insertion refuse the read (an activity oracle).
+            if current.scope.is_some() {
+                self.reprove_selected_agent_rows(&alias, selected, &current, params, peer_pid)?;
+                // CAD-2215: the project/SQL reproof above cannot see a cloud
+                // grant revocation: the snapshot this page was selected under
+                // still looks current for an already-KNOWN message, so the
+                // stale projection would release cloud content whose
+                // authority was withdrawn. Re-prove the same admission
+                // predicate now, per alias the page actually returns.
+                self.reprove_selected_cloud_rows(selected, &selected_message_alias, peer_pid)?;
+            }
+            Ok(())
+        };
+        // CAD-1853 review: the alias' event stream carries cloud request and
+        // result detail, so it applies the same source/owner decision as the
+        // dedicated cloud read before projecting anything — current READ
+        // authority, and only the caller's own source's rows.
+        let mut projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+        // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
+        // the operator reads them from the shared stream; every other caller gets
+        // the same page with those rows removed, cursors unchanged.
+        let hide_intents = daemon && scoped;
+        let visible = |projection: &cloud_agent_rpc::CloudProjection,
+                       events: Vec<crate::store::Event>|
+         -> Result<Vec<crate::store::Event>> {
+            let mut foreign = std::collections::HashMap::new();
+            let mut visible = Vec::with_capacity(events.len());
+            for mut event in events {
+                if hide_intents && event.kind == "assist_intent" {
+                    continue;
+                }
+                // A dispatch event can name a message delivered to a different
+                // agent. Prove cloud authority against that message's actual
+                // alias rather than treating absence from this alias as proof.
+                let selected: &cloud_agent_rpc::CloudProjection = if let Some(id) =
+                    event.payload.get("message").and_then(Value::as_str)
+                {
+                    let Some(message) = self.store.message(id)? else {
+                        continue;
+                    };
+                    // CAD-2215: remember the attribution this row was
+                    // admitted under, so the post-selection reproof judges the
+                    // same alias instead of re-deriving one.
+                    selected_message_alias
+                        .borrow_mut()
+                        .insert(id.to_string(), message.alias.clone());
+                    if message.alias != alias {
+                        match foreign.entry(message.alias) {
+                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let proof = self.admit_cloud_projection(
+                                    entry.key(),
+                                    peer_pid,
+                                    "agent events",
+                                )?;
+                                entry.insert(proof)
+                            }
+                        }
+                    } else {
+                        projection
+                    }
+                } else {
+                    projection
+                };
+                if !selected.admits_event(&event) {
+                    continue;
+                }
+                if scoped {
+                    agent_events_opaque::project_scoped_event(&mut event);
+                }
+                visible.push(event);
+            }
+            Ok(visible)
+        };
         // `tail` is the newest-first default `cadence events` uses
         // when no --after cursor is given: one bounded page ending at
         // the latest seq, oldest first within it, plus the forward
         // cursor and whether older history exists below the page.
         if params.get("tail").and_then(Value::as_bool).unwrap_or(false) {
-            let mut events = self.store.events_tail(&alias, 51)?;
-            let has_older = events.len() > 50;
-            // The store returns oldest first; discard the extra oldest row.
-            if has_older {
+            // A scoped tail is the newest VISIBLE page: scan newest-first past
+            // rows this reader may not see, with a real exclusive `before`
+            // bound so the scan makes progress instead of re-reading the same
+            // rows, and count `has_older` from visible rows only.
+            let (mut events, has_older, operator_cursor) = if scoped {
+                let issues = allowed_issues.as_deref().unwrap_or(&[]);
+                let mut before = i64::MAX;
+                let mut collected: Vec<crate::store::Event> = Vec::new();
+                loop {
+                    let rows = self.store.events_scoped_before(
+                        &alias,
+                        before,
+                        Self::EVENTS_SCAN_CHUNK,
+                        issues,
+                        &private_denials,
+                    )?;
+                    if rows.is_empty() {
+                        break;
+                    }
+                    let full = rows.len() as i64 == Self::EVENTS_SCAN_CHUNK;
+                    let oldest = rows.first().map(|e| e.seq).unwrap_or(before);
+                    if projection.needs_readmission(
+                        &self.store,
+                        rows.iter().filter_map(|event| {
+                            event.payload.get("message").and_then(Value::as_str)
+                        }),
+                    )? {
+                        projection =
+                            self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+                    }
+                    collected.extend(visible(&projection, rows)?);
+                    if collected.len() > Self::EVENTS_TAIL_PAGE {
+                        break;
+                    }
+                    if !full {
+                        break;
+                    }
+                    before = oldest;
+                }
+                collected.sort_by_key(|event| event.seq);
+                let has_older = collected.len() > Self::EVENTS_TAIL_PAGE;
+                if has_older {
+                    // Keep one older visible row until reproof: it is the
+                    // witness for has_older, even though it is not returned.
+                    let page_start = collected.len() - Self::EVENTS_TAIL_PAGE - 1;
+                    collected.drain(..page_start);
+                }
+                (collected, has_older, None)
+            } else {
+                let mut events = match allowed_issues.as_deref() {
+                    Some(issues) => {
+                        self.store
+                            .events_scoped(&alias, 0, 51, issues, &private_denials, true)?
+                    }
+                    None => self.store.events_tail(&alias, 51)?,
+                };
+                let has_older = events.len() > 50;
+                // The store returns oldest first; discard the extra oldest row.
+                if has_older {
+                    events.remove(0);
+                }
+                // Observed before it is projected: an event naming a row the
+                // admission snapshot does not cover — a routed cloud result that
+                // resolved since, or a turn that settled meanwhile — re-resolves
+                // this page's admission once, exactly as the waiting path does.
+                if projection.needs_readmission(
+                    &self.store,
+                    events
+                        .iter()
+                        .filter_map(|event| event.payload.get("message").and_then(Value::as_str)),
+                )? {
+                    projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+                }
+                let cursor = events.last().map(|e| e.seq).unwrap_or(0);
+                let events = visible(&projection, events)?;
+                (events, has_older, Some(cursor))
+            };
+            #[cfg(any(test, feature = "test-seam"))]
+            if scoped {
+                if let Some(hook) = &self.agent_events_selected_hook {
+                    hook(&alias, &events);
+                }
+            }
+            revalidate(&events)?;
+            if scoped && has_older {
                 events.remove(0);
             }
-            let cursor = events.last().map(|e| e.seq).unwrap_or(0);
-            return Ok(json!({
-                "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
-                "cursor": cursor,
-                "has_older": has_older,
-            }));
+            let mut page = match token_material.as_ref() {
+                Some((codec, principal, stream)) => agent_events_opaque::scoped_page(
+                    codec,
+                    principal,
+                    stream,
+                    filters.as_deref().unwrap_or_default(),
+                    &events,
+                    // A tail page ignores `after`; its cursor is the last
+                    // visible row or null, never a re-echoed token.
+                    None,
+                    Some(has_older),
+                    "agent events",
+                )?,
+                None => json!({
+                    "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                    "cursor": operator_cursor.unwrap_or(0),
+                    "has_older": has_older,
+                }),
+            };
+            if let Some(reason) = projection
+                .withheld
+                .filter(|_| !private_denials.exclude_cloud)
+            {
+                page["cloud_withheld"] = json!(reason);
+            }
+            Self::mark_agent_event_reader_scope(&mut page, &reader, format.is_some());
+            return Ok(page);
         }
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
-            let events = self.store.events(&alias, after, 100)?;
-            if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
-                let cursor = events.last().map(|e| e.seq).unwrap_or(after);
-                return Ok(json!({
-                    "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
-                    "cursor": cursor,
-                }));
-            }
-            if Instant::now() >= deadline {
-                return Ok(json!({"events": [], "cursor": after}));
+            if scoped {
+                // Forward scan: keep reading windows until the page is full of
+                // VISIBLE rows or the stream ends. Hidden rows shorten neither
+                // the page nor its continuation.
+                // The attribution map describes the rows of THIS attempt: an
+                // earlier attempt's ids are not among the rows this page can
+                // return, so keeping them would only grow the map.
+                selected_message_alias.borrow_mut().clear();
+                let mut scan = position.unwrap_or(0);
+                let mut collected: Vec<crate::store::Event> = Vec::with_capacity(Self::EVENTS_PAGE);
+                let issues = allowed_issues.as_deref().unwrap_or(&[]);
+                loop {
+                    let rows = self.store.events_scoped(
+                        &alias,
+                        scan,
+                        Self::EVENTS_SCAN_CHUNK,
+                        issues,
+                        &private_denials,
+                        false,
+                    )?;
+                    if rows.is_empty() {
+                        break;
+                    }
+                    let full = rows.len() as i64 == Self::EVENTS_SCAN_CHUNK;
+                    scan = rows.last().map(|e| e.seq).unwrap_or(scan);
+                    if projection.needs_readmission(
+                        &self.store,
+                        rows.iter().filter_map(|event| {
+                            event.payload.get("message").and_then(Value::as_str)
+                        }),
+                    )? {
+                        projection =
+                            self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+                    }
+                    let mut chunk = visible(&projection, rows)?;
+                    let need = Self::EVENTS_PAGE.saturating_sub(collected.len());
+                    if need == 0 || chunk.len() >= need {
+                        collected.extend(chunk.drain(..need));
+                        break;
+                    }
+                    collected.extend(chunk);
+                    if !full {
+                        break;
+                    }
+                }
+                if !collected.is_empty()
+                    || self.closing.load(Ordering::SeqCst)
+                    || Instant::now() >= deadline
+                {
+                    #[cfg(any(test, feature = "test-seam"))]
+                    if let Some(hook) = &self.agent_events_selected_hook {
+                        hook(&alias, &collected);
+                    }
+                    revalidate(&collected)?;
+                    let mut page = match token_material.as_ref() {
+                        Some((codec, principal, stream)) => agent_events_opaque::scoped_page(
+                            codec,
+                            principal,
+                            stream,
+                            filters.as_deref().unwrap_or_default(),
+                            &collected,
+                            supplied,
+                            None,
+                            "agent events",
+                        )?,
+                        None => {
+                            return Err(Error::rejected(
+                                "agent events refused: reader access changed",
+                            ))
+                        }
+                    };
+                    if let Some(reason) = projection
+                        .withheld
+                        .filter(|_| !private_denials.exclude_cloud)
+                    {
+                        page["cloud_withheld"] = json!(reason);
+                    }
+                    Self::mark_agent_event_reader_scope(&mut page, &reader, format.is_some());
+                    return Ok(page);
+                }
+            } else {
+                let events = self.store.events(&alias, numeric_after, 100)?;
+                if !events.is_empty()
+                    || self.closing.load(Ordering::SeqCst)
+                    || Instant::now() >= deadline
+                {
+                    // A waiting read can observe an event about a turn that
+                    // settled after this admission was taken — or, on an ordinary
+                    // alias, an event naming a routed cloud result that resolved
+                    // since. Re-resolve the page's whole admission before
+                    // projecting it, exactly as `thread_read` does: the old
+                    // admission never covered those rows. This page is returned
+                    // either way, so one re-resolution is the bound.
+                    let cursor = events.last().map(|e| e.seq).unwrap_or(numeric_after);
+                    let events = if events.is_empty() {
+                        events
+                    } else if projection.needs_readmission(
+                        &self.store,
+                        events.iter().filter_map(|event| {
+                            event.payload.get("message").and_then(Value::as_str)
+                        }),
+                    )? {
+                        projection =
+                            self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+                        visible(&projection, events)?
+                    } else {
+                        visible(&projection, events)?
+                    };
+                    revalidate(&events)?;
+                    let mut page = json!({
+                        "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                        "cursor": cursor,
+                    });
+                    if let Some(reason) = projection
+                        .withheld
+                        .filter(|_| !private_denials.exclude_cloud)
+                    {
+                        page["cloud_withheld"] = json!(reason);
+                    }
+                    Self::mark_agent_event_reader_scope(&mut page, &reader, format.is_some());
+                    return Ok(page);
+                }
             }
             let step = deadline.min(Instant::now() + Duration::from_secs(1));
             self.changed.wait_until(step);
         }
+    }
+
+    /// CAD-2215: the per-response reader acknowledgement. A scoped page always
+    /// names the opaque reader scope. A relayed operator page keeps the
+    /// acknowledgement it has always carried; a proven operator that asked for
+    /// the opaque format gets the additive operator acknowledgement instead, so
+    /// no client mistakes numeric positions for opaque ones.
+    fn mark_agent_event_reader_scope(
+        out: &mut Value,
+        reader: &agent_events_opaque::VerifiedAgentEventReader,
+        format_requested: bool,
+    ) {
+        let field = cadence_core::board_api::READER_SCOPE_FIELD;
+        if reader.principal.is_some() {
+            out[field] = json!(cadence_core::board_api::AGENT_EVENTS_SCOPE_ACK);
+        } else if format_requested {
+            out[field] = json!(cadence_core::board_api::AGENT_EVENTS_OPERATOR_SCOPE_ACK);
+        } else if reader.relayed {
+            out[field] = json!(cadence_core::board_api::AGENT_EVENTS_SCOPE_ACK);
+        }
+    }
+
+    /// CAD-2215: re-admit exactly the rows a scoped page is about to return.
+    ///
+    /// The page was selected under an earlier snapshot. An issue can be
+    /// reassigned to a non-readable project (or a row's task/job can become
+    /// private) while the reader's readable project SET stays the same, so a
+    /// set comparison is not enough. Re-running the same authorization
+    /// predicate over exactly the selected seqs (one JSON-array query), with
+    /// the CURRENT issue map and denial rows, is: a selected row that is no
+    /// longer admitted refuses the page, while an unrelated hidden job/issue
+    /// arriving meanwhile is not selected and cannot turn the read into a
+    /// refusal.
+    ///
+    /// This covers project/job/task/denial bindings only. Cloud admission is
+    /// re-proved separately by [`Self::reprove_selected_cloud_rows`], because
+    /// neither this query nor the readable project set can see a withdrawn
+    /// cloud grant, credential or owner.
+    fn reprove_selected_agent_rows(
+        &self,
+        alias: &str,
+        selected: &[crate::store::Event],
+        current: &agent_events_opaque::VerifiedAgentEventReader,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<()> {
+        let Some((readable, issues)) = current.scope.as_ref() else {
+            return Ok(());
+        };
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let changed = || Error::rejected("agent events refused: reader access changed");
+        let allowed = issues
+            .iter()
+            .filter(|(_, project)| readable.contains(*project))
+            .map(|(issue, _)| issue.as_str())
+            .collect::<Vec<_>>();
+        let denied = self
+            .private_job_denials_for_read(
+                params,
+                current.cli.as_ref(),
+                current.public.as_ref(),
+                peer_pid,
+            )
+            .map_err(|_| changed())?;
+        let seqs = selected.iter().map(|event| event.seq).collect::<Vec<_>>();
+        // One exact selected-set read (a JSON array of at most one page of
+        // seqs), not a numeric span: global seq gaps never widen the work, and
+        // only `seq` is projected, so no event payload is copied.
+        let admitted = self
+            .store
+            .events_scoped_admitted_seqs(alias, &seqs, &allowed, &denied)
+            .map_err(|_| changed())?;
+        let present = admitted
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        for seq in &seqs {
+            if !present.contains(seq) {
+                return Err(changed());
+            }
+        }
+        Ok(())
+    }
+
+    /// CAD-2215: re-prove CURRENT cloud admission for exactly the rows a
+    /// scoped page is about to return — including a tail's older `has_older`
+    /// witness, which is still among the selected rows at this point — and,
+    /// for a dispatch row naming a message delivered elsewhere, against that
+    /// message's own alias rather than this stream's.
+    ///
+    /// The projection a page was selected under is a snapshot, and
+    /// [`cloud_agent_rpc::CloudProjection::needs_readmission`] only notices
+    /// ids that snapshot never named, or a request-only operation that has
+    /// since settled. A cloud grant — or the credential, enrollment scope or
+    /// logical owner behind it — revoked for an ALREADY KNOWN message leaves
+    /// that snapshot looking current, so the row would be released from it.
+    /// Re-resolving the same admission predicate now, once per alias this page
+    /// actually returns rows from, closes that window: a selected row the
+    /// fresh admission no longer admits refuses the page instead of being
+    /// returned.
+    ///
+    /// Only selected rows and their aliases are re-proved. An unrelated
+    /// hidden insertion, a revocation on an alias the page does not name, and
+    /// a row that was already withheld at selection time cannot turn this read
+    /// into a refusal, so the refusal never reports work the reader may not
+    /// see.
+    fn reprove_selected_cloud_rows(
+        &self,
+        selected: &[crate::store::Event],
+        selected_message_alias: &std::cell::RefCell<std::collections::HashMap<String, String>>,
+        peer_pid: u32,
+    ) -> Result<()> {
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let changed = || Error::rejected("agent events refused: reader access changed");
+        let attribution = selected_message_alias.borrow();
+        // At most one fresh admission per alias, and only for aliases this
+        // page returns rows from.
+        let mut proofs: std::collections::HashMap<String, cloud_agent_rpc::CloudProjection> =
+            std::collections::HashMap::new();
+        for event in selected {
+            let Some(id) = event.payload.get("message").and_then(Value::as_str) else {
+                // Alias-level metadata carries no request or result text, so
+                // `admits_event` admits it under every admission.
+                continue;
+            };
+            // The row was admitted through this message's alias. Without that
+            // attribution it cannot be re-proved at all, so it is not served.
+            let Some(row_alias) = attribution.get(id).cloned() else {
+                return Err(changed());
+            };
+            let projection = match proofs.entry(row_alias) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let proof = self
+                        .admit_cloud_projection(entry.key(), peer_pid, "agent events")
+                        .map_err(|_| changed())?;
+                    entry.insert(proof)
+                }
+            };
+            if !projection.admits_event(event) {
+                return Err(changed());
+            }
+        }
+        Ok(())
     }
 
     /// Operator readiness claim for gated endpoints (pty): asserts the
@@ -711,6 +1266,12 @@ impl Shared {
         };
         let caller =
             self.authorize_agent_mutation(params, peer_pid, "agent set", &agent, mutation)?;
+        if patch
+            .as_object()
+            .is_some_and(|o| o.contains_key("skills") || o.contains_key("disabled_tools"))
+        {
+            self.operator_connection_on_agent("agent set skills/tools", params, peer_pid)?;
+        }
         // CAD-804: `gc_keep` is a registry keep, not an endpoint param.
         // Take it out before the endpoint-param allowlist runs; every
         // other key still validates and merges exactly as before.
@@ -828,6 +1389,27 @@ impl Shared {
         Ok(json!({"alias": alias, "state": "updated"}))
     }
 
+    /// Resolve mailbox access only after the connection proves its caller.
+    /// Agents may consume only their own registered mailbox.
+    fn inbox_caller(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<(String, crate::peer::AgentCaller)> {
+        reject_identity_fields(params, verb)?;
+        let caller = self.agent_caller(peer_pid, verb)?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if let crate::peer::AgentCaller::Agent(agent) = &caller {
+            if agent != &alias {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: an agent may access only its own inbox"
+                )));
+            }
+        }
+        Ok((alias, caller))
+    }
+
     /// Drain an inbox agent's durable queue — messages complete
     /// `via=inbox_read` as they are returned. `wait` long-polls on the
     /// daemon's change signal, the same mechanism `events` uses.
@@ -838,31 +1420,41 @@ impl Shared {
     /// restart resumes after its last `agent_inbox_ack`, not its last
     /// read. `unread` is the live queued count either way.
     ///
-    /// The peek is a read, so it keeps the mailbox's unguarded shape
-    /// (CAD-251). The drain is a consume: like `agent_inbox_ack`, a
-    /// proven **agent** caller may drain only its own inbox — a worker
-    /// can never consume another agent's queue — while unattributed and
-    /// operator callers pass as they always have.
+    /// Both reads and consumption require a proven operator or the
+    /// registered agent whose mailbox is named.
     pub(super) fn rpc_inbox(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
-        reject_identity_fields(params, "agent_inbox")?;
-        let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        let peek = params.get("peek").and_then(Value::as_bool) == Some(true);
-        let reader = inbox_reader(params)?;
-        if !peek {
-            if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
-                if caller != alias {
-                    return Err(Error::rejected(format!(
-                        "agent_inbox refused: agent '{caller}' cannot drain another \
-                         agent's inbox — '{alias}' is consumed by the operator or an \
-                         unattributed mailbox reader (caller rule, CAD-480)"
-                    )));
+        let (alias, caller) = self.inbox_caller(params, peer_pid, "agent_inbox")?;
+        let agent_uid = match &caller {
+            crate::peer::AgentCaller::Agent(_) => Some(self.store.agent(&alias)?.uid),
+            crate::peer::AgentCaller::Operator => None,
+        };
+        let reprove = || -> Result<()> {
+            let changed = || Error::rejected("agent_inbox refused: caller identity changed");
+            let current = self
+                .agent_caller(peer_pid, "agent_inbox")
+                .map_err(|_| changed())?;
+            if current != caller {
+                return Err(changed());
+            }
+            if let Some(expected_uid) = &agent_uid {
+                if self
+                    .store
+                    .agent(&alias)
+                    .map_or(true, |agent| agent.uid != *expected_uid)
+                {
+                    return Err(changed());
                 }
             }
-        }
+            Ok(())
+        };
+        let peek = params.get("peek").and_then(Value::as_bool) == Some(true);
+        let reader = inbox_reader(params)?;
         let after = optional_i64(params, "after");
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
+            // A long-poll must not keep authority that expired while waiting.
+            reprove()?;
             // A peek with no explicit `after` resumes at the reader's
             // ack watermark; a drain keeps the legacy bound of 0.
             let bound = match after {
@@ -875,6 +1467,9 @@ impl Shared {
             } else {
                 self.store.inbox_drain(&alias, bound)?
             };
+            if peek {
+                reprove()?;
+            }
             if !messages.is_empty() || self.closing.load(Ordering::SeqCst) {
                 self.wake();
                 let cursor = messages.last().map(|m| m.seq).unwrap_or(bound);
@@ -899,11 +1494,8 @@ impl Shared {
     /// same channel: `park` marks a queued message so the reader's
     /// peeks skip it (`inbox_park`), `fail` records one failed `--exec`
     /// attempt (`inbox_exec_fail`), and `reset` drops the reader's
-    /// cursor (`inbox_ack_reset`, operator only). A mailbox's consumer
-    /// has no verifiable identity (CAD-251), so unattributed and
-    /// operator callers pass exactly as they do on the read; the one
-    /// guard is that an agent may act only on its own alias — a worker
-    /// can never consume another agent's inbox.
+    /// cursor (`inbox_ack_reset`, operator only). An unattributed caller
+    /// cannot consume, park or report on a mailbox.
     ///
     /// The ack is a watermark: `through` (or the greatest `seqs` entry)
     /// completes every still-queued message at or below it, idempotent
@@ -913,27 +1505,15 @@ impl Shared {
     /// completes what exists but cannot blind the reader to later
     /// arrivals.
     pub(super) fn rpc_inbox_ack(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
-        reject_identity_fields(params, "agent_inbox_ack")?;
-        let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        let who = self.connection_caller(peer_pid)?;
+        let (alias, who) = self.inbox_caller(params, peer_pid, "agent_inbox_ack")?;
         let by = match &who {
-            caller_rule::Who::Agent(caller) if caller != &alias => {
-                return Err(Error::rejected(format!(
-                    "agent_inbox_ack refused: agent '{caller}' cannot ack another \
-                     agent's inbox — '{alias}' is consumed by the operator or an \
-                     unattributed mailbox reader (caller rule, CAD-480)"
-                )));
-            }
-            caller_rule::Who::Agent(caller) => caller.clone(),
-            caller_rule::Who::Operator => "operator".to_string(),
-            caller_rule::Who::Unproven(_) => "inbox-reader".to_string(),
+            crate::peer::AgentCaller::Agent(caller) => caller.clone(),
+            crate::peer::AgentCaller::Operator => "operator".to_string(),
         };
         let reader = inbox_reader(params)?;
-        // `reset` is the destructive action — it re-delivers everything
-        // still queued — so it needs operator proof, not merely a
-        // consumer's unattributed pass.
+        // Reset redelivers queued messages, so it requires the operator.
         if params.get("reset").and_then(Value::as_bool) == Some(true) {
-            if !matches!(who, caller_rule::Who::Operator) {
+            if !matches!(who, crate::peer::AgentCaller::Operator) {
                 return Err(Error::rejected(
                     "agent_inbox_ack --reset refused: resetting a reader cursor is \
                      an operator action — run it from an operator shell outside \
@@ -1122,20 +1702,31 @@ impl Shared {
     /// CAD-325: the slice of `agent_show` the board renders an agent row
     /// from — running messages, the parked count, queue and fence counts
     /// and the event cursor — without the whole message history.
-    pub(super) fn board_view(&self, alias: &str) -> Result<Value> {
+    pub(super) fn board_view(&self, alias: &str, peer_pid: u32) -> Result<Value> {
         let messages = self.store.running_messages(alias)?;
+        // CAD-1853: a routed cloud reply is a `worker_result` on the
+        // invoker's ordinary alias, and this view carries running message
+        // bodies. Every row asks the one cloud-row policy, or the board list
+        // becomes the body reader that `agent_show` refuses to be.
         // Never the turn token: it is the credential `message result`
         // checks, and the board has no use for it.
-        let running: Vec<Value> = messages
-            .iter()
-            .map(|m| {
-                let mut j = m.to_json();
-                if let Some(o) = j.as_object_mut() {
-                    o.remove("turn_id");
-                }
-                j
-            })
-            .collect();
+        let mut running: Vec<Value> = Vec::with_capacity(messages.len());
+        for m in &messages {
+            if !self.may_read_cloud_row(
+                peer_pid,
+                alias,
+                &m.id,
+                m.sender_uid.as_deref(),
+                m.recipient_uid.as_deref(),
+            )? {
+                continue;
+            }
+            let mut j = m.to_json();
+            if let Some(o) = j.as_object_mut() {
+                o.remove("turn_id");
+            }
+            running.push(j);
+        }
         let parked = self.store.parked_message_count(alias)?;
         Ok(json!({
             "messages": running,
@@ -1186,10 +1777,24 @@ impl Shared {
             )));
         }
         let mut reconciled = Vec::new();
+        let mut private_deliveries = Vec::new();
         for id in &ids {
             let message = self.store.reconcile(id, status, note, by, None)?;
             if let Some(result) = message.result.clone() {
                 self.notify_routed_target(&message, &result);
+            }
+            // CAD-2215: `agent unfence --status completed` is a real
+            // completion of any kickoff it settles; record the private
+            // result now instead of waiting for a verdict. The native
+            // reconcile above stands either way — its private settlement
+            // is reported beside it, never folded into or rolled back
+            // with it.
+            if message.source == "job_dispatch" && message.state == "completed" {
+                let mut settlement = self.settle_private_completion(&message.id);
+                if let Some(row) = settlement.as_object_mut() {
+                    row.insert("message".to_string(), json!(message.id));
+                }
+                private_deliveries.push(settlement);
             }
             reconciled.push(id.clone());
         }
@@ -1203,6 +1808,13 @@ impl Shared {
             .unwrap_or(false);
         let pty = agent.endpoint_kind == "pty";
         let mut out = json!({"alias": alias, "reconciled": reconciled});
+        // Each settled kickoff's private outcome is part of the answer:
+        // `reconciled` alone must not read as a private success when the
+        // ledger was unavailable, and nothing here rolls back the
+        // committed native reconciliation.
+        if !private_deliveries.is_empty() {
+            out["private_deliveries"] = json!(private_deliveries);
+        }
         if !resume {
             out["resumed"] = json!(false);
             if pty {
@@ -1690,40 +2302,4 @@ impl Shared {
                 .event_public(&agent.alias, "inbox_unconsumed", health);
         }
     }
-}
-
-/// CAD-1752: one validated hire from the role catalogue.
-struct CatalogueHire {
-    role: &'static crate::agent_roles::Role,
-    look: &'static str,
-    instructions: String,
-}
-
-/// Resolve a `catalogue` register request. The install picks the runtime,
-/// so a caller naming provider or endpoint kind is refused, and `profile`
-/// (mutually exclusive with instructions) never rides along.
-fn catalogue_hire(params: &Value, id: &str) -> Result<CatalogueHire> {
-    for field in ["provider", "endpoint_kind", "profile"] {
-        if !matches!(params.get(field), None | Some(Value::Null)) {
-            return Err(Error::rejected(format!(
-                "a catalogue hire takes '{field}' from the install, not the caller"
-            )));
-        }
-    }
-    let role = crate::agent_roles::find(id).ok_or_else(|| {
-        Error::rejected(format!(
-            "Unknown catalogue role '{id}' - one of: {}",
-            crate::agent_roles::ids()
-        ))
-    })?;
-    let look = match optional_text(params, "look")? {
-        None => role.look,
-        Some(look) => crate::agent_roles::canonical_look(look)
-            .ok_or_else(|| Error::rejected(format!("Unknown look '{look}'")))?,
-    };
-    Ok(CatalogueHire {
-        role,
-        look,
-        instructions: role.instructions(),
-    })
 }

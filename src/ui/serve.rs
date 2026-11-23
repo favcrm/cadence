@@ -2,7 +2,7 @@
 //! accept loop (`serve`), the response/static-file helpers they share, the
 //! embedded SPA build, and the `/api/agents` read model it serves.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use super::artifacts;
+use super::cloud_agents;
 use super::human_threads;
 use super::member_view::{member_event, member_running_item, redact_agents_payload};
 use super::notify_service;
@@ -25,11 +26,12 @@ use super::write_path::{
     request_identity, send, with_agents, write_route, HttpResp, BUSY_RETRY_AFTER_SECS,
 };
 use super::{
-    app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, approvals, apps, assist_route, business_templates,
-    cli_route, connections, crm_send, delivery_sync, endpoints, home, lane, locale, member_assist,
-    my_work, operator, platform_account, read_model, social_publish, stages, threads, topics,
-    updates, wiki, wiki_envelope, work_conversations, workflows,
+    agent_access, app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer,
+    app_records, app_release, app_runs, app_screens, approvals, apps, assist_route,
+    business_templates, cli_route, connections, credential_entry, crm_send, delivery_sync,
+    endpoints, home, lane, locale, member_assist, my_work, operator, platform_account, read_model,
+    routines, social_publish, stages, threads, time_zone, topics, updates, wiki, wiki_envelope,
+    work_conversations, workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -623,6 +625,437 @@ pub(crate) fn task_issue_map_from(state_dir: &Path, list: &Value) -> HashMap<Str
     map
 }
 
+pub(super) struct MemberJobState {
+    pub(super) bindings: HashMap<String, TaskBinding>,
+    pub(super) outcomes: board::JobOutcomes,
+    pub(super) fingerprint: u64,
+}
+
+/// Resolve member-visible jobs once for both issue status and task strips.
+pub(super) fn readable_job_state(
+    state_dir: &Path,
+    pm: &Pm,
+    actor: &str,
+    proof: &operator::ReadRelayProof,
+) -> Result<MemberJobState> {
+    crate::issue::write::checked_project_dirs(pm)?;
+    let readable = super::project_policy::readable(pm, actor);
+    let mut params = json!({"all": true, "tasks_detail": true});
+    proof.attach(&mut params);
+    let mut list = client::rpc(state_dir, "job_list", params)?;
+    // CAD-2215: a relayed NON-operator answer must carry the daemon's
+    // job-scope acknowledgement, added by that same reply after it re-proved
+    // the reader's membership, project scope and private-job denials. A
+    // daemon without it is a mixed-version daemon that may have ignored the
+    // proof and built the global list: that answer is unavailable — never an
+    // empty (or full) "success". A proven operator's own relay is exempt,
+    // because a full list is correct for it either way. The marker never
+    // reaches a client and never enters the fingerprint.
+    let relayed = !matches!(proof, operator::ReadRelayProof::Operator);
+    let ack = list
+        .as_object_mut()
+        .and_then(|fields| fields.remove(crate::daemon::jobs_rpc::JOB_SCOPE_FIELD));
+    let confirmed =
+        ack.as_ref().and_then(Value::as_str) == Some(crate::daemon::jobs_rpc::JOB_SCOPE_ACK);
+    if relayed && !confirmed {
+        return Err(Error::internal(
+            "job scope unavailable — the daemon did not confirm a reader-scoped answer",
+        ));
+    }
+    let jobs = list["jobs"]
+        .as_array()
+        .ok_or_else(|| Error::internal("job task scope is unavailable"))?;
+    if jobs.iter().any(|job| {
+        job["issue"].as_str().is_some_and(|issue| !issue.is_empty()) && !job["task_list"].is_array()
+    }) {
+        return Err(Error::internal("job task scope is unavailable"));
+    }
+    let mut issue_access = HashMap::new();
+    for job in jobs {
+        let Some(issue) = job["issue"].as_str().filter(|issue| !issue.is_empty()) else {
+            return Err(Error::internal("job issue scope is unavailable"));
+        };
+        if issue_access.contains_key(issue) {
+            continue;
+        }
+        let admitted = match crate::issue::write::issue_dir(pm, issue) {
+            Ok((project, _)) => readable.contains(&project.key),
+            Err(Error::Rejected(_)) => false,
+            Err(error) => return Err(error),
+        };
+        issue_access.insert(issue.to_string(), admitted);
+    }
+    if issue_access.values().any(|admitted| !admitted) {
+        return Err(Error::internal("job issue scope changed"));
+    }
+    Ok(MemberJobState {
+        bindings: task_issue_map_from(state_dir, &list),
+        outcomes: board::outcomes_from_jobs(jobs),
+        fingerprint: super::stream::value_fp(&list),
+    })
+}
+
+/// Resolve each task through its job and the tracker's current project policy.
+pub(super) fn readable_task_bindings(
+    state_dir: &Path,
+    pm: &Pm,
+    actor: &str,
+    proof: &operator::ReadRelayProof,
+) -> Result<HashMap<String, TaskBinding>> {
+    Ok(readable_job_state(state_dir, pm, actor, proof)?.bindings)
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) struct MemberAgentScope {
+    aliases: HashSet<String>,
+    running: HashMap<String, HashSet<String>>,
+}
+
+impl MemberAgentScope {
+    /// True when the daemon proved this alias visible to the reader. A stream
+    /// may name a row — or its tombstone — only for one of these.
+    pub(super) fn has_alias(&self, alias: &str) -> bool {
+        self.aliases.contains(alias)
+    }
+
+    /// The daemon-verified aliases this reader may see, for deciding which
+    /// thread pages its own stream may speak for.
+    pub(super) fn aliases(&self) -> impl Iterator<Item = &String> {
+        self.aliases.iter()
+    }
+}
+
+pub(super) fn consume_agent_scope(reply: &mut Value, expected: &str) -> bool {
+    matches!(
+        reply.as_object_mut()
+            .and_then(|fields| fields.remove(cadence_core::board_api::READER_SCOPE_FIELD)),
+        Some(Value::String(value)) if value == expected
+    )
+}
+
+/// Ask the daemon to re-verify the reader before projecting cached board rows.
+pub(super) fn member_agent_scope(
+    state_dir: &Path,
+    proof: &operator::ReadRelayProof,
+) -> Result<MemberAgentScope> {
+    let mut params = json!({"board": true});
+    proof.attach(&mut params);
+    let mut list = client::rpc(state_dir, "agent_list", params)?;
+    if !consume_agent_scope(&mut list, cadence_core::board_api::AGENT_LIST_SCOPE_ACK) {
+        return Err(Error::rejected("agent read scope is unavailable"));
+    }
+    let rows = list["agents"]
+        .as_array()
+        .ok_or_else(|| Error::internal("agent read scope is unavailable"))?;
+    let mut scope = MemberAgentScope {
+        aliases: HashSet::new(),
+        running: HashMap::new(),
+    };
+    for row in rows {
+        let alias = row["alias"]
+            .as_str()
+            .ok_or_else(|| Error::internal("agent read scope has no alias"))?;
+        scope.aliases.insert(alias.to_owned());
+        let ids = row["visible_running_messages"]
+            .as_array()
+            .ok_or_else(|| Error::internal("running message scope is unavailable"))?;
+        let mut visible = HashSet::with_capacity(ids.len());
+        for id in ids {
+            visible.insert(
+                id.as_str()
+                    .ok_or_else(|| Error::internal("running message scope is malformed"))?
+                    .to_string(),
+            );
+        }
+        scope.running.insert(alias.to_string(), visible);
+    }
+    Ok(scope)
+}
+
+/// The daemon's scoped status rule (CAD-2215) over a board row's visible
+/// running set: `busy` only when the reader's own work proves it, `null`
+/// otherwise — never `idle`, because a hidden project's turn may be running
+/// right now. The card's stored `state` comes from the shared operator
+/// snapshot, so it is always replaced, never forwarded.
+fn visible_agent_state(running: Option<&HashSet<String>>) -> Value {
+    match running {
+        Some(ids) if !ids.is_empty() => json!("busy"),
+        _ => Value::Null,
+    }
+}
+
+pub(super) fn restrict_member_agent_rows(payload: &mut Value, scope: &MemberAgentScope) {
+    if let Some(rows) = payload["agents"].as_array_mut() {
+        rows.retain(|row| {
+            row["alias"]
+                .as_str()
+                .is_some_and(|alias| scope.aliases.contains(alias))
+        });
+    }
+    if let Some(by_issue) = payload["by_issue"].as_object_mut() {
+        for rows in by_issue.values_mut().filter_map(Value::as_array_mut) {
+            rows.retain(|row| {
+                row["alias"]
+                    .as_str()
+                    .is_some_and(|alias| scope.aliases.contains(alias))
+            });
+        }
+    }
+    if let Some(profiles) = payload["profiles"].as_array_mut() {
+        for profile in profiles {
+            if let Some(runtimes) = profile["runtimes"].as_array_mut() {
+                runtimes.retain(|runtime| {
+                    runtime
+                        .as_str()
+                        .is_some_and(|alias| scope.aliases.contains(alias))
+                });
+            }
+        }
+    }
+}
+
+/// Filter the operator snapshot's issue strips using the daemon's live
+/// member-specific agent and job bindings before any card is serialized.
+pub(super) fn scope_member_board(
+    read: &mut read_model::BoardRead,
+    scope: &MemberAgentScope,
+    bindings: &HashMap<String, TaskBinding>,
+) {
+    read.by_issue.retain(|issue, rows| {
+        rows.retain(|row| {
+            scope.aliases.contains(&row.alias)
+                && bindings
+                    .get(&row.task)
+                    .is_some_and(|binding| binding.issue == *issue)
+        });
+        for row in rows.iter_mut() {
+            if row.message.as_ref().is_some_and(|id| {
+                !scope
+                    .running
+                    .get(&row.alias)
+                    .is_some_and(|ids| ids.contains(id))
+            }) {
+                row.message = None;
+            }
+            row.resume = None;
+            // CAD-2215: the card's strip comes from the shared operator
+            // snapshot, so its state is the stored one — replaced with the
+            // reader's own proof, exactly as `scope_member_agents` does.
+            let state = visible_agent_state(scope.running.get(&row.alias));
+            row.state = state.as_str().map(str::to_string);
+        }
+        !rows.is_empty()
+    });
+}
+
+/// Build cards from the current member-visible jobs and agent bindings.
+pub(super) fn readable_member_board(
+    state_dir: &Path,
+    pm: &Pm,
+    actor: &str,
+    proof: &operator::ReadRelayProof,
+    project: Option<&str>,
+) -> Result<read_model::BoardRead> {
+    let jobs = readable_job_state(state_dir, pm, actor, proof)?;
+    let scope = member_agent_scope(state_dir, proof)?;
+    member_board_over(state_dir, pm, actor, proof, project, &jobs, &scope)
+}
+
+/// [`readable_member_board`] over the job and agent scopes a caller already
+/// resolved for this read — the stream decides a whole batch of frames from
+/// one projection instead of one per frame.
+pub(super) fn member_board_over(
+    state_dir: &Path,
+    pm: &Pm,
+    actor: &str,
+    proof: &operator::ReadRelayProof,
+    project: Option<&str>,
+    jobs: &MemberJobState,
+    scope: &MemberAgentScope,
+) -> Result<read_model::BoardRead> {
+    let readable = super::project_policy::readable(pm, actor);
+    let mut read = read_model::get(state_dir, &pm.dir).board_readable(
+        pm,
+        project,
+        &readable,
+        (&jobs.outcomes, jobs.fingerprint),
+    );
+    scope_member_board(&mut read, scope, &jobs.bindings);
+    if super::project_policy::readable(pm, actor) != readable
+        || readable_job_state(state_dir, pm, actor, proof)?.fingerprint != jobs.fingerprint
+        || member_agent_scope(state_dir, proof)? != *scope
+    {
+        return Err(Error::rejected("member read scope changed"));
+    }
+    Ok(read)
+}
+
+pub(super) fn scope_member_agents(
+    payload: &mut Value,
+    bindings: &HashMap<String, TaskBinding>,
+    scope: &MemberAgentScope,
+) {
+    redact_agents_payload(payload);
+    if let Some(rows) = payload["agents"].as_array_mut() {
+        for row in rows {
+            let allowed_messages = row["alias"]
+                .as_str()
+                .and_then(|alias| scope.running.get(alias));
+            let mut visible = HashSet::new();
+            let mut issues = Vec::<String>::new();
+            if let Some(tasks) = row["tasks"].as_array_mut() {
+                tasks.retain(|task| {
+                    let Some(id) = task["task"].as_str() else {
+                        return false;
+                    };
+                    let Some(binding) = bindings.get(id) else {
+                        return false;
+                    };
+                    if task["issue"].as_str() != Some(binding.issue.as_str())
+                        || task["job"].as_str() != Some(binding.job.as_str())
+                    {
+                        return false;
+                    }
+                    visible.insert(id.to_string());
+                    if !issues.contains(&binding.issue) {
+                        issues.push(binding.issue.clone());
+                    }
+                    true
+                });
+                for task in tasks {
+                    if task["message"]["id"].as_str().is_some_and(|id| {
+                        !allowed_messages.is_some_and(|messages| messages.contains(id))
+                    }) {
+                        task["message"] = Value::Null;
+                    }
+                }
+            }
+            row["on"] = json!(issues);
+            if let Some(messages) = row["running_messages"].as_array_mut() {
+                messages.retain(|message| {
+                    message["task"]
+                        .as_str()
+                        .is_some_and(|task| visible.contains(task))
+                        && message["id"].as_str().is_some_and(|id| {
+                            allowed_messages.is_some_and(|messages| messages.contains(id))
+                        })
+                });
+            }
+            let (running, first) = row["running_messages"]
+                .as_array()
+                .map(|messages| (messages.len(), messages.first().cloned()))
+                .unwrap_or_default();
+            row["running"] = json!(running);
+            row["message"] = first.unwrap_or(Value::Null);
+            // CAD-2215: this row was rebuilt from the shared operator
+            // snapshot, so its `state` is the stored one, and `dead` turns on
+            // the unknown-message fence. Both move on hidden work, so the row
+            // gets the daemon's scoped derivation instead.
+            row["state"] = visible_agent_state(allowed_messages);
+            if let Some(fields) = row.as_object_mut() {
+                for key in [
+                    "queued",
+                    "unread",
+                    "oldest_unread_age_secs",
+                    "unknown",
+                    "parked",
+                    "fenced",
+                    "recovery",
+                    "resume",
+                    "resume_hint",
+                    "last_activity",
+                    "silent_secs",
+                    "stalled",
+                    "state_label",
+                    "event_cursor",
+                    "dead",
+                ] {
+                    fields.remove(key);
+                }
+            }
+        }
+    }
+    if let Some(by_issue) = payload["by_issue"].as_object_mut() {
+        by_issue.retain(|issue, rows| {
+            let Some(rows) = rows.as_array_mut() else {
+                return false;
+            };
+            rows.retain(|row| {
+                row["task"]
+                    .as_str()
+                    .and_then(|task| bindings.get(task))
+                    .is_some_and(|binding| binding.issue == *issue)
+            });
+            for row in rows.iter_mut() {
+                let allowed = row["alias"]
+                    .as_str()
+                    .and_then(|alias| scope.running.get(alias));
+                if row["message"]
+                    .as_str()
+                    .is_some_and(|id| !allowed.is_some_and(|messages| messages.contains(id)))
+                {
+                    row["message"] = Value::Null;
+                }
+                row["state"] = visible_agent_state(allowed);
+            }
+            !rows.is_empty()
+        });
+    }
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("totals");
+    }
+}
+
+fn scope_member_agent_detail(detail: &mut Value, bindings: &HashMap<String, TaskBinding>) {
+    detail["agent"] = super::member_view::member_agent_row(&detail["agent"]);
+    if let Some(agent) = detail["agent"].as_object_mut() {
+        agent.remove("event_cursor");
+    }
+    let mut visible = HashSet::new();
+    let mut issues = Vec::<String>::new();
+    if let Some(tasks) = detail["tasks"].as_array_mut() {
+        tasks.retain(|task| {
+            let Some(id) = task.as_str() else {
+                return false;
+            };
+            let Some(binding) = bindings.get(id) else {
+                return false;
+            };
+            visible.insert(id.to_string());
+            if !issues.contains(&binding.issue) {
+                issues.push(binding.issue.clone());
+            }
+            true
+        });
+    }
+    detail["on"] = json!(issues);
+    if let Some(running) = detail["running"].as_array_mut() {
+        running.retain(|message| {
+            message["task"]
+                .as_str()
+                .is_some_and(|id| visible.contains(id))
+        });
+    }
+    if let Some(events) = detail["events"].as_array_mut() {
+        events.retain(|event| {
+            event["task_id"]
+                .as_str()
+                .is_some_and(|id| visible.contains(id))
+        });
+        for event in events {
+            if let Some(payload) = event["payload"].as_object_mut() {
+                payload.remove("message");
+                payload.remove("turn_id");
+            }
+        }
+    }
+    if let Some(fields) = detail.as_object_mut() {
+        for key in ["queued", "unknown", "fenced", "recovery", "resume", "stats"] {
+            fields.remove(key);
+        }
+    }
+}
+
 /// Keep an ad-hoc current-message description useful without putting the
 /// queued prompt or provider credentials in browser JSON. The shared argv
 /// scrubber handles credential-shaped flags, headers, URIs and token forms;
@@ -701,30 +1134,71 @@ pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0 && seconds <= 8.64e12).then_some(seconds)
 }
 
+pub(crate) enum AgentReadError {
+    Unavailable,
+    Daemon(String),
+}
+
 /// The tail of an agent's event log for the agent page — the last `n`
 /// events via the daemon's `agent_events` RPC (the one the CLI long-polls).
-/// An RPC error is returned, not swallowed: the caller serves `[]` plus an
-/// `events_error` so an empty history is never silently a failed read.
+/// An operator sees an `events_error` for a failed read; a member cannot
+/// receive the earlier detail when its scoped event read fails.
 pub(crate) fn agent_events_tail(
     state_dir: &Path,
     alias: &str,
     cursor: i64,
     n: i64,
-) -> std::result::Result<Vec<Value>, String> {
-    let after = (cursor - n).max(0);
-    let reply = client::rpc(
-        state_dir,
-        "agent_events",
-        json!({"alias": alias, "after": after}),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(reply["events"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
-        .collect())
+    proof: Option<&operator::ReadRelayProof>,
+) -> std::result::Result<Vec<Value>, AgentReadError> {
+    let mut params = if proof.is_some() {
+        json!({"alias": alias, "tail": true,
+            "cursor_format": cadence_core::board_api::AGENT_EVENTS_CURSOR_FORMAT})
+    } else {
+        json!({"alias": alias, "after": (cursor - n).max(0)})
+    };
+    if let Some(proof) = proof {
+        proof.attach(&mut params);
+    }
+    let mut reply = client::rpc(state_dir, "agent_events", params)
+        .map_err(|e| AgentReadError::Daemon(e.to_string()))?;
+    if proof.is_some()
+        && !consume_agent_scope(&mut reply, cadence_core::board_api::AGENT_EVENTS_SCOPE_ACK)
+    {
+        return Err(AgentReadError::Unavailable);
+    }
+    let mut events = reply["events"].as_array().cloned().ok_or_else(|| {
+        if proof.is_some() {
+            AgentReadError::Unavailable
+        } else {
+            AgentReadError::Daemon("agent events are unavailable".to_string())
+        }
+    })?;
+    if proof.is_some()
+        && events.iter().any(|event| {
+            event.get("seq").is_some()
+                || event.get("event_seq").is_some()
+                || event
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || event
+                    .get("cursor")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        })
+    {
+        return Err(AgentReadError::Unavailable);
+    }
+    if proof.is_some() {
+        let start = events.len().saturating_sub(n.max(0) as usize);
+        events.drain(..start);
+        Ok(events)
+    } else {
+        Ok(events
+            .into_iter()
+            .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
+            .collect())
+    }
 }
 
 /// What the board needs from the daemon — agent rows enriched with the
@@ -754,6 +1228,7 @@ pub(crate) fn agents_payload_typed(
             agents: vec![],
             totals: None,
             by_issue: BTreeMap::new(),
+            profiles: vec![],
         };
     };
     let task_map = jobs
@@ -807,8 +1282,7 @@ pub(crate) fn agents_payload_typed(
         };
         // Mailboxes are not workers — they still appear on the Agents
         // screen (as kind "inbox") but never count as busy/fenced.
-        let actor = registry::has_actor(provider, kind);
-        if !actor {
+        if registry::placement(provider, kind) == registry::Placement::Queue {
             totals.inboxes += 1;
             // CAD-480: the mailbox's unread backlog and its oldest
             // unread age are the row's queue evidence — the daemon
@@ -956,6 +1430,7 @@ pub(crate) fn agents_payload_typed(
         agents: out,
         totals: Some(totals),
         by_issue,
+        profiles: list["profiles"].as_array().cloned().unwrap_or_default(),
     }
 }
 
@@ -972,24 +1447,37 @@ pub(crate) fn agent_detail(
     state_dir: &Path,
     alias: &str,
     operator: bool,
-) -> std::result::Result<Value, String> {
+    proof: &operator::ReadRelayProof,
+    #[cfg(test)] after_show: Option<&super::AgentDetailReadHook>,
+) -> std::result::Result<Value, AgentReadError> {
     // CAD-1752: the saved job text is the operator's to read; a member's
     // detail never carries `instructions`.
-    let show = client::rpc(
-        state_dir,
-        "agent_show",
-        json!({"alias": alias, "active_only": true,
-               "include_catalogue_instructions": operator, "include_stats": true}),
-    )
-    .map_err(|e| e.to_string())?;
+    let mut params = json!({"alias": alias, "active_only": true,
+        "include_catalogue_instructions": operator,
+        "include_profile_instructions": operator, "include_stats": true});
+    proof.attach(&mut params);
+    let mut show = client::rpc(state_dir, "agent_show", params)
+        .map_err(|e| AgentReadError::Daemon(e.to_string()))?;
+    if !operator && !consume_agent_scope(&mut show, cadence_core::board_api::AGENT_SHOW_SCOPE_ACK) {
+        return Err(AgentReadError::Unavailable);
+    }
+    #[cfg(test)]
+    if !operator {
+        if let Some(hook) = after_show {
+            hook(alias);
+        }
+    }
     let agent = &show["agent"];
     let cursor = show["event_cursor"].as_i64().unwrap_or(0);
-    let (events, events_error) = match agent_events_tail(state_dir, alias, cursor, 20) {
-        Ok(events) if operator => (events, None),
-        // A non-operator (fail closed) gets only the allowlisted fields.
-        Ok(events) => (events.iter().map(member_event).collect(), None),
-        Err(error) => (Vec::new(), Some(error)),
-    };
+    let (events, events_error) =
+        match agent_events_tail(state_dir, alias, cursor, 20, (!operator).then_some(proof)) {
+            Ok(events) if operator => (events, None),
+            // A non-operator (fail closed) gets only the allowlisted fields.
+            Ok(events) => (events.iter().map(member_event).collect(), None),
+            Err(AgentReadError::Unavailable) => return Err(AgentReadError::Unavailable),
+            Err(AgentReadError::Daemon(error)) if operator => (Vec::new(), Some(error)),
+            Err(AgentReadError::Daemon(_)) => return Err(AgentReadError::Unavailable),
+        };
     let provider = agent["provider"].as_str().unwrap_or_default();
     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
     let running: Vec<Value> = show["messages"]
@@ -1008,11 +1496,67 @@ pub(crate) fn agent_detail(
             }
         })
         .collect();
-    let fenced =
-        show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention");
+    // CAD-2215: a fence is `attention` or an unreconciled `unknown` row, and a
+    // scoped `agent_show` reports neither. A non-operator therefore gets
+    // `null` (unavailable), never a fabricated `false`.
+    let fenced = operator.then(|| {
+        show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention")
+    });
     let (tasks, issues) = match show["task_bindings"].as_array() {
         Some(rows) => task_binding_view(rows),
+        None if !operator => return Err(AgentReadError::Unavailable),
         None => legacy_task_view(state_dir, alias),
+    };
+    let (native_skills, native_tools) = if operator {
+        let params_opt = agent.get("params").filter(|v| v.is_object());
+        let skills_json = if registry::supports_per_agent_skills(provider, kind) {
+            let configured_skills: Option<Vec<String>> = params_opt
+                .and_then(|p| p.get("skills"))
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                });
+            // Loaded skill evidence comes strictly from runtime-reported
+            // `loaded_skills` on the live session, never from installed files.
+            let loaded_skills: Option<Vec<String>> = agent
+                .get("loaded_skills")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                });
+            let skills: Vec<Value> = crate::skill::bundled_catalog()
+                .into_iter()
+                .map(|mut item| {
+                    let name = item["name"].as_str().unwrap_or_default().to_string();
+                    let required = item["required"].as_bool().unwrap_or(false);
+                    let enabled = required
+                        || configured_skills
+                            .as_ref()
+                            .map(|list| list.iter().any(|s| s == &name))
+                            .unwrap_or(true);
+                    let loaded = loaded_skills
+                        .as_ref()
+                        .map(|list| list.iter().any(|s| s == &name));
+                    item["enabled"] = json!(enabled);
+                    item["loaded"] = json!(loaded);
+                    item["applies"] = json!("next_launch");
+                    item
+                })
+                .collect();
+            json!(skills)
+        } else {
+            Value::Null
+        };
+        let tools = registry::native_tools_json(provider, kind, params_opt);
+        (skills_json, json!(tools))
+    } else {
+        (Value::Null, Value::Null)
     };
     Ok(json!({
         "agent": agent,
@@ -1022,7 +1566,10 @@ pub(crate) fn agent_detail(
         "events": events,
         "events_error": events_error,
         "fenced": fenced,
-        "recovery": if fenced { agent["error"].clone() } else { Value::Null },
+        "recovery": match fenced {
+            Some(true) => agent["error"].clone(),
+            _ => Value::Null,
+        },
         "resume": registry::resume_command(
             provider, kind,
             agent["thread_id"].as_str().unwrap_or_default(),
@@ -1032,6 +1579,8 @@ pub(crate) fn agent_detail(
         "tasks": tasks,
         "on": issues,
         "stats": show["stats"],
+        "native_skills": native_skills,
+        "native_tools": native_tools,
     }))
 }
 
@@ -1104,13 +1653,16 @@ macro_rules! read_route_enums {
 read_route_enums!(
     app_assistant::Route<'_>,
     app_contexts::Route<'_>,
+    agent_access::Route<'_>,
     app_audiences::Route<'_>,
     app_records::Route<'_>,
     app_content::Route<'_>,
     connections::Route<'_>,
+    credential_entry::Route<'_>,
     crm_send::Route,
     app_release::Route<'_>,
     app_runs::Route<'_>,
+    routines::Route<'_>,
     social_publish::Route<'_>,
 );
 
@@ -1122,6 +1674,36 @@ fn screen_read_only(
     opts: &ServeOpts,
 ) -> std::result::Result<(), HttpResp> {
     operator::admit_screen_read(request, state_dir, opts).map(|_| ())
+}
+
+/// The caller's project scope for a read that names a project (CAD-2212).
+/// `Ok(None)` is the operator, served unfiltered; `Ok(Some(set))` is any
+/// other caller's readable projects; `Err` is the response to send.
+fn project_read_scope(
+    read_admission: Option<&operator::ReadAdmission>,
+    request: &Request,
+    pm: &Pm,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> std::result::Result<Option<std::collections::BTreeSet<String>>, HttpResp> {
+    let Some(admission) = read_admission else {
+        return Err(err_response(503, "read admission is missing"));
+    };
+    let actor = operator::read_actor(admission, request, state_dir, opts)?;
+    Ok((actor != "operator").then(|| crate::project_policy::readable(pm, &actor)))
+}
+
+/// A project outside a non-operator caller's scope — absent or refused —
+/// answers as unknown, in words that name no project (CAD-2212). The
+/// handlers' own unknown-project error lists every registered key, so it
+/// is kept for the operator only.
+fn hidden_project(
+    scope: Option<&std::collections::BTreeSet<String>>,
+    key: &str,
+) -> Option<HttpResp> {
+    scope
+        .is_some_and(|readable| !readable.contains(key))
+        .then(|| err_response(404, "unknown project"))
 }
 
 /// The one admit sequence for a board read block: a route that matched a
@@ -1187,7 +1769,9 @@ fn table_read_guard(
 fn read_dispatch(
     request: &mut Request,
     state_dir: &Path,
+    pm_dir: &Path,
     opts: &ServeOpts,
+    admission: Option<&operator::ReadAdmission>,
     bound: endpoints::Bound<'_>,
 ) -> HttpResp {
     let row = bound.endpoint;
@@ -1206,14 +1790,90 @@ fn read_dispatch(
         endpoints::RouteId::WorkspaceShow => {
             apps::workspace(request, state_dir, "app_workspace_show", bound.get("id"))
         }
+        endpoints::RouteId::AutomaticUpdatesGet => {
+            app_explorer::automatic_updates_get(state_dir, bound.get("id").unwrap_or_default())
+        }
+        endpoints::RouteId::MemberAccessGet => app_explorer::member_access_get(
+            request,
+            bound.get("id").unwrap_or_default(),
+            state_dir,
+            opts,
+        ),
         endpoints::RouteId::AgentDetail => {
             let alias = bound.get("alias").unwrap_or_default();
             // The viewer verdict the OperatorOnly reads use: only the
             // operator's session (with peer proof) gets the saved job text.
             let operator = operator::admit_operator_read(request, state_dir, opts).is_ok();
-            match agent_detail(state_dir, alias, operator) {
-                Ok(detail) => json_response(detail),
-                Err(error) => err_response(404, &error),
+            let Some(admission) = admission else {
+                return err_response(503, "read admission is missing");
+            };
+            let proof = admission.relay_proof();
+            match agent_detail(
+                state_dir,
+                alias,
+                operator,
+                &proof,
+                #[cfg(test)]
+                opts.agent_detail_show_hook.as_deref(),
+            ) {
+                Ok(mut detail) => {
+                    #[cfg(test)]
+                    if let Some(hook) = opts.agent_detail_read_hook.as_ref() {
+                        hook(alias);
+                    }
+                    if operator {
+                        if let Err(response) =
+                            operator::admit_operator_read(request, state_dir, opts)
+                        {
+                            return response;
+                        }
+                    } else {
+                        let actor = match operator::read_actor(admission, request, state_dir, opts)
+                        {
+                            Ok(actor) => actor,
+                            Err(response) => return response,
+                        };
+                        let pm = match Pm::at(pm_dir) {
+                            Ok(pm) => pm,
+                            Err(_) => {
+                                return err_response(503, "project task scope is unavailable")
+                            }
+                        };
+                        let jobs = match readable_job_state(state_dir, &pm, &actor, &proof) {
+                            Ok(jobs) => jobs,
+                            Err(_) => {
+                                return err_response(503, "project task scope is unavailable")
+                            }
+                        };
+                        let scope = match member_agent_scope(state_dir, &proof) {
+                            Ok(scope) => scope,
+                            Err(_) => return err_response(503, "agent read scope is unavailable"),
+                        };
+                        let current_jobs = readable_job_state(state_dir, &pm, &actor, &proof);
+                        let current_scope = member_agent_scope(state_dir, &proof);
+                        if current_jobs
+                            .as_ref()
+                            .map(|current| current.fingerprint)
+                            .ok()
+                            != Some(jobs.fingerprint)
+                            || current_scope.as_ref().ok() != Some(&scope)
+                        {
+                            return err_response(503, "agent read scope changed");
+                        }
+                        if !detail["agent"]["alias"]
+                            .as_str()
+                            .is_some_and(|target| scope.has_alias(target))
+                        {
+                            return err_response(404, "Unknown managed agent");
+                        }
+                        scope_member_agent_detail(&mut detail, &jobs.bindings);
+                    }
+                    json_response(detail)
+                }
+                Err(AgentReadError::Unavailable) => {
+                    err_response(503, "agent read scope is unavailable")
+                }
+                Err(AgentReadError::Daemon(error)) => err_response(404, &error),
             }
         }
         endpoints::RouteId::AgentRoles => match client::rpc(state_dir, "agent_roles", json!({})) {
@@ -1244,13 +1904,13 @@ fn read_dispatch(
 /// A board write waits this long for the one writer before answering
 /// `resource_busy`: long enough for an ordinary write queued behind
 /// another, short enough that a stuck request never queues the board.
-const WRITE_LOCK_WAIT: Duration = Duration::from_secs(5);
+pub(super) const WRITE_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// [`WRITE_LOCK`] with a deadline. `None` means another write still holds
 /// it after `within`, so the caller answers a retryable refusal instead of
 /// blocking its thread for the holder's whole daemon call. A poisoned lock
 /// is recovered exactly as the blocking `lock()` did.
-fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
+pub(super) fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
     let deadline = Instant::now() + within;
     loop {
         match WRITE_LOCK.try_lock() {
@@ -1264,16 +1924,35 @@ fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
 
 /// Whether this request takes the board's one writer. Every method
 /// `handle` treats as a write is serialized — `PUT` included, because the
-/// wiki serves PUT writes — except the device sign-in exchange (CAD-777:
-/// its handlers call the issuer, and its own state is separately locked).
+/// wiki serves PUT writes — except the device sign-in exchange (CAD-777),
+/// frame mount minting, mount token teardown, and closed screen-service calls
+/// (`app_screens::service` acquires [`WRITE_LOCK`] only for mutating ops so
+/// read-only screen queries do not contend with board writes; CAD-2534).
 fn serialized_write(method: &Method, url: &str) -> bool {
-    matches!(
+    if !matches!(
         method,
         Method::Post | Method::Patch | Method::Delete | Method::Put
-    ) && !matches!(
-        url.split('?').next().unwrap_or(""),
-        "/api/session/device/code" | "/api/session/device/poll"
-    )
+    ) {
+        return false;
+    }
+    let raw_path = url.split('?').next().unwrap_or("");
+    // Match `handle`'s percent-decoded path so encoded equivalents never take
+    // the outer lock and spin on `app_screens::service_with_lock_wait`; malformed
+    // escapes fail closed as serialized.
+    let Some(path) = pct_decode(raw_path) else {
+        return true;
+    };
+    !(method == &Method::Post
+        && (matches!(
+            path.as_str(),
+            "/api/session/device/code"
+                | "/api/session/device/poll"
+                | "/api/app-screen-services/call"
+        ) || app_screens::tool_revoke_route(&path)
+            || matches!(
+                endpoints::resolve("POST", &path).map(|b| b.endpoint.id),
+                Some(endpoints::RouteId::Mount)
+            )))
 }
 
 /// Run one write under [`WRITE_LOCK`]. The guard is dropped only after
@@ -1285,18 +1964,19 @@ fn run_serialized_write(
     state_dir: &Path,
     pm_dir: &Path,
     opts: &ServeOpts,
+    dedicated: Option<&str>,
     within: Duration,
 ) -> Option<Request> {
     let Some(_guard) = acquire_write_lock(within) else {
         return Some(request);
     };
-    handle(request, state_dir, pm_dir, opts);
+    handle(request, state_dir, pm_dir, opts, dedicated);
     None
 }
 
 /// The board's writer is still busy: transient, like a daemon `busy`
 /// refusal (`busy_response`), so the client retries instead of failing.
-fn board_busy_response() -> HttpResp {
+pub(super) fn board_busy_response() -> HttpResp {
     let mut resp = coded_response(
         503,
         "resource_busy",
@@ -1307,7 +1987,13 @@ fn board_busy_response() -> HttpResp {
     resp
 }
 
-fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
+fn handle(
+    mut request: Request,
+    state_dir: &Path,
+    pm_dir: &Path,
+    opts: &ServeOpts,
+    dedicated: Option<&str>,
+) {
     // CAD-482: a seam-armed board honors the assertion headers; the
     // scope makes the asserted identity visible to attribution and to
     // the daemon calls this request relays. Absent headers, or absent
@@ -1340,7 +2026,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         .find(|h| h.field.equiv("Host"))
         .map(|h| h.value.as_str().to_string())
         .unwrap_or_default();
-    if !host_allowed(&host, opts.port, &opts.allow_hosts) {
+    let at_entry_origin = credential_entry::accepts_host(opts, &host);
+    if !host_allowed(&host, opts.port, &opts.allow_hosts) && !at_entry_origin {
         let _ = request.respond(err_response(421, "misdirected request — Host not allowed"));
         return;
     }
@@ -1384,6 +2071,29 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
 
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
 
+    // CAD-1085: the ONE auth-only cross-origin exception. It is exact
+    // path+method on the pinned origin, accepts only a configured Board
+    // Origin and a strict form body, and never applies to the secret
+    // session/submit routes (which require the entry Origin). It runs
+    // before the generic write guard so the board-origin form can reach it.
+    if is_write && path == credential_entry::AUTH_PATH {
+        let response = credential_entry::authenticate(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+
+    // CAD-1085: the trusted credential origin gate runs before every
+    // handler and every body read. The entry page and its secret-bearing
+    // session/submit/cancel routes exist only on the root-pinned origin;
+    // the ordinary board 404s the page and refuses those writes with a
+    // closed refusal, so a credential body is never collected there. On a
+    // protected profile the legacy directly-typed connection bodies are
+    // refused here too, before `read_body`.
+    if let Some(response) = credential_entry::gate(&request, opts, &path, is_write) {
+        send(request, response);
+        return;
+    }
+
     // CAD-786: the recipient's unsubscribe confirmation page — the
     // token in the path is the credential, so the page is answered
     // before every session gate, on any host this board serves. The
@@ -1409,9 +2119,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // CAD-747: a hosted agent shares this network namespace and can dial
     // the board's loopback port (or the image's blind TCP relay) itself.
     // Host is therefore a surface selector, never proof of the Worker.
-    // In hosted-only mode the public board session gate must cover every
-    // protected route, even when the caller chooses a local Host.
-    if opts.board_public_only && !public_host {
+    // In public-only mode a local Host still cannot reach the board.
+    // The separately pinned entry host has already passed its own narrower
+    // route/origin gate above; it never enters the public board dispatcher.
+    if opts.board_public_only && !public_host && !at_entry_origin {
         if matches!(method, Method::Get | Method::Head)
             && raw_path == "/api/health"
             && raw_query.is_empty()
@@ -1449,18 +2160,23 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         };
         let read_only = opts.read_only
             || matches!(&caller, Some(operator::Caller::Named(named)) if !named.operator);
-        let response = app_screens::service(&mut request, state_dir, opts, rpc, read_only);
-        read_model::get(state_dir, pm_dir).invalidate();
+        let (response, mutated) =
+            app_screens::service(&mut request, state_dir, opts, rpc, read_only);
+        if mutated {
+            read_model::get(state_dir, pm_dir).invalidate();
+        }
         send(request, response);
         return;
     }
     if public_host {
         if path.starts_with("/__platform/") {
             let resp = match (method.as_str(), path.as_str()) {
-                ("GET" | "HEAD", "/__platform/login") => operator::platform_login(opts, raw_query),
-                ("GET" | "HEAD", _) => operator::platform_read(&path),
+                ("GET" | "HEAD", "/__platform/login") => {
+                    operator::platform_login(opts, raw_query, dedicated)
+                }
+                ("GET" | "HEAD", _) => operator::platform_read(&path, dedicated),
                 ("POST", "/__platform/session") => {
-                    operator::platform_session(&mut request, state_dir, opts)
+                    operator::platform_session(&mut request, state_dir, opts, dedicated)
                 }
                 _ => operator::platform_unknown(),
             };
@@ -1591,7 +2307,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // routes and streams. Local bootstrap/static files are public. The
     // screen document instead owns a one-use, live-session-bound capability.
     let private_api = path.starts_with("/api/")
-        && !matches!(path.as_str(), "/api/meta" | "/api/health" | "/api/version")
+        && !matches!(
+            path.as_str(),
+            "/api/meta" | "/api/health" | "/api/version" | "/api/protected-entry"
+        )
         && app_screens::frame_route(&path).is_none();
     let public_read = public_host && !matches!(path.as_str(), "/api/health" | "/api/version");
     let read_admission = if private_api || public_read {
@@ -1599,7 +2318,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             Ok(admission) => Some(admission),
             Err(resp) => {
                 let resp = if public_host && resp.status_code().0 == 401 {
-                    operator::session_bounce(&request, &path, opts)
+                    operator::session_bounce(&request, &path, opts, dedicated)
                 } else {
                     resp
                 };
@@ -1615,7 +2334,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // alias (`a/b` carries `/`) and answered 400 before any handler. The
     // table's single-segment row cannot bind it, so the answer is kept here.
     if let Some(tail) = path.strip_prefix("/api/agents/") {
-        if tail.contains('/') {
+        // CAD-1085: `/api/agents/<alias>/access` is one real bounded
+        // subresource; every other multi-segment tail stays the old 400.
+        if tail.contains('/') && agent_access::route(&path).is_none() {
             send(request, err_response(400, "bad agent alias"));
             return;
         }
@@ -1628,7 +2349,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     // its session bounce) before any per-row role guard. A path the table does
     // not own falls through to the chain below, unchanged.
     if let Some(bound) = endpoints::resolve(method.as_str(), &path) {
-        let response = read_dispatch(&mut request, state_dir, opts, bound);
+        let response = read_dispatch(
+            &mut request,
+            state_dir,
+            pm_dir,
+            opts,
+            read_admission.as_ref(),
+            bound,
+        );
         send(request, response);
         return;
     }
@@ -1649,16 +2377,29 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
 
     match path.as_str() {
         "/api/my-work" => {
-            let response = my_work::get(&request, state_dir, pm_dir, opts, raw_query);
+            let Some(admission) = read_admission.as_ref() else {
+                send(request, err_response(503, "read admission is missing"));
+                return;
+            };
+            let response = my_work::get(&request, state_dir, pm_dir, opts, admission, raw_query);
             send(request, response);
         }
         p if p.starts_with("/api/my-work/issues/") => {
             let id = &p["/api/my-work/issues/".len()..];
-            let response = my_work::get_issue(&request, state_dir, pm_dir, opts, id, raw_query);
+            let Some(admission) = read_admission.as_ref() else {
+                send(request, err_response(503, "read admission is missing"));
+                return;
+            };
+            let response =
+                my_work::get_issue(&request, state_dir, pm_dir, opts, admission, id, raw_query);
             send(request, response);
         }
         "/api/locale" => {
             let response = locale::get(&request, state_dir, opts);
+            send(request, response);
+        }
+        "/api/time-zone" => {
+            let response = time_zone::get(&request, state_dir, opts);
             send(request, response);
         }
         // What the SPA needs to render itself correctly for this
@@ -1742,7 +2483,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             .tailnet
                             .as_ref()
                             .map(|(dns, port)| tailnet_url(dns, *port)),
-                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        version: crate::overview::BUILD_VERSION.to_string(),
                         build_commit: crate::overview::BUILD_COMMIT.to_string(),
                         build_time: crate::overview::BUILD_TIME.to_string(),
                         daemon,
@@ -1756,6 +2497,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 ),
             );
         }
+        // CAD-1085: the SPA's origin gate — where the trusted credential
+        // form lives (root-pinned) and where this board is. Metadata only:
+        // no request, credential or capability.
+        "/api/protected-entry" => send(request, json_response(credential_entry::config_json(opts))),
         // CAD-561: the Update card's view and the draining banner.
         "/api/update" => send(request, updates::get(state_dir)),
         "/api/update/banner" => send(request, updates::banner_get(state_dir)),
@@ -1768,7 +2513,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         },
         "/api/platform-account" => send(request, platform_account::get(opts)),
         // CAD-1393: operator-only reads of company templates and drafts.
-        "/api/templates/show"
+        "/api/templates/list"
+        | "/api/templates/show"
         | "/api/documents/show"
         | "/api/documents/export"
         | "/api/templates/sample" => {
@@ -1829,9 +2575,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // Health probes are public, but the workspace projection is
             // not. Keep authenticated status chips truthful without
             // leaking tracker paths/counts to an unsigned probe.
-            let admitted = match operator::admit_read(&request, state_dir, opts) {
-                Ok(_) => true,
-                Err(resp) if resp.status_code().0 == 401 => false,
+            let admission = match operator::admit_read(&request, state_dir, opts) {
+                Ok(admission) => Some(admission),
+                Err(resp) if resp.status_code().0 == 401 => None,
                 Err(resp) => {
                     send(request, resp);
                     return;
@@ -1842,16 +2588,38 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 "embedded": cfg!(feature = "ui"),
                 "build": crate::overview::BUILD_COMMIT,
             });
-            if admitted {
+            if let Some(admission) = admission {
                 let pm = Pm::at(pm_dir).ok();
-                let (projects, issues) = match &pm {
-                    Some(pm) => (
-                        project::list(&pm.dir).map(|list| list.len()).unwrap_or(0),
-                        board::load_all(&pm.dir, None)
-                            .map(|list| list.len())
-                            .unwrap_or(0),
-                    ),
-                    None => (0, 0),
+                // CAD-2212: the tracker path and workspace-wide totals are
+                // the operator's. Anyone else counts only the projects
+                // their policy admits; an unresolved caller or an
+                // unreadable tracker gets no counts at all.
+                let actor = operator::read_actor(&admission, &request, state_dir, opts).ok();
+                let operator = actor.as_deref() == Some("operator");
+                let counts = match (&pm, actor.as_deref()) {
+                    (Some(pm), Some("operator")) => {
+                        match (
+                            project::list_checked(&pm.dir),
+                            board::load_all(&pm.dir, None),
+                        ) {
+                            (Ok(projects), Ok(issues)) => Some((projects.len(), issues.len())),
+                            _ => None,
+                        }
+                    }
+                    // `readable` fails closed to an empty set on an
+                    // unreadable tracker; check the listing so that case
+                    // omits the counts instead of reporting zeros.
+                    (Some(pm), Some(actor)) if project::list_checked(&pm.dir).is_ok() => {
+                        let readable = crate::project_policy::readable(pm, actor);
+                        board::load_all(&pm.dir, None).ok().map(|issues| {
+                            let issues = issues
+                                .iter()
+                                .filter(|i| readable.contains(&i.project))
+                                .count();
+                            (readable.len(), issues)
+                        })
+                    }
+                    _ => None,
                 };
                 let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
                 let daemon = if budget.read(state_dir, "health", json!({})).is_ok() {
@@ -1859,10 +2627,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 } else {
                     "unreachable"
                 };
-                health["pm_dir"] = json!(pm.as_ref().map(|pm| &pm.dir));
+                if operator {
+                    health["pm_dir"] = json!(pm.as_ref().map(|pm| &pm.dir));
+                }
                 health["pm_present"] = json!(pm.is_some());
-                health["projects"] = json!(projects);
-                health["issues"] = json!(issues);
+                if let Some((projects, issues)) = counts {
+                    health["projects"] = json!(projects);
+                    health["issues"] = json!(issues);
+                }
                 health["daemon"] = json!(daemon);
             }
             send(request, json_response(health));
@@ -1924,6 +2696,65 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 Ok(pm) => {
                     let readable = super::project_policy::readable(&pm, &actor);
                     super::project_policy::retain_overview(&mut overview, &readable);
+                    if actor == "operator"
+                        && operator::admit_operator_read(&request, state_dir, opts).is_ok()
+                    {
+                        if let Ok(res) = crate::client::rpc(state_dir, "routine_list", json!({})) {
+                            let waiting: Vec<Value> = res["routines"]
+                                .as_array()
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter(|r| {
+                                            matches!(
+                                                r["status"].as_str(),
+                                                Some("waiting_approval" | "repoint_required")
+                                            )
+                                        })
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !waiting.is_empty() {
+                                overview["routine_needs"] = json!(waiting);
+                            }
+                            let proposals: Vec<Value> = res["staged_proposals"]
+                                .as_array()
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter(|p| p["state"].as_str() == Some("pending"))
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !proposals.is_empty() {
+                                overview["routine_proposals"] = json!(proposals);
+                            }
+                            let step_holds: Vec<Value> =
+                                res["waiting_runs"].as_array().cloned().unwrap_or_default();
+                            if !step_holds.is_empty() {
+                                overview["routine_step_holds"] = json!(step_holds);
+                            }
+                        }
+                    } else if actor != "operator" {
+                        let proof = read_admission
+                            .as_ref()
+                            .expect("private read admission")
+                            .relay_proof();
+                        overview["monitoring"] =
+                            match readable_task_bindings(state_dir, &pm, &actor, &proof) {
+                                Ok(bindings) => {
+                                    let allowed = bindings.into_keys().collect::<HashSet<_>>();
+                                    let mut relay = json!({});
+                                    proof.attach(&mut relay);
+                                    crate::overview::monitoring_for_tasks(
+                                        state_dir, &allowed, &relay,
+                                    )
+                                }
+                                Err(_) => crate::overview::monitoring_unavailable(
+                                    "project task scope is unavailable",
+                                ),
+                            };
+                    }
                     send(request, json_response(overview));
                 }
                 Err(e) => send(request, err_response(503, &e.to_string())),
@@ -1988,10 +2819,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, &e.to_string()));
                     return;
                 }
-                let read = read_model::get(state_dir, pm_dir).board(&pm, filter.as_deref());
-                // CAD-405: each card carries its `work` block.
-                let by_id = read.by_id();
-                let ctx = read.ctx(&by_id);
                 let actor = match read_admission
                     .as_ref()
                     .map(|a| operator::read_actor(a, &request, state_dir, opts))
@@ -2009,6 +2836,28 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // AOS-274: filter before the slice and the card, so a
                 // restricted project contributes no row or count.
                 let readable = super::project_policy::readable(&pm, &actor);
+                let model = read_model::get(state_dir, pm_dir);
+                let read = if actor == "operator" {
+                    model.board(&pm, filter.as_deref())
+                } else {
+                    let Some(admission) = read_admission.as_ref() else {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    };
+                    let proof = admission.relay_proof();
+                    match readable_member_board(state_dir, &pm, &actor, &proof, filter.as_deref()) {
+                        Ok(read) => read,
+                        Err(_) => {
+                            send(
+                                request,
+                                err_response(503, "member read scope is unavailable"),
+                            );
+                            return;
+                        }
+                    }
+                };
+                let by_id = read.by_id();
+                let ctx = read.ctx(&by_id);
                 let body = cadence_core::board_api::IssuesResponse {
                     issues: read
                         .views
@@ -2038,7 +2887,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // the caller's readable set is applied to the view slice
                 // first: a restricted project contributes no epic, child
                 // or count.
-                let read = read_model::get(state_dir, pm_dir).board(&pm, None);
                 let actor = match read_admission
                     .as_ref()
                     .map(|a| operator::read_actor(a, &request, state_dir, opts))
@@ -2051,6 +2899,30 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     None => {
                         send(request, err_response(503, "read admission is missing"));
                         return;
+                    }
+                };
+                let read = if actor == "operator" {
+                    read_model::get(state_dir, pm_dir).board(&pm, None)
+                } else {
+                    let Some(admission) = read_admission.as_ref() else {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    };
+                    match readable_member_board(
+                        state_dir,
+                        &pm,
+                        &actor,
+                        &admission.relay_proof(),
+                        None,
+                    ) {
+                        Ok(read) => read,
+                        Err(_) => {
+                            send(
+                                request,
+                                err_response(503, "member read scope is unavailable"),
+                            );
+                            return;
+                        }
                     }
                 };
                 let readable = super::project_policy::readable(&pm, &actor);
@@ -2074,17 +2946,75 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
-        "/api/milestones" => send(
-            request,
-            stages::milestones(state_dir, pm_dir, query("project").as_deref()),
-        ),
+        "/api/milestones" => {
+            let Some(admission) = read_admission.as_ref() else {
+                send(request, err_response(503, "read admission is missing"));
+                return;
+            };
+            let actor = match operator::read_actor(admission, &request, state_dir, opts) {
+                Ok(actor) => actor,
+                Err(response) => {
+                    send(request, response);
+                    return;
+                }
+            };
+            let response = stages::milestones(
+                state_dir,
+                pm_dir,
+                query("project").as_deref(),
+                &actor,
+                &admission.relay_proof(),
+            );
+            send(request, response);
+        }
         "/api/agents" => {
             // CAD-1767: running-message text is the operator's; anyone else
             // (fail closed) gets the allowlisted rows.
             let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
             let mut payload = read_model::get(state_dir, pm_dir).agents();
             if !operator {
-                redact_agents_payload(&mut payload);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|admission| operator::read_actor(admission, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(response)) => {
+                        send(request, response);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let proof = read_admission
+                    .as_ref()
+                    .expect("private read admission")
+                    .relay_proof();
+                let scope = match member_agent_scope(state_dir, &proof) {
+                    Ok(scope) => scope,
+                    Err(_) => {
+                        send(
+                            request,
+                            err_response(503, "agent read scope is unavailable"),
+                        );
+                        return;
+                    }
+                };
+                let bindings = match Pm::at(pm_dir)
+                    .and_then(|pm| readable_task_bindings(state_dir, &pm, &actor, &proof))
+                {
+                    Ok(bindings) => bindings,
+                    Err(_) => {
+                        send(
+                            request,
+                            err_response(503, "project task scope is unavailable"),
+                        );
+                        return;
+                    }
+                };
+                restrict_member_agent_rows(&mut payload, &scope);
+                scope_member_agents(&mut payload, &bindings, &scope);
             }
             send(request, json_response(payload))
         }
@@ -2109,8 +3039,30 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, &e.to_string()));
                     return;
                 }
-                let (mems, errors) = crate::memory::load_all_report(&pm.dir);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let readable = super::project_policy::readable(&pm, &actor);
                 let projects = project::list(&pm.dir).unwrap_or_default();
+                let mut mems = Vec::new();
+                let mut errors = Vec::new();
+                for selected in projects.iter().filter(|p| readable.contains(&p.key)) {
+                    let (project_memories, project_errors) =
+                        crate::memory::load_project_report(&pm.dir, &selected.key);
+                    mems.extend(project_memories);
+                    errors.extend(project_errors);
+                }
                 let payload: Vec<Value> =
                     mems.iter()
                         .filter(|m| {
@@ -2147,33 +3099,35 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, err_response(405, "stream is GET only"));
             } else {
                 let admission = read_admission.expect("private stream admission");
-                // AOS-274: the stream is one shared, unfiltered frame
-                // source. A caller who cannot read every project is
-                // refused live updates rather than served rows and
-                // counts from projects it may not see.
-                let complete = match Pm::at(pm_dir) {
-                    Ok(pm) => match operator::read_actor(&admission, &request, state_dir, opts) {
-                        Ok(actor) => super::project_policy::reads_every_project(&pm, &actor),
-                        Err(resp) => {
-                            send(request, resp);
-                            return;
-                        }
-                    },
-                    // Fail closed when the tracker cannot be read.
-                    Err(_) => false,
+                let actor = match operator::read_actor(&admission, &request, state_dir, opts) {
+                    Ok(actor) => actor,
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
                 };
-                if !complete {
+                // A signed member's stream is projected per reader: every
+                // caller the project policy can describe gets live updates for
+                // what it may read, and a caller it cannot describe (or a
+                // tracker that cannot be checked) is refused before the head.
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                if !operator && !super::stream::member_stream_available(pm_dir, &actor) {
                     send(
                         request,
-                        err_response(
-                            403,
-                            "live updates are unavailable for a project-restricted workspace",
-                        ),
+                        err_response(403, "live updates are unavailable for this reader"),
                     );
                     return;
                 }
-                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
-                stream_events(request, state_dir, pm_dir, admission, operator);
+                stream_events(
+                    request,
+                    state_dir,
+                    pm_dir,
+                    admission,
+                    operator,
+                    &actor,
+                    #[cfg(test)]
+                    opts.member_stream_batch_hook.as_deref(),
+                );
             }
         }
         _ => {
@@ -2193,6 +3147,60 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 let mut segs = tail.split('/');
                 let key = segs.next().unwrap_or_default();
                 let sub = segs.next();
+                // `/api/projects/<key>/policy` (CAD-1950) — the recorded
+                // access policy the Settings section renders. Absent policy
+                // and workspace-visible are different records, so `recorded`
+                // says which this is; the page must not show one as the other.
+                if sub == Some("policy") && segs.next().is_none() {
+                    if !model::valid_key(key) {
+                        send(request, err_response(400, "bad project key"));
+                        return;
+                    }
+                    let actor = match read_admission
+                        .as_ref()
+                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                    {
+                        Some(Ok(actor)) => actor,
+                        Some(Err(resp)) => {
+                            send(request, resp);
+                            return;
+                        }
+                        None => {
+                            send(request, err_response(503, "read admission is missing"));
+                            return;
+                        }
+                    };
+                    match Pm::at(pm_dir) {
+                        Ok(pm) => match project::list(&pm.dir) {
+                            Ok(projects) => match projects.iter().find(|p| p.key == key) {
+                                Some(selected) => {
+                                    // AOS-274: a restricted project answers
+                                    // like an absent one, so the refusal does
+                                    // not name what it is hiding.
+                                    if super::project_policy::refused(&pm, &selected.key, &actor) {
+                                        send(request, err_response(404, "unknown project"));
+                                        return;
+                                    }
+                                    let policy = selected.policy.clone();
+                                    send(
+                                        request,
+                                        json_response(json!({
+                                            "project": selected.key,
+                                            "recorded": policy.is_some(),
+                                            "policy": policy,
+                                            "private_available":
+                                                crate::issue::write::private_available(),
+                                        })),
+                                    )
+                                }
+                                None => send(request, err_response(404, "unknown project")),
+                            },
+                            Err(error) => send(request, err_response(503, &error.to_string())),
+                        },
+                        Err(error) => send(request, err_response(503, &error.to_string())),
+                    }
+                    return;
+                }
                 if sub == Some("context") && segs.next().is_none() {
                     if !model::valid_key(key) {
                         send(request, err_response(400, "bad project key"));
@@ -2253,10 +3261,29 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // `/api/projects/<key>/workflows[/<name>/preview]` — the
                 // project's workflow templates beside PROJECT.md (CAD-496).
                 if let Some(read) = workflows::read_route(&path) {
-                    match Pm::at(pm_dir) {
-                        Ok(pm) => send(request, workflows::read(&pm, state_dir, &query, read)),
-                        Err(e) => send(request, err_response(503, &e.to_string())),
-                    }
+                    let pm = match Pm::at(pm_dir) {
+                        Ok(pm) => pm,
+                        Err(e) => {
+                            send(request, err_response(503, &e.to_string()));
+                            return;
+                        }
+                    };
+                    let scope = match project_read_scope(
+                        read_admission.as_ref(),
+                        &request,
+                        &pm,
+                        state_dir,
+                        opts,
+                    ) {
+                        Ok(scope) => scope,
+                        Err(resp) => {
+                            send(request, resp);
+                            return;
+                        }
+                    };
+                    let resp = hidden_project(scope.as_ref(), read.project())
+                        .unwrap_or_else(|| workflows::read(&pm, state_dir, &query, read));
+                    send(request, resp);
                     return;
                 }
             }
@@ -2384,6 +3411,39 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 &mut request,
                 state_dir,
                 opts,
+                credential_entry::route(&path),
+                operator::admit_operator_read,
+                |req, route| credential_entry::handle_read(req, state_dir, opts, route),
+            ) {
+                send(request, response);
+                return;
+            }
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                routines::route(&path),
+                operator::admit_operator_read,
+                |_req, route| routines::handle_read(state_dir, route, raw_query),
+            ) {
+                send(request, response);
+                return;
+            }
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                agent_access::route(&path),
+                operator::admit_operator_read,
+                |_req, route| agent_access::handle(state_dir, route),
+            ) {
+                send(request, response);
+                return;
+            }
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
                 crm_send::route(&path),
                 operator::admit_operator_read,
                 |_, route| crm_send::handle_read(state_dir, route, &query),
@@ -2446,13 +3506,37 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // bindings and doctor findings, its runs and its outputs
             // (CAD-557, CAD-563).
             if let Some(read) = apps::read_route(&path) {
-                match Pm::at(pm_dir) {
-                    Ok(pm) => {
-                        let resp = apps::read(&request, &pm, state_dir, opts, &query, read);
-                        send(request, resp);
+                let pm = match Pm::at(pm_dir) {
+                    Ok(pm) => pm,
+                    Err(e) => {
+                        send(request, err_response(503, &e.to_string()));
+                        return;
                     }
-                    Err(e) => send(request, err_response(503, &e.to_string())),
-                }
+                };
+                let scope = match project_read_scope(
+                    read_admission.as_ref(),
+                    &request,
+                    &pm,
+                    state_dir,
+                    opts,
+                ) {
+                    Ok(scope) => scope,
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
+                };
+                // `?project=` names a project on the list route too.
+                let named = read
+                    .project()
+                    .map(str::to_string)
+                    .or_else(|| query("project"));
+                let resp = named
+                    .and_then(|key| hidden_project(scope.as_ref(), &key))
+                    .unwrap_or_else(|| {
+                        apps::read(&request, &pm, state_dir, opts, &query, read, scope.as_ref())
+                    });
+                send(request, resp);
                 return;
             }
             // `/api/memories/<project>/<slug>` — memory detail.
@@ -2466,15 +3550,67 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, "bad memory path"));
                     return;
                 }
-                match Pm::at(pm_dir).and_then(|pm| crate::memory::find(&pm, Some(key), slug)) {
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let pm = match Pm::at(pm_dir) {
+                    Ok(pm) => pm,
+                    Err(e) => {
+                        send(request, err_response(503, &e.to_string()));
+                        return;
+                    }
+                };
+                if !super::project_policy::readable(&pm, &actor).contains(key) {
+                    send(request, err_response(404, "Unknown memory"));
+                    return;
+                }
+                let wiki_caller =
+                    match operator::board_caller(&request, state_dir, opts, false, None) {
+                        Ok(operator::Caller::Operator(_)) => crate::wiki::Caller::Operator,
+                        Ok(operator::Caller::Named(named)) if named.operator => {
+                            crate::wiki::Caller::Operator
+                        }
+                        Ok(operator::Caller::Named(named))
+                            if crate::ident::is_handle(&named.sub, crate::ident::HANDLE_MAX)
+                                && named.author == named.sub =>
+                        {
+                            crate::wiki::Caller::User(named.sub)
+                        }
+                        Ok(operator::Caller::Named(_)) => crate::wiki::Caller::Public,
+                        Ok(operator::Caller::Agent(alias)) => crate::wiki::Caller::Agent {
+                            alias,
+                            project: None,
+                        },
+                        Err(response) => {
+                            send(request, response);
+                            return;
+                        }
+                    };
+                match crate::memory::find(&pm, Some(key), slug) {
                     Ok((proj, m)) => {
                         let fresh = crate::memory::Freshness::for_project(Some(&proj));
                         send(
                             request,
-                            json_response(crate::memory::detail_json(&m, &fresh)),
+                            json_response(crate::memory::detail_json_with_evidence(
+                                &m,
+                                &fresh,
+                                Some(&pm),
+                                Some(&wiki_caller),
+                            )),
                         )
                     }
-                    Err(e) => send(request, err_response(404, &e.to_string())),
+                    Err(_) => send(request, err_response(404, "Unknown memory")),
                 }
                 return;
             }
@@ -2488,14 +3624,31 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // `/api/master/summary?since=` — "since you left" (CAD-328).
             if path == "/api/master/summary" {
-                send(request, home::master_summary(state_dir, &query));
+                let Some(admission) = read_admission.as_ref() else {
+                    send(request, err_response(503, "read admission is missing"));
+                    return;
+                };
+                let actor = match operator::read_actor(admission, &request, state_dir, opts) {
+                    Ok(actor) => actor,
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
+                };
+                send(request, home::master_summary(state_dir, &query, &actor));
                 return;
             }
             // `/api/master/state` — the header chips + turn state (CAD-551).
             if path == "/api/master/state" {
                 // CAD-1767: only a proven operator reads the turn's text.
                 let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
-                send(request, home::master_state(state_dir, operator));
+                // CAD-2215: the reader's own proof goes to the daemon, which
+                // re-proves it and answers only for that reader.
+                let proof = read_admission
+                    .as_ref()
+                    .expect("private read admission")
+                    .relay_proof();
+                send(request, home::master_state(state_dir, operator, &proof));
                 return;
             }
             // CAD-819: the cross-agent work conversation view (read-only).
@@ -2523,13 +3676,47 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     return;
                 }
             }
+            // CAD-1853: cloud-agent connections. Operator-only reads; the
+            // daemon projects identity/runtime/capabilities and the canonical
+            // Threads link. No second conversation store is read here.
+            if path == "/api/cloud-agents" {
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                send(request, cloud_agents::list(state_dir));
+                return;
+            }
+            if let Some(id) = path.strip_prefix("/api/cloud-agents/") {
+                if !id.is_empty() && !id.contains('/') {
+                    if let Err(response) = operator::admit_operator_read(&request, state_dir, opts)
+                    {
+                        send(request, response);
+                        return;
+                    }
+                    send(request, cloud_agents::show(state_dir, id));
+                    return;
+                }
+            }
             // `/api/threads/<alias>[/stream]` — an agent's chat (CAD-319).
             if let Some((alias, sub)) = threads::route(&path) {
                 // CAD-1767: only a proven operator reads a thread whole; every
                 // other reader gets the member view (fail closed).
                 let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
                 match sub {
-                    None => send(request, threads::read(state_dir, alias, &query, operator)),
+                    None => send(
+                        request,
+                        threads::read(
+                            state_dir,
+                            alias,
+                            &query,
+                            operator,
+                            &read_admission
+                                .as_ref()
+                                .expect("private read admission")
+                                .relay_proof(),
+                        ),
+                    ),
                     Some("stream") if head_only => {
                         send(request, err_response(405, "stream is GET only"))
                     }
@@ -2564,16 +3751,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 };
                 match Pm::at(pm_dir) {
                     Ok(pm) => {
-                        let read = read_model::get(state_dir, pm_dir).board(&pm, None);
-                        let by_id: std::collections::HashMap<String, &board::View> = read
-                            .views
-                            .iter()
-                            .map(|v| (v.issue.front.id.clone(), v))
-                            .collect();
-                        let Some(view) = by_id.get(&id) else {
-                            send(request, err_response(404, "unknown issue"));
-                            return;
-                        };
                         // AOS-274: a restricted project answers like an
                         // absent issue, without naming the project.
                         let actor = match read_admission
@@ -2589,6 +3766,35 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                                 send(request, err_response(503, "read admission is missing"));
                                 return;
                             }
+                        };
+                        let read = if actor == "operator" {
+                            read_model::get(state_dir, pm_dir).board(&pm, None)
+                        } else {
+                            let Some(admission) = read_admission.as_ref() else {
+                                send(request, err_response(503, "read admission is missing"));
+                                return;
+                            };
+                            match readable_member_board(
+                                state_dir,
+                                &pm,
+                                &actor,
+                                &admission.relay_proof(),
+                                None,
+                            ) {
+                                Ok(read) => read,
+                                Err(_) => {
+                                    send(
+                                        request,
+                                        err_response(503, "member read scope is unavailable"),
+                                    );
+                                    return;
+                                }
+                            }
+                        };
+                        let by_id = read.by_id();
+                        let Some(view) = by_id.get(&id) else {
+                            send(request, err_response(404, "unknown issue"));
+                            return;
                         };
                         if super::project_policy::refused(&pm, &view.issue.project, &actor) {
                             send(request, err_response(404, "unknown issue"));
@@ -2668,6 +3874,30 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, err_response(404, "no such route"));
                 return;
             }
+            // CAD-1085: every private entry document is the real SPA
+            // shell with a server-owned memory-only marker (and, after the
+            // auth POST, its one-use bootstrap). It must be uncompressed
+            // so the marker can be injected.
+            if at_entry_origin {
+                if let Some(request_id) = credential_entry::entry_page_id(&path) {
+                    send(
+                        request,
+                        credential_entry::handoff_document(opts, request_id),
+                    );
+                    return;
+                }
+                if path == "/login" || path == "/login/" {
+                    let response = match credential_entry::entry_document(opts, None) {
+                        Some(bytes) => credential_entry::document_response(bytes, 200),
+                        None => err_response(
+                            503,
+                            "no SPA build — pass --dist or rebuild with --features ui",
+                        ),
+                    };
+                    send(request, response);
+                    return;
+                }
+            }
             // Static: a file of the build, the SPA shell for a client
             // route, or 404 for a file that is not there.
             match static_answer_for(
@@ -2706,6 +3936,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     }
 }
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    let dedicated = operator::dedicated_config(opts)?.map(std::sync::Arc::<str>::from);
     if opts.board_public_only && opts.public.is_none() {
         return Err(Error::rejected(
             "board public-only mode requires a public board identity",
@@ -2739,6 +3970,43 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
     opts.agent_uid = board_boot_agent_uid(state_dir, opts.agent_uid)?;
+    // CAD-1085: the root profile pins the credential-entry origin. It is
+    // resolved from the daemon once (no agent or loaded guest needed), so
+    // every later Host/Origin decision is the deployment's, not a request
+    // field. A fixture may inject it; nothing else sets it. An absent or
+    // non-separate origin disables trusted entry EXPLICITLY — it never
+    // falls back to this board's own origin.
+    if opts.credential_entry_origin.is_none() {
+        let (installed, origin) = super::credential_entry_config(state_dir);
+        // `installed` alone (even with the owner down, or with an origin
+        // this deployment cannot use) blocks the legacy secret paths.
+        opts.protected_profile = opts.protected_profile || installed;
+        opts.credential_entry_origin = origin;
+    }
+    let entry = credential_entry::EntryOrigin::from_opts(&opts);
+    let entry_hosts = entry
+        .as_ref()
+        .map(credential_entry::EntryOrigin::host_forms)
+        .unwrap_or_default();
+    if entry_hosts.is_empty() && opts.credential_entry_origin.is_some() {
+        eprintln!(
+            "warning: the protected profile's credential origin is not a separate https origin \
+             — trusted credential entry is unsupported"
+        );
+        opts.credential_entry_origin = None;
+    }
+    // The entry host is NOT added to the ordinary board allowlist: it is
+    // accepted only by the credential-entry gate, which serves just its own
+    // page/API there. Its https Origin is a valid same-origin write Origin.
+    if let Some(origin) = entry.as_ref().map(credential_entry::EntryOrigin::origin) {
+        if !opts
+            .allow_origins
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+        {
+            opts.allow_origins.push(origin.to_string());
+        }
+    }
     opts.tailnet_latch = if opts.tailnet.is_some() {
         crate::tailnet_proof::OperatorLatch::at_startup(opts.tailscaled_socket.as_deref())
     } else {
@@ -2891,8 +4159,12 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         };
         // Thread per request: `/api/stream` holds its connection open
         // for the session's lifetime and must not starve the board.
-        let (state_dir, pm_dir, opts) =
-            (state_dir.to_path_buf(), pm_dir.to_path_buf(), opts.clone());
+        let (state_dir, pm_dir, opts, dedicated) = (
+            state_dir.to_path_buf(),
+            pm_dir.to_path_buf(),
+            opts.clone(),
+            dedicated.clone(),
+        );
         std::thread::spawn(move || {
             // CAD-777: the device sign-in exchange is exempt — its
             // handlers make issuer HTTP calls (up to 20 s each), so a
@@ -2901,16 +4173,21 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             // the pending map under its own mutex, and the daemon
             // serializes the mint itself.
             if serialized_write(request.method(), request.url()) {
-                if let Some(busy) =
-                    run_serialized_write(request, &state_dir, &pm_dir, &opts, WRITE_LOCK_WAIT)
-                {
+                if let Some(busy) = run_serialized_write(
+                    request,
+                    &state_dir,
+                    &pm_dir,
+                    &opts,
+                    dedicated.as_deref(),
+                    WRITE_LOCK_WAIT,
+                ) {
                     // A writer that never returns must not queue the board
                     // behind it: answer the retryable refusal the client
                     // already renders as busy (CAD-1653).
                     let _ = busy.respond(board_busy_response());
                 }
             } else {
-                handle(request, &state_dir, &pm_dir, &opts);
+                handle(request, &state_dir, &pm_dir, &opts, dedicated.as_deref());
             }
         });
     }
@@ -3156,17 +4433,188 @@ mod write_lock_tests {
                 "{method:?} is a read"
             );
         }
-        for path in ["/api/session/device/code", "/api/session/device/poll"] {
+        for path in [
+            "/api/session/device/code",
+            "/api/session/device/poll",
+            "/api/app-installations/inst-1/screens/main/mount",
+            "/api/app-installations/inst-1/screens/main/m%6funt",
+            "/api/app-screen-tools/revoke",
+            "/api/app-screen-tools/%72evoke",
+            "/api/app-screen-services/call",
+            "/api/app-screen-services/%63all",
+        ] {
             assert!(
                 !serialized_write(&Method::Post, path),
-                "{path} stays exempt"
+                "{path} stays exempt from the global POST write lock"
             );
             assert!(
                 !serialized_write(&Method::Post, &format!("{path}?retry=1")),
-                "a query string does not bypass the exemption"
+                "a query string does not bypass the exemption for {path}"
+            );
+        }
+        assert!(
+            serialized_write(&Method::Post, "/api/app-screen-services/%ZZcall"),
+            "malformed percent encoding must fail closed under serialized_write"
+        );
+        for path in [
+            "/api/app-screen-services/slot-prepare",
+            "/api/app-screen-services/slot-confirm",
+            "/api/app-screen-tools/invoke",
+            "/api/app-installations/inst-1/upgrade",
+        ] {
+            assert!(
+                serialized_write(&Method::Post, path),
+                "{path} remains serialized under the global POST write lock"
+            );
+        }
+        for method in [Method::Put, Method::Patch, Method::Delete] {
+            assert!(
+                serialized_write(&method, "/api/app-screen-services/call"),
+                "non-POST {method:?} cannot claim the POST-only exemption"
             );
         }
         assert!(serialized_write(&Method::Post, "/api/session"));
+    }
+
+    #[test]
+    fn cad2534_screen_service_write_lock_and_slot_prepare_guard() {
+        let state = tempfile::tempdir().expect("state dir");
+        let opts = ServeOpts::default();
+        let host = operator::board_host(opts.port);
+        let cookie = format!("cadence_operator_{}=tok-1", opts.port);
+        const WRITE_BODY: &str =
+            r#"{"action_token":"act-1","operation":"records.create","args":{}}"#;
+        const READ_BODY: &str = r#"{"action_token":"act-1","operation":"records.list","args":{}}"#;
+        let service_req = |body: &'static str| -> Request {
+            tiny_http::TestRequest::new()
+                .with_method(Method::Post)
+                .with_path("/api/app-screen-services/call")
+                .with_header(Header::from_bytes("Host", host.as_str()).unwrap())
+                .with_header(Header::from_bytes("Cookie", cookie.as_str()).unwrap())
+                .with_body(body)
+                .into()
+        };
+        let _held = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let body_json = |resp: HttpResp| -> Value {
+            serde_json::from_reader(resp.into_reader()).expect("JSON response")
+        };
+
+        // Write screen service call must contend on WRITE_LOCK and fail closed with 503.
+        let mut write_req = service_req(WRITE_BODY);
+        let (write_resp, write_mutated) = app_screens::service_with_lock_wait(
+            &mut write_req,
+            state.path(),
+            &opts,
+            "app_screen_service_call",
+            false,
+            Duration::from_millis(30),
+        );
+        assert_eq!(write_resp.status_code(), StatusCode(503));
+        assert!(
+            !write_mutated,
+            "busy refusal must not invalidate read_model"
+        );
+        assert!(
+            write_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "503 response must include Retry-After"
+        );
+        assert_eq!(body_json(write_resp)["code"], "resource_busy");
+
+        // Read screen service call bypasses WRITE_LOCK, reaches client::rpc, and does not
+        // invalidate read_model.
+        let mut read_req = service_req(READ_BODY);
+        let (read_resp, read_mutated) = app_screens::service_with_lock_wait(
+            &mut read_req,
+            state.path(),
+            &opts,
+            "app_screen_service_call",
+            false,
+            Duration::from_millis(30),
+        );
+        assert!(
+            !read_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "read-only screen service call must not hit WRITE_LOCK busy refusal"
+        );
+        assert_eq!(
+            body_json(read_resp)["code"],
+            "daemon_unavailable",
+            "read-only screen service call must bypass WRITE_LOCK and reach client::rpc"
+        );
+        assert!(
+            !read_mutated,
+            "read-only screen service call must not invalidate read_model"
+        );
+
+        // Slot prepare keeps outer serialized_write WRITE_LOCK and must not re-lock/deadlock.
+        let mut slot_req: Request = tiny_http::TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/app-screen-services/slot-prepare")
+            .with_header(Header::from_bytes("Host", host.as_str()).unwrap())
+            .with_header(Header::from_bytes("Cookie", cookie.as_str()).unwrap())
+            .with_body(WRITE_BODY)
+            .into();
+        let (slot_resp, _) = app_screens::service_with_lock_wait(
+            &mut slot_req,
+            state.path(),
+            &opts,
+            "app_screen_service_slot_prepare",
+            false,
+            Duration::from_millis(30),
+        );
+        assert!(
+            !slot_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "slot-prepare holds outer WRITE_LOCK and must not re-acquire or busy-refuse itself"
+        );
+        assert_eq!(
+            body_json(slot_resp)["code"],
+            "daemon_unavailable",
+            "slot-prepare must proceed past the lock guard to client::rpc"
+        );
+
+        // Screen mount and tool revoke also execute without deadlocking while WRITE_LOCK is held.
+        let mut mount_req: Request = tiny_http::TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/app-installations/inst-1/screens/main/mount")
+            .with_header(Header::from_bytes("Host", host.as_str()).unwrap())
+            .with_header(Header::from_bytes("Cookie", cookie.as_str()).unwrap())
+            .with_body(r"{}")
+            .into();
+        let mount_resp = app_screens::mount(&mut mount_req, state.path(), &opts, "inst-1", "main");
+        assert!(
+            !mount_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "screen mount must not hit WRITE_LOCK busy refusal"
+        );
+        assert_eq!(body_json(mount_resp)["code"], "daemon_unavailable");
+
+        let mut revoke_req: Request = tiny_http::TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/app-screen-tools/revoke")
+            .with_header(Header::from_bytes("Host", host.as_str()).unwrap())
+            .with_header(Header::from_bytes("Cookie", cookie.as_str()).unwrap())
+            .with_body(r#"{"action_token":"act-1"}"#)
+            .into();
+        let revoke_resp = app_screens::tool_revoke(&mut revoke_req, state.path(), &opts);
+        assert!(
+            !revoke_resp
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "screen tool revoke must not hit WRITE_LOCK busy refusal"
+        );
+        assert_eq!(body_json(revoke_resp)["code"], "daemon_unavailable");
     }
 
     #[test]
@@ -3186,6 +4634,7 @@ mod write_lock_tests {
             state.path(),
             pm.path(),
             &ServeOpts::default(),
+            None,
             Duration::from_millis(50),
         );
         assert!(refused.is_some(), "a held writer must not dispatch");
@@ -3197,6 +4646,7 @@ mod write_lock_tests {
                 state.path(),
                 pm.path(),
                 &ServeOpts::default(),
+                None,
                 Duration::from_millis(50),
             )
             .is_none(),
@@ -3213,6 +4663,65 @@ mod write_lock_tests {
         assert!(poisoned.join().is_err());
         let guard = acquire_write_lock(Duration::from_millis(50));
         assert!(guard.is_some(), "a poisoned lock is recovered, as before");
+    }
+}
+
+#[cfg(test)]
+mod protected_entry_host_tests {
+    use super::*;
+
+    #[test]
+    fn cad2487_public_only_board_serves_handoff_only_on_pinned_host() {
+        let state = tempfile::tempdir().unwrap();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let board = "board.example.test";
+        let entry = "entry.example.test";
+        let opts = ServeOpts {
+            port,
+            allow_hosts: vec![board.into()],
+            board_public_only: true,
+            public: Some(crate::ui::PublicBoard {
+                host: board.into(),
+                issuer: "https://identity.example.test".into(),
+                company: "co_test".into(),
+                authorize_url: "https://identity.example.test/authorize".into(),
+            }),
+            credential_entry_origin: Some(format!("https://{entry}")),
+            ..ServeOpts::default()
+        };
+        let id = "0b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b";
+        let handoff = format!("/connections/enroll/{id}");
+        let scope = state.path();
+        let local = format!("127.0.0.1:{port}");
+        let cases = [
+            (entry, handoff.as_str(), 200),
+            (board, handoff.as_str(), 404),
+            (entry, "/api/projects", 404),
+            (entry, "/api/credential-requests", 404),
+            (entry, "/api/session/device/code", 404),
+            (local.as_str(), "/api/projects", 421),
+        ];
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                for _ in 0..cases.len() {
+                    let request = server
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap();
+                    handle(request, scope, scope, &opts, None);
+                }
+            });
+            for (host, path, status) in cases {
+                let (actual, body) =
+                    cadence_agent::ui::http_get("127.0.0.1", port, path, host, &[]).unwrap();
+                assert_eq!(actual, status, "{host}{path}: {body}");
+                if status == 200 {
+                    assert!(body.contains(&format!("https://{board}/connections/authorize/{id}")));
+                    assert!(!body.contains("<input"), "handoff cannot collect secrets");
+                }
+            }
+        });
     }
 }
 
@@ -3237,7 +4746,14 @@ mod read_dispatch_tests {
             "precondition: the empty alias fails its validator"
         );
 
-        let response = read_dispatch(&mut request, state.path(), &ServeOpts::default(), bound);
+        let response = read_dispatch(
+            &mut request,
+            state.path(),
+            state.path(),
+            &ServeOpts::default(),
+            None,
+            bound,
+        );
 
         // The row's own pair, not a generic status, and never `agent_detail`.
         assert_eq!(response.status_code(), StatusCode(400));

@@ -133,6 +133,34 @@ pub(crate) struct AppCapabilityClaim<'a> {
     pub call_id: &'a str,
 }
 
+/// CAD-2042: the first page of run-bound source reads. The order matches the
+/// partial index, so `LIMIT` stops the index walk.
+///
+/// CAD-2120: the scan-start rowid fence is NOT a SQL predicate. As a residual
+/// filter before `LIMIT` it let a cursor naming a low fence (the cursor is
+/// opaque, not authenticated) walk the whole scoped history for one page.
+/// The fence is applied to the rowid column of the bounded index range
+/// instead, see `app_source_run_candidates`.
+pub(crate) const SOURCE_PAGE_FIRST_SQL: &str = "SELECT id,created,run_id,rowid
+   FROM app_capability_results
+  WHERE install_id=? AND context_id=? AND source_post_read=1
+  ORDER BY created DESC,id DESC LIMIT ?";
+
+/// CAD-2042: the continuation page. The cursor is one composite row value so
+/// that `(created,id)<(?,?)` is an index range start, not a disjunction
+/// evaluated while walking the scope from its newest entry.
+pub(crate) const SOURCE_PAGE_AFTER_SQL: &str = "SELECT id,created,run_id,rowid
+   FROM app_capability_results
+  WHERE install_id=? AND context_id=? AND source_post_read=1
+    AND (created,id)<(?,?)
+  ORDER BY created DESC,id DESC LIMIT ?";
+
+/// CAD-2120: receipts recorded in this scope while one scan runs are skipped
+/// by the fence. A page skips at most this many entries to find its rows;
+/// more means the scope moved too far for the scan to continue (or the fence
+/// was forged), so it restarts.
+const SOURCE_PAGE_FENCE_SLACK: usize = 1024;
+
 impl Store {
     /// Reserve the one paid operation for this run slot before provider I/O.
     /// A failed/uncertain result can only retry the same operation and key.
@@ -433,6 +461,20 @@ impl Store {
                             now()
                         ],
                     )?;
+                    // CAD-2042: a source read carries its owning run's
+                    // installation/context and the source marker in the same
+                    // transaction, so the page index and the receipt can
+                    // never disagree about what is a pageable source read.
+                    if result["kind"].as_str() == Some("social.source.posts") {
+                        tx.execute(
+                            "UPDATE app_capability_results
+                             SET source_post_read=1,
+                                 install_id=(SELECT install_id FROM app_runs WHERE id=?2),
+                                 context_id=(SELECT context_id FROM app_runs WHERE id=?2)
+                             WHERE id=?1",
+                            params![id, run],
+                        )?;
+                    }
                     // CAD-1365: an eligible media.generated.image
                     // receipt atomically catalogs its one draft asset
                     // plus the private origin link, inside THIS tx —
@@ -505,6 +547,104 @@ impl Store {
         )
     }
 
+    /// SOC-55: the `app_capability_results` rowid upper bound at scan start.
+    /// Rowid is the insertion order, not the host clock: a later receipt with
+    /// an equal or backdated `created` and any id is excluded from a scan that
+    /// began earlier. Receipts are immutable and never deleted, so the bound
+    /// is a stable snapshot of the run-bound rows.
+    pub(crate) fn app_source_run_watermark(&self) -> Result<i64> {
+        Ok(self.conn().query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM app_capability_results",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// CAD-2042: one page of run-bound source reads for this install/context,
+    /// newest first. The partial source index carries every scoped key and
+    /// the receipt order, so this is an ordered index range. `fence` is the
+    /// scan-start rowid: receipts recorded after the scan began are skipped.
+    /// An honest fence skips only rows written during the scan, so the page
+    /// reads about `limit` entries. The cursor carrying the fence is not
+    /// authenticated, so the skip budget is `SOURCE_PAGE_FENCE_SLACK`; past
+    /// it the scan is refused as `stale_cursor` rather than walking the
+    /// scoped history. This bounds this function only.
+    pub(crate) fn app_source_run_candidates(
+        &self,
+        install: &str,
+        context: &str,
+        after: Option<(f64, &str)>,
+        fence: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, f64, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let mut stmt = conn.prepare(match after {
+            Some(_) => SOURCE_PAGE_AFTER_SQL,
+            None => SOURCE_PAGE_FIRST_SQL,
+        })?;
+        let examine = (limit.saturating_add(SOURCE_PAGE_FENCE_SLACK)) as i64;
+        let mut scan = match after {
+            Some((at, id)) => stmt.query(params![install, context, at, id, examine])?,
+            None => stmt.query(params![install, context, examine])?,
+        };
+        let mut rows = Vec::with_capacity(limit.min(SOURCE_PAGE_FENCE_SLACK));
+        let mut skipped = 0usize;
+        // Stop at `limit` rows past the fence: an honest page reads about its
+        // own size. The skip budget bounds a forged fence.
+        while rows.len() < limit {
+            let Some(row) = scan.next()? else { break };
+            if row.get::<_, i64>(3)? <= fence {
+                rows.push((row.get(0)?, row.get(1)?, row.get(2)?));
+            } else {
+                skipped += 1;
+                if skipped > SOURCE_PAGE_FENCE_SLACK {
+                    return Err(Error::invalid(
+                        "stale_cursor",
+                        "the retained source library changed during the scan — restart it",
+                    ));
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// SOC-55: a run-bound source read of this install/context. Broker turns
+    /// use the existing draft proof; native host executions use their approved
+    /// step and exact claim. This read does not widen draft authorization.
+    /// `None` means the receipt is not provable; nothing is guessed.
+    pub(crate) fn app_source_run_receipt(
+        &self,
+        install: &str,
+        context: &str,
+        receipt_id: &str,
+    ) -> Option<(Value, String)> {
+        let receipt = self.app_capability_result(receipt_id).ok()?;
+        if receipt["result"]["kind"].as_str() != Some("social.source.posts") {
+            return None;
+        }
+        let run_id = receipt["run_id"].as_str()?.to_owned();
+        let run = self.app_run_show(&run_id).ok()?;
+        if run["install_id"].as_str() != Some(install)
+            || run["context_id"].as_str() != Some(context)
+        {
+            return None;
+        }
+        // Two supported producers: a broker-turn agent step (message/turn
+        // present) and the native host executor, which records with an empty
+        // message/turn and proves the approved dispatched step plus its exact
+        // immutable claim. Read authorization only; draft authorization is
+        // unchanged.
+        if receipt["message_id"].as_str() == Some("") {
+            source_host_receipt_recoverable_in(&self.conn(), &run, &receipt).ok()?;
+        } else {
+            source_receipt_recoverable_in(&self.conn(), &run, &receipt).ok()?;
+        }
+        Some((receipt, run_id))
+    }
+
     pub(crate) fn app_capability_asset(&self, id: &str) -> Result<Value> {
         let (receipt, bytes) = asset_material_in(&self.conn(), id)?;
         use base64::Engine;
@@ -513,6 +653,44 @@ impl Store {
             "size":bytes.len(),"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
         )
     }
+}
+
+/// A host-executed run records its capability receipt with an empty message
+/// and turn (`execute_host_run`); the proof is the approved dispatched step and
+/// the exact immutable claim that reserved the call. This is the read-side
+/// counterpart of the broker-turn proof above; it grants no draft authority.
+pub(super) fn source_host_receipt_recoverable_in(
+    conn: &impl super::StoreConn,
+    run: &Value,
+    receipt: &Value,
+) -> Result<()> {
+    if !matches!(run["state"].as_str(), Some("succeeded" | "failed"))
+        || run["approved_digest"] != run["snapshot_digest"]
+        || receipt["run_id"] != run["id"]
+        || receipt["message_id"].as_str() != Some("")
+    {
+        return Err(Error::rejected(
+            "source run has no recoverable approved host receipt",
+        ));
+    }
+    let belongs_to_host_step: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_capability_results r
+         JOIN app_capability_claims c ON c.run_id=r.run_id AND c.slot=r.slot
+         JOIN app_run_steps s ON s.run_id=r.run_id AND s.step_id=r.step_id
+         WHERE r.id=?1 AND r.run_id=?2 AND r.message_id=''
+         AND s.state IN ('dispatched','succeeded','failed')
+         AND c.step_id=r.step_id AND c.request_id=r.request_id
+         AND c.binding_digest=r.binding_digest AND c.input_digest=r.input_digest
+         AND c.call_id=r.id)",
+        params![receipt["id"].as_str(), run["id"].as_str()],
+        |r| r.get(0),
+    )?;
+    if !belongs_to_host_step {
+        return Err(Error::rejected(
+            "source receipt lacks its approved host step and claim",
+        ));
+    }
+    Ok(())
 }
 
 /// A later failed step does not erase a broker-recorded read. Recovery is

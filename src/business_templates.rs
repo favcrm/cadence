@@ -17,6 +17,55 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
+mod authoring;
+#[path = "business_templates_html.rs"]
+pub mod html;
+
+pub use authoring::{
+    check_definition_approvable, parse_definition, retained_source, retained_source_with_format,
+    validate_definition, AuthoringFormat, AuthoringKind, AuthoringSpec, ReferenceAsset,
+    TemplateDefinition, RESERVED_REFERENCE_NAMES,
+};
+#[cfg(test)]
+use authoring::{PACK_MAX_ASSET_BYTES, PACK_MAX_REFERENCES};
+pub use html::{
+    build_suggested_html_from_intake, extract_html_placeholders, render_html_template,
+    validate_and_sanitize_html_template, HTML_MAX_BYTES,
+};
+
+/// Sentinel string emitted for unpriced lines/totals under `allow_partial`.
+pub const UNRESOLVED_PRICE: &str = "UNRESOLVED";
+
+/// Retained source representation of a template version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceFormat {
+    Docx,
+    Html,
+    Authoring,
+}
+
+impl SourceFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Docx => "docx",
+            Self::Html => "html",
+            Self::Authoring => "authoring",
+        }
+    }
+}
+
+pub fn parse_source_format(s: &str) -> Result<SourceFormat> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "docx" => Ok(SourceFormat::Docx),
+        "html" => Ok(SourceFormat::Html),
+        "authoring" => Ok(SourceFormat::Authoring),
+        other => refuse(format!(
+            "unsupported template source_format '{other}'; expected docx, html, or authoring"
+        )),
+    }
+}
+
 /// Largest accepted money amount in minor units (10^13 cents).
 const MAX_MINOR: i128 = 10_000_000_000_000;
 /// Largest accepted quantity in thousandths (10^12 milli-units).
@@ -37,6 +86,7 @@ const RESERVED: &[&str] = &[
     "tax_rate",
     "discount_rate",
     "kind",
+    "has_unresolved_pricing",
 ];
 
 /// The document kind a template produces. Drafts only: no kind issues,
@@ -124,7 +174,7 @@ pub struct ItemOut {
 }
 
 /// A validated, calculated draft. `context()` is the complete placeholder
-/// map a later DOCX render reads.
+/// map a later DOCX or HTML render reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub kind: DocumentKind,
@@ -138,6 +188,7 @@ pub struct Draft {
     pub discount: String,
     pub tax: String,
     pub total: String,
+    pub has_unresolved_pricing: bool,
 }
 
 impl Draft {
@@ -156,11 +207,15 @@ impl Draft {
         ctx.insert("tax".into(), json!(self.tax));
         ctx.insert("total".into(), json!(self.total));
         ctx.insert("items".into(), json!(self.items));
+        ctx.insert(
+            "has_unresolved_pricing".into(),
+            json!(self.has_unresolved_pricing),
+        );
         Value::Object(ctx)
     }
 }
 
-fn refuse<T>(message: impl Into<String>) -> Result<T> {
+pub(super) fn refuse<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::rejected(message))
 }
 
@@ -339,347 +394,6 @@ pub fn check_approvable(spec: &TemplateSpec) -> Result<()> {
     Ok(())
 }
 
-/// Output format an agent authors against. Descriptive only: there is no
-/// renderer per format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthoringFormat {
-    Docx,
-    Pptx,
-    Xlsx,
-    Html,
-    Text,
-}
-
-/// The only authoring kind. It is not a quotation, invoice, or proposal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthoringKind {
-    Authoring,
-}
-
-/// One immutable reference file. `content_base64` is the bytes themselves;
-/// the daemon never resolves a path or URL from this record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReferenceAsset {
-    pub name: String,
-    pub media_type: String,
-    pub description: String,
-    pub content_base64: String,
-}
-
-/// A reference pack: guidelines plus the visual/textual references an
-/// agent should learn from. Data only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthoringSpec {
-    pub kind: AuthoringKind,
-    pub purpose: String,
-    pub format: AuthoringFormat,
-    pub guidelines: String,
-    #[serde(default)]
-    pub references: Vec<ReferenceAsset>,
-}
-
-/// One template body. Financial JSON is the historical spec object;
-/// authoring JSON is a separate shape discriminated by `kind`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum TemplateDefinition {
-    Financial(TemplateSpec),
-    Authoring(AuthoringSpec),
-}
-
-impl TemplateDefinition {
-    /// The financial spec, or a refusal when this version is an authoring pack.
-    pub fn financial(&self) -> Result<&TemplateSpec> {
-        match self {
-            Self::Financial(spec) => Ok(spec),
-            Self::Authoring(_) => {
-                refuse("this template is an authoring reference pack, not a financial document")
-            }
-        }
-    }
-
-    pub fn authoring(&self) -> Option<&AuthoringSpec> {
-        match self {
-            Self::Authoring(spec) => Some(spec),
-            Self::Financial(_) => None,
-        }
-    }
-
-    /// `quotation`, `invoice`, or `authoring`.
-    pub fn kind(&self) -> &str {
-        match self {
-            Self::Financial(spec) => match spec.kind {
-                DocumentKind::Quotation => "quotation",
-                DocumentKind::Invoice => "invoice",
-            },
-            Self::Authoring(_) => "authoring",
-        }
-    }
-}
-
-/// Reference basenames the show export owns. A pack must not reuse them.
-pub const RESERVED_REFERENCE_NAMES: &[&str] = &["guidelines.md", "template.json"];
-
-const PACK_MAX_REFERENCES: usize = 12;
-const PACK_MAX_GUIDELINES: usize = 64 * 1024;
-const PACK_MIN_GUIDELINES: usize = 16;
-const PACK_MAX_PURPOSE: usize = 2_000;
-const PACK_MIN_PURPOSE: usize = 8;
-const PACK_MAX_DESCRIPTION: usize = 2_000;
-const PACK_MIN_DESCRIPTION: usize = 8;
-const PACK_MAX_NAME: usize = 120;
-const PACK_MAX_ASSET_BYTES: usize = 2 * 1024 * 1024;
-const PACK_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-
-/// Parse and validate either a financial spec or an authoring pack.
-/// Reference payload size is bounded before any base64 decode.
-pub fn parse_definition(value: Value) -> Result<TemplateDefinition> {
-    bound_authoring_wire(&value)?;
-    let kind = value.get("kind").and_then(Value::as_str);
-    match kind {
-        Some("quotation") | Some("invoice") => {
-            Ok(TemplateDefinition::Financial(parse_spec(value)?))
-        }
-        Some("authoring") => {
-            let spec: AuthoringSpec = serde_json::from_value(value)
-                .map_err(|e| Error::rejected(format!("authoring pack is malformed: {e}")))?;
-            validate_authoring(&spec)?;
-            Ok(TemplateDefinition::Authoring(spec))
-        }
-        Some(other) => refuse(format!(
-            "template kind '{other}' is not quotation, invoice, or authoring"
-        )),
-        None => refuse("template spec is malformed: missing kind"),
-    }
-}
-
-/// Structural validation for whichever body this definition carries.
-pub fn validate_definition(definition: &TemplateDefinition) -> Result<()> {
-    match definition {
-        TemplateDefinition::Financial(spec) => validate_spec(spec),
-        TemplateDefinition::Authoring(spec) => validate_authoring(spec),
-    }
-}
-
-/// Financial versions still need confirmed calculation rules. A structurally
-/// valid authoring pack may be approved by the operator; it has no prices.
-pub fn check_definition_approvable(definition: &TemplateDefinition) -> Result<()> {
-    match definition {
-        TemplateDefinition::Financial(spec) => check_approvable(spec),
-        TemplateDefinition::Authoring(spec) => validate_authoring(spec),
-    }
-}
-
-/// The bytes retained for this definition. Financial versions keep the
-/// checked DOCX. Authoring versions keep an empty blob and refuse a DOCX.
-pub fn retained_source<'a>(definition: &TemplateDefinition, source: &'a [u8]) -> Result<&'a [u8]> {
-    match definition {
-        TemplateDefinition::Financial(_) => {
-            check_docx_package(source)?;
-            Ok(source)
-        }
-        TemplateDefinition::Authoring(_) => {
-            if !source.is_empty() {
-                return refuse("authoring reference packs do not accept a DOCX source");
-            }
-            Ok(source)
-        }
-    }
-}
-
-fn bound_authoring_wire(value: &Value) -> Result<()> {
-    if value.get("kind").and_then(Value::as_str) != Some("authoring") {
-        return Ok(());
-    }
-    if let Some(guidelines) = value.get("guidelines").and_then(Value::as_str) {
-        if guidelines.len() > PACK_MAX_GUIDELINES {
-            return refuse(format!("guidelines exceed {PACK_MAX_GUIDELINES} bytes"));
-        }
-    }
-    let Some(refs) = value.get("references") else {
-        return Ok(());
-    };
-    let Some(refs) = refs.as_array() else {
-        return Ok(());
-    };
-    if refs.len() > PACK_MAX_REFERENCES {
-        return refuse(format!("at most {PACK_MAX_REFERENCES} reference assets"));
-    }
-    let mut wire = 0usize;
-    for reference in refs {
-        let encoded = reference
-            .get("content_base64")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let asset_limit = PACK_MAX_ASSET_BYTES * 4 / 3 + 4;
-        if encoded.len() > asset_limit {
-            return refuse(format!(
-                "a reference exceeds {PACK_MAX_ASSET_BYTES} decoded bytes"
-            ));
-        }
-        wire = wire.saturating_add(encoded.len());
-    }
-    let total_limit = PACK_MAX_TOTAL_BYTES * 4 / 3 + refs.len() * 4;
-    if wire > total_limit {
-        return refuse(format!(
-            "reference assets exceed {PACK_MAX_TOTAL_BYTES} decoded bytes in total"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_authoring(spec: &AuthoringSpec) -> Result<()> {
-    let purpose = spec.purpose.trim();
-    if purpose.len() < PACK_MIN_PURPOSE || spec.purpose.len() > PACK_MAX_PURPOSE {
-        return refuse(format!(
-            "purpose must be {PACK_MIN_PURPOSE}..={PACK_MAX_PURPOSE} bytes of text"
-        ));
-    }
-    let guidelines = spec.guidelines.trim();
-    if guidelines.len() < PACK_MIN_GUIDELINES || spec.guidelines.len() > PACK_MAX_GUIDELINES {
-        return refuse(format!(
-            "guidelines must be {PACK_MIN_GUIDELINES}..={PACK_MAX_GUIDELINES} bytes"
-        ));
-    }
-    if spec.references.len() > PACK_MAX_REFERENCES {
-        return refuse(format!("at most {PACK_MAX_REFERENCES} reference assets"));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    let mut total = 0usize;
-    for reference in &spec.references {
-        check_reference_name(&reference.name)?;
-        let key = reference.name.to_ascii_lowercase();
-        if !seen.insert(key) {
-            return refuse(format!("reference '{}' is declared twice", reference.name));
-        }
-        if !reference_extension_matches(&reference.name, &reference.media_type)? {
-            return refuse(format!(
-                "reference '{}' extension does not match media_type '{}'",
-                reference.name, reference.media_type
-            ));
-        }
-        let description = reference.description.trim();
-        if description.len() < PACK_MIN_DESCRIPTION
-            || reference.description.len() > PACK_MAX_DESCRIPTION
-        {
-            return refuse(format!(
-                "reference '{}' needs a description of {PACK_MIN_DESCRIPTION}..={PACK_MAX_DESCRIPTION} bytes",
-                reference.name
-            ));
-        }
-        let asset_limit = PACK_MAX_ASSET_BYTES * 4 / 3 + 4;
-        if reference.content_base64.len() > asset_limit {
-            return refuse(format!(
-                "reference '{}' exceeds {PACK_MAX_ASSET_BYTES} decoded bytes",
-                reference.name
-            ));
-        }
-        let bytes = decode_reference(&reference.content_base64).map_err(|_| {
-            Error::rejected(format!(
-                "reference '{}' content_base64 is not standard base64",
-                reference.name
-            ))
-        })?;
-        if bytes.len() > PACK_MAX_ASSET_BYTES {
-            return refuse(format!(
-                "reference '{}' exceeds {PACK_MAX_ASSET_BYTES} decoded bytes",
-                reference.name
-            ));
-        }
-        total = total.saturating_add(bytes.len());
-        if total > PACK_MAX_TOTAL_BYTES {
-            return refuse(format!(
-                "reference assets exceed {PACK_MAX_TOTAL_BYTES} decoded bytes in total"
-            ));
-        }
-        check_reference_bytes(&reference.name, &reference.media_type, &bytes)?;
-    }
-    Ok(())
-}
-
-fn check_reference_name(name: &str) -> Result<()> {
-    let ok = !name.is_empty()
-        && name.len() <= PACK_MAX_NAME
-        && !name.starts_with('.')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
-        && !name.contains('/')
-        && !name.contains('\\');
-    if !ok {
-        return refuse(format!(
-            "reference name '{name}' must be a flat basename of letters, digits, '.', '_' or '-'"
-        ));
-    }
-    if RESERVED_REFERENCE_NAMES
-        .iter()
-        .any(|reserved| reserved.eq_ignore_ascii_case(name))
-    {
-        return refuse(format!("reference name '{name}' is reserved"));
-    }
-    Ok(())
-}
-
-fn decode_reference(text: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(text)
-}
-
-/// The basename extension must be one of the allowlisted suffixes for
-/// `media_type`. Comparison is ASCII case-insensitive. Returns an error
-/// when `media_type` itself is not an allowlisted type.
-fn reference_extension_matches(name: &str, media_type: &str) -> Result<bool> {
-    let ext = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
-    let allowed: &[&str] = match media_type {
-        "image/png" => &["png"],
-        "image/jpeg" => &["jpg", "jpeg"],
-        "application/pdf" => &["pdf"],
-        "text/plain" => &["txt"],
-        "text/markdown" => &["md"],
-        other => {
-            return refuse(format!(
-                "reference '{name}' media_type '{other}' is not png, jpeg, pdf, plain text, or markdown"
-            ))
-        }
-    };
-    Ok(allowed
-        .iter()
-        .any(|suffix| suffix.eq_ignore_ascii_case(ext)))
-}
-
-fn check_reference_bytes(name: &str, media_type: &str, bytes: &[u8]) -> Result<()> {
-    if bytes.is_empty() {
-        return refuse(format!("reference '{name}' is empty"));
-    }
-    let ok = match media_type {
-        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "application/pdf" => bytes.starts_with(b"%PDF-"),
-        "text/plain" | "text/markdown" => text_bytes(bytes),
-        _ => false,
-    };
-    if !ok {
-        return refuse(format!(
-            "reference '{name}' does not match media_type '{media_type}'"
-        ));
-    }
-    Ok(())
-}
-
-/// UTF-8 text. The only refused controls are bytes below 0x20 other than
-/// tab, LF, and CR. Contents stay untrusted data; nothing here is executed.
-fn text_bytes(bytes: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return false;
-    };
-    text.bytes()
-        .all(|b| b >= 0x20 || b == b'\t' || b == b'\n' || b == b'\r')
-}
-
 /// Placeholder data that exercises every declared field and one line
 /// item, for a labelled sample preview. It invents no company facts: every
 /// value is a fixed marker, and the sample is never stored as a document.
@@ -709,6 +423,18 @@ pub fn sample_data(spec: &TemplateSpec) -> DocumentData {
 
 /// Validate `data` against `spec` and compute every total in code.
 pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
+    build_draft_with_options(spec, data, false)
+}
+
+/// Validate `data` against `spec` and compute every priced line in code.
+/// When `allow_partial` is true, line items whose `unit_price` is empty or
+/// `"UNRESOLVED"` emit `"UNRESOLVED"` line totals and document totals while
+/// flagging `has_unresolved_pricing = true`.
+pub fn build_draft_with_options(
+    spec: &TemplateSpec,
+    data: &DocumentData,
+    allow_partial: bool,
+) -> Result<Draft> {
     validate_spec(spec)?;
     check_approvable(spec)?;
     for key in data.fields.keys() {
@@ -751,6 +477,7 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
     let rules = &spec.calculation;
     let mut items = Vec::with_capacity(data.items.len());
     let mut subtotal: i128 = 0;
+    let mut has_unresolved_pricing = false;
     for (index, row) in data.items.iter().enumerate() {
         let n = index + 1;
         let description = row.description.trim();
@@ -761,6 +488,17 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
         }
         let qty = parse_quantity(&row.quantity)
             .map_err(|e| Error::rejected(format!("line item {n}: {e}")))?;
+        let trimmed_price = row.unit_price.trim();
+        if allow_partial && (trimmed_price.is_empty() || trimmed_price == UNRESOLVED_PRICE) {
+            has_unresolved_pricing = true;
+            items.push(ItemOut {
+                description: description.to_string(),
+                quantity: format_milli(qty),
+                unit_price: UNRESOLVED_PRICE.to_string(),
+                line_total: UNRESOLVED_PRICE.to_string(),
+            });
+            continue;
+        }
         let price = parse_money(&row.unit_price)
             .map_err(|e| Error::rejected(format!("line item {n}: {e}")))?;
         let line = round_div(qty * price, 1000);
@@ -772,10 +510,20 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
             line_total: format_minor(line),
         });
     }
-    let discount = round_div(subtotal * rules.discount_bps as i128, 10_000);
-    let taxable = subtotal - discount;
-    let tax = round_div(taxable * rules.tax_rate_bps as i128, 10_000);
-    let total = taxable + tax;
+    let (subtotal_s, discount_s, tax_s, total_s) = if has_unresolved_pricing {
+        let u = || UNRESOLVED_PRICE.to_string();
+        (u(), u(), u(), u())
+    } else {
+        let discount = round_div(subtotal * rules.discount_bps as i128, 10_000);
+        let taxable = subtotal - discount;
+        let tax = round_div(taxable * rules.tax_rate_bps as i128, 10_000);
+        (
+            format_minor(subtotal),
+            format_minor(discount),
+            format_minor(tax),
+            format_minor(taxable + tax),
+        )
+    };
     Ok(Draft {
         kind: spec.kind,
         fields,
@@ -784,10 +532,11 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
         currency: rules.currency.clone(),
         tax_rate_bps: rules.tax_rate_bps,
         discount_bps: rules.discount_bps,
-        subtotal: format_minor(subtotal),
-        discount: format_minor(discount),
-        tax: format_minor(tax),
-        total: format_minor(total),
+        subtotal: subtotal_s,
+        discount: discount_s,
+        tax: tax_s,
+        total: total_s,
+        has_unresolved_pricing,
     })
 }
 
@@ -1110,5 +859,68 @@ mod tests {
     fn base64_std(bytes: &[u8]) -> String {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn html_template_sanitizes_renders_and_preserves_table_loops() {
+        let s = spec();
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let raw = format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><style>@page {{ size: A4; }} .num {{ text-align: right; }}</style></head><body><h1>{{{{ customer }}}}</h1><img src=\"data:image/png;base64,{png}\" alt=\"Logo\"><table><tbody>{{% for item in items %}}<tr><td>{{{{ item.description }}}}</td><td class=\"num\">{{{{ item.line_total }}}}</td></tr>{{% endfor %}}</tbody></table><p>{{{{ total }}}} {{{{ currency }}}}</p></body></html>"
+        );
+        let clean = validate_and_sanitize_html_template(raw.as_bytes(), &s).unwrap();
+        assert!(
+            clean.contains("@page { size: A4; }")
+                && clean.contains("<tbody>{% for item in items %}")
+        );
+        let d = build_draft(
+            &s,
+            &data(
+                json!([{"description": "<Acme & Sons>", "quantity": "2", "unit_price": "10.00"}]),
+            ),
+        )
+        .unwrap();
+        let rendered = render_html_template(&clean, &d.context(), true).unwrap();
+        assert!(
+            rendered.contains("data-sample-banner=\"true\"")
+                && rendered.contains("&lt;Acme &amp; Sons&gt;")
+                && !rendered.contains("{{")
+        );
+    }
+
+    #[test]
+    fn html_template_rejects_active_external_or_undeclared_content() {
+        let s = spec();
+        for bad in [
+            "<script>alert(1)</script><p>{{ customer }}</p>",
+            "<p onclick=\"alert(1)\">{{ customer }}</p>",
+            "<style>@import url(https://evil.invalid/x.css);</style><p>{{ customer }}</p>",
+            "<img src=\"https://evil.invalid/pixel.png\"><p>{{ customer }}</p>",
+            "<img src=\"data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=\"><p>{{ customer }}</p>",
+            "<p>{{ undeclared_field }}</p>",
+        ] {
+            assert!(
+                validate_and_sanitize_html_template(bad.as_bytes(), &s).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_draft_and_authoring_html_ref() {
+        let s = spec();
+        let d = data(
+            json!([{"description": "Fixed", "quantity": "1", "unit_price": "50.00"}, {"description": "Custom", "quantity": "2", "unit_price": "UNRESOLVED"}]),
+        );
+        assert!(build_draft(&s, &d).is_err());
+        let p = build_draft_with_options(&s, &d, true).unwrap();
+        assert!(
+            p.has_unresolved_pricing
+                && p.items[0].line_total == "50.00"
+                && p.items[1].line_total == "UNRESOLVED"
+                && p.subtotal == "UNRESOLVED"
+                && p.total == "UNRESOLVED"
+        );
+        assert!(parse_definition(pack(json!([{"name": "starter.html", "media_type": "text/html", "description": "HTML snippet", "content_base64": base64_std(b"<!doctype html><html><body>Hi</body></html>\n")}]))).is_ok());
     }
 }

@@ -27,6 +27,7 @@
 
 use std::cell::RefCell;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -684,6 +685,7 @@ impl HttpGh {
         let package = self.release_artifact(entry, PACKAGE_ARCHIVE, crate::upgrade::TARGET)?;
         let dir = tempfile::Builder::new()
             .prefix("cadence-release-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()?;
         let archive = dir.path().join(PACKAGE_ARCHIVE);
         self.download_artifact(entry, package, &archive)?;
@@ -1057,9 +1059,9 @@ impl ReleaseSource for HttpGh {
         })
     }
 
-    fn merged_titles(&self, _base: &str, _head: &str) -> Result<Vec<String>> {
-        // The snapshot carries no PR titles; `--check` reports none.
-        Ok(Vec::new())
+    fn merged_titles(&self, _base: &str, _head: &str) -> Result<Option<Vec<String>>> {
+        // The signed snapshot does not contain PR titles.
+        Ok(None)
     }
 
     /// `SCHEMA_VERSION` at `sha` when the signed facts name it — the

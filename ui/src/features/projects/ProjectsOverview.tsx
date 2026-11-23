@@ -9,8 +9,22 @@ import ProjectMilestoneSummary from "./ProjectMilestoneSummary";
 import { useLocale } from "../../lib/locale";
 
 const path = (project: string, section = "overview") => project === "all" ? `/projects${section === "issues" ? "?view=list" : ""}` : `/projects/${encodeURIComponent(project)}${section === "overview" ? "" : `/${section}`}`;
-export default function ProjectsOverview({ project, projects, issues, onOpenIssue, onRetry }: {
-  project: string; projects: Project[]; issues: ResourceState<IssueCard[]>; onOpenIssue: (id: string) => void; onRetry: () => void;
+export default function ProjectsOverview({
+  project,
+  projects,
+  issues,
+  onOpenIssue,
+  onRetry,
+  milestonesEnabled = true,
+  workflowsEnabled = true,
+}: {
+  project: string;
+  projects: Project[];
+  issues: ResourceState<IssueCard[]>;
+  onOpenIssue: (id: string) => void;
+  onRetry: () => void;
+  milestonesEnabled?: boolean;
+  workflowsEnabled?: boolean;
 }) {
   const { t, formatNumber } = useLocale();
   const cards = issues.data ?? [];
@@ -28,7 +42,7 @@ export default function ProjectsOverview({ project, projects, issues, onOpenIssu
       {[[t("Open issues"), summary.open], [t("In progress"), summary.doing], [t("In review"), summary.review], [t("Blocked"), summary.blocked]].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{issues.data ? value : "—"}</dd></div>)}
     </dl>
     <p className="text-micro text-ink-500 mb-6">{t("Issue counts exclude epics. In progress reflects tracker status; it does not mean an agent is currently running.")}</p>
-    {!all && <ProjectMilestoneSummary project={project} issuesAsOf={issues.asOf} />}
+    {!all && milestonesEnabled && <ProjectMilestoneSummary project={project} issuesAsOf={issues.asOf} />}
     {all ? <section aria-label={t("Projects")}><div className="flex items-center justify-between mb-3"><h2 className="text-section font-semibold text-ink-100">{t("Your projects")}</h2><span className="text-label text-ink-500">{formatNumber(projects.length)} {t("projects")}</span></div>
       <div className="project-grid">{projects.map((item) => {
         const work = projectSummary(cards, item.key);
@@ -48,7 +62,11 @@ export default function ProjectsOverview({ project, projects, issues, onOpenIssu
       <div className="space-y-5"><section className="project-summary-card" aria-label={t("Active epics")}><div className="flex items-baseline justify-between mb-4"><h2 className="text-section text-ink-100 font-semibold">{t("Active epics")}</h2><Link className="lnk text-label" href={path(project, "epics")}>{t("See all")} ↗</Link></div>
         {summary.epics.slice().sort((a, b) => Number(b.work?.health?.state === "at_risk") - Number(a.work?.health?.state === "at_risk")).slice(0, 3).map((epic) => <div className="project-epic" key={epic.id}><button className="text-left text-secondary text-ink-200 hover:text-accent" onClick={() => onOpenIssue(epic.id)}>{epic.title}</button><div className="my-2 flex gap-2"><span className="num text-micro text-ink-500">{epic.id}</span><HealthBadge view={healthView(epic.work?.health, undefined, t)} /></div><ProgressBar view={progressView(epic.work?.progress, t)} tone={healthView(epic.work?.health, undefined, t).tone} t={t} /></div>)}
         {issues.data && summary.epics.length === 0 && <p className="text-label text-ink-500">{t("No active epics yet.")}</p>}
-      </section><section className="project-summary-card"><h2 className="text-section text-ink-100 font-semibold mb-3">{t("Explore this project")}</h2><div className="project-section-links">{[["milestones", t("Milestones"), t("Delivery dates, criteria, and evidence")], ["workflows", t("Workflows"), t("Repeatable work you can run")], ["context", t("Context"), t("Project guidance and reading order")]].map(([section, title, description]) => <Link key={section} href={path(project, section)}><span>{title} ↗</span><small>{description}</small></Link>)}</div>{selected?.repos[0]?.remote && <p className="text-micro text-ink-500 mt-4 break-all">{selected.repos[0].remote}</p>}</section></div>
+      </section><section className="project-summary-card"><h2 className="text-section text-ink-100 font-semibold mb-3">{t("Explore this project")}</h2><div className="project-section-links">{([
+        ...(milestonesEnabled ? [["milestones", t("Milestones"), t("Delivery dates, criteria, and evidence")]] : []),
+        ...(workflowsEnabled ? [["workflows", t("Workflows"), t("Repeatable work you can run")]] : []),
+        ["context", t("Context"), t("Project guidance and reading order")],
+      ] as const).map(([section, title, description]) => <Link key={section} href={path(project, section)}><span>{title} ↗</span><small>{description}</small></Link>)}</div>{selected?.repos[0]?.remote && <p className="text-micro text-ink-500 mt-4 break-all">{selected.repos[0].remote}</p>}</section></div>
     </div>}
   </main>;
 }

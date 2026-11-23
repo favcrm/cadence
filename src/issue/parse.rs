@@ -240,39 +240,70 @@ fn checkbox_item(line: &str) -> Option<AcceptanceItem> {
     })
 }
 
+/// The canonical checklist rows and their original byte ranges. Both the
+/// acceptance reader and task-request projection use this one Markdown rule.
+fn acceptance_lines(body: &str) -> impl Iterator<Item = (LineRange, AcceptanceItem)> + '_ {
+    let sections = acceptance_sections(body);
+    let section = (sections.len() == 1).then(|| sections[0]);
+    section.into_iter().flat_map(move |section| {
+        let section_body = &body[section.heading_end..section.end];
+        let mut fences = Fences::default();
+        line_ranges(section_body)
+            .into_iter()
+            .filter_map(move |line| {
+                let text = &section_body[line.start..line.content_end];
+                if fences.is_code(text) {
+                    return None;
+                }
+                checkbox_item(text).map(|item| {
+                    (
+                        LineRange {
+                            start: section.heading_end + line.start,
+                            content_end: section.heading_end + line.content_end,
+                            end: section.heading_end + line.end,
+                        },
+                        item,
+                    )
+                })
+            })
+    })
+}
+
 /// Read acceptance items from the unique level-two `Acceptance` section.
 /// A duplicate heading is treated as malformed and produces no items on the
 /// read side; mutation uses `replace_acceptance` to report the error.
 pub fn acceptance_items(body: &str) -> Vec<AcceptanceItem> {
-    let sections = acceptance_sections(body);
-    if sections.len() != 1 {
-        return Vec::new();
-    }
-    let section = sections[0];
-    let section_body = &body[section.heading_end..section.end];
+    acceptance_lines(body).map(|(_, item)| item).collect()
+}
+
+/// Split a canonical task body into its prose and complete criteria without
+/// duplicating the criteria in the provider payload. Keep every other line,
+/// including Acceptance preambles, continuations and fenced examples.
+pub(crate) fn task_request(mut body: String) -> (String, Vec<AcceptanceItem>) {
+    let mut removed = Vec::new();
     let mut items = Vec::new();
-    let mut in_fence: Option<(u8, usize)> = None;
-    for line in line_ranges(section_body) {
-        let text = &section_body[line.start..line.content_end];
-        if let Some((marker, count)) = fence(text) {
-            match in_fence {
-                Some((open_marker, open_count))
-                    if open_marker == marker && is_closing_fence(text, marker, open_count) =>
-                {
-                    in_fence = None;
-                }
-                None => in_fence = Some((marker, count)),
-                _ => {}
-            }
-            continue;
-        }
-        if in_fence.is_none() {
-            if let Some(item) = checkbox_item(text) {
-                items.push(item);
-            }
-        }
+    for (line, item) in acceptance_lines(&body) {
+        removed.push(line);
+        items.push(item);
     }
-    items
+    if !removed.is_empty() {
+        // Compact the already-owned UTF-8 body in place. Ranges name complete
+        // original lines; this cursor counts original bytes even for removed
+        // characters, so Unicode and CRLF cannot shift later ranges.
+        let mut removed = removed.into_iter().peekable();
+        let mut offset = 0usize;
+        body.retain(|character| {
+            let at = offset;
+            offset += character.len_utf8();
+            while removed.peek().is_some_and(|line| line.end <= at) {
+                removed.next();
+            }
+            !removed
+                .peek()
+                .is_some_and(|line| line.start <= at && at < line.end)
+        });
+    }
+    (body, items)
 }
 
 /// Validate the existing body before replacing its acceptance section.

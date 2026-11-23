@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VerifyConnectionV1",
+  "description": "`verifyV1`: exactly the five fields; no password/role/destination/adapter.",
+  "type": "object",
+  "properties": {
+    "attempt_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "connection_id": {
+      "$ref": "#/$defs/Ident"
+    },
+    "expected_authorization_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "expected_credential_revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "verification_request_id": {
+      "$ref": "#/$defs/UuidV1"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "attempt_id",
+    "connection_id",
+    "expected_credential_revision",
+    "expected_authorization_revision",
+    "verification_request_id"
+  ],
+  "$defs": {
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    },
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

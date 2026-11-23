@@ -14,6 +14,7 @@ export default function ConfirmDialog({
   match,
   inputLabel,
   confirmLabel,
+  confirmVariant = "danger",
   pending,
   error,
   onConfirm,
@@ -27,6 +28,9 @@ export default function ConfirmDialog({
   match?: string;
   inputLabel?: string;
   confirmLabel: string;
+  /** The confirm button's weight: `danger` (the default) for a destructive
+   *  action, `primary` for one that is not, such as an approval. */
+  confirmVariant?: "danger" | "primary";
   pending: boolean;
   error: string | null;
   onConfirm: () => void;
@@ -91,12 +95,12 @@ export default function ConfirmDialog({
   };
 
   return (
-    <div className="crm-confirm-wrap" role="presentation">
-      <div className="crm-confirm-scrim" onClick={onCancel} />
+    <div className="s-confirm-wrap crm-confirm-wrap" role="presentation">
+      <div className="s-confirm-scrim crm-confirm-scrim" onClick={onCancel} />
       <section
         ref={dialogRef}
         tabIndex={-1}
-        className="card crm-confirm grid gap-3"
+        className="card s-confirm crm-confirm grid gap-3"
         role="dialog"
         aria-modal="true"
         aria-label={title}
@@ -105,7 +109,7 @@ export default function ConfirmDialog({
         <h4 className="text-cardtitle font-medium text-ink-100">{title}</h4>
         <div className="text-label text-ink-300">{body}</div>
         {expect !== undefined && (
-          <div className="crm-field">
+          <div className="s-field crm-field">
             <label className="text-label text-ink-300" htmlFor={inputId}>
               {inputLabel ?? `${t("Type")} ${match} ${t("to confirm")}`}
             </label>
@@ -127,13 +131,13 @@ export default function ConfirmDialog({
             {error}
           </p>
         )}
-        <div className="crm-toolbar">
+        <div className="s-toolbar crm-toolbar">
           <Button size="sm" onClick={onCancel} disabled={pending}>
             {t("Cancel")}
           </Button>
           <Button
             size="sm"
-            variant="danger"
+            variant={confirmVariant}
             loading={pending}
             disabled={pending || !gated}
             onClick={onConfirm}

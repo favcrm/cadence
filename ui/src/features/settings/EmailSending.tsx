@@ -7,6 +7,7 @@ import Select from "../../ui/Select";
 import PageState from "../../ui/PageState";
 import type { Viewer } from "../projects/work";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
+import SettingsDrawer from "./SettingsDrawer";
 import { newAudienceId } from "../app-shell/segmentGrammar";
 import {
   friendlySendError,
@@ -64,7 +65,7 @@ async function loadTargets(signal: AbortSignal): Promise<Target[]> {
     for (const ctx of contexts.filter((c) => c.state === "active")) {
       out.push({
         scope: { installId: install.install_id, contextId: ctx.id },
-        label: `${install.title || install.name} · ${ctx.config.label || ctx.id}`,
+        label: appContextLabel(install.title || install.name, ctx.config.label || ctx.id),
       });
     }
   }
@@ -79,17 +80,32 @@ function renderNote(note: SendNote | null, t: (english: string) => string): stri
     case "chosen": return t("Sender chosen.");
     case "changed": return t("Sender changed.");
     case "removed": return t("Sender removed.");
-    case "origin-cleared": return t("Unsubscribe address cleared — sends refuse until one is set.");
+    case "origin-cleared": return t("Your own address was cleared.");
     case "origin-set": return t("Unsubscribe links now use {origin}.").replace("{origin}", () => note.value ?? "");
   }
 }
 
-export default function EmailSending({ viewer }: { viewer: Viewer }) {
+/** "CRM · CRM" says nothing twice; the second part earns its place only by differing. */
+function appContextLabel(app: string, context: string): string {
+  return app === context ? app : `${app} · ${context}`;
+}
+
+export default function EmailSending({
+  viewer,
+  fixedUnsubscribeAddress = false,
+}: {
+  viewer: Viewer;
+  /** A hosted board's links always use its own address, so there's nothing to set. */
+  fixedUnsubscribeAddress?: boolean;
+}) {
   const t = useTranslate();
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [rows, setRows] = useState<Connection[] | null>(null);
   const [hostedSmtp, setHostedSmtp] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  // One drawer at a time: rows stay reachable by keyboard behind an open one.
+  const [openRow, setOpenRow] = useState<string | null>(null);
 
   useEffect(() => {
     // CAD-1193: unresolved role (null) waits; only a proven operator
@@ -109,7 +125,7 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
       },
     );
     return () => controller.abort();
-  }, [viewer.operator]);
+  }, [viewer.operator, attempt]);
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="email-sending-title">
@@ -131,8 +147,15 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
       ) : !viewer.operator ? (
         <PageState title={t("Operator access required")}>{t("Email sending is available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : error !== null ? (
-        <p className="text-label text-fail" role="alert">
+        <p className="text-label text-fail flex flex-wrap items-center gap-2" role="alert">
           {error}
+          <Button
+            size="sm"
+            onClick={() => {
+              setError(null);
+              setAttempt((n) => n + 1);
+            }}
+          >{t("Retry")}</Button>
         </p>
       ) : targets === null || rows === null ? (
         <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
@@ -140,30 +163,120 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
         <div className="grid gap-3 min-w-0">
           <WorkspaceAccountCard rows={rows} hostedSmtp={hostedSmtp} />
           {targets.length === 0 ? (
-            <p className="text-label text-ink-400" data-state="no-apps">{t("No installed app sends email, so there is nothing to set up yet.")}</p>
-          ) : (
-            <section className="card px-4 py-4 grid gap-3 min-w-0" aria-labelledby="email-apps-title">
-              <div>
-                <h2 id="email-apps-title" className="text-cardtitle font-medium text-ink-100">{t("Apps that send email")}</h2>
-                <p className="text-label text-ink-400 mt-1 break-words">{t("Each app can use the workspace account or a sender of its own. An app appears here when its screens declare email sending.")}</p>
-              </div>
-              <div className="grid gap-2 min-w-0">
-                {targets.map((target) => (
-                  <SenderCard
-                    key={`${target.scope.installId}:${target.scope.contextId}`}
-                    target={target}
-                    rows={rows}
-                    hostedSmtp={hostedSmtp}
-                    viewer={viewer}
-                  />
-                ))}
-              </div>
-            </section>
-          )}
-          <OriginCard viewer={viewer} />
+            <p className="text-label text-ink-400" data-state="no-apps">{t("No installed app sends email, so there is nothing to choose yet.")}</p>
+          ) : null}
+          <div className="settings-rows" aria-label={t("Apps that send email")}>
+            {targets.map((target) => (
+              <SenderRow
+                key={`${target.scope.installId}:${target.scope.contextId}`}
+                open={openRow === `${target.scope.installId}:${target.scope.contextId}`}
+                onOpen={() => setOpenRow(`${target.scope.installId}:${target.scope.contextId}`)}
+                onClose={() => setOpenRow(null)}
+                target={target}
+                rows={rows}
+                hostedSmtp={hostedSmtp}
+                viewer={viewer}
+              />
+            ))}
+            {!fixedUnsubscribeAddress && (
+              <OriginRow
+                viewer={viewer}
+                open={openRow === "origin"}
+                onOpen={() => setOpenRow("origin")}
+                onClose={() => setOpenRow(null)}
+              />
+            )}
+          </div>
         </div>
       )}
     </section>
+  );
+}
+
+/** One app: which account it sends from. The choice lives in the drawer. */
+function SenderRow({ target, rows, hostedSmtp, viewer, open, onOpen, onClose }: {
+  open: boolean;
+  onOpen: () => void;
+  onClose: () => void;
+  target: Target;
+  rows: Connection[];
+  hostedSmtp: boolean;
+  viewer: Viewer;
+}) {
+  const t = useTranslate();
+  const [binding, setBinding] = useState<SmtpBinding | null | undefined>(undefined);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    setFailed(false);
+    readSmtpBinding(target.scope).then(
+      (bound) => {
+        if (!controller.signal.aborted) setBinding(bound);
+      },
+      () => {
+        if (!controller.signal.aborted) setFailed(true);
+      },
+    );
+    return () => controller.abort();
+  }, [target.scope.installId, target.scope.contextId, open]);
+  const live = sendingFrom(binding);
+  const line = failed
+    ? t("Couldn't read the sender")
+    : binding === undefined
+      ? t("Reading…")
+      : binding === null
+        ? t("No sender chosen")
+        : live ?? t("The chosen sender needs re-checking");
+  return (
+    <>
+      <button type="button" className="settings-row" onClick={onOpen}>
+        <span className="settings-row-text">
+          <b>{target.label}</b>
+          <small>{line}</small>
+        </span>
+        {binding && live === null && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+      </button>
+      {open && (
+        <SettingsDrawer title={target.label} onClose={onClose}>
+          <SenderCard target={target} rows={rows} hostedSmtp={hostedSmtp} viewer={viewer} />
+        </SettingsDrawer>
+      )}
+    </>
+  );
+}
+
+/** Where unsubscribe links point. Set here only to override the default. */
+function OriginRow({ viewer, open, onOpen, onClose }: {
+  viewer: Viewer;
+  open: boolean;
+  onOpen: () => void;
+  onClose: () => void;
+}) {
+  const t = useTranslate();
+  const [origin, setOrigin] = useState<string | null | undefined>(undefined);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+    sendClient.sendOriginShow().then(
+      (value: unknown) => setOrigin(parseOriginReceipt(value).unsubscribeOrigin),
+      () => setFailed(true),
+    );
+  }, [open]);
+  return (
+    <>
+      <button type="button" className="settings-row" onClick={onOpen}>
+        <span className="settings-row-text">
+          <b>{t("Unsubscribe links")}</b>
+          <small>{failed ? t("Couldn't read the address") : origin === undefined ? t("Reading…") : origin ?? t("Not set")}</small>
+        </span>
+        {origin === null && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+      </button>
+      {open && (
+        <SettingsDrawer title={t("Unsubscribe links")} onClose={onClose}>
+          <OriginCard viewer={viewer} />
+        </SettingsDrawer>
+      )}
+    </>
   );
 }
 
@@ -228,6 +341,7 @@ function SenderCard({
   const [pending, setPending] = useState(false);
   const [note, setNote] = useState<SendNote | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -242,7 +356,7 @@ function SenderCard({
       },
     );
     return () => controller.abort();
-  }, [target.scope.installId, target.scope.contextId]);
+  }, [target.scope.installId, target.scope.contextId, attempt]);
 
   const { usable, unusable } = senderChoices(rows);
   const choice = usable.find((r) => r.id === picked) ?? usable.find((r) => binding && r.id === binding.connectionId) ?? usable[0];
@@ -264,21 +378,6 @@ function SenderCard({
   const live = sendingFrom(binding);
   return (
     <article className="border-t border-ink-700 first:border-t-0 pt-3 first:pt-0 grid gap-2 min-w-0" aria-label={target.label}>
-      <div className="flex flex-wrap items-start gap-x-3 gap-y-1">
-        <div className="min-w-0 flex-1">
-          <h3 className="text-body font-medium text-ink-100 break-words">{target.label}</h3>
-          <p className="text-micro text-ink-500 break-words">{target.scope.installId} · {target.scope.contextId}</p>
-        </div>
-        {binding === undefined && error === null ? (
-          <span className="chip bg-ink-800 text-ink-300">{t("Reading…")}</span>
-        ) : binding && live !== null ? (
-          <span className="chip bg-ok/10 text-ok">{t("Connected")}</span>
-        ) : binding && live === null ? (
-          <span className="chip bg-warn/10 text-warn">{t("Needs re-check")}</span>
-        ) : (
-          <span className="chip bg-ink-800 text-ink-300">{t("Not configured")}</span>
-        )}
-      </div>
       {binding === undefined && error === null && (
         <p className="text-label text-ink-400" role="status">{t("Reading the sender…")}</p>
       )}
@@ -300,7 +399,10 @@ function SenderCard({
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
-          {error}
+          {error}{" "}
+          {binding === undefined && (
+            <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
+          )}
         </p>
       )}
       {note && (
@@ -354,6 +456,7 @@ function SenderCard({
             ) : (
               binding && (
                 <>
+                  {(live === null || chosenId !== binding.connectionId) && (
                   <Button
                     size="sm"
                     variant="primary"
@@ -366,8 +469,9 @@ function SenderCard({
                       )
                     }
                   >
-                    {live === null || chosenId !== binding.connectionId ? t("Switch to this sender") : t("Current sender")}
+                    {t("Switch to this sender")}
                   </Button>
+                  )}
                   <Button size="sm" variant="danger" disabled={pending} onClick={() => setConfirmRevoke(true)}>{t("Stop using")}</Button>
                 </>
               )
@@ -422,23 +526,31 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
     const receipt = parseOriginReceipt(value);
     setOrigin(receipt.unsubscribeOrigin);
     setStored(receipt.stored);
-    setInput(receipt.unsubscribeOrigin ?? "");
+    // The field holds only your own override: saving the default would pin it.
+    setInput(receipt.stored ? receipt.unsubscribeOrigin ?? "" : "");
     return receipt;
   };
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
+    setError(null);
     sendClient.sendOriginShow().then(apply, (e: unknown) => setError(friendlySendError(e)));
-  }, []);
+  }, [attempt]);
 
   const save = (value: string | null) => {
     setPending(true);
     setError(null);
     setNote(null);
-    void sendClient
-      .sendOriginSet(value)
-      .then((value2) => {
-        const receipt = apply(value2);
+    // Re-read after writing: only the read says what is now stored, on every board.
+    void Promise.resolve()
+      .then(() => sendClient.sendOriginSet(value))
+      .then(() =>
+        // The write landed. A failed read mustn't report it as failed or show the old value.
+        sendClient.sendOriginShow().catch(() => ({ unsubscribe_origin: value, stored: value !== null })),
+      )
+      .then((shown) => {
+        const receipt = apply(shown);
         setNote(
-          receipt.unsubscribeOrigin === null
+          value === null || receipt.unsubscribeOrigin === null
             ? { key: "origin-cleared" }
             : { key: "origin-set", value: receipt.unsubscribeOrigin },
         );
@@ -449,7 +561,7 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
 
   return (
     <section aria-label={t("Unsubscribe origin")} className="card px-4 py-4 grid gap-3 min-w-0">
-      <h2 className="text-cardtitle font-medium text-ink-100">{t("Unsubscribe address")}</h2>
+      
       {origin === undefined && error === null ? (
         <p className="text-label text-ink-400" role="status">{t("Reading…")}</p>
       ) : (
@@ -461,7 +573,10 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
-          {error}
+          {error}{" "}
+          {origin === undefined && (
+            <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</Button>
+          )}
         </p>
       )}
       {note && (
@@ -474,11 +589,11 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
           className="crm-field-row"
           onSubmit={(e) => {
             e.preventDefault();
-            save(input);
+            if (input.trim() !== "") save(input);
           }}
         >
           <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="email-origin">{t("Origin (https; http on a loopback host)")}</label>
+            <label className="text-label text-ink-300" htmlFor="email-origin">{t("Use a different address (optional)")}</label>
             <input
               id="email-origin"
               className="field"
@@ -491,7 +606,9 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
             />
           </div>
           <div className="crm-toolbar" style={{ alignSelf: "end" }}>
-            <Button type="submit" size="sm" loading={pending} disabled={pending}>{t("Save")}</Button>
+            {input.trim() !== "" && input.trim() !== (stored ? origin ?? "" : "") && (
+              <Button type="submit" size="sm" loading={pending} disabled={pending}>{t("Save")}</Button>
+            )}
             {stored && (
               <Button size="sm" disabled={pending} onClick={() => save(null)}>{t("Clear")}</Button>
             )}

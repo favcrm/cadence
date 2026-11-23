@@ -211,6 +211,21 @@
     ]
   },
   "daemon": "reachable",
+  "profiles": [
+    {
+      "alias": "dev-1",
+      "catalogue": "developer",
+      "id": "dev-1",
+      "job": "private standing instructions",
+      "look": "builder",
+      "model": "inherit",
+      "role": "Developer",
+      "runtimes": [
+        "lead"
+      ],
+      "team_role": "dev"
+    }
+  ],
   "totals": {
     "fenced": 1,
     "inboxes": 1,

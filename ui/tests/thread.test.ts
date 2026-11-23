@@ -20,7 +20,12 @@ import {
   settlePending,
   threadItems,
   threadRuns,
+  failWithdrawn,
+  inFlightTurnKey,
+  unnamedTurnAnswered,
   itemMessage,
+  sendBefore,
+  rowPaintKey,
   type ThreadState,
 } from "../src/features/home/thread";
 import { composerBlock, masterStatus } from "../src/features/home/master";
@@ -252,6 +257,150 @@ async function main() {
     equal(threw, true, "a 503 is a failure");
   }
 
+  // CAD-1853: paging past rows a projection filtered out. The daemon reports
+  // what it SCANNED, so a page that kept nothing still advances, and the
+  // forward catch-up trusts the raw-page answer instead of the visible count.
+  {
+    const calls: string[] = [];
+    const filtered: PageReader = {
+      after: async (after, limit) => {
+        calls.push(`after:${after}`);
+        if (after === 100) {
+          // A full raw page the projection reduced to one entry.
+          return {
+            thread: { id: "t1" },
+            entries: [entry(101, "agent", "turn_result", "kept")].slice(0, limit),
+            cursor: 101,
+            more_after: true,
+          };
+        }
+        return {
+          thread: { id: "t1" },
+          entries: [entry(102, "agent", "turn_result", "next")].slice(0, limit),
+          cursor: 102,
+          more_after: false,
+        };
+      },
+      tail: async () => {
+        calls.push("tail");
+        // The newest page is entirely another source's: nothing kept, but the
+        // scan still stopped at 901.
+        return {
+          thread: { id: "t1" },
+          entries: [],
+          cursor: 1000,
+          scanned_before: 901,
+          more_before: true,
+        };
+      },
+      before: async (before, limit) => {
+        calls.push(`before:${before}`);
+        if (before === 901) {
+          return {
+            thread: { id: "t1" },
+            entries: [entry(850, "operator", "message", "older")].slice(0, limit),
+            cursor: 899,
+            scanned_before: 801,
+            more_before: true,
+          };
+        }
+        return {
+          thread: { id: "t1" },
+          entries: [],
+          cursor: 800,
+          scanned_before: 701,
+          more_before: false,
+        };
+      },
+    };
+
+    // The forward catch-up keeps going on `more_after` even though the kept
+    // page was short: the RAW scan filled the page.
+    const held = mergePage(null, {
+      thread: { id: "t1" },
+      entries: [entry(100, "operator", "message", "start")],
+    });
+    const caught = await loadThread(filtered, held, 2);
+    equal(calls, ["after:100", "after:101"], "a full raw page keeps catching up");
+    equal(lastSeq(caught), 102, "catch-up ends on the daemon's exhausted page");
+    calls.length = 0;
+
+    // A fully filtered tail still carries a backward boundary: older history
+    // stays reachable even with nothing held.
+    let s = await loadThread(filtered, null, 100);
+    equal(
+      [s.entries.length, s.older, s.moreBefore],
+      [0, 901, true],
+      "a filtered tail keeps its scanned boundary",
+    );
+    const older = await fetchEarlier(filtered, s, 100)!;
+    equal(calls, ["tail", "before:901"], "earlier continues below the scan, not from an empty page");
+    s = applyEarlier(s, await older);
+    equal(
+      [s.entries.map((e) => e.seq), s.older, s.moreBefore],
+      [[850], 801, true],
+      "a kept page moves the boundary down",
+    );
+    // The next press continues below the SCAN (801), never from the held entry
+    // (850): otherwise a partially filtered page is read again.
+    const bottom = await fetchEarlier(filtered, s, 100)!;
+    equal(calls[calls.length - 1], "before:801", "the next press continues below the scan");
+    s = applyEarlier(s, await bottom);
+    equal(
+      [s.entries.map((e) => e.seq), s.older, s.moreBefore],
+      [[850], 701, false],
+      "a fully filtered page still advances and reports exhaustion",
+    );
+  }
+
+  // CAD-1853: availability is independent of rows and never retains cached
+  // cloud history. Server provenance, not kind/alias/text, selects eviction.
+  {
+    const ordinary = entry(20, "operator", "message", "cloud_agent is just text");
+    const cloud = entry(10, "agent", "turn_result", "private", { payload: { cloud_agent: {} } });
+    const request = entry(11, "operator", "message", "cloud request", { payload: { source: "cloud_agent" } });
+    let s = addPending(mergePage(null, {
+      thread: { id: "t1" }, entries: [cloud, request, ordinary], reply_seq: 50,
+    }), "waiting", "ordinary pending", 1);
+    s = { ...s, cursor: 100, older: 10, moreBefore: true };
+    s = mergePage(s, { entries: [], cloud_withheld: "revoked" });
+    equal(
+      [s.cloudWithheld, s.entries.map((e) => e.seq), s.pending.map((p) => p.message), s.cursor, s.older, s.replySeq],
+      ["revoked", [20], ["waiting"], 100, 10, 50],
+      "denial evicts both cloud provenance shapes but preserves ordinary history, pending and watermarks",
+    );
+    s = reduceFrame(s, { type: "entry", data: JSON.stringify(cloud), id: "10" });
+    equal(s.entries.map((e) => e.seq), [20], "a replay cannot put cloud history back while withheld");
+    s = reduceFrame(s, {
+      type: "entry", data: JSON.stringify({ ...ordinary, text: "ordinary delivery updated" }), id: "20",
+    });
+    equal(s.entries[0].text, "ordinary delivery updated", "overlapping entries still update while cloud is denied");
+    for (const data of ['{"cloud_withheld":"future-code"}', "{}", "null", "not json", '{"cloud_withheld":false}', '{"cloud_withheld":""}']) {
+      s = reduceFrame(s, { type: "cloud_withheld", data, id: null });
+      equal(s.cloudWithheld != null && s.entries.every((e) => e.seq === 20), true, "unknown/malformed status never restores cloud access");
+    }
+    s = reduceFrame(s, { type: "cloud_withheld", data: '{"cloud_withheld":null}', id: null });
+    equal([s.cloudWithheld, s.cloudRefreshNeeded], [null, true], "explicit null clears the notice and requests restoration");
+    const calls: string[] = [];
+    s = await loadThread({
+      after: async () => { throw new Error("restoration must not skip evicted rows via catch-up"); },
+      tail: async () => {
+        calls.push("tail");
+        return { thread: { id: "t1" }, entries: [cloud, request], cursor: 100, more_before: true, scanned_before: 10 };
+      },
+      before: async () => { throw new Error("unexpected earlier read"); },
+    }, s);
+    equal(
+      [calls, s.cloudWithheld, s.cloudRefreshNeeded, s.entries.map((e) => e.seq), s.pending.map((p) => p.message), s.replySeq],
+      [["tail"], null, false, [10, 11, 20], ["waiting"], 50],
+      "restoration rereads the tail and merges ordinary rows/pending without lowering the complete reply watermark",
+    );
+    const empty = reduceFrame(null, { type: "cloud_withheld", data: '{"cloud_withheld":"unreachable"}', id: null });
+    equal([empty.cloudWithheld, empty.entries, empty.pending], ["unreachable", [], []], "status-only frames work before any entry");
+    const clean = mergePage(empty, { thread: { id: "t1" }, entries: [ordinary] });
+    equal([clean.cloudWithheld, clean.entries.map((e) => e.seq)], [null, [20]], "a clean page also clears unavailable status");
+  }
+
   // Plan cards: each epic once, at its first mention.
   {
     equal(planRef(entry(1, "agent", "tool_result", '{"epic": "D-2", "tickets": ["D-3"]}')), "D-2", "json epic");
@@ -287,7 +436,7 @@ async function main() {
     equal(masterStatus(agents([{ alias: "master", state: "stopped" }]), false).kind, "stopped", "stopped");
     equal(masterStatus(agents([{ alias: "master", state: "idle" }]), false), { kind: "running", state: "idle" }, "running");
     equal(
-      masterStatus({ daemon: "unreachable", agents: [], totals: null, by_issue: {}, refresh_error: false, snapshot_age_secs: 0, stale: false } as AgentsPayload, false).kind,
+      masterStatus({ daemon: "unreachable", agents: [], totals: null, by_issue: {}, profiles: [], refresh_error: false, snapshot_age_secs: 0, stale: false } as AgentsPayload, false).kind,
       "offline",
       "daemon down",
     );
@@ -381,7 +530,7 @@ main().catch((e) => {
       ],
     }),
   );
-  equal(threadRuns(cards).map((r) => r.turn), [false], "an artifact-only run is not a turn");
+  equal(threadRuns(cards).map((r) => r.turn), [true], "an artifact-only run is a turn too (CAD-2552)");
   // A hire proposal stays in its render run so Home can keep the existing
   // flat card row instead of inventing a trace-only turn.
   const hired = threadItems(
@@ -410,4 +559,128 @@ main().catch((e) => {
   );
   const pending = threadItems(addPending(s, "ui-p", "hi", 1));
   equal(itemMessage(pending[pending.length - 1]), "ui-p", "a pending row names its message");
+  equal(rowPaintKey(pending[pending.length - 1]), "user:ui-p", "a pending row shares its paint key with the stored send");
+  const storedUser = threadItems(
+    mergePage(null, { thread: { id: "t1" }, entries: [entry(1, "operator", "message", "hi", { message: "ui-p" })] }),
+  )[0];
+  equal(rowPaintKey(storedUser), "user:ui-p", "the stored operator row keeps that paint key");
+}
+
+{
+  const open = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "what is outstanding?", { message: "ui-1" }),
+        entry(2, "agent", "tool_call", "board_pending_actions"),
+        entry(3, "agent", "tool_call", "board_list_issues {\"limit\":50}"),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(open, "ui-1"), "e2", "an untagged tool run after the send is that turn");
+  equal(inFlightTurnKey(open, "server-id"), "e2", "a working id that matches no row still adopts the untagged run");
+  equal(inFlightTurnKey(open, null), null, "a submit with no id does not claim an older run");
+  equal(inFlightTurnKey(open, null, true), "e2", "a working turn with no id owns the open run after the newest send");
+  equal(
+    inFlightTurnKey([...open, { type: "pending", key: "pnext", pending: { message: "ui-2", text: "next", state: "sent", at: 1 } }], null, true),
+    "e2",
+    "a send not yet stored is not what is running; the open run before it still is",
+  );
+  const answered = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "what is outstanding?", { message: "ui-1" }),
+        entry(2, "agent", "tool_call", "board_pending_actions"),
+        entry(3, "agent", "turn_result", "Nothing is waiting."),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(answered, "ui-1"), null, "a landed answer is not still in flight");
+  equal(inFlightTurnKey(answered, null, true), null, "a landed answer is not in flight for an unnamed turn either");
+  {
+    const held = (message: string) => ({ message, text: `text ${message}`, state: "sent" as const, at: 1 });
+    const before = { ...mergePage(null, { thread: { id: "t" }, entries: [] }), pending: [held("q-1"), held("q-2")] };
+    const after = failWithdrawn(before, ["q-1", "not-here"], "withdrawn", () => "fresh");
+    equal(after.pending[0].state, "failed", "a withdrawn row fails");
+    equal(after.pending[0].message, "fresh", "a withdrawn row gets a fresh id");
+    equal(after.pending[0].text, "text q-1", "a withdrawn row keeps its text");
+    equal(after.pending[1], before.pending[1], "a row that was not withdrawn is untouched");
+    equal(failWithdrawn(before, [], "x", () => "fresh"), before, "nothing withdrawn changes nothing");
+  }
+  equal(unnamedTurnAnswered(answered), true, "a thread ending on an answer has no send waiting");
+  equal(unnamedTurnAnswered(open), false, "an open run is still waiting");
+  equal(
+    unnamedTurnAnswered([...answered, { type: "pending", key: "pnext", pending: { message: "ui-2", text: "next", state: "sent", at: 1 } }]),
+    false,
+    "a later send keeps its placeholder",
+  );
+  equal(inFlightTurnKey([], null, true), null, "an unnamed turn with no rows has nothing to own");
+  const tagged = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "older", { message: "m-old" }),
+        entry(2, "agent", "tool_call", "board_read", { message: "m-old" }),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(tagged, "m-other"), null, "a run tagged for another message is not adopted");
+  const waiting = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [entry(1, "operator", "message", "hello", { message: "ui-1" })],
+    }),
+  );
+  equal(inFlightTurnKey(waiting, "ui-1"), null, "a send with no assistant rows yet has no in-flight run");
+  // A row inside the candidate run that names another send belongs to a
+  // different turn: it is never adopted, even under a matching user row, and
+  // an untagged opener does not launder it.
+  const interleaved = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "mine", { message: "m-a" }),
+        entry(2, "agent", "thinking", "hers", { message: "m-b" }),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(interleaved, "m-a"), null, "a row tagged to another send is not adopted under a matching user row");
+  const mixed = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "mine", { message: "m-a" }),
+        entry(2, "agent", "thinking", "untagged"),
+        entry(3, "agent", "tool_call", "board_read", { message: "m-b" }),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(mixed, "m-a"), null, "an untagged opener followed by another send's row is not adopted");
+  const sameId = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "mine", { message: "m-a" }),
+        entry(2, "agent", "thinking", "untagged"),
+        entry(3, "agent", "tool_call", "board_read", { message: "m-a" }),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(sameId, "m-a"), "e2", "an untagged opener joins rows tagged with the same send");
+  // A system row between the send and its first assistant rows is
+  // transparent; a queued user row after it does not hide the run.
+  const gap = threadItems(
+    mergePage(null, {
+      thread: { id: "t-flight" },
+      entries: [
+        entry(1, "operator", "message", "mine", { message: "m-a" }),
+        entry(2, "system", "message", "note"),
+        entry(3, "operator", "message", "queued", { message: "m-b" }),
+        entry(4, "agent", "thinking", "working"),
+      ],
+    }),
+  );
+  equal(inFlightTurnKey(gap, "m-a"), "e4", "a system gap lets the tail run be adopted");
+  equal(sendBefore(gap, [gap[3]], new Set(["m-b"])), "m-a", "a queued user row is skipped when naming the run's send");
 }

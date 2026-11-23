@@ -37,13 +37,11 @@ use crate::issue::line_times::LineTimes;
 use crate::issue::{board, project};
 
 mod assembly;
-#[cfg(test)]
-mod cad1751_budget_acceptance;
 mod commands;
 mod github;
 mod github_cache;
 mod main_ci;
-mod monitoring;
+pub mod monitoring;
 mod needs_merge;
 mod sources;
 
@@ -65,6 +63,8 @@ use main_ci::main_ci_view;
 #[cfg(test)]
 use main_ci::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
 pub use monitoring::monitoring;
+#[doc(hidden)]
+pub use monitoring::{monitoring_for_tasks, monitoring_unavailable};
 use needs_merge::{merge_by_subject, sort_needs};
 #[cfg(test)]
 use sources::probe_agent;
@@ -74,6 +74,7 @@ use sources::{AgentProbe, DaemonView};
 /// Git identity baked in by build.rs — `unknown` when git or a repo
 /// was absent at build time, which every consumer reads as "cannot
 /// tell", never as zero.
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const BUILD_COMMIT: &str = env!("CADENCE_BUILD_COMMIT");
 /// The full build id `cadence --version` prints (`0.1.0+<sha>`, the
 /// same concat main.rs gives clap). The board announces it in the
@@ -560,7 +561,13 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
             return out;
         }
     };
-    for rec in records.into_values() {
+    // CAD-2215: shared Needs-you rows come only from records standing on
+    // an exact native dispatch receipt. A legacy candidate is operator
+    // recovery evidence (`cadence delivery ls`), never a shared row.
+    for rec in crate::delivery::ordinary_in_order(&records)
+        .into_iter()
+        .cloned()
+    {
         let id = rec.issue.as_str();
         let age = now - rec.since;
         let pr = rec.pr.as_deref();
@@ -716,7 +723,8 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
 /// every other row after classification and the subject merge. `title`
 /// is the board's text — already one line, bounded and redacted;
 /// `since` is when the problem began (epoch secs).
-pub(crate) fn delivery_sync_row(title: &str, subject: &str, since: i64, now: i64) -> Value {
+#[doc(hidden)]
+pub fn delivery_sync_row(title: &str, subject: &str, since: i64, now: i64) -> Value {
     let mut rows = vec![item(
         120,
         "delivery_sync",
@@ -878,19 +886,38 @@ impl<'a> StatusClock<'a> {
 
 /// The tracker project an agent works in: the longest declared repo
 /// path its cwd sits under (worktrees under `.cadence/wt/` included).
-/// "" — a global row — when nothing matches.
+/// "" — a global row — when nothing matches, and also when the deepest
+/// match is a tie: a checkout several projects register (CAD-2001)
+/// attributes the agent to none of them rather than to the last
+/// equal-depth claimant, which would relabel its rows for the wrong
+/// project and soften a real failure under `--project`.
 fn agent_project(a: &Value, repos: &[(PathBuf, String)]) -> String {
     let Some(cwd) = a["cwd"].as_str().filter(|c| !c.is_empty()) else {
         return String::new();
     };
     let cwd = PathBuf::from(cwd);
     let cwd = cwd.canonicalize().unwrap_or(cwd);
-    repos
+    // One entry per project: several rows may name the same checkout.
+    let mut hits: Vec<(&str, usize)> = Vec::new();
+    for (path, key) in repos {
+        if !cwd.starts_with(path) {
+            continue;
+        }
+        let depth = path.components().count();
+        match hits.iter_mut().find(|entry| entry.0 == key.as_str()) {
+            Some(entry) => entry.1 = entry.1.max(depth),
+            None => hits.push((key.as_str(), depth)),
+        }
+    }
+    let deepest = hits.iter().map(|(_, depth)| *depth).max().unwrap_or(0);
+    let mut at_depth = hits
         .iter()
-        .filter(|(path, _)| cwd.starts_with(path))
-        .max_by_key(|(path, _)| path.components().count())
-        .map(|(_, key)| key.clone())
-        .unwrap_or_default()
+        .filter(|(_, depth)| *depth == deepest)
+        .map(|(key, _)| *key);
+    match (at_depth.next(), at_depth.next()) {
+        (Some(only), None) => only.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// The needs-me rows one agent contributes: its `agent_list` row (state,
@@ -1537,7 +1564,7 @@ mod tests {
     fn merge_ready_decision_survives_an_older_no_safe_next_step_alert() {
         let state = tempfile::TempDir::new().unwrap();
         let sha = "a".repeat(40);
-        let mut rec = crate::delivery::Record::new("DEM-2", "demo", "w1", 0);
+        let mut rec = crate::delivery::Record::new_ordinary("DEM-2", "demo", "w1", 0, "m-demo");
         rec.state = crate::delivery::State::Passed;
         rec.pr = Some("https://github.com/acme/demo/pull/1".into());
         rec.verdict = Some(crate::delivery::VerdictRec {
@@ -2074,6 +2101,18 @@ mod tests {
         assert_eq!(agent_project(&a, &repos), "inner");
         assert_eq!(agent_project(&json!({"cwd": "/elsewhere"}), &repos), "");
         assert_eq!(agent_project(&json!({}), &repos), "");
+        // CAD-2001: two projects on one checkout tie at the same depth,
+        // so neither is named — and two rows of one project still are.
+        let shared = vec![
+            (root.clone(), "alpha".to_string()),
+            (root.clone(), "beta".to_string()),
+        ];
+        assert_eq!(agent_project(&a, &shared), "");
+        let twice = vec![
+            (root.clone(), "alpha".to_string()),
+            (root.clone(), "alpha".to_string()),
+        ];
+        assert_eq!(agent_project(&a, &twice), "alpha");
     }
 
     // ---- CAD-267: default-branch CI from Actions runs ----
@@ -2830,7 +2869,11 @@ mod tests {
             prefix: "CAD".into(),
             repos: vec![project::Repo {
                 path: Some(repo.to_string_lossy().into()),
-                remote: Some("git@github.com:favcrm/cadence.git".into()),
+                remote: Some(if BUILD_REMOTE == "unknown" {
+                    "git@github.com:favcrm/cadence.git".into()
+                } else {
+                    BUILD_REMOTE.into()
+                }),
                 base: None,
             }],
             components: vec![],
@@ -2849,7 +2892,15 @@ mod tests {
         // the declared remote matches; on foreign checkouts (unknown
         // remote) nothing matches — either outcome is consistent.
         if BUILD_REMOTE != "unknown" {
-            assert_eq!(m.map(|(k, _)| k), Some("cadence".to_string()));
+            assert_eq!(m.clone().map(|(k, _)| k), Some("cadence".to_string()));
+            // Two projects registering the build repo name no single
+            // project (CAD-2001): drift still measures, unattributed.
+            let mut twin = p.clone();
+            twin.key = "cadence-twin".into();
+            assert_eq!(
+                build_repo_match(&[p.clone(), twin]).map(|(k, _)| k),
+                Some(String::new())
+            );
         } else {
             assert!(m.is_none());
         }

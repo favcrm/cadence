@@ -58,6 +58,28 @@ pub fn accepted_until(exp: i64) -> i64 {
     exp + SKEW_SECS
 }
 
+#[doc(hidden)]
+pub fn dedicated_deployment_ok(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+#[doc(hidden)]
+pub fn dedicated_issuer_ok(s: &str) -> bool {
+    let Ok(uri) = s.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    uri.scheme_str() == Some("https")
+        && uri.path() == "/"
+        && uri.query().is_none()
+        && uri.authority().is_some_and(|authority| {
+            !authority.as_str().contains('@')
+                && s.strip_prefix("https://") == Some(authority.as_str())
+        })
+}
+
 /// The daemon-side trust root for public-name sign-in: this board's
 /// public host (the assertion's `aud`), the platform issuer (`iss` —
 /// also the JWKS origin) and the one company this instance serves.
@@ -537,6 +559,10 @@ pub fn valid_aud(host: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/agenticos/board_assertion.rs"]
+mod platform_minted_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -846,5 +872,10 @@ mod tests {
         assert_eq!(handle_of(&"s".repeat(100), ""), "s".repeat(64));
         assert_eq!(handle_of("", "fable@x.co"), "fable");
         assert_eq!(handle_of("", ""), "");
+    }
+
+    #[test]
+    fn the_platform_minted_fixture_verifies_and_a_tampered_copy_is_refused() {
+        platform_minted_fixture::check();
     }
 }

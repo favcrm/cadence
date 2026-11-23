@@ -1,15 +1,19 @@
 name: ci
 
 on:
-  # CAD-840: observational full-suite benchmark; automatic events stay 8-way.
+  # Manual dispatch runs the same six-shard suite as a pull request.
+  # CAD-1073 retired the 4/8 width switch; it did not change the matrix.
+  # CAD-1970: the isolated C1 native-fixture proof is a deliberately separate
+  # dispatch input rather than an unconditional manual-dispatch job. Its
+  # constructor source lives in another lane, so a plain dispatch on main used
+  # to report a failure for an artifact main never had. The proof itself is
+  # unchanged and still runs whenever it is asked for.
   workflow_dispatch:
     inputs:
-      test_shards:
-        description: Legacy benchmark input (inactive since CAD-1073 retired the shard suite)
-        type: choice
-        options: ["4", "8"]
-        default: "8"
-        required: true
+      native_fixture:
+        description: Run the isolated C1 native-fixture release-exclusion proof
+        type: boolean
+        default: false
   pull_request:
   # GitHub merge queue (CAD-290): each queued PR is tested on top of main
   # (and of the PRs ahead of it) on a gh-readonly-queue/* ref, so a PR
@@ -51,21 +55,50 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # Never let a manual input change PR, merge-group, push or tag coverage.
-  CADENCE_CI_SHARDS: ${{ github.event_name == 'workflow_dispatch' && inputs.test_shards == '4' && '4' || '8' }}
 
+# CAD-1967: the Linux gates run on instabox-medium. Its kernel 6.18.54 is
+# listed in supported_kernel_abi and both host acceptances (cad1196, cad1377)
+# pass there; the test profile compiles in 3:20 against 5:44 on ubuntu-latest.
+# The Linux cache writer in ci-cache-warm.yml uses the same runner. Actions
+# cache versions include the cached paths, so moving one without the other
+# can leave the gate compiling cold.
 jobs:
-  # CAD-926: rust-cache scope. Only `cache-warm` (push to main) SAVES the gate
-  # profiles' caches, under the shared keys gate-test-ld1, gate-release and
-  # gate-clippy (CAD-1493: -ldN is the linker/fingerprint epoch — bump it when
-  # a flag flips; rust-cache never overwrites an existing key). Every
-  # pull_request / merge_group gate job restores the same key and passes
-  # `save-if: false`: a queue ref saved ~1.4 GB per run that no other ref
-  # could read, and the repo sat at 12.7 GB against a 10 GB limit.
-  # release-artifact and release-build keep their own default-keyed caches
-  # (they run on main pushes and tags only). cross-build restores the
-  # per-target cross-* keys its own cache-warm legs write — restore-only
-  # in the gates, like every other shared key.
+  native-fixture-release-exclusion:
+    # C1 is an explicitly dispatched, isolated artifact check, not a fixture run.
+    if: github.event_name == 'workflow_dispatch' && inputs.native_fixture
+    runs-on: instabox-medium
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - run: scripts/ci-rust-toolchain --profile minimal
+      - name: Run independent C1 matrix on this isolated runner
+        env:
+          CAD1159_RUNNER_ADMISSION_ID: github-actions:${{ github.repository }}:${{ github.run_id }}:${{ github.run_attempt }}
+        run: |
+          set -eu
+          parent=$(mktemp -d "$RUNNER_TEMP/cad1159-c1.XXXXXX")
+          echo "CAD1159_C1_OUTPUT=$parent/result" >> "$GITHUB_ENV"
+          python3 scripts/acceptance/cad1159-native-fixture/check-release-exclusion.py \
+            "$GITHUB_WORKSPACE" "$parent/result"
+      - name: Retain report and all case logs, including failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cad1159-c1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CAD1159_C1_OUTPUT }}/report.json
+            ${{ env.CAD1159_C1_OUTPUT }}/logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The main-push jobs in ci-cache-warm.yml populate the shared gate cache
+  # keys. Gate jobs restore with `save-if: false`: a queue ref used to save
+  # ~1.4 GB per run that no other ref could read. release-artifact and
+  # release-build keep their own default-keyed caches. Keep shared key epochs
+  # aligned with the writers when compiler flags or profiles change.
   # The legacy cache-scope fixture was retired in CAD-1073.
   # CAD-409: with the merge queue (CAD-290), GitHub merges a queue entry by
   # moving main to the exact commit its merge_group run tested, so a push
@@ -84,7 +117,7 @@ jobs:
   # run because their `if` tolerates a skipped need.
   queue-evidence:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     permissions:
       actions: read
@@ -110,7 +143,7 @@ jobs:
                 if passed=$(gh api "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
                     --paginate --slurp \
                     | jq -r '[.[].jobs[]] as $jobs
-                          | ["fmt", "clippy", "test", "build", "ui"] | all(. as $g
+                          | ["fmt", "clippy", "build", "ui"] | all(. as $g
                               | [$jobs[] | select(.name == $g)] as $matching
                               | ($matching | length) > 0 and ($matching | all(.status == "completed" and .conclusion == "success")))'); then
                   if [ "$passed" = true ]; then
@@ -144,7 +177,7 @@ jobs:
   # PR feedback selection runs BASE policy, never a PR-provided classifier.
   # Merge groups, main, tags and any uncertainty retain all real gates.
   change-scope:
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -152,6 +185,8 @@ jobs:
       scope: ${{ steps.scope.outputs.scope }}
       tests: ${{ steps.scope.outputs.tests }}
       targets: ${{ steps.scope.outputs.targets }}
+      build: ${{ steps.scope.outputs.build }}
+      cross: ${{ steps.scope.outputs.cross }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         if: github.event_name == 'pull_request'
@@ -170,17 +205,21 @@ jobs:
           scope=full
           tests=true
           targets='[]'
+          build=true
+          cross=true
           policy="$RUNNER_TEMP/ci-change-scope.py"
           result="$RUNNER_TEMP/ci-change-scope.json"
           if [ "$EVENT" = pull_request ] && git show "$BASE:scripts/ci-change-scope.py" >"$policy"; then
             if python3 -I "$policy" --repo "$GITHUB_WORKSPACE" --base "$BASE" --head "$HEAD" --event "$EVENT" >"$result"; then
               # The tests scope is emitted only by a base classifier that
               # knows the new fields; legacy docs/ui records still apply.
-              if jq -e '(.scope == "docs" and .rust == "false" and .ui == "false" and (.tests // "false") == "false") or (.scope == "ui" and .rust == "false" and .ui == "true" and (.tests // "false") == "false") or (.scope == "tests" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets | type == "array") and (.targets | length) > 0 and (.targets | all(type == "string" and test("^[A-Za-z0-9_]+$")))) or (.scope == "full" and .rust == "true" and .ui == "true")' "$result" >/dev/null; then
+              if jq -e '(.scope == "docs" and .rust == "false" and .ui == "false" and (.tests // "false") == "false") or (.scope == "ui" and .rust == "false" and .ui == "true" and (.tests // "false") == "false") or (.scope == "tests" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets | type == "array") and (.targets | length) > 0 and (.targets | all(type == "string" and test("^[A-Za-z0-9_]+$")))) or (.scope == "full" and .rust == "true" and .ui == "true") or (.scope == "tests-only" and .rust == "true" and .ui == "false" and .tests == "true" and ((.targets // []) | length) == 0 and .build == "false" and (.cross == "false" or .cross == "true"))' "$result" >/dev/null; then
                 rust=$(jq -r .rust "$result")
                 ui=$(jq -r .ui "$result")
                 scope=$(jq -r .scope "$result")
                 tests=$(jq -r .tests "$result")
+                build=$(jq -r '.build // "true"' "$result")
+                cross=$(jq -r '.cross // "true"' "$result")
                 if [ "$scope" = tests ]; then
                   targets=$(jq -c .targets "$result")
                 fi
@@ -192,12 +231,14 @@ jobs:
           echo "scope=$scope" >> "$GITHUB_OUTPUT"
           echo "tests=$tests" >> "$GITHUB_OUTPUT"
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
-          echo "PR feedback scope: $scope; rust=$rust; ui=$ui; tests=$tests; targets=$targets. Merge queue always runs full integration validation." >> "$GITHUB_STEP_SUMMARY"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "cross=$cross" >> "$GITHUB_OUTPUT"
+          echo "PR feedback scope: $scope; rust=$rust; ui=$ui; tests=$tests; build=$build; cross=$cross; targets=$targets. Merge queue always runs full integration validation." >> "$GITHUB_STEP_SUMMARY"
 
   fmt:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 10
     steps:
       - name: Not applicable — rust PR feedback gate
@@ -206,69 +247,46 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/ci-rust-toolchain --profile minimal --component rustfmt
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
+      # CAD-1970: 27 contract checks, each an interpreter start plus a few
+      # seconds of work. As separate steps they cost 44.6 s of a 56 s job,
+      # almost all of it process startup in series. One step runs them 8 at a
+      # time: measured 13.8 s for the same 27, same results. A failure still
+      # names the check and fails the step.
+      # CAD-1970: the contract *tests* for this repo's own tooling were
+      # retired; what remains are checks, not tests — each one inspects the
+      # checkout and fails on a real inconsistency. They run together because
+      # each is an interpreter start plus a few seconds.
+      # CAD-1970: the contract *tests* for this repo's own tooling are
+      # retired — CI machinery is proved by running it. What remains are
+      # checks: each inspects the checkout and fails on a real inconsistency.
+      - name: Checks for this repo's own tooling
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          xargs -P 4 -I@ sh -c '@ || { echo "::error::check failed: @" >&2; exit 1; }' <<'CHECKS'
+            python3 scripts/check-review-recipe
+            scripts/design-kit --check
+          CHECKS
       - run: cargo fmt --all -- --check
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
-      - name: Validate manual benchmark width
+      - name: Refuse DDL edits to shipped migration blocks
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
         env:
-          BENCHMARK_SHARDS: ${{ inputs.test_shards }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            case "$BENCHMARK_SHARDS" in
-              4|8) ;;
-              *) echo 'manual benchmark width must be 4 or 8' >&2; exit 1 ;;
-            esac
-          fi
-      # CAD-1073 clean-slate transition: the legacy tests/scripts contract
-      # suite is retired; only the checks that validate this PR's own shape
-      # remain. The nextest inventory/test-plan/shard contracts are gone with
-      # the deleted suite and are rebuilt as behavior checks under the new
-      # policy.
-      - run: python3 scripts/check-review-recipe
-      - run: python3 scripts/test-review-recipe
-      - run: python3 -m unittest scripts/test_reduced_gate_release.py
-      - run: python3 scripts/test_pre_push_plan.py
-      - run: python3 scripts/test_workflow_cleanup.py
-      - run: python3 scripts/test_ci_change_scope.py
-      - run: python3 scripts/acceptance/test-cad-1370-feedback-contract.py
-      - run: python3 scripts/acceptance/test-cad-1400-release-install-gate.py
-      - run: python3 scripts/test_ci_fast_linker.py
-      - run: python3 scripts/test_release_reuse.py
-      # CAD-1800: a core-v* release must never become GitHub's Latest (install.sh).
-      - run: python3 scripts/test_core_wasm_release_latest.py
-      # CAD-1745: the independent shard-report selector acceptance drives the
-      # real CLI over a raw REST transport substitute (carried aliases
-      # included) and feeds the selected reports through check-test-junit.py.
-      - run: python3 scripts/test_select_shard_artifacts.py
-      - run: python3 -m unittest scripts/test_enqueue_human_paths.py
-      - run: python3 scripts/test_cad1743_bun_guards.py
-      - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
-      - run: python3 scripts/test_enqueue_requirements.py
-      - run: python3 scripts/test_enqueue_current_ci.py
-      - run: python3 scripts/test_operator_preflight.py
-      # CAD-1475: the operator-owned publicity lifecycle guard — the real
-      # helper driven through a stateful s3api boundary (conditional write,
-      # fixed-endpoint/bucket and bad-case refusals).
-      - run: python3 tests/cad1475_publicity_acceptance.py
-      - run: python3 tests/cad1479_r2_publish_gate_acceptance.py
-      # CAD-1540: the cross-build required-check gate — the real gate script is
-      # driven through all four matrix outcomes and must refuse failure/cancelled.
-      - run: python3 tests/cad1540_cross_build_gate_acceptance.py
-      - run: scripts/design-kit --check
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python3 scripts/check-migration-ddl --base "$BASE_SHA"
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
-      - name: Test contributor documentation checker
-        run: python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
       # CAD-833: the live-staging tick is mocked end-to-end — it must
       # run in CI, not only on the deploying host.
-      - name: Test live-staging deploy tick
-        run: python3 -m unittest discover -s scripts -p 'test_staging_deploy.py'
       - name: Verify live doctor/host source inventory
         run: scripts/split-doctor-host --check
 
   clippy:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     steps:
       - name: Not applicable — rust PR feedback gate
@@ -282,7 +300,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         with:
-          shared-key: gate-clippy
+          shared-key: gc2
           save-if: false
       - run: cargo clippy --all-targets --locked -- -D warnings
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
@@ -291,233 +309,61 @@ jobs:
       - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
 
-  # CAD-1480: the suite (~1400 cpu-s) cannot fit the wall-time budget on
-  # one runner, so N shards each run a deterministic nextest
-  # `hash:k/N` partition at the proven `-j 2`. Every shard still runs
-  # scripts/run-result-tests with the same isolation, toolchain and
-  # rust-cache, and uploads its junit plus expected inventory. The
-  # aggregate `test` job below keeps the required check name and re-runs
-  # the full zero-target coverage guard over the merged shard reports —
-  # coverage can never shrink inside a partition.
-  test-shards:
-    needs: [queue-evidence, change-scope]
-    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6]
-    steps:
-      - name: Not applicable — rust PR feedback gate
-        if: ${{ needs.change-scope.outputs.rust == 'false' }}
-        run: echo 'rust commands not run for this PR scope; full integration gates still run in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: scripts/ci-rust-toolchain --profile minimal
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        with:
-          # CAD-1493: key version carries the linker/fingerprint epoch —
-          # bump -ldN when a flag flips so the warm leg writes fresh
-          # artifacts instead of skipping an existing stale key.
-          shared-key: gate-test-ld1
-          save-if: false
-      # CAD-1487: linking dominated a shard while every tests/*.rs file was
-      # its own executable; CAD-1727 collapsed them into the one `suite`
-      # binary. mold/lld stays: it links that 223 MB suite and the product
-      # binaries materially faster than the default linker. cache-warm's
-      # test leg enables the same flag so main keeps the gate-test cache
-      # hot for it — the one cold run is this PR's own gate until the merge
-      # push re-warms.
-      - name: Enable fast linker (mold/lld; falls back to the default linker)
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
-      # CAD-1124: no doctests exist; mandatory default-feature clippy and
-      # build retain compilation coverage without a zero-test rebuild.
-      # CAD-1090: every cargo test target (scripts/result-test-args), with
-      # the test seam on and a 0-test target treated as a failure.
-      # CAD-1105: then the lib unit tests, with PATH cut to the toolchain.
-      # CAD-1214: then the unit tests inside the binary targets.
-      - name: Run this shard's partition of the integration targets, lib and bins
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        env:
-          CARGO_BUILD_JOBS: 4
-          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
-          SCOPE: ${{ needs.change-scope.outputs.scope }}
-          TARGETS: ${{ needs.change-scope.outputs.targets }}
-        run: |
-          # cadence-agent-exec protected_mechanics high-fd custody seats fd
-          # 70000 and fails closed unless the hard RLIMIT_NOFILE exceeds it.
-          # The hosted runner's hard limit is lower, so raise hard and soft for
-          # this shell (limits do not persist across steps) before the suite.
-          sudo prlimit --pid $$ --nofile=1048576:1048576
-          ulimit -n 1048576
-          echo "RLIMIT_NOFILE hard=$(ulimit -Hn) soft=$(ulimit -n)"
-          # CAD-1370: narrowed integration feedback only on pull_request,
-          # only when the trusted-base classifier emitted a valid tests
-          # scope, and only as a re-validated one-identifier-per-line file
-          # handed to the same run-result-tests runner — never an ambient
-          # env, a shell-joined string, or a PR-provided path. The lib and
-          # bins suites and every zero-target guard are unchanged. The
-          # partition index comes from the matrix, not the environment.
-          selection=
-          if [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ "$SCOPE" = tests ]; then
-            selection="$RUNNER_TEMP/ci-test-selection"
-            printf '%s' "$TARGETS" | jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_]+$"))' > /dev/null
-            printf '%s' "$TARGETS" | jq -r '.[]' > "$selection"
-            test -s "$selection"
-            if grep -qvE '^[A-Za-z0-9_]+$' "$selection"; then
-              echo "::error::test selection carries a non-identifier line" >&2
-              exit 1
-            fi
-            echo "Running narrowed integration selection: $(tr '\n' ' ' < "$selection")"
-            scripts/run-result-tests --test-selection "$selection" --partition "${{ matrix.shard }}/6" --jobs 4
-          else
-            scripts/run-result-tests --partition "${{ matrix.shard }}/6" --jobs 4
-          fi
-      # Artifacts always land (even on a red shard) so the aggregate can
-      # prove where coverage stopped. junit.xml is required; the shard
-      # step already failed when it is missing. CAD-1745: the name carries
-      # the producing attempt, so a rerun's report can never be confused
-      # with — or overwrite — the immutable report of an earlier attempt.
-      - name: Upload shard junit and expected inventory
-        if: always() && needs.change-scope.outputs.rust != 'false'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: test-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
-          path: |
-            target/nextest/cadence/junit.xml
-            target/nextest/cadence/expected-targets.txt
-          if-no-files-found: warn
-          retention-days: 1
-
-  # The required `test` check: merges every shard's junit and re-runs
-  # the zero-target coverage guard the single job used to run. A skipped
-  # shard set (docs-only PR scope) still resolves to a green no-op gate;
-  # a red shard or a hole in the merged report fails here. CAD-1745: it
-  # merges exactly the reports of each partition's latest actual
-  # execution, so a rerun keeps untouched partitions without reusing an
-  # older failure or success.
-  test:
-    needs: [queue-evidence, change-scope, test-shards]
-    if: ${{ always() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Not applicable — rust PR feedback gate
-        if: ${{ needs.change-scope.outputs.rust == 'false' }}
-        run: echo 'rust commands not run for this PR scope; full integration gates still run in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Require green shards before trusting their reports
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: |
-          if [ "${{ needs.test-shards.result }}" != "success" ]; then
-            echo "::error::test-shards finished as '${{ needs.test-shards.result }}'" >&2
-            exit 1
-          fi
-      # CAD-1745: a failed-job-only rerun copies an untouched green shard's
-      # row into the new attempt without re-running or re-uploading it.
-      # Resolve each partition to the attempt that actually executed it
-      # (the copied row aliases the earlier execution), then fetch exactly
-      # those six artifacts by ID. Older reports stay on the run as
-      # evidence; a non-green or ambiguous current execution fails this
-      # step instead of falling back to an older success.
-      - name: Select each partition's authoritative shard report
-        id: select
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          # A PR run's head is the PR head; queue and push runs checkout
-          # github.sha. The jobs and artifacts APIs report that same head.
-          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          set -euo pipefail
-          python3 scripts/select-shard-artifacts.py \
-            --repo "$GITHUB_REPOSITORY" \
-            --run-id "$GITHUB_RUN_ID" \
-            --sha "$SOURCE_SHA" \
-            --attempt "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        with:
-          artifact-ids: ${{ steps.select.outputs.artifact_ids }}
-          path: junits
-          # The REST artifact list is the same read-only source the
-          # selector checked, and it retains every earlier attempt's
-          # artifacts; each selected artifact lands in junits/<name>/.
-          github-token: ${{ github.token }}
-      - name: Validate merged shard coverage and results
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: |
-          set -euo pipefail
-          files=(junits/*/junit.xml)
-          if [ "${#files[@]}" -ne 6 ]; then
-            echo "::error::expected 6 shard junit reports, found ${#files[@]}: ${files[*]:-none}" >&2
-            exit 1
-          fi
-          invs=(junits/*/expected-targets.txt)
-          if [ "${#invs[@]}" -ne 6 ]; then
-            echo "::error::expected 6 shard inventories, found ${#invs[@]}: ${invs[*]:-none}" >&2
-            exit 1
-          fi
-          first=${invs[0]}
-          for f in "${invs[@]}"; do
-            if ! cmp -s "$first" "$f"; then
-              echo "::error::shard inventories disagree: $first vs $f" >&2
-              exit 1
-            fi
-          done
-          package=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')
-          python3 scripts/check-test-junit.py --package "$package" \
-            --targets-file "$first" "${files[@]}"
-
   build:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     steps:
       - name: Not applicable — rust PR feedback gate
-        if: ${{ needs.change-scope.outputs.rust == 'false' }}
+        if: ${{ needs.change-scope.outputs.rust == 'false' && needs.change-scope.outputs.build != 'false' }}
         run: echo 'rust commands not run for this PR scope; full integration gates still run in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/ci-rust-toolchain --profile minimal
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         with:
           shared-key: gate-release
           save-if: false
       # CAD-1103: the linker flag follows rust-cache, which hashes RUST* env.
       - name: Enable fast linker (mold/lld; falls back to the default linker)
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       - name: Enable shared sccache (no-op without credentials)
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         env:
           SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         with:
           bun-version-file: ui/package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         with:
           node-version: 22
+      # CAD-1970: a PR push proves the shipping profile *checks*; the queue and
+      # main prove it *links*. Linking, packaging and the seam assertions need
+      # the built artifact, so they stay where a broken merge is caught before
+      # it lands rather than weeks later at release.
+      - run: cargo check --profile ci --locked
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name == 'pull_request' }}
       - run: cargo build --profile ci --locked
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
+      # CAD-2153/CAD-2721: check the platform fixture with the production
+      # verifier without compiling the library test harness. The scheduled
+      # library test calls the same assertions.
+      - name: Verify the platform-minted board assertion fixture
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
+        run: cargo run --profile ci --locked --example board_assertion_fixture
       - name: Package and clean-consumer check for the app toolchain
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"
       - name: Rehearse offline hosted migration with the built CLI
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         env:
           CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/ci/cadence
         run: python3 scripts/test-hosted-migration.py -v
@@ -535,10 +381,15 @@ jobs:
       # the seam. The step below is the guard's own tripwire: it builds
       # the forbidden combination and asserts the compile_error fires.
       - name: Assert the ci-profile gate binary carries no test seam
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: |
           if grep -aq 'cadence-test-seam-v1' target/ci/cadence; then
             echo "release binary contains the CAD-482 test seam" >&2
+            exit 1
+          fi
+          # S-VIEW-1 diagnostic seam (src/adapter/pi_guest/diag_seam.rs) marker.
+          if grep -aq 'cadence-n1-s-view-1-isolate-seam-refusal-v1' target/ci/cadence; then
+            echo "release binary contains the S-VIEW-1 diagnostic seam" >&2
             exit 1
           fi
       # CAD-482: the grep above proves the shipped binary carries no
@@ -548,16 +399,29 @@ jobs:
       # seam's own compile_error message (any other failure — a missing
       # dep, a syntax error — must not count, so grep the message).
       - name: Assert the test seam refuses a release build
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && github.event_name != 'pull_request' }}
         run: sh scripts/check-release-test-seam
+      # CAD-1970: the `ui` gate's compile, run here so the release cache and
+      # the Node/Bun toolchain are paid once. It runs AFTER the two seam
+      # assertions above on purpose: `cargo build --features ui` overwrites
+      # `target/ci/cadence`, and those assertions must judge the default-feature
+      # binary, not the ui one.
+      - run: bun install --frozen-lockfile
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && needs.change-scope.outputs.ui != 'false' }}
+        working-directory: ui
+      - run: bun run build
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && needs.change-scope.outputs.ui != 'false' }}
+        working-directory: ui
+      - run: cargo build --profile ci --locked --features ui
+        if: ${{ needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' && needs.change-scope.outputs.ui != 'false' }}
       - name: sccache statistics
-        if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' }}
+        if: ${{ !cancelled() && needs.change-scope.outputs.rust != 'false' && needs.change-scope.outputs.build != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   ui:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 20
     defaults:
       run:
@@ -582,162 +446,39 @@ jobs:
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
       - run: bun run lint
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
-      - run: bun run test:url-state
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-      - name: App-kit receiver and bundle-check tests
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        run: bun run test:app-kit
       - name: Verify app development isolation and HMR
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
         run: node --test ../scripts/app-dev/*.test.mjs
       - run: bun run build
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
+      # CAD-2084: compile the UI tests under the nightly's CommonJS config so a
+      # test that does not compile fails the PR. Compile only; the tests run
+      # nightly.
+      - name: Compile UI tests
+        if: ${{ needs.change-scope.outputs.ui != 'false' }}
+        run: bunx tsrs -p tsconfig.tests.json --outDir "$RUNNER_TEMP/ui-tests"
+      # CAD-1850: consumers vendor exact, committed runtime bytes and hashes.
+      # Check the canonical source and deterministic output in this same gate.
+      - name: Hosted runtime package checks
+        if: ${{ needs.change-scope.outputs.ui != 'false' }}
+        working-directory: worker-runtime
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun run typecheck
+          bun run build
+          git diff --exit-code -- dist
       # This job had no install step and built on the runner's preinstalled
       # (floating) Rust; the default working directory here is ui/.
-      - run: $GITHUB_WORKSPACE/scripts/ci-rust-toolchain --profile minimal
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        with:
-          shared-key: gate-release
-          save-if: false
-      - name: Enable fast linker (mold/lld; falls back to the default linker)
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
-      - name: Enable shared sccache (no-op without credentials)
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        env:
-          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
-          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
-          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
-      - run: cargo build --profile ci --locked --features ui
-        if: ${{ needs.change-scope.outputs.ui != 'false' }}
-        working-directory: ${{ github.workspace }}
+      # CAD-1970: the `--features ui` compile moved into `build`, which already
+      # has the release cache and the Node/Bun toolchain. Two jobs each
+      # restoring `gate-release` and compiling the same profile was ~110 s of
+      # duplicated work for one job's worth of signal. This job keeps every
+      # check that can only be made here (typecheck, lint, url-state, app-kit,
+      # HMR, the bundle, the hosted runtime package); the compile that proves
+      # the binary still builds with the ui feature runs there.
       - name: sccache statistics
         if: ${{ !cancelled() && needs.change-scope.outputs.ui != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
-
-  # CAD-904 / CI-SEC-2: the ONLY job that holds the read-write R2 key. It
-  # runs on push to main alone, under the `sccache-writer` environment
-  # (deployment branch: main only), and compiles merged code. No gate job,
-  # no pull_request and no merge_group job sees the key: a queued PR's build
-  # scripts and tests run in the gates, which only ever read the cache.
-  # Nothing `needs` it and it never fails the run.
-  # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
-  # per profile, each with its own target dir and the shared key the gates
-  # restore (gate-test-ld1: test; gate-release: build + ui;
-  # gate-clippy: clippy). The rust-cache step precedes `ci-sccache enable`
-  # exactly as in the gates, because the cache key hashes RUST* env vars and
-  # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved
-  # target dir is the point), but are skipped when the exact cache key already
-  # exists (rust-cache would not save) and sccache has nothing to warm.
-  cache-warm:
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    continue-on-error: true
-    environment: sccache-writer
-    strategy:
-      fail-fast: false
-      matrix:
-        profile: [test, release, release-full, clippy]
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: scripts/ci-rust-toolchain --profile minimal --component clippy
-      - id: cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # CAD-1493: the test leg's key carries the fingerprint epoch that
-          # the gate reads (gate-test-ld1); release/clippy stay unversioned.
-          shared-key: gate-${{ matrix.profile }}${{ matrix.profile == 'test' && '-ld1' || '' }}
-          # A lint or test failure on main must not freeze the refresh.
-          cache-on-failure: true
-      # The clippy leg has no sccache: clippy-driver calls are not cacheable
-      # and no gate reads clippy objects from it.
-      # CAD-1103: the gates' linker flag is part of the cargo fingerprint, so
-      # the release leg warms the cache with the same flag the gates use.
-      # CAD-1487: test-shards enable the fast linker too (83-binary link is
-      # the shard bottleneck), so the test leg must warm with it as well.
-      - name: Enable fast linker (test and release legs; same flags as the gates)
-        if: matrix.profile == 'test' || matrix.profile == 'release'
-        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
-      - name: Enable shared sccache (read-write; no-op without credentials)
-        id: sccache
-        if: matrix.profile == 'test' || matrix.profile == 'release'
-        env:
-          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}
-          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY }}
-          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
-      - name: Warm the test profile (feature-on, as the shards build it)
-        if: matrix.profile == 'test' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: cargo test --no-run --locked --all-targets --features test-seam
-      # CAD-1103: gates build the `ci` profile, so that is what this leg
-      # warms (dependencies are shared with the `ui` feature build). release-artifact keeps its own cache.
-      - name: Warm the ci profile
-        if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
-        run: cargo build --profile ci --locked
-      # CAD-1131: the shipping profile, so the queue's release-queue-build
-      # restores warm dependencies (no fast linker or sccache: the same
-      # build as release-artifact).
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
-        with:
-          bun-version-file: ui/package.json
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
-        with:
-          node-version: 22
-      - name: Warm the release profile (queue release build)
-        if: matrix.profile == 'release-full' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          (cd ui && bun install --frozen-lockfile && bun run build)
-          cargo build --release --locked --features ui
-      - name: Warm the clippy profile (not sccache-cacheable; rust-cache only)
-        if: matrix.profile == 'clippy' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cargo clippy --all-targets --locked -- -D warnings
-          cargo clippy --all-targets --locked --features test-seam -- -D warnings
-      - name: sccache statistics
-        if: ${{ !cancelled() }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
-
-  # CAD-1551: warm both cross-build dependency profiles on merged code only.
-  # The test profile optimizes dependencies differently from dev, so test
-  # artifacts alone do not warm the gate's default production-feature build.
-  # Bump the shared epoch in producer and consumer when warm inputs change:
-  # an existing immutable cache entry would otherwise skip the new work.
-  cache-warm-cross:
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-linux
-            runner: ubuntu-22.04-arm
-          - target: aarch64-macos
-            runner: macos-14
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: scripts/ci-rust-toolchain --profile minimal
-      - id: cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: cross-dual1-${{ matrix.target }}
-      - name: Warm the cross-build test and dev profiles
-        if: steps.cache.outputs.cache-hit != 'true'
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: |
-          cargo test --no-run --locked --features test-seam --test cad1425_client_update_refusal_acceptance
-          cargo build --locked
 
   # CAD-1131: build the release binary once per git TREE. A queue entry's
   # merge_group run builds the shipping binary in parallel with the gates
@@ -764,7 +505,7 @@ jobs:
         with:
           node-version: 22
       - run: scripts/ci-rust-toolchain --profile minimal
-      # Restore-only, from the key `cache-warm` (release-full) saves on main.
+      # Restore-only, from the release-full leg of ci-cache-warm.yml.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: gate-release-full
@@ -774,14 +515,16 @@ jobs:
       - run: bun run build
         working-directory: ui
       - run: cargo build --release --locked --features ui
-      - name: Pack the binary with its tree-hash manifest
+      - name: Pack the release pair with its tree-hash manifest
         id: pack
         env:
           SOURCE_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          strip --strip-unneeded -o "$RUNNER_TEMP/cadence-runtime-owner" target/release/cadence-runtime-owner
           python3 scripts/release-reuse.py pack --binary target/release/cadence \
+            --owner "$RUNNER_TEMP/cadence-runtime-owner" \
             --sha "$SOURCE_SHA" --dest dist --run-id "$RUN_ID" \
             --rustc "$(rustc --version)" --cargo "$(cargo --version)"
           echo "tree=$(jq -r .tree dist/manifest.json)" >> "$GITHUB_OUTPUT"
@@ -792,6 +535,8 @@ jobs:
             dist/cadence
             dist/cadence.sha256
             dist/manifest.json
+            dist/cadence-runtime-owner
+            dist/cadence-runtime-owner.sha256
           if-no-files-found: error
           retention-days: 2
 
@@ -811,6 +556,7 @@ jobs:
     outputs:
       reused: ${{ steps.done.outputs.reused }}
       sha256: ${{ steps.reuse.outputs.sha256 }}
+      owner_sha256: ${{ steps.reuse.outputs.owner_sha256 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Refuse reduced-gate release artifact before reusing
@@ -845,6 +591,8 @@ jobs:
             dist/cadence
             dist/cadence.sha256
             dist/manifest.json
+            dist/cadence-runtime-owner
+            dist/cadence-runtime-owner.sha256
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -876,13 +624,13 @@ jobs:
   # release build matches what was tested; the exact rustc/cargo versions
   # are recorded in manifest.json. Neither job is a required check.
   release-artifact:
-    needs: [queue-evidence, release-reuse, fmt, clippy, test, build, ui]
+    needs: [queue-evidence, release-reuse, fmt, clippy, build, ui]
     if: >-
       ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       needs.release-reuse.outputs.reused != 'true' &&
       (needs.queue-evidence.outputs.tested == 'true' ||
       (needs.fmt.result == 'success' && needs.clippy.result == 'success' &&
-      needs.test.result == 'success' && needs.build.result == 'success' &&
+      needs.build.result == 'success' &&
       needs.ui.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -893,6 +641,7 @@ jobs:
     # vouch for itself.
     outputs:
       sha256: ${{ steps.assemble.outputs.sha256 }}
+      owner_sha256: ${{ steps.assemble.outputs.owner_sha256 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Refuse reduced-gate release artifact before building
@@ -938,6 +687,8 @@ jobs:
             *) echo "binary reports '$version', expected +$SOURCE_SHA" >&2; exit 1 ;;
           esac
           (cd dist && sha256sum cadence > cadence.sha256)
+          strip --strip-unneeded -o dist/cadence-runtime-owner target/release/cadence-runtime-owner
+          (cd dist && sha256sum cadence-runtime-owner > cadence-runtime-owner.sha256)
           jq -n \
             --arg source_sha "$SOURCE_SHA" \
             --argjson run_id "$RUN_ID" \
@@ -951,11 +702,12 @@ jobs:
             '{source_sha: $source_sha, run_id: $run_id, run_attempt: $run_attempt,
               rustc: $rustc, cargo: $cargo, features: ["ui"],
               target: "x86_64-linux", runner: "ubuntu-24.04",
-              checks: ["fmt", "clippy", "test", "build", "ui"],
+              checks: ["fmt", "clippy", "build", "ui"],
               checks_event: $checks_event, checks_run_id: $checks_run_id,
               sha256: $sha256, built_at: $built_at}' > dist/manifest.json
           cat dist/manifest.json dist/cadence.sha256
           echo "sha256=$(cut -d' ' -f1 dist/cadence.sha256)" >> "$GITHUB_OUTPUT"
+          echo "owner_sha256=$(cut -d' ' -f1 dist/cadence-runtime-owner.sha256)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-build-${{ github.sha }}
@@ -963,6 +715,8 @@ jobs:
             dist/cadence
             dist/cadence.sha256
             dist/manifest.json
+            dist/cadence-runtime-owner
+            dist/cadence-runtime-owner.sha256
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -1025,6 +779,37 @@ jobs:
           retention-days: 90
           # A re-run of this job re-attests the same sha in the same run.
           overwrite: true
+      - name: Check the protected runtime owner against the build output
+        working-directory: dist
+        env:
+          BUILT_OWNER_SHA256: ${{ needs.release-reuse.outputs.owner_sha256 || needs.release-artifact.outputs.owner_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILT_OWNER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test -f cadence-runtime-owner && test ! -L cadence-runtime-owner
+          size=$(stat -c '%s' cadence-runtime-owner)
+          test "$size" -gt 0 && test "$size" -le 134217728
+          test "$(sha256sum cadence-runtime-owner)" = "$BUILT_OWNER_SHA256  cadence-runtime-owner"
+          test "$(cat cadence-runtime-owner.sha256)" = "$BUILT_OWNER_SHA256  cadence-runtime-owner"
+      - name: Attest the Linux protected runtime owner
+        id: owner-proof
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/cadence-runtime-owner
+      - name: Save the owner build attestation with the binary
+        env:
+          BUNDLE: ${{ steps.owner-proof.outputs.bundle-path }}
+        run: cp "$BUNDLE" dist/owner-attestation.jsonl
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cadence-runtime-owner-${{ github.sha }}-x86_64-linux
+          path: |
+            dist/cadence-runtime-owner
+            dist/cadence-runtime-owner.sha256
+            dist/owner-attestation.jsonl
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
 
   # CAD-311: a `v*` tag publishes a GitHub Release that install.sh
   # installs. Same shape as release-artifact/release-attest above: the
@@ -1046,7 +831,7 @@ jobs:
   # binary needs glibc 2.35, not 2.39.
   release-gate:
     if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [fmt, clippy, test, build, ui]
+    needs: [fmt, clippy, build, ui]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -1058,7 +843,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "$NEEDS_JSON" | jq -r 'to_entries[] | "\(.key): \(.value.result)"' >> "$GITHUB_STEP_SUMMARY"
-          echo "$NEEDS_JSON" | jq -e '. as $needs | ["fmt", "clippy", "test", "build", "ui"] | all(. as $gate | $needs[$gate].result == "success")' >/dev/null || {
+          echo "$NEEDS_JSON" | jq -e '. as $needs | ["fmt", "clippy", "build", "ui"] | all(. as $gate | $needs[$gate].result == "success")' >/dev/null || {
             echo "Required upstream gate failed, was cancelled/skipped, or has no result; refusing release" >&2
             exit 1
           }
@@ -1107,7 +892,7 @@ jobs:
           - target: aarch64-linux
             runner: ubuntu-22.04-arm
           - target: aarch64-macos
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -1166,7 +951,7 @@ jobs:
             '{source_sha: $source_sha, version: $version, run_id: $run_id,
               run_attempt: $run_attempt, rustc: $rustc, cargo: $cargo,
               features: ["ui"], target: $target, runner: $runner,
-              checks: ["fmt", "clippy", "test", "build", "ui"],
+              checks: ["fmt", "clippy", "build", "ui"],
               sha256: $sha256, built_at: $built_at}' > stage/manifest.json
           asset="cadence-$TAG-$TARGET.tar.gz"
           tar -czf "dist/$asset" -C stage cadence cadence.sha256 manifest.json
@@ -1207,7 +992,7 @@ jobs:
           - target: aarch64-linux
             runner: ubuntu-22.04-arm
           - target: aarch64-macos
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     permissions:
@@ -1312,6 +1097,8 @@ jobs:
             scripts/install.sh
             ui/package.json
             ui/app-kit/
+            app-toolchain/template/
+            app-toolchain/checklist/
           sparse-checkout-cone-mode: false
           path: src
           persist-credentials: false
@@ -1339,12 +1126,22 @@ jobs:
           import hashlib, json, re, sys, tarfile
           from pathlib import Path
           archive, tag, source_sha, ui_manifest_path = sys.argv[1:]
-          app_kit_files = ("README.md", "package.json", "src/index.mjs", "src/receiver.mjs",
-                           "src/refusal.mjs", "types/index.d.ts")
+          app_kit_files = ("README.md", "package.json", "src/forms.mjs", "src/index.mjs",
+                           "src/react.mjs", "src/receiver.mjs", "src/refusal.mjs",
+                           "types/index.d.ts", "types/react.d.ts")
+          template_files = ("README.md", "package.json", "preview.html", "app/app.md",
+                            "app/workflows/hello.md", "scripts/build.mjs", "scripts/dev-preview.mjs",
+                            "scripts/package.mjs", "scripts/pre-push", "src/main.js",
+                            "src/styles.css", "tests/template.test.mjs")
+          checklist_files = ("README.md", "package.json", "app/app.md", "app/app-storage.json",
+                             "app/storage/001-tasks.json", "app/workflows/plan.md",
+                             "src/main.js", "src/styles.css")
           expected = {
               "LICENSE", "README.md", "frame-kit/frame.html", "frame-kit/kit.css",
               "frame-kit/metadata.json", "package.json", "bun.lock", "toolchain.json",
               *(f"app-kit/{relative}" for relative in app_kit_files),
+              *(f"template/{relative}" for relative in template_files),
+              *(f"checklist/{relative}" for relative in checklist_files),
           }
           if not re.fullmatch(r"v[0-9][0-9A-Za-z.+_-]*", tag) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
               raise SystemExit("invalid release tag or source commit")
@@ -1363,6 +1160,10 @@ jobs:
                   relative: tar.extractfile(f"app-kit/{relative}").read()
                   for relative in app_kit_files
               }
+              archived_examples = {
+                  group: {relative: tar.extractfile(f"{group}/{relative}").read() for relative in files}
+                  for group, files in (("template", template_files), ("checklist", checklist_files))
+              }
           ui = json.load(open(ui_manifest_path, encoding="utf-8"))
           ui_pins = {**ui["dependencies"], **ui["devDependencies"]}
           pin_names = ("react", "react-dom", "vite", "@vitejs/plugin-react")
@@ -1376,13 +1177,24 @@ jobs:
               if archived_app_kit[relative] != (app_kit_dir / relative).read_bytes():
                   raise SystemExit(f"app-kit archive bytes differ from source: {relative}")
           app_kit_version = json.loads((app_kit_dir / "package.json").read_text())["version"]
+          example_hashes = {}
+          for group, files in (("template", template_files), ("checklist", checklist_files)):
+              source_dir = Path(ui_manifest_path).parent.parent / "app-toolchain" / group
+              example_hashes[group] = {}
+              for relative in files:
+                  source = (source_dir / relative).read_bytes()
+                  if archived_examples[group][relative] != source:
+                      raise SystemExit(f"{group} archive bytes differ from source: {relative}")
+                  example_hashes[group][relative] = hashlib.sha256(source).hexdigest()
           manager = ui.get("packageManager")
           if not isinstance(manager, str) or not re.fullmatch(r"bun@[0-9]+(?:\.[0-9]+){2}", manager):
               raise SystemExit("UI package manager must be an exact bun major.minor.patch version")
           if metadata != {"schema": "cadence-app-toolchain/1", "tag": tag,
                           "source_sha": source_sha, "package_manager": manager, "pins": pins,
-                          "app_kit": {"version": app_kit_version, "files": app_kit_hashes}}:
-              raise SystemExit("app-toolchain version, source, schema, package manager, pins or app-kit do not match")
+                          "app_kit": {"version": app_kit_version, "files": app_kit_hashes},
+                          "template": {"files": example_hashes["template"]},
+                          "checklist": {"files": example_hashes["checklist"]}}:
+              raise SystemExit("app-toolchain metadata or source bytes do not match")
           expected_package = {
               "name": "cadence-app-toolchain", "private": True,
               "version": tag[1:], "type": "module", "packageManager": manager,
@@ -1584,16 +1396,34 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      # CAD-2288: the owned catalogue has no prerelease field and its
+      # "latest" is the newest record, so a prerelease stays on GitHub
+      # only. Same test as the publish step's classification.
+      - name: Classify the tag
+        id: classify
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease=false
+          case "${TAG%%+*}" in *-*) prerelease=true ;; esac
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          if [ "$prerelease" = true ]; then
+            echo "$TAG is a prerelease: not uploaded to the release store or catalogue (GitHub release only)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.classify.outputs.prerelease == 'false'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: release-${{ github.ref_name }}-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - if: steps.classify.outputs.prerelease == 'false'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-bundles-${{ github.ref_name }}
           path: dist/bundles
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - if: steps.classify.outputs.prerelease == 'false'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           sparse-checkout: |
             scripts/publish-release.py
@@ -1601,6 +1431,7 @@ jobs:
           path: src
           persist-credentials: false
       - name: Publish the public-client release
+        if: steps.classify.outputs.prerelease == 'false'
         env:
           TAG: ${{ github.ref_name }}
           SOURCE_SHA: ${{ github.sha }}
@@ -1660,44 +1491,49 @@ jobs:
         include:
           - target: aarch64-linux
             runner: ubuntu-22.04-arm
+            rust_target: aarch64-unknown-linux-gnu
           - target: aarch64-macos
-            runner: macos-14
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        if: matrix.target == 'aarch64-macos'
+        if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         with:
           bun-version-file: ui/package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: matrix.target == 'aarch64-macos'
+        if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         with:
           node-version: 22
       - run: bun install --frozen-lockfile
-        if: matrix.target == 'aarch64-macos'
+        if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         working-directory: ui
       - run: bun run build
-        if: matrix.target == 'aarch64-macos'
+        if: ${{ matrix.target == 'aarch64-macos' && needs.change-scope.outputs.cross != 'false' }}
         working-directory: ui
       - run: scripts/ci-rust-toolchain --profile minimal
+      - run: rustup target add ${{ matrix.rust_target }}
+        if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name == 'pull_request' }}
       # Restore-only cache with both test-seam/test and default/dev dependencies.
-      # Keep the epoch aligned with cache-warm-cross; only main saves it.
+      # Keep the epoch aligned with cache-warm-cross in ci-cache-warm.yml.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ needs.change-scope.outputs.cross != 'false' }}
         with:
-          shared-key: cross-dual1-${{ matrix.target }}
+          shared-key: cross-dual2-${{ matrix.target }}
           save-if: false
       # The acceptance links CARGO_BIN_EXE_cadence, so `cargo test` builds
       # the binary too; run it first and let `cargo build` verify the
       # production feature shape afterward.
       # CAD-1425: the client-update refusal acceptance runs on each native
       # leg; the cfg(macos) test is the real Apple Silicon outcome.
-      - name: Run the CAD-1425 client update refusal acceptance
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: cargo test --locked --features test-seam --test cad1425_client_update_refusal_acceptance -- --test-threads 2
+      - run: cargo check --locked --target ${{ matrix.rust_target }}
+        if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name == 'pull_request' }}
       - run: cargo build --locked
+        if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name != 'pull_request' }}
       - run: target/debug/cadence --version
+        if: ${{ needs.change-scope.outputs.cross != 'false' && github.event_name != 'pull_request' }}
 
   # CAD-1540: `cross-build` cannot be a required check itself — `change-scope`
   # skips it on docs-only changes, and a skipped or absent context blocks merges
@@ -1708,7 +1544,7 @@ jobs:
     name: cross-build (required)
     needs: [cross-build]
     if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -1725,7 +1561,7 @@ jobs:
   # this phase.
   secrets:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: instabox-medium
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

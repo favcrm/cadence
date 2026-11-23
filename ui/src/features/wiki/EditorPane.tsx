@@ -4,7 +4,7 @@ import { sessionStore } from "../../lib/draft";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { navigate } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
-import Md from "../../ui/Md";
+import PageText from "./PageText";
 import { IconWarning } from "../../ui/icons";
 import { wiki } from "./api";
 import {
@@ -137,7 +137,7 @@ export default function EditorPane({
   const save = async () => {
     if (savingRef.current || !dirty || status !== "ready") return;
     if (readOnly) {
-      onToast("err", "writes are disabled on this board — sign in as the operator to edit.");
+      onToast("err", "writes are disabled on this board — sign in with editing access to edit.");
       return;
     }
     savingRef.current = true;
@@ -270,7 +270,7 @@ export default function EditorPane({
         />
         <div className="wk-ehead wk-preview-head" id={previewLabelId}>{t("Preview")}</div>
         <div id={previewId} className="wk-eprev issue-reader" role="region" aria-labelledby={previewLabelId}>
-          <Md text={text} />
+          <PageText path={path} text={text} />
         </div>
       </div>
 

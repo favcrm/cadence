@@ -23,13 +23,14 @@ The ordinary Vite scripts and files remain app-owned; this package adds no lifec
 
 ## Starter template
 
-The Cadence repository's [`template/`](template/README.md) is a minimal working
-app: the `cadence` package contract, an `app-screens/v2` package, an app-kit
-receiver with presentation and drawer helpers, a build that bundles the kit,
-a loopback surface preview, and `cadence app check` in the pre-push. The next
-toolchain archive packages it; until then, copy it from the Cadence checkout
-and point `CADENCE_APP_KIT` at this archive's `app-kit/` (or keep them
-siblings). See the [Cadence app development guide](https://github.com/favcrm/cadence/blob/main/docs/guides/app-development.md).
+The archive's [`template/`](template/README.md) is a working screen app:
+the `cadence` package contract, an `app-screens/v2` package, an app-kit
+receiver, a loopback surface preview, and a ZIP packager for private hosted
+workspaces. Copy `template/` and `app-kit/` together; each template source is
+pinned in `toolchain.json`. See the [Cadence app development guide](https://github.com/favcrm/cadence/blob/main/docs/guides/app-development.md).
+The [`checklist/`](checklist/README.md) example uses hosted records and
+shows the declared operations agents can discover through `app_describe`.
+Its source files are also pinned in `toolchain.json`.
 
 ## Canonical host frame
 
@@ -44,6 +45,37 @@ The parent origin must be the actual frame parent; the kit accepts HTTPS or an
 HTTP `localhost`/`*.localhost` origin with a port, not a loopback IP literal.
 
 The default exported frame is an empty offline reference. For an app smoke test, serve the exported frame and mount your application using the actual `--parent-origin` and `--bundle` values. Do not patch generated renderer bytes, replace the host bridge, or treat the empty reference as a running app integration.
+
+## Package integrity is not runtime admission
+
+Use the matching, archive-verified CLI for the complete immutable bundle:
+
+```sh
+cadence app inspect ./path/to/app-bundle --json
+cadence app frame-kit --out /tmp/my-app-static-frame \
+  --bundle ./path/to/app-bundle --parent-origin http://localhost:5173 --integrity-only
+cadence app fixtures --bundle ./path/to/app-bundle --json --integrity-only
+```
+
+`inspect` emits `app-package-inspection/1`: the same inventory, byte limits,
+secret scans, manifest, known descriptors, workflows, screens and storage/member
+pairing checks as `app check`. Its digest binds every original member.
+Inspection reports `secret_policy: no-host-allowlist`: it uses the same scanner
+without loading or inheriting a machine's Native secret exceptions. Native
+validation retains its existing operator exception policy.
+`native_compatibility` reports the actual Native registry; `target_compatibility`
+is null, never an inferred hosted compatibility verdict. Unknown contract payload
+semantics, including the `app-storage/v1` migration DSL, need their target's
+validator and runtime acceptance. Inspection installs, approves and consents to
+nothing.
+
+`--integrity-only` is explicit static preview, not permission to run unsupported
+contracts. Both preview commands retain their Native-checked defaults. Default
+`app check`, install, execution approval and run still refuse a requirement
+Native does not implement; recognizing storage files does not implement storage.
+These commands require a CLI release containing `app inspect` and the explicit
+preview flags; an older released CLI must refuse, not be treated as a pass.
+
 
 ## Screen bridge receiver
 
@@ -62,3 +94,11 @@ Do not edit the packaged receiver and do not treat it as the protocol's
 source: the wire contract is the Cadence `screenProtocol` document for this
 release. What a PUSH means, the app's closed verb set, and payload validation
 stay app-owned.
+
+Hosted private uploads currently refuse screen-declared platform tools: the
+existing Social-specific broker does not yet provide a host-owned consent
+step for an untrusted private frame. Records screens and tool screens also
+use mutually exclusive host contracts. Do not embed provider credentials or
+assume that a tool alias or an installed app grants access to the platform's
+general tool catalog. `app_describe`/`app_call` expose supported declared
+record operations; agent writes remain subject to the owner's decision.

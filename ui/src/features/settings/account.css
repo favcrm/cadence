@@ -188,6 +188,11 @@
   color: var(--color-ink-500);
   font-size: var(--text-label);
 }
+.account-members-note a {
+  color: var(--color-ink-200);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 @media (max-width: 767px) {
   .account-workspace {
     padding: 1.25rem 1rem 2rem;

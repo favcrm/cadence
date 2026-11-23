@@ -7,11 +7,19 @@
 //! envelope through [`crate::remote_cli::call_verb`]. The source tree is
 //! walked and the manifest checked before any mutating op.
 
-use std::ffi::CString;
-use std::fs::{self, File};
-use std::io::{Read, Seek, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::{Component, Path, PathBuf};
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
+mod export;
+mod fs_guard;
+mod walk;
+
+#[cfg(test)]
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -22,15 +30,32 @@ use crate::error::{Error, Result};
 use crate::wiki::transfer::{manifest_digest, Manifest, ManifestEntry};
 use crate::wiki::ABSENT;
 
-const MAX_ENTRIES: usize = 256;
-const MANIFEST_BYTES: usize = 256 * 1024;
-const FILE_CAP: u64 = 100 * 1024 * 1024;
-const TOTAL_CAP: u64 = 256 * 1024 * 1024;
-const TEXT_CAP: u64 = 64 * 1024 * 1024;
-const CHUNK_BYTES: usize = 16_384;
-const PATH_CAP: usize = 512;
-const ID_CAP: usize = 80;
-const SOURCE_CAP: usize = 128;
+use export::export_wiki;
+pub(super) use export::ExportEntry;
+#[cfg(test)]
+use export::{check_export_dest, write_export_entry};
+use fs_guard::{contained_source_meta, guard_local, open_contained, refused_path};
+#[cfg(test)]
+use walk::push_file;
+pub(super) use walk::{
+    canonical_wiki, check_export_bounds, hex_encode, is_absent, is_real_dir, join_wiki,
+    optional_sha, parse_kind, plan_digest, required_str,
+};
+use walk::{
+    check_manifest, check_token, discover_read_or_list, entry_failure, entry_id,
+    is_directory_range, source_identity, split_wiki, status_entry_failed, walk_local, wiki_operand,
+    Walked,
+};
+
+pub(super) const MAX_ENTRIES: usize = 256;
+pub(super) const MANIFEST_BYTES: usize = 256 * 1024;
+pub(super) const FILE_CAP: u64 = 100 * 1024 * 1024;
+pub(super) const TOTAL_CAP: u64 = 256 * 1024 * 1024;
+pub(super) const TEXT_CAP: u64 = 64 * 1024 * 1024;
+pub(super) const CHUNK_BYTES: usize = 16_384;
+pub(super) const PATH_CAP: usize = 512;
+pub(super) const ID_CAP: usize = 80;
+pub(super) const SOURCE_CAP: usize = 128;
 const STATUS_PAGE: u64 = 32;
 
 /// A copy the CLI already parsed. `wiki:` is stripped; paths are not yet
@@ -85,7 +110,7 @@ fn ensure_deadline(deadline: Instant) -> Result<()> {
     remaining_time(deadline).map(|_| ())
 }
 
-trait Channel {
+pub(super) trait Channel {
     /// `write` selects the mutating wiki action (`write` / local RPC).
     /// Reads use `job_status` remotely and the same RPC locally.
     fn transfer(&mut self, root: &str, op: Value, write: bool) -> Result<Value>;
@@ -96,6 +121,14 @@ trait Channel {
     fn discover(&mut self, path: &str) -> Result<()>;
     /// Current destination revision from an existing read, never a new if_rev guess.
     fn current_rev(&mut self, path: &str) -> Result<String>;
+    /// CAD-2271: whether an error this channel's `transfer` returned proves
+    /// the request changed nothing. Only the hosted channel can tell (see
+    /// [`hosted_stop_is_unchanged`]). A local daemon's code crosses the
+    /// socket unchanged and its refusal can follow a publish, so the
+    /// default, which the local channel keeps, trusts nothing.
+    fn proves_unchanged(&self, _error: &Error) -> bool {
+        false
+    }
 }
 
 struct LocalChannel<'a> {
@@ -231,6 +264,25 @@ impl Channel for RemoteChannel<'_> {
             Err(error) => Err(error),
         }
     }
+
+    fn proves_unchanged(&self, error: &Error) -> bool {
+        hosted_stop_is_unchanged(error)
+    }
+}
+
+/// CAD-2271: a hosted transfer error that proves the request changed
+/// nothing. Either the board refused it with one of its own transfer codes
+/// (only [`crate::remote_cli::is_wiki_copy_refusal`] codes, which on the
+/// hosted path come only from the board's refusal table), or the board never
+/// ran the request: `timeout` at the command deadline or during session
+/// renewal, `waking` when the gateway answered that the board was still
+/// waking or this copy's wake budget ran out before sending.
+fn hosted_stop_is_unchanged(error: &Error) -> bool {
+    match (error.kind(), error.code()) {
+        ("rejected", Some(code)) => crate::remote_cli::is_wiki_copy_refusal(code),
+        ("busy", Some(code)) => matches!(code, "timeout" | "waking"),
+        _ => false,
+    }
 }
 
 fn execute(request: &CopyRequest<'_>, channel: &mut dyn Channel, deadline: Instant) -> Result<i32> {
@@ -313,22 +365,71 @@ fn import_local(
         }
     };
     check_manifest(&manifest)?;
+    // `transfer.rs::receipt` carries this admitted manifest's canonical
+    // digest; computing it here is what makes a foreign or stale receipt
+    // fail instead of passing as this manifest's.
+    let expected_digest = manifest_digest(&manifest)?;
 
-    let mut begin = json!({"op": "begin", "manifest": manifest});
-    if let Some(job) = request.resume {
-        begin["job_id"] = json!(job);
+    // `begin` mints a UUID when the request omits one, and an id the server
+    // minted is the one thing a lost answer cannot recover — replaying would
+    // admit a second job. Send an explicit id instead: `--resume` its
+    // supplied one, a fresh copy a locally minted UUID. The server dedupes an
+    // explicit id against the same owner, root, digest and manifest, so the
+    // requested id is the reconciliation key either way.
+    let requested_job = match request.resume {
+        Some(job) => job.to_string(),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    let begin = json!({"op": "begin", "job_id": &requested_job, "manifest": manifest});
+    let receipt = match channel.transfer(&root, begin, true) {
+        Ok(receipt) => receipt,
+        // A lost answer may still have admitted the job under the id this
+        // request named: keep `unknown` and name that id. A definite
+        // refusal recorded nothing and keeps its own verdict.
+        Err(error) if error.kind() == "unknown" => {
+            return Err(begin_unproved(
+                &requested_job,
+                format!("the begin answer was lost: {error}"),
+            ))
+        }
+        Err(error) => return Err(error),
+    };
+    // The answer is read only after the request was dispatched: begin admits
+    // the manifest and publishes no entry. The receipt must name the id this
+    // request asked for — anything else is a foreign body — and the advice
+    // below names that requested id, never one the receipt invented.
+    if identity(&receipt, "job_id") != Some(requested_job.as_str()) {
+        return Err(begin_unproved(
+            &requested_job,
+            "the begin answer omitted or named a different job",
+        ));
     }
-    let receipt = channel.transfer(&root, begin, true)?;
-    let job_id = required_str(&receipt, "job_id")?;
-    let digest = required_str(&receipt, "digest")?;
-    check_token(&job_id, "job id")?;
-    println!(
-        "{}",
-        serde_json::to_string(&json!({"job_id": job_id, "digest": digest, "root": root}))
-            .map_err(|e| Error::rejected(format!("wiki cp receipt: {e}")))?
-    );
+    // `receipt()` echoes the admitted root and canonical digest. Their
+    // absence or a different value is a foreign body.
+    if identity(&receipt, "root") != Some(root.as_str()) {
+        return Err(begin_unproved(
+            &requested_job,
+            "the begin answer omitted or changed its root",
+        ));
+    }
+    if identity(&receipt, "digest") != Some(expected_digest.as_str()) {
+        return Err(begin_unproved(
+            &requested_job,
+            "the begin answer named another manifest digest",
+        ));
+    }
+    let job_id = requested_job.as_str();
+    let receipt_line =
+        serde_json::to_string(&json!({"job_id": job_id, "digest": &expected_digest, "root": root}))
+            .map_err(|e| Error::rejected(format!("wiki cp receipt: {e}")))?;
+    // The receipt precedes the entry sends: a closed stdout must not
+    // panic the transfer into a half-sent, successful-looking exit.
+    crate::output::print_line(&receipt_line);
 
-    let progress = status_received(channel, &root, &job_id)?;
+    // Nothing is published yet — begin admits the manifest and publishes no
+    // entry — so a progress read this client cannot trust is a definite
+    // stop, not a possible write.
+    let progress = status_received(channel, &root, job_id)?;
     let mut failures: Vec<String> = Vec::new();
     for item in &walked {
         let id = entry_id(&item.rel);
@@ -336,79 +437,153 @@ fn import_local(
             .get(&id)
             .ok_or_else(|| Error::rejected("wiki cp job status omitted an admitted entry"))?;
         if !entry_progress.decided {
-            if let Err(error) = send_entry(
+            // The board's record of this entry disagrees with the manifest it
+            // admitted. A resume reads the same record, so only a new job helps.
+            // The `dir` and empty-file cases match `send_entry`'s early returns.
+            if item.kind != "dir" && item.size != 0 && entry_progress.received > item.size {
+                return Err(Error::rejected(format!(
+                    "wiki cp job {job_id}: the board holds {} staged bytes for '{}', more than \
+                     its pinned size {}; resuming this job cannot fix that — copy again without \
+                     `--resume`",
+                    entry_progress.received, item.rel, item.size
+                )));
+            }
+            if let Err(stop) = send_entry(
                 channel,
                 &root,
-                &job_id,
+                job_id,
                 item,
                 &local,
                 entry_progress.received,
+                deadline,
             ) {
-                // A dropped chunk is ambiguous: do not finish and do not retry.
-                return Err(Error::rejected(format!(
-                    "wiki cp job {job_id} stopped on '{}': {error} — resume with --resume {job_id}; \
-                     this attempt was not retried",
-                    item.rel
-                )));
+                // A dropped chunk is ambiguous: do not finish and do not
+                // retry. An unchanged stop (the board's own refusal, the
+                // deadline before sending, or `waking`) or a local source
+                // problem reads as stopped; a channel error or a chunk answer
+                // this client could not read is reconciled by the same job.
+                return Err(chunk_stopped(job_id, &item.rel, stop));
             }
         }
-        match channel.transfer(
+        match send_step(
+            channel,
             &root,
             json!({"op": "apply", "job_id": job_id, "root": root, "entry_id": id}),
-            true,
+            deadline,
         ) {
             Ok(body) => {
-                // One apply. `unresolved` is not terminal: the stage stays,
-                // finish would be refused, and a later resume may apply again.
-                // Do not loop apply or recompute the admitted `if_rev` here.
-                if body["outcome"].as_str() == Some("unresolved") {
-                    let detail = body["error"]
-                        .as_str()
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or("publication is not committed; staged bytes were kept");
-                    let mut notes = vec![detail.to_string()];
-                    notes.extend(failures);
-                    return Err(Error::rejected(format!(
-                        "wiki cp job {job_id} stopped on '{}': unresolved — {}; \
-                         finish was not called; this attempt was not retried — resume with \
-                         --resume {job_id}; admitted if_rev was not recomputed",
-                        item.rel,
-                        notes.join("; ")
-                    )));
+                // One apply. The answer must be this entry's — `entry_id`
+                // is always emitted, and a body naming another job or
+                // entry proves nothing about this one. Do not loop apply
+                // or recompute the admitted `if_rev` here.
+                if identity(&body, "entry_id") != Some(id.as_str())
+                    || !optional_job_id(&body, job_id)
+                {
+                    return Err(unproved(
+                        job_id,
+                        format!("apply '{}' answered for another job or entry", item.rel),
+                    ));
                 }
-                if let Some(why) = entry_failure(&body, &item.rel) {
-                    failures.push(why);
+                match body["outcome"].as_str() {
+                    // The server decided this entry: applied/skipped are
+                    // done, `conflict`/`failed` are its proven refusals.
+                    Some("applied" | "skipped" | "conflict" | "failed") => {
+                        if let Some(why) = entry_failure(&body, &item.rel) {
+                            failures.push(why);
+                        }
+                    }
+                    // `unresolved` is written before `write`, `mkdir` or
+                    // `put_blob`: the publication was attempted and may
+                    // have landed. The stage stays, finish would refuse
+                    // the job, and only the same job can reconcile it.
+                    Some("unresolved") => {
+                        let detail = body["error"]
+                            .as_str()
+                            .filter(|text| !text.is_empty())
+                            .unwrap_or("publication could not be verified; staged bytes were kept");
+                        let mut notes = vec![detail.to_string()];
+                        notes.extend(failures);
+                        return Err(unproved(
+                            job_id,
+                            format!(
+                                "apply '{}' is unresolved — {}; finish was not called and \
+                                 this attempt was not retried; admitted if_rev was not \
+                                 recomputed",
+                                item.rel,
+                                notes.join("; ")
+                            ),
+                        ));
+                    }
+                    // No outcome this contract knows: the reply cannot be
+                    // read, and the publication may have happened. The
+                    // server's already-decided early return carries its
+                    // `outcome` (entry_value), so a body without one is
+                    // never that answer.
+                    _ => {
+                        return Err(unproved(
+                            job_id,
+                            format!("apply '{}' answered no outcome this build knows", item.rel),
+                        ))
+                    }
                 }
             }
-            Err(error) => {
-                return Err(Error::rejected(format!(
-                    "wiki cp job {job_id} apply '{}' was not confirmed: {error} — not retried",
-                    item.rel
-                )));
+            Err(stop) => {
+                // The apply may have committed before the reply was lost:
+                // unless the stop proves otherwise, the caller reconciles
+                // the same job instead of redoing the write.
+                return Err(apply_stopped(job_id, &item.rel, stop));
             }
         }
     }
 
-    let finished = channel.transfer(
+    let finished = send_step(
+        channel,
         &root,
         json!({"op": "finish", "job_id": job_id, "root": root}),
-        true,
-    )?;
-    if let Some(why) = job_failure(&finished) {
-        failures.push(why);
+        deadline,
+    )
+    .map_err(|stop| finish_stopped(job_id, stop))?;
+    if identity(&finished, "job_id") != Some(job_id)
+        || identity(&finished, "digest") != Some(expected_digest.as_str())
+        || identity(&finished, "root") != Some(root.as_str())
+    {
+        return Err(unproved(
+            job_id,
+            "finish answered for another job, manifest digest or root",
+        ));
     }
-    println!(
-        "{}",
-        serde_json::to_string(&finished)
-            .map_err(|e| Error::rejected(format!("wiki cp finish: {e}")))?
-    );
+    // `complete` is the server closing the job; `failed`/`partial` are its
+    // proven terminal outcomes (decided entries, or the root error the
+    // receipt carries). Anything else is not this contract's answer, and
+    // finish may still have run — root creation included.
+    match finished["state"].as_str() {
+        Some("complete") => {}
+        Some(state) if state == "failed" || state == "partial" => {
+            failures.push(format!("job state {state}"));
+        }
+        Some(other) => {
+            return Err(unproved(
+                job_id,
+                format!("finish answered job state '{other}'"),
+            ))
+        }
+        None => return Err(unproved(job_id, "finish answered no job state")),
+    }
+    if finished["index"] == "superseded" {
+        failures.push("job destination was superseded; no newer content was overwritten".into());
+    }
+    let receipt = serde_json::to_string(&finished)
+        .map_err(|e| Error::rejected(format!("wiki cp finish: {e}")))?;
+    // The receipt precedes a possible nonzero status: a closed stdout must
+    // not panic the job's own verdict into success.
+    crate::output::print_line(&receipt);
     if request.wait_index {
-        match wait_index(channel, &root, &job_id, deadline) {
-            Ok(body) => println!(
-                "{}",
-                serde_json::to_string(&body)
-                    .map_err(|e| Error::rejected(format!("wiki cp index: {e}")))?
-            ),
+        match wait_index(channel, &root, job_id, deadline) {
+            Ok(body) => {
+                let receipt = serde_json::to_string(&body)
+                    .map_err(|e| Error::rejected(format!("wiki cp index: {e}")))?;
+                crate::output::print_line(&receipt);
+            }
             Err(error) => {
                 failures.push(error.to_string());
             }
@@ -417,18 +592,210 @@ fn import_local(
     if failures.is_empty() {
         Ok(0)
     } else {
-        eprintln!(
-            "{}",
-            serde_json::to_string(&json!({
-                "job_id": job_id,
-                "failures": failures,
-            }))
-            .unwrap_or_else(|_| format!("wiki cp job {job_id} completed with entry failures"))
-        );
+        // The failure report precedes the nonzero status: a closed stderr
+        // must not panic it into success.
+        let report = serde_json::to_string(&json!({
+            "job_id": job_id,
+            "failures": failures,
+        }))
+        .unwrap_or_else(|_| format!("wiki cp job {job_id} completed with entry failures"));
+        crate::output::eprint_line(&report);
         Ok(1)
     }
 }
 
+/// CAD-2271: how a chunk, apply or finish ended without completing. Where
+/// the error came from decides what it proves, not its kind: a local daemon
+/// can publish a page and then answer `busy` or `rejected` when it fails to
+/// record the outcome, and a lost local reply is `internal`.
+enum Stop {
+    /// Nothing changed: the command deadline passed before this client sent
+    /// the request, or the channel proved the refusal
+    /// ([`Channel::proves_unchanged`]). Read as stopped, with one next step.
+    Unchanged(Error),
+    /// The channel answered with an error it cannot prove changed nothing,
+    /// so the step may have landed: `unknown`, reconciled by the same job.
+    Unconfirmed(Error),
+    /// This client stopped while preparing or checking a chunk, before this
+    /// run applied the file: a local source problem (`rejected`, exit 3), or
+    /// a chunk answer it could not read (`unknown`, exit 1). Not the local
+    /// daemon: its refusals are [`Stop::Unconfirmed`]. There is no `From`
+    /// into `Stop`: each site names its class, so a channel error cannot
+    /// become `Client` through `?`.
+    Client(Error),
+}
+
+/// A [`Stop::Client`] from anything this client raises itself, I/O included.
+fn client_stop(error: impl Into<Error>) -> Stop {
+    Stop::Client(error.into())
+}
+
+/// Send one chunk, apply or finish. A command deadline that has already
+/// passed stops it before anything is sent; an error the channel returns
+/// counts as [`Stop::Unchanged`] only when the channel proves it.
+fn send_step(
+    channel: &mut dyn Channel,
+    root: &str,
+    op: Value,
+    deadline: Instant,
+) -> std::result::Result<Value, Stop> {
+    ensure_deadline(deadline).map_err(Stop::Unchanged)?;
+    channel.transfer(root, op, true).map_err(|error| {
+        if channel.proves_unchanged(&error) {
+            Stop::Unchanged(error)
+        } else {
+            Stop::Unconfirmed(error)
+        }
+    })
+}
+
+/// A chunk that did not complete. An unchanged stop gets the plain next
+/// step. A channel error, or a chunk answer this client could not read, may
+/// have staged the chunk, and only the same job can tell. A local source
+/// problem stopped before this run applied the file, so it makes no staging
+/// claim. (A resumed `unresolved` entry may already be published by an
+/// earlier run, so the message speaks only for this run.)
+fn chunk_stopped(job_id: &str, rel: &str, stop: Stop) -> Error {
+    let what = format!("wiki cp job {job_id} stopped on '{rel}'");
+    let hedged = |error: &Error| {
+        Error::unknown(format!(
+            "{what}: {error} — the chunk may or may not have been staged; reconcile the same job \
+             with `--resume {job_id}` before repeating anything; this attempt was not retried"
+        ))
+    };
+    match stop {
+        Stop::Unchanged(error) => job_refused(job_id, &what, error),
+        Stop::Unconfirmed(error) => hedged(&error),
+        Stop::Client(error) if error.kind() == "unknown" => hedged(&error),
+        Stop::Client(error) => Error::rejected(format!(
+            "{what}: {error} — this run did not apply this file and did not finish the job; \
+             copy again without `--resume`"
+        )),
+    }
+}
+
+/// An apply that did not complete. It may have committed unless the stop
+/// is unchanged, so it is reconciled, never redone.
+fn apply_stopped(job_id: &str, rel: &str, stop: Stop) -> Error {
+    match stop {
+        Stop::Unchanged(error) => job_refused(
+            job_id,
+            &format!("wiki cp job {job_id} apply '{rel}' stopped"),
+            error,
+        ),
+        Stop::Unconfirmed(error) | Stop::Client(error) => Error::unknown(format!(
+            "wiki cp job {job_id} apply '{rel}' was not confirmed: {error} — this attempt was \
+             not retried; reconcile that job with `--resume {job_id}` before repeating anything"
+        )),
+    }
+}
+
+/// A finish that did not complete, on the same terms as [`apply_stopped`].
+fn finish_stopped(job_id: &str, stop: Stop) -> Error {
+    match stop {
+        Stop::Unchanged(error) => job_refused(
+            job_id,
+            &format!("wiki cp job {job_id} finish stopped"),
+            error,
+        ),
+        Stop::Unconfirmed(error) | Stop::Client(error) => Error::unknown(format!(
+            "wiki cp job {job_id} finish was not confirmed: {error} — reconcile the same job \
+             with `--resume {job_id}` before repeating anything"
+        )),
+    }
+}
+
+/// CAD-2261: a chunk, apply or finish that stopped with nothing changed — a
+/// board refusal, or this client stopping first, such as at the command
+/// deadline — with its next step. A job the board no longer has cannot be
+/// resumed; anything else is resumed with the same job.
+///
+/// CAD-2271: the stop keeps its kind and code. A board refusal stays
+/// `rejected` with the board's code (exit 3). A pre-send stop stays `busy`
+/// (exit 75), which `--resume` retries: `timeout` at the command deadline or
+/// during session renewal, or `waking`, either because the board's gateway
+/// answered that the board was still waking or because this copy's wake
+/// budget ran out before sending.
+///
+/// CAD-2275: a `waking` stop gets this client's own sentence, true in both
+/// cases. The wake budget's text says "retry", and a plain rerun would start
+/// a new job.
+fn job_refused(job_id: &str, what: &str, error: Error) -> Error {
+    let message = match error.code() {
+        Some("not_found") => {
+            format!("{what}: {error} — that job is gone, so copy again without `--resume`")
+        }
+        Some("waking") => format!(
+            "{what}: the board did not run the request — it was still waking, or this copy's \
+             `--wake-timeout` ran out first; resume with `--resume {job_id}`, with a larger \
+             `--wake-timeout`; this attempt was not retried"
+        ),
+        _ => format!(
+            "{what}: {error} — resume with `--resume {job_id}`; this attempt was not retried"
+        ),
+    };
+    match error.code() {
+        Some(code) => Error::Structured(crate::error::Structured {
+            kind: error.kind(),
+            code: code.to_string(),
+            message,
+            revision: None,
+        }),
+        // Not reached: every unchanged stop carries a code. Without one,
+        // nothing proves the stop, so it is reconciled.
+        None => Error::unknown(message),
+    }
+}
+
+/// A transfer op that was already dispatched, answered with a body this
+/// client cannot trust. `transfer.rs` writes `unresolved` before `write`,
+/// `mkdir` or `put_blob`, so a malformed, foreign or unproved answer leaves
+/// publication possibly done. Only the same job can reconcile it:
+/// `--resume <job_id>` re-reads the durable entries and publishes nothing
+/// already decided.
+fn unproved(job_id: &str, detail: impl std::fmt::Display) -> Error {
+    Error::unknown(format!(
+        "wiki cp job {job_id}: {detail} — the publication may or may not have been \
+         recorded; reconcile the same job with `--resume {job_id}` before repeating anything"
+    ))
+}
+
+/// A begin whose answer was lost or cannot be read. The job may or may not
+/// have been admitted under the id this request named, but begin records no
+/// published entry — `transfer.rs` only inserts the job and pins the
+/// manifest. The explicit id is deduped against the same owner, root, digest
+/// and manifest, so `--resume <id>` reconciles it; repeating the copy would
+/// admit a second job.
+fn begin_unproved(job_id: &str, detail: impl std::fmt::Display) -> Error {
+    Error::unknown(format!(
+        "wiki cp job {job_id}: {detail} — the job may or may not have been admitted, but \
+         begin publishes no entry; reconcile the same job with `--resume {job_id}` (the \
+         server dedupes that id against the same manifest) instead of repeating the copy"
+    ))
+}
+
+/// One identity field of a transfer answer. Each proven server shape emits
+/// the fields its callers require — `receipt()` the job id, root and
+/// digest, `entry_value`/`record_publish` the entry id, chunk both ids, and
+/// finish the job id — so an absent or non-string field is a foreign body,
+/// never one to read past.
+fn identity<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+    body.get(key).and_then(Value::as_str)
+}
+
+/// An apply answer's job id is optional: the server's already-decided
+/// `entry_value` omits it while the publish receipt carries it. A present
+/// value must still name this job.
+fn optional_job_id(body: &Value, job_id: &str) -> bool {
+    match body.get("job_id") {
+        None => true,
+        Some(value) => value.as_str() == Some(job_id),
+    }
+}
+
+/// Send one entry's remaining chunks. A chunk request goes through
+/// [`send_step`]; anything this client finds itself (the local source, an
+/// answer it cannot read) is a [`Stop::Client`].
 fn send_entry(
     channel: &mut dyn Channel,
     root: &str,
@@ -436,12 +803,14 @@ fn send_entry(
     item: &Walked,
     local_root: &Path,
     received: u64,
-) -> Result<()> {
+    deadline: Instant,
+) -> std::result::Result<(), Stop> {
     if item.kind == "dir" {
         return Ok(());
     }
     if item.size == 0 {
-        let body = channel.transfer(
+        let body = send_step(
+            channel,
             root,
             json!({
                 "op": "chunk",
@@ -451,21 +820,29 @@ fn send_entry(
                 "offset": 0,
                 "data_base64": "",
             }),
-            true,
+            deadline,
         )?;
-        if body["received"].as_u64() != Some(0) {
-            return Err(Error::rejected(format!(
-                "chunk '{}' did not confirm an empty file — not retried",
+        let want_entry = entry_id(&item.rel);
+        if identity(&body, "job_id") != Some(job_id)
+            || identity(&body, "entry_id") != Some(want_entry.as_str())
+        {
+            // Dispatched: a body that names another job or entry cannot be
+            // read as this chunk's acknowledgment.
+            return Err(client_stop(Error::unknown(format!(
+                "chunk '{}' answered for another job or entry",
                 item.rel
-            )));
+            ))));
+        }
+        if body["received"].as_u64() != Some(0) {
+            // Dispatched: the stage may hold these bytes even though the
+            // answer did not confirm an empty file. The caller adds the
+            // same-job reconciliation.
+            return Err(client_stop(Error::unknown(format!(
+                "chunk '{}' did not confirm an empty file",
+                item.rel
+            ))));
         }
         return Ok(());
-    }
-    if received > item.size {
-        return Err(Error::rejected(format!(
-            "staged length {received} exceeds source size {}",
-            item.size
-        )));
     }
     let path = if item.single_file {
         local_root.to_path_buf()
@@ -473,19 +850,19 @@ fn send_entry(
         local_root.join(&item.rel)
     };
     // Re-check the ancestor chain, then open only through no-follow fds.
-    let mut file = open_contained(&path)?;
+    let mut file = open_contained(&path).map_err(client_stop)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK_BYTES];
     let mut hashed = 0u64;
     while hashed < received {
         let want =
             usize::try_from((received - hashed).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
-        let n = file.read(&mut buf[..want])?;
+        let n = file.read(&mut buf[..want]).map_err(client_stop)?;
         if n == 0 {
-            return Err(Error::rejected(format!(
+            return Err(client_stop(Error::rejected(format!(
                 "source '{}' shrank during copy",
                 item.rel
-            )));
+            ))));
         }
         hasher.update(&buf[..n]);
         hashed += n as u64;
@@ -494,16 +871,17 @@ fn send_entry(
     while offset < item.size {
         let want =
             usize::try_from((item.size - offset).min(CHUNK_BYTES as u64)).unwrap_or(CHUNK_BYTES);
-        let n = file.read(&mut buf[..want])?;
+        let n = file.read(&mut buf[..want]).map_err(client_stop)?;
         if n == 0 {
-            return Err(Error::rejected(format!(
+            return Err(client_stop(Error::rejected(format!(
                 "source '{}' shrank during copy",
                 item.rel
-            )));
+            ))));
         }
         hasher.update(&buf[..n]);
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-        let body = channel.transfer(
+        let body = send_step(
+            channel,
             root,
             json!({
                 "op": "chunk",
@@ -513,421 +891,43 @@ fn send_entry(
                 "offset": offset,
                 "data_base64": data_base64,
             }),
-            true,
+            deadline,
         )?;
-        let got = body["received"].as_u64().ok_or_else(|| {
-            Error::rejected(format!(
-                "chunk '{}' did not confirm received bytes — not retried",
+        // Dispatched: a reply that names another job or entry, that this
+        // client cannot read, or that acknowledges other bytes than were
+        // sent leaves the stage possibly ahead. Only the same job can
+        // reconcile it (the caller adds that clause); `status` reports the
+        // durable `received`.
+        let want_entry = entry_id(&item.rel);
+        if identity(&body, "job_id") != Some(job_id)
+            || identity(&body, "entry_id") != Some(want_entry.as_str())
+        {
+            return Err(client_stop(Error::unknown(format!(
+                "chunk '{}' answered for another job or entry",
                 item.rel
-            ))
+            ))));
+        }
+        let want = offset + n as u64;
+        let got = body["received"].as_u64().ok_or_else(|| {
+            client_stop(Error::unknown(format!(
+                "chunk '{}' did not confirm its received bytes",
+                item.rel
+            )))
         })?;
-        if got != offset + n as u64 {
-            return Err(Error::rejected(format!(
-                "chunk '{}' confirmed {got} bytes, expected {} — not retried",
-                item.rel,
-                offset + n as u64
-            )));
+        if got != want {
+            return Err(client_stop(Error::unknown(format!(
+                "chunk '{}' confirmed {got} bytes where {want} were sent",
+                item.rel
+            ))));
         }
         offset = got;
     }
     let digest = hex_encode(hasher.finalize());
     if item.sha256.as_deref() != Some(digest.as_str()) {
-        return Err(Error::rejected(format!(
+        return Err(client_stop(Error::rejected(format!(
             "source '{}' changed after the manifest was pinned",
             item.rel
-        )));
-    }
-    Ok(())
-}
-
-fn export_wiki(
-    request: &CopyRequest<'_>,
-    wiki_src: &str,
-    channel: &mut dyn Channel,
-) -> Result<i32> {
-    if request.resume.is_some() {
-        return Err(Error::rejected(
-            "wiki cp --resume applies to a local-to-wiki import job, not an export",
-        ));
-    }
-    if request.wait_index {
-        return Err(Error::rejected(
-            "wiki cp --wait-index applies to an import job, not an export",
-        ));
-    }
-    let root_or_file = canonical_wiki(wiki_src)?;
-    let dest = guard_local(Path::new(request.dest), true)?;
-    channel.discover(&root_or_file)?;
-    let listed = list_export(channel, &root_or_file, request.recursive)?;
-    let digest = plan_digest(&listed);
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "op": "export",
-            "root": root_or_file,
-            "digest": digest,
-            "entries": listed.iter().map(|e| json!({
-                "path": e.path,
-                "kind": e.kind,
-                "rev": e.rev,
-                "size": e.size,
-                "sha256": e.sha256,
-            })).collect::<Vec<_>>(),
-        }))
-        .map_err(|e| Error::rejected(format!("wiki cp export plan: {e}")))?
-    );
-    check_export_dest(&dest, &root_or_file, &listed, request.update)?;
-    // One no-follow directory fd for the whole publication. Child directories
-    // and file names are created relative to it, including an empty source.
-    let anchor = ExportAnchor::open(&dest, &root_or_file, &listed)?;
-    let mut failures = Vec::new();
-    for entry in &listed {
-        if let Err(error) = write_anchored(channel, &root_or_file, &anchor, entry, request.update) {
-            failures.push(format!("{}: {error}", entry.path));
-            break;
-        }
-    }
-    if failures.is_empty() {
-        Ok(0)
-    } else {
-        eprintln!(
-            "{}",
-            serde_json::to_string(&json!({"op": "export", "failures": failures}))
-                .unwrap_or_else(|_| "wiki cp export incomplete".to_string())
-        );
-        Ok(1)
-    }
-}
-
-#[derive(Clone)]
-struct ExportEntry {
-    path: String,
-    kind: String,
-    size: u64,
-    sha256: Option<String>,
-    rev: String,
-}
-
-fn list_export(
-    channel: &mut dyn Channel,
-    wiki_src: &str,
-    recursive: bool,
-) -> Result<Vec<ExportEntry>> {
-    let first = export_call(channel, wiki_src, wiki_src, 0, Some(1), None)?;
-    let kind = parse_kind(first["kind"].as_str().unwrap_or(""))?;
-    if kind == "dir" {
-        if !recursive {
-            return Err(Error::rejected(
-                "wiki cp of a wiki directory needs --recursive — nothing was written",
-            ));
-        }
-        let mut out = Vec::new();
-        collect_dir(channel, wiki_src, wiki_src, "", &mut out)?;
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        check_export_bounds(&out)?;
-        Ok(out)
-    } else {
-        let size = first["size"]
-            .as_u64()
-            .ok_or_else(|| Error::rejected(format!("wiki export '{wiki_src}' omitted size")))?;
-        let rev = required_str(&first, "rev")?;
-        let sha = optional_sha(&first)?;
-        let entry = ExportEntry {
-            path: String::new(),
-            kind,
-            size,
-            sha256: sha,
-            rev,
-        };
-        check_export_bounds(std::slice::from_ref(&entry))?;
-        Ok(vec![entry])
-    }
-}
-
-fn collect_dir(
-    channel: &mut dyn Channel,
-    scope: &str,
-    dir: &str,
-    rel: &str,
-    out: &mut Vec<ExportEntry>,
-) -> Result<()> {
-    let mut offset = 0u64;
-    loop {
-        let page = export_call(channel, scope, dir, offset, Some(1), None)?;
-        let entries = page["entries"].as_array().ok_or_else(|| {
-            Error::rejected(format!(
-                "wiki export '{dir}' did not return directory entries"
-            ))
-        })?;
-        for raw in entries {
-            let name = raw["name"]
-                .as_str()
-                .ok_or_else(|| Error::rejected(format!("wiki export '{dir}' entry has no name")))?;
-            if name.is_empty()
-                || name.contains('/')
-                || name == "."
-                || name == ".."
-                || name.starts_with('.')
-            {
-                return Err(Error::rejected(format!(
-                    "wiki export '{dir}' refused entry '{name}'"
-                )));
-            }
-            let child_rel = if rel.is_empty() {
-                name.to_string()
-            } else {
-                format!("{rel}/{name}")
-            };
-            let child = join_wiki(dir, name);
-            canonical_wiki(&child)?;
-            let kind = parse_kind(
-                raw["kind"]
-                    .as_str()
-                    .ok_or_else(|| Error::rejected("wiki export entry omitted kind"))?,
-            )?;
-            if kind == "dir" {
-                out.push(ExportEntry {
-                    path: child_rel.clone(),
-                    kind,
-                    size: 0,
-                    sha256: None,
-                    rev: ABSENT.to_string(),
-                });
-                collect_dir(channel, scope, &child, &child_rel, out)?;
-            } else {
-                let meta = export_call(channel, scope, &child, 0, Some(1), None)?;
-                out.push(ExportEntry {
-                    path: child_rel,
-                    kind,
-                    size: meta["size"].as_u64().ok_or_else(|| {
-                        Error::rejected(format!("wiki export '{child}' omitted size"))
-                    })?,
-                    sha256: optional_sha(&meta)?,
-                    rev: required_str(&meta, "rev")?,
-                });
-            }
-            if out.len() > MAX_ENTRIES {
-                return Err(Error::rejected(
-                    "wiki cp refused: the export exceeds 256 entries — nothing was written",
-                ));
-            }
-        }
-        match page.get("next_offset") {
-            Some(Value::Null) => break,
-            Some(next)
-                if !entries.is_empty() && next.as_u64() == Some(offset + entries.len() as u64) =>
-            {
-                offset += entries.len() as u64;
-            }
-            _ => return Err(Error::rejected("wiki export returned invalid pagination")),
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn write_export_entry(
-    channel: &mut dyn Channel,
-    scope: &str,
-    dest_root: &Path,
-    entry: &ExportEntry,
-    all: &[ExportEntry],
-    update: bool,
-) -> Result<()> {
-    let anchor = ExportAnchor::open(dest_root, scope, all)?;
-    write_anchored(channel, scope, &anchor, entry, update)
-}
-
-fn write_anchored(
-    channel: &mut dyn Channel,
-    scope: &str,
-    anchor: &ExportAnchor,
-    entry: &ExportEntry,
-    update: bool,
-) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-
-    if entry.kind == "dir" {
-        if anchor.single_name.is_some() {
-            return Err(Error::rejected(
-                "wiki export refused a directory where a file destination was selected",
-            ));
-        }
-        let _created = hold_relative_dir(&anchor.dir, Path::new(&entry.path))?;
-        return Ok(());
-    }
-
-    let (parent, name, display) = if let Some(single) = &anchor.single_name {
-        let parent = anchor.dir.try_clone().map_err(|err| {
-            Error::rejected(format!("wiki cp cannot hold export directory: {err}"))
-        })?;
-        let display = anchor
-            .root
-            .join(std::ffi::OsStr::from_bytes(single.as_bytes()));
-        (parent, single.clone(), display)
-    } else {
-        let rel = Path::new(&entry.path);
-        let parent_rel = rel.parent().unwrap_or(Path::new(""));
-        let leaf = rel
-            .file_name()
-            .ok_or_else(|| refused_path(rel, "unsupported path"))?;
-        let parent = hold_relative_dir(&anchor.dir, parent_rel)?;
-        let name = leaf_name(leaf, rel)?;
-        (parent, name, anchor.root.join(rel))
-    };
-    refuse_export_leaf(&parent, &name, &display, update)?;
-    let mut stage = PrivateStage::create(&parent, &display)?;
-    let mut got = 0u64;
-    while got < entry.size {
-        let ask = (entry.size - got).min(CHUNK_BYTES as u64);
-        let page = export_call(
-            channel,
-            scope,
-            &export_path(scope, entry),
-            got,
-            Some(ask),
-            Some(&entry.rev),
-        )?;
-        let page_rev = required_str(&page, "rev")?;
-        if page_rev != entry.rev {
-            return Err(Error::rejected(format!(
-                "export revision changed for '{}'",
-                entry.path
-            )));
-        }
-        let data = page["data_base64"].as_str().unwrap_or("");
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|_| Error::rejected("export returned undecodable bytes"))?;
-        if bytes.is_empty() || (bytes.len() as u64 != ask && got + bytes.len() as u64 != entry.size)
-        {
-            return Err(Error::rejected("export returned a short slice"));
-        }
-        stage.file.write_all(&bytes)?;
-        got += bytes.len() as u64;
-    }
-    if got != entry.size {
-        return Err(Error::rejected("export length mismatch"));
-    }
-    stage.file.sync_all()?;
-    let (_, file_hash) = hash_open_file(&mut stage.file)?;
-    if let Some(want) = &entry.sha256 {
-        if want != &file_hash {
-            return Err(Error::rejected(format!(
-                "export hash mismatch for '{}'",
-                entry.path
-            )));
-        }
-    }
-    if entry.kind == "text" {
-        let mut text = Vec::new();
-        stage.file.rewind()?;
-        stage.file.read_to_end(&mut text)?;
-        if std::str::from_utf8(&text).is_err() {
-            return Err(Error::rejected(format!(
-                "export '{}' is not UTF-8 text",
-                entry.path
-            )));
-        }
-    }
-    commit_stage(&stage, &name, update, &display)?;
-    parent
-        .sync_all()
-        .map_err(|err| Error::rejected(format!("cannot sync {}: {err}", display.display())))?;
-    Ok(())
-}
-
-fn export_path(scope: &str, entry: &ExportEntry) -> String {
-    if entry.path.is_empty() {
-        scope.to_string()
-    } else {
-        join_wiki(scope, &entry.path)
-    }
-}
-
-fn export_call(
-    channel: &mut dyn Channel,
-    scope: &str,
-    path: &str,
-    offset: u64,
-    bytes: Option<u64>,
-    rev: Option<&str>,
-) -> Result<Value> {
-    let mut op = json!({"op": "export", "path": path, "offset": offset});
-    if let Some(bytes) = bytes {
-        op["bytes"] = json!(bytes);
-    }
-    if let Some(rev) = rev {
-        op["rev"] = json!(rev);
-    }
-    let body = match channel.transfer(scope, op, false) {
-        Ok(body) => body,
-        Err(error) if is_absent(&error) => {
-            return Err(error);
-        }
-        Err(error) => return Err(error),
-    };
-    if body.get("conflict").is_some() || body.get("error").is_some() {
-        return Err(Error::rejected(format!(
-            "wiki export '{path}' refused: {}",
-            body.get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("conflict")
-        )));
-    }
-    Ok(body)
-}
-
-fn check_export_dest(
-    dest: &Path,
-    scope: &str,
-    entries: &[ExportEntry],
-    update: bool,
-) -> Result<()> {
-    let single = entries.len() == 1 && entries[0].path.is_empty();
-    if !single {
-        if let Ok(meta) = symlink_meta(dest) {
-            if meta.file_type().is_symlink() {
-                return Err(refused_path(dest, "symlink"));
-            }
-            if !meta.is_dir() {
-                return Err(refused_path(dest, "export destination is not a directory"));
-            }
-        }
-    }
-    for entry in entries {
-        let path = if single {
-            if is_real_dir(dest) {
-                let name = scope.rsplit('/').next().unwrap_or("export");
-                dest.join(name)
-            } else {
-                dest.to_path_buf()
-            }
-        } else {
-            dest.join(&entry.path)
-        };
-        if entry.kind == "dir" {
-            if let Ok(meta) = symlink_meta(&path) {
-                if meta.file_type().is_symlink() || !meta.is_dir() {
-                    return Err(refused_path(&path, "conflicts with the exported directory"));
-                }
-            }
-            continue;
-        }
-        if let Ok(meta) = symlink_meta(&path) {
-            if meta.file_type().is_symlink() {
-                return Err(refused_path(&path, "symlink"));
-            }
-            if !update {
-                return Err(Error::rejected(format!(
-                    "wiki cp refused to overwrite '{}' — pass --update",
-                    path.display()
-                )));
-            }
-            if !meta.is_file() {
-                return Err(refused_path(&path, "not a regular file"));
-            }
-        }
+        ))));
     }
     Ok(())
 }
@@ -1139,9 +1139,9 @@ struct EntryProgress {
     decided: bool,
 }
 
-/// `pending` and `unresolved` still need apply. `unresolved` means the
-/// publication is not committed and the stage was kept; it is not a
-/// decision, so resume may apply once. Any other outcome is refused.
+/// `pending` needs apply. `unresolved` may already have been published;
+/// resuming the same job asks the server to reconcile its recorded attempt.
+/// Any unrecognized outcome is refused.
 fn outcome_is_decided(outcome: Option<&str>) -> Result<bool> {
     match outcome {
         Some("pending" | "unresolved") => Ok(false),
@@ -1203,1114 +1203,6 @@ fn status_received(
         }
     }
     Ok(out)
-}
-
-struct Walked {
-    rel: String,
-    kind: String,
-    size: u64,
-    sha256: Option<String>,
-    single_file: bool,
-}
-
-fn walk_local(root: &Path, file_name: Option<&str>) -> Result<Vec<Walked>> {
-    let mut out = Vec::new();
-    if let Some(name) = file_name {
-        push_file(&mut out, root, name, true)?;
-    } else {
-        walk_dir(root, Path::new(""), &mut out)?;
-    }
-    out.sort_by(|a, b| a.rel.cmp(&b.rel));
-    if out.len() > MAX_ENTRIES {
-        return Err(Error::rejected(
-            "wiki cp refused: more than 256 entries — nothing was sent",
-        ));
-    }
-    let mut total = 0u64;
-    for item in &out {
-        total = total.saturating_add(item.size);
-    }
-    if total > TOTAL_CAP {
-        return Err(Error::rejected(
-            "wiki cp refused: the tree exceeds 256 MiB — nothing was sent",
-        ));
-    }
-    Ok(out)
-}
-
-fn walk_dir(root: &Path, rel: &Path, out: &mut Vec<Walked>) -> Result<()> {
-    let full = if rel.as_os_str().is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel)
-    };
-    // Open with O_NOFOLLOW on every component, then list that fd. A path
-    // listing would follow an ancestor swapped for a symlink after the check.
-    let opened = open_contained(&full)?;
-    let meta = opened
-        .metadata()
-        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", full.display())))?;
-    if meta.file_type().is_symlink() {
-        return Err(refused_path(&full, "symlink"));
-    }
-    if !meta.is_dir() {
-        return Err(refused_path(&full, "not a directory"));
-    }
-    if !rel.as_os_str().is_empty() {
-        let rel_s = path_utf8(rel)?;
-        out.push(Walked {
-            rel: rel_s,
-            kind: "dir".to_string(),
-            size: 0,
-            sha256: None,
-            single_file: false,
-        });
-    }
-    let mut names = list_nofollow_dir(opened, &full)?;
-    names.sort();
-    for name in names {
-        let child = rel.join(name);
-        let abs = root.join(&child);
-        let meta = contained_source_meta(&abs)?;
-        let ft = meta.file_type();
-        if ft.is_symlink() {
-            return Err(refused_path(&abs, "symlink"));
-        } else if ft.is_dir() {
-            walk_dir(root, &child, out)?;
-        } else if ft.is_file() {
-            push_file(out, &abs, &path_utf8(&child)?, false)?;
-        } else {
-            return Err(refused_path(&abs, "not a regular file or directory"));
-        }
-    }
-    Ok(())
-}
-
-fn push_file(out: &mut Vec<Walked>, path: &Path, rel: &str, single_file: bool) -> Result<()> {
-    if rel.is_empty()
-        || rel.starts_with('.')
-        || rel.split('/').any(|s| s.is_empty() || s.starts_with('.'))
-    {
-        return Err(Error::rejected(format!(
-            "wiki cp refused internal path '{rel}' — nothing was sent"
-        )));
-    }
-    // Hash and UTF-8 checks read this fd. A second path open would follow
-    // an ancestor symlink planted after admission.
-    let mut file = open_contained(path)?;
-    let meta = file
-        .metadata()
-        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", path.display())))?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
-        return Err(refused_path(path, "not a regular file"));
-    }
-    let kind = kind_for_name(rel);
-    let cap = if kind == "text" { TEXT_CAP } else { FILE_CAP };
-    if meta.len() > cap {
-        return Err(Error::rejected(format!(
-            "wiki cp refused '{}': {} bytes exceeds the {}-byte cap — nothing was sent",
-            rel,
-            meta.len(),
-            cap
-        )));
-    }
-    let (size, sha) = if kind == "text" {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|e| Error::rejected(format!("wiki cp cannot read {}: {e}", path.display())))?;
-        if bytes.len() as u64 > cap {
-            return Err(Error::rejected(format!(
-                "wiki cp refused '{rel}': {} bytes exceeds the {cap}-byte cap — nothing was sent",
-                bytes.len()
-            )));
-        }
-        if std::str::from_utf8(&bytes).is_err() {
-            return Err(Error::rejected(format!(
-                "wiki cp refused '{rel}': text is not UTF-8 — nothing was sent"
-            )));
-        }
-        (bytes.len() as u64, hex_encode(Sha256::digest(&bytes)))
-    } else {
-        let hashed = hash_open_file(&mut file)?;
-        if hashed.0 > cap {
-            return Err(Error::rejected(format!(
-                "wiki cp refused '{rel}': {} bytes exceeds the {cap}-byte cap — nothing was sent",
-                hashed.0
-            )));
-        }
-        hashed
-    };
-    out.push(Walked {
-        rel: rel.to_string(),
-        kind,
-        size,
-        sha256: Some(sha),
-        single_file,
-    });
-    Ok(())
-}
-
-fn check_manifest(manifest: &Manifest) -> Result<()> {
-    if manifest.version != 1 {
-        return Err(Error::rejected("wiki cp manifest version must be 1"));
-    }
-    check_token(&manifest.source_id, "source id")?;
-    if manifest.source_id.len() > SOURCE_CAP {
-        return Err(Error::rejected("wiki cp source id is too long"));
-    }
-    canonical_wiki(&manifest.root)?;
-    if manifest.entries.len() > MAX_ENTRIES {
-        return Err(Error::rejected("wiki cp manifest has too many entries"));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for entry in &manifest.entries {
-        check_token(&entry.id, "entry id")?;
-        if entry.id.len() > ID_CAP || entry.path.is_empty() || entry.path.len() > PATH_CAP {
-            return Err(Error::rejected(format!(
-                "wiki cp refused entry '{}'",
-                entry.path
-            )));
-        }
-        if !seen.insert(entry.path.clone()) {
-            return Err(Error::rejected(format!(
-                "wiki cp refused duplicate path '{}' — nothing was sent",
-                entry.path
-            )));
-        }
-        canonical_wiki(&join_wiki(&manifest.root, &entry.path))?;
-        match entry.kind.as_str() {
-            "dir" => {
-                if entry.size != 0 || entry.sha256.is_some() {
-                    return Err(Error::rejected(format!(
-                        "wiki cp directory '{}' cannot carry file bytes",
-                        entry.path
-                    )));
-                }
-            }
-            "text" | "blob" => {
-                let sha = entry.sha256.as_deref().ok_or_else(|| {
-                    Error::rejected(format!("wiki cp file '{}' is missing sha256", entry.path))
-                })?;
-                if sha.len() != 64
-                    || !sha
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    return Err(Error::rejected(format!(
-                        "wiki cp file '{}' has a bad sha256",
-                        entry.path
-                    )));
-                }
-            }
-            _ => {
-                return Err(Error::rejected(
-                    "wiki cp manifest has an unsupported entry kind",
-                ))
-            }
-        }
-    }
-    let encoded = serde_json::to_vec(manifest)
-        .map_err(|e| Error::rejected(format!("wiki cp manifest: {e}")))?;
-    if encoded.len() > MANIFEST_BYTES {
-        return Err(Error::rejected(
-            "wiki cp refused: the manifest exceeds 256 KiB — nothing was sent",
-        ));
-    }
-    Ok(())
-}
-
-fn check_export_bounds(entries: &[ExportEntry]) -> Result<()> {
-    if entries.len() > MAX_ENTRIES {
-        return Err(Error::rejected("wiki cp export exceeds 256 entries"));
-    }
-    let total: u64 = entries.iter().fold(0, |n, e| n.saturating_add(e.size));
-    if total > TOTAL_CAP {
-        return Err(Error::rejected("wiki cp export exceeds 256 MiB"));
-    }
-    for entry in entries {
-        if entry.kind != "dir" && (entry.sha256.is_none() || entry.size > FILE_CAP) {
-            return Err(Error::rejected(
-                "wiki export file lacks its checksum or exceeds the file cap",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn is_real_dir(path: &Path) -> bool {
-    symlink_meta(path)
-        .ok()
-        .is_some_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
-}
-
-fn kind_for_name(path: &str) -> String {
-    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    if name.ends_with(".md") || name.ends_with(".markdown") || name.ends_with(".txt") {
-        "text".to_string()
-    } else {
-        "blob".to_string()
-    }
-}
-
-fn parse_kind(raw: &str) -> Result<String> {
-    match raw {
-        "dir" | "text" | "blob" => Ok(raw.to_string()),
-        _ => Err(Error::rejected(format!(
-            "wiki cp refused unsupported entry kind '{raw}'"
-        ))),
-    }
-}
-
-fn entry_failure(body: &Value, path: &str) -> Option<String> {
-    if body.get("conflict").is_some() {
-        return Some(format!("{path}: conflict"));
-    }
-    if matches!(body["extraction"].as_str(), Some("failed" | "conflict")) {
-        return Some(format!(
-            "{path}: original stored; extraction {}",
-            body["extraction"]
-        ));
-    }
-    match body["outcome"].as_str() {
-        Some("applied" | "skipped") => None,
-        Some("conflict" | "failed" | "error") => Some(format!(
-            "{path}: {}",
-            body["outcome"].as_str().unwrap_or("failed")
-        )),
-        Some(other) => Some(format!("{path}: {other}")),
-        None if body.get("error").is_some() => Some(format!("{path}: error")),
-        None => Some(format!("{path}: apply omitted outcome")),
-    }
-}
-
-fn status_entry_failed(body: &Value) -> bool {
-    matches!(
-        body["outcome"].as_str(),
-        Some("conflict" | "failed" | "error")
-    ) || body.get("conflict").is_some()
-        || matches!(
-            body["extraction"].as_str(),
-            Some("failed" | "empty" | "conflict")
-        )
-}
-
-fn job_failure(body: &Value) -> Option<String> {
-    if body["index"] == "superseded" {
-        return Some("job destination was superseded; no newer content was overwritten".into());
-    }
-    match body["state"].as_str() {
-        Some("complete") => None,
-        Some(other) => Some(format!("job state {other}")),
-        None => Some("finish omitted state".to_string()),
-    }
-}
-
-fn source_identity(kind: &str, path: &Path) -> Result<String> {
-    let abs = lexical_abs(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(kind.as_bytes());
-    hasher.update([0]);
-    hasher.update(abs.to_string_lossy().as_bytes());
-    let id = hex_encode(hasher.finalize());
-    check_token(&id, "source id")?;
-    Ok(id)
-}
-
-fn entry_id(rel: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(rel.as_bytes());
-    hex_encode(hasher.finalize())
-}
-
-fn plan_digest(entries: &[ExportEntry]) -> String {
-    let mut hasher = Sha256::new();
-    for entry in entries {
-        hasher.update(entry.path.as_bytes());
-        hasher.update([0]);
-        hasher.update(entry.rev.as_bytes());
-        hasher.update([0]);
-        hasher.update(entry.sha256.as_deref().unwrap_or("").as_bytes());
-        hasher.update([0]);
-    }
-    hex_encode(hasher.finalize())
-}
-
-fn wiki_operand(raw: &str) -> Option<&str> {
-    raw.strip_prefix("wiki:")
-}
-
-fn canonical_wiki(path: &str) -> Result<String> {
-    if path.len() > PATH_CAP {
-        return Err(Error::rejected(format!(
-            "wiki path '{path}' refused: path is too long"
-        )));
-    }
-    let norm = crate::wiki::normalize(path)?;
-    if norm.is_empty() {
-        return Err(Error::rejected(
-            "wiki cp refused the wiki root — name a directory under it",
-        ));
-    }
-    if norm.len() > PATH_CAP {
-        return Err(Error::rejected(format!(
-            "wiki path '{norm}' refused: path is too long"
-        )));
-    }
-    Ok(norm)
-}
-
-fn split_wiki(path: &str) -> Result<(String, String)> {
-    match path.rsplit_once('/') {
-        Some((parent, name)) if !parent.is_empty() && !name.is_empty() => {
-            Ok((canonical_wiki(parent)?, name.to_string()))
-        }
-        _ => Err(Error::rejected(
-            "wiki cp file destination needs a parent directory — nothing was sent",
-        )),
-    }
-}
-
-fn join_wiki(root: &str, rel: &str) -> String {
-    if rel.is_empty() {
-        root.to_string()
-    } else if root.is_empty() {
-        rel.to_string()
-    } else {
-        format!("{root}/{rel}")
-    }
-}
-
-fn check_token(value: &str, what: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > ID_CAP.max(SOURCE_CAP)
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return Err(Error::rejected(format!("wiki cp refused {what} '{value}'")));
-    }
-    Ok(())
-}
-
-fn required_str(body: &Value, key: &str) -> Result<String> {
-    body[key]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| Error::rejected(format!("wiki cp response omitted {key}")))
-}
-
-fn optional_sha(body: &Value) -> Result<Option<String>> {
-    match body.get("sha256") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(sha))
-            if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) =>
-        {
-            Ok(Some(sha.to_ascii_lowercase()))
-        }
-        _ => Err(Error::rejected("wiki export returned a bad sha256")),
-    }
-}
-
-fn is_absent(error: &Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    text.contains("no such") || text.contains("not found") || text.contains("does not exist")
-}
-
-/// Bounded `read` refuses a directory (`a range read needs a text page`).
-/// That is the directory case of discovery and an update pin, not a missing file.
-fn is_directory_range(error: &Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    text.contains("range") && text.contains("director")
-}
-
-/// File discovery is the existing bounded read. A directory (range refusal,
-/// or an explicit `kind: dir`) is enumerated with the ordinary list action.
-/// Absence is success so a new import root does not require a parent read.
-fn discover_read_or_list(read: Result<Value>, list: impl FnOnce() -> Result<Value>) -> Result<()> {
-    let list_directory = match read {
-        Ok(body) => body.get("kind").and_then(Value::as_str) == Some("dir"),
-        Err(error) if is_absent(&error) => return Ok(()),
-        Err(error) if is_directory_range(&error) => true,
-        Err(error) => return Err(error),
-    };
-    if !list_directory {
-        return Ok(());
-    }
-    match list() {
-        Ok(_) => Ok(()),
-        Err(error) if is_absent(&error) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn refused_path(path: &Path, why: &str) -> Error {
-    Error::rejected(format!(
-        "wiki cp refused '{}': {why} — nothing was sent",
-        path.display()
-    ))
-}
-
-fn guard_local(path: &Path, _write: bool) -> Result<PathBuf> {
-    let abs = lexical_abs(path)?;
-    if crate::master::caller_is_master() {
-        let cwd = lexical_abs(&std::env::current_dir().map_err(|e| {
-            Error::rejected(format!("wiki cp cannot resolve the working directory: {e}"))
-        })?)?;
-        if !abs.starts_with(&cwd) {
-            return Err(Error::rejected(format!(
-                "wiki cp refused '{}': outside the registered working directory",
-                path.display()
-            )));
-        }
-    }
-    Ok(abs)
-}
-
-fn lexical_abs(path: &Path) -> Result<PathBuf> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut out = PathBuf::new();
-    for component in abs.components() {
-        match component {
-            Component::RootDir => out.push(component),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    return Err(Error::rejected(format!(
-                        "wiki cp refused '{}'",
-                        path.display()
-                    )));
-                }
-            }
-            Component::Normal(seg) => out.push(seg),
-            Component::Prefix(_) => {
-                return Err(Error::rejected(format!(
-                    "wiki cp refused '{}'",
-                    path.display()
-                )))
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn symlink_meta(path: &Path) -> Result<fs::Metadata> {
-    fs::symlink_metadata(path)
-        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", path.display())))
-}
-
-fn path_utf8(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| Error::rejected("wiki cp refused a non-UTF-8 path"))
-}
-
-/// Metadata of `path` after every existing ancestor, including the leaf,
-/// has been opened with `O_NOFOLLOW`. A missing path is an error. This
-/// is the import admission check: nothing is hashed or listed first.
-fn contained_source_meta(path: &Path) -> Result<fs::Metadata> {
-    let file = open_contained(path)?;
-    file.metadata()
-        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", path.display())))
-}
-
-/// Open `path` by walking from the filesystem root with `openat` and
-/// `O_NOFOLLOW` on every component. The returned fd is the only handle;
-/// a later path open is not used for source bytes.
-fn open_contained(path: &Path) -> Result<File> {
-    refuse_symlink_chain(path)?;
-    let mut current = open_root_dir()?;
-    let mut cur = PathBuf::new();
-    cur.push(Component::RootDir);
-    let abs = lexical_abs(path)?;
-    for component in abs.components() {
-        let Component::Normal(seg) = component else {
-            if matches!(component, Component::RootDir) {
-                continue;
-            }
-            return Err(refused_path(path, "unsupported path"));
-        };
-        cur.push(seg);
-        let is_last = cur == abs;
-        let name = CString::new(os_str_bytes(seg)).map_err(|_| {
-            Error::rejected(format!(
-                "wiki cp refused '{}': path contains an interior nul — nothing was sent",
-                path.display()
-            ))
-        })?;
-        // Ancestors are directories, so they must not use O_NONBLOCK
-        // (some kernels return ENOTSUP). The leaf uses O_NONBLOCK so a
-        // fifo cannot stall admission; a directory leaf that a kernel
-        // refuses that way is retried below. Symlinks stay ELOOP.
-        let flags = if is_last {
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
-        } else {
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        };
-        let mut next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
-        if next < 0 && is_last {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOTSUP) {
-                let dir_flags =
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-                next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), dir_flags) };
-            }
-        }
-        if next < 0 {
-            let err = std::io::Error::last_os_error();
-            // Linux reports a symlink as ELOOP. A kernel that returns the
-            // link descriptor is still refused by fstat below.
-            if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(current.as_raw_fd(), &name)
-            {
-                return Err(refused_path(&cur, "symlink"));
-            }
-            return Err(Error::rejected(format!(
-                "wiki cp cannot read {}: {err}",
-                cur.display()
-            )));
-        }
-        let opened = unsafe { OwnedFd::from_raw_fd(next) };
-        if is_symlink_fd(opened.as_raw_fd()) {
-            return Err(refused_path(&cur, "symlink"));
-        }
-        current = opened;
-    }
-    let file = File::from(current);
-    let meta = file
-        .metadata()
-        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", path.display())))?;
-    if meta.file_type().is_symlink() {
-        return Err(refused_path(path, "symlink"));
-    }
-    if !meta.is_file() && !meta.is_dir() {
-        return Err(refused_path(path, "not a regular file or directory"));
-    }
-    Ok(file)
-}
-
-fn open_root_dir() -> Result<OwnedFd> {
-    let fd = unsafe {
-        libc::open(
-            c"/".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(
-            "wiki cp cannot open the filesystem root — nothing was sent",
-        ));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn os_str_bytes(seg: &std::ffi::OsStr) -> &[u8] {
-    use std::os::unix::ffi::OsStrExt;
-    seg.as_bytes()
-}
-
-fn is_symlink_fd(fd: std::os::fd::RawFd) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstat(fd, &mut st) };
-    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
-}
-
-fn is_symlink_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
-}
-
-/// Names in a directory fd from [`open_contained`]. `fdopendir` consumes
-/// `file`. `.` and `..` are omitted. The caller's path is not opened again.
-fn list_nofollow_dir(file: File, path: &Path) -> Result<Vec<std::ffi::OsString>> {
-    use std::ffi::{CStr, OsStr};
-    use std::os::fd::IntoRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    struct CloseDir(*mut libc::DIR);
-    impl Drop for CloseDir {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { libc::closedir(self.0) };
-            }
-        }
-    }
-
-    let fd = file.into_raw_fd();
-    let dir = unsafe { libc::fdopendir(fd) };
-    if dir.is_null() {
-        let err = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(Error::rejected(format!(
-            "wiki cp cannot read {}: {err}",
-            path.display()
-        )));
-    }
-    let dir = CloseDir(dir);
-    let mut names = Vec::new();
-    loop {
-        clear_errno();
-        let ent = unsafe { libc::readdir(dir.0) };
-        if ent.is_null() {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error().unwrap_or(0) != 0 {
-                return Err(Error::rejected(format!(
-                    "wiki cp cannot read {}: {err}",
-                    path.display()
-                )));
-            }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
-        let bytes = name.to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        names.push(OsStr::from_bytes(bytes).to_os_string());
-    }
-    Ok(names)
-}
-
-fn clear_errno() {
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    unsafe {
-        *libc::__error() = 0;
-    }
-}
-
-/// Private export stage in a held directory fd. `Drop` unlinks only the
-/// stage name. After `renameat` that name is already gone, so cleanup
-/// cannot remove the published file.
-struct PrivateStage {
-    dir: OwnedFd,
-    name: CString,
-    file: File,
-}
-
-impl Drop for PrivateStage {
-    fn drop(&mut self) {
-        unsafe {
-            libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0);
-        }
-    }
-}
-
-impl PrivateStage {
-    fn create(dir: &File, display: &Path) -> Result<Self> {
-        let flags =
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let mut last = None;
-        for _ in 0..8 {
-            let label = format!(".cadence-transfer-{}", hex_encode(stage_nonce()));
-            let name = CString::new(label).map_err(|_| {
-                Error::rejected(format!(
-                    "cannot stage {}: bad stage name",
-                    display.display()
-                ))
-            })?;
-            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
-            if fd >= 0 {
-                let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-                if dup < 0 {
-                    let err = std::io::Error::last_os_error();
-                    unsafe {
-                        libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0);
-                        libc::close(fd);
-                    }
-                    return Err(Error::rejected(format!(
-                        "cannot stage {}: {err}",
-                        display.display()
-                    )));
-                }
-                return Ok(Self {
-                    dir: unsafe { OwnedFd::from_raw_fd(dup) },
-                    name,
-                    file: File::from(unsafe { OwnedFd::from_raw_fd(fd) }),
-                });
-            }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EEXIST) {
-                return Err(Error::rejected(format!(
-                    "cannot stage {}: {err}",
-                    display.display()
-                )));
-            }
-            last = Some(err);
-        }
-        Err(Error::rejected(format!(
-            "cannot stage {}: {}",
-            display.display(),
-            last.map(|err| err.to_string())
-                .unwrap_or_else(|| "export stage was not created".to_string())
-        )))
-    }
-}
-
-fn stage_nonce() -> [u8; 16] {
-    let mut nonce = [0u8; 16];
-    if getrandom::fill(&mut nonce).is_ok() {
-        return nonce;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let mixed = (u128::from(std::process::id()) << 96) ^ nanos;
-    nonce.copy_from_slice(&mixed.to_ne_bytes());
-    nonce
-}
-
-/// Create-only links the stage under `dest` and leaves an existing name
-/// untouched. `--update` renames onto that name. Both operations use the
-/// held directory fd, never a reopened path.
-fn commit_stage(
-    stage: &PrivateStage,
-    dest: &std::ffi::CStr,
-    update: bool,
-    display: &Path,
-) -> Result<()> {
-    let rc = if update {
-        unsafe {
-            libc::renameat(
-                stage.dir.as_raw_fd(),
-                stage.name.as_ptr(),
-                stage.dir.as_raw_fd(),
-                dest.as_ptr(),
-            )
-        }
-    } else {
-        unsafe {
-            libc::linkat(
-                stage.dir.as_raw_fd(),
-                stage.name.as_ptr(),
-                stage.dir.as_raw_fd(),
-                dest.as_ptr(),
-                0,
-            )
-        }
-    };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        if !update
-            && (err.kind() == std::io::ErrorKind::AlreadyExists
-                || err.raw_os_error() == Some(libc::EEXIST))
-        {
-            return Err(Error::rejected(format!(
-                "wiki cp refused to overwrite '{}' — pass --update",
-                display.display()
-            )));
-        }
-        return Err(Error::rejected(format!(
-            "cannot commit {}: {err}",
-            display.display()
-        )));
-    }
-    if !update {
-        unsafe {
-            libc::unlinkat(stage.dir.as_raw_fd(), stage.name.as_ptr(), 0);
-        }
-    }
-    Ok(())
-}
-
-fn hash_open_file(file: &mut File) -> Result<(u64, String)> {
-    file.rewind()?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
-    let mut size = 0u64;
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        size += n as u64;
-    }
-    Ok((size, hex_encode(hasher.finalize())))
-}
-
-struct ExportAnchor {
-    dir: File,
-    root: PathBuf,
-    single_name: Option<CString>,
-}
-
-impl ExportAnchor {
-    /// Hold the directory that will contain published names. A single file
-    /// whose destination is not already a real directory is published in
-    /// its parent; every other plan publishes inside `dest`.
-    fn open(dest: &Path, scope: &str, entries: &[ExportEntry]) -> Result<Self> {
-        let single = entries.len() == 1 && entries[0].path.is_empty();
-        if single && !is_real_dir(dest) {
-            let parent = match dest.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => parent,
-                _ => Path::new("/"),
-            };
-            let leaf = dest
-                .file_name()
-                .ok_or_else(|| refused_path(dest, "unsupported path"))?;
-            return Ok(Self {
-                dir: hold_export_dir(parent)?,
-                root: parent.to_path_buf(),
-                single_name: Some(leaf_name(leaf, dest)?),
-            });
-        }
-        let single_name = if single {
-            let base = scope
-                .rsplit('/')
-                .next()
-                .filter(|name| !name.is_empty())
-                .unwrap_or("export");
-            Some(leaf_name(std::ffi::OsStr::new(base), dest)?)
-        } else {
-            None
-        };
-        Ok(Self {
-            dir: hold_export_dir(dest)?,
-            root: dest.to_path_buf(),
-            single_name,
-        })
-    }
-}
-
-/// Walk `path` from `/` with the same `O_NOFOLLOW` directory opens as
-/// [`open_contained`]. Missing components are created with `mkdirat` on
-/// the held parent. The returned fd, not the path, is the destination.
-fn hold_export_dir(path: &Path) -> Result<File> {
-    let abs = lexical_abs(path)?;
-    let mut current = File::from(open_root_dir()?);
-    let mut built = PathBuf::new();
-    built.push(Component::RootDir);
-    for component in abs.components() {
-        let Component::Normal(seg) = component else {
-            if matches!(component, Component::RootDir) {
-                continue;
-            }
-            return Err(refused_path(path, "unsupported path"));
-        };
-        let name = component_cstr(seg, path)?;
-        built.push(seg);
-        current = open_or_create_dir(&current, &name, &built)?;
-    }
-    Ok(current)
-}
-
-fn hold_relative_dir(root: &File, rel: &Path) -> Result<File> {
-    if rel.as_os_str().is_empty() {
-        return root.try_clone().map_err(|err| {
-            Error::rejected(format!("wiki cp cannot hold export directory: {err}"))
-        });
-    }
-    let mut current = root
-        .try_clone()
-        .map_err(|err| Error::rejected(format!("wiki cp cannot hold export directory: {err}")))?;
-    let mut built = PathBuf::new();
-    for component in rel.components() {
-        let Component::Normal(seg) = component else {
-            return Err(refused_path(rel, "unsupported path"));
-        };
-        let bytes = os_str_bytes(seg);
-        if bytes.is_empty()
-            || bytes == b"."
-            || bytes == b".."
-            || bytes.starts_with(b".")
-            || bytes.contains(&b'/')
-            || bytes.contains(&0)
-        {
-            return Err(refused_path(rel, "unsupported path"));
-        }
-        let name = component_cstr(seg, rel)?;
-        built.push(seg);
-        current = open_or_create_dir(&current, &name, &built)?;
-    }
-    Ok(current)
-}
-
-enum DirFail {
-    Missing,
-    Symlink,
-    NotDir,
-    Io(std::io::Error),
-}
-
-fn open_dir_at(parent: &File, name: &std::ffi::CStr) -> std::result::Result<File, DirFail> {
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(parent.as_raw_fd(), name) {
-            return Err(DirFail::Symlink);
-        }
-        if err.raw_os_error() == Some(libc::ENOENT) {
-            return Err(DirFail::Missing);
-        }
-        if err.raw_os_error() == Some(libc::ENOTDIR) {
-            return Err(DirFail::NotDir);
-        }
-        return Err(DirFail::Io(err));
-    }
-    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    if is_symlink_fd(file.as_raw_fd()) {
-        return Err(DirFail::Symlink);
-    }
-    match file.metadata() {
-        Ok(meta) if meta.is_dir() => Ok(file),
-        Ok(_) => Err(DirFail::NotDir),
-        Err(err) => Err(DirFail::Io(err)),
-    }
-}
-
-fn open_or_create_dir(parent: &File, name: &std::ffi::CStr, display: &Path) -> Result<File> {
-    match open_dir_at(parent, name) {
-        Ok(file) => Ok(file),
-        Err(DirFail::Missing) => {
-            let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) };
-            let created = rc == 0;
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EEXIST) {
-                    return Err(Error::rejected(format!(
-                        "wiki cp cannot create {}: {err}",
-                        display.display()
-                    )));
-                }
-            }
-            let child = match open_dir_at(parent, name) {
-                Ok(file) => file,
-                Err(DirFail::Symlink) => return Err(refused_path(display, "symlink")),
-                Err(DirFail::NotDir) => return Err(refused_path(display, "not a directory")),
-                Err(DirFail::Missing) => {
-                    return Err(Error::rejected(format!(
-                        "wiki cp cannot create {}",
-                        display.display()
-                    )))
-                }
-                Err(DirFail::Io(err)) => {
-                    return Err(Error::rejected(format!(
-                        "wiki cp cannot create {}: {err}",
-                        display.display()
-                    )))
-                }
-            };
-            if created {
-                parent.sync_all().map_err(|err| {
-                    Error::rejected(format!("wiki cp cannot sync {}: {err}", display.display()))
-                })?;
-            }
-            Ok(child)
-        }
-        Err(DirFail::Symlink) => Err(refused_path(display, "symlink")),
-        Err(DirFail::NotDir) => Err(refused_path(display, "not a directory")),
-        Err(DirFail::Io(err)) => Err(Error::rejected(format!(
-            "wiki cp cannot open {}: {err}",
-            display.display()
-        ))),
-    }
-}
-
-fn component_cstr(seg: &std::ffi::OsStr, display: &Path) -> Result<CString> {
-    CString::new(os_str_bytes(seg)).map_err(|_| {
-        Error::rejected(format!(
-            "wiki cp refused '{}': path contains an interior nul — nothing was sent",
-            display.display()
-        ))
-    })
-}
-
-fn leaf_name(seg: &std::ffi::OsStr, display: &Path) -> Result<CString> {
-    let bytes = os_str_bytes(seg);
-    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&0) {
-        return Err(refused_path(display, "unsupported path"));
-    }
-    component_cstr(seg, display)
-}
-
-fn refuse_export_leaf(
-    dir: &File,
-    name: &std::ffi::CStr,
-    display: &Path,
-    update: bool,
-) -> Result<()> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(());
-        }
-        return Err(Error::rejected(format!(
-            "wiki cp cannot stat {}: {err}",
-            display.display()
-        )));
-    }
-    let kind = st.st_mode & libc::S_IFMT;
-    if kind == libc::S_IFLNK {
-        return Err(refused_path(display, "symlink"));
-    }
-    if kind != libc::S_IFREG {
-        return Err(refused_path(display, "not a regular file"));
-    }
-    if !update {
-        return Err(Error::rejected(format!(
-            "wiki cp refused to overwrite '{}' — pass --update",
-            display.display()
-        )));
-    }
-    Ok(())
-}
-
-fn refuse_symlink_chain(path: &Path) -> Result<()> {
-    let mut cur = PathBuf::new();
-    if path.is_absolute() {
-        cur.push(Component::RootDir);
-    }
-    let parent = path.parent().unwrap_or(path);
-    for component in parent.components() {
-        match component {
-            Component::RootDir => {}
-            Component::CurDir => continue,
-            Component::ParentDir => {
-                return Err(refused_path(path, "path escapes its parent"));
-            }
-            Component::Normal(_) => cur.push(component),
-            Component::Prefix(_) => return Err(refused_path(path, "unsupported path")),
-        }
-        if cur.as_os_str().is_empty() {
-            continue;
-        }
-        if let Ok(meta) = fs::symlink_metadata(&cur) {
-            if meta.file_type().is_symlink() {
-                return Err(refused_path(&cur, "symlink"));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0xf) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -2480,6 +1372,530 @@ mod tests {
         fn current_rev(&mut self, _path: &str) -> Result<String> {
             Ok(ABSENT.to_string())
         }
+    }
+
+    /// CAD-2261: the first cross-language vector. Every manifest the tenant
+    /// board admitted in the AOS-566 fixture (a byte-identical copy of
+    /// agenticos-v2 `apps/api/src/board/fixtures/wiki-transfer.contract.json`
+    /// at `67a3839ae1222b2e6a9be7904aca270f5a449aea`) must hash here to the
+    /// digest the board answered, or no hosted copy could ever begin.
+    #[test]
+    fn manifest_digest_matches_the_tenant_board_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/agenticos/wiki-transfer.contract.json"
+        ))
+        .unwrap();
+        let mut vectors = 0;
+        for step in fixture["steps"].as_array().unwrap() {
+            let transfer = &step["arguments"]["transfer"];
+            if transfer["op"] != "begin" || step["response"]["status"] != 200 {
+                continue;
+            }
+            let manifest: Manifest = serde_json::from_value(transfer["manifest"].clone()).unwrap();
+            check_manifest(&manifest).unwrap();
+            assert_eq!(
+                manifest_digest(&manifest).unwrap(),
+                step["response"]["body"]["digest"].as_str().unwrap(),
+                "{}",
+                step["label"]
+            );
+            vectors += 1;
+        }
+        assert!(vectors > 0, "the fixture holds no admitted manifest");
+    }
+
+    fn exit(error: &Error) -> i32 {
+        crate::error::exit_code_for_kind(error.kind())
+    }
+
+    /// CAD-2261: a board refusal wrapped as "wiki cp job J stopped on …"
+    /// keeps the board's code. CAD-2271: this client's own deadline stop
+    /// keeps `busy` and its code, so it exits 75 and `--resume` retries it.
+    #[test]
+    fn the_job_wrapper_keeps_the_board_code() {
+        let refused = job_refused(
+            "J",
+            "wiki cp job J stopped on 'a.bin'",
+            Error::invalid("stage_incomplete", "not all bytes yet (stage_incomplete)"),
+        );
+        assert_eq!(
+            (refused.kind(), refused.code()),
+            ("rejected", Some("stage_incomplete"))
+        );
+        assert_eq!(exit(&refused), 3);
+        assert!(refused.to_string().starts_with("wiki cp job J stopped"));
+        let late = job_refused(
+            "J",
+            "wiki cp job J finish stopped",
+            Error::busy_coded("timeout", "deadline elapsed"),
+        );
+        assert_eq!((late.kind(), late.code()), ("busy", Some("timeout")));
+        assert_eq!(exit(&late), 75);
+    }
+
+    /// CAD-2275: the board's record of an entry holding more bytes than its
+    /// pinned size cannot be fixed by resuming (a resume reads the same
+    /// record), so it says to copy again, before any chunk is sent.
+    #[test]
+    fn an_over_staged_entry_says_to_copy_again() {
+        struct OverStaged {
+            entry: String,
+            job_id: Option<String>,
+            operations: Vec<String>,
+        }
+        impl Channel for OverStaged {
+            fn transfer(&mut self, root: &str, op: Value, _write: bool) -> Result<Value> {
+                let name = op["op"].as_str().unwrap();
+                self.operations.push(name.to_string());
+                match name {
+                    "begin" => {
+                        let job_id = op["job_id"].as_str().unwrap().to_string();
+                        let manifest: Manifest =
+                            serde_json::from_value(op["manifest"].clone()).unwrap();
+                        let digest = manifest_digest(&manifest).unwrap();
+                        self.job_id = Some(job_id.clone());
+                        Ok(json!({"job_id": job_id, "digest": digest, "root": root}))
+                    }
+                    "status" => Ok(json!({
+                        "job_id": self.job_id.as_deref().unwrap(), "root": root,
+                        "entries": [{"entry_id": self.entry, "received": 10, "outcome": "pending"}],
+                        "next_offset": null
+                    })),
+                    other => panic!("unexpected transfer operation: {other}"),
+                }
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                panic!("create-only copy must not read a revision")
+            }
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("cad2275-")
+            .tempdir_in(cwd)
+            .unwrap();
+        fs::write(source.path().join("note.txt"), b"abc").unwrap();
+        let request = CopyRequest {
+            source: source.path().to_str().unwrap(),
+            dest: "wiki:global/synthetic",
+            recursive: true,
+            update: false,
+            resume: None,
+            wait_index: false,
+        };
+        let mut channel = OverStaged {
+            entry: entry_id("note.txt"),
+            job_id: None,
+            operations: Vec::new(),
+        };
+        let error = import_local(
+            &request,
+            "global/synthetic",
+            &mut channel,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert_eq!(channel.operations, ["begin", "status"], "no chunk was sent");
+        assert_eq!((error.kind(), exit(&error)), ("rejected", 3), "{text}");
+        assert!(
+            text.contains("holds 10 staged bytes for 'note.txt', more than its pinned size 3"),
+            "{text}"
+        );
+        assert!(text.contains("copy again without `--resume`"), "{text}");
+        assert!(text.contains("resuming this job cannot fix that"), "{text}");
+        assert!(!text.contains("this run did not apply"), "{text}");
+    }
+
+    /// CAD-2275: a `waking` stop names one next step. The wake budget's own
+    /// text says "retry", and a plain rerun would start a new job, so this
+    /// client says what happened and to resume the same job.
+    #[test]
+    fn a_waking_stop_names_one_next_step() {
+        let waking = job_refused(
+            "J",
+            "wiki cp job J apply 'a.md' stopped",
+            Error::busy_coded(
+                "waking",
+                "org 'demo' is still waking after 120s — retry, or pass a larger --wake-timeout",
+            ),
+        );
+        let text = waking.to_string();
+        assert_eq!(
+            (waking.kind(), waking.code(), exit(&waking)),
+            ("busy", Some("waking"), 75),
+            "{text}"
+        );
+        assert!(text.contains("the board did not run the request"), "{text}");
+        assert!(text.contains("resume with `--resume J`"), "{text}");
+        assert!(text.contains("a larger `--wake-timeout`"), "{text}");
+        assert!(!text.contains("retry"), "{text}");
+        assert!(!text.contains("still waking after"), "{text}");
+    }
+
+    /// CAD-2261: a mid-job stop tells the user one next step that works. A
+    /// job the board no longer has is copied again; an unchanged stop is
+    /// resumed; anything that may have reached the board or daemon (a lost
+    /// local reply is `internal`) is reconciled, never called refused.
+    /// CAD-2271: and its exit code says which: 3 refused, 75 stopped before
+    /// sending, 1 not confirmed.
+    #[test]
+    fn a_mid_job_stop_names_one_next_step_that_works() {
+        let gone = apply_stopped(
+            "J",
+            "a.bin",
+            Stop::Unchanged(Error::invalid(
+                "not_found",
+                "the board no longer has this copy job",
+            )),
+        );
+        let text = gone.to_string();
+        assert_eq!((gone.kind(), gone.code()), ("rejected", Some("not_found")));
+        assert_eq!(exit(&gone), 3);
+        assert!(text.contains("copy again without `--resume`"), "{text}");
+        assert!(!text.contains("--resume J"), "{text}");
+
+        let short = apply_stopped(
+            "J",
+            "a.bin",
+            Stop::Unchanged(Error::invalid("stage_incomplete", "not all bytes yet")),
+        );
+        let text = short.to_string();
+        assert_eq!(short.code(), Some("stage_incomplete"));
+        assert!(
+            text.starts_with("wiki cp job J apply 'a.bin' stopped: "),
+            "{text}"
+        );
+        assert!(text.contains("resume with `--resume J`"), "{text}");
+
+        let late = finish_stopped(
+            "J",
+            Stop::Unchanged(Error::busy_coded("timeout", "deadline elapsed")),
+        );
+        assert!(
+            late.to_string().contains("resume with `--resume J`"),
+            "{late}"
+        );
+        assert_eq!(
+            (late.kind(), late.code(), exit(&late)),
+            ("busy", Some("timeout"), 75)
+        );
+
+        // A lost reply may have committed: never "stopped" or "refused".
+        for lost in [
+            apply_stopped(
+                "J",
+                "a.bin",
+                Stop::Unconfirmed(Error::internal("io: timed out")),
+            ),
+            finish_stopped("J", Stop::Unconfirmed(Error::internal("io: timed out"))),
+            apply_stopped(
+                "J",
+                "a.bin",
+                Stop::Unconfirmed(Error::unknown("reply lost")),
+            ),
+            finish_stopped("J", Stop::Unconfirmed(Error::unknown("reply lost"))),
+        ] {
+            let text = lost.to_string();
+            assert!(text.contains("was not confirmed"), "{text}");
+            assert!(text.contains("reconcile"), "{text}");
+            assert!(
+                !text.contains("stopped") && !text.contains("refused"),
+                "{text}"
+            );
+            assert_eq!((lost.kind(), exit(&lost)), ("unknown", 1), "{text}");
+        }
+        // A native daemon can publish and then fail to record the outcome:
+        // its `busy`, a code-less `rejected` or its own code is not proof of
+        // no effect.
+        for after_publish in [
+            apply_stopped(
+                "J",
+                "a.md",
+                Stop::Unconfirmed(Error::busy_coded("busy", "guarded core writer is busy")),
+            ),
+            finish_stopped(
+                "J",
+                Stop::Unconfirmed(Error::busy_coded("busy", "guarded core writer is busy")),
+            ),
+            apply_stopped(
+                "J",
+                "a.md",
+                Stop::Unconfirmed(Error::rejected("the daemon's hosted lease is lost")),
+            ),
+            finish_stopped(
+                "J",
+                Stop::Unconfirmed(Error::invalid("storage_unavailable", "store unavailable")),
+            ),
+        ] {
+            let text = after_publish.to_string();
+            assert!(text.contains("was not confirmed"), "{text}");
+            assert!(!text.contains("stopped"), "{text}");
+            assert_eq!(exit(&after_publish), 1, "{text}");
+        }
+        let chunk = chunk_stopped(
+            "J",
+            "a.bin",
+            Stop::Unconfirmed(Error::internal("io: reset")),
+        );
+        assert!(
+            chunk
+                .to_string()
+                .contains("may or may not have been staged"),
+            "{chunk}"
+        );
+        assert_eq!(exit(&chunk), 1);
+        let chunk = chunk_stopped(
+            "J",
+            "a.bin",
+            Stop::Unchanged(Error::invalid("chunk_conflict", "differ")),
+        );
+        assert_eq!(chunk.code(), Some("chunk_conflict"));
+        assert_eq!(exit(&chunk), 3);
+        assert!(
+            chunk.to_string().contains("resume with `--resume J`"),
+            "{chunk}"
+        );
+        // CAD-2275: a local source problem stopped before this run applied
+        // the file. It is a refusal (exit 3) that speaks only for this run
+        // and names one next step that always works: a new copy. It never
+        // also says the chunk may or may not have been staged, so "nothing
+        // was sent" from a refused path cannot contradict the wrapper.
+        for source in [
+            Error::rejected("source 'a.bin' changed after the manifest was pinned"),
+            Error::rejected("source 'a.bin' shrank during copy"),
+            refused_path(Path::new("notes/a.bin"), "a symlink"),
+            Error::internal("io: read failed"),
+        ] {
+            let error = chunk_stopped("J", "a.bin", Stop::Client(source));
+            let text = error.to_string();
+            assert_eq!(
+                (error.kind(), error.code(), exit(&error)),
+                ("rejected", None, 3),
+                "{text}"
+            );
+            assert!(
+                text.contains("this run did not apply this file and did not finish the job"),
+                "{text}"
+            );
+            assert!(!text.contains("may or may not have been staged"), "{text}");
+            assert!(text.contains("copy again without `--resume`"), "{text}");
+            assert!(!text.contains("--resume J"), "{text}");
+        }
+        // A chunk answer this client could not read may have staged it.
+        let unread = chunk_stopped(
+            "J",
+            "a.bin",
+            Stop::Client(Error::unknown(
+                "chunk 'a.bin' did not confirm its received bytes",
+            )),
+        );
+        let text = unread.to_string();
+        assert_eq!(exit(&unread), 1);
+        assert!(text.contains("may or may not have been staged"), "{text}");
+    }
+
+    /// CAD-2271: a stop at the command deadline is decided before anything is
+    /// sent, so it is unchanged on every channel and exits 75.
+    #[test]
+    fn a_deadline_stop_sends_nothing_and_exits_busy() {
+        struct Counts(u32);
+        impl Channel for Counts {
+            fn transfer(&mut self, _root: &str, _op: Value, _write: bool) -> Result<Value> {
+                self.0 += 1;
+                Ok(json!({}))
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                Ok(ABSENT.to_string())
+            }
+        }
+        let mut channel = Counts(0);
+        let stop = send_step(
+            &mut channel,
+            "global/synthetic",
+            json!({"op": "finish", "job_id": "J", "root": "global/synthetic"}),
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(channel.0, 0, "nothing was sent");
+        let error = finish_stopped("J", stop);
+        let text = error.to_string();
+        assert_eq!(
+            (error.kind(), error.code(), exit(&error)),
+            ("busy", Some("timeout"), 75),
+            "{text}"
+        );
+        assert!(text.contains("resume with `--resume J`"), "{text}");
+    }
+
+    /// CAD-2271: a local daemon's code crosses the socket unchanged and its
+    /// refusal can follow a publish, so no code it sends makes a stop
+    /// definite. Only the hosted channel trusts the board's refusal table.
+    #[test]
+    fn a_coded_refusal_from_the_local_daemon_is_never_definite() {
+        let daemon = LocalChannel {
+            state_dir: Path::new("/nonexistent-cad2271"),
+            deadline: Instant::now(),
+        };
+        // The real hosted channel, never sent anything here.
+        let target = crate::remote_cli::RemoteTarget {
+            org: "synthetic".to_string(),
+            endpoint: "https://synthetic.invalid".to_string(),
+            org_id: "ws_synthetic".to_string(),
+            identity: None,
+        };
+        let hosted = RemoteChannel {
+            target: &target,
+            wake_timeout: 0,
+            deadline: Instant::now(),
+        };
+        let mut codes = 0;
+        for code in crate::remote_cli::wiki_copy_refusal_codes() {
+            let refusal = Error::invalid(code, "refused");
+            assert!(!daemon.proves_unchanged(&refusal), "{code}");
+            assert!(hosted.proves_unchanged(&refusal), "{code}");
+            codes += 1;
+        }
+        assert!(codes > 0);
+        for stop in [
+            Error::busy_coded("timeout", "deadline elapsed"),
+            Error::busy_coded("waking", "still waking"),
+        ] {
+            assert!(!daemon.proves_unchanged(&stop), "{stop}");
+            assert!(hosted.proves_unchanged(&stop), "{stop}");
+        }
+        for other in [
+            Error::rejected("no code"),
+            Error::invalid("storage_unavailable", "store unavailable"),
+            Error::busy_coded("busy", "writer is busy"),
+            Error::internal("io: reset"),
+            Error::unknown("reply lost"),
+        ] {
+            assert!(!hosted.proves_unchanged(&other), "{other}");
+        }
+
+        // Through a whole copy: the same refusal after `apply` is a stop on a
+        // hosted channel and "not confirmed" on any other.
+        struct RefusesApply {
+            hosted: bool,
+            refusal: Box<dyn Fn() -> Error>,
+            entry: String,
+            job_id: Option<String>,
+            operations: Vec<String>,
+        }
+        impl Channel for RefusesApply {
+            fn transfer(&mut self, root: &str, op: Value, _write: bool) -> Result<Value> {
+                let name = op["op"].as_str().unwrap();
+                self.operations.push(name.to_string());
+                match name {
+                    "begin" => {
+                        let job_id = op["job_id"].as_str().unwrap().to_string();
+                        let manifest: Manifest =
+                            serde_json::from_value(op["manifest"].clone()).unwrap();
+                        let digest = manifest_digest(&manifest).unwrap();
+                        self.job_id = Some(job_id.clone());
+                        Ok(json!({"job_id": job_id, "digest": digest, "root": root}))
+                    }
+                    "status" => Ok(json!({
+                        "job_id": self.job_id.as_deref().unwrap(), "root": root,
+                        "entries": [{"entry_id": self.entry, "received": 0, "outcome": "pending"}],
+                        "next_offset": null
+                    })),
+                    "chunk" => {
+                        let sent = base64::engine::general_purpose::STANDARD
+                            .decode(op["data_base64"].as_str().unwrap())
+                            .unwrap()
+                            .len() as u64;
+                        Ok(json!({
+                            "job_id": self.job_id.as_deref().unwrap(),
+                            "entry_id": self.entry,
+                            "received": op["offset"].as_u64().unwrap() + sent,
+                        }))
+                    }
+                    "apply" => Err((self.refusal)()),
+                    other => panic!("unexpected transfer operation: {other}"),
+                }
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                panic!("create-only copy must not read a revision")
+            }
+            fn proves_unchanged(&self, error: &Error) -> bool {
+                self.hosted && hosted_stop_is_unchanged(error)
+            }
+        }
+
+        let cwd = std::env::current_dir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("cad2271-")
+            .tempdir_in(cwd)
+            .unwrap();
+        fs::write(source.path().join("note.txt"), b"abc").unwrap();
+        let request = CopyRequest {
+            source: source.path().to_str().unwrap(),
+            dest: "wiki:global/synthetic",
+            recursive: true,
+            update: false,
+            resume: None,
+            wait_index: false,
+        };
+        let run = |hosted: bool, code: &'static str| {
+            let mut channel = RefusesApply {
+                hosted,
+                refusal: Box::new(move || Error::invalid(code, "refused after apply")),
+                entry: entry_id("note.txt"),
+                job_id: None,
+                operations: Vec::new(),
+            };
+            let error = import_local(
+                &request,
+                "global/synthetic",
+                &mut channel,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert_eq!(channel.operations, ["begin", "status", "chunk", "apply"]);
+            error
+        };
+        for code in crate::remote_cli::wiki_copy_refusal_codes() {
+            let error = run(false, code);
+            let text = error.to_string();
+            assert_eq!(
+                (error.kind(), exit(&error)),
+                ("unknown", 1),
+                "{code}: {text}"
+            );
+            assert!(text.contains("was not confirmed"), "{code}: {text}");
+            assert!(!text.contains("stopped"), "{code}: {text}");
+        }
+        let error = run(true, "not_found");
+        let text = error.to_string();
+        assert_eq!(
+            (error.kind(), error.code(), exit(&error)),
+            ("rejected", Some("not_found"), 3),
+            "{text}"
+        );
+        assert!(text.contains("copy again without `--resume`"), "{text}");
+    }
+
+    /// CAD-2260: a hosted board names a missing path by code, with no
+    /// "not found" wording. Discovery must read that as a new import root, and
+    /// must not hide any other refusal.
+    #[test]
+    fn a_hosted_not_found_is_a_new_destination_for_discovery() {
+        let missing = || Error::invalid("not_found", "no page at that path (HTTP 404)");
+        assert!(is_absent(&missing()));
+        discover_read_or_list(Err(missing()), || unreachable!("absent needs no listing")).unwrap();
+        let denied = Error::invalid("forbidden", "not permitted (HTTP 403)");
+        assert!(!is_absent(&denied));
+        assert!(discover_read_or_list(Err(denied), || unreachable!()).is_err());
     }
 
     #[test]
@@ -2744,5 +2160,101 @@ mod tests {
         assert!(!outside.join("nested").exists());
         assert!(!real.join("nested").exists());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    // CAD-2009: independently authored by the ticket author.
+    #[test]
+    fn cad2009_unproved_copy_receipts_remain_unknown_without_replay() {
+        struct Uncertain {
+            scenario: u8,
+            entry: String,
+            job_id: Option<String>,
+            operations: Vec<String>,
+        }
+        impl Channel for Uncertain {
+            fn transfer(&mut self, root: &str, op: Value, _write: bool) -> Result<Value> {
+                let name = op["op"].as_str().unwrap();
+                self.operations.push(name.to_string());
+                Ok(match name {
+                    "begin" => {
+                        let job_id = op["job_id"].as_str().unwrap();
+                        uuid::Uuid::parse_str(job_id).unwrap();
+                        self.job_id = Some(job_id.to_string());
+                        if self.scenario == 5 {
+                            return Err(Error::unknown("synthetic lost begin reply"));
+                        }
+                        let manifest: Manifest =
+                            serde_json::from_value(op["manifest"].clone()).unwrap();
+                        let digest = if self.scenario == 3 {
+                            "0".repeat(64)
+                        } else {
+                            manifest_digest(&manifest).unwrap()
+                        };
+                        json!({"job_id": job_id, "digest": digest, "root": root})
+                    }
+                    "status" => json!({
+                        "job_id": self.job_id.as_deref().unwrap(), "root": root,
+                        "entries": [{"entry_id": self.entry, "received": if self.scenario == 0 { 0 } else { 3 }, "outcome": "pending"}],
+                        "next_offset": null
+                    }),
+                    "chunk" => {
+                        json!({"job_id": self.job_id.as_deref().unwrap(), "entry_id": self.entry})
+                    }
+                    "apply" if self.scenario == 1 => {
+                        json!({"entry_id": self.entry, "outcome": "unresolved"})
+                    }
+                    "apply" if self.scenario == 4 => {
+                        json!({"entry_id": self.entry, "job_id": null, "outcome": "applied"})
+                    }
+                    "apply" => json!({"entry_id": self.entry}),
+                    _ => panic!("unexpected transfer operation: {name}"),
+                })
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                panic!("create-only copy must not read a revision")
+            }
+        }
+
+        let cwd = std::env::current_dir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("cad2009-")
+            .tempdir_in(cwd)
+            .unwrap();
+        fs::write(source.path().join("note.txt"), b"abc").unwrap();
+        let request = CopyRequest {
+            source: source.path().to_str().unwrap(),
+            dest: "wiki:global/synthetic",
+            recursive: true,
+            update: false,
+            resume: None,
+            wait_index: false,
+        };
+        for scenario in 0..6 {
+            let mut channel = Uncertain {
+                scenario,
+                entry: entry_id("note.txt"),
+                job_id: None,
+                operations: Vec::new(),
+            };
+            let error = import_local(
+                &request,
+                "global/synthetic",
+                &mut channel,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), "unknown", "scenario {scenario}: {error}");
+            let job_id = channel.job_id.as_deref().unwrap();
+            assert!(error.to_string().contains(&format!("--resume {job_id}")));
+            if scenario == 3 || scenario == 5 {
+                assert_eq!(channel.operations, ["begin"]);
+            } else {
+                let last = if scenario == 0 { "chunk" } else { "apply" };
+                assert_eq!(channel.operations, ["begin", "status", last]);
+            }
+        }
     }
 }

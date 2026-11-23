@@ -149,10 +149,6 @@ pub fn install(pm_dir: &Path) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod cad1255_acceptance;
-#[cfg(test)]
-mod cad1256_acceptance;
-#[cfg(test)]
 mod cad1256_staged_lint;
 
 #[cfg(test)]

@@ -2,526 +2,34 @@
 //!
 //! The tracker Git tree is the source of truth. The SQLite database is a
 //! disposable search cache: a changed wiki tree rebuilds it in one transaction,
-//! including moves and removals. No caller identity is stored in the index;
-//! every hit is checked against the wiki's existing path allowlist at query time.
+//! including moves and removals. Separate project and personal corpora prevent
+//! inaccessible pages from influencing a caller's search ranking; every hit is
+//! also checked against the wiki's path allowlist at query time.
 
-use std::collections::HashMap;
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use super::{allowed, normalize, normalize_dir, vault_dir, Caller, Op, SEARCH_CAP, TEXT_CAP};
+use super::{allowed, normalize_dir, vault_dir, Caller, Op, SEARCH_CAP};
 use crate::error::{Error, Result};
 use crate::issue::Pm;
 
-// v2 rebuilds indexes created before committed Git objects became the
-// source of the indexed text (v1 read the mutable worktree).
-const SCHEMA: &str = "wiki-fts-v2";
-const CHUNK_BYTES: usize = 4096;
+mod db;
+mod scan;
 
-fn db_error(error: rusqlite::Error) -> Error {
-    Error::internal(format!("wiki index: {error}"))
-}
-
-/// The index file path under the daemon state dir — named so the
-/// operator doc, a backup and a test all agree on the disposable file.
-pub fn db_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("wiki-search.sqlite3")
-}
-
-fn open(state_dir: &Path) -> Result<Connection> {
-    std::fs::create_dir_all(state_dir)?;
-    let conn = Connection::open(db_path(state_dir)).map_err(db_error)?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(db_error)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS wiki_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-    )
-    .map_err(db_error)?;
-    let chunks_exist: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_index_chunks')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_error)?;
-    if !chunks_exist {
-        conn.execute_batch(
-            "DELETE FROM wiki_index_meta WHERE key IN ('revision','schema');
-             CREATE VIRTUAL TABLE wiki_index_chunks USING fts5(
-             path UNINDEXED, title, heading, body, line UNINDEXED,
-             rev UNINDEXED, source UNINDEXED, tokenize='unicode61 remove_diacritics 2'
-         );",
-        )
-        .map_err(db_error)?;
-    }
-    let check: String = conn
-        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
-        .map_err(db_error)?;
-    if check != "ok" {
-        return Err(Error::internal(format!(
-            "wiki index integrity check: {check}"
-        )));
-    }
-    Ok(conn)
-}
-
-fn open_status(state_dir: &Path) -> Result<Option<Connection>> {
-    let path = db_path(state_dir);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let conn =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_error)?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(db_error)?;
-    let check: String = conn
-        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
-        .map_err(db_error)?;
-    if check != "ok" {
-        return Err(Error::internal(format!(
-            "wiki index integrity check: {check}"
-        )));
-    }
-    let chunks_exist: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_index_chunks')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_error)?;
-    if !chunks_exist {
-        return Err(Error::internal("wiki index FTS table is missing"));
-    }
-    Ok(Some(conn))
-}
-
-/// The database is derived data. Preserve a broken copy for diagnosis and
-/// recreate it from the wiki tree; only the refresh/search path repairs it.
-fn open_repair(state_dir: &Path) -> Result<Connection> {
-    match open(state_dir) {
-        Ok(conn) => Ok(conn),
-        Err(first) => {
-            let diagnosis = first.to_string();
-            if !diagnosis.contains("not a database")
-                && !diagnosis.contains("malformed")
-                && !diagnosis.contains("integrity check")
-            {
-                return Err(first); // Busy, permissions and I/O errors are not corruption.
-            }
-            let path = db_path(state_dir);
-            if !path.is_file() {
-                return Err(first);
-            }
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let quarantine = state_dir.join(format!("wiki-search.sqlite3.corrupt-{stamp}"));
-            std::fs::rename(&path, &quarantine)?;
-            open(state_dir).map_err(|e| {
-                Error::internal(format!(
-                    "wiki index repair failed after saving {} ({first}): {e}",
-                    quarantine.display()
-                ))
-            })
-        }
-    }
-}
-
-/// Read one `wiki_index_meta` key; `None` when absent.
-fn meta_get(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM wiki_index_meta WHERE key=?1",
-        [key],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-}
-
-/// Upsert one `wiki_index_meta` key inside `tx`.
-fn meta_put(tx: &rusqlite::Transaction, key: &str, value: &str) -> Result<()> {
-    tx.execute(
-        "INSERT INTO wiki_index_meta(key,value) VALUES (?1,?2)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![key, value],
-    )
-    .map_err(db_error)?;
-    Ok(())
-}
-
-/// What the index freshness is keyed on. The committed Git tree of the vault
-/// changes only when the wiki changes — unlike the tracker HEAD, which advances
-/// for every issue and report. A vault outside the tracker has no Git tree to
-/// observe (`Untracked`): the index then rebuilds on each query until that
-/// layout has a committed source of truth, and never reports itself current.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Source {
-    /// `git rev-parse HEAD:<vault-rel>` — the committed tree oid, or
-    /// `"absent"` when the vault is not yet committed.
-    Tree(String),
-    /// The vault is not inside the tracker's Git — no revision exists.
-    Untracked,
-}
-
-impl Source {
-    /// The meta `revision` value: the oid, `"absent"`, or `"untracked"`.
-    fn value(&self) -> &str {
-        match self {
-            Source::Tree(t) => t.as_str(),
-            Source::Untracked => "untracked",
-        }
-    }
-}
-
-fn source_revision(pm: &Pm, vault: &Path) -> Result<Source> {
-    let Ok(rel) = vault.strip_prefix(&pm.dir) else {
-        return Ok(Source::Untracked);
-    };
-    let Some(rel) = rel.to_str().map(|s| s.replace('\\', "/")) else {
-        return Ok(Source::Untracked);
-    };
-    let tree = format!("HEAD:{rel}");
-    match crate::issue::git(&pm.dir, &["rev-parse", "--verify", &tree]) {
-        Ok(oid) => Ok(Source::Tree(oid)),
-        Err(e) => {
-            // A tracked vault can be absent before its first wiki write;
-            // a failed Git command against an existing path is an error.
-            let listing = crate::issue::git(&pm.dir, &["ls-tree", "HEAD", &rel])?;
-            if listing.is_empty() {
-                Ok(Source::Tree("absent".to_string()))
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-fn pages(vault: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let mut stack = ["global", "projects", "agents", "users"]
-        .into_iter()
-        .map(|root| vault.join(root))
-        .collect::<Vec<_>>();
-    let mut found = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let meta = path.symlink_metadata()?;
-            if meta.file_type().is_symlink() || entry.file_name().to_string_lossy().starts_with('.')
-            {
-                continue;
-            }
-            if meta.is_dir() {
-                stack.push(path);
-            } else if meta.is_file() && meta.len() <= TEXT_CAP {
-                let rel = path
-                    .strip_prefix(vault)
-                    .map_err(|e| Error::internal(e.to_string()))?;
-                let name = rel.to_string_lossy().replace('\\', "/");
-                if !name.ends_with(".blob") && normalize(&name).is_ok() {
-                    found.push((name, path));
-                }
-            }
-        }
-    }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(found)
-}
-
-/// A generated extraction is searchable only while its raw pointer still
-/// names the exact bytes it describes. This also handles a failed conversion,
-/// a removed PDF, and a PDF move without returning old source text.
-fn current_extraction(vault: &Path, path: &str, text: &str) -> bool {
-    let Some(source) = path.strip_suffix(".extracted.md") else {
-        return true;
-    };
-    if !text.starts_with("---\nkind: extracted-source\n") {
-        return true; // An ordinary page happens to use this suffix.
-    }
-    let pointer = vault.join(format!("{source}.blob"));
-    let Ok(raw) = std::fs::read_to_string(pointer) else {
-        return false;
-    };
-    current_extraction_with_pointer(path, text, Some(&raw))
-}
-
-fn current_extraction_with_pointer(path: &str, text: &str, pointer: Option<&str>) -> bool {
-    let Some(source) = path.strip_suffix(".extracted.md") else {
-        return true;
-    };
-    if !text.starts_with("---\nkind: extracted-source\n") {
-        return true;
-    }
-    let Some(raw) = pointer else {
-        return false;
-    };
-    let Ok(meta) = serde_json::from_str::<Value>(raw) else {
-        return false;
-    };
-    let Some(sha) = meta["sha256"].as_str() else {
-        return false;
-    };
-    let Ok(source_path) = serde_json::to_string(source) else {
-        return false;
-    };
-    text.starts_with(&format!(
-        "---\nkind: extracted-source\nsource_path: {source_path}\nsource_sha256: {sha}\n"
-    ))
-}
-
-/// Read immutable Git objects for one captured wiki tree. A concurrent
-/// writer may advance HEAD or change the worktree, but neither can change
-/// these objects. Git's NUL record separator handles every accepted path.
-fn git_bytes(pm: &Pm, args: &[&str]) -> Result<Vec<u8>> {
-    let out = crate::reaper::output(Command::new("git").arg("-C").arg(&pm.dir).args(args))?;
-    if !out.status.success() {
-        return Err(Error::internal(format!(
-            "wiki index git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(out.stdout)
-}
-
-fn tracked_entries(pm: &Pm, tree: &str) -> Result<Vec<(String, String)>> {
-    if tree == "absent" {
-        return Ok(Vec::new());
-    }
-    let listing = git_bytes(pm, &["ls-tree", "-r", "-z", tree])?;
-    let mut found = Vec::new();
-    for record in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let Some(tab) = record.iter().position(|b| *b == b'\t') else {
-            return Err(Error::internal("wiki index: invalid git tree record"));
-        };
-        let header = std::str::from_utf8(&record[..tab])
-            .map_err(|e| Error::internal(format!("wiki index tree header: {e}")))?;
-        let Some(oid) = header
-            .strip_prefix("100644 blob ")
-            .or_else(|| header.strip_prefix("100755 blob "))
-        else {
-            continue; // A symlink or gitlink is never a wiki page.
-        };
-        let Ok(path) = std::str::from_utf8(&record[tab + 1..]) else {
-            continue;
-        };
-        if !matches!(
-            path.split('/').next(),
-            Some("global" | "projects" | "agents" | "users")
-        ) || path.split('/').any(|seg| seg.starts_with('.'))
-        {
-            continue;
-        }
-        let logical = path.strip_suffix(".blob").unwrap_or(path);
-        if normalize(logical).is_ok() {
-            found.push((path.to_string(), oid.to_string()));
-        }
-    }
-    Ok(found)
-}
-
-fn split_line(line: &str) -> Vec<&str> {
-    if line.len() <= CHUNK_BYTES {
-        return vec![line];
-    }
-    let mut out = Vec::new();
-    let mut start = 0;
-    while start < line.len() {
-        let mut end = (start + CHUNK_BYTES).min(line.len());
-        while !line.is_char_boundary(end) {
-            end -= 1;
-        }
-        out.push(&line[start..end]);
-        start = end;
-    }
-    out
-}
-
-fn chunks(text: &str) -> Vec<(usize, String, String)> {
-    let mut out = Vec::new();
-    let mut body = String::new();
-    let mut heading = String::new();
-    let mut start_line = 1;
-    for (i, line) in text.lines().enumerate() {
-        if line.starts_with('#') && !body.is_empty() {
-            out.push((start_line, heading.clone(), std::mem::take(&mut body)));
-        }
-        if line.starts_with('#') {
-            heading = line.trim_start_matches('#').trim().to_string();
-        }
-        for part in split_line(line) {
-            if !body.is_empty() && body.len() + part.len() + 1 > CHUNK_BYTES {
-                out.push((start_line, heading.clone(), std::mem::take(&mut body)));
-            }
-            if body.is_empty() {
-                start_line = i + 1;
-            }
-            body.push_str(part);
-            body.push('\n');
-        }
-    }
-    if !body.is_empty() {
-        out.push((start_line, heading, body));
-    }
-    out
-}
-
-/// What one rebuild counted — fed to `wiki_index_meta` and to the
-/// operator health surface.
-#[derive(Debug, Default, Clone, Copy)]
-struct Scan {
-    /// Source files whose normalized name is indexable (`.extracted.md`
-    /// included, `.blob` and dotfiles excluded).
-    pages: usize,
-    /// Chunks committed.
-    chunks: usize,
-    /// Pages skipped for a refused read or a provenance/mixed-source rule.
-    skipped: usize,
-}
-
-fn rebuild(conn: &mut Connection, pm: &Pm, vault: &Path, source: &Source) -> Result<Scan> {
-    let started = Instant::now();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db_error)?;
-    tx.execute("DELETE FROM wiki_index_chunks", [])
-        .map_err(db_error)?;
-    let mut scan = Scan::default();
-    {
-        let mut insert = tx
-            .prepare("INSERT INTO wiki_index_chunks(path,title,heading,body,line,rev,source) VALUES (?1,?2,?3,?4,?5,?6,?7)")
-            .map_err(db_error)?;
-        let entries = match source {
-            Source::Tree(tree) => tracked_entries(pm, tree)?,
-            Source::Untracked => pages(vault)?
-                .into_iter()
-                .map(|(path, file)| (path, file.to_string_lossy().into_owned()))
-                .collect(),
-        };
-        let mut pointers = HashMap::new();
-        if matches!(source, Source::Tree(_)) {
-            for (path, oid) in &entries {
-                if path.ends_with(".blob") {
-                    let bytes = git_bytes(pm, &["cat-file", "blob", oid])?;
-                    if bytes.len() <= 4096 {
-                        if let Ok(text) = String::from_utf8(bytes) {
-                            pointers.insert(path.clone(), text);
-                        }
-                    }
-                }
-            }
-        }
-        for (path, location) in entries {
-            if path.ends_with(".blob") {
-                continue;
-            }
-            let bytes = match source {
-                Source::Tree(_) => git_bytes(pm, &["cat-file", "blob", &location])?,
-                Source::Untracked => std::fs::read(&location)?,
-            };
-            if bytes.len() as u64 > TEXT_CAP {
-                scan.skipped += 1;
-                continue;
-            }
-            let rev = super::rev_bytes(&bytes);
-            let Ok(text) = String::from_utf8(bytes) else {
-                scan.skipped += 1;
-                continue;
-            };
-            let extraction_ok = match source {
-                Source::Tree(_) => {
-                    let pointer = format!("{}.blob", path.trim_end_matches(".extracted.md"));
-                    current_extraction_with_pointer(
-                        &path,
-                        &text,
-                        pointers.get(&pointer).map(String::as_str),
-                    )
-                }
-                Source::Untracked => current_extraction(vault, &path, &text),
-            };
-            if !extraction_ok {
-                scan.skipped += 1;
-                continue;
-            }
-            scan.pages += 1;
-            let title = text
-                .lines()
-                .find_map(|line| line.strip_prefix("# "))
-                .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path));
-            let page_source = path.strip_suffix(".extracted.md").unwrap_or(&path);
-            for (line, heading, body) in chunks(&text) {
-                insert
-                    .execute(params![
-                        path,
-                        title,
-                        heading,
-                        body,
-                        line as i64,
-                        rev,
-                        page_source
-                    ])
-                    .map_err(db_error)?;
-                scan.chunks += 1;
-            }
-        }
-    }
-    // Rows + revision commit atomically: a reader on another connection
-    // sees either the old complete snapshot or this one — never half.
-    meta_put(&tx, "revision", source.value())?;
-    meta_put(&tx, "schema", SCHEMA)?;
-    meta_put(&tx, "last_refresh_at", &format!("{:.3}", epoch_now()))?;
-    meta_put(
-        &tx,
-        "last_refresh_ms",
-        &started.elapsed().as_millis().to_string(),
-    )?;
-    meta_put(&tx, "pages_indexed", &scan.pages.to_string())?;
-    meta_put(&tx, "chunks_indexed", &scan.chunks.to_string())?;
-    meta_put(&tx, "skipped_pages", &scan.skipped.to_string())?;
-    tx.commit().map_err(db_error)?;
-    Ok(scan)
-}
-
-/// The stored `(schema, revision)` pair — `None` when either key is
-/// absent (a fresh or wiped index).
-fn stored_meta(conn: &Connection) -> Option<(String, String)> {
-    let (schema, revision) = (meta_get(conn, "schema")?, meta_get(conn, "revision")?);
-    Some((schema, revision))
-}
-
-/// Why the committed snapshot does not match the stored one — the
-/// freshness reason the health surface reports and `ensure_current`
-/// acts on. `None` = the index already mirrors the committed tree.
-fn stale_reason(source: &Source, stored: Option<&(String, String)>) -> Option<String> {
-    match source {
-        Source::Untracked => Some(
-            "the vault is not inside the tracker's Git — no committed tree \
-             to prove freshness against; every query rebuilds"
-                .to_string(),
-        ),
-        Source::Tree(tree) => match stored {
-            None => Some("no index snapshot yet".to_string()),
-            Some((schema, _)) if schema != SCHEMA => Some(format!(
-                "schema changed ({schema} → {SCHEMA}); a rebuild rewrites the index"
-            )),
-            Some((_, old)) if old != tree => Some(format!(
-                "the wiki tree advanced past the indexed revision ({old} → {tree})"
-            )),
-            Some(_) => None,
-        },
-    }
-}
+pub use db::db_path;
+pub(super) use db::table_for;
+use db::{
+    chunk_tables, create_chunks, db_error, epoch_now, hex_of, meta_get, meta_put, open,
+    open_repair, open_status, CHUNK_BYTES, INDEX_GLOBAL, SCHEMA,
+};
+use scan::{rebuild, source_revision, stale_reason, stored_meta, Scan, Source};
 
 /// One process-wide writer for the index: two threads reaching
 /// `ensure_current` together take turns — the second sees the first's
@@ -578,14 +86,6 @@ fn query_terms(q: &str) -> Result<String> {
         return Err(Error::rejected("wiki search refused: empty query"));
     }
     Ok(terms.join(" AND "))
-}
-
-/// Wall-clock seconds for the `last_refresh_at` meta value.
-fn epoch_now() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
 }
 
 /// What one refresh run recorded — the fields `wiki_index_meta` keeps
@@ -864,13 +364,17 @@ impl IndexRefresh {
     }
 
     /// Spawn the refresh worker thread; the returned handle is joined at
-    /// shutdown after `close`.
-    pub fn spawn(self: &Arc<Self>) -> thread::JoinHandle<()> {
+    /// shutdown after `close`. Refusal is reported, never a panic.
+    pub(crate) fn spawn(self: &Arc<Self>) -> Option<crate::thread_budget::Budgeted<()>> {
         let me = Arc::clone(self);
-        thread::Builder::new()
-            .name("wiki-index-refresh".to_string())
-            .spawn(move || me.run())
-            .expect("spawn wiki-index-refresh")
+        match crate::thread_budget::spawn_named("wiki-index-refresh".to_string(), move || me.run())
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("cadence: wiki index refresh not started: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -892,7 +396,7 @@ fn search_with_hook(
     } else {
         norm.split('/').collect::<Vec<_>>()
     };
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     let expression = query_terms(q)?;
     let vault = vault_dir(pm)?;
     // A write may commit between the first freshness check and the
@@ -908,7 +412,7 @@ fn search_with_hook(
         // Read metadata first to establish the SQLite snapshot before
         // any concurrent index commit can land.
         let indexed = stored_meta(&tx);
-        let matches = search_from_connection(&tx, caller, &norm, &expression)?;
+        let matches = search_from_connection(&tx, pm, caller, &norm, &expression)?;
         after_hits();
         let after = source_revision(pm, &vault)?;
         let current = matches!(after, Source::Untracked)
@@ -928,54 +432,197 @@ fn search_with_hook(
 
 fn search_from_connection(
     conn: &Connection,
+    pm: &Pm,
     caller: &Caller,
     norm: &str,
     expression: &str,
 ) -> Result<Vec<Value>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT path,line,rev,heading,source,
-                    snippet(wiki_index_chunks,3,'','','…',32),
-                    bm25(wiki_index_chunks,0.0,6.0,3.0,1.0)
-             FROM wiki_index_chunks WHERE wiki_index_chunks MATCH ?1
-             ORDER BY 7, path, line",
-        )
-        .map_err(db_error)?;
-    let rows = stmt
-        .query_map([expression], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, f64>(6)?,
-            ))
-        })
-        .map_err(db_error)?;
+    // CAD-2187: authorization runs before ranking. Each project has its own
+    // table, so a query scores only the corpus it may read — the alternative
+    // (one table plus a `WHERE`) removes private rows from the result but not
+    // from the statistics `bm25` scores with, which is an observable channel.
+    let readable: Vec<String> =
+        crate::project_policy::readable(pm, &super::policy_spelling(caller))
+            .into_iter()
+            .collect();
+    let existing = chunk_tables(conn)?;
+    let mut tables: Vec<String> = vec![INDEX_GLOBAL.to_string()];
+    for key in &readable {
+        let table = table_for(&format!("projects/{key}"));
+        if existing.contains(&table) {
+            tables.push(table);
+        }
+    }
+    match caller {
+        Caller::Operator => tables.extend(
+            existing
+                .iter()
+                .filter(|table| table.starts_with("wiki_index_u_"))
+                .cloned(),
+        ),
+        Caller::User(owner) => {
+            let table = format!("wiki_index_u_{}", hex_of(owner));
+            if existing.contains(&table) {
+                tables.push(table);
+            }
+        }
+        _ => {}
+    }
     let mut matches = Vec::new();
-    for row in rows {
-        let (path, line, rev, heading, source, snippet, score) = row.map_err(db_error)?;
+    for table in tables {
+        let sql = format!(
+            "SELECT path,line,rev,heading,source,
+                    snippet({table},3,'','','…',32),
+                    bm25({table},0.0,6.0,3.0,1.0)
+             FROM {table} WHERE {table} MATCH ?1
+             ORDER BY 7, path, line"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(db_error)?;
+        let rows = stmt
+            .query_map([expression], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, f64>(6)?,
+                ))
+            })
+            .map_err(db_error)?;
+        let mut found = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        matches.append(&mut found);
+    }
+    // Scores come from different corpora, so they order within a project and
+    // not across one: the tie-break is the path, which is stable and readable.
+    matches.sort_by(|a, b| {
+        a.6.partial_cmp(&b.6)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let mut out = Vec::new();
+    for (path, line, rev, heading, source, snippet, score) in matches {
         if !norm.is_empty() && path != norm && !path.starts_with(&format!("{norm}/")) {
             continue;
         }
-        let rel = path.split('/').collect::<Vec<_>>();
-        if allowed(caller, Op::Read, &rel).is_err() {
+        if super::project_of_path(&path).is_some_and(|key| {
+            readable
+                .binary_search_by(|project| project.as_str().cmp(key))
+                .is_err()
+        }) {
             continue;
         }
-        matches.push(json!({"path":path,"line":line,"text":snippet.trim(),
-                            "heading":heading,"rev":rev,"source":source,"score":-score}));
-        if matches.len() >= SEARCH_CAP {
+        // The table already bounds the corpus by project; the coarse table
+        // still decides `users/` and `agents/` — and re-checking costs nothing.
+        let rel = path.split('/').collect::<Vec<_>>();
+        if !super::allowed_by_table(caller, Op::Read, &rel).is_ok() {
+            continue;
+        }
+        out.push(json!({"path":path,"line":line,"text":snippet.trim(),
+                        "heading":heading,"rev":rev,"source":source,"score":-score}));
+        if out.len() >= SEARCH_CAP {
             break;
         }
     }
-    Ok(matches)
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CAD-2187: a private project's pages are not in a caller's results, and
+    /// the filter is a literal project prefix rather than a pattern — a
+    /// readable `a-b` must not admit the resembling `axb`. (CAD-2215 refuses a
+    /// tracker holding a key outside `[a-z0-9-]`, so `a_b` is no longer a key.)
+    #[test]
+    fn search_returns_only_the_projects_the_caller_may_read() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        for (key, policy) in [
+            (
+                "secret",
+                "policy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+            ),
+            (
+                "a-b",
+                "policy:\n  version: 3\n  visibility: private\n  members:\n  - users/rob\n",
+            ),
+            (
+                "axb",
+                "policy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+            ),
+        ] {
+            let dir = pm.dir.join(key);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("project.yaml"),
+                format!(
+                    "key: {key}\nprefix: {}\n{policy}",
+                    key.replace('-', "").to_uppercase()
+                ),
+            )
+            .unwrap();
+        }
+        for path in [
+            "projects/secret/theodolite.md",
+            "projects/a-b/theodolite.md",
+            "projects/axb/theodolite.md",
+            "global/theodolite.md",
+        ] {
+            super::super::write(&pm, &Caller::Operator, path, "# Page\ntheodolite\n", None)
+                .unwrap();
+        }
+        let state = root.path().join("state");
+        let paths = |caller: &Caller| -> Vec<String> {
+            let found = search_with_hook(&pm, &state, caller, "theodolite", "", || {}).unwrap();
+            found["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // The grant reads its project; a stranger reads neither it nor the
+        // project whose key merely resembles it.
+        let mia = Caller::User("mia".to_string());
+        let rob = Caller::User("rob".to_string());
+        let theirs = paths(&mia);
+        assert!(
+            theirs.iter().any(|p| p.starts_with("projects/secret/")),
+            "{theirs:?}"
+        );
+        assert!(
+            theirs.iter().any(|p| p.starts_with("projects/axb/")),
+            "{theirs:?}"
+        );
+        assert!(
+            !theirs.iter().any(|p| p.starts_with("projects/a-b/")),
+            "{theirs:?}"
+        );
+        let mine = paths(&rob);
+        assert!(
+            mine.iter().any(|p| p.starts_with("projects/a-b/")),
+            "{mine:?}"
+        );
+        assert!(
+            !mine.iter().any(|p| p.starts_with("projects/secret/")),
+            "{mine:?}"
+        );
+        assert!(
+            !mine.iter().any(|p| p.starts_with("projects/axb/")),
+            "{mine:?}"
+        );
+        // `global/` has no project, so every caller still searches it.
+        for found in [&theirs, &mine] {
+            assert!(found.iter().any(|p| p.starts_with("global/")), "{found:?}");
+        }
+    }
 
     #[test]
     fn search_retries_when_a_removal_commits_after_hits_are_read() {

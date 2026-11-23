@@ -44,6 +44,22 @@ pub(super) struct ScreenServiceProof {
     confirmed: Option<(Value, Value)>,
     csv_confirmation: Option<(String, String)>,
     command_args: Option<Value>,
+    /// CAD-2379, CAD-2717: who the live session is, derived from the live
+    /// session, never from a frame field.
+    actor: ScreenActor,
+}
+
+/// CAD-2717: the live session's person, decided once where the proof is
+/// built. `Operator` is a positive fact (a native operator origin, or a
+/// public session whose board user is an operator); operator-only
+/// operations admit it and nothing else.
+#[derive(Clone)]
+enum ScreenActor {
+    Operator,
+    /// A board member; carries its project-policy spelling (CAD-2379).
+    Member {
+        policy_actor: String,
+    },
 }
 
 impl ScreenServiceProof {
@@ -55,6 +71,15 @@ impl ScreenServiceProof {
             .context_id
             .as_deref()
             .ok_or_else(|| screen_access_denied("missing screen context"))
+    }
+    pub(super) fn policy_actor(&self) -> &str {
+        match &self.actor {
+            ScreenActor::Operator => "operator",
+            ScreenActor::Member { policy_actor } => policy_actor,
+        }
+    }
+    pub(super) fn is_operator(&self) -> bool {
+        matches!(self.actor, ScreenActor::Operator)
     }
     pub(super) fn csv_confirmation(&self) -> Option<(&str, &str)> {
         self.csv_confirmation
@@ -83,24 +108,7 @@ impl ScreenServiceConfirmation {
 }
 
 #[cfg(test)]
-impl Shared {
-    /// Test-only clock seam: age every held confirmation past
-    /// [`CONFIRM_TTL`] so the expiry refusal runs without sleeping.
-    #[cfg(feature = "test-seam")]
-    pub(crate) fn age_screen_confirmations_for_test(&self) {
-        let aged = Instant::now()
-            .checked_sub(CONFIRM_TTL)
-            .expect("monotonic clock covers the TTL");
-        for item in self
-            .screen_service_confirmations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values_mut()
-        {
-            item.issued = aged;
-        }
-    }
-}
+impl Shared {}
 
 struct CsvInFlight<'a> {
     key: String,
@@ -334,7 +342,25 @@ args!(WaBrief {
     conversation_id: String,
     guidance: String
 });
-args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, replace: Option<bool> });
+args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, params: Option<Value>, replace: Option<bool> });
+/// CAD-2555: a route patch's `params` — an object of at most six plain-text
+/// values under `[a-z_]{1,24}` names. Types, dates and enums are the app's
+/// declared view's to check; the shell only keeps the set bounded and plain.
+fn check_route_params(params: &Value) -> Result<()> {
+    use crate::issue::app_screen_decl as decl;
+    let ok = params.as_object().is_some_and(|map| {
+        map.len() <= decl::MAX_VIEW_PARAMS
+            && map.iter().all(|(name, value)| {
+                decl::valid_view_param_name(name)
+                    && value.as_str().is_some_and(decl::valid_view_param_value)
+            })
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::rejected("invalid route params"))
+    }
+}
 // CAD-1662: Works content. Bounds follow the store's grammar; the daemon
 // re-validates every field, these structs only close the shape.
 args!(WorksId { id: String });
@@ -352,6 +378,12 @@ args!(WorksRequestReviewArgs {
 });
 args!(WorksReviewArgs { id: String, revision: i64, decision: Option<String>, note: Option<String> });
 args!(WorksExportArgs { id: String, revision: i64, format: Option<String> });
+// CAD-2379: the dated read's window. The shape is closed here; the day
+// grammar and the span bound are enforced by `app_calendar_query::parse_window`.
+args!(CalendarQueryArgs {
+    from: String,
+    to: String
+});
 // CAD-1827: campaign work. Scope and the writing actor are host-derived;
 // the body carries only the campaign, the CAS token and the values. Nulls
 // are kept (a typed round-trip would drop an explicit clear), so `save`
@@ -394,6 +426,15 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         // CAD-1827: a campaign work read is the campaign alone; a save keeps
         // its explicit nulls so `null` clears instead of disappearing.
         CampaignWorkShow => typed::<CampaignId>(value),
+        CalendarQuery => {
+            let args: CalendarQueryArgs = serde_json::from_value(value.clone()).map_err(|_| {
+                Error::rejected("screen service arguments exceed their closed shape")
+            })?;
+            super::app_calendar_query::parse_window(&args.from, &args.to)?;
+            typed::<CalendarQueryArgs>(value)
+        }
+        // CAD-2402: the call takes no arguments; any key is refused.
+        RoutinesList => typed::<Empty>(value),
         CampaignWorkSave => {
             let _: CampaignWorkSaveArgs = serde_json::from_value(value.clone()).map_err(|_| {
                 Error::rejected("screen service arguments exceed their closed shape")
@@ -453,6 +494,9 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
                 .map_err(|_| Error::rejected("unsupported route patch"))?;
             if value.get("replace").is_some_and(|flag| !flag.is_boolean()) {
                 return Err(Error::rejected("route replace must be a boolean"));
+            }
+            if let Some(params) = value.get("params") {
+                check_route_params(params)?;
             }
             Ok(value.clone())
         }
@@ -594,6 +638,10 @@ fn native_method(operation: ScreenOperation) -> Result<&'static str> {
         // CAD-1827: the paired campaign-work contract's two operations.
         CampaignWorkShow => "crm_campaign_work_show",
         CampaignWorkSave => "crm_campaign_work_save",
+        // CAD-2379: served by the host itself, never a daemon RPC method.
+        CalendarQuery => "app_calendar_query",
+        // CAD-2402: served by the host itself, never a daemon RPC method.
+        RoutinesList => "app_routines_list",
         _ => {
             return Err(Error::rejected(
                 "screen operation has no implemented executor",
@@ -680,11 +728,20 @@ impl Shared {
         let (session, view) = self
             .tool_session(token, key, origin)
             .ok_or_else(|| screen_access_denied("screen service requires live operator session"))?;
-        let member = origin == Origin::Public
-            && !view
-                .user
-                .as_ref()
-                .is_some_and(crate::operator_auth::BoardUser::is_operator);
+        // CAD-2717: classify every origin explicitly, so a new kind of
+        // session must be placed here before it can be admitted at all.
+        let actor = match origin {
+            Origin::Loopback | Origin::Tailnet => ScreenActor::Operator,
+            Origin::Public => match view.user.as_ref() {
+                Some(user) if user.is_operator() => ScreenActor::Operator,
+                Some(user) => ScreenActor::Member {
+                    policy_actor: crate::project_policy::policy_user_actor(&user.sub),
+                },
+                None => ScreenActor::Member {
+                    policy_actor: "service/unresolved-member".to_string(),
+                },
+            },
+        };
         let context = self
             .tool_context_proven(action_token, &session)
             .map_err(|error| {
@@ -693,7 +750,7 @@ impl Shared {
         // CAD-1537: a member uses only a read-only mount, and a read-only
         // mount admits only the read allowlist — every write, SLOT
         // (prepare and confirm) and host command is refused here.
-        if member && !context.read_only {
+        if !matches!(actor, ScreenActor::Operator) && !context.read_only {
             return Err(screen_access_denied(
                 "screen service requires operator-role public session",
             ));
@@ -716,6 +773,7 @@ impl Shared {
             confirmed: None,
             csv_confirmation: None,
             command_args: None,
+            actor,
         })
     }
 
@@ -997,6 +1055,50 @@ impl Shared {
                 },
             );
         }
+        if proof.operation == CalendarQuery {
+            // The scope proof re-checks the live mount, the approved bundle
+            // and that this package declares the operation. The sources are
+            // gathered after it: each opens its own stores and the catalog,
+            // which must not nest inside the runtime snapshot it holds.
+            self.screen_service_scope(
+                proof.install(),
+                proof.context()?,
+                true,
+                Some(proof),
+                || Ok(()),
+            )?;
+            return self.screen_calendar_query(proof, &params);
+        }
+        if matches!(proof.operation, WorksQuery | WorksGet) {
+            // CAD-2683: the Works reads are in the read-only allowlist for the
+            // operator's canvas mount. Members also hold read-only mounts and
+            // the read runs as the operator, so only a verified operator
+            // session is admitted (CAD-2717).
+            if !proof.is_operator() {
+                return Err(screen_access_denied(
+                    "screen service requires operator-role public session",
+                ));
+            }
+        }
+        if proof.operation == RoutinesList {
+            // CAD-2402: routines are an operator read. A member session is
+            // already refused at the proof (members hold read-only mounts,
+            // which admit only the read allowlist); this is the second wall,
+            // and it admits only a verified operator session (CAD-2717).
+            if !proof.is_operator() {
+                return Err(screen_access_denied(
+                    "screen service requires operator-role public session",
+                ));
+            }
+            self.screen_service_scope(
+                proof.install(),
+                proof.context()?,
+                true,
+                Some(proof),
+                || Ok(()),
+            )?;
+            return self.screen_routines_list();
+        }
         if matches!(proof.operation, OriginShow | OriginManage) {
             params
                 .as_object_mut()
@@ -1148,7 +1250,6 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        use crate::issue::app_campaign_work as work;
         self.operator_connection("campaign work sources", params, peer_pid)?;
         if params.as_object().is_none_or(|fields| !fields.is_empty()) {
             return Err(Error::invalid(
@@ -1156,6 +1257,13 @@ impl Shared {
                 "campaign work sources takes no fields",
             ));
         }
+        self.campaign_work_inventory()
+    }
+
+    /// The discovery itself, after the caller's admission. CAD-2379: the
+    /// calendar read shares it, so both name the same live sources.
+    pub(super) fn campaign_work_inventory(&self) -> Result<Value> {
+        use crate::issue::app_campaign_work as work;
         let pm = self.pm_at(&self.pm_dir()?)?;
         let listed = workspace::list(&pm)?;
         let rows = match listed {
@@ -1678,6 +1786,9 @@ impl Shared {
         fields.remove("context_id");
         match proof.operation {
             ScreenRoutePatch => {
+                if let Some(params) = args.get("params") {
+                    check_route_params(params)?;
+                }
                 if let Some(view) = args.get("view").filter(|v| !v.is_null()) {
                     if !matches!(view.as_str(), Some("list" | "new")) {
                         return Err(Error::rejected("unsupported screen view"));
@@ -1869,5 +1980,68 @@ impl Shared {
             );
         }
         response(result)
+    }
+}
+
+#[cfg(test)]
+mod route_patch_params_tests {
+    use super::*;
+
+    #[test]
+    fn route_patch_params_refusals() {
+        let patch = |params: Value| json!({ "section": "a", "params": params });
+        let many: serde_json::Map<String, Value> = (0..7)
+            .map(|i| (format!("k{}", "a".repeat(i)), json!("v")))
+            .collect();
+        let six: serde_json::Map<String, Value> = (0..6)
+            .map(|i| (format!("k{}", "a".repeat(i)), json!("v")))
+            .collect();
+        let long_name = "a".repeat(25);
+        let ok_name = "a".repeat(24);
+        let ok_value = "x".repeat(200);
+        let long_value = "x".repeat(201);
+
+        let accepted = [
+            json!({ "section": "a" }),
+            json!({ "section": "a", "view": "v", "record_id": "r", "segment_id": "s", "replace": true }),
+            patch(json!({})),
+            patch(json!({ "q": "hello world", "sort_by": "name" })),
+            patch(json!({ ok_name.clone(): ok_value })),
+            patch(Value::Object(six)),
+        ];
+        for args in &accepted {
+            assert!(
+                call_args(ScreenOperation::ScreenRoutePatch, args).is_ok(),
+                "should accept {args}"
+            );
+        }
+
+        let refused = [
+            ("too many entries", patch(Value::Object(many))),
+            ("uppercase name", patch(json!({ "Q": "v" }))),
+            ("digit name", patch(json!({ "q1": "v" }))),
+            ("dash name", patch(json!({ "a-b": "v" }))),
+            ("empty name", patch(json!({ "": "v" }))),
+            ("overlong name", patch(json!({ long_name: "v" }))),
+            ("empty value", patch(json!({ "q": "" }))),
+            ("overlong value", patch(json!({ "q": long_value }))),
+            ("newline in value", patch(json!({ "q": "a\nb" }))),
+            ("nul in value", patch(json!({ "q": "a\u{0}b" }))),
+            ("number value", patch(json!({ "q": 1 }))),
+            ("bool value", patch(json!({ "q": true }))),
+            ("null value", patch(json!({ "q": null }))),
+            ("object value", patch(json!({ "q": {} }))),
+            ("array value", patch(json!({ "q": ["a"] }))),
+            ("params array", patch(json!(["a"]))),
+            ("params string", patch(json!("q=v"))),
+            ("params null", patch(Value::Null)),
+            ("unknown key", json!({ "section": "a", "bogus": "x" })),
+        ];
+        for (case, args) in &refused {
+            assert!(
+                call_args(ScreenOperation::ScreenRoutePatch, args).is_err(),
+                "should refuse {case}: {args}"
+            );
+        }
     }
 }

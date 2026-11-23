@@ -223,8 +223,11 @@ async function main() {
     row("stale")?.textContent?.includes("Withheld from agents"),
     "Accepted stale evidence stays withheld",
   );
+  const proposalRow = row("proposal");
   assert(
-    row("proposal")?.textContent?.includes("Awaiting PM finalization"),
+    proposalRow &&
+      proposalRow.textContent?.includes("Proposed") &&
+      !proposalRow.textContent?.toLowerCase().includes("available to agents"),
     "Passing proposal receipts do not mean available",
   );
   assert(

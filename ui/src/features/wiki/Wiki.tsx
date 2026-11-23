@@ -3,10 +3,13 @@ import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
+import { onPrivateReadsPaused } from "../../lib/privateSession";
 import Button from "../../ui/Button";
 import PageState from "../../ui/PageState";
+import { IconTrash, IconWarning } from "../../ui/icons";
 import {
   blobPage,
+  isMissingWikiFolder,
   wiki,
   WikiError,
   type WikiEntry,
@@ -33,11 +36,14 @@ import {
 } from "./shared";
 import FileExplorer from "./FileExplorer";
 import PagePane from "./PagePane";
+import { statusText, whoLabel } from "./hosted";
 import EditorPane from "./EditorPane";
-import FolderPane from "./FolderPane";
+import FolderPane, { type DeleteReceipt } from "./FolderPane";
 import UploadPane from "./UploadPane";
 import SearchPane from "./SearchPane";
 import HistoryPane from "./HistoryPane";
+import TrashPane from "./TrashPane";
+import { ManagedFilePane, ManagedList } from "./ManagedFileViews";
 import "./wiki.css";
 
 /**
@@ -56,10 +62,22 @@ export interface WikiProps {
   navHref: (route: Route) => string;
   /** Writes are blocked (read-only board or unsigned) — the reason is shown. */
   readOnly: boolean;
+  /** Why writes are blocked, when the board knows (App's `writeBlock`). */
+  readOnlyReason?: string | null;
   /** The acting agent, for the "you" marker and write attribution. */
   actor: string;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   scope?: WikiScope;
+  /** A hosted Worker board (undefined until the board's meta is known): uploads go through POST /api/wiki/upload instead of transfer jobs. */
+  hosted?: boolean;
+  /** The signed-in member's subject id, so hosted "edited by" can say "you". */
+  viewerSub?: string | null;
+  /** The proven operator (`true`), a proven non-operator (`false`) or
+   *  unknown (`null`/absent). Trash discovery is operator-only; `false`
+   *  never probes it and never guesses a host capability. */
+  operator?: boolean | null;
+  managedFiles?: boolean;
+  onManagedChange?: () => void;
 }
 
 type Open =
@@ -70,16 +88,35 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }: WikiProps) {
+function unavailableRevision(error: unknown): boolean {
+  return error instanceof WikiError && (
+    error.status === 404 ||
+    (error.status === 400 && (error.code === "invalid_request" || error.message.startsWith("wiki revision unavailable:")))
+  );
+}
+
+export default function Wiki({ route, navHref, readOnly, readOnlyReason, actor, onToast, scope, hosted, viewerSub, operator, managedFiles, onManagedChange }: WikiProps) {
   const t = useTranslate();
   const root = scope?.root ?? "";
   const current = route.path ?? root;
   const validPath = withinScope(current, root);
+  const trashMode = route.mode === "trash";
+  // Trash is the workspace's, not a project context's, and only a proven
+  // operator gets the entry. A proven non-operator gets no discovery at all.
+  const trashHref = operator === true && !scope
+    ? navHref({ screen: "wiki", mode: "trash", path: null, query: null })
+    : null;
+  const restricted = !!managedFiles && !!route.protectedFiles && !scope;
+  const fileHref = (target: Route) => navHref(
+    restricted && target.screen === "wiki"
+      ? { ...target, protectedFiles: true, archived: route.archived }
+      : target,
+  );
   const [children, setChildren] = useState<Record<string, WikiEntry[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set([""]));
   const [dirError, setDirError] = useState<Record<string, string>>({});
   const [open, setOpen] = useState<Open | null>(null);
-  const [openError, setOpenError] = useState<{ status: number; message: string } | null>(null);
+  const [openError, setOpenError] = useState<{ status: number; message: string; at?: string } | null>(null);
   const [tick, setTick] = useState(0);
   const [missingRoot, setMissingRoot] = useState(false);
   const chooseStartPage = useRef(Boolean(scope && current === root && route.mode === "browse"));
@@ -113,7 +150,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
         return next;
       });
     } catch (error) {
-      if (scope && path === root && message(error).includes("no such directory")) {
+      if (scope && path === root && isMissingWikiFolder(error, path)) {
         setMissingRoot(true);
         setChildren((c) => ({ ...c, [root]: [] }));
       } else {
@@ -173,7 +210,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
       try {
         ls = await wiki.ls(path);
       } catch (error) {
-        if (scope && path === root && message(error).includes("no such directory")) {
+        if (scope && path === root && isMissingWikiFolder(error, path)) {
           setMissingRoot(true);
           return { path, kind: "dir", listing: { path, entries: [] } };
         }
@@ -190,6 +227,8 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
             rev: ls.rev,
             edited_by: ls.edited_by,
             mtime: ls.mtime,
+            status: ls.status,
+            status_reason: ls.status_reason,
           },
         );
       }
@@ -199,7 +238,12 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
       try {
         if (route.at !== undefined) {
           if (!path || !route.at) throw new WikiError("This revision is unavailable", 404);
-          land({ path, kind: "file", page: { ...(await readRevision(path, route.at)), historical: true } });
+          const pinned = await readRevision(path, route.at);
+          // The board says whether the selector is the page's current content
+          // (a hosted pinned read answers `historical: false` for it). Absent —
+          // the native daemon — the view stays pinned, which is what `at` asked
+          // for.
+          land({ path, kind: "file", page: { ...pinned, historical: pinned.historical !== false } });
           return;
         }
         const known = path ? entryOf(path) : null;
@@ -226,6 +270,9 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
         setOpenError({
           status: error instanceof WikiError ? error.status : 0,
           message: message(error),
+          // Only a definitive revision refusal suppresses retry; transient
+          // service or network failures must remain retryable at the same pin.
+          ...(route.at !== undefined && unavailableRevision(error) ? { at: route.at } : {}),
         });
       }
     })();
@@ -269,18 +316,33 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
           emptyText={dirError[root] ? t("Files unavailable") : missingRoot || open?.kind === "dir" ? t("No pages yet") : t("Loading…")}
           hrefFor={hrefFor}
           onToggle={toggle}
+          trash={trashHref ? { href: trashHref, active: trashMode } : undefined}
         />
 
         <div className="wk-pane" data-mode={route.mode}>
-          {route.mode === "search" ? (
-            <SearchPane route={route} navHref={navHref} />
+          {managedFiles && route.file !== undefined ? (
+            route.file && route.version
+              ? <ManagedFilePane key={`${route.file}:${route.version}`} id={route.file} version={route.version} readOnly={readOnly} navHref={fileHref} onChange={onManagedChange} />
+              : <PageState title={t("This file version is unavailable")}>{t("A valid file and version are required.")}</PageState>
+          ) : restricted || (managedFiles && route.archived) ? (
+            <ManagedLibraryPane key={`${restricted}:${!!route.archived}`} root={root} restricted={restricted} archived={!!route.archived} navHref={navHref} fileHref={fileHref} />
+          ) : route.mode === "trash" ? (
+            <TrashPane
+              operator={operator}
+              navHref={navHref}
+              readOnly={readOnly}
+              readOnlyReason={readOnlyReason}
+              onToast={onToast}
+              onRefresh={refresh}
+            />
+          ) : route.mode === "search" ? (
+            <SearchPane route={route} navHref={navHref} managedFiles={managedFiles} />
           ) : route.mode === "history" && route.path ? (
             <HistoryPane
               path={route.path}
               navHref={navHref}
-              readOnly={readOnly}
-              onToast={onToast}
-              onChanged={refresh}
+              hosted={hosted}
+              viewerSub={viewerSub}
             />
           ) : route.mode === "edit" && route.path ? (
             <EditorPane
@@ -299,8 +361,10 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
               dir={route.path ?? dir}
               navHref={navHref}
               readOnly={readOnly}
+              readOnlyReason={readOnlyReason}
               onToast={onToast}
               onUploaded={refresh}
+              multipart={hosted === true}
             />
           ) : (
             <BrowsePane
@@ -312,8 +376,13 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
               dir={dir}
               navHref={navHref}
               readOnly={readOnly}
+              readOnlyReason={readOnlyReason}
+              hosted={hosted}
+              viewerSub={viewerSub}
+              trashHref={trashHref}
               section={route.section}
               page={route.page}
+              managedFiles={managedFiles}
               onToast={onToast}
               onRefresh={refresh}
               onFail={fail}
@@ -326,6 +395,48 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
   );
 }
 
+function ManagedLibraryPane({ root, restricted, archived, navHref, fileHref }: {
+  root: string;
+  restricted: boolean;
+  archived: boolean;
+  navHref: (route: Route) => string;
+  fileHref: (route: Route) => string;
+}) {
+  const t = useTranslate();
+  const [query, setQuery] = useState("");
+  const route = { screen: "wiki", mode: "browse", path: null, query: null } as const;
+  return (
+    <section className="grid gap-4 p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Button href={navHref(route)}>{t("Files")}</Button>
+        <strong>{t(restricted ? "Restricted files" : "Archived")}</strong>
+        {restricted
+          ? <Button href={navHref({ ...route, protectedFiles: true, archived: !archived })}>{t(archived ? "Active" : "Archived")}</Button>
+          : root === "" && <Button href={navHref({ ...route, protectedFiles: true, archived: true })}>{t("Restricted files")}</Button>}
+      </div>
+      {restricted && (
+        <form className="wk-sinput" onSubmit={(event) => {
+          event.preventDefault();
+          const value = new FormData(event.currentTarget).get("q");
+          setQuery(typeof value === "string" ? value.trim() : "");
+        }}>
+          <input className="field" type="search" name="q" maxLength={200} aria-label={t("Search restricted files")} />
+          <Button type="submit">{t("Search")}</Button>
+        </form>
+      )}
+      <ManagedList
+        key={query}
+        path={root}
+        archived={archived}
+        query={query}
+        protectedFiles={restricted}
+        empty={restricted ? <p className="text-secondary text-ink-400">{t("No restricted files match.")}</p> : undefined}
+        navHref={fileHref}
+      />
+    </section>
+  );
+}
+
 function BrowsePane({
   scope,
   missingRoot,
@@ -335,8 +446,13 @@ function BrowsePane({
   dir,
   navHref,
   readOnly,
+  readOnlyReason,
+  hosted,
+  viewerSub,
+  trashHref,
   section,
   page: citedPage,
+  managedFiles,
   onToast,
   onRefresh,
   onFail,
@@ -344,13 +460,19 @@ function BrowsePane({
   scope?: WikiScope;
   missingRoot: boolean;
   open: Open | null;
-  error: { status: number; message: string } | null;
+  error: { status: number; message: string; at?: string } | null;
   path: string;
   dir: string;
   navHref: (route: Route) => string;
   readOnly: boolean;
+  readOnlyReason?: string | null;
+  hosted?: boolean;
+  viewerSub?: string | null;
+  /** The operator's Trash screen, absent for a non-operator or a context. */
+  trashHref: string | null;
   section?: string;
   page?: number;
+  managedFiles?: boolean;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onRefresh: () => void;
   onFail: (error: unknown, verb: string) => void;
@@ -358,6 +480,9 @@ function BrowsePane({
   const t = useTranslate();
   const [creating, setCreating] = useState<{ kind: "page" | "dir"; value: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [receipt, setReceipt] = useState<(DeleteReceipt & { folder: string }) | null>(null);
+  useEffect(() => { setReceipt(null); }, [path]);
+  useEffect(() => onPrivateReadsPaused(() => setReceipt(null)), []);
   const createContext = async () => {
     if (!scope || readOnly) return;
     setBusy(true);
@@ -384,6 +509,23 @@ function BrowsePane({
             </Button>
           }>
             {error.message.includes("session") ? t("Use Sign in at the top of the board to open your project pages.") : error.message}
+          </PageState>
+        </>
+      );
+    }
+    if (error.at !== undefined) {
+      // A pinned revision that is gone, was never retained, or belongs to a
+      // scope this caller cannot read: the page itself is still there, so the
+      // way out is the current revision, not a retry of the same selector.
+      return (
+        <>
+          <Bar path={path} navHref={navHref} />
+          <PageState title={t("This revision is unavailable")} icon={<IconWarning size={32} />} actions={
+            <Button href={navHref({ screen: "wiki", mode: "browse", path, query: null })}>
+              {t("Open the current revision")}
+            </Button>
+          }>
+            {error.message}
           </PageState>
         </>
       );
@@ -451,8 +593,13 @@ function BrowsePane({
   );
 
   if (open.kind === "dir") {
-    const locked = open.listing.writable === false || open.listing.locked === true;
-    const writeBlocked = readOnly || locked || missingRoot;
+    // The root is a list of folders on both boards: neither accepts a page or
+    // an upload at `""` itself (the namespaces below it carry their own
+    // grants), so its buttons stay off without claiming the caller is
+    // read-only — a member's `users/<id>/` and `global/` are writable.
+    const rootHere = path === "";
+    const locked = !rootHere && (open.listing.writable === false || open.listing.locked === true);
+    const writeBlocked = readOnly || locked || missingRoot || rootHere;
     return (
       <>
         <WikiToolbar path={path} navHref={navHref} actions={<>
@@ -469,49 +616,61 @@ function BrowsePane({
               {t("Upload")}
             </Button>
             <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
+            {trashHref && <Button href={trashHref} icon={<IconTrash />}>{t("Trash")}</Button>}
+            {managedFiles && <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null, archived: true })}>{t("Archived")}</Button>}
+            {managedFiles && rootHere && <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null, protectedFiles: true })}>{t("Restricted files")}</Button>}
         </>} />
         {missingRoot && scope && (
           <EmptyCard title={t("No project context yet")} action={
             <Button disabled={readOnly || busy} onClick={() => void createContext()}>{t("Create project context")}</Button>
           }>
             {t("Start with a project brief, research, or decisions.")}
-            {readOnly && ` ${t("Sign in with editing access to create pages.")}`}
+            {readOnly && readOnlyReason && ` ${readOnlyReason}`}
           </EmptyCard>
         )}
         {locked && (
           <Note warn>
             <LockIcon size={13} />
-            {path ? `${path}/` : t(WIKI_ROOT_LABEL)} {t("is read-only for you — you can read, not write.")}
+            {path}/ {t("is read-only for you — you can read it, not write here.")}
           </Note>
         )}
-        {readOnly && !locked && !missingRoot && <Note warn>{t("Sign in with editing access to add or edit pages.")}</Note>}
+        {readOnly && !locked && !missingRoot && (
+          <Note warn>{readOnlyReason ?? t("Writes are disabled on this board.")}</Note>
+        )}
         {newRow}
         {!missingRoot && isCollectionRoot(path) && <CollectionPane path={path} navHref={navHref} readOnly={readOnly} />}
         {!missingRoot && <FolderPane
           entries={open.listing.entries ?? []}
+          receipt={receipt?.folder === path ? receipt : null}
+          onReceipt={(next) => setReceipt({ ...next, folder: path })}
           navHref={navHref}
           readOnly={writeBlocked}
+          trashHref={trashHref}
           onRefresh={onRefresh}
           onToast={onToast}
           onFail={onFail}
         />}
+        {managedFiles && !missingRoot && <ManagedList path={path} navHref={navHref} />}
       </>
     );
   }
 
   const page = open.page;
-  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} section={section} citedPage={citedPage} />;
-  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} />;
+  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} hosted={hosted} viewerSub={viewerSub} section={section} citedPage={citedPage} />;
+  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} hosted={hosted} viewerSub={viewerSub} />;
 }
 
-function BlobPane({ page, blob, navHref }: {
+function BlobPane({ page, blob, navHref, hosted, viewerSub }: {
   page: WikiPage;
   blob: PreviewKind;
   navHref: (route: Route) => string;
+  hosted?: boolean;
+  viewerSub?: string | null;
 }) {
   const t = useTranslate();
   const { src, download, error, loading } = useWikiBlobSource(page.path, blob, true);
   const name = baseName(page.path);
+  const status = statusText(page.status);
   return (
     <>
       <WikiToolbar path={page.path} navHref={navHref} actions={<>
@@ -527,7 +686,13 @@ function BlobPane({ page, blob, navHref }: {
             <track kind="captions" />
           </video>
         ) : blob === "pdf" && src ? (
-          <iframe className="wk-pdf" src={src} sandbox="" title={name} />
+          // Chrome's PDF viewer will not run in a fully sandboxed frame, and the sandbox stays:
+          // the blob opens in its own tab, where the browser's isolated viewer renders it.
+          <div className="wk-download">
+            <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
+            <div className="wk-etitle">{name}</div>
+            <a className="btn btn-primary" href={src} target="_blank" rel="noopener noreferrer">{t("Open PDF")}</a>
+          </div>
         ) : (
           <div className="wk-download">
             <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
@@ -545,7 +710,8 @@ function BlobPane({ page, blob, navHref }: {
         <span className="num">{name}</span>
         {page.size != null && <span>{fmtBytes(page.size)}</span>}
         {page.mime && <span>{page.mime}</span>}
-        {page.edited_by && <span>{t("uploaded by")} {page.edited_by}</span>}
+        {page.edited_by && <span>{t("uploaded by")} {whoLabel(page.edited_by, viewerSub, t, hosted)}</span>}
+        {status && <span>{t(status.text)}{page.status_reason ? ` — ${page.status_reason}` : ""}</span>}
         {page.mtime && <span>{relTime(page.mtime)}</span>}
       </div>
     </>

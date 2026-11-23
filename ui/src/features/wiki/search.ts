@@ -1,4 +1,4 @@
-import { extOf, previewKind } from "./preview";
+import { previewKind } from "./preview";
 
 /**
  * Search results' view-model (CAD-581): the type chips, and the snippet
@@ -15,15 +15,24 @@ export const TYPE_FILTERS: TypeFilter[] = ["all", "pages", "images", "video", "p
 export interface SearchHit {
   path: string;
   name: string;
-  kind?: string | null;
+  /**
+   * The host's own kind when it prints one (`page` or `file`); `null` when it
+   * does not. The native index prints no kind, so it is inferred from the name
+   * there — never assumed to be a page.
+   */
+  kind?: "page" | "file" | null;
   mime?: string | null;
   snippet: string;
   line?: number;
+  /** The indexed text's revision, when the board printed it. */
+  rev?: string;
+  /** Native: the page the indexed text came from. Hosted: `page`, `extracted` or `name`. */
+  source?: string;
 }
 
-export function hitKind(hit: SearchHit): Exclude<TypeFilter, "all"> {
-  if (hit.kind === "page" || extOf(hit.name) === "md") return "pages";
-  switch (previewKind(hit.name, hit.mime)) {
+/** The chips a file can claim by its own name or MIME. */
+function fileChip(name: string, mime?: string | null): Exclude<TypeFilter, "all"> | null {
+  switch (previewKind(name, mime)) {
     case "image":
       return "images";
     case "video":
@@ -31,8 +40,21 @@ export function hitKind(hit: SearchHit): Exclude<TypeFilter, "all"> {
     case "pdf":
       return "pdf";
     default:
-      return "pages";
+      return null;
   }
+}
+
+/**
+ * Which chip a hit belongs to, or `null` when it has no chip of its own (a
+ * zip, an archive, any other attachment) and so appears only under All. A
+ * page is never counted as a file and an attachment is never counted as a
+ * page: the hosted board says which it is, and the native board's non-pointer
+ * files are all text pages.
+ */
+export function hitKind(hit: SearchHit): Exclude<TypeFilter, "all"> | null {
+  if (hit.kind === "page") return "pages";
+  if (hit.kind === "file" || hit.mime) return fileChip(hit.name, hit.mime);
+  return fileChip(hit.name, hit.mime) ?? "pages";
 }
 
 export function filterHits(hits: SearchHit[], filter: TypeFilter): SearchHit[] {

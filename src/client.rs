@@ -1,6 +1,6 @@
-//! CLI-side socket client: one request/response per connection.
-//! Long waits (`ask`, `events --follow`) are driven client-side by
-//! repeating requests, so a hung call never holds a daemon slot.
+//! CLI-side socket client. Most calls use one request per connection;
+//! connected paid reads retain one connection across discovery and dispatch.
+//! Long waits (`ask`, `events --follow`) repeat requests client-side.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -14,6 +14,18 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::proto;
+// Distinguish a locally decoded invalid frame from a transport failure without
+// deriving the answer from error text.
+pub(crate) const MALFORMED_DAEMON_RESPONSE: &str = "malformed_daemon_response";
+
+fn malformed_daemon_response() -> Error {
+    Error::Structured(crate::error::Structured {
+        kind: "internal",
+        code: MALFORMED_DAEMON_RESPONSE.to_string(),
+        message: "Daemon returned a malformed response".to_string(),
+        revision: None,
+    })
+}
 
 /// State directory: `$CADENCE_STATE_DIR`, else the resolved home's
 /// `state/` — `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`
@@ -306,6 +318,9 @@ fn spawn_daemon_run(state_dir: &Path, identity: Option<&str>) -> Result<std::pro
     // outbound RPCs. The child's `daemon run` re-arms from the state
     // dir's minted token instead.
     command.env_remove(crate::test_seam::AS_ENV);
+    for marker in crate::peer::AGENT_RUNTIME_MARKERS {
+        command.env_remove(marker);
+    }
     command
         .args(["--state-dir"])
         .arg(state_dir)
@@ -524,9 +539,9 @@ impl MetaBudget {
 
 /// One request/response frame under a single absolute `deadline`
 /// covering connect, the request write and the reply read together.
-/// Only [`MetaBudget`] uses this: a courtesy metadata answer must
-/// degrade inside seconds even when the dependency's listen backlog
-/// is full (a blocking `UnixStream::connect` has no timeout), when the
+/// Used for bounded metadata and issue reads, which must return even
+/// when the dependency's listen backlog is full (a blocking
+/// `UnixStream::connect` has no timeout), when the
 /// peer accepts no bytes (the general path's write is unbounded), or
 /// when the reply trickles (a per-read timeout resets on every byte).
 /// The wire frames are identical to [`rpc_frame_on`]'s; the deadline
@@ -568,7 +583,26 @@ fn rpc_deadline_frame_on(
     let fd = stream.as_raw_fd();
     write_bounded(fd, body.as_bytes(), deadline)?;
     let line = read_line_bounded(fd, deadline)?;
-    serde_json::from_str(&line).map_err(|_| Error::internal("Daemon returned a malformed response"))
+    let frame: Value = serde_json::from_str(&line).map_err(|_| malformed_daemon_response())?;
+    let valid = match frame.get("ok").and_then(Value::as_bool) {
+        Some(true) => frame.get("result").is_some(),
+        Some(false) => {
+            frame
+                .pointer("/error/kind")
+                .and_then(Value::as_str)
+                .is_some()
+                && frame
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .is_some()
+        }
+        None => false,
+    };
+    if valid {
+        Ok(frame)
+    } else {
+        Err(malformed_daemon_response())
+    }
 }
 
 /// Poll `fd` for `events` until it signals or `deadline` passes.
@@ -639,6 +673,41 @@ pub(crate) fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixSt
             Err(e)
         }
     }
+}
+
+/// True when `socket` is provably a dead daemon's leftover: connect(2)
+/// answers ECONNREFUSED (the file exists, nothing listens) or ENOENT.
+/// Any other outcome — a connection, a full backlog, a permission or
+/// path error — is not proof, so a daemon that might be alive is never
+/// read as stopped. A nonblocking connect never waits.
+pub(crate) fn socket_has_no_listener(socket: &Path) -> bool {
+    let Ok((addr, len)) = unix_addr(socket) else {
+        return false;
+    };
+    // SAFETY: fixed, valid socket(2) arguments.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return false;
+    }
+    let refused = arm_socket(fd).is_ok() && {
+        // SAFETY: `addr` is a sockaddr_un valid for `len` bytes; `fd` is a
+        // live nonblocking unix stream socket.
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                len,
+            )
+        };
+        rc != 0
+            && matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECONNREFUSED | libc::ENOENT)
+            )
+    };
+    // SAFETY: `fd` is a live descriptor we own.
+    unsafe { libc::close(fd) };
+    refused
 }
 
 /// Set O_NONBLOCK + FD_CLOEXEC on `fd` the portable way — fcntl
@@ -874,6 +943,10 @@ pub(crate) fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> R
 /// general path's per-read inactivity timeout. Peer EOF before the
 /// newline is a closed connection, not an answer.
 pub(crate) fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> {
+    read_line_with_limit(fd, deadline, usize::MAX)
+}
+
+fn read_line_with_limit(fd: RawFd, deadline: Instant, limit: usize) -> Result<String> {
     let mut line = Vec::new();
     let mut buf = [0u8; 2048];
     loop {
@@ -887,12 +960,16 @@ pub(crate) fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> 
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if n > 0 {
             let chunk = &buf[..n as usize];
-            match chunk.iter().position(|b| *b == b'\n') {
-                Some(end) => {
-                    line.extend_from_slice(&chunk[..end]);
-                    break;
-                }
-                None => line.extend_from_slice(chunk),
+            let end = chunk.iter().position(|b| *b == b'\n');
+            let part = &chunk[..end.unwrap_or(chunk.len())];
+            if part.len() > limit.saturating_sub(line.len()) {
+                return Err(Error::internal(
+                    "daemon response exceeds the frame size bound",
+                ));
+            }
+            line.extend_from_slice(part);
+            if end.is_some() {
+                break;
             }
             continue;
         }
@@ -905,7 +982,7 @@ pub(crate) fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> 
             _ => return Err(e.into()),
         }
     }
-    String::from_utf8(line).map_err(|_| Error::internal("Daemon returned a malformed response"))
+    String::from_utf8(line).map_err(|_| malformed_daemon_response())
 }
 
 /// Query the daemon bound to this private state directory, ignoring
@@ -938,6 +1015,76 @@ pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Resul
         params,
         Duration::from_secs(700),
     )?))
+}
+
+// The provider HTTP body is limited to 2 MiB; leave room for the daemon
+// envelope without allowing an unusable answer to grow without bound.
+const RPC_SESSION_FRAME_CAP: usize = 4 * 1024 * 1024;
+
+/// A sequence of RPCs pinned to one daemon connection. Connected paid reads
+/// use it to bind capability discovery to the daemon that receives the call.
+pub struct RpcSession<'a> {
+    state_dir: &'a Path,
+    stream: UnixStream,
+}
+
+impl<'a> RpcSession<'a> {
+    pub fn connect(state_dir: &'a Path) -> Result<Self> {
+        let socket = rpc_socket_path(state_dir)?;
+        let stream = UnixStream::connect(&socket).map_err(|_| daemon_unreachable(&socket))?;
+        stream.set_nonblocking(true)?;
+        Ok(Self { state_dir, stream })
+    }
+
+    /// Connect to one daemon within a bounded deadline.
+    pub fn connect_timeout(state_dir: &'a Path, timeout: Duration) -> Result<Self> {
+        let socket = rpc_socket_path(state_dir)?;
+        let stream = connect_bounded(&socket, Instant::now() + timeout)?;
+        Ok(Self { state_dir, stream })
+    }
+
+    /// Distinguish a complete daemon answer from an unusable transport frame.
+    /// There is no reconnect or replay after a request has been written.
+    pub fn answer(&mut self, method: &str, params: Value) -> Result<Result<Value>> {
+        self.answer_timeout(method, params, Duration::from_secs(700))
+    }
+
+    /// Like [`Self::answer`], with a bounded deadline for this exchange.
+    pub fn answer_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Result<Value>> {
+        let mut request = proto::request(method, params);
+        if let Some(test_caller) = crate::test_seam::caller_frame(self.state_dir)? {
+            request[crate::test_seam::FRAME_FIELD] = test_caller;
+        }
+        let mut body = request.to_string();
+        body.push('\n');
+        let deadline = Instant::now() + timeout;
+        let fd = self.stream.as_raw_fd();
+        write_bounded(fd, body.as_bytes(), deadline)?;
+        let line = read_line_with_limit(fd, deadline, RPC_SESSION_FRAME_CAP)?;
+        let frame: Value = serde_json::from_str(&line).map_err(|_| malformed_daemon_response())?;
+        let valid = match frame.get("ok").and_then(Value::as_bool) {
+            Some(true) => frame.get("result").is_some() && frame.get("error").is_none(),
+            Some(false) => {
+                frame.get("result").is_none()
+                    && ["/error/kind", "/error/message"].iter().all(|field| {
+                        frame
+                            .pointer(field)
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.trim().is_empty())
+                    })
+            }
+            None => false,
+        };
+        if !valid {
+            return Err(malformed_daemon_response());
+        }
+        Ok(proto::unwrap(frame))
+    }
 }
 
 /// CAD-508 retry budget for connects across the daemon restart window.
@@ -1489,6 +1636,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod cad1365_original_extra_acceptance;

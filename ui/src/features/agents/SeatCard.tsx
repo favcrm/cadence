@@ -1,6 +1,7 @@
 import { MASTER } from "../home/master";
 import { useTranslate } from "../../lib/locale";
-import type { Agent } from "../../lib/types";
+import type { Agent, PersonalAssistantRow } from "../../lib/types";
+import { IconLock } from "../../ui/icons";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { activeTasks } from "./AgentBlocks";
 import { agentStatus, lifecycleBadge, lifecycleOf, type LifecycleTone } from "./agentView";
@@ -47,11 +48,14 @@ export default function SeatCard({
   agent: a,
   roleLine,
   isNew,
+  title,
   onOpen,
 }: {
   agent: Agent;
   roleLine: string;
   isNew?: boolean;
+  /** What the card is called when that is not the alias (the company Master). */
+  title?: string;
   onOpen: () => void;
 }) {
   const t = useTranslate();
@@ -71,8 +75,8 @@ export default function SeatCard({
         still={lifecycle !== "active"}
         size={44}
       />
-      <span className="min-w-0">
-        <span className="t">{a.alias}</span>
+      <span className="min-w-0 wrap-anywhere">
+        <span className="t">{title ?? a.alias}</span>
         <span className="s">{roleLine}</span>
       </span>
       <span className="st">
@@ -81,5 +85,46 @@ export default function SeatCard({
         {badge && <span className="rc-badge ml-auto">{badge}</span>}
       </span>
     </button>
+  );
+}
+
+/** CAD-2353: the caller's own assistant, first in the roster: "<name> · Your
+ *  assistant" with its face. Its chat is Home, so there is no status to read
+ *  here; the card opens its page. */
+export function PersonalSeat({ row, onOpen }: { row: PersonalAssistantRow; onOpen: () => void }) {
+  const t = useTranslate();
+  return (
+    <button
+      type="button"
+      className="rc-seat clickable"
+      aria-label={t("Open {name}, your assistant").replace("{name}", () => row.name)}
+      onClick={onOpen}
+    >
+      <AgentAvatar slug={agentLook("assistant", { look: row.look })} still size={44} />
+      <span className="min-w-0 wrap-anywhere">
+        <span className="t">
+          {row.name} · {t("Your assistant")}
+        </span>
+        <span className="s">{t("Chats on Home")}</span>
+      </span>
+    </button>
+  );
+}
+
+/** A default personal seat, not an agent detail destination or a live status. */
+export function TeammateSeat({ name }: { name: string }) {
+  const t = useTranslate();
+  return (
+    <li className="rc-seat">
+      <AgentAvatar slug="robot" still size={44} />
+      <span className="min-w-0 break-words">
+        <span className="t">{name || t("Teammate")}</span>
+        <span className="s">{t("Personal assistant")}</span>
+      </span>
+      <span className="st">
+        <IconLock aria-hidden="true" />
+        {t("Private")}
+      </span>
+    </li>
   );
 }

@@ -1,0 +1,17 @@
+{
+  "id": "0123456789abcdef0123456789abcdef",
+  "tool": "share_request",
+  "status": "pending",
+  "createdAt": 1795402980000,
+  "input": {
+    "request_id": "sr_0123456789abcdef0123456789abcdef",
+    "requester": "Jamie",
+    "app": "accounting",
+    "app_label": "Accounting",
+    "view": "pnl",
+    "view_label": "Profit and loss",
+    "params": "compare=prior_year&from=2026-07-01&to=2026-09-30",
+    "reason": "Preparing the Q4 budget review on Thursday.",
+    "requested_at": "2026-11-23T02:43:00.000Z"
+  }
+}

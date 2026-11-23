@@ -1,7 +1,12 @@
-//! `cadence issue epic ls|show|stage`: epic listing, detail and the
-//! stage gate.
+//! `cadence issue epic`: listing, detail, the stage gate, and the plan
+//! writes (`propose`, `approve`, `reject`).
 
-use clap::Subcommand;
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
+use std::io::Read;
+use std::path::Path;
+
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -9,77 +14,40 @@ use crate::issue::{board, model, project, work};
 
 use super::{open_pm, print_json, print_ls_table, print_stage_and_health, print_table};
 
-#[derive(Subcommand)]
-pub enum EpicAction {
-    /// List epics with `total`, per-status counts, `done_ratio`,
-    /// `blocked`, the distinct owners of their children and a `work`
-    /// block: stage, size-weighted progress (S=1 M=3 L=8, unsized=M,
-    /// dropped excluded) and health (on_track | at_risk | stalled).
-    /// Value flags repeat and comma-join and match ANY of their values;
-    /// different flags AND.
-    #[command(after_long_help = crate::filter::GRAMMAR)]
-    #[command(visible_alias = "list")]
-    Ls {
-        /// Project key; repeatable — epics in any of them.
-        #[arg(long, value_delimiter = ',')]
-        project: Vec<String>,
-        /// Stage id (the project's `stages:` list, or shape build
-        /// verify release done, plus rejected); repeatable.
-        #[arg(long, value_delimiter = ',')]
-        stage: Vec<String>,
-        /// Health (on_track at_risk stalled); repeatable.
-        #[arg(long, value_delimiter = ',')]
-        health: Vec<String>,
-        /// Milestone id; repeatable.
-        #[arg(long, value_delimiter = ',')]
-        milestone: Vec<String>,
-        /// Sort by id project title status priority owner total
-        /// done_ratio blocked stage health progress; `-KEY` descending.
-        #[arg(long, allow_hyphen_values = true)]
-        sort: Option<String>,
-        /// Keep only the first N rows.
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Keep only these keys in each JSON row (comma-joined).
-        /// Refused when stdout is a table; a pipe or `--json` is enough.
-        #[arg(long, value_delimiter = ',')]
-        fields: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// One epic and its children: status, owner, priority, tags.
-    Show {
-        id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Move an epic to another stage — a gate decision and one tracker
-    /// commit, through the daemon. One stage forward at a time, any
-    /// stage back. A forward move into an operator stage (default
-    /// `build` and `release`; PROJECT.md `operator_stages`) needs the
-    /// operator's own connection; other moves take the caller's lane.
-    Stage {
-        /// The epic id.
-        id: String,
-        /// Target stage (default list: shape build verify release done).
-        stage: String,
-        /// Why — one line, recorded in the commit subject.
-        #[arg(long)]
-        note: Option<String>,
-    },
-}
+mod args;
+pub use args::EpicAction;
 
-/// `cadence issue epic ls|show|stage`.
+/// `cadence issue epic ls|show|stage|propose|approve|reject`.
 pub fn run_epic(action: &EpicAction, state_dir: &std::path::Path) -> Result<i32> {
-    if let EpicAction::Stage { id, stage, note } = action {
-        model::check_id(id)?;
-        let out = crate::client::rpc(
-            state_dir,
-            "epic_stage",
-            json!({"epic": id, "stage": stage, "note": note}),
-        )?;
-        print_json(&out);
-        return Ok(0);
+    match action {
+        EpicAction::Stage { id, stage, note } => {
+            model::check_id(id)?;
+            let out = crate::client::rpc(
+                state_dir,
+                "epic_stage",
+                json!({"epic": id, "stage": stage, "note": note}),
+            )?;
+            print_json(&out);
+            return Ok(0);
+        }
+        EpicAction::Propose {
+            project,
+            file,
+            workflow,
+            inputs,
+        } => {
+            return propose_plan(
+                state_dir,
+                project,
+                file.as_deref(),
+                workflow.as_deref(),
+                inputs,
+                "issue epic",
+            );
+        }
+        EpicAction::Approve { epic } => return decide_plan(state_dir, epic, None),
+        EpicAction::Reject { epic, reason } => return decide_plan(state_dir, epic, Some(reason)),
+        EpicAction::Ls { .. } | EpicAction::Show { .. } => {}
     }
     let pm = open_pm()?;
     let projects = match action {
@@ -97,8 +65,8 @@ pub fn run_epic(action: &EpicAction, state_dir: &std::path::Path) -> Result<i32>
     }
     // Every project loads so cross-project children count.
     let issues = board::load_all(&pm.dir, None)?;
-    let jobs = board::fetch_job_outcomes(state_dir);
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let jobs = board::fetch_job_state(state_dir);
+    let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
     let now = crate::issue::time::now_epoch();
     let by_id: std::collections::HashMap<String, &board::View> = views
         .iter()
@@ -213,7 +181,10 @@ pub fn run_epic(action: &EpicAction, state_dir: &std::path::Path) -> Result<i32>
                 print_ls_table(&kids);
             }
         }
-        EpicAction::Stage { .. } => unreachable!("handled above"),
+        EpicAction::Stage { .. }
+        | EpicAction::Propose { .. }
+        | EpicAction::Approve { .. }
+        | EpicAction::Reject { .. } => unreachable!("handled above"),
     }
     Ok(0)
 }
@@ -264,4 +235,98 @@ fn print_epics_table(epics: &[Value]) {
     }
     print_table(&rows);
     eprintln!("PROGRESS = done weight / live weight (S=1 M=3 L=8, unsized=M)");
+}
+
+/// `plan propose` and `issue epic propose`. `verb` is the command the
+/// caller typed, used only in the missing-source error.
+pub fn propose_plan(
+    state_dir: &Path,
+    project: &str,
+    file: Option<&Path>,
+    workflow: Option<&str>,
+    inputs: &[String],
+    verb: &str,
+) -> Result<i32> {
+    let mut params = json!({"project": project});
+    match (file, workflow) {
+        (Some(file), None) => {
+            let cap = crate::issue::plan::MAX_PLAN_BYTES as u64;
+            let text = match read_plan_body(state_dir, file, cap) {
+                Err(e) if e.to_string().contains(crate::master::NO_STDIN) => return Err(e),
+                res => res.map_err(|e| {
+                    Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
+                })?,
+            };
+            params["text"] = json!(text);
+        }
+        (None, Some(name)) => {
+            params["workflow"] = json!(name);
+            if !inputs.is_empty() {
+                let mut map = serde_json::Map::new();
+                for pair in inputs {
+                    let Some((k, v)) = pair.split_once('=') else {
+                        return Err(Error::rejected(format!("--input '{pair}' — expected k=v")));
+                    };
+                    if k.is_empty() {
+                        return Err(Error::rejected("--input needs a name: k=v"));
+                    }
+                    map.insert(k.to_string(), json!(v));
+                }
+                params["inputs"] = Value::Object(map);
+            }
+        }
+        _ => {
+            if crate::master::caller_is_master() {
+                return Err(Error::rejected(crate::master::NO_STDIN));
+            }
+            return Err(Error::rejected(format!(
+                "{verb} propose needs --file <plan.md> or --workflow <name>"
+            )));
+        }
+    }
+    let out = crate::client::rpc(state_dir, "plan_propose", params)?;
+    print_json(&out);
+    Ok(0)
+}
+
+/// `plan approve` (`reason` absent) and `plan reject`.
+pub fn decide_plan(state_dir: &Path, epic: &str, reason: Option<&str>) -> Result<i32> {
+    let out = match reason {
+        None => crate::client::rpc(state_dir, "plan_approve", json!({"epic": epic}))?,
+        Some(reason) => crate::client::rpc(
+            state_dir,
+            "plan_reject",
+            json!({"epic": epic, "reason": reason}),
+        )?,
+    };
+    print_json(&out);
+    Ok(0)
+}
+
+/// Same read as the CLI's `read_master_command_file`: a master caller
+/// cannot use stdin, and everyone else may pass `-`.
+fn read_plan_body(state_dir: &Path, file: &Path, max: u64) -> Result<String> {
+    let path = Some(file).filter(|f| f.as_os_str() != "-" && !f.as_os_str().is_empty());
+    if crate::master::caller_is_master() {
+        let Some(path) = path else {
+            return Err(Error::rejected(crate::master::NO_STDIN));
+        };
+        return crate::master::read_command_file(state_dir, path, max);
+    }
+    let read_limit = max.saturating_add(1);
+    if let Some(path) = path {
+        let mut body = String::new();
+        std::fs::File::open(path)?
+            .take(read_limit)
+            .read_to_string(&mut body)?;
+        return Ok(body);
+    }
+    if super::atty_stdin() {
+        return Err(Error::rejected("Provide --text or --file"));
+    }
+    let mut body = String::new();
+    std::io::stdin()
+        .take(read_limit)
+        .read_to_string(&mut body)?;
+    Ok(body)
 }

@@ -1,0 +1,44 @@
+{
+  "name": "@cadence/hosted-runtime",
+  "version": "0.1.0",
+  "description": "Provider-neutral hosted agent conversation runtime behind one Durable Object.",
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/runtime.mjs"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "bun test",
+    "build": "rm -rf dist && bun scripts/gen-company-outputs.mjs && tsc -p tsconfig.build.json && bun scripts/build.mjs",
+    "verify": "bun run typecheck && bun run test && bun run build",
+    "eval:compaction": "bun evals/compaction-retention.eval.ts"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-durable": "1.5.2",
+    "@earendil-works/pi-schema": "1.5.2",
+    "agents": "0.33.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260930.2",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

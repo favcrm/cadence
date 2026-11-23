@@ -313,7 +313,8 @@ impl Store {
     pub fn inbox_status(&self, alias: &str) -> Result<Option<Value>> {
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
-        if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+        if registry::placement(&agent.provider, &agent.endpoint_kind) != registry::Placement::Queue
+        {
             return Ok(None);
         }
         let mut states = serde_json::Map::new();

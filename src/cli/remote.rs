@@ -1,17 +1,81 @@
 //! CAD-1019 slice 2: dispatch for a `Remote` org selection — maps the
 //! allowlisted local commands to AOS-128 verbs and runs them through
 //! [`cadence_agent::remote_cli`]. Anything outside the allowlist is refused
-//! *here*, before a request is ever built. Operator-only verbs never map.
-//! `issue project policy` is `project_policy`; project add/list stay local.
+//! *here*, before a request is ever built. Operator-only daemon verbs never
+//! map.
+//! `issue project policy` is `project_policy_read` (bare) or `project_policy`
+//! (with `--visibility`); `project new` is `project_new` and `issue project ls`
+//! is `project_ls` on a hosted org, while `issue project add`/`set-remote` stay local.
+
+mod blob_cat;
+mod document_template;
+mod issue_text;
+mod media_artifact;
+mod merge_gate;
 
 use super::*;
+#[cfg(test)]
+use blob_cat::collect_remote_blob;
+use blob_cat::remote_blob_cat;
 use cadence_agent::remote_cli::RemoteTarget;
 use cadence_agent::remote_migration::MigrationCommand;
 use cadence_agent::wiki::cli::WikiAction;
+use document_template::{remote_document, remote_template};
+use media_artifact::remote_platform_artifact;
+#[cfg(test)]
+use media_artifact::{
+    collect_platform_artifact, PLATFORM_MEDIA_ARTIFACT_MAX_BYTES, PLATFORM_VIDEO_ARTIFACT_MAX_BYTES,
+};
+use merge_gate::{merge_gate, refuse_managed};
 use std::path::PathBuf;
 
 fn unsupported(verb: &str, flag: &str, why: &str) -> Error {
     Error::rejected(format!("remote `{verb}` cannot {flag} — {why}"))
+}
+
+/// The kinds a hosted project timeline entry can carry (CAD-2240).
+const TIMELINE_KINDS: [&str; 7] = [
+    "created", "status", "owner", "claim", "comment", "message", "review",
+];
+
+pub(super) const HOSTED_ISSUE_LS_REFUSAL: &str = "the remote route's filter does not implement it";
+
+/// The presence checks and names used by both hosted routing and offline discovery.
+#[derive(Default)]
+struct HostedIssueLsOptions {
+    stage: bool,
+    health: bool,
+    since: bool,
+    until: bool,
+    ready: bool,
+    blocked: bool,
+    at: bool,
+    sort: bool,
+    fields: bool,
+    summary: bool,
+}
+
+impl HostedIssueLsOptions {
+    fn restrictions(self) -> [(&'static str, bool); 10] {
+        [
+            ("--stage", self.stage),
+            ("--health", self.health),
+            ("--since", self.since),
+            ("--until", self.until),
+            ("--ready", self.ready),
+            ("--blocked", self.blocked),
+            ("--at", self.at),
+            ("--sort", self.sort),
+            ("--fields", self.fields),
+            ("--summary", self.summary),
+        ]
+    }
+}
+
+pub(super) fn hosted_issue_ls_unsupported_flags() -> [&'static str; 10] {
+    HostedIssueLsOptions::default()
+        .restrictions()
+        .map(|(flag, _)| flag)
 }
 
 /// `cadence <verb>` → AOS-128 `(verb, arguments)`. Every returned verb is
@@ -19,9 +83,17 @@ fn unsupported(verb: &str, flag: &str, why: &str) -> Error {
 /// server's `arguments` object accepts. A command outside the set — or a
 /// flag that cannot cross the wire faithfully — refuses locally; nothing
 /// is sent (contract I2: an allowlist, not a tunnel).
-fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String, Value>)> {
+fn verb_for(
+    command: &Commands,
+    command_path: Option<&str>,
+) -> Result<(&'static str, serde_json::Map<String, Value>)> {
     if let Commands::Wiki { action } = command {
-        return wiki_for(action);
+        return wiki_for(action, command_path);
+    }
+    if let Commands::Issue { action } = command {
+        if let Some(args) = issue_text::edit_args(action)? {
+            return Ok(("issue_set", args));
+        }
     }
     let mut args = serde_json::Map::new();
     let verb = match command {
@@ -114,6 +186,39 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             "agent_list"
         }
         Commands::Agent {
+            action: AgentAction::Profiles,
+        } => "agent_profile_list",
+        // `agent roles` is a pure read of a static table, so a hosted org
+        // answers it from its pinned copy instead of refusing. It takes no
+        // arguments at all.
+        Commands::Agent {
+            action: AgentAction::Roles,
+        } => "agent_roles",
+        // CAD-2101: the hosted profile verbs. The board owns the field names,
+        // limits, revision fence and who may write.
+        Commands::Agent {
+            action: AgentAction::Profile { action },
+        } => {
+            let (verb, built) = super::agent_profile::request(action)?;
+            args = built;
+            verb
+        }
+        // CAD-2396: a hosted workspace's own skills. The board owns the
+        // package rules, the revision fence and who may approve.
+        Commands::WorkspaceSkill { action } => {
+            let (verb, built) = super::workspace_skill::request(action)?;
+            args = built;
+            verb
+        }
+        Commands::Agent {
+            action: AgentAction::Context { id },
+        } => {
+            // The id is the board's own `ap_…`; a caller cannot name a path,
+            // a verb or an authority field through it.
+            args.insert("id".into(), json!(id));
+            "agent_profile_context"
+        }
+        Commands::Agent {
             action:
                 AgentAction::Show {
                     alias,
@@ -166,29 +271,43 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                     json: _,
                 },
         } => {
-            // Straight pass-through of the list grammar; the remote
-            // tracker owns the same flags the local `issue ls` parses.
-            for (flag, present) in [
-                ("--project", !project.is_empty()),
-                ("--stage", !stage.is_empty()),
-                ("--health", !health.is_empty()),
-                ("--since", since.is_some()),
-                ("--until", until.is_some()),
-                ("--ready", *ready),
-                ("--blocked", *blocked),
-                ("--at", at.is_some()),
-                ("--sort", sort.is_some()),
-                ("--limit", limit.is_some()),
-                ("--fields", !fields.is_empty()),
-                ("--summary", *summary),
-            ] {
+            // Refuse list filters that cannot cross the hosted route faithfully.
+            // CAD-1999: `--project` now crosses the wire — the hosted
+            // route filters one registered (or ticket-derived) project,
+            // so a repeated flag refuses rather than silently keeping one.
+            let hosted_options = HostedIssueLsOptions {
+                stage: !stage.is_empty(),
+                health: !health.is_empty(),
+                since: since.is_some(),
+                until: until.is_some(),
+                ready: *ready,
+                blocked: *blocked,
+                at: at.is_some(),
+                sort: sort.is_some(),
+                fields: !fields.is_empty(),
+                summary: *summary,
+            };
+            for (flag, present) in hosted_options.restrictions() {
                 if present {
-                    return Err(unsupported(
-                        "issue ls",
-                        flag,
-                        "the remote route's filter does not implement it",
+                    return Err(unsupported("issue ls", flag, HOSTED_ISSUE_LS_REFUSAL));
+                }
+            }
+            if let Some(n) = limit {
+                if !(1..=5000).contains(n) {
+                    return Err(Error::rejected(
+                        "remote `issue ls` --limit must be 1 to 5000 — nothing was sent",
                     ));
                 }
+                args.insert("limit".into(), json!(n));
+            }
+            if project.len() > 1 {
+                return Err(Error::rejected(
+                    "remote `issue ls` filters one --project at a time — the \
+                     hosted route takes a single key; nothing was sent",
+                ));
+            }
+            if let Some(key) = project.first() {
+                args.insert("project".into(), json!(key));
             }
             for (key, values) in [
                 ("status", status),
@@ -240,6 +359,7 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                     id,
                     file,
                     status,
+                    request_id,
                 },
         } => {
             // Every flag the hosted `issue_new` cannot honour is refused
@@ -266,6 +386,14 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                     "remote `issue new` does not support {} — nothing was sent",
                     unsupported.join(" ")
                 )));
+            }
+            if request_id
+                .as_ref()
+                .is_some_and(|key| key.trim().is_empty() || key.len() > 128)
+            {
+                return Err(Error::rejected(
+                    "--request-id must be nonblank and at most 128 UTF-8 bytes — nothing was sent",
+                ));
             }
             // `--file` is read client-side (an unmanaged remote caller
             // has no master confinement); `-` reads stdin — never a
@@ -313,7 +441,183 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             if let Some(b) = body {
                 args.insert("body".into(), json!(b));
             }
+            if let Some(key) = request_id {
+                args.insert("request_id".into(), json!(key));
+            }
             "issue_new"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Attach { id, file },
+        } => {
+            use base64::Engine;
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            const LIMIT: u64 = 1_048_576;
+            let name = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| cadence_agent::issue::model::valid_artifact_name(name))
+                .filter(|name| !cadence_agent::issue::model::reserved_artifact_name(name))
+                .ok_or_else(|| Error::rejected("invalid artifact name — nothing was sent"))?;
+            let opened = if cadence_agent::master::caller_is_master() {
+                let state = cadence_agent::client::state_dir()?;
+                cadence_agent::master::open_command_file(&state, file)?
+            } else {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(file)?
+            };
+            let meta = opened.metadata()?;
+            if !meta.is_file() || meta.len() > LIMIT {
+                return Err(Error::rejected(
+                    "artifact must be a regular file of at most 1 MiB — nothing was sent",
+                ));
+            }
+            let mut bytes = Vec::with_capacity(meta.len() as usize);
+            opened.take(LIMIT + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > LIMIT {
+                return Err(Error::rejected("artifact exceeds 1 MiB — nothing was sent"));
+            }
+            args.insert("id".into(), json!(id));
+            args.insert("name".into(), json!(name));
+            args.insert(
+                "data".into(),
+                json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            );
+            "issue_attach"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Artifact { id, name },
+        } => {
+            if !name
+                .strip_prefix("hosted:")
+                .is_some_and(cadence_agent::issue::model::valid_artifact_name)
+            {
+                return Err(Error::rejected("invalid artifact name — nothing was sent"));
+            }
+            args.insert("id".into(), json!(id));
+            args.insert("name".into(), json!(name));
+            "issue_artifact"
+        }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Review {
+                    id,
+                    artifact,
+                    digest,
+                    decision,
+                    text,
+                    file,
+                },
+        } => {
+            if !artifact
+                .strip_prefix("hosted:")
+                .is_some_and(cadence_agent::issue::model::valid_artifact_name)
+            {
+                return Err(Error::rejected(
+                    "invalid artifact identifier — nothing was sent",
+                ));
+            }
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(Error::rejected(
+                    "digest must be the lowercase hex sha256 you read — nothing was sent",
+                ));
+            }
+            if !matches!(decision.as_str(), "pass" | "revise" | "blocked") {
+                return Err(Error::rejected(
+                    "decision must be pass, revise or blocked — nothing was sent",
+                ));
+            }
+            let body = match (text, file) {
+                (Some(text), None) => text.clone(),
+                (None, Some(path)) if path.as_os_str() == "-" => {
+                    read_stdin_remote("issue review --file")?
+                }
+                (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+                    Error::rejected(format!(
+                        "issue review --file {}: cannot read it locally: {e}",
+                        path.display()
+                    ))
+                })?,
+                _ => {
+                    return Err(Error::rejected(
+                        "one of -m or --file is required — nothing was sent",
+                    ));
+                }
+            };
+            if body.trim().is_empty() {
+                return Err(Error::rejected(
+                    "a verdict needs its findings — nothing was sent",
+                ));
+            }
+            if body.len() > 16 * 1024 {
+                return Err(Error::rejected(
+                    "verdict text exceeds the 16 KB cap — trim it; nothing was sent",
+                ));
+            }
+            args.insert("id".into(), json!(id));
+            args.insert("artifact".into(), json!(artifact));
+            args.insert("digest".into(), json!(digest));
+            args.insert("decision".into(), json!(decision));
+            args.insert("text".into(), json!(body));
+            "issue_review"
+        }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Say {
+                    id,
+                    to,
+                    from,
+                    message,
+                    text,
+                    file,
+                },
+        } => {
+            let body = read_body_capped(text.clone(), file.clone(), TICKET_MESSAGE_BYTES as u64)?;
+            if body.trim().is_empty() {
+                return Err(Error::rejected(
+                    "a ticket message needs text — nothing was sent",
+                ));
+            }
+            if body.len() > TICKET_MESSAGE_BYTES {
+                return Err(Error::rejected(
+                    "ticket message exceeds the 16,000 byte cap — trim it; nothing was sent",
+                ));
+            }
+            args.insert("id".into(), json!(id));
+            args.insert("to".into(), json!(ticket_role(to, "--to")?));
+            if let Some(from) = from {
+                args.insert("from".into(), json!(ticket_role(from, "--from")?));
+            }
+            args.insert("message".into(), json!(ticket_message_id(message)?));
+            args.insert("text".into(), json!(body));
+            "issue_message_send"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Messages { id, to, after },
+        } => {
+            args.insert("id".into(), json!(id));
+            if let Some(to) = to {
+                args.insert("to".into(), json!(ticket_role(to, "--to")?));
+            }
+            if let Some(after) = after {
+                args.insert("after".into(), json!(ticket_seq(*after, "--after")?));
+            }
+            "issue_messages"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::MessagesRead { id, role, through },
+        } => {
+            args.insert("id".into(), json!(id));
+            args.insert("role".into(), json!(ticket_role(role, "--role")?));
+            args.insert("through".into(), json!(ticket_seq(*through, "--through")?));
+            "issue_messages_read"
         }
         Commands::Issue {
             action:
@@ -436,6 +740,18 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             "issue_set"
         }
         Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Link { id, kind, target },
+        } => {
+            link_args(&mut args, id, kind, target, "link")?;
+            "issue_link"
+        }
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Unlink { id, kind, target },
+        } => {
+            link_args(&mut args, id, kind, target, "unlink")?;
+            "issue_unlink"
+        }
+        Commands::Issue {
             action:
                 cadence_agent::issue::cli::IssueAction::Project {
                     action:
@@ -443,23 +759,253 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                             key,
                             visibility,
                             grants,
+                            clear_grants,
+                            json: _,
                         },
                 },
         } => {
-            // Exact shared arguments. Visibility is the canonical spelling
-            // (`workspace-visible` | `private`), never the serde rename of
-            // the tracker enum. Grants replace the recorded list; an empty
-            // list is sent as `[]`, not omitted. No role, actor, or org.
-            let visibility = match visibility {
-                cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible => {
-                    "workspace-visible"
+            match cadence_agent::issue::cli::resolve_project_policy_request(
+                key,
+                *visibility,
+                grants,
+                *clear_grants,
+            )
+            .map_err(|err| {
+                let msg = format!("{err}; nothing was sent");
+                if err.kind() == "rejected" {
+                    Error::rejected(msg)
+                } else {
+                    Error::usage(msg)
                 }
-                cadence_agent::issue::cli::PolicyVisibility::Private => "private",
-            };
+            })? {
+                None => {
+                    args.insert("project".into(), json!(key));
+                    "project_policy_read"
+                }
+                Some(visibility) => {
+                    // Exact shared arguments. Visibility is the canonical spelling
+                    // (`workspace-visible` | `private`), never the serde rename of
+                    // the tracker enum; `wire()` is that one spelling, shared with the
+                    // daemon's parser. Grants replace the recorded list; an empty
+                    // list is sent as `[]`, not omitted. No role, actor, or org.
+                    args.insert("project".into(), json!(key));
+                    args.insert("visibility".into(), json!(visibility.wire()));
+                    args.insert("grants".into(), json!(grants));
+                    "project_policy"
+                }
+            }
+        }
+        // CAD-1999: `cadence project new` on a hosted org registers an
+        // empty project — its key, its human-readable name and an optional
+        // issue-id prefix. The local-only flags register a git checkout and
+        // seed its PROJECT.md, which a hosted org has no path to, so they
+        // refuse before a request exists rather than being dropped. The
+        // name is required and sent as given: the registry keeps it
+        // distinct from the key (the key is lower-case, the name is the
+        // human label).
+        Commands::Project {
+            action:
+                ProjectCmd::New {
+                    key,
+                    name,
+                    repo,
+                    prefix,
+                    goal,
+                    agents,
+                    issue,
+                    visibility,
+                    grants,
+                },
+        } => {
+            // CAD-1950: the hosted create contract is `{key, name, prefix?}`
+            // and records no access policy. Accepting the flags here would
+            // drop them silently, so they refuse before a request exists —
+            // the same rule the local-only flags above follow. `--visibility`
+            // is checked by presence, not value: even the local default
+            // spelled out on the command line is a request this verb cannot
+            // honour. The policy is set afterwards with
+            // `issue project policy`, which is hosted.
+            if visibility.is_some() || !grants.is_empty() {
+                return Err(Error::rejected(
+                    "remote `project new` records no access policy — --visibility \
+                     and --grant are local-only; create the project, then set its \
+                     policy with `cadence issue project policy`; nothing was sent",
+                ));
+            }
+            let mut local = Vec::new();
+            if repo.is_some() {
+                local.push("--repo");
+            }
+            if goal.is_some() {
+                local.push("--goal");
+            }
+            if !agents.is_empty() {
+                local.push("--agent");
+            }
+            if issue.is_some() {
+                local.push("--issue");
+            }
+            if !local.is_empty() {
+                return Err(Error::rejected(format!(
+                    "remote `project new` does not support {} — it registers an \
+                     empty hosted project, not a repo checkout or a seeded \
+                     PROJECT.md; nothing was sent",
+                    local.join(" ")
+                )));
+            }
+            let name = name.as_deref().map(str::trim).unwrap_or_default();
+            if name.is_empty() {
+                return Err(Error::rejected(
+                    "remote `project new` needs --name <human name> — the hosted \
+                     registry keeps it beside the key; nothing was sent",
+                ));
+            }
+            if name.len() > 200 {
+                return Err(Error::rejected(
+                    "remote `project new` --name must be at most 200 bytes — \
+                     nothing was sent",
+                ));
+            }
+            args.insert("key".into(), json!(key));
+            args.insert("name".into(), json!(name));
+            if let Some(prefix) = prefix {
+                args.insert("prefix".into(), json!(prefix));
+            }
+            "project_new"
+        }
+        Commands::Project {
+            action:
+                ProjectCmd::Ls {
+                    sort,
+                    limit,
+                    fields,
+                    json: _,
+                },
+        } => {
+            for (flag, present) in [
+                ("--sort", sort.is_some()),
+                ("--limit", limit.is_some()),
+                ("--fields", !fields.is_empty()),
+            ] {
+                if present {
+                    return Err(unsupported(
+                        "project ls",
+                        flag,
+                        "the hosted project read returns the registry as it is; \
+                         sorting, truncating and field selection are local transforms",
+                    ));
+                }
+            }
+            "project_ls"
+        }
+        // CAD-1999: `issue project ls` reads the hosted registry, which
+        // includes projects that exist only as their tickets' key. The
+        // route takes no arguments, so the local row transforms refuse
+        // instead of being applied to a shape the client does not own.
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Ls {
+                            sort,
+                            limit,
+                            fields,
+                            json: _,
+                        },
+                },
+        } => {
+            for (flag, present) in [
+                ("--sort", sort.is_some()),
+                ("--limit", limit.is_some()),
+                ("--fields", !fields.is_empty()),
+            ] {
+                if present {
+                    return Err(unsupported(
+                        "issue project ls",
+                        flag,
+                        "the hosted project read returns the registry as it is; \
+                         sorting, truncating and field selection are local transforms",
+                    ));
+                }
+            }
+            "project_ls"
+        }
+        // CAD-2240: `issue project timeline <key>` reads one project's
+        // timeline. `--since` takes the grammar other listers accept and
+        // crosses the wire as an ISO instant; a kind the board does not
+        // know refuses here, before a request exists.
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Timeline {
+                            key,
+                            since,
+                            kinds,
+                            open,
+                            limit,
+                            before,
+                            json: _,
+                        },
+                },
+        } => {
+            let key_ok = key.len() <= 32
+                && key.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !key_ok {
+                return Err(Error::rejected(format!(
+                    "'{key}' is not a project key (lower-case letters, digits and hyphens, \
+                     at most 32) — nothing was sent"
+                )));
+            }
             args.insert("project".into(), json!(key));
-            args.insert("visibility".into(), json!(visibility));
-            args.insert("grants".into(), json!(grants));
-            "project_policy"
+            if let Some(n) = limit {
+                if !(1..=100).contains(n) {
+                    return Err(Error::rejected(
+                        "--limit must be 1 to 100 — nothing was sent",
+                    ));
+                }
+                args.insert("limit".into(), json!(n));
+            }
+            if let Some(cursor) = before {
+                args.insert("before".into(), json!(cursor));
+            }
+            if let Some(bad) = kinds.iter().find(|k| !TIMELINE_KINDS.contains(&k.as_str())) {
+                return Err(Error::rejected(format!(
+                    "--kind '{bad}' is not a timeline kind ({}) — nothing was sent",
+                    TIMELINE_KINDS.join(", ")
+                )));
+            }
+            if !kinds.is_empty() {
+                let mut unique: Vec<&String> = Vec::new();
+                for kind in kinds {
+                    if !unique.contains(&kind) {
+                        unique.push(kind);
+                    }
+                }
+                args.insert("kinds".into(), json!(unique));
+            }
+            if let Some(spec) = since {
+                let at = cadence_agent::filter::parse_time(
+                    "since",
+                    spec,
+                    cadence_agent::issue::time::now_epoch(),
+                )?;
+                // An instant past year 9999 has no ISO form the board can read; its
+                // 400 would read as an older board (see `timeline_board_too_old`).
+                if !(0..=253_402_300_799).contains(&at) {
+                    return Err(Error::rejected(
+                        "--since is outside years 0000 to 9999 (an epoch is in seconds) — nothing was sent",
+                    ));
+                }
+                args.insert("since".into(), json!(cadence_agent::issue::time::iso(at)));
+            }
+            if *open {
+                args.insert("open_only".into(), json!(true));
+            }
+            "project_timeline"
         }
         Commands::Message {
             action:
@@ -599,6 +1145,89 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             }
             "message_inbox"
         }
+        Commands::Inbox {
+            alias,
+            action:
+                Some(InboxAction::Ack {
+                    alias: ack_alias,
+                    seqs,
+                    through,
+                    reader,
+                    reset,
+                }),
+            peek,
+            after,
+            wait,
+            follow,
+            reader: outer_reader,
+            exec,
+            exec_retry_ms,
+            exec_timeout_ms,
+            exec_max_failures,
+        } => {
+            if alias.is_some()
+                || *peek
+                || after.is_some()
+                || *wait != 0
+                || *follow
+                || outer_reader.is_some()
+                || exec.is_some()
+                || *exec_retry_ms != 1000
+                || *exec_timeout_ms != 120_000
+                || *exec_max_failures != 5
+            {
+                return Err(unsupported(
+                    "inbox ack",
+                    "streaming, polling, or outer inbox flags",
+                    "remote `inbox ack` only accepts the target alias, seqs / --through, and --reader",
+                ));
+            }
+            if *reset {
+                return Err(unsupported(
+                    "inbox ack",
+                    "--reset",
+                    "remote inbox ack cannot reset a local daemon reader cursor",
+                ));
+            }
+            let ack_alias = ack_alias.trim();
+            if ack_alias.is_empty() {
+                return Err(Error::rejected(
+                    "remote `inbox ack` needs a non-empty recipient alias — nothing was sent",
+                ));
+            }
+            if seqs.is_empty() && through.is_none() {
+                return Err(Error::rejected(
+                    "`cadence inbox ack` needs at least one seq — `inbox ack <alias> <seq>...` or `--through <seq>`",
+                ));
+            }
+            if seqs.len() > 100 || seqs.iter().any(|&seq| seq <= 0) {
+                return Err(Error::rejected(
+                    "remote `inbox ack` seqs must be 1..=100 positive sequence numbers — nothing was sent",
+                ));
+            }
+            if let Some(t) = through {
+                if *t <= 0 {
+                    return Err(Error::rejected(
+                        "remote `inbox ack` `--through` must be a positive sequence number — nothing was sent",
+                    ));
+                }
+                args.insert("through".into(), json!(t));
+            }
+            if !seqs.is_empty() {
+                args.insert("seqs".into(), json!(seqs));
+            }
+            if let Some(r) = reader {
+                let trimmed = r.trim();
+                if trimmed.is_empty() || r.len() > 64 {
+                    return Err(Error::rejected(
+                        "remote `inbox ack` `--reader` must be 1..=64 bytes — nothing was sent",
+                    ));
+                }
+                args.insert("reader".into(), json!(trimmed));
+            }
+            args.insert("alias".into(), json!(ack_alias));
+            "message_ack"
+        }
         Commands::Team { action } => team_for(action, &mut args),
         // CAD-1586: `cadence master status` on a remote org — the hosted
         // `master_status` verb (settings.read) carrying only an optional
@@ -628,11 +1257,786 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("payload".into(), Value::Object(payload));
             "settings_agents"
         }
-        _ => return Err(unavailable(command)),
+        Commands::App {
+            action: AppAction::Describe { app },
+        } => {
+            let mut body = serde_json::Map::new();
+            if let Some(app) = app {
+                body.insert("app".into(), json!(app));
+            }
+            let body = Value::Object(body);
+            let key = platform_request_key("app_describe", None, Some(&body), None, None)?;
+            args.insert("operation".into(), json!("call"));
+            args.insert("tool".into(), json!("app_describe"));
+            args.insert("key".into(), json!(key));
+            args.insert("body".into(), body);
+            "platform_call"
+        }
+        Commands::App {
+            action:
+                AppAction::Call {
+                    app,
+                    operation,
+                    args: input,
+                    request,
+                    reason,
+                },
+        } => {
+            let input = super::platform::parse_platform_input(input)
+                .map_err(|error| Error::invalid("app_call", format!("--args: {error}")))?;
+            let mut body = json!({
+                "app": app,
+                "operation": operation,
+                "args": serde_json::to_string(&input)?,
+            });
+            if let Some(reason) = reason {
+                body["reason"] = json!(reason);
+            }
+            let key =
+                platform_request_key("app_call", None, Some(&body), None, request.as_deref())?;
+            args.insert("operation".into(), json!("call"));
+            args.insert("tool".into(), json!("app_call"));
+            args.insert("key".into(), json!(key));
+            args.insert("body".into(), body);
+            "platform_call"
+        }
+        Commands::App {
+            action: AppAction::Skill { app, skill },
+        } => {
+            let body = json!({
+                "app": app,
+                "skill": skill,
+            });
+            let key = platform_request_key("app_skill", None, Some(&body), None, None)?;
+            args.insert("operation".into(), json!("call"));
+            args.insert("tool".into(), json!("app_skill"));
+            args.insert("key".into(), json!(key));
+            args.insert("body".into(), body);
+            "platform_call"
+        }
+        Commands::App {
+            action:
+                AppAction::Pending {
+                    status,
+                    id,
+                    conversation,
+                },
+        } => {
+            let mut body = serde_json::Map::new();
+            if let Some(status) = status {
+                body.insert("status".into(), json!(status.as_str()));
+            }
+            if let Some(id) = id {
+                body.insert("id".into(), json!(id));
+            }
+            if let Some(conversation) = conversation {
+                body.insert("conversation".into(), json!(conversation));
+            }
+            let body = Value::Object(body);
+            let key = platform_request_key("board_pending_actions", None, Some(&body), None, None)?;
+            args.insert("operation".into(), json!("call"));
+            args.insert("tool".into(), json!("board_pending_actions"));
+            args.insert("key".into(), json!(key));
+            args.insert("body".into(), body);
+            "platform_call"
+        }
+        // CAD-2226: the three owner-enrollment acts ride the existing
+        // `platform_call` relay. The hosted workspace owns its stored login,
+        // its provider consent and every account it links, so a local flag
+        // naming any of them refuses here rather than being dropped from a
+        // request that would then enroll something else.
+        Commands::Connection { action } => {
+            match action {
+                ConnectionAction::Providers => {
+                    args.insert("operation".into(), json!("connection_providers"));
+                }
+                ConnectionAction::Ls => {
+                    args.insert("operation".into(), json!("connection_list"));
+                }
+                ConnectionAction::Enroll {
+                    provider,
+                    scopes,
+                    shape,
+                    agent,
+                    // Hosted enrollment prints the returned link for the
+                    // person's own browser; it never opens one here, so the
+                    // flag selects nothing on the wire.
+                    no_open: _,
+                } => {
+                    if !scopes.is_empty() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--scope",
+                            "a hosted enrollment takes the scopes the provider's own consent \
+                             screen grants, never a caller-selected list",
+                        ));
+                    }
+                    if shape.is_some() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--shape",
+                            "the hosted server records the shape of the account the provider \
+                             authorizes",
+                        ));
+                    }
+                    if agent.is_some() {
+                        return Err(unsupported(
+                            "connection enroll",
+                            "--agent",
+                            "a hosted enrollment binds the live workspace owner, not a local \
+                             agent alias",
+                        ));
+                    }
+                    if !cadence_agent::remote_cli::connection_toolkit_slug(provider) {
+                        return Err(Error::invalid(
+                            "connection_start",
+                            "toolkit must be 1-64 of a-z 0-9 _ - starting with a-z",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("connection_start"));
+                    args.insert("body".into(), json!({"toolkit": provider}));
+                }
+                ConnectionAction::Sites { connection_id } => {
+                    args.insert("operation".into(), json!("connection_sites"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                }
+                ConnectionAction::SelectSite {
+                    connection_id,
+                    site_url,
+                } => {
+                    args.insert("operation".into(), json!("connection_select_site"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                    args.insert("body".into(), json!({ "siteUrl": site_url }));
+                }
+                ConnectionAction::Assets { connection_id } => {
+                    args.insert("operation".into(), json!("connection_assets"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                }
+                ConnectionAction::SelectAsset {
+                    connection_id,
+                    value,
+                } => {
+                    args.insert("operation".into(), json!("connection_select_asset"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                    args.insert("body".into(), json!({ "value": value }));
+                }
+                ConnectionAction::Revoke { connection_id } => {
+                    args.insert("operation".into(), json!("connection_revoke"));
+                    args.insert("connectionId".into(), json!(connection_id));
+                }
+                ConnectionAction::Whatsapp { action } => match action {
+                    super::connection::WhatsappAction::Status { provider } => {
+                        args.insert("operation".into(), json!("whatsapp_status"));
+                        args.insert("body".into(), json!({ "provider": provider.as_str() }));
+                    }
+                    super::connection::WhatsappAction::Connect { provider } => {
+                        args.insert("operation".into(), json!("whatsapp_connect"));
+                        args.insert("body".into(), json!({ "provider": provider.as_str() }));
+                    }
+                    super::connection::WhatsappAction::Start { provider } => {
+                        args.insert("operation".into(), json!("whatsapp_start"));
+                        args.insert("body".into(), json!({ "provider": provider.as_str() }));
+                    }
+                    super::connection::WhatsappAction::Stop { provider } => {
+                        args.insert("operation".into(), json!("whatsapp_stop"));
+                        args.insert("body".into(), json!({ "provider": provider.as_str() }));
+                    }
+                    super::connection::WhatsappAction::Disconnect { provider, confirm } => {
+                        if !*confirm {
+                            return Err(Error::usage(
+                                "disconnecting WhatsApp is destructive and requires --confirm",
+                            ));
+                        }
+                        args.insert("operation".into(), json!("whatsapp_disconnect"));
+                        args.insert(
+                            "body".into(),
+                            json!({ "provider": provider.as_str(), "confirm": true }),
+                        );
+                    }
+                    super::connection::WhatsappAction::Inspect { company_id } => {
+                        if !valid_whatsapp_company_id(company_id) {
+                            return Err(Error::invalid(
+                                "whatsapp_inspect",
+                                "--company-id must be 1-128 characters with no ASCII control characters",
+                            ));
+                        }
+                        args.insert("operation".into(), json!("whatsapp_inspect"));
+                        args.insert(
+                            "body".into(),
+                            json!({ "provider": "official", "favcrm_company_id": company_id }),
+                        );
+                    }
+                    super::connection::WhatsappAction::Link {
+                        company_id,
+                        request,
+                    } => {
+                        if !valid_whatsapp_company_id(company_id) {
+                            return Err(Error::invalid(
+                                "whatsapp_link",
+                                "--company-id must be 1-128 characters with no ASCII control characters",
+                            ));
+                        }
+                        args.insert("operation".into(), json!("whatsapp_link"));
+                        args.insert(
+                            "body".into(),
+                            json!({ "provider": "official", "favcrm_company_id": company_id }),
+                        );
+                        if let Some(req) = request.as_deref() {
+                            if !valid_platform_handle(req) {
+                                return Err(Error::invalid(
+                                    "whatsapp_link",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            args.insert("key".into(), json!(req));
+                        }
+                    }
+                    super::connection::WhatsappAction::Rescope { request } => {
+                        args.insert("operation".into(), json!("whatsapp_rescope"));
+                        args.insert("body".into(), json!({ "provider": "official" }));
+                        if let Some(req) = request.as_deref() {
+                            if !valid_platform_handle(req) {
+                                return Err(Error::invalid(
+                                    "whatsapp_rescope",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            args.insert("key".into(), json!(req));
+                        }
+                    }
+                },
+                _ => return Err(unavailable(command_path)),
+            }
+            "platform_call"
+        }
+        Commands::Platform { action } => {
+            // CAD-1678: a hosted workspace owns its catalog, its accounts and
+            // its per-project default, so a flag naming any of them cannot
+            // cross faithfully — it refuses here rather than being silently
+            // ignored by the door. The tool and its input are the only caller
+            // facts that travel.
+            match action {
+                PlatformAction::Tools { project, .. } => {
+                    if project.is_some() {
+                        return Err(unsupported(
+                            "platform tools",
+                            "--project",
+                            "a hosted workspace resolves its own default account",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("tools"));
+                }
+                PlatformAction::Call {
+                    tool,
+                    input,
+                    query,
+                    request,
+                    platform,
+                    account,
+                    project,
+                    connection,
+                    max_charge,
+                } => {
+                    if platform.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--platform",
+                            "a hosted workspace runs its own registered platforms",
+                        ));
+                    }
+                    if account.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--account",
+                            "a hosted workspace funds and resolves its own account",
+                        ));
+                    }
+                    if project.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--project",
+                            "a hosted workspace resolves its own project",
+                        ));
+                    }
+                    if max_charge.is_some() {
+                        return Err(unsupported(
+                            "platform call",
+                            "--max-charge",
+                            "a hosted workspace funds calls from its own balance",
+                        ));
+                    }
+                    if let Some(id) = connection {
+                        super::connection::validate_connection_id(id).map_err(|_| {
+                            Error::invalid(
+                                "platform_call",
+                                "connection must be 1-128 of A-Z a-z 0-9 _ -",
+                            )
+                        })?;
+                    }
+                    if !valid_platform_tool_slug(tool) {
+                        return Err(Error::invalid(
+                            "platform_call",
+                            "tool must be 1-128 of a-z 0-9 _ . - starting with a-z or 0-9",
+                        ));
+                    }
+                    let body = match input {
+                        Some(input) => Some(super::platform::parse_platform_input(input)?),
+                        None => None,
+                    };
+                    let query = match query {
+                        Some(query) => Some(super::platform::parse_platform_input(query)?),
+                        None => None,
+                    };
+                    if body.is_none() && query.is_none() {
+                        return Err(Error::usage(
+                            "platform call needs --input or, on a hosted org, --query",
+                        ));
+                    }
+                    if connection.is_some() && (body.is_none() || query.is_some()) {
+                        return Err(Error::usage(
+                            "a hosted connected read takes --input and no --query",
+                        ));
+                    }
+                    // The handle names the retry: an identical call replays the
+                    // door's recorded outcome instead of charging again, so a
+                    // second intentional run needs a fresh --request.
+                    let key = platform_request_key(
+                        tool,
+                        query.as_ref(),
+                        body.as_ref(),
+                        connection.as_deref(),
+                        request.as_deref(),
+                    )?;
+                    args.insert(
+                        "operation".into(),
+                        json!(if connection.is_some() {
+                            "connected_read"
+                        } else {
+                            "call"
+                        }),
+                    );
+                    args.insert("tool".into(), json!(tool));
+                    args.insert("key".into(), json!(key));
+                    if let Some(connection) = connection {
+                        args.insert("connectionId".into(), json!(connection));
+                    }
+                    if let Some(body) = body {
+                        args.insert("body".into(), body);
+                    }
+                    if let Some(query) = query {
+                        args.insert("query".into(), query);
+                    }
+                }
+                PlatformAction::Stage {
+                    tool,
+                    input,
+                    connection,
+                    request,
+                } => {
+                    super::connection::validate_connection_id(connection).map_err(|_| {
+                        Error::invalid(
+                            "platform_call",
+                            "connection must be 1-128 of A-Z a-z 0-9 _ -",
+                        )
+                    })?;
+                    if !valid_platform_tool_slug(tool) {
+                        return Err(Error::invalid(
+                            "platform_call",
+                            "tool must be 1-128 of a-z 0-9 _ . - starting with a-z or 0-9",
+                        ));
+                    }
+                    let body = super::platform::parse_platform_input(input)?;
+                    let key = match request {
+                        Some(request) => {
+                            if !valid_platform_handle(request) {
+                                return Err(Error::invalid(
+                                    "platform_call",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            request.clone()
+                        }
+                        None => platform_replay_key(tool, None, Some(&body), Some(connection)),
+                    };
+                    args.insert("operation".into(), json!("connected_effect"));
+                    args.insert("tool".into(), json!(tool));
+                    args.insert("connectionId".into(), json!(connection));
+                    args.insert("body".into(), body);
+                    args.insert("key".into(), json!(key));
+                }
+                PlatformAction::Status {
+                    request,
+                    job,
+                    tool,
+                    input,
+                    query,
+                    connection,
+                } => {
+                    let body = match input {
+                        Some(input) => Some(super::platform::parse_platform_input(input)?),
+                        None => None,
+                    };
+                    let query = match query {
+                        Some(query) => Some(super::platform::parse_platform_input(query)?),
+                        None => None,
+                    };
+                    if (body.is_some() || query.is_some()) && tool.is_none() {
+                        return Err(Error::usage(
+                            "platform status with --input or --query requires --tool <tool>",
+                        ));
+                    }
+                    if let Some(id) = connection {
+                        super::connection::validate_connection_id(id).map_err(|_| {
+                            Error::invalid(
+                                "platform_status",
+                                "connection must be 1-128 of A-Z a-z 0-9 _ -",
+                            )
+                        })?;
+                        if tool.is_none() || body.is_none() || query.is_some() || job.is_some() {
+                            return Err(Error::usage(
+                                "connected-read status takes --connection with --tool and --input, and no --query or --job",
+                            ));
+                        }
+                    }
+                    let key = match request {
+                        Some(request) => {
+                            if !valid_platform_handle(request) {
+                                return Err(Error::invalid(
+                                    "platform_status",
+                                    "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+                                ));
+                            }
+                            Some(request.clone())
+                        }
+                        None if tool.is_some() => {
+                            if body.is_none() && query.is_none() {
+                                return Err(Error::usage(
+                                    "platform status with --tool needs --request <handle>, or --input/--query to derive the handle",
+                                ));
+                            }
+                            Some(platform_replay_key(
+                                tool.as_deref().unwrap_or_default(),
+                                query.as_ref(),
+                                body.as_ref(),
+                                connection.as_deref(),
+                            ))
+                        }
+                        None => None,
+                    };
+                    if let Some(job_id) = job {
+                        if !valid_media_job_id(job_id) {
+                            return Err(Error::invalid(
+                                "platform_status",
+                                "job must be med_ followed by 1-80 of A-Z a-z 0-9 _ -",
+                            ));
+                        }
+                        args.insert("jobId".into(), json!(job_id));
+                    }
+                    if key.is_none() && job.is_none() {
+                        return Err(Error::usage(
+                            "platform status requires --request <handle>, --job <job-id>, or --tool <tool> with --input/--query",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("status"));
+                    if let Some(key) = key {
+                        args.insert("key".into(), json!(key));
+                    }
+                    if let Some(tool) = tool {
+                        if !valid_platform_tool_slug(tool) {
+                            return Err(Error::invalid(
+                                "platform_status",
+                                "tool must be 1-128 of a-z 0-9 _ . - starting with a-z or 0-9",
+                            ));
+                        }
+                        args.insert("tool".into(), json!(tool));
+                    }
+                    if let Some(body) = body {
+                        args.insert("body".into(), body);
+                    }
+                    if let Some(query) = query {
+                        args.insert("query".into(), query);
+                    }
+                    if let Some(connection) = connection {
+                        args.insert("connectionId".into(), json!(connection));
+                    }
+                }
+                PlatformAction::Artifact { reference, .. } => {
+                    if !valid_media_artifact_ref(reference) {
+                        return Err(Error::invalid(
+                            "platform_artifact",
+                            "artifact ref must be med_<job-id>.<64-lowercase-hex-sha256>",
+                        ));
+                    }
+                    args.insert("operation".into(), json!("artifact"));
+                    args.insert("ref".into(), json!(reference));
+                }
+                _ => return Err(unavailable(command_path)),
+            }
+            "platform_call"
+        }
+        Commands::Routine { action } if action.uses_local_script() => {
+            return Err(unsupported(
+                "routine",
+                "--script",
+                "local workspace shell scripts cannot run in hosted Cloudflare Workers; run against a local workspace daemon (`cadence routine ...` without `--org`) or wait for hosted routine Worker routes",
+            ));
+        }
+        _ => return Err(unavailable(command_path)),
     };
     Ok((verb, args))
 }
 
+/// The hosted reply-token grammar (`[A-Za-z0-9_.:-]{1,128}`), checked here so
+/// a bad `--request` never reaches a paid call.
+fn valid_platform_handle(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+fn valid_whatsapp_company_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+}
+
+fn whatsapp_connection_stderr_hint(
+    action: &super::connection::WhatsappAction,
+    body: &Value,
+) -> Option<String> {
+    use super::connection::{WhatsappAction, WhatsappProviderArg};
+    let url = body
+        .pointer("/data/url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("https://"))?;
+    match action {
+        WhatsappAction::Connect {
+            provider: WhatsappProviderArg::Linked,
+        } => {
+            if body
+                .pointer("/data/alreadyConnected")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                Some(format!(
+                    "Linked WhatsApp is already connected. Open Cadence WhatsApp Settings to manage or pause ($0/mo):\n  {url}"
+                ))
+            } else {
+                Some(format!(
+                    "Open Cadence WhatsApp Settings in your browser to scan the pairing QR code (no browser was opened here and no QR secret is printed):\n  {url}"
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn platform_request_key(
+    tool: &str,
+    query: Option<&Value>,
+    body: Option<&Value>,
+    connection: Option<&str>,
+    request: Option<&str>,
+) -> Result<String> {
+    match request {
+        Some(request) if valid_platform_handle(request) => Ok(request.to_owned()),
+        Some(_) => Err(Error::invalid(
+            "platform_call",
+            "request must be 1-128 of A-Z a-z 0-9 _ . : -",
+        )),
+        None => Ok(platform_replay_key(tool, query, body, connection)),
+    }
+}
+
+fn valid_media_job_id(value: &str) -> bool {
+    value.strip_prefix("med_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 80
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    })
+}
+
+fn valid_media_artifact_ref(value: &str) -> bool {
+    let Some((job_id, digest)) = value.split_once('.') else {
+        return false;
+    };
+    valid_media_job_id(job_id)
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_platform_tool_slug(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 128
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        })
+}
+
+/// CAD-1678: the reply key a hosted tool call replays under. The relay body
+/// has no header channel, so the token rides in the arguments; deriving it
+/// from the tool and its input means a resubmitted identical call reads the
+/// door's recorded outcome instead of charging a second time, while a
+/// different input is a different call.
+fn platform_replay_key(
+    tool: &str,
+    query: Option<&Value>,
+    body: Option<&Value>,
+    connection: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    #[derive(serde::Serialize)]
+    struct Material<'a> {
+        // The field order preserves the existing BTreeMap serialization.
+        body: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        connection: Option<&'a str>,
+        query: Option<&'a Value>,
+        tool: &'a str,
+    }
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(
+        &mut writer,
+        &Material {
+            body,
+            connection,
+            query,
+            tool,
+        },
+    )
+    .expect("JSON values serialize to the hash writer");
+    format!("pcli_{:x}", writer.0.finalize())
+}
+
+/// The tenant's own cap on a ticket message, so an oversized one stays off the wire.
+const TICKET_MESSAGE_BYTES: usize = 16_000;
+
+/// A role on a ticket: a free label, in the tenant's grammar.
+/// One link request, validated where the answer is already known: the four
+/// kinds are fixed, an id must satisfy the shared grammar, and a self-link is
+/// always refused. All three cost a round trip otherwise, and each says
+/// nothing was sent. Nothing is trimmed: a value the board would refuse must
+/// be refused here rather than quietly repaired into a different write.
+fn link_args(
+    args: &mut serde_json::Map<String, Value>,
+    id: &str,
+    kind: &str,
+    target: &str,
+    action: &str,
+) -> Result<()> {
+    if !matches!(kind, "blocked_by" | "relates" | "parent" | "duplicate_of") {
+        return Err(Error::rejected(format!(
+            "unknown link kind '{kind}' — use blocked_by, relates, parent or \
+             duplicate_of; nothing was sent"
+        )));
+    }
+    for (label, value) in [("issue", id), ("target", target)] {
+        if !cadence_core::issue::valid_id(value) {
+            return Err(Error::rejected(format!(
+                "invalid {label} id '{value}' — expected <PREFIX>-<n> like CAD-16; \
+                 nothing was sent"
+            )));
+        }
+    }
+    if id == target {
+        return Err(Error::rejected(format!(
+            "a ticket cannot {action} itself ({id}); nothing was sent"
+        )));
+    }
+    args.insert("id".into(), json!(id));
+    args.insert("kind".into(), json!(kind));
+    args.insert("target".into(), json!(target));
+    Ok(())
+}
+
+fn ticket_role<'a>(value: &'a str, flag: &str) -> Result<&'a str> {
+    let mut chars = value.chars();
+    let shaped = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && value.len() <= 32;
+    if shaped {
+        Ok(value)
+    } else {
+        Err(Error::rejected(format!(
+            "{flag} must be a role of 1-32 lowercase letters, digits or hyphens, starting \
+             with a letter — nothing was sent"
+        )))
+    }
+}
+
+/// A ticket message's stable id, in the tenant's grammar.
+fn ticket_message_id(value: &str) -> Result<&str> {
+    let mut chars = value.chars();
+    let shaped = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && value.len() <= 64
+        && !value.starts_with(cadence_agent::proto::DAEMON_MESSAGE_PREFIX);
+    if shaped {
+        Ok(value)
+    } else {
+        Err(Error::rejected(
+            "--message must be 1-64 lowercase letters, digits or hyphens, not starting with \
+             '-', never `sys-*` — nothing was sent",
+        ))
+    }
+}
+
+/// A `seq` the tenant can compare exactly: it is a JavaScript safe integer there.
+fn ticket_seq(value: u64, flag: &str) -> Result<u64> {
+    if value < (1 << 53) {
+        Ok(value)
+    } else {
+        Err(Error::rejected(format!(
+            "{flag} is too large to be a message seq — nothing was sent"
+        )))
+    }
+}
+
+/// Explain a refusal that a narrowed consent caused (CAD-2213): the credential
+/// is valid, it simply never asked for `scope`. Only the uncertain 401 is
+/// enriched — an authorization, availability or mutation-uncertain refusal
+/// already says something true and is left alone.
+fn scope_hint(error: Error, capabilities: &[String], scope: &str, hint: &str) -> Error {
+    if capabilities.iter().any(|c| c == scope)
+        || !error
+            .to_string()
+            .contains("did not confirm why it refused the credential")
+    {
+        return error;
+    }
+    let carried = if capabilities.is_empty() {
+        "none recorded".to_string()
+    } else {
+        capabilities.join(", ")
+    };
+    // Replace, never append: a scope gap is a known cause, so leaving the
+    // "uncertain 401" text in front would still read as an auth outage.
+    Error::rejected(format!(
+        "the remote refused this action because this login does not carry `{scope}` \
+         (it has: {carried}); run `{hint}` once, then repeat the command. Nothing was sent"
+    ))
+}
 /// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
 /// `{alias, text, message}` crosses the wire — three strings, the same
 /// recipient + body + stable-id the local `agent_send` call would take,
@@ -737,7 +2141,10 @@ fn remote_send_args(
 /// `enumerate` (search carries `q`, ls does not), `cat` is `read`, a text
 /// `put` is `write`. The argument names are the local CLI's own. Blob upload,
 /// index, mkdir/mv/rm and history have no remote mapping and refuse here.
-fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String, Value>)> {
+fn wiki_for(
+    action: &WikiAction,
+    command_path: Option<&str>,
+) -> Result<(&'static str, serde_json::Map<String, Value>)> {
     let mut args = serde_json::Map::new();
     let verb = match action {
         WikiAction::Upload { .. } => {
@@ -751,7 +2158,7 @@ fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String
             "enumerate"
         }
         WikiAction::Search { q, path, .. } => {
-            args.insert("q".into(), json!(q));
+            args.insert("q".into(), json!(q.join(" ")));
             args.insert("path".into(), json!(path.clone().unwrap_or_default()));
             "enumerate"
         }
@@ -809,13 +2216,7 @@ fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String
             }
             "write"
         }
-        _ => {
-            return Err(Error::rejected(
-                "`cadence wiki` this subcommand is not available on a remote org in this \
-                 build — remote wiki verbs are: wiki ls, wiki search, wiki cat, wiki put \
-                 (text), wiki cp. Use `--org local` or `cadence org switch` to run locally.",
-            ))
-        }
+        _ => return Err(unavailable(command_path)),
     };
     Ok((verb, args))
 }
@@ -844,265 +2245,258 @@ fn upload(
         &bytes,
         overwrite,
         wake_timeout,
-        |line| eprintln!("{line}"),
+        eprint_line,
     )
     .inspect_err(|error| {
         if error.kind() == "busy" && error.code() == Some("waking") {
-            eprintln!(
-                "{}",
-                serde_json::to_string(&json!({"kind": "busy", "state": "waking"}))
-                    .unwrap_or_default()
-            );
+            eprint_line(&json!({"kind": "busy", "state": "waking"}).to_string());
         }
     })?;
-    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    print_json(&out);
     Ok(0)
 }
 
-/// Remote blob cats stay under the default wiki upload cap. A larger
-/// pointer is refused before a range is fetched or a spool is created.
-const REMOTE_BLOB_SPOOL_BOUND: u64 = 100 * 1024 * 1024;
+/// A version's size on a hosted org; the server refuses more.
+const ARTIFACT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Normal remote `wiki cat` of a blob (no `--meta`, no range flags).
-/// Discovery already returned pointer metadata. This fetches bounded
-/// ranges pinned to that revision, spools them privately, and writes
-/// stdout only after the spool matches the pointer SHA-256.
-fn remote_blob_cat(
+/// AOS-346: `cadence artifact` on a hosted org. The server decides who may see
+/// what from the credential; nothing here names an actor or a scope.
+fn artifact(
     target: &cadence_agent::remote_cli::RemoteTarget,
-    command: &Commands,
-    discovered: &Value,
-    deadline: std::time::Instant,
+    action: &super::artifact::ArtifactAction,
     wake_timeout: u64,
-) -> Result<bool> {
-    let Commands::Wiki {
-        action:
-            WikiAction::Cat {
-                path,
-                meta,
-                offset,
-                bytes,
-                rev,
-            },
-    } = command
-    else {
-        return Ok(false);
+) -> Result<i32> {
+    use super::artifact::ArtifactAction;
+    use cadence_agent::remote_cli::{call_verb, upload_artifact, ArtifactUpload, RemoteAnswer};
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(wake_timeout))
+        .ok_or_else(|| Error::usage("invalid wake timeout"))?;
+    let read = |verb: &str, args: serde_json::Map<String, Value>| -> Result<Value> {
+        match call_verb(target, verb, args, deadline, wake_timeout, eprint_line)? {
+            RemoteAnswer::Ok(body) => Ok(body),
+            RemoteAnswer::Conflict(_) => Err(Error::rejected("remote read answered a conflict")),
+        }
     };
-    if *meta || offset.is_some() || bytes.is_some() || rev.is_some() || discovered["kind"] != "blob"
-    {
-        return Ok(false);
-    }
-    stream_remote_blob(target, path, discovered, deadline, wake_timeout)?;
-    Ok(true)
-}
-
-fn stream_remote_blob(
-    target: &cadence_agent::remote_cli::RemoteTarget,
-    path: &str,
-    discovered: &Value,
-    deadline: std::time::Instant,
-    wake_timeout: u64,
-) -> Result<()> {
-    let mut spool = collect_remote_blob(discovered, |offset, rev| {
-        remote_blob_range(target, path, offset, rev, deadline, wake_timeout)
-    })?;
-    std::io::copy(&mut spool, &mut std::io::stdout())
-        .map_err(|e| Error::rejected(format!("remote wiki cat: cannot write stdout: {e}")))?;
-    Ok(())
-}
-
-fn collect_remote_blob(
-    discovered: &Value,
-    mut fetch: impl FnMut(u64, &str) -> Result<Value>,
-) -> Result<tempfile::NamedTempFile> {
-    use sha2::Digest;
-    use std::io::{Seek, SeekFrom, Write};
-    use std::os::unix::fs::PermissionsExt;
-
-    let sha = blob_meta_str(discovered, "sha256")?;
-    if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err(Error::rejected(
-            "remote wiki cat refused: blob sha256 is not 64 lowercase hex digits; nothing was written",
-        ));
-    }
-    let rev = blob_meta_str(discovered, "rev")?;
-    let canon = blob_meta_str(discovered, "path")?;
-    let size = discovered["size"].as_u64().ok_or_else(|| {
-        Error::rejected(
-            "remote wiki cat refused: blob size is not a non-negative integer; nothing was written",
-        )
-    })?;
-    if size > REMOTE_BLOB_SPOOL_BOUND {
-        return Err(Error::rejected(format!(
-            "remote wiki cat refused: blob is {size} bytes, over the {REMOTE_BLOB_SPOOL_BOUND}-byte spool bound; nothing was written"
-        )));
-    }
-    let mut spool = tempfile::Builder::new()
-        .prefix(".cadence-wiki-blob-")
-        .permissions(std::fs::Permissions::from_mode(0o600))
-        .tempfile()
-        .map_err(|e| {
-            Error::rejected(format!(
-                "remote wiki cat refused: cannot open a private spool: {e}; nothing was written"
-            ))
-        })?;
-    let mut offset = 0u64;
-    let mut hasher = sha2::Sha256::new();
-    loop {
-        let page = fetch(offset, rev)?;
-        if !blob_range_fits(&page) {
-            return Err(Error::rejected(
-                "remote wiki cat refused: complete blob range exceeds the native bound; nothing was written",
-            ));
+    match action {
+        ArtifactAction::Put {
+            kind,
+            title,
+            file,
+            id,
+            issue,
+            label,
+            customer,
+        } => {
+            if cadence_agent::master::caller_is_master() {
+                return Err(Error::rejected(
+                    "the master puts artifacts on its own board; nothing was sent",
+                ));
+            }
+            let bytes = cadence_agent::wiki::upload::read_local_file(file, ARTIFACT_MAX_BYTES)?;
+            let name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "artifact".into());
+            let title = title.join(" ");
+            let out = upload_artifact(
+                target,
+                &ArtifactUpload {
+                    kind,
+                    title: &title,
+                    id: id.as_deref(),
+                    issue: issue.as_deref(),
+                    label: label.as_deref(),
+                    customer: customer.as_deref(),
+                    file_name: &cadence_agent::wiki::upload::part_file_name(&name),
+                    bytes: &bytes,
+                },
+                wake_timeout,
+                eprint_line,
+            )?;
+            print_json(&out);
+            Ok(0)
         }
-        if page.get("data_base64").is_none() {
-            return Err(Error::rejected(
-                "remote wiki cat refused: the server returned blob metadata without original bytes (data_base64); nothing was written",
-            ));
+        ArtifactAction::Find {
+            q,
+            label,
+            customer,
+            kind,
+            limit,
+        } => {
+            let mut args = serde_json::Map::new();
+            for (key, value) in [
+                ("q", q),
+                ("label", label),
+                ("customer", customer),
+                ("kind", kind),
+            ] {
+                if let Some(value) = value {
+                    args.insert(key.into(), json!(value));
+                }
+            }
+            if let Some(limit) = limit {
+                args.insert("limit".into(), json!(limit));
+            }
+            let out = read("artifact_find", args)?;
+            print_json(&out);
+            Ok(0)
         }
-        for key in ["kind", "mime", "name", "rev", "sha256", "size"] {
-            if page.get(key) != discovered.get(key) {
+        // CAD-2286: the type list is also the probe that decides whether the
+        // document lifecycle is available here.
+        ArtifactAction::Types => {
+            print_json(&read("document_types", serde_json::Map::new())?);
+            Ok(0)
+        }
+        // The probe, the submit and the probe-then-submit race are in
+        // `remote_cli::submit_document`.
+        ArtifactAction::Submit { id } => {
+            print_json(&cadence_agent::remote_cli::submit_document(
+                target,
+                id,
+                deadline,
+                wake_timeout,
+                eprint_line,
+            )?);
+            Ok(0)
+        }
+        ArtifactAction::Show { id, version, out } => {
+            let Some(path) = out else {
+                if version.is_some() {
+                    return Err(Error::usage(
+                        "--version selects the bytes to write; pass --out <new file>",
+                    ));
+                }
+                let mut args = serde_json::Map::new();
+                args.insert("id".into(), json!(id));
+                let found = read("artifact_show", args)?;
+                print_json(&found);
+                return Ok(0);
+            };
+            fn malformed_page() -> Error {
+                Error::rejected(
+                    "remote answered a malformed or inconsistent artifact page; nothing was written",
+                )
+            }
+            let mut bytes = Vec::new();
+            let mut pinned = version.map(u64::from);
+            let mut pinned_total: Option<usize> = None;
+            let mut pinned_digest: Option<[u8; 64]> = None;
+            let file = loop {
+                let mut args = serde_json::Map::new();
+                args.insert("id".into(), json!(id));
+                args.insert("offset".into(), json!(bytes.len()));
+                if let Some(version) = pinned {
+                    args.insert("version".into(), json!(version));
+                }
+                let mut body = read("artifact_read", args)?;
+                let metadata = body
+                    .get("file")
+                    .and_then(Value::as_object)
+                    .ok_or_else(malformed_page)?;
+                if metadata.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+                    return Err(malformed_page());
+                }
+                let page_version = metadata
+                    .get("version")
+                    .and_then(Value::as_u64)
+                    .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
+                    .ok_or_else(malformed_page)?;
+                if pinned.is_some_and(|version| version != page_version) {
+                    return Err(malformed_page());
+                }
+                pinned = Some(page_version);
+                let total = body
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .filter(|total| *total <= ARTIFACT_MAX_BYTES)
+                    .and_then(|total| usize::try_from(total).ok())
+                    .ok_or_else(malformed_page)?;
+                if pinned_total.is_some_and(|expected| expected != total)
+                    || body.get("offset").and_then(Value::as_u64) != Some(bytes.len() as u64)
+                    || metadata
+                        .get("bytes")
+                        .is_some_and(|size| size.as_u64() != Some(total as u64))
+                {
+                    return Err(malformed_page());
+                }
+                pinned_total = Some(total);
+                let digest = metadata
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .filter(|digest| {
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+                    .ok_or_else(malformed_page)?;
+                if let Some(expected) = &pinned_digest {
+                    if expected.as_slice() != digest.as_bytes() {
+                        return Err(malformed_page());
+                    }
+                } else {
+                    let mut expected = [0; 64];
+                    expected.copy_from_slice(digest.as_bytes());
+                    pinned_digest = Some(expected);
+                }
+                let encoded = body
+                    .get("content_base64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(malformed_page)?;
+                let remaining = total.checked_sub(bytes.len()).ok_or_else(malformed_page)?;
+                if encoded.len() > remaining.div_ceil(3) * 4 {
+                    return Err(malformed_page());
+                }
+                let previous_len = bytes.len();
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode_vec(encoded, &mut bytes)
+                    .map_err(|_| malformed_page())?;
+                if bytes.len() > total || (bytes.len() == previous_len && bytes.len() < total) {
+                    return Err(malformed_page());
+                }
+                if bytes.len() == total {
+                    break body["file"].take();
+                }
+            };
+            use sha2::{Digest, Sha256};
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let actual = Sha256::digest(&bytes);
+            let expected = pinned_digest.expect("a completed page has a digest");
+            if !actual
+                .iter()
+                .zip(expected.as_chunks::<2>().0.iter())
+                .all(|(byte, pair)| {
+                    pair[0] == HEX[(byte >> 4) as usize] && pair[1] == HEX[(byte & 0xf) as usize]
+                })
+            {
+                return Err(Error::rejected(
+                    "the artifact's bytes do not match its digest. Nothing was written",
+                ));
+            }
+            use std::io::Write;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600); // An artifact may be private to its creator.
+            let mut target_file = options
+                .open(path)
+                .map_err(|e| Error::rejected(format!("cannot create {}: {e}", path.display())))?;
+            if let Err(error) = target_file.write_all(&bytes) {
+                let _ = std::fs::remove_file(path);
                 return Err(Error::rejected(format!(
-                    "remote wiki cat refused: blob range changed '{key}'; nothing was written"
+                    "cannot write {}: {error}",
+                    path.display()
                 )));
             }
+            print_json(&json!({
+                "file": file,
+                "written": path.display().to_string(),
+            }));
+            Ok(0)
         }
-        if page["path"].as_str() != Some(canon) {
-            return Err(Error::rejected(
-                "remote wiki cat refused: blob range path does not match the pointer; nothing was written",
-            ));
-        }
-        let start = page["range"]["start"].as_u64().ok_or_else(|| {
-            Error::rejected(
-                "remote wiki cat refused: blob range start is missing; nothing was written",
-            )
-        })?;
-        let end = page["range"]["end"].as_u64().ok_or_else(|| {
-            Error::rejected(
-                "remote wiki cat refused: blob range end is missing; nothing was written",
-            )
-        })?;
-        let total = page["range"]["total"].as_u64().ok_or_else(|| {
-            Error::rejected(
-                "remote wiki cat refused: blob range total is missing; nothing was written",
-            )
-        })?;
-        if start != offset || total != size || end < start || end > size {
-            return Err(Error::rejected(format!(
-                "remote wiki cat refused: blob range {start}..{end} of {total} does not continue offset {offset} of {size}; nothing was written"
-            )));
-        }
-        let encoded = page["data_base64"].as_str().ok_or_else(|| {
-            Error::rejected(
-                "remote wiki cat refused: data_base64 is not a string; nothing was written",
-            )
-        })?;
-        if encoded.len() >= cadence_agent::wiki::NATIVE_TOOL_LINE_BOUND {
-            return Err(Error::rejected(
-                "remote wiki cat refused: encoded blob range exceeds the native bound; nothing was written",
-            ));
-        }
-        use base64::Engine;
-        let chunk = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|_| {
-                Error::rejected(
-                    "remote wiki cat refused: data_base64 is not standard base64; nothing was written",
-                )
-            })?;
-        if chunk.len() as u64 != end - start
-            || chunk.len() >= cadence_agent::wiki::NATIVE_TOOL_LINE_BOUND
-        {
-            return Err(Error::rejected(
-                "remote wiki cat refused: blob range bytes do not match the declared slice; nothing was written",
-            ));
-        }
-        if end == offset && size != offset {
-            return Err(Error::rejected(
-                "remote wiki cat refused: blob range made no progress; nothing was written",
-            ));
-        }
-        spool.write_all(&chunk).map_err(|e| {
-            Error::rejected(format!(
-                "remote wiki cat refused: cannot spool blob bytes: {e}; nothing was written"
-            ))
-        })?;
-        hasher.update(&chunk);
-        offset = end;
-        if offset == size {
-            break;
-        }
-    }
-    let got: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    if got != sha || offset != size {
-        return Err(Error::rejected(
-            "remote wiki cat refused: spooled bytes do not match the pointer sha256; nothing was written",
-        ));
-    }
-    spool.seek(SeekFrom::Start(0)).map_err(|e| {
-        Error::rejected(format!(
-            "remote wiki cat refused: cannot read the blob spool: {e}; nothing was written"
-        ))
-    })?;
-    Ok(spool)
-}
-
-fn blob_range_fits(page: &Value) -> bool {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() >= cadence_agent::wiki::NATIVE_TOOL_LINE_BOUND - 1 - self.0 {
-                return Err(std::io::ErrorKind::InvalidData.into());
-            }
-            self.0 += bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    serde_json::to_writer(Count(0), page).is_ok()
-}
-
-fn blob_meta_str<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            Error::rejected(format!(
-                "remote wiki cat refused: blob metadata '{key}' is missing; nothing was written"
-            ))
-        })
-}
-
-fn remote_blob_range(
-    target: &cadence_agent::remote_cli::RemoteTarget,
-    path: &str,
-    offset: u64,
-    rev: &str,
-    deadline: std::time::Instant,
-    wake_timeout: u64,
-) -> Result<Value> {
-    let mut args = serde_json::Map::new();
-    args.insert("path".into(), json!(path));
-    args.insert("offset".into(), json!(offset));
-    args.insert("rev".into(), json!(rev));
-    match cadence_agent::remote_cli::call_verb(
-        target,
-        "read",
-        args,
-        deadline,
-        wake_timeout,
-        |line| eprintln!("{line}"),
-    )? {
-        cadence_agent::remote_cli::RemoteAnswer::Ok(body) => Ok(body),
-        cadence_agent::remote_cli::RemoteAnswer::Conflict(_) => Err(Error::rejected(
-            "remote wiki cat refused: blob range returned a conflict; nothing was written",
-        )),
     }
 }
 
@@ -1122,28 +2516,30 @@ fn wiki_text(command: &Commands, body: &Value) -> Result<bool> {
         WikiAction::Cat { path, .. } if body["kind"] == "dir" => {
             return Err(Error::rejected(format!(
                 "wiki cat '{path}' refused: a directory — use `wiki ls`"
-            )))
+            )));
         }
         WikiAction::Cat {
             offset, bytes, rev, ..
         } if offset.is_some() || bytes.is_some() || rev.is_some() => {
             // The daemon already bounded this compact line. Pretty-printing
-            // it could push one line over the native tool bound.
-            println!("{}", serde_json::to_string(body).unwrap_or_default());
+            // it could push one line over the native tool bound, so this is
+            // a deliberate exception to the stdout JSON policy.
+            print_line(&serde_json::to_string(body).unwrap_or_default());
             true
         }
         WikiAction::Cat { meta: false, .. } if body["kind"] == "text" => {
-            print!("{}", body["text"].as_str().unwrap_or(""));
+            // Raw text: verbatim bytes, no policy, no added newline.
+            print_text(body["text"].as_str().unwrap_or(""));
             true
         }
         WikiAction::Search { json: false, .. } => {
             for m in body["matches"].as_array().cloned().unwrap_or_default() {
-                println!(
+                print_line(&format!(
                     "{}:{}: {}",
                     m["path"].as_str().unwrap_or(""),
                     m["line"].as_u64().unwrap_or(0),
                     m["text"].as_str().unwrap_or("")
-                );
+                ));
             }
             true
         }
@@ -1180,20 +2576,11 @@ fn team_for(
     }
 }
 
-fn unavailable(command: &Commands) -> Error {
-    // The refusal names the command so an agent can branch on it; the
-    // allowlisted alternatives are the only remote surface.
+fn unavailable(command_path: Option<&str>) -> Error {
+    let path = command_path.unwrap_or("<command>");
+    let listed = "`cadence commands --all` lists every verb this client offers.";
     Error::rejected(format!(
-        "`cadence {}` is not available on a remote org in this build - \
-         remote verbs are: status, agent list, agent show, issue ls, \
-         issue show, issue log, issue new, issue comment, issue set, \
-         send/message send (--message required), message read, inbox (peek), \
-         issue project policy, wiki ls, wiki search, wiki cat, \
-         wiki put (text), wiki cp, settings agents <verb>, master status, \
-         team list, team invites, team invite, team revoke-invite, \
-         team set-role, team remove. \
-         Use `--org local` or `cadence org switch` to run locally.",
-        name(command)
+        "`cadence {path}` is not available on a remote org in this build; nothing was sent. {listed}"
     ))
 }
 
@@ -1220,7 +2607,7 @@ fn atty_remote_stdin() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
-/// A stable command name for the refusal — never a trust decision.
+/// A stable command name for authorization refusals — never a trust decision.
 fn name(command: &Commands) -> &'static str {
     match command {
         Commands::Issue { .. } => "issue <verb>",
@@ -1247,6 +2634,53 @@ fn placement_of(command: &Commands) -> Option<registry::Placement> {
     }
 }
 
+fn print_issue_artifact(command: &Commands, body: &Value) -> Result<bool> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let Commands::Issue {
+        action: cadence_agent::issue::cli::IssueAction::Artifact { id, name },
+    } = command
+    else {
+        return Ok(false);
+    };
+    let bad = || Error::rejected("hosted artifact response does not match the requested bytes");
+    let artifact = body
+        .get("artifact")
+        .and_then(Value::as_object)
+        .ok_or_else(bad)?;
+    if !artifact
+        .get("ticketId")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(id))
+        || artifact.get("name").and_then(Value::as_str) != Some(name.as_str())
+    {
+        return Err(bad());
+    }
+    let data = artifact
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(bad)?;
+    if data.len() > 1_398_104 {
+        return Err(bad());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| bad())?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if bytes.len() > 1_048_576
+        || artifact.get("size").and_then(Value::as_u64) != Some(bytes.len() as u64)
+        || artifact.get("sha256").and_then(Value::as_str) != Some(digest.as_str())
+    {
+        return Err(bad());
+    }
+    // Raw artifact bytes: no JSON policy, no re-encoding. A reader that
+    // stopped early already has what it asked for, so it is not a failed
+    // download; any other stdout fault still fails the command.
+    write_stdout(&bytes)?;
+    Ok(true)
+}
+
 /// Entry point for a `Remote` resolution (called by `action_dispatch`
 /// instead of the local `dispatch`). `Org` stays local — it edits the
 /// registry, not a daemon — so `org switch local` still gets you home.
@@ -1257,7 +2691,34 @@ pub(super) fn run(
     command: Commands,
     wake_timeout: u64,
     local_state: Option<std::path::PathBuf>,
+    command_path: Option<String>,
 ) -> Result<i32> {
+    run_with_finish(
+        target,
+        command,
+        wake_timeout,
+        local_state,
+        command_path,
+        local_agent::hosted_finish,
+    )
+}
+
+fn run_with_finish<F>(
+    target: cadence_agent::remote_cli::RemoteTarget,
+    command: Commands,
+    wake_timeout: u64,
+    local_state: Option<std::path::PathBuf>,
+    command_path: Option<String>,
+    finish: F,
+) -> Result<i32>
+where
+    F: FnOnce(
+        &RemoteTarget,
+        &str,
+        Option<&std::path::Path>,
+        Option<&std::path::Path>,
+    ) -> Result<serde_json::Value>,
+{
     if let Commands::Org { action } = command {
         return org::run(action);
     }
@@ -1266,11 +2727,12 @@ pub(super) fn run(
     // lands as RemoteOwner: blanket settings authority with no agent
     // grant binding. A managed caller (CADENCE_ALIAS — worker, master or
     // a daemon-approved argv child under CADENCE_GRANT_TOKEN) spending it
-    // would impersonate the human owner. There is no client-side
-    // agents/<h> credential path yet (remote_auth notes per-agent
-    // enrollment is not configured), so remote settings verbs are refused
-    // for managed callers outright — never narrowed to "no grant" and
-    // never silently allowed. Operators on their own shell unaffected.
+    // would impersonate the human owner. Since CAD-2149 a managed session
+    // does hold an agent credential, but that one is deliberately not
+    // owner-class and binds no settings grant, so settings and master
+    // diagnostics are still refused for managed callers outright — never
+    // narrowed to "no grant" and never silently allowed. Operators on their
+    // own shell are unaffected.
     if (matches!(&command, Commands::Settings { .. })
         || matches!(
             &command,
@@ -1286,9 +2748,8 @@ pub(super) fn run(
             "settings_agent_session_required",
             format!(
                 "remote `{}` refused for a managed caller: the call would spend the \
-             stored owner login — owner-class settings authority an agent can \
-             never hold — and there is no hosted agent-principal credential to \
-             bind a settings grant to yet; the operator runs this from a plain \
+             stored owner login, and owner-class settings authority is never \
+             delegated to an agent credential; the operator runs this from a plain \
              shell, or grant-bound ops run on the local daemon (`cadence \
              settings agents grant request …`)",
                 name(&command)
@@ -1305,15 +2766,39 @@ pub(super) fn run(
         return settings::run_remote(&target, action, grant, wake_timeout, local_state.as_deref());
     }
     if let Commands::Agent { action } = &command {
+        // `--cloud` and `agent cloud` talk to the local daemon. A saved
+        // remote org must not send them over the hosted pickup path:
+        // `agent connect` without `--cloud` is that path.
+        match action {
+            AgentAction::Connect {
+                cloud: true,
+                workspace,
+                alias,
+                ..
+            } => {
+                let state = local_state
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(cadence_agent::client::state_dir)?;
+                return cloud_agent::connect(state, workspace.clone(), alias.clone());
+            }
+            AgentAction::Cloud { action } => {
+                let state = local_state
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(cadence_agent::client::state_dir)?;
+                return cloud_agent::run(state, action.clone());
+            }
+            _ => {}
+        }
         if let Some(bridge) = action.bridge() {
             return local_agent::run(&target, &bridge, wake_timeout, local_state);
         }
     }
-    if let Commands::LocalAgent { action } = &command {
-        return local_agent::run(&target, action, wake_timeout, local_state);
-    }
     if let Commands::App { action } = &command {
-        return super::hosted_app::run(&target, action);
+        if !action.is_hosted_action() {
+            return super::hosted_app::run(&target, action);
+        }
     }
     if let Commands::Restore {
         source,
@@ -1370,6 +2855,46 @@ pub(super) fn run(
     }
     if let Commands::Issue {
         action:
+            cadence_agent::issue::cli::IssueAction::Finish {
+                id,
+                worktree,
+                force,
+                keep_branch,
+                remote,
+                merged,
+                dry_run,
+                ..
+            },
+    } = &command
+    {
+        // CAD-2178: hosted finish releases one merged, clean, idle lane and
+        // nothing else. An option that would widen or soften that is refused
+        // rather than ignored — `--keep-branch` ignored would delete a branch
+        // the caller asked to keep.
+        for (set, flag) in [
+            (*force, "--force"),
+            (*keep_branch, "--keep-branch"),
+            (*remote, "--remote"),
+            (*merged, "--merged"),
+            (*dry_run, "--dry-run"),
+        ] {
+            if set {
+                return Err(Error::rejected(format!(
+                    "`issue finish {flag}` is not available on a hosted org; hosted finish \
+                     takes only <ID> [--worktree <path>] and releases a merged, clean, idle \
+                     lane. Nothing was removed"
+                )));
+            }
+        }
+        let Some(id) = id.as_deref() else {
+            return Err(Error::usage("hosted issue finish requires an issue id"));
+        };
+        let value = finish(&target, id, worktree.as_deref(), local_state.as_deref())?;
+        print_json(&value);
+        return Ok(0);
+    }
+    if let Commands::Issue {
+        action:
             cadence_agent::issue::cli::IssueAction::Start {
                 id,
                 repo,
@@ -1383,11 +2908,11 @@ pub(super) fn run(
                 force,
                 by,
                 take_over,
+                profile,
             },
     } = &command
     {
         if *job
-            || base.is_some()
             || owner.is_some()
             || pm.is_some()
             || spec.is_some()
@@ -1395,9 +2920,10 @@ pub(super) fn run(
             || *force
             || by.is_some()
             || take_over.is_some()
+            || (base.is_some() && profile.is_none())
         {
             return Err(Error::usage(
-                "hosted issue start accepts --repo and --name only. It claims this machine's local agent and does not open a job. Nothing was sent.",
+                "hosted issue start accepts --repo, --name, --profile and --base (with --profile). It claims this issue for this session and does not open a job. Nothing was sent.",
             ));
         }
         return local_agent::start(
@@ -1405,6 +2931,8 @@ pub(super) fn run(
             id,
             repo.as_deref(),
             name.as_deref(),
+            profile.as_deref(),
+            base.as_deref(),
             wake_timeout,
             local_state,
         );
@@ -1419,6 +2947,28 @@ pub(super) fn run(
     } = &command
     {
         return upload(&target, file, path, *overwrite, wake_timeout);
+    }
+    if let Commands::Artifact { action } = &command {
+        return artifact(&target, action, wake_timeout);
+    }
+    if let Commands::Template { action } = &command {
+        return remote_template(&target, action, wake_timeout);
+    }
+    if let Commands::Document { action } = &command {
+        return remote_document(&target, action, wake_timeout);
+    }
+    if let Commands::Platform {
+        action: PlatformAction::Artifact { reference, out },
+    } = &command
+    {
+        return remote_platform_artifact(
+            &target,
+            reference,
+            out,
+            wake_timeout,
+            eprint_line,
+            print_json,
+        );
     }
     if let Commands::Wiki {
         action:
@@ -1445,7 +2995,55 @@ pub(super) fn run(
             },
         );
     }
-    let (verb, args) = verb_for(&command)?;
+    if let Some(code) = merge_gate(&target, &command, wake_timeout)? {
+        return Ok(code);
+    }
+    // CAD-1999: a hosted project create is the live human workspace owner's
+    // own act — the same CAD-1586 rule the merge approval and Settings
+    // follow. A managed caller (worker, master, grant-bound argv child)
+    // spending the stored login would act as that owner, so it refuses
+    // before a request exists; the board's own owner check would otherwise
+    // be satisfied by the owner's credential, not by the caller.
+    if matches!(
+        &command,
+        Commands::Project {
+            action: ProjectCmd::New { .. }
+        }
+    ) {
+        refuse_managed(&target, "project new")?;
+    }
+    // CAD-2226: provider enrollment and the reads around it are the live human
+    // owner's own acts — the same CAD-1586 rule the merge approval and Settings
+    // follow. A managed caller spending the stored login would act as that
+    // owner, so it refuses before a request exists; the board independently
+    // requires a live human owner for the same three operations.
+    if let Some(verb) = connection_owner_verb(&command) {
+        refuse_managed(&target, verb)?;
+    }
+    let mut command = command;
+    if let Commands::Agent {
+        action: AgentAction::Profile { action },
+    } = &mut command
+    {
+        // CAD-2101: refused in the client before any request exists; the
+        // board cannot tell a managed agent on its owner's login from the
+        // owner (docs/guides/hosted-workspace.md).
+        super::agent_profile::refuse_managed_write(action, target.identity.is_some())?;
+        super::agent_profile::resolve_latest(&target, action, wake_timeout)?;
+    }
+    if let Commands::WorkspaceSkill { action } = &command {
+        // CAD-2396: approve and revoke are an owner's decision, refused for a
+        // managed caller before any request exists; the board cannot tell a
+        // managed agent on its owner's login from the owner.
+        super::workspace_skill::refuse_managed_decision(action, target.identity.is_some())?;
+    }
+    if let Commands::Issue { action } = &command {
+        if issue_text::needs_human(action) {
+            refuse_managed(&target, "hosted issue text editing")?;
+        }
+    }
+    let (verb, mut args) = verb_for(&command, command_path.as_deref())?;
+    let keyed_issue_create = verb == "issue_new" && args.contains_key("request_id");
     // CAD-1568: a remote send keeps its caller-chosen `--message` id for
     // reconciliation. An `unknown` outcome — the response was lost after
     // the call was attempted — may have recorded the message anyway; the
@@ -1459,30 +3057,205 @@ pub(super) fn run(
                 .map(str::to_string)
         })
         .flatten();
+    let stage_operation = args.get("operation") == Some(&json!("connected_effect"));
+    let platform_key = (verb == "platform_call")
+        .then(|| args.get("key").and_then(Value::as_str).map(str::to_string))
+        .flatten();
+    let app_action = matches!(
+        args.get("tool").and_then(Value::as_str),
+        Some("app_call" | "app_describe" | "app_skill" | "board_pending_actions")
+    );
+    if verb == "platform_call" {
+        use std::fmt::Write as _;
+
+        let op = args
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or("call");
+        let (mut line, show_tool) = match &command {
+            Commands::App {
+                action: AppAction::Describe { app: Some(app) },
+            } => (
+                format!(
+                    "cadence app org={} operation=describe app={app:?}",
+                    target.org
+                ),
+                false,
+            ),
+            Commands::App {
+                action: AppAction::Describe { app: None },
+            } => (
+                format!("cadence app org={} operation=describe", target.org),
+                false,
+            ),
+            Commands::App {
+                action: AppAction::Call { app, operation, .. },
+            } => (
+                format!(
+                    "cadence app org={} operation=call app={app:?} action={operation:?}",
+                    target.org
+                ),
+                false,
+            ),
+            Commands::App {
+                action: AppAction::Skill { app, skill },
+            } => (
+                format!(
+                    "cadence app org={} operation=skill app={app:?} skill={skill:?}",
+                    target.org
+                ),
+                false,
+            ),
+            Commands::App {
+                action:
+                    AppAction::Pending {
+                        status,
+                        id,
+                        conversation,
+                    },
+            } => {
+                let mut summary = format!("cadence app org={} operation=pending", target.org);
+                if let Some(status) = status {
+                    write!(&mut summary, " status={}", status.as_str())
+                        .expect("writing to a string cannot fail");
+                }
+                if let Some(id) = id {
+                    write!(&mut summary, " id={id:?}").expect("writing to a string cannot fail");
+                }
+                if let Some(conversation) = conversation {
+                    write!(&mut summary, " conversation={conversation:?}")
+                        .expect("writing to a string cannot fail");
+                }
+                (summary, false)
+            }
+            _ => (
+                format!("cadence platform org={} operation={op}", target.org),
+                true,
+            ),
+        };
+        if show_tool {
+            if let Some(tool) = args.get("tool").and_then(Value::as_str) {
+                write!(&mut line, " tool={tool}").expect("writing to a string cannot fail");
+            }
+        }
+        if let Some(key) = platform_key.as_deref() {
+            write!(&mut line, " request={key}").expect("writing to a string cannot fail");
+        }
+        if let Some(job_id) = args.get("jobId").and_then(Value::as_str) {
+            write!(&mut line, " job={job_id}").expect("writing to a string cannot fail");
+        }
+        eprint_line(&line);
+    }
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_secs(wake_timeout))
         .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
+    let edits_issue_text =
+        verb == "issue_set" && issue_text::resolve(&target, &mut args, deadline, wake_timeout)?;
+    let issue_ls_fallback = (verb == "issue_ls")
+        .then(|| {
+            let n = args.get("limit").and_then(Value::as_u64)? as usize;
+            let mut without_limit = args.clone();
+            without_limit.remove("limit");
+            Some((n, without_limit))
+        })
+        .flatten();
     let out = match cadence_agent::remote_cli::call_verb(
         &target,
         verb,
         args,
         deadline,
         wake_timeout,
-        |line| eprintln!("{line}"),
+        eprint_line,
     ) {
         Ok(out) => out,
         Err(error) => {
-            if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
-                eprintln!(
-                    "remote send `{id}` was not confirmed — it may or may not have \
-                     been recorded. Reconcile before resubmitting: `cadence message \
-                     read {id} --org {}` returns your durable message and its state. \
-                     If nothing is recorded, retry `send` with the same --message {id} \
-                     — the same id and content does not enqueue another message.",
-                    target.org
-                );
+            // Hosted wire compatibility: if an older board predates `limit` on
+            // `issue_ls` and answers `400 invalid_request`, retry once without
+            // `limit`, slice locally, and state on stderr what was not applied
+            // server-side. If the retry also refuses (for instance another bad
+            // filter value), surface that refusal unchanged.
+            if let Some((n, without_limit)) = issue_ls_fallback.filter(|_| {
+                error.code() == Some(cadence_agent::remote_cli::ISSUE_LS_LIMIT_UNSUPPORTED)
+            }) {
+                match cadence_agent::remote_cli::call_verb(
+                    &target,
+                    verb,
+                    without_limit,
+                    deadline,
+                    wake_timeout,
+                    eprint_line,
+                ) {
+                    Ok(cadence_agent::remote_cli::RemoteAnswer::Ok(mut body)) => {
+                        truncate_issue_ls_body(&mut body, n);
+                        eprint_line(&format!(
+                            "remote board on `{}` predates server-side `issue_ls` limit; \
+                             truncated to {n} locally.",
+                            target.org
+                        ));
+                        cadence_agent::remote_cli::RemoteAnswer::Ok(body)
+                    }
+                    Ok(other) => other,
+                    Err(retry_err) => return remote_failure(retry_err),
+                }
+            } else {
+                if edits_issue_text && error.code() == Some("invalid_request") {
+                    eprint_line(
+                        "The server refused this edit. If this board predates CLI body editing, \
+                         use the issue page's description editor or upgrade the board.",
+                    );
+                }
+                if verb == "issue_new" && error.kind() == "unknown" {
+                    if keyed_issue_create {
+                        eprint_line(
+                            "Issue creation was not confirmed. If the board supports retry IDs, \
+                             repeat the same command with the same --request-id, unchanged \
+                             arguments, and the same user and acting agent or human identity. \
+                             If that identity is unavailable, inspect the board instead. \
+                             Do not remove the ID after an unknown outcome.",
+                        );
+                    } else {
+                        eprint_line(
+                            "Issue creation was not confirmed. Inspect the board before \
+                             repeating the create; it may already have succeeded.",
+                        );
+                    }
+                }
+                if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
+                    eprint_line(&format!(
+                        "remote send `{id}` was not confirmed — it may or may not have \
+                         been recorded. Reconcile before resubmitting: `cadence message \
+                         read {id} --org {}` returns your durable message and its state. \
+                         If nothing is recorded, retry `send` with the same --message {id} \
+                         — the same id and content does not enqueue another message.",
+                        target.org
+                    ));
+                }
+                if let Some(key) = platform_key
+                    .as_deref()
+                    .filter(|_| error.kind() == "unknown")
+                    .filter(|_| stage_operation)
+                {
+                    eprint_line(&format!(
+                        "remote stage `{key}` on org `{}` was not confirmed — nothing runs \
+                         without an owner's approval, and repeating the same `platform stage` \
+                         with `--request {key}` replays the same staged action instead of \
+                         staging a second one.",
+                        target.org
+                    ));
+                }
+                if let Some(key) = platform_key
+                    .filter(|_| error.kind() == "unknown" && !stage_operation && !app_action)
+                {
+                    eprint_line(&format!(
+                        "remote platform call `{key}` on org `{}` was not confirmed — \
+                         reconcile read-only with `cadence --org {} platform status --request {key}` \
+                         before repeating; replaying `platform call` returns a recorded outcome, \
+                         or starts and charges a new call if `{key}` was not recorded.",
+                        target.org, target.org
+                    ));
+                }
+                return remote_failure(error);
             }
-            return remote_failure(error);
         }
     };
     match out {
@@ -1493,6 +3266,9 @@ pub(super) fn run(
             if let Some(want) = placement_of(&command) {
                 retain_by_placement(&mut body, want);
             }
+            if print_issue_artifact(&command, &body)? {
+                return Ok(0);
+            }
             match remote_blob_cat(&target, &command, &body, deadline, wake_timeout) {
                 Ok(true) => return Ok(0),
                 Ok(false) => {}
@@ -1501,24 +3277,139 @@ pub(super) fn run(
             if wiki_text(&command, &body)? {
                 return Ok(0);
             }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&body).unwrap_or_default()
-            );
+            // CAD-2226: a hosted enrollment's only useful output is the
+            // one-time provider link the transport verified. Print it for the
+            // person's own browser — this server-side flow never opens one —
+            // and note that it enrolls the account only.
+            if matches!(
+                &command,
+                Commands::Connection {
+                    action: ConnectionAction::Enroll { .. }
+                }
+            ) {
+                print_json(&hosted_enrollment_document(&body)?);
+                eprint_line(
+                    "Open this one-time link in your own browser; no browser was opened here. \
+                     It enrolls the provider account only — selecting a verified property \
+                     (for example a Search Console site) is not part of enrollment.",
+                );
+                return Ok(0);
+            }
+            if let Commands::Connection {
+                action: ConnectionAction::Whatsapp { action },
+            } = &command
+            {
+                if let Some(hint) = whatsapp_connection_stderr_hint(action, &body) {
+                    eprint_line(&hint);
+                }
+            }
+            if matches!(&command, Commands::Platform { .. }) {
+                for summary in super::platform::platform_human_summary(&body) {
+                    eprint_line(&summary);
+                }
+            }
+            // The ordinary hosted answer is one JSON document under the
+            // shared stdout policy, like a local verb's.
+            let exit = if matches!(
+                &command,
+                Commands::App {
+                    action: AppAction::Call { .. }
+                }
+            ) {
+                app_call_receipt_exit(&body)
+            } else {
+                0
+            };
+            print_json(&body);
+            if exit != 0 {
+                return Err(Error::invalid(
+                    "staged_action_not_applied",
+                    "The staged action was denied or failed; inspect the returned status.",
+                ));
+            }
             Ok(0)
         }
         cadence_agent::remote_cli::RemoteAnswer::Conflict(body) => {
             // A checked conflict is the remote's "not written" verdict:
             // print the whole body so the caller resyncs from
             // `current_rev`/`card`, and exit 5 — the same conflict code
-            // the local write path exits (see `error::EXIT_TABLE`).
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&body).unwrap_or_default()
-            );
+            // the local write path exits (see `error::EXIT_TABLE`). The
+            // report cannot change that verdict: `print_json` absorbs a
+            // closed consumer instead of panicking.
+            print_json(&body);
             Ok(5)
         }
     }
+}
+
+/// A terminal refusal remains nonzero while the action receipt stays visible.
+fn app_call_receipt_exit(body: &Value) -> i32 {
+    let Some(data) = body.get("data").and_then(Value::as_object) else {
+        return 0;
+    };
+    if data.get("staged").and_then(Value::as_bool) == Some(true)
+        && data
+            .get("actionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && matches!(
+            data.get("status").and_then(Value::as_str),
+            Some("denied" | "failed")
+        )
+    {
+        3
+    } else {
+        0
+    }
+}
+
+/// The connection acts a hosted org serves, named as the stable command a
+/// refusal quotes. Every other `connection` action keeps the local custody
+/// path and refuses on a hosted org rather than half-mapping to a relay
+/// operation that does not exist.
+fn connection_owner_verb(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Connection {
+            action: ConnectionAction::Providers,
+        } => Some("connection providers"),
+        Commands::Connection {
+            action: ConnectionAction::Ls,
+        } => Some("connection ls"),
+        Commands::Connection {
+            action: ConnectionAction::Enroll { .. },
+        } => Some("connection enroll"),
+        Commands::Connection {
+            action: ConnectionAction::Whatsapp { action },
+        } => Some(match action {
+            super::connection::WhatsappAction::Status { .. } => "connection whatsapp status",
+            super::connection::WhatsappAction::Connect { .. } => "connection whatsapp connect",
+            super::connection::WhatsappAction::Start { .. } => "connection whatsapp start",
+            super::connection::WhatsappAction::Stop { .. } => "connection whatsapp stop",
+            super::connection::WhatsappAction::Disconnect { .. } => {
+                "connection whatsapp disconnect"
+            }
+            super::connection::WhatsappAction::Inspect { .. } => "connection whatsapp inspect",
+            super::connection::WhatsappAction::Link { .. } => "connection whatsapp link",
+            super::connection::WhatsappAction::Rescope { .. } => "connection whatsapp rescope",
+        }),
+        _ => None,
+    }
+}
+
+/// CAD-2226: the user-facing success of a hosted enrollment is the one-time
+/// provider link, and only a link the transport verified. It is printed for
+/// the person's own browser — nothing here opens one, logs it or repeats it.
+fn hosted_enrollment_document(body: &Value) -> Result<Value> {
+    let url = cadence_agent::remote_cli::connection_authorization_url(body).ok_or_else(|| {
+        Error::unknown(
+            "remote connection enrollment returned no usable authorization link — the provider \
+             link may or may not exist. An account appears in `cadence --org <org> connection ls` \
+             only after the provider callback completes, so an empty list does not prove no link \
+             was issued; nothing is retried automatically, and starting again is a deliberate new \
+             enrollment",
+        )
+    })?;
+    Ok(json!({ "entry_url": url }))
 }
 
 /// CAD-1593: `restore` against a remote org. Only `--portable` forms exist
@@ -1580,7 +3471,7 @@ fn remote_restore(
             ));
         }
     }
-    let note = |line: &str| eprintln!("{line}");
+    let note = eprint_line;
     let digests = expected_package_digest.is_some()
         || expected_destination_digest.is_some()
         || expected_generation.is_some();
@@ -1718,9 +3609,18 @@ fn migration_outcome_exit_code(receipt: &Value) -> i32 {
     }
 }
 
+fn truncate_issue_ls_body(body: &mut Value, limit: usize) {
+    if let Some(issues) = body.get_mut("issues").and_then(Value::as_array_mut) {
+        issues.truncate(limit);
+    }
+}
+
 pub(super) fn remote_failure(error: Error) -> Result<i32> {
     if error.kind() == "busy" && error.code() == Some("waking") {
-        eprintln!("{}", json!({"kind": "busy", "state": "waking"}));
+        // The wake verdict is a nonzero status (75): print it through the
+        // closed-consumer-tolerant writer so a closed stderr cannot turn
+        // it into a panic that exits 0.
+        eprint_line(&json!({"kind": "busy", "state": "waking"}).to_string());
         Ok(75)
     } else {
         Err(error)
@@ -1728,8 +3628,223 @@ pub(super) fn remote_failure(error: Error) -> Result<i32> {
 }
 
 #[cfg(test)]
+mod cad1946_hosted_gate_refusal_tests;
+#[cfg(test)]
+mod hosted_finish_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_call_review_denied_or_failed_staged_calls_exit_nonzero() {
+        for status in ["denied", "failed"] {
+            let receipt = json!({"ok": true, "data": {
+                "staged": true, "actionId": "act_synthetic", "status": status, "replayed": true
+            }});
+            assert_eq!(app_call_receipt_exit(&receipt), 3, "{status}");
+        }
+        for status in ["pending", "applied"] {
+            let receipt = json!({"ok": true, "data": {
+                "staged": true, "actionId": "act_synthetic", "status": status, "replayed": true
+            }});
+            assert_eq!(app_call_receipt_exit(&receipt), 0, "{status}");
+        }
+        assert_eq!(
+            app_call_receipt_exit(&json!({"ok": true, "data": {"status": "failed"}})),
+            0
+        );
+        assert_eq!(
+            app_call_receipt_exit(
+                &json!({"ok": true, "data": {"staged": true, "status": "failed"}})
+            ),
+            0
+        );
+    }
+    #[test]
+    fn accept_revise_is_refused_before_any_request_for_a_managed_caller() {
+        let target = cadence_agent::remote_cli::RemoteTarget {
+            org: "fav-limited".into(),
+            endpoint: "https://example.invalid".into(),
+            org_id: "org_synthetic".into(),
+            identity: Some(cadence_agent::remote_cli::CliIdentityPin {
+                subject_id: "usr_agent".into(),
+                issuer: "iss_synthetic".into(),
+            }),
+        };
+        let err = refuse_managed(&target, "audit accept-revise").unwrap_err();
+        assert!(err.to_string().contains("managed caller"), "{err}");
+        assert!(err.to_string().contains("Nothing was sent"), "{err}");
+    }
+
+    /// Through the real hosted call site: the endpoint is unreachable and the
+    /// credential directory is absent, so a missing gate would answer a
+    /// transport error instead of the managed-caller refusal.
+    #[test]
+    fn hosted_owner_enrollment_is_refused_to_a_managed_caller_before_any_request() {
+        let _lock = crate::cli::org::tests::RESOLVE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CADENCE_ALIAS", "synthetic-worker");
+        let target = || cadence_agent::remote_cli::RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://127.0.0.1:1".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
+        };
+        let enroll = || Commands::Connection {
+            action: ConnectionAction::Enroll {
+                provider: "google_search_console".into(),
+                scopes: Vec::new(),
+                shape: None,
+                agent: None,
+                no_open: true,
+            },
+        };
+        let out = [
+            run(
+                target(),
+                Commands::Connection {
+                    action: ConnectionAction::Providers,
+                },
+                1,
+                None,
+                Some("connection providers".into()),
+            ),
+            run(
+                target(),
+                Commands::Connection {
+                    action: ConnectionAction::Ls,
+                },
+                1,
+                None,
+                Some("connection ls".into()),
+            ),
+            run(
+                target(),
+                enroll(),
+                1,
+                None,
+                Some("connection enroll".into()),
+            ),
+        ];
+        std::env::remove_var("CADENCE_ALIAS");
+        for result in out {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("managed caller"), "{err}");
+            assert!(err.to_string().contains("Nothing was sent"), "{err}");
+        }
+    }
+
+    // CAD-2165: the managed refusal for owner-class settings names the reason
+    // and refuses before any request, including `master resume`.
+    #[test]
+    fn hosted_settings_is_refused_to_a_managed_caller_before_any_request() {
+        let _lock = crate::cli::org::tests::RESOLVE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CADENCE_ALIAS", "synthetic-worker");
+        let target = || cadence_agent::remote_cli::RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://127.0.0.1:1".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
+        };
+        let out = [
+            run(
+                target(),
+                Commands::Settings {
+                    action: settings::SettingsAction::Agents {
+                        grant: None,
+                        action: settings::AgentsAction::Show,
+                    },
+                },
+                1,
+                None,
+                Some("settings agents show".into()),
+            ),
+            run(
+                target(),
+                Commands::Master {
+                    action: MasterAction::Resume { grant: None },
+                },
+                1,
+                None,
+                Some("master resume".into()),
+            ),
+        ];
+        std::env::remove_var("CADENCE_ALIAS");
+        for result in out {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("managed caller"), "{error}");
+            assert!(error.to_string().contains("never delegated"), "{error}");
+        }
+    }
+
+    #[test]
+    fn hosted_finish_refuses_through_remote_dispatch_without_tracker_access() {
+        use cadence_agent::issue::cli::IssueAction;
+        use cadence_agent::local_assignment::{CoordHttp, Coordinator, Reply};
+        use std::{cell::Cell, os::unix::fs::PermissionsExt, rc::Rc};
+
+        struct FakeRemote(Rc<Cell<usize>>);
+        impl CoordHttp for FakeRemote {
+            fn send(&mut self, _: &str, _: &str, _: Option<&Value>) -> Result<Reply> {
+                self.0.set(self.0.get() + 1);
+                Err(Error::rejected("unexpected remote call"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let coordinator = Coordinator::new(
+            FakeRemote(calls.clone()),
+            "ws_synthetic".into(),
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        let tracker = dir.path().join("local-tracker");
+        let command = Commands::Issue {
+            action: IssueAction::Finish {
+                id: Some("CAD-42".into()),
+                worktree: None,
+                force: false,
+                keep_branch: false,
+                remote: false,
+                merged: false,
+                project: None,
+                dry_run: false,
+                json: false,
+            },
+        };
+        let target = RemoteTarget {
+            org: "synthetic".into(),
+            endpoint: "https://synthetic.cadencecloud.app".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
+        };
+        let error = run_with_finish(
+            target,
+            command,
+            1,
+            Some(tracker.clone()),
+            Some("issue finish".into()),
+            |_, issue, worktree, state| {
+                cadence_agent::local_assignment::finish_guidance::release(
+                    &coordinator,
+                    issue,
+                    worktree,
+                    state.unwrap(),
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), "rejected");
+        assert!(error.to_string().contains("cannot be confirmed"), "{error}");
+        assert!(!error.to_string().contains("reconcile"), "{error}");
+        assert_eq!(calls.get(), 0, "no remote tracker call");
+        assert!(!tracker.exists(), "no local tracker operation");
+    }
 
     #[test]
     fn remote_wiki_cat_refuses_a_directory_like_local_cat() {
@@ -1758,9 +3873,671 @@ mod read_contract_tests {
     use cadence_agent::issue::cli::IssueAction;
 
     fn outcome(command: &Commands) -> std::result::Result<(&'static str, Value), String> {
-        match verb_for(command) {
+        match verb_for(command, None) {
             Ok((verb, args)) => Ok((verb, Value::Object(args))),
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn platform(action: PlatformAction) -> Commands {
+        Commands::Platform { action }
+    }
+
+    fn call_with(
+        tool: &str,
+        input: Option<&str>,
+        query: Option<&str>,
+        request: Option<&str>,
+    ) -> Commands {
+        platform(PlatformAction::Call {
+            tool: tool.into(),
+            input: input.map(str::to_string),
+            query: query.map(str::to_string),
+            request: request.map(str::to_string),
+            platform: None,
+            account: None,
+            project: None,
+            connection: None,
+            max_charge: None,
+        })
+    }
+
+    #[test]
+    fn hosted_connected_read_retry_key_binds_the_connection() {
+        let call = |connection: &str| {
+            platform(PlatformAction::Call {
+                tool: "search_console_report".into(),
+                input: Some(r#"{"site_url":"sc-domain:example.test"}"#.into()),
+                query: None,
+                request: None,
+                platform: None,
+                account: None,
+                project: None,
+                connection: Some(connection.into()),
+                max_charge: None,
+            })
+        };
+        let (_, first) = outcome(&call("con_first")).expect("hosted read should be accepted");
+        let (_, repeat) = outcome(&call("con_first")).expect("identical read should be accepted");
+        let (_, different) = outcome(&call("con_second")).expect("other connection is distinct");
+        assert!(valid_platform_handle(first["key"].as_str().unwrap()));
+        assert_eq!(first["key"], repeat["key"]);
+        assert_ne!(first["key"], different["key"]);
+    }
+
+    fn stage(tool: &str, input: &str, connection: &str, request: Option<&str>) -> Commands {
+        platform(PlatformAction::Stage {
+            tool: tool.into(),
+            input: input.into(),
+            connection: connection.into(),
+            request: request.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn hosted_stage_sends_exactly_the_connected_effect_arguments() {
+        let (verb, args) = outcome(&stage(
+            "gmail_send",
+            r#"{"to":"a@b.test"}"#,
+            "con_one",
+            Some("req-1"),
+        ))
+        .expect("stage is accepted");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(
+            args,
+            json!({
+                "operation": "connected_effect",
+                "tool": "gmail_send",
+                "connectionId": "con_one",
+                "body": {"to": "a@b.test"},
+                "key": "req-1",
+            })
+        );
+    }
+
+    #[test]
+    fn hosted_stage_derives_its_key_from_tool_connection_and_input() {
+        let key = |tool, input, con| {
+            outcome(&stage(tool, input, con, None)).unwrap().1["key"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = key("gmail_send", r#"{"to":"a"}"#, "con_one");
+        assert!(valid_platform_handle(&first));
+        assert_eq!(first, key("gmail_send", r#"{"to":"a"}"#, "con_one"));
+        assert_ne!(first, key("gmail_send", r#"{"to":"b"}"#, "con_one"));
+        assert_ne!(first, key("gmail_send", r#"{"to":"a"}"#, "con_two"));
+    }
+
+    #[test]
+    fn local_stage_refuses_before_contacting_anything() {
+        let missing = std::path::Path::new("/nonexistent-cadence-state-dir");
+        let action = PlatformAction::Stage {
+            tool: "gmail_send".into(),
+            input: "{}".into(),
+            connection: "con_one".into(),
+            request: None,
+        };
+        let error = super::super::platform::run_platform(missing, &action).unwrap_err();
+        assert!(error.to_string().contains("Nothing was sent"), "{error}");
+    }
+
+    #[test]
+    fn hosted_connected_read_status_uses_the_same_connection_bound_key() {
+        let input = r#"{"site_url":"sc-domain:example.test"}"#;
+        let call = platform(PlatformAction::Call {
+            tool: "search_console_report".into(),
+            input: Some(input.into()),
+            query: None,
+            request: None,
+            platform: None,
+            account: None,
+            project: None,
+            connection: Some("con_first".into()),
+            max_charge: None,
+        });
+        let (_, call_args) = outcome(&call).unwrap();
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "platform",
+            "status",
+            "--tool",
+            "search_console_report",
+            "--connection",
+            "con_first",
+            "--input",
+            input,
+        ])
+        .expect("status accepts the connection needed to identify the read");
+        let (_, status_args) = outcome(&cli.command).unwrap();
+        assert_eq!(status_args["key"], call_args["key"]);
+        assert_eq!(status_args["connectionId"], "con_first");
+        assert_eq!(status_args["body"], call_args["body"]);
+    }
+
+    #[test]
+    fn hosted_platform_replay_key_is_stable_and_input_bound() {
+        let (_, args) = outcome(&call_with(
+            "generate_image",
+            Some(r#"{"prompt": "synthetic"}"#),
+            None,
+            None,
+        ))
+        .unwrap();
+        let key = args["key"].as_str().expect("a call carries a reply key");
+        assert!(valid_platform_handle(key), "{key}");
+        // The same command replays the same key; another input is another call.
+        assert_eq!(
+            outcome(&call_with(
+                "generate_image",
+                Some(r#"{"prompt": "synthetic"}"#),
+                None,
+                None
+            ))
+            .unwrap()
+            .1["key"],
+            json!(key)
+        );
+        assert_ne!(
+            outcome(&call_with(
+                "generate_image",
+                Some(r#"{"prompt": "a different prompt"}"#),
+                None,
+                None
+            ))
+            .unwrap()
+            .1["key"],
+            json!(key)
+        );
+        let ordered = outcome(&call_with(
+            "example_tool",
+            Some(r#"{"nested":{"a":1,"b":2},"name":"x"}"#),
+            None,
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        let reordered = outcome(&call_with(
+            "example_tool",
+            Some(r#"{"name":"x","nested":{"b":2,"a":1}}"#),
+            None,
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        assert_eq!(
+            ordered, reordered,
+            "object key order must not trigger a new charge"
+        );
+        let query_key = outcome(&call_with(
+            "read_posts",
+            None,
+            Some(r#"{"handle": "first"}"#),
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        let other_query_key = outcome(&call_with(
+            "read_posts",
+            None,
+            Some(r#"{"handle": "second"}"#),
+            None,
+        ))
+        .unwrap()
+        .1["key"]
+            .clone();
+        assert_ne!(
+            query_key, other_query_key,
+            "distinct queries cannot share a replay"
+        );
+    }
+
+    #[test]
+    fn hosted_platform_refuses_an_invalid_request_handle() {
+        let refused = outcome(&call_with(
+            "generate_image",
+            Some("{}"),
+            None,
+            Some("bad handle"),
+        ))
+        .unwrap_err();
+        assert!(refused.contains("1-128"), "{refused}");
+    }
+
+    #[test]
+    fn hosted_platform_refuses_flags_the_workspace_owns() {
+        for (label, action) in [
+            (
+                "--project",
+                PlatformAction::Tools {
+                    json: true,
+                    project: Some("cadence".into()),
+                },
+            ),
+            (
+                "--platform",
+                PlatformAction::Call {
+                    tool: "generate_image".into(),
+                    input: Some("{}".into()),
+                    query: None,
+                    request: None,
+                    platform: Some("agenticos".into()),
+                    account: None,
+                    project: None,
+                    connection: None,
+                    max_charge: None,
+                },
+            ),
+            (
+                "--account",
+                PlatformAction::Call {
+                    tool: "generate_image".into(),
+                    input: Some("{}".into()),
+                    query: None,
+                    request: None,
+                    platform: None,
+                    account: Some("work".into()),
+                    project: None,
+                    connection: None,
+                    max_charge: None,
+                },
+            ),
+        ] {
+            let refused = outcome(&platform(action)).unwrap_err();
+            assert!(refused.contains(label), "{label}: {refused}");
+        }
+    }
+
+    fn connection(action: ConnectionAction) -> Commands {
+        Commands::Connection { action }
+    }
+
+    fn enroll(
+        toolkit: &str,
+        scopes: Vec<String>,
+        shape: Option<&str>,
+        agent: Option<&str>,
+        no_open: bool,
+    ) -> Commands {
+        connection(ConnectionAction::Enroll {
+            provider: toolkit.into(),
+            scopes,
+            shape: shape.map(str::to_string),
+            agent: agent.map(str::to_string),
+            no_open,
+        })
+    }
+
+    #[test]
+    fn hosted_connection_owner_reads_map_to_their_relay_operations() {
+        for (action, operation) in [
+            (ConnectionAction::Providers, "connection_providers"),
+            (ConnectionAction::Ls, "connection_list"),
+        ] {
+            let (verb, args) = outcome(&connection(action)).unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args["operation"], json!(operation));
+            assert_eq!(
+                args.as_object().unwrap().len(),
+                1,
+                "a hosted connection read carries the operation and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_sends_only_the_exact_toolkit_body() {
+        for no_open in [true, false] {
+            let (verb, args) = outcome(&enroll(
+                "google_search_console",
+                Vec::new(),
+                None,
+                None,
+                no_open,
+            ))
+            .unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args["operation"], json!("connection_start"));
+            assert_eq!(
+                args["body"],
+                json!({"toolkit": "google_search_console"}),
+                "the relay admits exactly the toolkit"
+            );
+            assert_eq!(
+                args.as_object().unwrap().len(),
+                2,
+                "--no-open selects nothing on the wire: hosted enrollment never opens a browser"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_refuses_local_only_flags() {
+        for (label, scopes, shape, agent) in [
+            (
+                "--scope",
+                vec!["search_console.read".to_string()],
+                None,
+                None,
+            ),
+            ("--shape", Vec::new(), Some("token"), None),
+            ("--agent", Vec::new(), None, Some("synthetic-worker")),
+        ] {
+            let refused =
+                outcome(&enroll("google_search_console", scopes, shape, agent, true)).unwrap_err();
+            assert!(refused.contains(label), "{label}: {refused}");
+            assert!(
+                refused.contains("cannot"),
+                "a discarded local flag must refuse, not be dropped: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_connection_enroll_refuses_an_unsafe_toolkit_before_dispatch() {
+        for toolkit in [
+            String::new(),
+            "Google".into(),
+            "../etc".into(),
+            "a b".into(),
+            "UPPER".into(),
+            "a.b".into(),
+            "1abc".into(),
+            "_abc".into(),
+            "a".repeat(65),
+        ] {
+            let refused = outcome(&enroll(&toolkit, Vec::new(), None, None, true)).unwrap_err();
+            assert!(refused.contains("toolkit"), "{toolkit:?}: {refused}");
+        }
+        // The server's own grammar is accepted, hyphens and digits included.
+        let (_, args) = outcome(&enroll(
+            "google-search_console2",
+            Vec::new(),
+            None,
+            None,
+            true,
+        ))
+        .expect("a lowercase identifier toolkit is accepted");
+        assert_eq!(args["body"]["toolkit"], json!("google-search_console2"));
+    }
+
+    #[test]
+    fn hosted_connection_actions_outside_owner_enrollment_stay_unavailable() {
+        // Local credential custody, rotation and SMTP keep refusing instead
+        // of being half-mapped to a hosted operation that does not exist.
+        // CAD-2233 routed revocation to the hosted `connection_revoke`
+        // operation on purpose; its managed-caller owner gate is CAD-2320.
+        let (verb, args) = outcome(&connection(ConnectionAction::Revoke {
+            connection_id: "con_synthetic".into(),
+        }))
+        .expect("CAD-2233 maps revoke to its hosted operation");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(
+            args,
+            json!({"operation": "connection_revoke", "connectionId": "con_synthetic"})
+        );
+        for action in [
+            ConnectionAction::Show {
+                connection_id: "con_synthetic".into(),
+            },
+            ConnectionAction::Check {
+                connection_id: "con_synthetic".into(),
+            },
+            ConnectionAction::Manage { no_open: true },
+        ] {
+            let refused = outcome(&connection(action)).unwrap_err();
+            assert!(
+                refused.contains("not available on a remote org"),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_three_owner_enrollment_acts_are_the_managed_caller_gate() {
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Providers)),
+            Some("connection providers")
+        );
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Ls)),
+            Some("connection ls")
+        );
+        assert_eq!(
+            connection_owner_verb(&enroll(
+                "google_search_console",
+                Vec::new(),
+                None,
+                None,
+                true
+            )),
+            Some("connection enroll")
+        );
+        assert_eq!(
+            connection_owner_verb(&connection(ConnectionAction::Show {
+                connection_id: "con_synthetic".into()
+            })),
+            None
+        );
+        assert_eq!(connection_owner_verb(&Commands::MyWork), None);
+    }
+
+    #[test]
+    fn a_hosted_enrollment_success_is_only_its_validated_link() {
+        let url = "https://provider.example.test/oauth?synthetic=1";
+        let body = json!({"ok": true, "data": {"url": url}});
+        let document = hosted_enrollment_document(&body).expect("a validated HTTPS link succeeds");
+        assert_eq!(document, json!({"entry_url": url}));
+        assert_eq!(
+            document.as_object().unwrap().len(),
+            1,
+            "the link is the only user-facing value, and it is never repeated"
+        );
+        // The opaque query and an explicit valid port are preserved verbatim.
+        for url in [
+            "https://provider.example.test/oauth?a=1&b=%2F&c=two+words",
+            "https://provider.example.test:443/oauth",
+            "https://[2001:db8::1]:8443/oauth",
+        ] {
+            let body = json!({"ok": true, "data": {"url": url}});
+            assert_eq!(
+                hosted_enrollment_document(&body).expect("a valid HTTPS link succeeds"),
+                json!({"entry_url": url})
+            );
+        }
+        for refused in [
+            json!({"ok": true}),
+            json!({"ok": true, "data": {}}),
+            json!({"ok": false, "data": {"url": url}}),
+            json!({"ok": true, "data": {"url": "http://provider.example.test/oauth"}}),
+            json!({"ok": true, "data": {"url": "/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test}not"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:notaport/x"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:999999/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:65536/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test:/oauth"}}),
+            json!({"ok": true, "data": {"url": "https://user:secret@provider.example.test/x"}}),
+            json!({"ok": true, "data": {"url": "https://provider.example.test/\n"}}),
+        ] {
+            assert!(
+                hosted_enrollment_document(&refused).is_err(),
+                "must not report a link it cannot verify: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_platform_mixed_query_and_body_preserve_distinct_replay_keys() {
+        use clap::Parser;
+
+        let replay_key = |body: &str, query: &str| {
+            let cli = Cli::try_parse_from([
+                "cadence",
+                "--org",
+                "acme",
+                "platform",
+                "call",
+                "example_tool",
+                "--input",
+                body,
+                "--query",
+                query,
+            ])
+            .unwrap_or_else(|error| {
+                panic!("a hosted tool must accept query fields alongside its POST body: {error}")
+            });
+            let (_, args) = outcome(&cli.command).expect("mixed-input call needs a replay key");
+            args["key"]
+                .as_str()
+                .expect("a hosted call needs a replay handle")
+                .to_owned()
+        };
+
+        let original = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"first"}"#);
+        let repeated = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"first"}"#);
+        let changed_query = replay_key(r#"{"prompt":"alpha"}"#, r#"{"resource":"second"}"#);
+        let changed_body = replay_key(r#"{"prompt":"beta"}"#, r#"{"resource":"first"}"#);
+
+        assert_eq!(
+            original, repeated,
+            "repeating the same mixed-input invocation must reconcile the original call"
+        );
+        assert_ne!(
+            original, changed_query,
+            "changing only the query must not replay a call for a different resource"
+        );
+        assert_ne!(
+            original, changed_body,
+            "changing only the body must not replay a call with different content"
+        );
+    }
+
+    #[test]
+    fn hosted_app_skill_maps_to_app_skill_platform_call() {
+        use clap::Parser;
+
+        let parse_skill = |app: &str, skill: &str| {
+            let cli = Cli::try_parse_from(["cadence", "app", "skill", app, skill])
+                .expect("app skill parses cleanly");
+            outcome(&cli.command).expect("app skill maps to platform_call")
+        };
+
+        let (verb, args) = parse_skill("accounting", "bookkeeping");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args["operation"], json!("call"));
+        assert_eq!(args["tool"], json!("app_skill"));
+        assert_eq!(
+            args["body"],
+            json!({
+                "app": "accounting",
+                "skill": "bookkeeping",
+            })
+        );
+        let key = args["key"]
+            .as_str()
+            .expect("app skill carries a replay handle");
+        assert!(valid_platform_handle(key), "{key}");
+
+        let (_, repeated) = parse_skill("accounting", "bookkeeping");
+        assert_eq!(repeated["key"], json!(key));
+
+        let (_, other) = parse_skill("accounting", "tax");
+        assert_ne!(other["key"], json!(key));
+
+        assert!(
+            Cli::try_parse_from([
+                "cadence",
+                "app",
+                "skill",
+                "accounting",
+                "bookkeeping",
+                "--ref",
+                "x"
+            ])
+            .is_err(),
+            "app skill must not accept an unsupported --ref flag"
+        );
+    }
+
+    #[test]
+    fn hosted_app_pending_maps_to_board_pending_actions_with_optional_filters() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["cadence", "app", "pending"])
+            .expect("bare app pending parses cleanly");
+        let (verb, args) = outcome(&cli.command).expect("app pending maps to platform_call");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args["operation"], json!("call"));
+        assert_eq!(args["tool"], json!("board_pending_actions"));
+        assert_eq!(args["body"], json!({}));
+        let key = args["key"]
+            .as_str()
+            .expect("app pending carries a replay handle");
+        assert!(valid_platform_handle(key), "{key}");
+
+        let filtered = Cli::try_parse_from([
+            "cadence",
+            "app",
+            "pending",
+            "--status",
+            "pending",
+            "--id",
+            "act_123",
+            "--conversation",
+            "conv_456",
+        ])
+        .expect("filtered app pending parses cleanly");
+        let (_, filtered_args) = outcome(&filtered.command).expect("filtered app pending maps");
+        assert_eq!(
+            filtered_args["body"],
+            json!({
+                "status": "pending",
+                "id": "act_123",
+                "conversation": "conv_456",
+            })
+        );
+
+        for status in ["approved", "denied"] {
+            let cli = Cli::try_parse_from(["cadence", "app", "pending", "--status", status])
+                .unwrap_or_else(|e| panic!("status {status} should parse: {e}"));
+            let (_, parsed) = outcome(&cli.command).expect("status filter maps");
+            assert_eq!(parsed["body"], json!({ "status": status }));
+        }
+
+        assert!(
+            Cli::try_parse_from(["cadence", "app", "pending", "--status", "invalid"]).is_err(),
+            "app pending must reject unknown --status values"
+        );
+    }
+
+    #[test]
+    fn hosted_app_skill_and_pending_require_org_and_stay_off_local_daemon() {
+        use super::super::app::{run as run_local_app, PendingStatus};
+
+        let skill = AppAction::Skill {
+            app: "accounting".into(),
+            skill: "bookkeeping".into(),
+        };
+        let pending = AppAction::Pending {
+            status: Some(PendingStatus::Pending),
+            id: None,
+            conversation: None,
+        };
+        assert!(skill.is_hosted_action());
+        assert!(pending.is_hosted_action());
+        assert!(!AppAction::Ls { project: None }.is_hosted_action());
+
+        for action in [skill, pending] {
+            let err =
+                run_local_app(PathBuf::from("/nonexistent-cadence-state-dir"), action).unwrap_err();
+            assert_eq!(err.kind(), "usage", "{err}");
+            assert!(err.to_string().contains("--org"), "{err}");
         }
     }
 
@@ -1966,6 +4743,89 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn agent_roles_crosses_the_relay_without_arguments() {
+        let (verb, args) = outcome(&Commands::Agent {
+            action: AgentAction::Roles,
+        })
+        .unwrap();
+        assert_eq!(verb, "agent_roles");
+        assert_eq!(args, json!({}));
+    }
+
+    #[test]
+    fn agent_profile_reads_send_only_the_profile_id() {
+        let (verb, args) = outcome(&Commands::Agent {
+            action: AgentAction::Profiles,
+        })
+        .unwrap();
+        assert_eq!(verb, "agent_profile_list");
+        assert_eq!(args, json!({}));
+
+        let (verb, args) = outcome(&Commands::Agent {
+            action: AgentAction::Context {
+                id: "ap_11111111-2222-4333-8444-555555555555".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "agent_profile_context");
+        assert_eq!(
+            args,
+            json!({"id": "ap_11111111-2222-4333-8444-555555555555"})
+        );
+    }
+
+    #[test]
+    fn agent_profile_commands_map_to_the_hosted_verbs() {
+        use crate::cli::agent_profile::ProfileAction;
+        let id = "ap_11111111-2222-4333-8444-555555555555";
+        let profile = |action| Commands::Agent {
+            action: AgentAction::Profile { action },
+        };
+        let (verb, args) = outcome(&profile(ProfileAction::Get { id: id.into() })).unwrap();
+        assert_eq!((verb, args), ("agent_profile_show", json!({"id": id})));
+
+        let (verb, args) = outcome(&profile(ProfileAction::Create {
+            alias: "ledger".into(),
+            catalogue: "accountant".into(),
+            job_file: None,
+            model: Some("inherit".into()),
+        }))
+        .unwrap();
+        assert_eq!(verb, "agent_profile_create");
+        assert_eq!(
+            args,
+            json!({"alias": "ledger", "catalogue": "accountant", "model": "inherit"})
+        );
+
+        let (verb, args) = outcome(&profile(ProfileAction::Edit {
+            id: id.into(),
+            set: vec!["role=Planner".into()],
+            set_json: vec!["skills=[\"a\"]".into()],
+            file: vec![],
+            expect_rev: Some(4),
+            latest: false,
+        }))
+        .unwrap();
+        assert_eq!(verb, "agent_profile_update");
+        assert_eq!(
+            args,
+            json!({"id": id, "expectedRevision": 4, "role": "Planner", "skills": ["a"]})
+        );
+
+        let (verb, args) = outcome(&profile(ProfileAction::Archive {
+            id: id.into(),
+            expect_rev: Some(4),
+            latest: false,
+        }))
+        .unwrap();
+        assert_eq!(verb, "agent_profile_update");
+        assert_eq!(
+            args,
+            json!({"id": id, "expectedRevision": 4, "status": "archived"})
+        );
+    }
+
+    #[test]
     fn status_refuses_group_all_and_watch() {
         for command in [
             Commands::Status {
@@ -2005,30 +4865,96 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn issue_new_preserves_optional_retry_id() {
+        let parse = |key: &str| {
+            Cli::try_parse_from([
+                "cadence",
+                "issue",
+                "new",
+                "Synthetic issue",
+                "--project",
+                "demo",
+                "--request-id",
+                key,
+            ])
+            .expect("issue new accepts a retry ID")
+        };
+        let (verb, args) = outcome(&parse(" create-1 ").command).unwrap();
+        assert_eq!(verb, "issue_new");
+        assert_eq!(
+            args,
+            json!({
+                "project": "demo",
+                "title": "Synthetic issue",
+                "request_id": " create-1 "
+            })
+        );
+        for invalid in [" ", &"x".repeat(129)] {
+            let err = outcome(&parse(invalid).command).unwrap_err();
+            assert!(err.contains("--request-id"), "{err}");
+        }
+        let without_key = Cli::try_parse_from([
+            "cadence",
+            "issue",
+            "new",
+            "Synthetic issue",
+            "--project",
+            "demo",
+        ])
+        .unwrap();
+        let (_, args) = outcome(&without_key.command).unwrap();
+        assert!(args.get("request_id").is_none());
+    }
+
+    #[test]
     fn issue_ls_sends_only_the_filter_the_route_owns() {
         let (verb, args) = outcome(&issue_ls(|l| {
+            l.project = vec!["ops".into()];
             l.status = vec!["doing".into()];
             l.tags = vec!["t".into()];
             l.owner = vec!["me".into()];
             l.plan = vec!["approved".into()];
             l.open = true;
+            l.limit = Some(10);
         }))
         .unwrap();
         assert_eq!(verb, "issue_ls");
         assert_eq!(
             args,
             json!({
+                "project": "ops",
                 "status": ["doing"], "tag": ["t"], "owner": ["me"],
-                "plan": ["approved"], "open": true,
+                "plan": ["approved"], "open": true, "limit": 10,
             })
         );
+
+        for bad_limit in [0usize, 5001usize] {
+            let err = outcome(&issue_ls(|l| l.limit = Some(bad_limit))).unwrap_err();
+            assert!(err.contains("--limit"), "{bad_limit}: {err}");
+        }
+
+        let mut legacy_body = json!({
+            "issues": [{"id": "OPS-1"}, {"id": "OPS-2"}, {"id": "OPS-3"}]
+        });
+        truncate_issue_ls_body(&mut legacy_body, 2);
+        assert_eq!(
+            legacy_body,
+            json!({"issues": [{"id": "OPS-1"}, {"id": "OPS-2"}]})
+        );
+    }
+
+    #[test]
+    fn issue_ls_refuses_more_than_one_project() {
+        // CAD-1999: the hosted route filters a single key; a repeated
+        // `--project` must refuse, never silently keep one of them.
+        let err = outcome(&issue_ls(|l| l.project = vec!["ops".into(), "cad".into()])).unwrap_err();
+        assert!(err.contains("one --project"), "{err}");
     }
 
     #[test]
     fn issue_ls_rejects_every_flag_the_route_cannot_apply() {
         type Cases = Vec<(&'static str, fn(&mut IssueLs))>;
         let cases: Cases = vec![
-            ("--project", |l| l.project = vec!["cadence".into()]),
             ("--stage", |l| l.stage = vec!["build".into()]),
             ("--health", |l| l.health = vec!["on_track".into()]),
             ("--since", |l| l.since = Some("7d".into())),
@@ -2037,7 +4963,6 @@ mod read_contract_tests {
             ("--blocked", |l| l.blocked = true),
             ("--at", |l| l.at = Some("HEAD~1".into())),
             ("--sort", |l| l.sort = Some("id".into())),
-            ("--limit", |l| l.limit = Some(5)),
             ("--fields", |l| l.fields = vec!["id".into()]),
             ("--summary", |l| l.summary = true),
         ];
@@ -2076,6 +5001,328 @@ mod read_contract_tests {
         })
         .unwrap();
         assert_eq!(args, json!({"id": "CAD-1", "limit": 10}));
+    }
+
+    #[test]
+    fn ticket_message_verbs_send_exactly_what_the_tenant_reads() {
+        let say = |from: Option<&str>| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Say {
+                    id: "CAD-1".into(),
+                    to: "developer".into(),
+                    from: from.map(Into::into),
+                    message: "tm-1".into(),
+                    text: Some("REVISE: head moved".into()),
+                    file: None,
+                },
+            })
+            .unwrap()
+        };
+        let (verb, args) = say(Some("reviewer"));
+        assert_eq!(verb, "issue_message_send");
+        assert_eq!(
+            args,
+            json!({
+                "id": "CAD-1",
+                "to": "developer",
+                "from": "reviewer",
+                "message": "tm-1",
+                "text": "REVISE: head moved",
+            })
+        );
+        // Unset options are absent, not null: the tenant's argument check is exact.
+        assert!(say(None).1.get("from").is_none());
+
+        let messages = |to: Option<&str>, after: Option<u64>| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Messages {
+                    id: "CAD-1".into(),
+                    to: to.map(Into::into),
+                    after,
+                },
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            messages(None, None),
+            ("issue_messages", json!({"id": "CAD-1"}))
+        );
+        assert_eq!(
+            messages(Some("developer"), Some(7)).1,
+            json!({"id": "CAD-1", "to": "developer", "after": 7})
+        );
+
+        let (verb, args) = outcome(&Commands::Issue {
+            action: IssueAction::MessagesRead {
+                id: "CAD-1".into(),
+                role: "developer".into(),
+                through: 7,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "issue_messages_read");
+        assert_eq!(
+            args,
+            json!({"id": "CAD-1", "role": "developer", "through": 7})
+        );
+    }
+
+    #[test]
+    fn ticket_message_verbs_refuse_a_bad_value_before_the_wire() {
+        let say = |to: &str, from: Option<&str>, message: &str, text: &str| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Say {
+                    id: "CAD-1".into(),
+                    to: to.into(),
+                    from: from.map(Into::into),
+                    message: message.into(),
+                    text: Some(text.into()),
+                    file: None,
+                },
+            })
+        };
+        assert!(say(&"r".repeat(32), None, &"m".repeat(64), &"x".repeat(16_000)).is_ok());
+        for bad in [
+            say("Not A Role", None, "tm-1", "hi"),
+            say("-dev", None, "tm-1", "hi"),
+            say("", None, "tm-1", "hi"),
+            say(&"r".repeat(33), None, "tm-1", "hi"),
+            say("developer", Some("Not A Role"), "tm-1", "hi"),
+            say("developer", None, "sys-reserved", "hi"),
+            say("developer", None, "-leading", "hi"),
+            say("developer", None, &"m".repeat(65), "hi"),
+            say("developer", None, "tm-1", "   "),
+            say("developer", None, "tm-1", &"x".repeat(16_001)),
+        ] {
+            assert!(bad.unwrap_err().contains("nothing was sent"));
+        }
+        let too_big = 1u64 << 53;
+        assert!(outcome(&Commands::Issue {
+            action: IssueAction::Messages {
+                id: "CAD-1".into(),
+                to: None,
+                after: Some(too_big),
+            },
+        })
+        .is_err());
+        assert!(outcome(&Commands::Issue {
+            action: IssueAction::MessagesRead {
+                id: "CAD-1".into(),
+                role: "developer".into(),
+                through: too_big,
+            },
+        })
+        .is_err());
+    }
+
+    // CAD-2083 acceptance, written from the ticket by the reviewer: real argv,
+    // the real verb map, and the tenant's own grammar (`TICKET_ROLE`,
+    // `TICKET_MESSAGE_ID`, `TICKET_MESSAGE_BODY_MAX`, `Number.isSafeInteger`).
+    fn cad2083_argv(args: &[String]) -> std::result::Result<(&'static str, Value), String> {
+        use clap::Parser;
+        let mut argv = vec!["cadence".to_string(), "--org".into(), "acme".into()];
+        argv.extend_from_slice(args);
+        let cli = crate::cli::Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+        outcome(&cli.command)
+    }
+
+    fn cad2083_say(to: &str, from: Option<&str>, message: &str, text: &str) -> Vec<String> {
+        let mut args: Vec<String> = ["issue", "say", "CAD-1"].map(Into::into).to_vec();
+        args.push(format!("--to={to}"));
+        if let Some(from) = from {
+            args.push(format!("--from={from}"));
+        }
+        args.push(format!("--message={message}"));
+        args.push(format!("--text={text}"));
+        args
+    }
+
+    #[test]
+    fn cad2083_argv_sends_exactly_the_keys_the_tenant_admits() {
+        assert_eq!(
+            cad2083_argv(&cad2083_say("developer", Some("reviewer"), "tm-1", "hi")).unwrap(),
+            (
+                "issue_message_send",
+                json!({"id": "CAD-1", "to": "developer", "from": "reviewer",
+                    "message": "tm-1", "text": "hi"})
+            )
+        );
+        // The tenant's `exactKeys` and role check refuse a null: unset is absent.
+        assert_eq!(
+            cad2083_argv(&cad2083_say("developer", None, "tm-1", "hi")).unwrap(),
+            (
+                "issue_message_send",
+                json!({"id": "CAD-1", "to": "developer", "message": "tm-1", "text": "hi"})
+            )
+        );
+        let argv =
+            |args: &[&str]| cad2083_argv(&args.iter().map(ToString::to_string).collect::<Vec<_>>());
+        assert_eq!(
+            argv(&["issue", "messages", "CAD-1"]).unwrap(),
+            ("issue_messages", json!({"id": "CAD-1"}))
+        );
+        assert_eq!(
+            argv(&[
+                "issue",
+                "messages",
+                "CAD-1",
+                "--to",
+                "developer",
+                "--after",
+                "0"
+            ])
+            .unwrap(),
+            (
+                "issue_messages",
+                json!({"id": "CAD-1", "to": "developer", "after": 0})
+            )
+        );
+        assert_eq!(
+            argv(&[
+                "issue",
+                "messages-read",
+                "CAD-1",
+                "--role",
+                "developer",
+                "--through",
+                "7"
+            ])
+            .unwrap(),
+            (
+                "issue_messages_read",
+                json!({"id": "CAD-1", "role": "developer", "through": 7})
+            )
+        );
+        // `--role` and `--through` are both required by the tenant.
+        assert!(argv(&["issue", "messages-read", "CAD-1", "--role", "developer"]).is_err());
+        assert!(argv(&["issue", "messages-read", "CAD-1", "--through", "7"]).is_err());
+    }
+
+    #[test]
+    fn cad2083_values_follow_the_tenant_grammar_before_the_wire() {
+        let refused = |args: Vec<String>| {
+            let err = cad2083_argv(&args).unwrap_err();
+            assert!(err.contains("nothing was sent"), "{args:?}: {err}");
+        };
+        let long_role = "r".repeat(32);
+        for good in ["a", "a-", "a1", long_role.as_str()] {
+            cad2083_argv(&cad2083_say(good, Some(good), "tm-1", "hi")).unwrap();
+        }
+        let too_long_role = "r".repeat(33);
+        for bad in [
+            "",
+            "-a",
+            "1a",
+            "A",
+            "a_b",
+            "é",
+            "a\n",
+            too_long_role.as_str(),
+        ] {
+            refused(cad2083_say(bad, None, "tm-1", "hi"));
+            refused(cad2083_say("developer", Some(bad), "tm-1", "hi"));
+        }
+        let long_id = "m".repeat(64);
+        for good in ["1", "a-", "0-0", "sys", "sysx-1", long_id.as_str()] {
+            cad2083_argv(&cad2083_say("developer", None, good, "hi")).unwrap();
+        }
+        let too_long_id = "m".repeat(65);
+        for bad in ["", "-a", "A", "a_b", "sys-1", "a\n", too_long_id.as_str()] {
+            refused(cad2083_say("developer", None, bad, "hi"));
+        }
+        // The cap is UTF-8 bytes, not characters.
+        cad2083_argv(&cad2083_say("developer", None, "tm-1", &"é".repeat(8_000))).unwrap();
+        refused(cad2083_say(
+            "developer",
+            None,
+            "tm-1",
+            &format!("{}x", "é".repeat(8_000)),
+        ));
+        for blank in ["   ", " \n\t"] {
+            refused(cad2083_say("developer", None, "tm-1", blank));
+        }
+        let seq = |flag: &str, value: &str| -> Vec<String> {
+            let mut args: Vec<String> = match flag {
+                "--after" => ["issue", "messages", "CAD-1"].map(Into::into).to_vec(),
+                _ => ["issue", "messages-read", "CAD-1", "--role", "developer"]
+                    .map(Into::into)
+                    .to_vec(),
+            };
+            args.push(format!("{flag}={value}"));
+            args
+        };
+        for flag in ["--after", "--through"] {
+            cad2083_argv(&seq(flag, "9007199254740991")).unwrap();
+            refused(seq(flag, "9007199254740992"));
+            assert!(cad2083_argv(&seq(flag, "-1")).is_err());
+        }
+    }
+
+    #[test]
+    fn issue_review_sends_the_digest_it_was_given_and_refuses_a_bad_one() {
+        let digest = "7743ce348d9284d677a185f33295b92266cc435a5b5f775029b300066d26693a";
+        let (verb, args) = outcome(&Commands::Issue {
+            action: IssueAction::Review {
+                id: "CAD-1".into(),
+                artifact: "hosted:drafts.md".into(),
+                digest: digest.into(),
+                decision: "pass".into(),
+                text: Some("Uses only the supplied facts.".into()),
+                file: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "issue_review");
+        assert_eq!(
+            args,
+            json!({
+                "id": "CAD-1",
+                "artifact": "hosted:drafts.md",
+                "digest": digest,
+                "decision": "pass",
+                "text": "Uses only the supplied facts.",
+            })
+        );
+
+        let bad = |action: IssueAction| outcome(&Commands::Issue { action }).unwrap_err();
+        let review = |artifact: &str, digest: &str, decision: &str, text: Option<&str>| {
+            IssueAction::Review {
+                id: "CAD-1".into(),
+                artifact: artifact.into(),
+                digest: digest.into(),
+                decision: decision.into(),
+                text: text.map(str::to_string),
+                file: None,
+            }
+        };
+        // A native basename, an uppercase or short digest, an unknown decision
+        // and a missing body are refused before any request is built.
+        assert!(bad(review("drafts.md", digest, "pass", Some("Supported.")))
+            .contains("invalid artifact identifier"));
+        assert!(bad(review(
+            "hosted:drafts.md",
+            &digest.to_uppercase(),
+            "pass",
+            Some("Supported.")
+        ))
+        .contains("lowercase hex sha256"));
+        assert!(bad(review(
+            "hosted:drafts.md",
+            "abc",
+            "pass",
+            Some("Supported.")
+        ))
+        .contains("lowercase hex sha256"));
+        assert!(bad(review(
+            "hosted:drafts.md",
+            digest,
+            "approve",
+            Some("Supported.")
+        ))
+        .contains("pass, revise or blocked"));
+        assert!(
+            bad(review("hosted:drafts.md", digest, "pass", None)).contains("one of -m or --file")
+        );
     }
 
     #[test]
@@ -2163,9 +5410,320 @@ mod read_contract_tests {
         assert_eq!(verb, "message_inbox");
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn inbox_ack_cmd(
+        alias: &str,
+        seqs: Vec<i64>,
+        through: Option<i64>,
+        reader: Option<&str>,
+        reset: bool,
+    ) -> Commands {
+        Commands::Inbox {
+            alias: None,
+            action: Some(InboxAction::Ack {
+                alias: alias.into(),
+                seqs,
+                through,
+                reader: reader.map(str::to_string),
+                reset,
+            }),
+            peek: false,
+            after: None,
+            wait: 0,
+            follow: false,
+            reader: None,
+            exec: None,
+            exec_retry_ms: 1000,
+            exec_timeout_ms: 120_000,
+            exec_max_failures: 5,
+        }
+    }
+
     #[test]
-    fn remote_project_add_and_list_stay_unmapped() {
+    fn inbox_ack_maps_to_message_ack_with_seqs_through_and_reader() {
+        let (verb, args) =
+            outcome(&inbox_ack_cmd("bookkeeper", vec![3, 5], None, None, false)).unwrap();
+        assert_eq!(verb, "message_ack");
+        assert_eq!(args, json!({"alias": "bookkeeper", "seqs": [3, 5]}));
+
+        let (verb, args) = outcome(&inbox_ack_cmd(
+            "bookkeeper",
+            vec![],
+            Some(10),
+            Some("ops"),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(verb, "message_ack");
+        assert_eq!(
+            args,
+            json!({"alias": "bookkeeper", "through": 10, "reader": "ops"})
+        );
+    }
+
+    #[test]
+    fn inbox_ack_refuses_reset_invalid_bounds_and_outer_flags() {
+        let err = outcome(&inbox_ack_cmd("m", vec![], None, None, true)).unwrap_err();
+        assert!(err.contains("--reset"), "{err}");
+
+        for cmd in [
+            inbox_ack_cmd("  ", vec![1], None, None, false),
+            inbox_ack_cmd("m", vec![], None, None, false),
+            inbox_ack_cmd("m", vec![0], None, None, false),
+            inbox_ack_cmd("m", vec![-2], None, None, false),
+            inbox_ack_cmd("m", (1..=101).collect(), None, None, false),
+            inbox_ack_cmd("m", vec![], Some(0), None, false),
+            inbox_ack_cmd("m", vec![1], None, Some("  "), false),
+            inbox_ack_cmd("m", vec![1], None, Some(&"r".repeat(65)), false),
+        ] {
+            assert!(outcome(&cmd).is_err());
+        }
+
+        for mutate in [
+            |c: &mut Commands| {
+                let Commands::Inbox { follow, .. } = c else {
+                    unreachable!()
+                };
+                *follow = true;
+            },
+            |c: &mut Commands| {
+                let Commands::Inbox { peek, .. } = c else {
+                    unreachable!()
+                };
+                *peek = true;
+            },
+            |c: &mut Commands| {
+                let Commands::Inbox { exec, .. } = c else {
+                    unreachable!()
+                };
+                *exec = Some(vec!["cat".into()]);
+            },
+            |c: &mut Commands| {
+                let Commands::Inbox { alias, .. } = c else {
+                    unreachable!()
+                };
+                *alias = Some("outer".into());
+            },
+        ] {
+            let mut cmd = inbox_ack_cmd("m", vec![1], None, None, false);
+            mutate(&mut cmd);
+            assert!(outcome(&cmd).is_err());
+        }
+    }
+
+    #[test]
+    fn remote_send_accepts_specialist_alias() {
+        let cmd = Commands::Send {
+            alias: Some("bookkeeper".into()),
+            to: None,
+            text: Some("Check bill #104".into()),
+            file: None,
+            message: Some("bk-msg-1".into()),
+            reply_to: None,
+            task: None,
+            ready: false,
+            force: false,
+            nudge: false,
+            steer: SteerArgs::default(),
+            wait: None,
+        };
+        let (verb, args) = outcome(&cmd).unwrap();
+        assert_eq!(verb, "message_send");
+        assert_eq!(
+            args,
+            json!({"alias": "bookkeeper", "text": "Check bill #104", "message": "bk-msg-1"})
+        );
+    }
+
+    #[test]
+    fn remote_project_new_and_ls_map_but_add_and_set_remote_stay_unmapped() {
         use cadence_agent::issue::cli::ProjectAction;
+        let (verb, args) = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: Some("Operations".into()),
+                repo: None,
+                prefix: Some("OPS".into()),
+                goal: None,
+                agents: vec![],
+                issue: None,
+                visibility: None,
+                grants: vec![],
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_new");
+        assert_eq!(
+            args,
+            json!({"key": "ops", "name": "Operations", "prefix": "OPS"})
+        );
+
+        // The name is the hosted registry's own field: a create without it
+        // refuses, and the local repo/PROJECT.md flags never cross.
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: None,
+                repo: None,
+                prefix: None,
+                goal: None,
+                agents: vec![],
+                issue: None,
+                visibility: None,
+                grants: vec![],
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--name"), "{err}");
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::New {
+                key: "ops".into(),
+                name: Some("Operations".into()),
+                repo: Some(std::path::PathBuf::from("/tmp/ops")),
+                prefix: None,
+                goal: None,
+                agents: vec![],
+                issue: None,
+                visibility: None,
+                grants: vec![],
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--repo"), "{err}");
+
+        // CAD-1950: the hosted create contract carries no access policy, so
+        // the policy flags refuse rather than being dropped; the policy is
+        // set afterwards with `issue project policy`. The last case is the
+        // one a value comparison missed: `workspace-visible` is the local
+        // default, but naming it here is still a request this verb cannot
+        // honour, so it refuses by presence.
+        for (visibility, grants) in [
+            (
+                Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+                Vec::new(),
+            ),
+            (
+                Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+                vec!["users/alex".to_string()],
+            ),
+            (
+                Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+                Vec::new(),
+            ),
+        ] {
+            let err = outcome(&Commands::Project {
+                action: ProjectCmd::New {
+                    key: "ops".into(),
+                    name: Some("Operations".into()),
+                    repo: None,
+                    prefix: None,
+                    goal: None,
+                    agents: vec![],
+                    issue: None,
+                    visibility,
+                    grants,
+                },
+            })
+            .unwrap_err();
+            assert!(err.contains("issue project policy"), "{err}");
+        }
+
+        let (verb, args) = outcome(&Commands::Project {
+            action: ProjectCmd::Ls {
+                sort: None,
+                limit: None,
+                fields: vec![],
+                json: false,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_ls");
+        assert_eq!(args, json!({}));
+
+        let err = outcome(&Commands::Project {
+            action: ProjectCmd::Ls {
+                sort: None,
+                limit: Some(5),
+                fields: vec![],
+                json: false,
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--limit"), "{err}");
+
+        let (verb, args) = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort: None,
+                    limit: None,
+                    fields: vec![],
+                    json: false,
+                },
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "project_ls");
+        assert_eq!(args, json!({}));
+
+        let timeline = |kinds: Vec<String>, limit| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Project {
+                    action: ProjectAction::Timeline {
+                        key: "atlas".into(),
+                        since: Some("2026-11-01".into()),
+                        kinds,
+                        open: true,
+                        limit,
+                        before: Some("cursor".into()),
+                        json: false,
+                    },
+                },
+            })
+        };
+        let (verb, args) = timeline(vec!["status".into(), "review".into()], Some(20)).unwrap();
+        assert_eq!(verb, "project_timeline");
+        assert_eq!(
+            args,
+            json!({"project": "atlas", "limit": 20, "before": "cursor",
+                   "kinds": ["status", "review"], "since": "2026-11-01T00:00:00Z",
+                   "open_only": true})
+        );
+        assert!(timeline(vec!["decision".into()], None)
+            .unwrap_err()
+            .contains("--kind"));
+        assert!(timeline(vec![], Some(101)).unwrap_err().contains("--limit"));
+        let (_, args) = timeline(vec!["status".into(), "status".into()], None).unwrap();
+        assert_eq!(args["kinds"], json!(["status"]));
+        // A millisecond epoch is past year 9999: refused here, so the board's 400
+        // for it can never be read as "this board is too old".
+        let far = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Timeline {
+                    key: "atlas".into(),
+                    since: Some("1762819200000".into()),
+                    kinds: vec![],
+                    open: false,
+                    limit: None,
+                    before: None,
+                    json: false,
+                },
+            },
+        });
+        assert!(far.unwrap_err().contains("--since"));
+
+        let err = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort: Some("key".into()),
+                    limit: None,
+                    fields: vec![],
+                    json: false,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("--sort"), "{err}");
+
         let add = outcome(&Commands::Issue {
             action: IssueAction::Project {
                 action: ProjectAction::Add {
@@ -2180,18 +5738,193 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(add.contains("not available on a remote org"), "{add}");
-        let ls = outcome(&Commands::Issue {
+        let set_remote = outcome(&Commands::Issue {
             action: IssueAction::Project {
-                action: ProjectAction::Ls {
-                    sort: None,
-                    limit: None,
-                    fields: vec![],
-                    json: false,
+                action: ProjectAction::SetRemote {
+                    key: "cadence".into(),
+                    from: "github.com/old/name".into(),
+                    to: "github.com/new/name".into(),
                 },
             },
         })
         .unwrap_err();
-        assert!(ls.contains("not available on a remote org"), "{ls}");
+        assert!(
+            set_remote.contains("not available on a remote org"),
+            "{set_remote}"
+        );
+
+        let policy_with_key = |key: &str, visibility, grants: Vec<String>, clear_grants| {
+            outcome(&Commands::Issue {
+                action: IssueAction::Project {
+                    action: ProjectAction::Policy {
+                        key: key.into(),
+                        visibility,
+                        grants,
+                        clear_grants,
+                        json: false,
+                    },
+                },
+            })
+        };
+        let policy = |visibility, grants: Vec<String>, clear_grants| {
+            policy_with_key("atlas", visibility, grants, clear_grants)
+        };
+        assert_eq!(
+            policy(None, Vec::new(), false).unwrap(),
+            ("project_policy_read", json!({"project": "atlas"}))
+        );
+        for err in [
+            policy_with_key("../escape", None, Vec::new(), false).unwrap_err(),
+            policy_with_key("ATLAS", None, Vec::new(), false).unwrap_err(),
+            policy_with_key("", None, Vec::new(), false).unwrap_err(),
+        ] {
+            assert!(err.contains("nothing was sent"), "{err}");
+        }
+        let err = policy(None, vec!["users/alex".into()], false).unwrap_err();
+        assert!(
+            err.contains("--visibility") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(None, Vec::new(), true).unwrap_err();
+        assert!(
+            err.contains("--visibility") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(None, vec!["users/alex".into()], true).unwrap_err();
+        assert!(
+            err.contains("--visibility") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(
+            Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+            Vec::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("--clear-grants") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        for blank in ["", "   "] {
+            let err = policy(
+                Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+                vec![blank.into()],
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("non-empty") && err.contains("nothing was sent"),
+                "{err}"
+            );
+        }
+        let err = policy(
+            Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+            vec!["operator".into()],
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot be combined") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(
+            Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+            Vec::new(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("--clear-grants") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        let err = policy(
+            Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+            vec!["users/alex".into()],
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot be combined") && err.contains("nothing was sent"),
+            "{err}"
+        );
+        assert_eq!(
+            policy(
+                Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+                Vec::new(),
+                true,
+            )
+            .unwrap(),
+            (
+                "project_policy",
+                json!({"project": "atlas", "visibility": "private", "grants": []}),
+            )
+        );
+        assert_eq!(
+            policy(
+                Some(cadence_agent::issue::cli::PolicyVisibility::Private),
+                vec!["agents/ap_11111111-1111-4111-8111-111111111111".into()],
+                false,
+            )
+            .unwrap(),
+            (
+                "project_policy",
+                json!({
+                    "project": "atlas",
+                    "visibility": "private",
+                    "grants": ["agents/ap_11111111-1111-4111-8111-111111111111"],
+                }),
+            )
+        );
+        assert_eq!(
+            policy(
+                Some(cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible),
+                Vec::new(),
+                false,
+            )
+            .unwrap(),
+            (
+                "project_policy",
+                json!({"project": "atlas", "visibility": "workspace-visible", "grants": []}),
+            )
+        );
+        // End-to-end Clap argv parsing for CAD-2650 policy read, --json parity, and guarded writes.
+        let argv = |parts: &[&str]| {
+            cad2083_argv(&parts.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            argv(&["issue", "project", "policy", "atlas"]).unwrap(),
+            ("project_policy_read", json!({"project": "atlas"}))
+        );
+        assert_eq!(
+            argv(&["issue", "project", "policy", "atlas", "--json"]).unwrap(),
+            ("project_policy_read", json!({"project": "atlas"}))
+        );
+        assert_eq!(
+            argv(&[
+                "issue",
+                "project",
+                "policy",
+                "atlas",
+                "--visibility",
+                "private",
+                "--clear-grants",
+            ])
+            .unwrap(),
+            (
+                "project_policy",
+                json!({"project": "atlas", "visibility": "private", "grants": []}),
+            )
+        );
+        assert!(argv(&[
+            "issue",
+            "project",
+            "policy",
+            "atlas",
+            "--visibility",
+            "workspace-visible",
+            "--clear-grants",
+        ])
+        .is_err());
     }
 
     /// CAD-1568: `cadence send`/`message send` become `message_send` with
@@ -2313,12 +6046,1231 @@ mod read_contract_tests {
     }
 
     #[test]
+    fn remote_link_maps_to_the_board_verb_and_refuses_locally() {
+        use cadence_agent::issue::cli::IssueAction;
+        let link = |kind: &str, target: &str| Commands::Issue {
+            action: IssueAction::Link {
+                id: "CAD-16".into(),
+                kind: kind.into(),
+                target: target.into(),
+            },
+        };
+
+        let (verb, args) = verb_for(&link("blocked_by", "CAD-9"), None).unwrap();
+        assert_eq!(verb, "issue_link");
+        assert_eq!(args.get("id").and_then(Value::as_str), Some("CAD-16"));
+        assert_eq!(args.get("kind").and_then(Value::as_str), Some("blocked_by"));
+        assert_eq!(args.get("target").and_then(Value::as_str), Some("CAD-9"));
+
+        // Both refusals are knowable here, so neither reaches the wire.
+        let unknown = verb_for(&link("cousin", "CAD-9"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("blocked_by, relates, parent or duplicate_of"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("nothing was sent"), "{unknown}");
+
+        // A value the board would refuse is refused here, never trimmed into a
+        // different write: a trailing newline is not "repaired" to a valid kind.
+        let padded_kind = verb_for(&link("relates\n", "CAD-9"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(padded_kind.contains("unknown link kind"), "{padded_kind}");
+
+        let self_link = verb_for(&link("relates", "CAD-16"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(self_link.contains("cannot link itself"), "{self_link}");
+
+        // The shared grammar bounds both ids, so a malformed one costs no request.
+        for malformed in ["CAD-", "cad-16", "CAD-1234567890", "CAD-9\nX"] {
+            let err = verb_for(&link("relates", malformed), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid target id"), "{malformed}: {err}");
+            assert!(err.contains("nothing was sent"), "{malformed}: {err}");
+        }
+
+        let unlink = Commands::Issue {
+            action: IssueAction::Unlink {
+                id: "CAD-16".into(),
+                kind: "parent".into(),
+                target: "CAD-9".into(),
+            },
+        };
+        assert_eq!(verb_for(&unlink, None).unwrap().0, "issue_unlink");
+    }
+
+    #[test]
     fn verbs_outside_the_read_allowlist_refuse() {
         let err = outcome(&Commands::Agent {
             action: AgentAction::Stop { alias: "w1".into() },
         })
         .unwrap_err();
         assert!(err.contains("not available on a remote org"), "{err}");
+    }
+
+    #[test]
+    fn a_scope_gap_refusal_names_the_login_flag_and_the_credential() {
+        let caps = vec!["cli.read".to_string(), "cli.write".to_string()];
+        let uncertain = Error::rejected(
+            "the remote did not confirm why it refused the credential (uncertain, HTTP 401); \
+             nothing was retried",
+        );
+        let hinted = scope_hint(
+            uncertain,
+            &caps,
+            "audit.approve",
+            "cadence login --audit-approve",
+        )
+        .to_string();
+        assert!(
+            hinted.contains("does not carry `audit.approve`"),
+            "{hinted}"
+        );
+        assert!(hinted.contains("cadence login --audit-approve"), "{hinted}");
+        assert!(hinted.contains("cli.read, cli.write"), "{hinted}");
+        // A known cause replaces the uncertain-401 text; it never leads with it.
+        assert!(!hinted.contains("uncertain"), "{hinted}");
+
+        // A credential that carries the scope keeps the original message.
+        let owned = vec!["audit.approve".to_string()];
+        let plain =
+            scope_hint(Error::rejected("boom"), &owned, "audit.approve", "unused").to_string();
+        assert!(plain.contains("boom"), "{plain}");
+        assert!(!plain.contains("does not carry"), "{plain}");
+
+        // A different refusal is never rewritten.
+        let ended = Error::rejected("the remote session ended (authentication, HTTP 401)");
+        let kept = scope_hint(ended, &caps, "audit.approve", "unused").to_string();
+        assert!(kept.contains("session ended"), "{kept}");
+        assert!(!kept.contains("does not carry"), "{kept}");
+    }
+
+    #[test]
+    fn unavailable_commands_keep_the_hosted_context_and_hide_arguments() {
+        for (argv, expected) in [
+            (
+                vec![
+                    "cadence",
+                    "issue",
+                    "edit",
+                    "CAD-1",
+                    "--unlink",
+                    "blocked_by:private-value",
+                ],
+                "`cadence issue edit`",
+            ),
+            (
+                vec!["cadence", "wiki", "mkdir", "private-value"],
+                "`cadence wiki mkdir`",
+            ),
+        ] {
+            let matches = super::super::help::root_command(false)
+                .try_get_matches_from(argv)
+                .unwrap();
+            let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+            let path = super::super::action_dispatch::command_path(&matches);
+            let err = verb_for(&cli.command, path.as_deref()).unwrap_err();
+            let message = err.to_string();
+            assert_eq!(err.kind(), "rejected");
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("private-value"), "{message}");
+            assert!(!message.contains("--org local"), "{message}");
+            assert!(!message.contains("org switch"), "{message}");
+            assert!(message.contains("nothing was sent"), "{message}");
+            if expected == "`cadence wiki mkdir`" {
+                assert!(message.contains("cadence commands --all"), "{message}");
+            }
+        }
+    }
+
+    // CAD-2127: `platform status` is a read that resolves the same request
+    // handle a `platform call` used — by `--request`, by `--job`, or by
+    // deriving the identical `pcli_<sha256>` key from `--tool` plus its
+    // input/query.
+    fn status_with(
+        request: Option<&str>,
+        job: Option<&str>,
+        tool: Option<&str>,
+        input: Option<&str>,
+        query: Option<&str>,
+    ) -> Commands {
+        platform(PlatformAction::Status {
+            request: request.map(str::to_string),
+            job: job.map(str::to_string),
+            tool: tool.map(str::to_string),
+            input: input.map(str::to_string),
+            query: query.map(str::to_string),
+            connection: None,
+        })
+    }
+
+    /// The mapped refusal for a command that must never build a request.
+    fn refusal(command: &Commands) -> Error {
+        match verb_for(command, None) {
+            Ok((verb, _)) => panic!("`{verb}` must refuse before any request is built"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn hosted_connections_map_to_owner_platform_calls() {
+        let cases = [
+            (
+                ConnectionAction::Providers,
+                json!({"operation": "connection_providers"}),
+            ),
+            (
+                ConnectionAction::Ls,
+                json!({"operation": "connection_list"}),
+            ),
+            (
+                ConnectionAction::Revoke {
+                    connection_id: "con_synthetic".into(),
+                },
+                json!({
+                    "operation": "connection_revoke",
+                    "connectionId": "con_synthetic"
+                }),
+            ),
+            (
+                ConnectionAction::Sites {
+                    connection_id: "con_synthetic".into(),
+                },
+                json!({
+                    "operation": "connection_sites",
+                    "connectionId": "con_synthetic"
+                }),
+            ),
+            (
+                ConnectionAction::SelectSite {
+                    connection_id: "con_synthetic".into(),
+                    site_url: "sc-domain:example.test".into(),
+                },
+                json!({
+                    "operation": "connection_select_site",
+                    "connectionId": "con_synthetic",
+                    "body": {"siteUrl": "sc-domain:example.test"}
+                }),
+            ),
+            (
+                ConnectionAction::Assets {
+                    connection_id: "con_synthetic".into(),
+                },
+                json!({
+                    "operation": "connection_assets",
+                    "connectionId": "con_synthetic"
+                }),
+            ),
+            (
+                ConnectionAction::SelectAsset {
+                    connection_id: "con_synthetic".into(),
+                    value: "act_1234567890".into(),
+                },
+                json!({
+                    "operation": "connection_select_asset",
+                    "connectionId": "con_synthetic",
+                    "body": {"value": "act_1234567890"}
+                }),
+            ),
+        ];
+        for (action, expected) in cases {
+            let (verb, args) = outcome(&Commands::Connection { action }).unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args, expected);
+        }
+    }
+
+    #[test]
+    fn hosted_whatsapp_connections_map_strictly_and_require_human_owner() {
+        use super::super::connection::{WhatsappAction, WhatsappProviderArg};
+        for (action, expected, owner_verb) in [
+            (
+                WhatsappAction::Status {
+                    provider: WhatsappProviderArg::Linked,
+                },
+                json!({"operation": "whatsapp_status", "body": {"provider": "linked"}}),
+                "connection whatsapp status",
+            ),
+            (
+                WhatsappAction::Status {
+                    provider: WhatsappProviderArg::Official,
+                },
+                json!({"operation": "whatsapp_status", "body": {"provider": "official"}}),
+                "connection whatsapp status",
+            ),
+            (
+                WhatsappAction::Connect {
+                    provider: WhatsappProviderArg::Linked,
+                },
+                json!({"operation": "whatsapp_connect", "body": {"provider": "linked"}}),
+                "connection whatsapp connect",
+            ),
+            (
+                WhatsappAction::Start {
+                    provider: WhatsappProviderArg::Official,
+                },
+                json!({"operation": "whatsapp_start", "body": {"provider": "official"}}),
+                "connection whatsapp start",
+            ),
+            (
+                WhatsappAction::Stop {
+                    provider: WhatsappProviderArg::Linked,
+                },
+                json!({"operation": "whatsapp_stop", "body": {"provider": "linked"}}),
+                "connection whatsapp stop",
+            ),
+            (
+                WhatsappAction::Disconnect {
+                    provider: WhatsappProviderArg::Official,
+                    confirm: true,
+                },
+                json!({"operation": "whatsapp_disconnect", "body": {"provider": "official", "confirm": true}}),
+                "connection whatsapp disconnect",
+            ),
+            (
+                WhatsappAction::Inspect {
+                    company_id: "comp_42".into(),
+                },
+                json!({"operation": "whatsapp_inspect", "body": {"provider": "official", "favcrm_company_id": "comp_42"}}),
+                "connection whatsapp inspect",
+            ),
+            (
+                WhatsappAction::Link {
+                    company_id: "comp_42".into(),
+                    request: None,
+                },
+                json!({"operation": "whatsapp_link", "body": {"provider": "official", "favcrm_company_id": "comp_42"}}),
+                "connection whatsapp link",
+            ),
+            (
+                WhatsappAction::Link {
+                    company_id: "comp_42".into(),
+                    request: Some("req_link_1".into()),
+                },
+                json!({"operation": "whatsapp_link", "body": {"provider": "official", "favcrm_company_id": "comp_42"}, "key": "req_link_1"}),
+                "connection whatsapp link",
+            ),
+            (
+                WhatsappAction::Rescope { request: None },
+                json!({"operation": "whatsapp_rescope", "body": {"provider": "official"}}),
+                "connection whatsapp rescope",
+            ),
+            (
+                WhatsappAction::Rescope {
+                    request: Some("req_rescope_1".into()),
+                },
+                json!({"operation": "whatsapp_rescope", "body": {"provider": "official"}, "key": "req_rescope_1"}),
+                "connection whatsapp rescope",
+            ),
+        ] {
+            let cmd = Commands::Connection {
+                action: ConnectionAction::Whatsapp { action },
+            };
+            assert_eq!(connection_owner_verb(&cmd), Some(owner_verb));
+            let (verb, args) = outcome(&cmd).unwrap();
+            assert_eq!(verb, "platform_call");
+            assert_eq!(args, expected);
+        }
+
+        let err = outcome(&Commands::Connection {
+            action: ConnectionAction::Whatsapp {
+                action: WhatsappAction::Disconnect {
+                    provider: WhatsappProviderArg::Linked,
+                    confirm: false,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("--confirm"),
+            "disconnect without --confirm must refuse: {err}"
+        );
+
+        let bad_co = outcome(&Commands::Connection {
+            action: ConnectionAction::Whatsapp {
+                action: WhatsappAction::Inspect {
+                    company_id: "bad\nid".into(),
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(bad_co.contains("--company-id"), "{bad_co}");
+
+        for payload in [
+            json!({"ok": true, "data": {"qr": "secret"}}),
+            json!({"ok": true, "data": {"qrCode": "secret"}}),
+            json!({"ok": true, "data": {"QRCode": "secret"}}),
+            json!({"nested": [{"QR_SVG": "<svg/>"}]}),
+            json!({"nested": [{"pairingQr": "raw"}]}),
+            json!({"nested": [{"pairingQR": "raw"}]}),
+            json!({"meta": {"qr-data": "raw"}}),
+        ] {
+            assert!(
+                cadence_agent::remote_cli::contains_qr_key(&payload),
+                "expected QR key detection for {payload}"
+            );
+        }
+        for safe in [
+            json!({"ok": true, "data": {"provider": "linked", "state": "pairing", "pairing_url": "https://example.test/account#linked"}}),
+            json!({"ok": true, "data": {"query": "ok", "square": 1, "require": true, "displayPhoneNumber": "+85290001111"}}),
+        ] {
+            assert!(
+                !cadence_agent::remote_cli::contains_qr_key(&safe),
+                "unexpected false positive QR key detection for {safe}"
+            );
+        }
+
+        let linked_status = cadence_agent::remote_cli::project_whatsapp_connection_answer(
+            "whatsapp_status",
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "connected": true,
+                "state": "connected",
+                "extraInternalToken": "strip-me"
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            linked_status,
+            json!({"ok": true, "data": {"provider": "linked", "connected": true, "state": "connected"}})
+        );
+
+        let official_status = cadence_agent::remote_cli::project_whatsapp_connection_answer(
+            "whatsapp_status",
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "connected": true,
+                "enabled": true,
+                "binding": {"status": "active", "workspaceName": "Acme", "favcrmToken": "secret"},
+                "displayPhoneNumber": "+852 9000 1111",
+                "verifiedName": "Acme Support",
+                "webhook": {"subscribed": true, "status": "verified", "rawSecret": "strip"},
+                "wabaId": "strip-me",
+                "phoneNumberId": "strip-me"
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            official_status,
+            json!({"ok": true, "data": {
+                "provider": "official",
+                "connected": true,
+                "enabled": true,
+                "binding": {"status": "active", "workspaceName": "Acme"},
+                "displayPhoneNumber": "+852 9000 1111",
+                "verifiedName": "Acme Support",
+                "webhook": {"subscribed": true, "status": "verified"}
+            }})
+        );
+
+        let inspect = cadence_agent::remote_cli::project_whatsapp_connection_answer(
+            "whatsapp_inspect",
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "inspect": {
+                    "favcrmCompanyId": "comp_42",
+                    "workspaceName": "Acme",
+                    "organisationName": "Acme Ltd",
+                    "role": "owner",
+                    "internalGrant": "strip-me"
+                },
+                "extraField": "strip-me"
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect,
+            json!({"ok": true, "data": {
+                "provider": "official",
+                "inspect": {
+                    "favcrmCompanyId": "comp_42",
+                    "workspaceName": "Acme",
+                    "organisationName": "Acme Ltd",
+                    "role": "owner"
+                }
+            }})
+        );
+        assert!(
+            cadence_agent::remote_cli::project_whatsapp_connection_answer(
+                "whatsapp_inspect",
+                &json!({"ok": true, "data": {
+                    "provider": "official",
+                    "inspect": {
+                        "favcrmCompanyId": "comp_42",
+                        "workspaceName": "Acme",
+                        "organisationName": "Acme Ltd",
+                        "role": "guest"
+                    }
+                }})
+            )
+            .is_none()
+        );
+
+        let connect_ok = cadence_agent::remote_cli::project_whatsapp_connection_answer(
+            "whatsapp_connect",
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "state": "pairing",
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked",
+                "expiresAt": "2026-11-23T02:00:00Z",
+                "extraRenamedSecret": "strip-me"
+            }}),
+        )
+        .unwrap();
+        assert_eq!(
+            connect_ok,
+            json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "state": "pairing",
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked",
+                "expiresAt": "2026-11-23T02:00:00Z"
+            }})
+        );
+        for bad_connect in [
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "url": "http://insecure.example.test"}}),
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "url": "data:text/plain,abc"}}),
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "url": "https://user:pass@example.test/"}}),
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "qr": "raw"}}),
+            json!({"ok": true, "data": {"provider": "linked", "action": "connect", "qrCode": "raw"}}),
+        ] {
+            assert!(
+                cadence_agent::remote_cli::project_whatsapp_connection_answer(
+                    "whatsapp_connect",
+                    &bad_connect
+                )
+                .is_none(),
+                "expected refusal for {bad_connect}"
+            );
+        }
+
+        let linked_pairing_hint = whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &connect_ok,
+        )
+        .unwrap();
+        assert!(linked_pairing_hint.contains("Cadence WhatsApp Settings"));
+        assert!(linked_pairing_hint
+            .contains("https://alpha.board.example.test/apps/waba?waba=connection&mode=linked"));
+        assert!(linked_pairing_hint.contains("no QR secret is printed"));
+
+        let linked_connected_hint = whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "alreadyConnected": true,
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked"
+            }}),
+        )
+        .unwrap();
+        assert!(linked_connected_hint.contains("already connected"));
+        assert!(linked_connected_hint.contains("$0/mo"));
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "url": "http://insecure.example.test/apps/waba"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Official,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "action": "connect",
+                "url": "https://portal.favcrm.example.test/wa/connect?token=tok"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Rescope { request: None },
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "action": "rescope",
+                "url": "https://portal.favcrm.example.test/wa/connect?token=tok"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Status {
+                provider: WhatsappProviderArg::Linked
+            },
+            &json!({"ok": true, "data": {"provider": "linked", "state": "connected"}}),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn hosted_platform_status_maps_a_request_handle_or_job_id_to_a_read() {
+        let (verb, args) = outcome(&status_with(Some("cad2127-run-1"), None, None, None, None))
+            .expect("a request handle is a complete status target");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args, json!({"operation": "status", "key": "cad2127-run-1"}));
+
+        let (verb, args) = outcome(&status_with(None, Some("med_job-1"), None, None, None))
+            .expect("a hosted media job id is a complete status target");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args, json!({"operation": "status", "jobId": "med_job-1"}));
+
+        // Both targets may ride together; neither dispatches or polls.
+        let (_, args) = outcome(&status_with(
+            Some("cad2127-run-1"),
+            Some("med_job-1"),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            args,
+            json!({"operation": "status", "key": "cad2127-run-1", "jobId": "med_job-1"})
+        );
+    }
+
+    #[test]
+    fn hosted_platform_status_derives_exactly_the_call_key_from_tool_and_body() {
+        // The status key must be the same replay handle the failed call used:
+        // a derived key that differed would reconcile the wrong request.
+        for (tool, input, query) in [
+            ("generate_image", Some(r#"{"prompt": "synthetic"}"#), None),
+            ("read_posts", None, Some(r#"{"handle": "first"}"#)),
+            (
+                "example_tool",
+                Some(r#"{"prompt": "synthetic"}"#),
+                Some(r#"{"resource": "first"}"#),
+            ),
+        ] {
+            let (verb, call_args) = outcome(&call_with(tool, input, query, None))
+                .expect("the call maps to a replay key");
+            assert_eq!(verb, "platform_call");
+            let call_key = call_args["key"]
+                .as_str()
+                .expect("a call carries its reply key")
+                .to_owned();
+            assert!(
+                call_key.starts_with("pcli_"),
+                "a derived handle is the sha256 replay key: {call_key}"
+            );
+            assert_eq!(call_key.len(), "pcli_".len() + 64, "{call_key}");
+
+            let (verb, status_args) = outcome(&status_with(None, None, Some(tool), input, query))
+                .expect("tool plus its input derives the same handle");
+            assert_eq!(verb, "platform_call");
+            assert_eq!(status_args["operation"], json!("status"));
+            assert_eq!(status_args["key"], json!(call_key));
+            assert_eq!(status_args["tool"], json!(tool));
+            assert!(
+                valid_platform_handle(&call_key),
+                "the derived handle is the wire grammar: {call_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_platform_status_refuses_bad_handles_jobs_and_missing_targets() {
+        // Everything below is decided in `verb_for`, before any request exists.
+        let bad_handles: Vec<String> = vec![
+            String::new(),
+            "bad handle".into(),
+            "bad/handle".into(),
+            "a".repeat(129),
+        ];
+        for handle in bad_handles {
+            let error = refusal(&status_with(Some(handle.as_str()), None, None, None, None));
+            assert_eq!(error.kind(), "rejected", "{handle:?}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("1-128"), "{handle:?}: {message}");
+        }
+
+        let too_long = format!("med_{}", "a".repeat(81));
+        for job in ["job-1", "med_", "med_bad/job", too_long.as_str()] {
+            let error = refusal(&status_with(None, Some(job), None, None, None));
+            assert_eq!(error.kind(), "rejected", "{job:?}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("med_"), "{job:?}: {message}");
+        }
+
+        // No target at all.
+        let error = refusal(&status_with(None, None, None, None, None));
+        assert_eq!(error.kind(), "usage", "{error}");
+        let message = error.to_string();
+        assert!(message.contains("--request"), "{message}");
+        assert!(message.contains("--job"), "{message}");
+
+        // A tool with no request and no body/query cannot derive a handle.
+        let error = refusal(&status_with(None, None, Some("generate_image"), None, None));
+        assert_eq!(error.kind(), "usage", "{error}");
+        let message = error.to_string();
+        assert!(message.contains("--input"), "{message}");
+        assert!(message.contains("--query"), "{message}");
+
+        // Body/query without a tool cannot name the tool the key hashed.
+        let error = refusal(&status_with(None, None, None, Some("{}"), None));
+        assert_eq!(error.kind(), "usage", "{error}");
+        let message = error.to_string();
+        assert!(message.contains("--tool"), "{message}");
+    }
+
+    // CAD-2127 follow-up (independent security review): the hosted call echoes
+    // the tool name on the pre-call correlation line and puts it on the wire,
+    // so a name outside the slug grammar — notably one carrying a newline or
+    // control byte that could forge that line — is refused while the call is
+    // mapped, before any request or stderr correlation exists.
+    #[test]
+    fn hosted_platform_refuses_an_unsafe_tool_name_before_dispatch() {
+        let too_long = format!("a{}", "a".repeat(128));
+        for tool in [
+            "GenerateImage",
+            "generate image",
+            "generate\nimage",
+            "generate\rimage",
+            "generate\u{1b}image",
+            "-generate_image",
+            ".generate_image",
+            "generate/image",
+            "genérate_image",
+            "",
+            too_long.as_str(),
+        ] {
+            let error = refusal(&call_with(tool, Some("{}"), None, None));
+            assert_eq!(error.kind(), "rejected", "{tool:?}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("a-z"), "{tool:?}: {message}");
+            // The refusal is a fixed sentence: the rejected name cannot forge
+            // a second line in the caller's terminal.
+            assert!(!message.contains('\n'), "{tool:?}: {message:?}");
+            assert!(!message.contains('\r'), "{tool:?}: {message:?}");
+        }
+        // The same guard accepts the declared slug, so it is a grammar check,
+        // not a blanket refusal.
+        assert!(outcome(&call_with("generate_image", Some("{}"), None, None)).is_ok());
+    }
+
+    #[test]
+    fn hosted_platform_artifact_maps_a_verified_ref_and_refuses_bad_ones() {
+        let digest = "a".repeat(64);
+        let reference = format!("med_job-1.{digest}");
+        let (verb, args) = outcome(&platform(PlatformAction::Artifact {
+            reference: reference.clone(),
+            out: PathBuf::from("/tmp/cad2127-image.png"),
+        }))
+        .expect("a complete ref maps to the artifact read");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args, json!({"operation": "artifact", "ref": reference}));
+
+        // A ref without a job id, a short/upper-case digest, or a non-hex
+        // digest cannot name a retained artifact, so it refuses locally.
+        for bad in [
+            "med_job-1".to_string(),
+            format!("job-1.{digest}"),
+            format!("med_.{digest}"),
+            format!("med_job-1.{}", "a".repeat(63)),
+            format!("med_job-1.{}", "A".repeat(64)),
+            format!("med_job-1.{}", "z".repeat(64)),
+        ] {
+            let error = refusal(&platform(PlatformAction::Artifact {
+                reference: bad.clone(),
+                out: PathBuf::from("/tmp/cad2127-image.png"),
+            }));
+            assert_eq!(error.kind(), "rejected", "{bad}: {error}");
+            let message = error.to_string();
+            assert!(message.contains("med_<job-id>"), "{bad}: {message}");
+        }
+    }
+
+    fn artifact_ref_for(bytes: &[u8]) -> (String, String) {
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        (format!("med_job1.{digest}"), digest)
+    }
+
+    fn artifact_page(
+        reference: &str,
+        job_id: &str,
+        digest: &str,
+        mime: &str,
+        offset: u64,
+        total: u64,
+        chunk: &[u8],
+    ) -> Value {
+        use base64::Engine;
+        json!({
+            "ok": true,
+            "data": {
+                "ref": reference,
+                "jobId": job_id,
+                "digest": digest,
+                "mime": mime,
+                "offset": offset,
+                "total": total,
+                "bytes": chunk.len(),
+                "content_base64": base64::engine::general_purpose::STANDARD.encode(chunk),
+            },
+        })
+    }
+
+    fn run_artifact_pages(
+        reference: &str,
+        out: &std::path::Path,
+        pages: Vec<std::result::Result<Value, String>>,
+    ) -> (Result<Value>, usize) {
+        let served = std::cell::Cell::new(0usize);
+        let mut pages = pages.into_iter();
+        let result = collect_platform_artifact(reference, out, |_offset| {
+            served.set(served.get() + 1);
+            match pages.next() {
+                Some(Ok(page)) => Ok(page),
+                Some(Err(message)) => Err(Error::rejected(message)),
+                None => Err(Error::rejected(
+                    "the download asked for a page it should not need",
+                )),
+            }
+        });
+        (result, served.get())
+    }
+
+    // CAD-2127: a multi-page artifact is spooled, checked page by page and in
+    // full, and only then created at the destination.
+    #[test]
+    fn a_multi_page_artifact_is_verified_before_the_destination_is_created() {
+        let bytes = b"\x89PNG\r\n\x1a\nsynthetic-provider-image-bytes";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let total = bytes.len() as u64;
+        let split = 8usize; // page one keeps the PNG signature intact
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("image.png");
+        let mut fetched = Vec::new();
+        let mut existed_during_fetch = false;
+        let receipt = collect_platform_artifact(&reference, &out, |offset| {
+            fetched.push(offset);
+            existed_during_fetch |= out.exists();
+            let chunk = if offset == 0 {
+                &bytes[..split]
+            } else {
+                &bytes[split..]
+            };
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "image/png",
+                offset,
+                total,
+                chunk,
+            ))
+        })
+        .expect("a verified two-page artifact is written");
+        assert_eq!(fetched, vec![0, split as u64], "pages are contiguous");
+        assert!(
+            !existed_during_fetch,
+            "the destination must not exist before the full digest check"
+        );
+        assert_eq!(receipt["ref"].as_str(), Some(reference.as_str()));
+        assert_eq!(receipt["jobId"], json!("med_job1"));
+        assert_eq!(receipt["digest"].as_str(), Some(digest.as_str()));
+        assert_eq!(receipt["mime"], json!("image/png"));
+        assert_eq!(receipt["bytes"], json!(total));
+        assert_eq!(
+            receipt["written"].as_str(),
+            Some(out.to_str().unwrap()),
+            "the receipt names the created file"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), bytes.as_slice());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a retained artifact stays private");
+    }
+
+    #[test]
+    fn a_large_video_artifact_is_verified_before_the_destination_is_created() {
+        let bytes = vec![0x56; 10 * 1024 * 1024 + 1];
+        let (reference, digest) = artifact_ref_for(&bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let receipt = collect_platform_artifact(&reference, &out, |offset| {
+            assert!(
+                !out.exists(),
+                "unverified video must not reach the destination"
+            );
+            let start = offset as usize;
+            let end = (start + 1024 * 1024).min(bytes.len());
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                &bytes[start..end],
+            ))
+        })
+        .expect("a verified video above the image limit is written");
+        assert_eq!(receipt["mime"], json!("video/mp4"));
+        assert_eq!(receipt["bytes"], json!(bytes.len()));
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_tampered_video_leaves_no_destination() {
+        let bytes = b"synthetic-webm";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("verified.webm");
+        let (verified, _) = run_artifact_pages(
+            &reference,
+            &good,
+            vec![Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/webm",
+                0,
+                bytes.len() as u64,
+                bytes,
+            ))],
+        );
+        assert!(verified.is_ok());
+        assert_eq!(std::fs::read(&good).unwrap(), bytes);
+        let out = dir.path().join("video.webm");
+        let (result, _) = run_artifact_pages(
+            &reference,
+            &out,
+            vec![Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/webm",
+                0,
+                bytes.len() as u64,
+                b"tampered-webm!",
+            ))],
+        );
+        assert!(result.is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn an_existing_destination_is_refused_before_any_page_is_fetched() {
+        let bytes = b"\x89PNG\r\n\x1a\nsynthetic-provider-image-bytes";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let split = 8usize;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("image.png");
+        std::fs::write(&out, b"keep me").unwrap();
+        let (result, served) = run_artifact_pages(
+            &reference,
+            &out,
+            vec![Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "image/png",
+                0,
+                bytes.len() as u64,
+                &bytes[..split],
+            ))],
+        );
+        let error = result.expect_err("an existing file must never be adopted");
+        assert_eq!(error.kind(), "rejected", "{error}");
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(served, 0, "no page may be fetched for an existing file");
+        assert_eq!(std::fs::read(&out).unwrap(), b"keep me".as_slice());
+    }
+
+    #[test]
+    fn a_destination_created_during_download_is_not_replaced() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            std::fs::write(&out, b"other writer").unwrap();
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"other writer");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_replaced_destination_directory_is_not_reported_as_success() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("destination");
+        let moved = dir.path().join("moved-destination");
+        std::fs::create_dir(&parent).unwrap();
+        let out = parent.join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            std::fs::rename(&parent, &moved).unwrap();
+            std::fs::create_dir(&parent).unwrap();
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        assert!(
+            result.is_err(),
+            "the reported path no longer names the pinned directory"
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn a_substituted_spool_cannot_publish_unverified_bytes() {
+        let bytes = b"synthetic-video";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("video.mp4");
+        let result = collect_platform_artifact(&reference, &out, |offset| {
+            let stage = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".cadence-media-artifact-")
+                })
+                .expect("the download is staged before fetching");
+            let is_dir = stage.is_dir();
+            std::fs::rename(&stage, dir.path().join("moved-stage")).unwrap();
+            if is_dir {
+                std::fs::create_dir(&stage).unwrap();
+                std::fs::write(stage.join("artifact"), b"substituted").unwrap();
+            } else {
+                std::fs::write(&stage, b"substituted").unwrap();
+            }
+            Ok(artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "video/mp4",
+                offset,
+                bytes.len() as u64,
+                bytes,
+            ))
+        });
+        if result.is_ok() {
+            assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        } else {
+            assert!(!out.exists(), "a refused download must not publish a file");
+        }
+    }
+
+    #[test]
+    fn an_unverified_artifact_page_leaves_no_partial_file() {
+        let bytes = b"\x89PNG\r\n\x1a\nsynthetic-provider-image-bytes";
+        let (reference, digest) = artifact_ref_for(bytes);
+        let total = bytes.len() as u64;
+        let split = 8usize;
+        let first = || {
+            artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "image/png",
+                0,
+                total,
+                &bytes[..split],
+            )
+        };
+        let second = |offset, total, chunk: &[u8]| {
+            artifact_page(
+                &reference,
+                "med_job1",
+                &digest,
+                "image/png",
+                offset,
+                total,
+                chunk,
+            )
+        };
+        let (other_reference, other_digest) = artifact_ref_for(b"not the served bytes");
+
+        let cases: Vec<(&str, Vec<std::result::Result<Value, String>>)> = vec![
+            (
+                "a foreign ref",
+                vec![
+                    Ok(first()),
+                    Ok(artifact_page(
+                        &format!("med_other.{digest}"),
+                        "med_job1",
+                        &digest,
+                        "image/png",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a foreign job id",
+                vec![
+                    Ok(first()),
+                    Ok(artifact_page(
+                        &reference,
+                        "med_job2",
+                        &digest,
+                        "image/png",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a foreign digest",
+                vec![
+                    Ok(first()),
+                    Ok(artifact_page(
+                        &reference,
+                        "med_job1",
+                        &"0".repeat(64),
+                        "image/png",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a non-contiguous offset",
+                vec![
+                    Ok(first()),
+                    Ok(second(split as u64 + 1, total, &bytes[split..])),
+                ],
+            ),
+            (
+                "a changed total",
+                vec![
+                    Ok(first()),
+                    Ok(second(split as u64, total + 1, &bytes[split..])),
+                ],
+            ),
+            (
+                "a changed mime",
+                vec![
+                    Ok(first()),
+                    Ok(artifact_page(
+                        &reference,
+                        "med_job1",
+                        &digest,
+                        "image/jpeg",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a digest that does not match the bytes",
+                vec![
+                    Ok(artifact_page(
+                        &other_reference,
+                        "med_job1",
+                        &other_digest,
+                        "image/png",
+                        0,
+                        total,
+                        &bytes[..split],
+                    )),
+                    Ok(artifact_page(
+                        &other_reference,
+                        "med_job1",
+                        &other_digest,
+                        "image/png",
+                        split as u64,
+                        total,
+                        &bytes[split..],
+                    )),
+                ],
+            ),
+            (
+                "a later page fetch error",
+                vec![Ok(first()), Err("the second page never arrived".into())],
+            ),
+        ];
+
+        for (label, pages) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("image.png");
+            let (result, served) = run_artifact_pages(&reference, &out, pages);
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), "rejected", "{label}: {error}");
+            assert!(
+                !out.exists(),
+                "{label}: a refused download must leave no file at {}",
+                out.display()
+            );
+            assert!(served >= 1, "{label}: no page was fetched");
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "{label}: the destination directory must stay empty"
+            );
+        }
+
+        // A total of zero or beyond the supported bound cannot be a real
+        // artifact, so it is refused before the destination is created.
+        for (total, mime) in [
+            (0u64, "image/png"),
+            (PLATFORM_MEDIA_ARTIFACT_MAX_BYTES + 1, "image/png"),
+            (PLATFORM_VIDEO_ARTIFACT_MAX_BYTES + 1, "video/mp4"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("image.png");
+            let (result, _) = run_artifact_pages(
+                &reference,
+                &out,
+                vec![Ok(artifact_page(
+                    &reference,
+                    "med_job1",
+                    &digest,
+                    mime,
+                    0,
+                    total,
+                    &bytes[..split],
+                ))],
+            );
+            let error = result.expect_err("an impossible total must refuse");
+            assert_eq!(error.kind(), "rejected", "{total}: {error}");
+            assert!(!out.exists(), "{total}: {error}");
+        }
     }
 }
 

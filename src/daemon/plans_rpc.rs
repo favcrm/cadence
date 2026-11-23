@@ -33,6 +33,25 @@ fn proposal_inputs(inputs: Option<&Value>) -> Result<BTreeMap<String, String>> {
     }
 }
 
+/// `true` only for an automatic apply that claims it still saw an approval.
+/// Absent on a manual upgrade, which is itself the consent. Any other shape
+/// is refused before the package is fetched.
+fn automatic_upgrade_requested(method: &str, params: &Value) -> Result<bool> {
+    if method != "app_workspace_upgrade" {
+        return Ok(false);
+    }
+    match (
+        params.get("automatic"),
+        params.get("observed_approval").and_then(Value::as_str),
+    ) {
+        (None, None) => Ok(false),
+        (Some(Value::Bool(true)), Some("approved")) => Ok(true),
+        _ => Err(Error::rejected(
+            "an automatic update must set automatic true and observed_approval \"approved\"",
+        )),
+    }
+}
+
 impl Shared {
     /// CAD-360: the plan gate for every daemon dispatch of a task —
     /// `task_dispatch` and both monitor paths. A task whose job is bound
@@ -172,6 +191,13 @@ impl Shared {
                 // beside bound work; only a truly absent grant takes the
                 // ordinary path. `text`/`app` proposals never reach here.
                 if crate::issue::app::split_ref(name).is_none() && !name.contains('/') {
+                    // CAD-1867: a stored project workflow has no installed
+                    // bundle to resolve `skill:` against, and the grant path
+                    // renders this same text — refuse the directive before
+                    // either path can drop it.
+                    crate::issue::workflow::refuse_skill_directive(
+                        &crate::issue::workflow::read_for(&self.pm_dir()?, project, name)?,
+                    )?;
                     if let Some(out) =
                         self.admit_unattended_workflow(project, name, &provided, &actor)?
                     {
@@ -188,6 +214,26 @@ impl Shared {
             }
         };
         let pm = self.pm()?;
+        // CAD-622: a plan naming an app's source is authored by its
+        // proposer, and an app's own team agents never author changes to
+        // that app. The saved team and the installation's run role
+        // inputs are both read here; a refusal writes nothing.
+        let planned = crate::issue::app_guard::apps_in_text(&text);
+        let remotes: Vec<String> = crate::issue::project::list(&pm.dir)?
+            .into_iter()
+            .find(|p| p.key == project)
+            .map(|p| p.repos.iter().filter_map(|r| r.remote.clone()).collect())
+            .unwrap_or_default();
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        if let Some(why) =
+            crate::issue::app_guard::refusals(guard, &planned, &[actor.as_str()], &remotes)?
+        {
+            return Err(Error::rejected(why));
+        }
         let allow = crate::secret::Allowlist::load(&self.state_dir)?;
         let out =
             crate::issue::plan::propose(&pm, project, &text, workflow, &allow, &actor, &|| {
@@ -258,6 +304,10 @@ impl Shared {
             )));
         }
         let text = crate::issue::workflow::read_for(&pm_dir, project, name)?;
+        // CAD-1867: a project workflow is not an installed app's workflow, so
+        // a `skill:` directive has no bundle to resolve against — refuse it
+        // rather than propose a plan that silently drops it.
+        crate::issue::workflow::refuse_skill_directive(&text)?;
         let digest = crate::issue::workflow::gate_digest(&text)?;
         let approvals = self.store.workflow_approvals()?;
         let ok = approvals
@@ -568,6 +618,8 @@ impl Shared {
                 "catalogue",
                 "catalogue_resolution",
                 "hosted_operation_id",
+                "automatic",
+                "observed_approval",
             ],
             "app_workspace_upgrade_check" => &[
                 "install_id",
@@ -588,6 +640,9 @@ impl Shared {
         if object.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(Error::rejected("unknown workspace catalog parameter"));
         }
+        // An automatic apply is not itself consent. The claim is checked
+        // before the package fetch so a malformed one never opens the network.
+        let automatic_apply = automatic_upgrade_requested(method, params)?;
         let hosted_operation_id = params
             .get("hosted_operation_id")
             .map(|_| required_str(params, "hosted_operation_id"))
@@ -716,6 +771,12 @@ impl Shared {
                                 incompatible_bindings.push(binding["id"].clone());
                             }
                         }
+                        // Still under the PM lock, after the fetch and before
+                        // any journal byte. A revoke during the fetch holds
+                        // this same lock and has already committed.
+                        if automatic_apply {
+                            self.automatic_update_still_observed(id, expected_digest)?;
+                        }
                         Ok((
                             json!({"incompatible_contexts":incompatible_contexts,
                             "rebind_required":incompatible_bindings,
@@ -810,7 +871,16 @@ impl Shared {
                 result["install_id"].as_str().map(str::to_owned),
                 result["digest"].as_str().map(str::to_owned),
             ) {
-                result["consent"] = self.record_install_consent(&pm, &id, &digest, via);
+                result["consent"] = if automatic_apply {
+                    self.record_automatic_upgrade_consent(
+                        &pm,
+                        &id,
+                        &digest,
+                        required_str(params, "expected_digest")?,
+                    )?
+                } else {
+                    self.record_install_consent(&pm, &id, &digest, via)
+                };
             }
         }
         let project_approval = |row: &mut Value| -> Result<()> {
@@ -1342,6 +1412,32 @@ impl Shared {
             Some(Value::String(repo)) => Some(std::path::PathBuf::from(repo)),
             Some(_) => return Err(Error::rejected("'repo' must be a path string or null")),
         };
+        // CAD-1950: the create-time access policy. An unknown spelling is a
+        // refusal, never a default — a typo must not silently create a
+        // workspace-visible project.
+        let visibility = match params.get("visibility") {
+            None | Some(Value::Null) => crate::issue::project::Visibility::WorkspaceVisible,
+            Some(Value::String(raw)) => crate::issue::cli::PolicyVisibility::from_wire(raw)
+                .map(crate::issue::cli::PolicyVisibility::recorded)
+                .ok_or_else(|| {
+                    Error::rejected(format!(
+                        "'visibility' must be workspace-visible or private (got {raw:?})"
+                    ))
+                })?,
+            Some(_) => return Err(Error::rejected("'visibility' must be a string")),
+        };
+        let grants = match params.get("grants") {
+            None | Some(Value::Null) => vec![],
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| {
+                    v.as_str().map(str::to_string).ok_or_else(|| {
+                        Error::rejected("'grants' must be a list of caller spellings")
+                    })
+                })
+                .collect::<Result<_>>()?,
+            Some(_) => return Err(Error::rejected("'grants' must be a list of strings")),
+        };
         let req = crate::issue::project_new::Request {
             key: required_str(params, "key")?.to_string(),
             repo,
@@ -1349,6 +1445,8 @@ impl Shared {
             goal: text("goal"),
             agents,
             issue: text("issue"),
+            visibility,
+            grants,
         };
         let pm = self.pm()?;
         let out = crate::issue::project_new::run(

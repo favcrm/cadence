@@ -1189,6 +1189,14 @@ fn cad778_frozen_run_with_float_identity_approves() {
         })
         .unwrap();
     let id = run["id"].as_str().unwrap();
+    // CAD-622: a new snapshot always records its team-role map — an empty
+    // map included — so it is never mistaken for a legacy snapshot whose
+    // role keys were never recorded.
+    assert_eq!(
+        run["snapshot"]["team_roles"],
+        json!({}),
+        "a new snapshot carries its team-role provenance"
+    );
     s.app_run_decide(
         id,
         run["snapshot_digest"].as_str(),
@@ -1422,7 +1430,7 @@ fn cad1142_reason_class_is_bounded_and_never_echoes() {
     // free text never passes through verbatim unless it IS the class.
     const CLASSES: &[&str] = &[
         "run binding receipt is no longer current",
-        "capability price changed since run approval",
+        "capability price could not be confirmed",
         "run context was updated or archived",
         "capability connection receipt is stale or unavailable",
         "registered assignment identity or group changed",
@@ -1444,4 +1452,751 @@ fn cad1142_reason_class_is_bounded_and_never_echoes() {
         assert!(CLASSES.contains(&class), "{hostile} -> {class}");
         assert!(!class.contains("leaked") && !class.contains("abc"));
     }
+}
+
+const TWO_PROPOSALS: &str = "\
+## Recorded decisions
+
+The group agreed to keep the current lunch hours.
+
+## Proposed next steps
+
+- Publish the Tuesday menu on the board.
+- Ask the vendor for a written quote.
+
+## Notes
+
+This line is not a proposal.
+";
+
+const ONE_PROPOSAL: &str = "\
+## Proposed next steps
+
+- Publish the Tuesday menu on the board.
+";
+
+fn reviewed_text_run(markdown: &str) -> (TempDir, Store, String, String, String) {
+    let (dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap().to_string();
+    s.app_run_decide(
+        &id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    let dispatched = s.app_run_dispatch(&id, "sha256:bundle").unwrap();
+    let produce_step = dispatched["steps"][0]["step_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let writer = start_local_step(&s, &dispatched, 0, "writer");
+    let envelope = json!({
+        "schema": 1,
+        "kind": "produce_text",
+        "run_id": id,
+        "step_id": produce_step,
+        "revision": 1,
+        "outcome": "succeeded",
+        "artifacts": [{"media_type": "text/markdown", "text": markdown}],
+    });
+    s.finish(
+        &writer,
+        "completed",
+        &json!({"turn_id": writer.turn_id, "text": envelope.to_string()}),
+        None,
+    )
+    .unwrap();
+    let next = s.app_run_dispatch(&id, "sha256:bundle").unwrap();
+    let review_step = next["steps"][1]["step_id"].as_str().unwrap().to_string();
+    let reviewer = start_local_step(&s, &next, 1, "reviewer");
+    let artifact = next["artifacts"][0]["id"].as_str().unwrap().to_string();
+    let fetched = s
+        .app_artifact_with_digest(
+            &artifact,
+            Some((&reviewer.id, reviewer.turn_id.as_deref().unwrap())),
+            "sha256:bundle",
+        )
+        .unwrap();
+    let digest = fetched["digest"].as_str().unwrap().to_string();
+    let response = json!({
+        "schema": 1,
+        "kind": "review_text",
+        "run_id": id,
+        "step_id": review_step,
+        "revision": 1,
+        "producer_step_id": produce_step,
+        "producer_revision": 1,
+        "artifact_sha256": digest,
+        "decision": "approve",
+        "rationale": "The proposals are in the source.",
+    });
+    s.finish(
+        &reviewer,
+        "completed",
+        &json!({"turn_id": reviewer.turn_id, "text": response.to_string()}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(s.app_run_show(&id).unwrap()["state"], "succeeded");
+    (dir, s, id, artifact, digest)
+}
+
+fn flipped_digest(digest: &str) -> String {
+    let mut chars: Vec<char> = digest.chars().collect();
+    chars[7] = if chars[7] == '0' { '1' } else { '0' };
+    chars.into_iter().collect()
+}
+
+#[test]
+fn cad1887_fresh_schema_includes_the_operator_decision_tables() {
+    let (dir, _store) = store();
+    let db = dir.path().join("t.sqlite3");
+    let present = |kind: &str, name: &str| -> bool {
+        Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
+                [kind, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    };
+    assert!(present("table", "app_run_dispositions"));
+    assert!(present("table", "app_run_tickets"));
+    assert!(present("index", "app_run_tickets_issue"));
+    assert!(present("table", "app_runs"));
+    let version: i64 = Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, crate::rollout::SCHEMA_VERSION);
+}
+
+#[test]
+fn cad1887_proposed_steps_parser_keeps_only_the_section() {
+    let steps = crate::store::app_runs::parse_proposed_steps(TWO_PROPOSALS).unwrap();
+    assert_eq!(
+        steps,
+        vec![
+            "Publish the Tuesday menu on the board.".to_string(),
+            "Ask the vendor for a written quote.".to_string(),
+        ]
+    );
+    assert_eq!(
+        crate::store::app_runs::parse_proposed_steps(ONE_PROPOSAL)
+            .unwrap()
+            .len(),
+        1
+    );
+    let prose = "## Proposed next steps\n\n- One\nAlso this\n- Two\n";
+    assert!(crate::store::app_runs::parse_proposed_steps(prose)
+        .unwrap_err()
+        .to_string()
+        .contains("not a single proposal"));
+    assert!(
+        crate::store::app_runs::parse_proposed_steps("No heading\n- One\n- Two\n")
+            .unwrap_err()
+            .to_string()
+            .contains("no Proposed next steps")
+    );
+    let twice = format!("{TWO_PROPOSALS}\n## Proposed next steps\n\n- Again\n- Twice\n");
+    assert!(crate::store::app_runs::parse_proposed_steps(&twice)
+        .unwrap_err()
+        .to_string()
+        .contains("more than one"));
+}
+
+#[test]
+fn cad1887_disposition_accepts_one_proposal_and_tickets_only_with_two() {
+    let (_dir, s, id, artifact, digest) = reviewed_text_run(ONE_PROPOSAL);
+    assert!(s.app_run_show(&id).unwrap()["disposition"].is_null());
+    let upgrade_before = s
+        .app_install_upgrade_ready("install-1")
+        .err()
+        .map(|e| e.to_string());
+    let accepted = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
+        .unwrap();
+    assert_eq!(accepted["decision"], "accept");
+    assert_eq!(accepted["replayed"], false);
+    let err = s
+        .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("at least two"), "{err}");
+    let upgrade_after = s
+        .app_install_upgrade_ready("install-1")
+        .err()
+        .map(|e| e.to_string());
+    assert_eq!(upgrade_before, upgrade_after);
+}
+
+#[test]
+fn cad1887_decline_is_durable_and_blocks_a_ticket() {
+    let (_dir, s, id, artifact, digest) = reviewed_text_run(TWO_PROPOSALS);
+    let declined = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "decline", None)
+        .unwrap();
+    assert_eq!(declined["decision"], "decline");
+    let replay = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "decline", None)
+        .unwrap();
+    assert_eq!(replay["replayed"], true);
+    let err = s
+        .app_run_disposition(&id, "decision-2", &artifact, &digest, "accept", None)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already has an operator decision"),
+        "{err}"
+    );
+    let err = s
+        .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("accepted disposition"), "{err}");
+    assert_eq!(s.app_run_show(&id).unwrap()["state"], "succeeded");
+    assert!(s.app_run_show(&id).unwrap()["ticket"].is_null());
+}
+
+#[test]
+fn cad1887_one_selected_ticket_survives_restart_and_refuses_the_rest() {
+    let (dir, s, id, artifact, digest) = reviewed_text_run(TWO_PROPOSALS);
+    s.write_tx(|conn| {
+        let tx = &mut *conn;
+        tx.execute(
+            "UPDATE app_run_reviews SET reviewer='writer' WHERE run_id=?",
+            [&id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let err = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
+        .unwrap_err();
+    assert!(err.to_string().contains("producer"), "{err}");
+    s.write_tx(|conn| {
+        let tx = &mut *conn;
+        tx.execute(
+            "UPDATE app_run_reviews SET reviewer='reviewer' WHERE run_id=?",
+            [&id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let err = s
+        .app_run_disposition(
+            &id,
+            "decision-1",
+            &artifact,
+            &flipped_digest(&digest),
+            "accept",
+            None,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("digest"), "{err}");
+    let accepted = s
+        .app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
+        .unwrap();
+    assert_eq!(accepted["replayed"], false);
+    assert_eq!(
+        s.app_run_disposition(&id, "decision-1", &artifact, &digest, "accept", None)
+            .unwrap()["replayed"],
+        true
+    );
+    let reserved = s
+        .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
+        .unwrap();
+    assert_eq!(
+        reserved["suggestion"],
+        "Publish the Tuesday menu on the board."
+    );
+    assert_eq!(reserved["count"], 2);
+    assert!(reserved["issue_id"].is_null());
+    assert_eq!(reserved["replayed"], false);
+    let replay = s
+        .app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, None)
+        .unwrap();
+    assert_eq!(replay["replayed"], true);
+    let err = s
+        .app_run_ticket_reserve(&id, "ticket-2", &artifact, &digest, 2, None)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already has a selected ticket"),
+        "{err}"
+    );
+    let err = s
+        .app_run_ticket_bind(&id, "ticket-1", "not-an-issue", None)
+        .unwrap_err();
+    assert!(err.to_string().contains("Invalid issue id"), "{err}");
+    let bound = s
+        .app_run_ticket_bind(&id, "ticket-1", "CAD-1887", None)
+        .unwrap();
+    assert_eq!(bound["issue_id"], "CAD-1887");
+    assert_eq!(bound["replayed"], false);
+    assert_eq!(
+        s.app_run_ticket_bind(&id, "ticket-1", "CAD-1887", None)
+            .unwrap()["replayed"],
+        true
+    );
+    let err = s
+        .app_run_ticket_bind(&id, "ticket-1", "CAD-1", None)
+        .unwrap_err();
+    assert!(err.to_string().contains("different issue"), "{err}");
+    let shown = s.app_run_show(&id).unwrap();
+    assert_eq!(shown["disposition"]["decision"], "accept");
+    assert_eq!(shown["ticket"]["issue_id"], "CAD-1887");
+    assert_eq!(
+        shown["ticket"]["suggestion"],
+        "Publish the Tuesday menu on the board."
+    );
+    assert_ne!(
+        shown["ticket"]["suggestion"],
+        "Ask the vendor for a written quote."
+    );
+    assert_eq!(shown["state"], "succeeded");
+    drop(s);
+    let reopened = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    let shown = reopened.app_run_show(&id).unwrap();
+    assert_eq!(shown["disposition"]["decision"], "accept");
+    assert_eq!(shown["ticket"]["issue_id"], "CAD-1887");
+    assert_eq!(shown["ticket"]["index"], 1);
+}
+
+/// A human receipt uses `request_id` for the operation UUID. The caller's
+/// idempotency id has to survive under another field, or a board-owner
+/// audit cannot be tied back to the decision or ticket request.
+#[test]
+fn cad1887_human_receipt_keeps_the_caller_request_id() {
+    let (_dir, s, id, artifact, digest) = reviewed_text_run(TWO_PROPOSALS);
+    let human = json!({
+        "sub": "operator-1",
+        "company": "acme",
+        "session": "session-1",
+        "role": "operator",
+        "display": "Operator",
+    });
+    s.app_run_disposition(
+        &id,
+        "decision-1",
+        &artifact,
+        &digest,
+        "accept",
+        Some(&human),
+    )
+    .unwrap();
+    s.app_run_ticket_reserve(&id, "ticket-1", &artifact, &digest, 1, Some(&human))
+        .unwrap();
+    s.app_run_ticket_bind(&id, "ticket-1", "CAD-1887", Some(&human))
+        .unwrap();
+    for (kind, caller_id) in [
+        ("app_run_disposition_recorded", "decision-1"),
+        ("app_run_ticket_reserved", "ticket-1"),
+        ("app_run_ticket_bound", "ticket-1"),
+    ] {
+        let raw: String = s
+            .conn()
+            .query_row(
+                "SELECT payload FROM events WHERE alias=?1 AND kind=?2",
+                [crate::store::app_runs::APP_RUN_APPROVAL_STREAM, kind],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: serde_json::Value = raw.parse().unwrap();
+        assert_eq!(
+            payload["decision_request_id"], caller_id,
+            "{kind}: {payload}"
+        );
+        assert_eq!(
+            payload["request_id"], payload["correlation_id"],
+            "{kind}: {payload}"
+        );
+        assert_ne!(payload["request_id"], caller_id, "{kind}: {payload}");
+        uuid::Uuid::parse_str(payload["request_id"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["human"]["sub"], "operator-1", "{kind}");
+    }
+}
+
+/// CAD-2042: the retained-source page is an ordered scoped index range, not a
+/// join plus temp-B-tree sort over the whole scoped history. Recording a
+/// source read denormalizes its owning run's installation/context and the
+/// source marker in the same transaction, and the page query reads the page
+/// from `app_capability_results_source`.
+#[test]
+fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
+    let (_dir, s, _run) = runtime_fixture();
+    let install = "install-1";
+    let config = crate::store::app_contexts::ContextConfig::new(
+        "Synthetic source context",
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let context = s
+        .app_context_create(install, &config, "cad2042-context")
+        .unwrap();
+    let context_id = context["context"]["id"].as_str().unwrap().to_string();
+    let (_config, proof) = s.app_context_proof(install, &context_id).unwrap();
+
+    let text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
+    let inputs = std::collections::BTreeMap::new();
+    let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
+    let run = s
+        .app_run_create_with_context(
+            crate::store::app_runs::LocalRunRequest {
+                install_id: install,
+                bundle_digest: "sha256:bundle",
+                workflow: &workflow,
+                inputs: &inputs,
+                request_id: "cad2042-run",
+                owner_pm: Some("lead"),
+                project_link: None,
+            },
+            Some(&proof),
+        )
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_string();
+    s.app_run_decide(
+        &run_id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    let dispatched = s.app_run_dispatch(&run_id, "sha256:bundle").unwrap();
+    let writer = start_local_step(&s, &dispatched, 0, "writer");
+    let turn = writer.turn_id.as_deref().unwrap();
+    let input_digest = crate::store::app_runs::material_digest(&json!({"handle":"client_a"}));
+    s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
+        run: &run_id,
+        step: "s1",
+        message: &writer.id,
+        turn,
+        slot: "source",
+        request: "cad2042-request",
+        binding_digest: "binding-a",
+        input_digest: &input_digest,
+        call_id: "cad2042-receipt",
+    })
+    .unwrap();
+    let result = json!({
+        "schema": 1,
+        "kind": "social.source.posts",
+        "handle": "client_a",
+        "posts": [{"id": "p1", "permalink": "https://www.instagram.com/p/AbC/", "published_at_unix": 1}],
+    });
+    s.app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
+        id: "cad2042-receipt",
+        run: &run_id,
+        step: "s1",
+        message: &writer.id,
+        turn,
+        slot: "source",
+        request: "cad2042-request",
+        binding_digest: "binding-a",
+        input_digest: &input_digest,
+        result: &result,
+        asset: None,
+    })
+    .unwrap();
+
+    let (flag, receipt_install, receipt_context): (i64, Option<String>, Option<String>) = s
+        .conn()
+        .query_row(
+            "SELECT source_post_read,install_id,context_id FROM app_capability_results WHERE id=?",
+            ["cad2042-receipt"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        flag, 1,
+        "a source read is marked in the recording transaction"
+    );
+    assert_eq!(receipt_install.as_deref(), Some(install));
+    assert_eq!(receipt_context.as_deref(), Some(context_id.as_str()));
+
+    let fence = s.app_source_run_watermark().unwrap();
+    let page = s
+        .app_source_run_candidates(install, &context_id, None, fence, 5)
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+        vec!["cad2042-receipt"],
+        "the recorded source read is pageable in its own scope"
+    );
+
+    let plan: Vec<String> = s
+        .conn()
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::store::app_capabilities::SOURCE_PAGE_AFTER_SQL
+        ))
+        .unwrap()
+        .query_map(params![install, &context_id, 0.0f64, "zzzz", 5i64], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let plan_text = plan.join("\n");
+    assert!(
+        plan_text.contains("app_capability_results_source"),
+        "the page must use its scoped ordered index: {plan_text}"
+    );
+    assert!(
+        !plan_text.contains("TEMP B-TREE"),
+        "the page must not sort scoped history before LIMIT: {plan_text}"
+    );
+    assert!(
+        plan_text.contains("(created,id)<(?,?)"),
+        "the cursor must be one composite index bound: {plan_text}"
+    );
+}
+
+/// CAD-2042: the batched backfill resumes from its durable cursor after an
+/// interruption. Simulates a crash between batches: rows before the cursor
+/// were committed, rows after it were not, and the index/version never
+/// committed.
+#[test]
+fn cad2042_interrupted_backfill_resumes_and_converges() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("resume.sqlite3");
+    drop(Store::open(&path).unwrap());
+    {
+        // A plain connection: the store's own authorizer refuses fixture DDL.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        for i in 0..2 {
+            conn.execute(
+                "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+                 VALUES(?1,'install-resume',1,'sha256:bundle','{}','sha256:snap','lead',?2,'succeeded',1.0,1.0,'ctx-resume')",
+                rusqlite::params![format!("r-resume-{i}"), format!("req-resume-{i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+                 VALUES(?1,?2,'s1','','','source',?3,'sha256:b','sha256:i','{\"kind\":\"social.source.posts\"}','sha256:d',1.0,2)",
+                rusqlite::params![format!("c-resume-{i}"), format!("r-resume-{i}"), format!("cr-resume-{i}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS app_capability_results_source;
+             UPDATE app_capability_results
+                SET source_post_read=1, install_id='install-resume', context_id='ctx-resume'
+              WHERE id='c-resume-0';
+             UPDATE app_capability_results
+                SET source_post_read=0, install_id=NULL, context_id=NULL
+              WHERE id='c-resume-1';
+             INSERT OR REPLACE INTO app_schema_progress(name,cursor)
+               SELECT 'cad2042-source-scope', rowid FROM app_capability_results WHERE id='c-resume-0';
+             UPDATE schema_version SET version=61;",
+        )
+        .unwrap();
+    }
+
+    // No rollout lease in a fixture: the schema-test constructor skips the
+    // operator gate while still running the real migration blocks.
+    let reopened = Store::open_for_schema_tests(&path).unwrap();
+    let conn = reopened.conn();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version,
+        crate::rollout::SCHEMA_VERSION,
+        "the resumed upgrade finishes"
+    );
+    let rows: Vec<(String, i64, Option<String>, Option<String>)> = conn
+        .prepare("SELECT id,source_post_read,install_id,context_id FROM app_capability_results ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (id, flag, install, context) in &rows {
+        assert_eq!(*flag, 1, "{id} is flagged after the resume");
+        assert_eq!(install.as_deref(), Some("install-resume"), "{id}");
+        assert_eq!(context.as_deref(), Some("ctx-resume"), "{id}");
+    }
+    let progress: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_schema_progress WHERE name='cad2042-source-scope'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(progress, 0, "the progress row is cleared on completion");
+    let indexes: Vec<String> = conn
+        .prepare("PRAGMA index_list(app_capability_results)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "app_capability_results_source"),
+        "the page index is recreated: {indexes:?}"
+    );
+}
+
+/// CAD-2042: a connection from a pre-v62 binary inserts through the old column
+/// list. The v62 trigger must mark that row from its own run, or the page
+/// would silently omit history written after the upgrade.
+#[test]
+fn cad2042_pre_v62_writer_still_produces_a_pageable_receipt() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("oldwriter.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    conn.execute(
+        "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+         VALUES('r-old','install-old',1,'sha256:bundle','{}','sha256:snap','lead','req-old','succeeded',1.0,1.0,'ctx-old')",
+        [],
+    )
+    .unwrap();
+    // Exactly the pre-v62 column list: no install/context/marker columns.
+    conn.execute(
+        "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+         VALUES('c-old','r-old','s1','','','source','cr-old','sha256:b','sha256:i','{\"kind\":\"social.source.posts\"}','sha256:d',1.0,2)",
+        [],
+    )
+    .unwrap();
+    let row: (i64, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT source_post_read,install_id,context_id FROM app_capability_results WHERE id='c-old'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, 1, "the trigger marks a source read");
+    assert_eq!(row.1.as_deref(), Some("install-old"));
+    assert_eq!(row.2.as_deref(), Some("ctx-old"));
+}
+
+/// CAD-2120: the cursor is opaque, not authenticated, so a caller can name any
+/// scan-start fence. A low fence must cost a bounded index range, not the
+/// scoped history, and must end in a restart rather than a silent empty scan.
+#[test]
+fn cad2120_low_run_fence_is_bounded_and_restarts_the_scan() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("fence.sqlite3");
+    drop(Store::open(&path).unwrap());
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+             INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema,install_id,context_id,source_post_read)
+               SELECT 'c'||i,'r','s','','','source'||i,'q'||i,'b','i','{}','d',i,2,'inst','ctx',1 FROM n;",
+        )
+        .unwrap();
+    }
+    let s = Store::open_for_schema_tests(&path).unwrap();
+    let watermark = s.app_source_run_watermark().unwrap();
+    // An honest fence returns the page.
+    let page = s
+        .app_source_run_candidates("inst", "ctx", None, watermark, 10)
+        .unwrap();
+    assert_eq!(page.len(), 10);
+    // A forged low fence would hide all 3000 rows. It must be refused after a
+    // bounded look, not answered empty after walking the scope.
+    let err = s
+        .app_source_run_candidates("inst", "ctx", None, 0, 10)
+        .unwrap_err();
+    assert_eq!(err.code(), Some("stale_cursor"), "{err}");
+    // A forged fence only arrives with a cursor, which takes the continuation
+    // SQL: the same bound must hold there.
+    let err = s
+        .app_source_run_candidates("inst", "ctx", Some((2999.0, "c2999")), 0, 10)
+        .unwrap_err();
+    assert_eq!(err.code(), Some("stale_cursor"), "{err}");
+    // A fence that only hides a few recent rows still pages.
+    let some = s
+        .app_source_run_candidates("inst", "ctx", None, watermark - 5, 10)
+        .unwrap();
+    assert_eq!(some.len(), 10);
+    assert_eq!(some[0].0, "c2995");
+}
+
+/// CAD-2120: the decision on the v62 backfill cursor. A missing progress row
+/// is completion on a v62 store and a fault below it.
+#[test]
+fn cad2120_missing_backfill_progress_is_decided_by_the_version() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("progress.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(Store::source_scope_progress(&conn).unwrap(), None);
+    conn.execute("UPDATE schema_version SET version=61", [])
+        .unwrap();
+    assert!(Store::source_scope_progress(&conn).is_err());
+    conn.execute(
+        "INSERT INTO app_schema_progress(name,cursor) VALUES('cad2042-source-scope',7)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(Store::source_scope_progress(&conn).unwrap(), Some(7));
+}
+
+/// CAD-2120: concurrent openers of a v61 store with several backfill batches.
+/// A loser used to fail on the progress row the winner deleted. The timing is
+/// the scheduler's, but every interleaving must succeed.
+#[test]
+fn cad2120_concurrent_openers_of_a_v61_store_all_succeed() {
+    for round in 0..5 {
+        concurrent_v61_round(round);
+    }
+}
+
+fn concurrent_v61_round(round: usize) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(format!("race{round}.sqlite3"));
+    drop(Store::open(&path).unwrap());
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated,context_id)
+               VALUES('r','inst',1,'sha256:bundle','{}','sha256:snap','lead','req-r','succeeded',1.0,1.0,'ctx');
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<170000)
+             INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,created,receipt_schema)
+               SELECT 'c'||i,'r','s','','','source'||i,'q'||i,'b','i','{\"kind\":\"social.source.posts\"}','d',i,2 FROM n;
+             DROP TRIGGER IF EXISTS app_capability_results_source_scope;
+             DROP INDEX IF EXISTS app_capability_results_source;
+             INSERT OR REPLACE INTO app_schema_progress(name,cursor) VALUES('cad2042-source-scope',0);
+             UPDATE schema_version SET version=61;",
+        )
+        .unwrap();
+    }
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let (path, gate) = (path.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                Store::open_for_schema_tests(&path)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle
+            .join()
+            .unwrap()
+            .expect("every opener reaches the current schema");
+    }
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, crate::rollout::SCHEMA_VERSION);
+    let progress: i64 = conn
+        .query_row("SELECT COUNT(*) FROM app_schema_progress", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(progress, 0);
 }

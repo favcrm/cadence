@@ -192,6 +192,11 @@ fn unix_now() -> Result<u64> {
         .map_err(|_| rejected("System clock is invalid"))
 }
 
+/// The credential directory: `--auth-dir` when given, else
+/// [`crate::home::config_dir`]`/remote-auth` — `<home>/config/remote-auth`
+/// for a first run, `$XDG_CONFIG_HOME/cadence/remote-auth` (else
+/// `~/.config/cadence/remote-auth`) for an existing installation, which
+/// keeps the credentials it already has.
 pub fn auth_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = explicit {
         if !dir.is_absolute() {
@@ -199,20 +204,33 @@ pub fn auth_dir(explicit: Option<&Path>) -> Result<PathBuf> {
         }
         return Ok(dir.to_owned());
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| rejected("Set HOME, XDG_CONFIG_HOME or --auth-dir"))?;
-    if !base.is_absolute() {
-        return Err(rejected("Credential directory must be absolute"));
-    }
-    Ok(base.join("cadence/remote-auth"))
+    Ok(crate::home::config_dir()?.join("remote-auth"))
 }
 
 fn private_dir(dir: &Path, create: bool) -> Result<()> {
+    // CAD-1922: a first run keeps its credentials in `<home>/config`. A
+    // symlinked home root or credential root would redirect them, so
+    // refuse both — the credential file and dir themselves are refused
+    // below, which leaves an out-of-home `--auth-dir` untouched.
+    if let Ok(home) = crate::home::home() {
+        if dir.starts_with(&home) {
+            let levels = [Some(home.as_path()), dir.parent()];
+            for level in levels.into_iter().flatten() {
+                let linked = std::fs::symlink_metadata(level)
+                    .is_ok_and(|meta| meta.file_type().is_symlink());
+                if linked {
+                    return Err(rejected(
+                        "the consolidated home's credential directory is reached through a \
+                         symlink — refusing to read or write credentials",
+                    ));
+                }
+            }
+        }
+    }
     if !dir.exists() && create {
-        fs::create_dir_all(dir)?;
+        // Inside the consolidated home this also creates the home root
+        // above it 0700; the leaf is 0700 either way.
+        crate::home::create_home_dir(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     let meta = fs::symlink_metadata(dir)?;
@@ -244,6 +262,14 @@ fn load(dir: &Path) -> Result<Credential> {
         return Err(rejected("Credential file exceeds size limit"));
     }
     serde_json::from_slice(&bytes).map_err(|_| rejected("Credential file is invalid"))
+}
+
+fn load_optional(dir: &Path) -> Result<Option<Credential>> {
+    match fs::symlink_metadata(dir.join("credential.json")) {
+        Ok(_) => Ok(Some(load(dir)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn save(dir: &Path, credential: &Credential) -> Result<()> {
@@ -644,6 +670,20 @@ pub fn login(issuer: &str, org: &str, dir: &Path, token_stdin: bool, no_open: bo
 }
 
 pub fn status(dir: Option<&Path>, issuer: Option<&str>, org: Option<&str>) -> Result<i32> {
+    let (report, code) = status_report(dir, issuer, org)?;
+    println!("{report}");
+    Ok(code)
+}
+
+/// CAD-1988: the `auth status` report and its exit code, without printing.
+/// An absent credential is the `no_credential` state and an unreadable store
+/// is `unavailable` — never an internal IO error that tells the operator
+/// nothing about the credential.
+pub fn status_report(
+    dir: Option<&Path>,
+    issuer: Option<&str>,
+    org: Option<&str>,
+) -> Result<(Value, i32)> {
     let (credential, source) = if let Some(token) = std::env::var_os("CADENCE_TOKEN") {
         let token = token
             .into_string()
@@ -656,7 +696,32 @@ pub fn status(dir: Option<&Path>, issuer: Option<&str>, org: Option<&str>) -> Re
             .or_else(|| std::env::var("CADENCE_ORG").ok());
         (environment_credential(token, issuer, org)?, "environment")
     } else {
-        let credential = load(&auth_dir(dir)?)?;
+        let stored = auth_dir(dir)?;
+        let credential = match load_optional(&stored) {
+            Ok(Some(credential)) => credential,
+            Ok(None) => {
+                return Ok((
+                    json!({
+                        "state": "no_credential",
+                        "source": "stored",
+                        "live_verified": false,
+                        "note": "no stored legacy credential; sign in with `cadence login`, or name a hosted workspace with `--org <name>`",
+                    }),
+                    1,
+                ))
+            }
+            Err(_) => {
+                return Ok((
+                    json!({
+                        "state": "unavailable",
+                        "source": "stored",
+                        "live_verified": false,
+                        "note": "the saved credential cannot be read; check its permissions or sign in again",
+                    }),
+                    1,
+                ))
+            }
+        };
         if issuer.is_some_and(|i| issuer_origin(i).ok().as_deref() != Some(&credential.issuer))
             || org.is_some_and(|o| o != credential.org)
         {
@@ -675,11 +740,10 @@ pub fn status(dir: Option<&Path>, issuer: Option<&str>, org: Option<&str>) -> Re
         return Err(rejected("Stored credential expired; sign in again (refresh is not supported by this issuer contract)"));
     }
     let principal = verify(&issuer, &credential.org, &credential.token)?;
-    println!(
-        "{}",
-        json!({"authenticated":true,"source":source,"issuer":issuer,"principal":principal,"expires_at":credential.expires_at,"hosted_cadence":"not_configured","note":CONTRACT_NOTE})
-    );
-    Ok(0)
+    Ok((
+        json!({"authenticated":true,"source":source,"issuer":issuer,"principal":principal,"expires_at":credential.expires_at,"hosted_cadence":"not_configured","note":CONTRACT_NOTE}),
+        0,
+    ))
 }
 
 pub fn logout(dir: &Path) -> Result<i32> {
@@ -700,6 +764,22 @@ pub fn logout(dir: &Path) -> Result<i32> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    // CAD-1988: an absent legacy credential is a state the operator can read,
+    // not an internal IO error.
+    #[test]
+    fn status_report_treats_an_absent_legacy_credential_as_no_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cad1988-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (report, code) = status_report(Some(&dir), None, None).unwrap();
+        assert_eq!(report["state"], "no_credential");
+        assert_eq!(report["source"], "stored");
+        assert_eq!(report["live_verified"], false);
+        assert_eq!(code, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn credential(org: &str) -> Credential {
         Credential {

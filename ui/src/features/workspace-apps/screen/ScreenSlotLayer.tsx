@@ -5,12 +5,13 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
   onTap: (token: string, trusted: boolean, pressedAt: number, input?: string) => void;
   onCancel: (token: string) => void;
 }) {
+  const t = useTranslate();
   const [input, setInput] = useState(card.input?.value ?? "");
   const pressed = useRef(0);
   const titles: Record<string, string> = {
-    "records.csv.import": "Import this CSV plan?", "records.csv.confirm": "Confirm this CSV plan?", "content.approve": "Approve this content revision?",
+    "records.csv.import": "Import this CSV plan?", "records.csv.confirm": "Confirm this CSV plan?",
     "smtp.manage": "Open email sending settings?", "smtp.bind": "Bind this SMTP connection?", "smtp.rebind": "Replace this SMTP binding?", "smtp.revoke": "Revoke this SMTP binding?",
-    "smtp.test-send": "Send one test email?", "sends.approve": "Approve this frozen send?", "sends.resolve": "Resolve this uncertain delivery?",
+    "sends.resolve": "Resolve this uncertain delivery?",
     "origin.manage": "Change the daemon-global unsubscribe origin?", "chat.campaign.open": "Open this campaign's assistant?", "chat.campaign.brief": "Send this campaign brief?", "chat.whatsapp.brief": "Ask the assistant to draft this reply?",
     "whatsapp.reply.send": "Send this WhatsApp reply?",
     "whatsapp.template.send": "Send this WhatsApp template?", "whatsapp.broadcast.test.send": "Send one WhatsApp test message?",
@@ -19,23 +20,26 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
   };
   const field = card.input;
   const invalid = field?.choices ? !field.choices.some(c => c.value === input) : field?.field === "to_email" ? !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) : false;
-  return <WorkspaceDialog title={titles[card.operation] ?? "Confirm app action?"} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
+  return <WorkspaceDialog title={t(card.title ?? titles[card.operation] ?? "Confirm app action?")} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
     <div className="wa-stack" data-host-confirm={view.token.slice(0, 8)}>
-      <p>This is a Cadence host confirmation. Facts below came from the current server receipt, not the app frame.</p>
-      <dl>{card.facts.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.value}</dd></div>)}</dl>
+      {card.note ? <p>{t(card.note)}</p> : <p>{t("This is a Cadence host confirmation. Facts below came from the current server receipt, not the app frame.")}</p>}
+      <dl>{card.facts.map((fact, i) => <div key={i}><dt>{t(fact.label)}</dt><dd style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.strong ? <strong style={{ fontSize: "1.25em" }}>{fact.value}</strong> : card.operation === "catalog.confirm" && fact.label === "Effect" ? t(fact.value) : fact.value}</dd></div>)}</dl>
+      {!!card.details?.length && <details><summary>Technical details</summary>
+        <dl>{card.details.map((fact, i) => <div key={i}><dt>{fact.label}</dt><dd className="num" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{fact.value}</dd></div>)}</dl>
+      </details>}
       {field && <label className="wa-stack">{field.label}
         {field.choices ? <select value={input} onChange={e => setInput(e.target.value)} disabled={view.pending}><option value="">Select…</option>{field.choices.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}</select>
           : field.field === "brief" ? <textarea value={input} readOnly rows={6} />
-          : <input type={field.field === "to_email" ? "email" : "url"} value={input} maxLength={field.field === "to_email" ? 320 : 2048} onChange={e => setInput(e.target.value)} disabled={view.pending} />}
+          : <input className="wa-input" type={field.field === "to_email" ? "email" : "url"} value={input} maxLength={field.field === "to_email" ? 320 : 2048} onChange={e => setInput(e.target.value)} disabled={view.pending} />}
       </label>}
-      <p>No automatic retry. If the result is uncertain, inspect fresh status before requesting another effect.</p>
+      <p>{t(card.retry ?? "No automatic retry. If the result is uncertain, inspect fresh status before requesting another effect.")}</p>
       <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-        <Button disabled={view.pending} onClick={() => onCancel(view.token)}>Cancel</Button>
+        <Button disabled={view.pending} onClick={() => onCancel(view.token)}>{t("Cancel")}</Button>
         <button type="button" className="btn btn-primary" disabled={view.pending || invalid} aria-busy={view.pending}
           onPointerDown={e => { pressed.current = e.timeStamp; }} onClick={e => {
             const at = e.detail === 0 ? performance.now() : pressed.current; pressed.current = 0;
             onTap(view.token, e.isTrusted, at, input);
-          }}>{view.pending ? "Working…" : view.label}</button>
+          }}>{view.pending ? t("Working…") : t(view.label)}</button>
       </div>
     </div>
   </WorkspaceDialog>;
@@ -110,8 +114,9 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
         <WorkspaceDialog title={t(view.card.title ?? "Post this now?")} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
           <div className="wa-stack" data-host-confirm={view.token.slice(0, 8)}>
             {view.card.image && <img src={view.card.image} alt={t("The image that will post")} style={{ maxWidth: "100%", maxHeight: 240, objectFit: "contain", borderRadius: 8 }} />}
-            <p className="wa-caption" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.caption}</p>
+            {view.card.caption && <p className="wa-caption" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.caption}</p>}
             <p>{t("To")} <strong>{view.card.target}</strong></p>
+            {view.card.disclosure && <p data-host-disclosure style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.disclosure}</p>}
             {view.card.detail && <p>{view.card.detail}</p>}
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
               <Button disabled={view.pending} onClick={() => onCancel(view.token)}>{t("Cancel")}</Button>
@@ -122,7 +127,7 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
                   pressed.current = 0;
                   onTap(view.token, event.isTrusted, at);
                 }}>
-                {view.pending ? t("Posting…") : view.label}
+                {view.pending ? t("Working…") : view.label}
               </button>
             </div>
           </div>

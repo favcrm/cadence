@@ -39,6 +39,7 @@
 //! any byte is looked at.
 
 use std::collections::{BTreeMap, HashSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -48,9 +49,43 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::issue::model;
 use crate::issue::parse;
-use crate::issue::{app_view, board, plan, project, workflow, write, Pm};
+use crate::issue::{app_view, board, project, workflow, write, Pm};
 
 use cadence_core::app_compat::{self, Compat};
+
+mod grammar;
+mod inspect;
+mod skill;
+mod validate;
+
+pub(crate) use validate::{
+    inspect_texts, validate, validate_storage_members, validate_texts, Validated,
+};
+
+#[doc(hidden)]
+pub use grammar::{bundle_path_ok, file_cap, root_member, skill_subdir_ok, MAX_APP_BYTES};
+// Preserve existing crate-internal re-exports from `issue::app` verbatim.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use grammar::{bundle_grammar_json, GRAMMAR_VERSION};
+pub use grammar::{
+    skill_member_ok, SKILL_DIR, SKILL_ENTRY, SKILL_FILES_MAX, SKILL_FILE_BYTES, SKILL_MANIFEST,
+    SKILL_MANIFEST_BYTES, SKILL_PACKAGE_BYTES,
+};
+use grammar::{
+    skill_nested_ext, MAX_FILES, SKILL_ALL_EXTS, SKILL_REFERENCES_EXTS, SKILL_ROOT_EXTS,
+    SKILL_SCRIPTS_EXTS,
+};
+#[allow(unused_imports)]
+pub(crate) use grammar::{DirRule, DIR_RULES, MAX_SCREEN_ASSET_BYTES, ROOT_MEMBERS};
+
+pub use inspect::{
+    board_rows, check_installed, doctor, lint_dir, ls, plan_text, read_manifest, show,
+};
+use inspect::{daemon_aliases, known_connections};
+pub use skill::{
+    parse_skill_manifest, skill_package, skill_packages, SkillFile, SkillManifest, SkillPackage,
+};
 
 /// `<pm>/<project>/apps/` — beside PROJECT.md and `workflows/`.
 pub const DIR: &str = "apps";
@@ -66,7 +101,9 @@ pub const LOCAL_CONNECTION: &str = "local";
 
 /// `app.md` frontmatter keys v0 knows. Anything else refuses — the same
 /// fail-loud rule the workflow and plan parsers apply.
-const MANIFEST_KEYS: &[&str] = &["app", "title", "version", "needs", "summary", "listing"];
+const MANIFEST_KEYS: &[&str] = &[
+    "app", "title", "version", "needs", "summary", "listing", "i18n",
+];
 
 /// Frontmatter keys the later stages reserve — refused with their own
 /// message so a bundle carrying one names the stage, not "unknown key".
@@ -79,7 +116,9 @@ const GATED_KEYS: &[&str] = &["records", "actions", "ui", "settings", "actors"];
 /// exactly one file — `views/app-views-v1.json`, the app-views/v1
 /// descriptor — and only when `app.md` declares `needs.views.contract`.
 /// CAD-1129: `assets/` is the catalog's icon and screenshots — flat
-/// `*.svg` files only.
+/// `*.svg` files only. CAD-1867: `skills/` holds one `<tag>/` package per
+/// installed skill — its `skill.json` manifest, flat root text leaves, and
+/// `scripts/` and `references/` subdirectories.
 const TOP_DIRS: &[&str] = &[
     "workflows",
     "rubrics",
@@ -87,358 +126,9 @@ const TOP_DIRS: &[&str] = &[
     "screens",
     "views",
     "assets",
+    "storage",
+    "skills",
 ];
-
-/// Largest single file in a bundle — workflows render to plans, so the
-/// plan cap applies; the same bound keeps every other file small.
-const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
-
-/// CAD-1254: a declared screen's JS/CSS asset (`screens/<tag>/<stem>.js|css`)
-/// gets its own 384 KiB per-file cap; nothing else is raised.
-pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = 384 * 1024;
-
-/// The per-file cap for bundle member `rel`: [`MAX_SCREEN_ASSET_BYTES`] for a
-/// screen JS/CSS leaf, else [`MAX_FILE_BYTES`].
-pub(crate) fn file_cap(rel: &str) -> u64 {
-    let screen_leaf = rel
-        .strip_prefix("screens/")
-        .is_some_and(|r| r.split('/').count() == 2 && (r.ends_with(".js") || r.ends_with(".css")));
-    if screen_leaf {
-        MAX_SCREEN_ASSET_BYTES
-    } else {
-        MAX_FILE_BYTES
-    }
-}
-
-/// The root files admitted beside `app.md`. One list for the source loader,
-/// the catalogue importer and the board's files-mode transport. CAD-1415 added
-/// `app-actions.json` to the first two and missed the third, so a bundle the
-/// daemon accepts was refused before it ever reached the daemon.
-pub(crate) const ROOT_MEMBERS: &[&str] = &[
-    MANIFEST,
-    crate::issue::app_chat::FILE,
-    crate::issue::app_assistant::FILE,
-    crate::issue::app_action::FILE,
-];
-
-pub(crate) fn root_member(name: &str) -> bool {
-    ROOT_MEMBERS.contains(&name)
-}
-
-/// Visible, ASCII, flat leaf name — no dotfile, no separator, no escape.
-fn plain_leaf_ok(seg: &str) -> bool {
-    !seg.is_empty()
-        && seg.is_ascii()
-        && !seg.starts_with('.')
-        && seg != ".."
-        && !seg.contains('\\')
-        && !seg.contains('\0')
-}
-
-/// A workflow leaf: `<tag>.md`, the installer's own tag rule. Every trailing
-/// `.md` is stripped before the tag check, which the published document states
-/// explicitly.
-fn workflow_leaf_ok(seg: &str) -> bool {
-    plain_leaf_ok(seg)
-        && seg.ends_with(WORKFLOW_SUFFIX)
-        && crate::issue::model::valid_tag(seg.trim_end_matches(WORKFLOW_SUFFIX))
-}
-
-/// How one flat top-level directory admits its leaves.
-#[derive(Clone, Copy)]
-pub(crate) enum DirRule {
-    /// `<tag>.md`, the installer's own tag rule.
-    WorkflowMdTag,
-    /// Exactly this leaf name.
-    Exact(&'static str),
-    /// Any visible, ASCII, flat leaf.
-    VisibleLeaf,
-    /// A visible flat `<leaf>.svg`, bounded in bytes.
-    SvgLeaf { max_leaf_bytes: usize },
-    /// A `screens/<tag>/` package: the declaration or a tag-shaped stem plus
-    /// `js|css|svg|json`.
-    ScreensPackage,
-}
-
-/// The directory half of the grammar, in one table. [`bundle_path_ok`]
-/// evaluates it and [`bundle_grammar_json`] publishes it; there is no second
-/// list to keep in step.
-pub(crate) const DIR_RULES: &[(&str, DirRule)] = &[
-    ("workflows", DirRule::WorkflowMdTag),
-    ("views", DirRule::Exact(crate::issue::app_view::FILE)),
-    ("rubrics", DirRule::VisibleLeaf),
-    ("templates", DirRule::VisibleLeaf),
-    // CAD-1129: catalog icons and screenshots are flat SVG leaves.
-    (
-        "assets",
-        DirRule::SvgLeaf {
-            max_leaf_bytes: ASSET_MAX_LEAF_BYTES,
-        },
-    ),
-    ("screens", DirRule::ScreensPackage),
-];
-
-/// Version of the published grammar document. Bump only for a shape change.
-#[cfg(test)]
-pub(crate) const GRAMMAR_VERSION: u32 = 1;
-
-/// The lexical pieces the published document must state normatively. They are
-/// constants so the predicate and the document cannot disagree.
-const WORKFLOW_SUFFIX: &str = ".md";
-const ASSET_SUFFIX: &str = ".svg";
-const ASSET_MAX_LEAF_BYTES: usize = 128;
-#[cfg(test)]
-const SCREEN_ASSET_EXTS: &[&str] = &["js", "css", "svg", "json"];
-/// `model::valid_tag`: every byte drawn from this set, 1..=32 bytes, never
-/// leading with `-`. Stated as a charset, not a regex: `$` admits a trailing
-/// line terminator in JavaScript, which would let a consumer accept a tag the
-/// host refuses.
-#[cfg(test)]
-const VALID_TAG_CHARSET: &str = "abcdefghijklmnopqrstuvwxyz0123456789-";
-#[cfg(test)]
-const VALID_TAG_MAX_BYTES: usize = 32;
-
-fn dir_rule(directory: &str) -> Option<DirRule> {
-    DIR_RULES
-        .iter()
-        .find(|(name, _)| *name == directory)
-        .map(|(_, rule)| *rule)
-}
-
-/// The one bundle path grammar. The board's files-mode transport (install and
-/// upgrade) admits every member through this, and the source loader and the
-/// catalogue importer share [`root_member`] for the root set while keeping
-/// their own directory walkers. The root list is therefore one fact, and the
-/// transport can no longer refuse a member the daemon accepts.
-///
-/// It is lexical only: it says which paths may exist, never whether their bytes
-/// are valid. Splitting on literal `/` and refusing empty, `.` and `..`
-/// segments matters for the upload transport: `Path::components` folds `a//b`,
-/// `a/./b` and `a/../b` onto one staged file and would defeat duplicate
-/// detection.
-pub(crate) fn bundle_path_ok(path: &str) -> bool {
-    if path.is_empty() || !path.is_ascii() || path.contains('\\') || path.contains('\0') {
-        return false;
-    }
-    let segs: Vec<&str> = path.split('/').collect();
-    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
-        return false;
-    }
-    match segs.as_slice() {
-        [name] => root_member(name),
-        [directory, leaf] => match dir_rule(directory) {
-            Some(DirRule::WorkflowMdTag) => workflow_leaf_ok(leaf),
-            Some(DirRule::Exact(name)) => *leaf == name,
-            Some(DirRule::VisibleLeaf) => plain_leaf_ok(leaf),
-            Some(DirRule::SvgLeaf { max_leaf_bytes }) => {
-                plain_leaf_ok(leaf) && leaf.ends_with(ASSET_SUFFIX) && leaf.len() <= max_leaf_bytes
-            }
-            // A screens package is a directory, never a flat leaf.
-            Some(DirRule::ScreensPackage) | None => false,
-        },
-        // CAD-1006: one tag-named package dir per screen.
-        ["screens", tag, leaf] => {
-            crate::issue::model::valid_tag(tag) && crate::issue::app_screen_pkg::leaf_ok(leaf)
-        }
-        _ => false,
-    }
-}
-
-/// The published grammar document, generated from [`ROOT_MEMBERS`],
-/// [`DIR_RULES`] and the caps. `contracts/bundle-grammar/v1/grammar.json` must
-/// equal this byte for byte; the test below refuses drift.
-#[cfg(test)]
-pub(crate) fn bundle_grammar_json() -> String {
-    let directories: Vec<serde_json::Value> = DIR_RULES
-        .iter()
-        .map(|(directory, rule)| match rule {
-            DirRule::WorkflowMdTag => {
-                serde_json::json!({ "dir": directory, "rule": "workflow_md_tag" })
-            }
-            DirRule::Exact(name) => {
-                serde_json::json!({ "dir": directory, "rule": "exact", "name": name })
-            }
-            DirRule::VisibleLeaf => serde_json::json!({ "dir": directory, "rule": "visible_leaf" }),
-            DirRule::SvgLeaf { max_leaf_bytes } => serde_json::json!({
-                "dir": directory,
-                "rule": "svg_leaf",
-                "maxLeafBytes": max_leaf_bytes,
-            }),
-            DirRule::ScreensPackage => serde_json::json!({
-                "dir": directory,
-                "rule": "screens_package",
-                "declaration": crate::issue::app_screen_pkg::SCREEN_MANIFEST,
-                "leaf": "tag_stem.(js|css|svg|json)",
-            }),
-        })
-        .collect();
-    let document = serde_json::json!({
-        "version": GRAMMAR_VERSION,
-        "rootFiles": ROOT_MEMBERS,
-        "segments": {
-            "asciiOnly": true,
-            "nonEmpty": true,
-            "forbidExact": [".", ".."],
-            "forbidLeadingDot": true,
-            "forbidBackslash": true,
-            "forbidNul": true,
-        },
-        "definitions": {
-            "validTag": {
-                "wholeInput": true,
-                "minBytes": 1,
-                "maxBytes": VALID_TAG_MAX_BYTES,
-                "charset": VALID_TAG_CHARSET,
-                "forbidLeading": "-",
-            },
-            "workflowMdTag": {
-                "segment": true,
-                "suffix": WORKFLOW_SUFFIX,
-                "stem": "validTag of the leaf with every trailing suffix removed",
-            },
-            "visibleLeaf": { "segment": true },
-            "svgLeaf": {
-                "segment": true,
-                "suffix": ASSET_SUFFIX,
-                "maxLeafBytes": ASSET_MAX_LEAF_BYTES,
-            },
-            "screensPackage": {
-                "path": "screens/<tag>/<leaf>",
-                "tag": "validTag",
-                "declaration": crate::issue::app_screen_pkg::SCREEN_MANIFEST,
-                "assetStem": "validTag",
-                "extensions": SCREEN_ASSET_EXTS,
-            },
-            "exact": { "leaf": "the name carried by the directory entry" },
-        },
-        "directories": directories,
-        "caps": {
-            "fileBytes": MAX_FILE_BYTES,
-            "screenAssetBytes": MAX_SCREEN_ASSET_BYTES,
-            "bundleBytes": MAX_APP_BYTES,
-            "files": MAX_FILES,
-        },
-    });
-    serde_json::to_string_pretty(&document).expect("grammar document serializes") + "\n"
-}
-
-#[cfg(test)]
-mod bundle_grammar_tests {
-    use super::*;
-
-    #[test]
-    fn admits_every_member_the_daemon_accepts() {
-        for path in [
-            "app.md",
-            "app-chat.json",
-            "app-assistant.json",
-            "app-actions.json",
-            "workflows/post.md",
-            "views/app-views-v1.json",
-            "rubrics/brand.md",
-            "templates/base.liquid",
-            "assets/crm.svg",
-            "screens/crm/screens.json",
-            "screens/crm/client.js",
-            "screens/crm/styles.css",
-        ] {
-            assert!(bundle_path_ok(path), "{path}");
-        }
-        // The descriptor the board transport used to refuse.
-        assert!(root_member(crate::issue::app_action::FILE));
-    }
-
-    #[test]
-    fn refuses_members_outside_the_grammar() {
-        for path in [
-            "",
-            "readme.md",
-            "app-actions/actions.json",
-            "assets/crm.png",
-            "assets/nested/icon.svg",
-            "workflows/UPPER.md",
-            "views/other.json",
-            "screens/crm/deep/file.js",
-            "../secret",
-            "app.md/inner",
-            "./app-actions.json",
-        ] {
-            assert!(!bundle_path_ok(path), "{path}");
-        }
-        // The snapshot and catalogue walkers cap an asset leaf at 128 bytes.
-        assert!(bundle_path_ok(&format!("assets/{}.svg", "a".repeat(124))));
-        assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
-    }
-
-    fn grammar_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("contracts/bundle-grammar/v1/grammar.json")
-    }
-
-    /// The published document is generated, never hand-written: this test is
-    /// the only thing keeping `contracts/bundle-grammar/v1/grammar.json` equal
-    /// to the predicate consumers are expected to apply.
-    #[test]
-    fn published_artifact_matches_the_predicate() {
-        let path = grammar_path();
-        let published = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        assert_eq!(
-            published,
-            bundle_grammar_json(),
-            "regenerate with `cargo test --lib regenerate_bundle_grammar -- --ignored`"
-        );
-    }
-
-    /// Regenerates the artifact. Ignored so an ordinary run can never bless
-    /// drifted bytes by rewriting them before comparing.
-    #[test]
-    #[ignore = "writes the checked-in grammar artifact"]
-    fn regenerate_bundle_grammar() {
-        let path = grammar_path();
-        std::fs::create_dir_all(path.parent().expect("grammar dir")).expect("create grammar dir");
-        std::fs::write(&path, bundle_grammar_json()).expect("write grammar");
-    }
-
-    /// The document's normative claims must match the functions that enforce
-    /// them, not just the table it was serialized from.
-    #[test]
-    fn published_definitions_match_the_predicate() {
-        for byte in VALID_TAG_CHARSET.bytes() {
-            let tag = format!("a{}", byte as char);
-            assert!(crate::issue::model::valid_tag(&tag), "{tag}");
-        }
-        assert!(crate::issue::model::valid_tag(
-            &"a".repeat(VALID_TAG_MAX_BYTES)
-        ));
-        // A trailing line terminator is the case a `$`-anchored regex would
-        // wrongly admit in JavaScript; the host refuses it.
-        for tag in ["", "-a", "A", "a_b", "a.b", "a ", "a\n"] {
-            assert!(!crate::issue::model::valid_tag(tag), "{tag}");
-        }
-        assert!(!crate::issue::model::valid_tag(
-            &"a".repeat(VALID_TAG_MAX_BYTES + 1)
-        ));
-        for ext in SCREEN_ASSET_EXTS {
-            assert!(
-                crate::issue::app_screen_pkg::leaf_ok(&format!("x.{ext}")),
-                "{ext}"
-            );
-        }
-        assert!(!crate::issue::app_screen_pkg::leaf_ok("x.txt"));
-        // The workflow rule strips every trailing suffix, as the document says.
-        assert!(bundle_path_ok("workflows/post.md.md"));
-        // The asset rule is bounded by the published leaf cap.
-        assert!(bundle_path_ok(&format!("assets/{}.svg", "a".repeat(124))));
-        assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
-    }
-}
-
-/// Most files a bundle may carry.
-const MAX_FILES: usize = 128;
-
-/// Largest bundle, all files together — an A1 app is text.
-pub(crate) const MAX_APP_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The `app.md` definition: the frontmatter fields plus the body, the
 /// guide agents read. `needs.connections` declares the slots the app's
@@ -464,6 +154,8 @@ pub struct Manifest {
     /// CAD-1129 §3: the display-only catalog block (`listing:`), plain
     /// JSON already host-validated — it can declare no capability.
     pub listing: Option<crate::issue::app_listing::Listing>,
+    /// Optional top-level display translations (`{ <locale>: { title?, summary?, tagline? } }`).
+    pub i18n: Option<serde_json::Value>,
     pub guide: String,
 }
 
@@ -477,6 +169,62 @@ impl Manifest {
         self.capabilities
             .values()
             .find(|need| need.is_file_upload())
+    }
+
+    /// Merged display translations `{ <locale>: { title?, summary?, tagline? } }`
+    /// from `listing.i18n` overlaid with top-level `i18n` (top-level wins per field).
+    pub fn display_i18n(&self) -> serde_json::Value {
+        use serde_json::{Map, Value};
+        fn overlay(src: Option<&Value>, out: &mut Map<String, Value>, top: bool) {
+            let Some(Value::Object(locales)) = src else {
+                return;
+            };
+            for (locale, entry) in locales {
+                let Value::Object(fields) = entry else {
+                    continue;
+                };
+                let prev_key = out.keys().find(|k| k.eq_ignore_ascii_case(locale)).cloned();
+                if prev_key.is_none()
+                    && out.len() >= cadence_core::app_screen_decl::MAX_I18N_LOCALES
+                {
+                    continue;
+                }
+                let mut merged = prev_key
+                    .as_deref()
+                    .and_then(|k| out.get(k))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                for k in ["title", "summary", "tagline"] {
+                    if let Some(v @ Value::String(_)) = fields.get(k) {
+                        merged.insert(k.to_string(), v.clone());
+                    }
+                }
+                if !merged.is_empty() {
+                    let key = if top {
+                        if let Some(p) = prev_key.filter(|p| p != locale) {
+                            out.remove(&p);
+                        }
+                        locale.clone()
+                    } else {
+                        prev_key.unwrap_or_else(|| locale.clone())
+                    };
+                    out.insert(key, Value::Object(merged));
+                }
+            }
+        }
+        let mut merged = Map::new();
+        overlay(
+            self.listing.as_ref().and_then(|l| l.value.get("i18n")),
+            &mut merged,
+            false,
+        );
+        overlay(self.i18n.as_ref(), &mut merged, true);
+        if merged.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(merged)
+        }
     }
 }
 
@@ -671,7 +419,7 @@ fn dir_of(pm_dir: &Path, project: &str) -> Result<PathBuf> {
 }
 
 /// `apps/<name>/` — the content folder; must exist as a real directory.
-fn app_dir(pm_dir: &Path, project: &str, name: &str) -> Result<PathBuf> {
+pub(super) fn app_dir(pm_dir: &Path, project: &str, name: &str) -> Result<PathBuf> {
     check_name(name, "app name")?;
     let dir = dir_of(pm_dir, project)?.join(name);
     match dir.symlink_metadata() {
@@ -802,7 +550,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     let title = need_str("title", "one line naming the app")?;
     let version = need_str("version", "a version string like 0.1.0")?;
     for (k, v, cap) in [("title", &title, 120), ("version", &version, 40)] {
-        if v.chars().count() > cap || v.chars().any(char::is_control) {
+        if v.encode_utf16().count() > cap
+            || v.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return Err(Error::rejected(format!(
                 "app.md `{k}:` — ≤{cap} chars, no control characters"
             )));
@@ -815,7 +566,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             let s = s.trim();
             if s.is_empty() {
                 None
-            } else if s.chars().count() > 160 || s.chars().any(char::is_control) {
+            } else if s.encode_utf16().count() > 160
+                || s.chars()
+                    .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+            {
                 return Err(Error::rejected(
                     "app.md `summary:` — ≤160 chars, no control characters",
                 ));
@@ -938,6 +692,27 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             Some(crate::issue::app_listing::parse(value, yaml_len, &slots)?)
         }
     };
+    let i18n = match get("i18n") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(value) => Some(crate::issue::app_listing::parse_manifest_i18n(value)?),
+    };
+    let mut combined_locales = HashSet::new();
+    for map in [
+        listing.as_ref().and_then(|l| l.value.get("i18n")),
+        i18n.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|v| v.as_object())
+    {
+        combined_locales.extend(map.keys().map(|k| k.to_ascii_lowercase()));
+    }
+    if combined_locales.len() > cadence_core::app_screen_decl::MAX_I18N_LOCALES {
+        return Err(Error::rejected(format!(
+            "app.md listing.i18n and i18n together cannot exceed {} distinct locales",
+            cadence_core::app_screen_decl::MAX_I18N_LOCALES
+        )));
+    }
     let requires =
         app_compat::parse_requires(get("needs").and_then(serde_yaml::Value::as_mapping))?;
     Ok(Manifest {
@@ -950,6 +725,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         view_contract,
         requires,
         listing,
+        i18n,
         guide: body.to_string(),
     })
 }
@@ -961,7 +737,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
 /// `rubrics/` and `templates/` are flat text dirs. Everything else —
 /// a nested dir, a fifo/socket/device, a dotfile, a name that is not
 /// UTF-8, an oversize file — refuses.
-fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+pub(super) fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     let meta = root
         .symlink_metadata()
         .map_err(|e| Error::rejected(format!("cannot stat app source {}: {e}", root.display())))?;
@@ -1033,7 +809,7 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
         return Err(Error::rejected(format!(
             "app source entry '{name}' — v0 knows app.md, app-chat.json, workflows/, \
-             rubrics/, templates/, screens/, views/; everything else refuses"
+             rubrics/, templates/, screens/, skills/, views/; everything else refuses"
         )));
     }
     if !manifest {
@@ -1088,6 +864,17 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                 }
                 continue;
             }
+            if *top == "skills" {
+                // CAD-1867: a skills member is a <tag>/ directory handled
+                // by the nested pass below — never a flat file.
+                if !ft.is_dir() {
+                    return Err(entry_err(
+                        &format!("{top}/{name}"),
+                        "a skill package is a <tag>/ directory",
+                    ));
+                }
+                continue;
+            }
             if ft.is_dir() {
                 return Err(entry_err(
                     &format!("{top}/{name}"),
@@ -1114,7 +901,14 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                     "views/ holds exactly app-views-v1.json",
                 ));
             }
-            files.push((format!("{top}/{name}"), entry.path()));
+            let relative = format!("{top}/{name}");
+            if top == "storage" && !bundle_path_ok(&relative) {
+                return Err(entry_err(
+                    &relative,
+                    "storage migrations are flat <tag>.json files",
+                ));
+            }
+            files.push((relative, entry.path()));
         }
         // screens/<tag>/<leaf> — the one nested level v1 allows: each
         // `<tag>` is a tag-named subdir holding the declaration and flat
@@ -1189,6 +983,123 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             // screens/ holds subdirs only — the flat-member loop above
             // collected none for it; drop the loop's own (empty) result.
         }
+        // CAD-1867: skills/<tag>/<member>, where `<member>` is a flat root
+        // text leaf or a file in `scripts/` or `references/`. Exactly the
+        // grammar `skill_member_ok` states — a directory is only ever
+        // `scripts/` or `references/`, never a file, and nothing nests
+        // deeper.
+        if top == "skills" {
+            for tag_entry in std::fs::read_dir(dir)?.flatten() {
+                let tag = tag_entry.file_name();
+                let Some(tag) = tag.to_str() else {
+                    return Err(Error::rejected("skills/ carries a non-UTF-8 name"));
+                };
+                if tag.starts_with('.') {
+                    return Err(entry_err(
+                        &format!("skills/{tag}"),
+                        "dotfiles are not app content",
+                    ));
+                }
+                let ft = tag_entry
+                    .file_type()
+                    .map_err(|e| Error::rejected(format!("cannot stat 'skills/{tag}': {e}")))?;
+                if ft.is_symlink() {
+                    return Err(entry_err(
+                        &format!("skills/{tag}"),
+                        "a symlink — an app folder holds real files only",
+                    ));
+                }
+                if !ft.is_dir() {
+                    return Err(entry_err(
+                        &format!("skills/{tag}"),
+                        "a skill package is a <tag>/ directory",
+                    ));
+                }
+                check_name(tag, "skill name")?;
+                let tagdir = tag_entry.path();
+                for leaf in std::fs::read_dir(&tagdir)?.flatten() {
+                    let leaf_name = leaf.file_name();
+                    let Some(leaf_name) = leaf_name.to_str() else {
+                        return Err(Error::rejected(
+                            "skills/<tag>/ carries a non-UTF-8 leaf name",
+                        ));
+                    };
+                    let rel = format!("skills/{tag}/{leaf_name}");
+                    if leaf_name.starts_with('.') {
+                        return Err(entry_err(&rel, "dotfiles are not app content"));
+                    }
+                    let lft = leaf
+                        .file_type()
+                        .map_err(|e| Error::rejected(format!("cannot stat '{rel}': {e}")))?;
+                    if lft.is_symlink() {
+                        return Err(entry_err(
+                            &rel,
+                            "a symlink — an app folder holds real files only",
+                        ));
+                    }
+                    if lft.is_dir() {
+                        if !skill_subdir_ok(leaf_name) {
+                            return Err(entry_err(
+                                &rel,
+                                "a skill package nests only scripts/ or references/",
+                            ));
+                        }
+                        for member in std::fs::read_dir(leaf.path())?.flatten() {
+                            let member_name = member.file_name();
+                            let Some(member_name) = member_name.to_str() else {
+                                return Err(Error::rejected(format!(
+                                    "{rel}/ carries a non-UTF-8 name"
+                                )));
+                            };
+                            let member_rel = format!("{rel}/{member_name}");
+                            if member_name.starts_with('.') {
+                                return Err(entry_err(&member_rel, "dotfiles are not app content"));
+                            }
+                            let mft = member.file_type().map_err(|e| {
+                                Error::rejected(format!("cannot stat '{member_rel}': {e}"))
+                            })?;
+                            if mft.is_symlink() {
+                                return Err(entry_err(
+                                    &member_rel,
+                                    "a symlink — an app folder holds real files only",
+                                ));
+                            }
+                            if !mft.is_file() {
+                                return Err(entry_err(
+                                    &member_rel,
+                                    "skill members are flat files — no deeper folders",
+                                ));
+                            }
+                            let package_member = format!("{leaf_name}/{member_name}");
+                            if !skill_member_ok(&package_member) {
+                                return Err(entry_err(
+                                    &member_rel,
+                                    &format!(
+                                        "a {leaf_name}/ member is <stem>.<{}>",
+                                        skill_nested_ext(leaf_name).unwrap_or(&[]).join("|")
+                                    ),
+                                ));
+                            }
+                            files.push((member_rel, member.path()));
+                        }
+                        continue;
+                    }
+                    if !lft.is_file() {
+                        return Err(entry_err(&rel, "not a regular file"));
+                    }
+                    if !skill_member_ok(leaf_name) {
+                        return Err(entry_err(
+                            &rel,
+                            &format!(
+                                "a package root leaf is <stem>.<{}>",
+                                SKILL_ROOT_EXTS.join("|")
+                            ),
+                        ));
+                    }
+                    files.push((rel, leaf.path()));
+                }
+            }
+        }
     }
     if files.len() > MAX_FILES {
         return Err(Error::rejected(format!(
@@ -1219,7 +1130,7 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// The `uses:` slots a workflow names: each `uses:` metadata value is a
 /// static slot list — `[a, b]` or `a, b` — never a placeholder (the
 /// slot contract must be checkable at install).
-fn workflow_slots(text: &str) -> Result<Vec<String>> {
+pub(super) fn workflow_slots(text: &str) -> Result<Vec<String>> {
     let (_, body) = parse::split_front(text)?;
     let metas = workflow::ticket_meta(body)?;
     let mut slots = Vec::new();
@@ -1245,360 +1156,6 @@ fn workflow_slots(text: &str) -> Result<Vec<String>> {
         }
     }
     Ok(slots)
-}
-
-/// What `validate` returns on success: the parsed manifest, the
-/// verified file texts (`rel-path → text`, sorted), the secret guard's
-/// warnings and the workflow checks' notes.
-pub(crate) struct Validated {
-    pub(crate) manifest: Manifest,
-    pub(crate) files: Vec<(String, String)>,
-    pub(crate) secret_warnings: Vec<crate::secret::Finding>,
-    pub(crate) notes: Vec<String>,
-    pub(crate) compatibility: Value,
-}
-
-/// Read a bundle's files as UTF-8 text and validate them: the manifest
-/// parses, every workflow passes the CAD-487 `workflow check` (same
-/// `check_text`), every `uses:` names a declared slot, and the secret
-/// guard runs over each file — an install refuses on any error.
-pub(crate) fn validate(
-    root: &Path,
-    agents: &HashSet<String>,
-    agent_sources: &[String],
-) -> Result<Validated> {
-    let paths = bundle_files(root)?;
-    let mut files = Vec::with_capacity(paths.len());
-    let mut secret_warnings = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    for (rel, path) in paths {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| Error::rejected(format!("cannot read app file {rel}: {e}")))?;
-        if bytes.len() as u64 > file_cap(&rel) {
-            return Err(Error::rejected(format!(
-                "{rel} is {} bytes — a file is at most {}",
-                bytes.len(),
-                file_cap(&rel)
-            )));
-        }
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => {
-                errors.push(format!(
-                    "{rel}: not UTF-8 text — an A1 app carries text only"
-                ));
-                continue;
-            }
-        };
-        match crate::secret::guard(&format!("app file {rel}"), &text) {
-            Ok(findings) => secret_warnings.extend(findings),
-            Err(e) => errors.push(format!("{rel}: {e}")),
-        }
-        files.push((rel, text));
-    }
-    validate_contents(files, secret_warnings, errors, agents, agent_sources)
-}
-
-/// Validate an immutable descriptor-read snapshot before workspace publication.
-pub(crate) fn validate_texts(
-    files: Vec<(String, String)>,
-    agents: &HashSet<String>,
-    agent_sources: &[String],
-) -> Result<Validated> {
-    if files.len() > MAX_FILES {
-        return Err(Error::rejected("app bundle exceeds its file limit"));
-    }
-    if files.iter().map(|(_, text)| text.len() as u64).sum::<u64>() > MAX_APP_BYTES {
-        return Err(Error::rejected(
-            "app bundle exceeds its aggregate byte limit",
-        ));
-    }
-    let mut warnings = Vec::new();
-    for (name, text) in &files {
-        if text.len() as u64 > file_cap(name) {
-            return Err(Error::rejected("app bundle file exceeds its limit"));
-        }
-        warnings.extend(crate::secret::guard(&format!("app file {name}"), text)?);
-    }
-    validate_contents(files, warnings, Vec::new(), agents, agent_sources)
-}
-
-fn validate_contents(
-    files: Vec<(String, String)>,
-    secret_warnings: Vec<crate::secret::Finding>,
-    mut errors: Vec<String>,
-    agents: &HashSet<String>,
-    agent_sources: &[String],
-) -> Result<Validated> {
-    let manifest = match files.iter().find(|(rel, _)| rel == MANIFEST) {
-        Some((_, text)) => match parse_manifest(text) {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                errors.push(e.to_string());
-                // Without a manifest the slot check cannot run; report
-                // the rest anyway.
-                Manifest {
-                    app: String::new(),
-                    title: String::new(),
-                    version: String::new(),
-                    connections: vec![],
-                    capabilities: BTreeMap::new(),
-                    summary: None,
-                    view_contract: None,
-                    requires: Compat::legacy(),
-                    listing: None,
-                    guide: String::new(),
-                }
-            }
-        },
-        None => Manifest {
-            app: String::new(),
-            title: String::new(),
-            version: String::new(),
-            connections: vec![],
-            capabilities: BTreeMap::new(),
-            summary: None,
-            view_contract: None,
-            requires: Compat::legacy(),
-            listing: None,
-            guide: String::new(),
-        },
-    };
-    // CAD-1129 §3: every asset `listing` references must be in this
-    // bundle's own inventory — `assets/` flat *.svg, nothing outside.
-    if let Some(listing) = &manifest.listing {
-        for asset in &listing.assets {
-            if !files.iter().any(|(rel, _)| rel == asset) {
-                errors.push(format!(
-                    "listing asset '{asset}' is not in the bundle's assets/"
-                ));
-            }
-        }
-    }
-    // CAD-1110: a package whose chat descriptor breaks the app-chat/v1
-    // grammar is refused at install and update, not at first use.
-    if let Some((_, text)) = files
-        .iter()
-        .find(|(rel, _)| rel == crate::issue::app_chat::FILE)
-    {
-        if let Err(e) = crate::issue::app_chat::validate(text, &manifest.app) {
-            errors.push(e.to_string());
-        }
-    }
-    if let Some((_, text)) = files
-        .iter()
-        .find(|(rel, _)| rel == crate::issue::app_action::FILE)
-    {
-        if let Err(e) = crate::issue::app_action::validate_customer_bundle(text, &manifest.app) {
-            errors.push(e.to_string());
-        }
-    }
-    if let Some((_, text)) = files
-        .iter()
-        .find(|(rel, _)| rel == crate::issue::app_assistant::FILE)
-    {
-        match crate::issue::app_assistant::validate(text) {
-            Ok(descriptor)
-                if descriptor
-                    .app
-                    .as_deref()
-                    .is_none_or(|app| app == manifest.app) => {}
-            Ok(_) => errors.push(format!(
-                "{} declares a different app name",
-                crate::issue::app_assistant::FILE
-            )),
-            Err(e) => errors.push(format!("{}: {e}", crate::issue::app_assistant::FILE)),
-        }
-    }
-    // CAD-864: the descriptor and its manifest declaration pair up —
-    // either alone refuses. A declared `needs.views` with no
-    // `views/app-views-v1.json` (or the reverse) is a bundle that
-    // misstates what it ships. When both exist the descriptor parses
-    // under the app-views/v1 gate and its `app` is this manifest's app:
-    // the descriptor was reviewed *with* this bundle, and its
-    // provenance can never borrow another app's views.
-    let descriptor_file = files
-        .iter()
-        .find(|(rel, _)| rel == app_view::REL_PATH)
-        .map(|(_, text)| text.as_str());
-    match (manifest.view_contract.as_deref(), descriptor_file) {
-        (Some(app_view::CONTRACT), Some(text)) => match app_view::parse_descriptor(text) {
-            Ok(descriptor) if descriptor.app == manifest.app => {}
-            Ok(descriptor) => errors.push(format!(
-                "{}: descriptor `app` is '{}' — it must be this bundle's '{}'",
-                app_view::REL_PATH,
-                descriptor.app,
-                manifest.app
-            )),
-            Err(e) => errors.push(format!("{}: {e}", app_view::REL_PATH)),
-        },
-        (Some(_), None) => errors.push(format!(
-            "app.md declares `needs.views` but the bundle carries no {} — the \
-             declaration and the descriptor file install together or not at all",
-            app_view::REL_PATH
-        )),
-        (None, Some(_)) => errors.push(format!(
-            "{} is present but app.md never declares `needs.views.contract` — an \
-             undeclared descriptor can never install",
-            app_view::REL_PATH
-        )),
-        (None, None) => {}
-        // An unknown contract value already failed `parse_manifest`.
-        (Some(_), Some(_)) => {}
-    }
-    let mut notes = Vec::new();
-    let mut workflow_count = 0usize;
-    for (rel, text) in &files {
-        // `bundle_files` admits only `workflows/<tag>.md` under that top.
-        if !rel.starts_with("workflows/") {
-            continue;
-        }
-        workflow_count += 1;
-        let (errs, ns, _) = workflow::check_text(text, agents, agent_sources);
-        errors.extend(errs.into_iter().map(|e| format!("{rel}: {e}")));
-        notes.extend(ns.into_iter().map(|n| format!("{rel}: {n}")));
-        if let Ok(template) = workflow::parse_template(text) {
-            if let Some(slot) = template.publication_slot {
-                if !manifest.capabilities.contains_key(&slot) {
-                    errors.push(format!(
-                        "{rel}: publication_slot '{slot}' is not declared in needs.capabilities"
-                    ));
-                }
-            }
-        }
-        match workflow_slots(text) {
-            Ok(slots) => {
-                for slot in slots {
-                    if !manifest.connections.iter().any(|s| s == &slot) {
-                        errors.push(format!(
-                            "{rel}: `uses: {slot}` — the app does not declare that slot; \
-                             add it to `needs.connections` in app.md so the binding is \
-                             the operator's choice, not the bundle's"
-                        ));
-                    }
-                }
-            }
-            Err(e) => errors.push(format!("{rel}: {e}")),
-        }
-    }
-    // CAD-1270 item 3: every `screens/<tag>/` member group is a screen
-    // package — integrity-check each through the same
-    // `app_screen_pkg::extract` → `app_screen_decl::validate_map` the
-    // mount RPC re-runs, so a malformed declaration, an
-    // undeclared/tampered asset or a tag dir without `screens.json`
-    // refuses at install, not first mount. `tags_in` additionally
-    // enforces the ≤8 declared-package bound; the member-prefix scan
-    // also collects an orphan tag dir (no screens.json), which
-    // `tags_in` cannot see. This shared check is what install,
-    // install-check and the offline `app check` all inherit — no second
-    // parser.
-    {
-        let screen_map: BTreeMap<String, String> = files.iter().cloned().collect();
-        if let Err(e) = crate::issue::app_screen_pkg::tags_in(&screen_map) {
-            errors.push(format!("screens: {e}"));
-        }
-        let mut candidates: Vec<&str> = Vec::new();
-        for rel in screen_map.keys() {
-            if let Some(rest) = rel.strip_prefix("screens/") {
-                if let Some((tag, _)) = rest.split_once('/') {
-                    if !candidates.contains(&tag) {
-                        candidates.push(tag);
-                    }
-                }
-            }
-        }
-        for tag in candidates {
-            match crate::issue::app_screen_pkg::extract(&screen_map, tag) {
-                // Same binding the mount RPC enforces: the package's
-                // declared `app` must be this bundle's manifest app —
-                // a package cannot claim a different app.
-                Ok(pkg) if pkg.app != manifest.app => errors.push(format!(
-                    "screens/{tag}: screen package declares an app that is not the installation"
-                )),
-                Err(e) => errors.push(format!("screens/{tag}: {e}")),
-                Ok(_) => {}
-            }
-        }
-    }
-    // CAD-1177: an app may ship no workflows only when it is a genuine
-    // standalone-tools plugin — it carries at least one integrity-checked
-    // `app-screens/v2` screen whose declared `tools` map resolves every
-    // alias to a real `needs.capabilities` slot. That is the v2
-    // no-workflow-file path: the tool, not a run, is the unit of work.
-    // An empty app, a screen that fails integrity, or a tool whose slot
-    // the manifest never declares cannot substitute for workflows and
-    // still refuses.
-    if workflow_count == 0 && !has_tools_only_screen(&files, &manifest) {
-        errors.push("workflows/ holds no *.md workflow".to_string());
-    }
-    let compatibility = match app_compat::host(env!("CARGO_PKG_VERSION"))
-        .and_then(|host| manifest.requires.check(&host))
-    {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            errors.push(error.to_string());
-            Value::Null
-        }
-    };
-    if !errors.is_empty() {
-        return Err(Error::rejected(format!(
-            "app is not installable — {}",
-            errors.join("; ")
-        )));
-    }
-    Ok(Validated {
-        manifest,
-        files,
-        secret_warnings,
-        notes,
-        compatibility,
-    })
-}
-
-/// CAD-1177: whether the bundle carries a genuine standalone-tools
-/// screen — an integrity-checked `app-screens/v2` package whose
-/// declared `tools` map is non-empty AND resolves every alias to a
-/// `needs.capabilities` slot with a `read`/`draft` effect (the only
-/// effects a standalone, approval-free invoke may run). Its `may` is
-/// `tools.invoke`, optionally plus the exact `media.read` permission a
-/// `screen-media.v1` screen declares (CAD-1365). This is the
-/// install-time proof that lets a workflow-free plugin install; it is
-/// deliberately strict so an empty or malformed bundle cannot borrow
-/// the exception. Returns false on any integrity/parse failure — a
-/// broken screen never satisfies the exception (its own error is
-/// reported by the screen validators elsewhere).
-fn has_tools_only_screen(files: &[(String, String)], manifest: &Manifest) -> bool {
-    let map: BTreeMap<String, String> = files.iter().cloned().collect();
-    let Ok(tags) = crate::issue::app_screen_pkg::tags_in(&map) else {
-        return false;
-    };
-    tags.iter().any(|tag| {
-        let Ok(pkg) = crate::issue::app_screen_pkg::extract(&map, tag) else {
-            return false;
-        };
-        pkg.contract == "app-screens/v2"
-            // The screen must be FOR this app — a package declaring a
-            // different app can never satisfy this bundle's exception.
-            && pkg.app == manifest.app
-            && !pkg.tools.is_empty()
-            // `tools.invoke` alone, plus — only under the media host
-            // contract — the exact `media.read`/`media.publish`
-            // declarations. No other `may` member and no media right on
-            // an actions-contract screen qualifies.
-            && pkg.may.iter().all(|m| {
-                m == crate::issue::app_screen_decl::MAY_TOOLS_INVOKE
-                    || ((m == crate::issue::app_screen_decl::MAY_MEDIA_READ
-                        || m == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH)
-                        && pkg.host_contract.as_deref()
-                            == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA))
-            })
-            && pkg.tools.values().all(|slot| {
-                manifest
-                    .capabilities
-                    .get(slot)
-                    .is_some_and(|decl| matches!(decl.effect.as_str(), "read" | "draft"))
-            })
-    })
 }
 
 /// `mkdir` that never follows a link: `create_dir` is EEXIST on any
@@ -1697,7 +1254,12 @@ pub fn digest(pm_dir: &Path, project: &str, name: &str) -> Result<String> {
 /// file — a caller that renders a buffer it already read proves the
 /// approval covered THOSE bytes, never a second read a co-host writer
 /// could have flipped (N2: plan_text renders what it digests).
-fn digest_over(pm_dir: &Path, project: &str, name: &str, over: &[(&str, &str)]) -> Result<String> {
+pub(super) fn digest_over(
+    pm_dir: &Path,
+    project: &str,
+    name: &str,
+    over: &[(&str, &str)],
+) -> Result<String> {
     let dir = app_dir(pm_dir, project, name)?;
     let record = read_record(pm_dir, project, name)?;
     let text = std::fs::read_to_string(dir.join(MANIFEST)).map_err(|e| {
@@ -1849,7 +1411,7 @@ pub fn approval_binds(payload: &Value, digest: &str, install_id: &str) -> bool {
 /// moved — any bundle or binding edit re-gates the app), `unapproved`
 /// (no record, or the record belongs to another install), or `unknown`
 /// (the approval store did not read — never shown granted).
-fn approval_state(
+pub(super) fn approval_state(
     approvals: Option<&Map<String, Value>>,
     key: &str,
     digest: &str,
@@ -1995,7 +1557,9 @@ pub(crate) fn resolve_source(source: &str) -> Result<(PathBuf, Source, Option<te
             "app source {source} is a file — it names a folder or a git url"
         )));
     }
-    let tmp = tempfile::tempdir()?;
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let clone_dir = tmp.path().join("clone");
     let sha = clone_git(source, &clone_dir)?;
     Ok((
@@ -2174,7 +1738,9 @@ fn diff_report(name: &str, old_dir: &Path, new_files: &[(String, String)]) -> Re
         .filter(|(k, v)| old.get(*k).is_some_and(|o| o != *v))
         .map(|(k, _)| k)
         .collect();
-    let tmp = tempfile::tempdir()?;
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let (old_root, new_root) = (tmp.path().join("old"), tmp.path().join("new"));
     for (rel, text) in &old {
         let to = old_root.join(rel);
@@ -2952,659 +2518,6 @@ pub fn derive_grants(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec
     Ok(out)
 }
 
-/// The connection names the daemon registers, best-effort — `local` is
-/// always in the set (the built-in contract, CAD-546 or not). `None`
-/// when the daemon is unreachable; callers then report "not verified"
-/// rather than "unknown".
-fn known_connections(state_dir: &Path) -> Option<HashSet<String>> {
-    let v = crate::client::rpc(state_dir, "daemon_info", json!({})).ok()?;
-    let mut set: HashSet<String> = v["connections"]
-        .as_array()?
-        .iter()
-        .filter_map(|c| c.as_str().map(str::to_string))
-        .collect();
-    set.insert(LOCAL_CONNECTION.to_string());
-    Some(set)
-}
-
-/// The manifest of an installed app (`apps/<name>/app.md`).
-pub fn read_manifest(pm_dir: &Path, project: &str, name: &str) -> Result<Manifest> {
-    let file = app_dir(pm_dir, project, name)?.join(MANIFEST);
-    if file.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{} is a symlink — the tracker never follows links",
-            file.display()
-        )));
-    }
-    let text = std::fs::read_to_string(&file)
-        .map_err(|e| Error::rejected(format!("cannot read {}: {e}", file.display())))?;
-    parse_manifest(&text)
-}
-
-/// The daemon's registered agent aliases, best-effort — install/update
-/// resolve `agent:` against them like `workflow add` does.
-fn daemon_aliases(state_dir: &Path) -> Vec<String> {
-    crate::client::rpc(state_dir, "agent_list", json!({}))
-        .ok()
-        .and_then(|v| v["agents"].as_array().cloned())
-        .map(|a| {
-            a.iter()
-                .filter_map(|a| a["alias"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Every installed app of `project_key` (or all projects), one row per
-/// `apps/<name>/` dir — plus one `error` row per stray entry (a symlink,
-/// an orphan `<name>.yaml` with no folder, a folder with no record).
-pub fn ls(pm: &Pm, project_key: Option<&str>, state_dir: &Path) -> Result<Value> {
-    let projects = project::list(&pm.dir)?;
-    let projects: Vec<&project::Project> = match project_key {
-        Some(key) => {
-            let found: Vec<&project::Project> = projects.iter().filter(|p| p.key == key).collect();
-            if found.is_empty() {
-                return Err(project::unknown_project(key, &pm.dir));
-            }
-            found
-        }
-        None => projects.iter().collect(),
-    };
-    let approvals = fetch_approvals(state_dir);
-    let mut rows = Vec::new();
-    for p in projects {
-        let dir = pm.dir.join(&p.key).join(DIR);
-        if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-            rows.push(json!({
-                "project": p.key, "name": null,
-                "error": "apps/ is a symlink — the tracker never follows links",
-            }));
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut seen_records: HashSet<String> = HashSet::new();
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            let Ok(ft) = e.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
-                rows.push(json!({
-                    "project": p.key, "name": name,
-                    "error": "symlink — the tracker never follows links",
-                }));
-                continue;
-            }
-            if ft.is_dir() {
-                rows.push(describe(&pm.dir, &p.key, &name, approvals.as_ref()));
-                continue;
-            }
-            if let Some(stem) = name.strip_suffix(".yaml") {
-                seen_records.insert(stem.to_string());
-                continue; // the record's own row is the app dir's
-            }
-            rows.push(json!({
-                "project": p.key, "name": name,
-                "error": "not an app — apps/ holds <name>/ folders and <name>.yaml records",
-            }));
-        }
-        // A record without its folder — a half-removed app.
-        for stem in seen_records {
-            if !dir.join(&stem).is_dir() {
-                rows.push(json!({
-                    "project": p.key, "name": stem,
-                    "error": "install record without its app folder — remove \
-                              the stray file or reinstall",
-                }));
-            }
-        }
-    }
-    rows.sort_by(|a, b| {
-        (
-            a["project"].as_str().unwrap_or(""),
-            a["name"].as_str().unwrap_or(""),
-        )
-            .cmp(&(
-                b["project"].as_str().unwrap_or(""),
-                b["name"].as_str().unwrap_or(""),
-            ))
-    });
-    Ok(json!({"apps": rows, "count": rows.len()}))
-}
-
-/// One installed app's summary row — used by `ls` and the board list.
-fn describe(
-    pm_dir: &Path,
-    project: &str,
-    name: &str,
-    approvals: Option<&Map<String, Value>>,
-) -> Value {
-    let mut row = json!({"project": project, "name": name});
-    let record = match read_record(pm_dir, project, name) {
-        Ok(record) => record,
-        Err(e) => {
-            row["error"] = json!(e.to_string());
-            return row;
-        }
-    };
-    let manifest = match read_manifest(pm_dir, project, name) {
-        Ok(manifest) => manifest,
-        Err(e) => {
-            row["error"] = json!(e.to_string());
-            return row;
-        }
-    };
-    let workflows: Vec<String> = match bundle_files(&app_dir_or(pm_dir, project, name)) {
-        Ok(files) => files
-            .iter()
-            .filter_map(|(rel, _)| {
-                rel.strip_prefix("workflows/")
-                    .and_then(|n| n.strip_suffix(".md"))
-                    .map(str::to_string)
-            })
-            .collect(),
-        Err(e) => {
-            row["error"] = json!(e.to_string());
-            return row;
-        }
-    };
-    row["title"] = json!(manifest.title);
-    row["version"] = json!(manifest.version);
-    row["summary"] = json!(manifest.summary);
-    row["workflows"] = json!(workflows);
-    // The card's primary action (CAD-563 r2): the app's first workflow
-    // (sorted, so the choice is deterministic) and the human label the
-    // board names the action with.
-    let mut names = workflows.clone();
-    names.sort();
-    if let Some(first) = names.first() {
-        let label = std::fs::read_to_string(
-            app_dir_or(pm_dir, project, name)
-                .join("workflows")
-                .join(format!("{first}.md")),
-        )
-        .ok()
-        .and_then(|text| workflow::parse_template(&text).ok())
-        .and_then(|tpl| tpl.label);
-        row["primary"] = json!({"workflow": first, "label": label});
-    }
-    row["connections"] = json!(manifest
-        .connections
-        .iter()
-        .map(|slot| json!({
-            "slot": slot,
-            "bound": record.binding(slot),
-        }))
-        .collect::<Vec<_>>());
-    match digest(pm_dir, project, name) {
-        Ok(d) => {
-            row["digest"] = json!(d);
-            row["approved"] = match approvals {
-                Some(a) => json!(approved(project, name, &d, &record.install_id, Some(a))),
-                None => json!("unknown — daemon unreachable"),
-            };
-            row["approval"] = json!(approval_state(
-                approvals,
-                &approval_key(project, name),
-                &d,
-                &record.install_id,
-            ));
-        }
-        Err(e) => row["error"] = json!(e.to_string()),
-    }
-    row["source"] = serde_json::to_value(&record.source).unwrap_or(Value::Null);
-    row["team"] = json!(record.team);
-    row["installed_at"] = json!(record.installed_at);
-    row["installed_by"] = json!(record.installed_by);
-    row["updated_at"] = json!(record.updated_at);
-    row
-}
-
-/// `apps/<name>/` without the "must be installed" wording — for
-/// internal walkers that already know it exists.
-fn app_dir_or(pm_dir: &Path, project: &str, name: &str) -> PathBuf {
-    pm_dir.join(project).join(DIR).join(name)
-}
-
-/// `cadence app show <app> --project <key>` — the manifest, the guide,
-/// each workflow's summary (the same detail `workflow show` gives),
-/// declared slots with their effective bindings, the install record,
-/// the digest and the approval state.
-pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<Value> {
-    model::check_key(project_key)?;
-    if !project::list(&pm.dir)?.iter().any(|p| p.key == project_key) {
-        return Err(project::unknown_project(project_key, &pm.dir));
-    }
-    let mut out = describe(
-        &pm.dir,
-        project_key,
-        name,
-        fetch_approvals(state_dir).as_ref(),
-    );
-    if out.get("error").is_some() {
-        return Ok(out);
-    }
-    let dir = app_dir(&pm.dir, project_key, name)?;
-    let manifest = read_manifest(&pm.dir, project_key, name)?;
-    let daemon_agents = daemon_aliases(state_dir);
-    let (agents, agent_sources) =
-        workflow::known_agents(&pm.dir, Some(project_key), &daemon_agents);
-    let mut workflows = Vec::new();
-    let mut rubrics = Vec::new();
-    for (rel, path) in bundle_files(&dir)? {
-        if let Some(rb) = rel
-            .strip_prefix("rubrics/")
-            .and_then(|n| n.strip_suffix(".md"))
-        {
-            // A file verified real at scan could still be swapped for a
-            // link before the read — re-check the leaf, like
-            // `read_workflow` and `board_rows` do.
-            if path
-                .symlink_metadata()
-                .map(|m| !m.is_file())
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            rubrics.push(json!({
-                "name": rb,
-                "body": std::fs::read_to_string(&path).unwrap_or_default(),
-            }));
-            continue;
-        }
-        let Some(wf) = rel
-            .strip_prefix("workflows/")
-            .and_then(|n| n.strip_suffix(".md"))
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let (errors, notes, doc) = workflow::check_text(&text, &agents, &agent_sources);
-        let tpl = workflow::parse_template(&text).ok();
-        workflows.push(json!({
-            "name": format!("{name}/{wf}"),
-            "ok": errors.is_empty(),
-            "errors": errors,
-            "notes": notes,
-            "title": doc.as_ref().map(|d| d.title.clone()),
-            // The workflow's human label (`label:`, wording) — the
-            // board's primary action names it; the app's title when the
-            // workflow never declared one.
-            "label": tpl.as_ref().and_then(|t| t.label.clone()),
-            "tickets": doc.as_ref().map(|d| d.tickets.len()),
-            "inputs": tpl.as_ref().map(workflow::inputs_json),
-            // The steps, in order, from the canonical render: each
-            // title (input names stand in for values) and the agent
-            // expression — an input name when the ticket's `agent:` is
-            // exactly `{{input}}`, which is how the board maps a run's
-            // owners back to the team inputs.
-            "steps": doc.as_ref().map(|d| d.tickets.iter().map(|t| json!({
-                "title": t.title,
-                "agent": t.agent,
-                "size": t.size,
-            })).collect::<Vec<_>>()),
-            "distinct": tpl.as_ref().map(|t| t.distinct.clone()),
-            "uses": workflow_slots(&text).unwrap_or_default(),
-        }));
-    }
-    let record = read_record(&pm.dir, project_key, name)?;
-    out["summary"] = json!(manifest.summary);
-    out["guide"] = json!(manifest.guide);
-    out["workflows"] = json!(workflows);
-    out["rubrics"] = json!(rubrics);
-    out["record"] = serde_json::to_value(&record).unwrap_or(Value::Null);
-    Ok(out)
-}
-
-/// `plan propose --workflow <app>/<wf>` resolution — the daemon's read:
-/// the app must be installed (record included), its current digest must
-/// match the operator's recorded approval (`app_unapproved` otherwise),
-/// then the workflow renders exactly as a stored one would. The app's
-/// saved default team (CAD-577) fills any team role the proposal left
-/// unset — the operator set it, so a fresh install runs with only a
-/// topic; an explicit input still wins.
-pub fn plan_text(
-    pm_dir: &Path,
-    app_approvals: &std::collections::HashMap<String, Value>,
-    project: &str,
-    app: &str,
-    wf: &str,
-    provided: &BTreeMap<String, String>,
-) -> Result<String> {
-    let _ = app_dir(pm_dir, project, app)?;
-    let record = read_record(pm_dir, project, app)?;
-    let text = read_workflow(pm_dir, project, app, wf)?;
-    // The digest covers THIS buffer for the rendered workflow — the
-    // bytes the operator approved are the bytes rendered, even if a
-    // co-host writer flips the file after this one read (N2).
-    let rel = format!("workflows/{wf}.md");
-    let digest = digest_over(pm_dir, project, app, &[(rel.as_str(), text.as_str())])?;
-    let ok = app_approvals
-        .get(&approval_key(project, app))
-        .is_some_and(|p| approval_binds(p, digest.as_str(), &record.install_id));
-    if !ok {
-        return Err(Error::invalid(
-            "app_unapproved",
-            format!(
-                "app '{app}' in {project} is not approved for its current structure \
-                 ({digest}) — a slot, binding, guide, rubric, template or workflow \
-                 gate change resets it; the operator re-approves with `cadence app \
-                 approve {app} --project {project}`"
-            ),
-        ));
-    }
-    // The saved default team fills any team role THIS workflow declares
-    // and the proposal left unset (CAD-577). The team record is the
-    // union across the app's workflows; filling a role another workflow
-    // declares makes `render` refuse `unknown input`. An explicit input
-    // still wins: the caller named that agent.
-    let declared = workflow::parse_template(&text).ok();
-    let mut inputs = provided.clone();
-    for (role, agent) in &record.team {
-        if declared
-            .as_ref()
-            .is_some_and(|tpl| tpl.inputs.contains_key(role))
-        {
-            inputs.entry(role.clone()).or_insert_with(|| agent.clone());
-        }
-    }
-    workflow::render(&text, &inputs)
-}
-
-/// `app approve`'s view of the INSTALLED folder — the same strict scan
-/// and checks a fresh source passes, so a hand edit after install
-/// cannot smuggle content past the operator's review.
-pub fn check_installed(
-    pm_dir: &Path,
-    project: &str,
-    name: &str,
-    agents: &HashSet<String>,
-    agent_sources: &[String],
-) -> Result<Vec<String>> {
-    let dir = app_dir(pm_dir, project, name)?;
-    let _ = read_record(pm_dir, project, name)?;
-    Ok(validate(&dir, agents, agent_sources)?.notes)
-}
-
-/// The board's New-run rows for `project`'s app workflows — one per
-/// `apps/<app>/workflows/<wf>.md`, named `<app>/<wf>`, carrying the
-/// APP's approval state (approval is whole-app; there is no
-/// per-workflow approval). An app that fails its installed checks lists
-/// its workflows with the error attached — the board shows why it
-/// cannot run rather than hiding it.
-pub fn board_rows(pm_dir: &Path, project: &str, state_dir: &Path) -> Vec<Value> {
-    let mut rows = Vec::new();
-    let dir = pm_dir.join(project).join(DIR);
-    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return rows;
-    }
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return rows;
-    };
-    let approvals = fetch_approvals(state_dir);
-    let daemon_agents = daemon_aliases(state_dir);
-    let (agents, agent_sources) = workflow::known_agents(pm_dir, Some(project), &daemon_agents);
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let Ok(ft) = e.file_type() else {
-            continue;
-        };
-        if !ft.is_dir() || !model::valid_tag(&name) {
-            continue;
-        }
-        let checked = check_installed(pm_dir, project, &name, &agents, &agent_sources)
-            .map_err(|e| e.to_string());
-        let app_digest = digest(pm_dir, project, &name);
-        let install_id = current_install_id(pm_dir, project, &name);
-        let approved = match &app_digest {
-            Ok(d) => match &approvals {
-                Some(a) => json!(approved(project, &name, d, &install_id, Some(a))),
-                None => json!("unknown — daemon unreachable"),
-            },
-            Err(_) => Value::Null,
-        };
-        // The listing goes through bundle_files — the same no-links walk
-        // install and approve enforce — so a symlinked workflows/ dir (or
-        // any planted link) becomes the app's error row instead of
-        // leaking the foreign dir's file names onto the board (N1).
-        match bundle_files(&e.path()) {
-            Ok(files) => {
-                for (rel, path) in &files {
-                    let Some(stem) = rel
-                        .strip_prefix("workflows/")
-                        .and_then(|n| n.strip_suffix(".md"))
-                    else {
-                        continue;
-                    };
-                    // A file verified real at scan could still be swapped
-                    // for a link before the read — re-check the leaf.
-                    if path
-                        .symlink_metadata()
-                        .map(|m| !m.is_file())
-                        .unwrap_or(true)
-                    {
-                        continue;
-                    }
-                    let text = std::fs::read_to_string(path).unwrap_or_default();
-                    let (_, _, doc) = workflow::check_text(&text, &agents, &agent_sources);
-                    let tpl = workflow::parse_template(&text).ok();
-                    let mut row = json!({
-                        "project": project,
-                        "name": format!("{name}/{stem}"),
-                        "app": name,
-                        "title": doc.as_ref().map(|d| d.title.clone()),
-                        "tickets": doc.map(|d| d.tickets.len()),
-                        "inputs": tpl.as_ref().map(workflow::inputs_json),
-                        "approved": approved,
-                        "digest": app_digest.as_ref().ok(),
-                    });
-                    if let Err(why) = &checked {
-                        row["error"] = json!(why);
-                    }
-                    rows.push(row);
-                }
-            }
-            Err(why) => {
-                // One row still names the broken app — the board shows
-                // why it cannot run rather than hiding it.
-                let mut row = json!({
-                    "project": project,
-                    "name": name,
-                    "app": name,
-                    "title": Value::Null,
-                    "tickets": Value::Null,
-                    "inputs": Value::Null,
-                    "approved": approved,
-                    "digest": app_digest.as_ref().ok(),
-                });
-                row["error"] = match &checked {
-                    Err(checked_why) => json!(checked_why),
-                    Ok(_) => json!(why.to_string()),
-                };
-                rows.push(row);
-            }
-        }
-    }
-    rows
-}
-
-/// `issue lint`'s view of `<pm>/<key>/apps/` — each `<name>/` is an app
-/// folder with a parseable `app.md`, each `<name>.yaml` a well-formed
-/// record that names it; anything else is a warning, a symlink an
-/// error, like the workflows dir's own lint.
-pub fn lint_dir(
-    dir: &Path,
-    project_key: &str,
-    err: &mut dyn FnMut(String),
-    warn: &mut dyn FnMut(String),
-) {
-    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        err(format!(
-            "{project_key}/{DIR}: symlink — the board never follows links"
-        ));
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut names: Vec<String> = Vec::new();
-    let mut records: Vec<String> = Vec::new();
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
-            err(format!(
-                "{project_key}/{DIR}/{name}: symlink — the board never follows links"
-            ));
-            continue;
-        }
-        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            if !model::valid_tag(&name) {
-                warn(format!(
-                    "{project_key}/{DIR}/{name}: not an app name — [a-z0-9-], ≤32"
-                ));
-                continue;
-            }
-            names.push(name);
-            continue;
-        }
-        if let Some(stem) = name.strip_suffix(".yaml") {
-            records.push(stem.to_string());
-            continue;
-        }
-        warn(format!(
-            "{project_key}/{DIR}/{name}: not an app — apps/ holds <name>/ folders \
-             and <name>.yaml records"
-        ));
-    }
-    for name in &names {
-        let app_path = dir.join(name);
-        let md = app_path.join(MANIFEST);
-        if md.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-            err(format!(
-                "{project_key}/{DIR}/{name}/app.md: symlink — the board never follows links"
-            ));
-            continue;
-        }
-        match std::fs::read_to_string(&md) {
-            Err(_) => err(format!("{project_key}/{DIR}/{name}: no app.md")),
-            Ok(text) => match parse_manifest(&text) {
-                Err(e) => err(format!("{project_key}/{DIR}/{name}/app.md: {e}")),
-                Ok(m) if m.app != *name => warn(format!(
-                    "{project_key}/{DIR}/{name}/app.md: declares app '{}' — the folder \
-                     and record name it",
-                    m.app
-                )),
-                Ok(_) => {}
-            },
-        }
-        if !records.iter().any(|r| r == name) {
-            warn(format!(
-                "{project_key}/{DIR}/{name}: no install record {name}.yaml — it was \
-                 not installed by `cadence app install`"
-            ));
-        }
-    }
-    for stem in &records {
-        if names.iter().any(|n| n == stem) {
-            continue;
-        }
-        warn(format!(
-            "{project_key}/{DIR}/{stem}.yaml: install record without its app folder"
-        ));
-    }
-}
-
-/// `cadence doctor`'s app report — per installed app, every declared
-/// slot's binding health: `unbound` (explicitly unbound), `unknown` when
-/// the connection name isn't registered (`known` is the daemon's
-/// connection set — `None` when unreachable, reported as
-/// "unavailable", never as "unknown connection"), plus slots bound
-/// that the manifest no longer declares.
-pub fn doctor(pm_dir: &Path, known: Option<&HashSet<String>>) -> Value {
-    let mut rows = Vec::new();
-    let Ok(projects) = project::list(pm_dir) else {
-        return json!({"apps": [], "note": "no readable PM projects"});
-    };
-    for p in projects {
-        let apps_dir = pm_dir.join(&p.key).join(DIR);
-        if apps_dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-            rows.push(json!({
-                "project": p.key, "app": null,
-                "error": "apps/ is a symlink — never followed",
-            }));
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&apps_dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) || !model::valid_tag(&name) {
-                continue;
-            }
-            let (manifest, record) = match (
-                read_manifest(pm_dir, &p.key, &name),
-                read_record(pm_dir, &p.key, &name),
-            ) {
-                (Ok(m), Ok(r)) => (m, r),
-                (a, b) => {
-                    let why = a
-                        .err()
-                        .or(b.err())
-                        .map(|e| e.to_string())
-                        .unwrap_or_default();
-                    rows.push(json!({"project": p.key, "app": name, "error": why}));
-                    continue;
-                }
-            };
-            let mut unbound = Vec::new();
-            let mut unknown = Vec::new();
-            let mut ok = Vec::new();
-            for slot in &manifest.connections {
-                match record.binding(slot) {
-                    None => unbound.push(slot.clone()),
-                    Some(conn) => match known {
-                        None => ok.push(
-                            json!({"slot": slot, "connection": conn, "verified": "unavailable"}),
-                        ),
-                        Some(known) if known.contains(conn) => {
-                            ok.push(json!({"slot": slot, "connection": conn}))
-                        }
-                        Some(_) => unknown.push(json!({"slot": slot, "connection": conn})),
-                    },
-                }
-            }
-            let stray: Vec<&String> = record
-                .bindings
-                .keys()
-                .filter(|k| !manifest.connections.iter().any(|s| s == *k))
-                .collect();
-            let mut row = json!({
-                "project": p.key,
-                "app": name,
-                "slots_ok": ok,
-                "unbound": unbound,
-                "unknown_connection": unknown,
-            });
-            if !stray.is_empty() {
-                row["stray_bindings"] = json!(stray);
-            }
-            if known.is_none() {
-                row["connection_check"] = json!("unavailable — daemon unreachable");
-            }
-            rows.push(row);
-        }
-    }
-    json!({"apps": rows, "count": rows.len()})
-}
-
-#[cfg(test)]
-#[path = "app_nested_copy_acceptance.rs"]
-mod nested_copy_acceptance;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3808,6 +2721,60 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         assert_eq!(none.view_contract, None);
     }
 
+    #[test]
+    fn manifest_display_i18n_merges_listing_and_top_level() {
+        let mk = |extra: &str| {
+            format!("---\napp: crm\ntitle: CRM\nversion: '0.2.2'\nsummary: Manage customers\nneeds:\n  connections: []\n{extra}\n---\n\nGuide\n")
+        };
+        let none = parse_manifest(APP_MD).unwrap();
+        assert!(none.i18n.is_none() && none.display_i18n().is_null());
+
+        let d = parse_manifest(&mk(
+            "listing:\n  tagline: T\n  i18n: { zh-TW: { title: A, tagline: L, about: B }, zh-HK: { title: C } }\n\
+             i18n: { zh-TW: { title: 客戶管理, summary: 管理 } }",
+        ))
+        .unwrap()
+        .display_i18n();
+        let z = &d["zh-TW"];
+        assert_eq!(
+            (
+                z["title"].as_str(),
+                z["summary"].as_str(),
+                z["tagline"].as_str(),
+                d["zh-HK"]["title"].as_str()
+            ),
+            (Some("客戶管理"), Some("管理"), Some("L"), Some("C"))
+        );
+        assert!(z.get("about").is_none());
+        let locs = |a: u8, b: u8| {
+            (a..b)
+                .map(|i| format!("en-x{i}: {{ title: T }}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ci = parse_manifest(&mk(&format!(
+            "listing: {{ i18n: {{ zh-tw: {{ title: A, tagline: K }}, {} }} }}\ni18n: {{ zh-TW: {{ title: 客戶 }} }}",
+            locs(0, 7)
+        )))
+        .unwrap()
+        .display_i18n();
+        let obj = ci.as_object().unwrap();
+        assert!(obj.len() == 8 && obj.contains_key("zh-TW") && !obj.contains_key("zh-tw"));
+        assert_eq!(
+            (
+                ci["zh-TW"]["title"].as_str(),
+                ci["zh-TW"]["tagline"].as_str()
+            ),
+            (Some("客戶"), Some("K"))
+        );
+        assert!(parse_manifest(&mk(&format!(
+            "listing: {{ i18n: {{ {} }} }}\ni18n: {{ {} }}",
+            locs(0, 5),
+            locs(5, 9)
+        )))
+        .is_err());
+    }
+
     /// CAD-864: declaration and descriptor file pair up in the
     /// validator — either alone refuses, a mismatched `app` refuses.
     #[test]
@@ -3958,5 +2925,507 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         let pkg = crate::issue::app_screen_pkg::extract(&map, "feed").unwrap();
         assert_eq!(pkg.contract, "app-screens/v2");
         assert_eq!(pkg.tools["instagram.read"], "source");
+    }
+
+    /// CAD-1867: a bundle carrying one complete skill package, as the text map
+    /// install and run creation both validate. `declared` is the manifest's
+    /// `files`; `carried` is what the bundle actually holds.
+    fn skill_bundle(
+        declared: &[&str],
+        carried: &[(&str, &str)],
+        workflow: &str,
+    ) -> BTreeMap<String, String> {
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": declared,
+        });
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert(
+            MANIFEST.to_string(),
+            "---\napp: skill-app\ntitle: Skill app\nversion: '1'\nneeds:\n  \
+             connections: []\n---\n\nGuide.\n"
+                .to_string(),
+        );
+        files.insert("workflows/do.md".to_string(), workflow.to_string());
+        files.insert(
+            format!("{SKILL_DIR}/meeting-writer/{SKILL_MANIFEST}"),
+            manifest.to_string(),
+        );
+        for (member, text) in carried {
+            files.insert(
+                format!("{SKILL_DIR}/meeting-writer/{member}"),
+                text.to_string(),
+            );
+        }
+        files
+    }
+
+    /// The storage guard workflow with a `skill:` line appended as the step's
+    /// last metadata line — the only position the plan parser can read.
+    fn skill_workflow(skill_line: &str) -> String {
+        SKILL_BASE_WORKFLOW.replace(
+            "agent: dev-1\nsize: S\n",
+            &format!("agent: dev-1\nsize: S\n{skill_line}"),
+        )
+    }
+
+    /// A minimal valid workflow the install gate accepts.
+    const SKILL_BASE_WORKFLOW: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}}\"\n\
+inputs:\n  topic: { ask: \"About what?\" }\n---\n\n\
+Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] brief written\n";
+
+    fn skill_texts(files: &BTreeMap<String, String>) -> Vec<(String, String)> {
+        files.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    fn install_error(files: &BTreeMap<String, String>) -> String {
+        match validate_texts(skill_texts(files), &HashSet::new(), &[]) {
+            Ok(_) => panic!("install accepts the bundle"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    const SKILL_MD: &str = "Read references/style.md, then run ./scripts/build.py.\n";
+    const STYLE_MD: &str = "Short sentences.\n";
+    const BUILD_PY: &str = "print('ok')\n";
+
+    /// The complete package installs and freezes every declared member
+    /// byte-exactly, with the manifest's own digest.
+    #[test]
+    fn cad1867_a_complete_skill_package_installs_and_freezes_its_bytes() {
+        let files = skill_bundle(
+            &[SKILL_ENTRY, "references/style.md", "scripts/build.py"],
+            &[
+                (SKILL_ENTRY, SKILL_MD),
+                ("references/style.md", STYLE_MD),
+                ("scripts/build.py", BUILD_PY),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let validated = validate_texts(skill_texts(&files), &HashSet::new(), &[]).unwrap();
+        assert_eq!(validated.manifest.app, "skill-app");
+
+        let package = skill_package(&files, "meeting-writer").unwrap();
+        assert_eq!(package.name, "meeting-writer");
+        assert_eq!(
+            package
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![SKILL_ENTRY, "references/style.md", "scripts/build.py"]
+        );
+        for file in &package.files {
+            let exact = &files[&format!("{SKILL_DIR}/meeting-writer/{}", file.path)];
+            assert_eq!(&file.text, exact, "{} froze different bytes", file.path);
+            assert_eq!(
+                file.sha256,
+                format!("sha256:{}", sha256_hex(exact.as_bytes()))
+            );
+        }
+        let manifest_path = format!("{SKILL_DIR}/meeting-writer/{SKILL_MANIFEST}");
+        assert_eq!(
+            package.manifest_sha256,
+            format!("sha256:{}", sha256_hex(files[&manifest_path].as_bytes()))
+        );
+        assert!(package.digest.starts_with("sha256:"));
+        // Deterministic: the same bytes freeze to the same package.
+        assert_eq!(package, skill_package(&files, "meeting-writer").unwrap());
+    }
+
+    /// A manifest that omits a member its own declared text references is
+    /// refused at install, and the SAME validator refuses it again at run
+    /// creation — one function, so the two cannot disagree.
+    #[test]
+    fn cad1867_an_undeclared_reference_refuses_at_install_and_at_run_creation() {
+        // SKILL.md names `references/style.md`; the manifest omits it and the
+        // bundle does not carry it either, so only the reference scan catches
+        // it.
+        let files = skill_bundle(
+            &[SKILL_ENTRY, "scripts/build.py"],
+            &[(SKILL_ENTRY, SKILL_MD), ("scripts/build.py", BUILD_PY)],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let install = install_error(&files);
+        assert!(install.contains("references/style.md"), "{install}");
+        let run = skill_package(&files, "meeting-writer")
+            .expect_err("run creation refuses")
+            .to_string();
+        assert!(run.contains("references/style.md"), "{run}");
+    }
+
+    /// The declared set must equal the present set in both directions, each
+    /// mismatch naming the path.
+    #[test]
+    fn cad1867_declared_and_present_sets_must_match() {
+        // Present but undeclared.
+        let extra = skill_bundle(
+            &[SKILL_ENTRY, "scripts/build.py"],
+            &[
+                (SKILL_ENTRY, SKILL_MD),
+                ("scripts/build.py", BUILD_PY),
+                ("references/style.md", STYLE_MD),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let error = install_error(&extra);
+        assert!(error.contains("references/style.md"), "{error}");
+        assert!(error.contains("not declared"), "{error}");
+
+        // Declared but absent.
+        let missing = skill_bundle(
+            &[SKILL_ENTRY, "notes.txt"],
+            &[(SKILL_ENTRY, "See notes.txt.\n")],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let error = install_error(&missing);
+        assert!(error.contains("notes.txt"), "{error}");
+    }
+
+    /// `SKILL.md` is required, `skill.json` is never one of its own members,
+    /// and an unknown field is refused by the closed decode.
+    #[test]
+    fn cad1867_the_manifest_is_closed_and_requires_its_entry() {
+        let entry =
+            |value: serde_json::Value| parse_skill_manifest(&value.to_string(), "meeting-writer");
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": ["scripts/a.py"],
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains(SKILL_ENTRY));
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY, SKILL_MANIFEST],
+        }))
+        .is_err());
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "other",
+            "files": [SKILL_ENTRY],
+        }))
+        .is_err());
+        assert!(entry(serde_json::json!({
+            "schema": 2,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY],
+        }))
+        .is_err());
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY],
+            "extra": 1,
+        }))
+        .is_err());
+        // A nested directory is not a member.
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY, "scripts"],
+        }))
+        .is_err());
+        assert!(entry(serde_json::json!({
+            "schema": 1,
+            "name": "meeting-writer",
+            "files": [SKILL_ENTRY, "scripts/a.rb"],
+        }))
+        .is_err());
+    }
+
+    /// The published caps: 16 declared members, 16 KiB per member, 4 KiB for
+    /// the manifest, 32 KiB per package.
+    #[test]
+    fn cad1867_the_skill_caps_are_enforced() {
+        // 17 declared members.
+        let mut declared: Vec<String> = vec![SKILL_ENTRY.to_string()];
+        for n in 0..SKILL_FILES_MAX {
+            declared.push(format!("references/r{n}.md"));
+        }
+        let names: Vec<&str> = declared.iter().map(String::as_str).collect();
+        let mut carried: Vec<(&str, &str)> = vec![(SKILL_ENTRY, "Plain instructions.\n")];
+        carried.extend(
+            declared
+                .iter()
+                .skip(1)
+                .map(|member| (member.as_str(), "x\n")),
+        );
+        let files = skill_bundle(&names, &carried, &skill_workflow("skill: meeting-writer\n"));
+        assert!(
+            install_error(&files).contains("at most"),
+            "over the member count"
+        );
+
+        // One member over the per-file cap.
+        let big = "a".repeat(SKILL_FILE_BYTES as usize + 1);
+        let files = skill_bundle(
+            &[SKILL_ENTRY, "notes.txt"],
+            &[
+                (SKILL_ENTRY, "See notes.txt.\n"),
+                ("notes.txt", big.as_str()),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        assert!(skill_package(&files, "meeting-writer")
+            .unwrap_err()
+            .to_string()
+            .contains("at most"));
+
+        // Four 8 KiB members plus the manifest are over the package cap.
+        let chunk = "b".repeat(8 * 1024);
+        let files = skill_bundle(
+            &[
+                SKILL_ENTRY,
+                "notes.txt",
+                "references/a.md",
+                "references/b.md",
+                "references/c.md",
+            ],
+            &[
+                (SKILL_ENTRY, "See notes.txt.\n"),
+                ("notes.txt", chunk.as_str()),
+                ("references/a.md", chunk.as_str()),
+                ("references/b.md", chunk.as_str()),
+                ("references/c.md", chunk.as_str()),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        assert!(skill_package(&files, "meeting-writer")
+            .unwrap_err()
+            .to_string()
+            .contains("at most"));
+    }
+
+    /// A package may reference only its own declared members: another
+    /// package's path refuses, and so does a bare undeclared name.
+    #[test]
+    fn cad1867_a_reference_to_another_package_refuses() {
+        let files = skill_bundle(
+            &[SKILL_ENTRY],
+            &[(SKILL_ENTRY, "See skills/other-skill/SKILL.md.\n")],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let error = install_error(&files);
+        assert!(error.contains("other-skill"), "{error}");
+
+        let bare = skill_bundle(
+            &[SKILL_ENTRY],
+            &[(SKILL_ENTRY, "See notes.md for the rules.\n")],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let error = install_error(&bare);
+        assert!(error.contains("notes.md"), "{error}");
+    }
+
+    #[test]
+    fn cad1867_static_undeclared_material_cannot_disappear_from_the_scan() {
+        let mut files: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::from([
+                (
+                    "skills/demo/skill.json".into(),
+                    r#"{"schema":1,"name":"demo","files":["SKILL.md"]}"#.into(),
+                ),
+                ("skills/demo/SKILL.md".into(), "Read SKILL.md.\n".into()),
+            ]);
+        assert!(crate::issue::app::skill_package(&files, "demo").is_ok());
+        let long_member = format!("scripts/{}.py", "a".repeat(246));
+        for reference in [long_member, ".//scripts/missing.py".to_owned()] {
+            files.insert("skills/demo/SKILL.md".into(), format!("Run {reference}.\n"));
+            let error = crate::issue::app::skill_package(&files, "demo")
+                .expect_err("static undeclared material must refuse")
+                .to_string();
+            assert!(error.contains("scripts/"), "{error}");
+        }
+    }
+
+    /// Every `.`-led spelling of the same relative path is the same reference,
+    /// so a dotted form cannot hide material the plain form refuses.
+    #[test]
+    fn cad1867_dotted_spellings_are_not_a_way_around_the_scan() {
+        let mut files: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::from([
+                (
+                    "skills/demo/skill.json".into(),
+                    r#"{"schema":1,"name":"demo","files":["SKILL.md"]}"#.into(),
+                ),
+                ("skills/demo/SKILL.md".into(), "Read SKILL.md.\n".into()),
+            ]);
+        assert!(crate::issue::app::skill_package(&files, "demo").is_ok());
+        for reference in [
+            ".//./scripts/missing.py",
+            ".//scripts/missing.py",
+            "././scripts/missing.py",
+            ".//./skills/other/SKILL.md",
+            "../scripts/missing.py",
+            "../references/spec.md",
+        ] {
+            files.insert("skills/demo/SKILL.md".into(), format!("Run {reference}.\n"));
+            let error = crate::issue::app::skill_package(&files, "demo")
+                .expect_err("a dotted spelling must still refuse")
+                .to_string();
+            assert!(
+                error.contains("missing.py")
+                    || error.contains("other")
+                    || error.contains("through '..'"),
+                "{reference}: {error}"
+            );
+        }
+    }
+
+    /// A workflow that names a package the bundle does not carry refuses at
+    /// install, and `skill:` must be the step's LAST metadata line.
+    #[test]
+    fn cad1867_a_declared_tag_must_resolve_and_be_the_last_metadata_line() {
+        let files = skill_bundle(
+            &[SKILL_ENTRY],
+            &[(SKILL_ENTRY, "Plain instructions.\n")],
+            &skill_workflow("skill: other-skill\n"),
+        );
+        let error = install_error(&files);
+        assert!(error.contains("other-skill"), "{error}");
+
+        let misordered = skill_workflow("skill: meeting-writer\nsize: S\n");
+        let error = crate::issue::workflow::skill_tags(&misordered)
+            .expect_err("skill must be last")
+            .to_string();
+        assert!(error.contains("last metadata line"), "{error}");
+    }
+
+    /// A frozen package is a value: updating the installed bundle afterwards
+    /// leaves the frozen material — and its digest — exactly as it was.
+    #[test]
+    fn cad1867_a_frozen_package_does_not_change_when_the_bundle_updates() {
+        let mut files = skill_bundle(
+            &[SKILL_ENTRY, "scripts/build.py"],
+            &[
+                (SKILL_ENTRY, "Run ./scripts/build.py.\n"),
+                ("scripts/build.py", BUILD_PY),
+            ],
+            &skill_workflow("skill: meeting-writer\n"),
+        );
+        let frozen = skill_package(&files, "meeting-writer").unwrap();
+        let frozen_json = serde_json::to_value(&frozen).unwrap();
+        files.insert(
+            format!("{SKILL_DIR}/meeting-writer/scripts/build.py"),
+            "print('replaced')\n".to_string(),
+        );
+        let updated = skill_package(&files, "meeting-writer").unwrap();
+        assert_ne!(frozen.digest, updated.digest);
+        assert_eq!(serde_json::to_value(&frozen).unwrap(), frozen_json);
+        assert_eq!(
+            frozen.files[1].text, BUILD_PY,
+            "the frozen value kept its own bytes"
+        );
+    }
+
+    /// CAD-622: an installed copy stays immutable between approvals — an
+    /// edit to `<pm>/<project>/apps/<name>` moves the digest, the board's
+    /// approval word reads `changed` (the same predicate), and a run's
+    /// gate refuses `app_unapproved` instead of running unreviewed bytes.
+    #[test]
+    fn cad622_an_edit_after_approval_shows_changed_and_stops_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        crate::issue::write::project_add(&pm, "demo", "DEM", &[], &[], &[], None).unwrap();
+        let base = pm.dir.join("demo").join(DIR).join("social-content");
+        std::fs::create_dir_all(base.join("workflows")).unwrap();
+        std::fs::write(
+            base.join(MANIFEST),
+            "---\napp: social-content\ntitle: Social content\nversion: '1'\nneeds:\n  connections: []\n---\n\nThe guide.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("workflows").join("post.md"),
+            "---\ntitle: \"Post\"\ngoal: \"Write one post\"\ninputs: {}\n---\n\n## Draft\n\nWrite it.\n\n### Acceptance\n- [ ] written\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pm.dir.join("demo").join(DIR).join("social-content.yaml"),
+            serde_yaml::to_string(&Record {
+                schema: 1,
+                app: "social-content".into(),
+                install_id: "install-1".into(),
+                source: Source::Path {
+                    path: "tests/fixtures/apps/social-content".into(),
+                },
+                bindings: Default::default(),
+                team: Default::default(),
+                installed_at: "2026-01-01T00:00:00Z".into(),
+                installed_by: "operator".into(),
+                updated_at: None,
+                removed: None,
+                restore_after: None,
+                purge_after: None,
+                catalogue: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let approved_digest = digest(&pm.dir, "demo", "social-content").unwrap();
+        let payload = json!({
+            "digest": approved_digest,
+            "install_id": "install-1",
+            "by": "operator",
+            "revoked": false,
+        });
+        let mut approvals = std::collections::HashMap::new();
+        approvals.insert(approval_key("demo", "social-content"), payload.clone());
+        let rendered = plan_text(
+            &pm.dir,
+            &approvals,
+            "demo",
+            "social-content",
+            "post",
+            &BTreeMap::new(),
+        )
+        .expect("the approved install renders");
+        assert!(rendered.contains("Write it"));
+
+        // An edit to the installed copy — the bytes the operator approved
+        // are no longer the bytes on disk.
+        let guide = base.join(MANIFEST);
+        let mut text = std::fs::read_to_string(&guide).unwrap();
+        text.push_str("\nAn unapproved addition.\n");
+        std::fs::write(&guide, text).unwrap();
+        let moved = digest(&pm.dir, "demo", "social-content").unwrap();
+        assert_ne!(moved, approved_digest, "the digest covers the guide");
+        assert!(
+            !approval_binds(&payload, &moved, "install-1"),
+            "the board reads this install as changed, not approved"
+        );
+        let refused = plan_text(
+            &pm.dir,
+            &approvals,
+            "demo",
+            "social-content",
+            "post",
+            &BTreeMap::new(),
+        )
+        .expect_err("an edit after approval stops the run");
+        assert!(
+            refused
+                .to_string()
+                .contains("not approved for its current structure"),
+            "{refused}"
+        );
+        // The operator's re-approval restores it.
+        let mut approvals = approvals.clone();
+        approvals.insert(
+            approval_key("demo", "social-content"),
+            json!({"digest": moved, "install_id": "install-1", "revoked": false}),
+        );
+        plan_text(
+            &pm.dir,
+            &approvals,
+            "demo",
+            "social-content",
+            "post",
+            &BTreeMap::new(),
+        )
+        .expect("re-approval admits the new bytes");
     }
 }

@@ -1,9 +1,9 @@
 export const STATUS_CHIP: Record<string, string> = {
   backlog: "bg-ink-800 text-ink-400",
   ready: "bg-ink-800 text-ink-300",
-  doing: "bg-info/10 text-info",
-  review: "bg-warn/10 text-warn",
-  done: "bg-ok/10 text-ok",
+  doing: "bg-info/10 status-chip-doing",
+  review: "bg-warn/10 status-chip-review",
+  done: "bg-ok/10 status-chip-done",
   dropped: "bg-ink-800 text-ink-500",
 };
 

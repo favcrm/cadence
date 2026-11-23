@@ -10,7 +10,7 @@
 # CADENCE_NEXTTEST_BIN.
 set -eu
 
-VERSION=0.9.145
+VERSION=0.9.150
 TARGET=x86_64-unknown-linux-gnu
 ARCHIVE="cargo-nextest-$VERSION-$TARGET.tar.gz"
 URL="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$VERSION/$ARCHIVE"

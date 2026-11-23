@@ -1,5 +1,7 @@
 //! CAD-535: `cadence agent` — moved verbatim from src/main.rs.
 
+use super::cloud_agent;
+use super::join;
 use super::local_agent;
 use super::*;
 
@@ -31,9 +33,13 @@ mod bridge_tests {
     fn hosted_bridge_verbs_map_to_the_existing_actions() {
         assert!(matches!(
             AgentAction::Connect {
+                cloud: false,
+                local: false,
                 alias: Some("w".into()),
+                workspace: None,
                 repo: None,
                 name: None,
+                fyi_only: false,
             }
             .bridge(),
             Some(local_agent::LocalAgentAction::Connect { .. })
@@ -50,15 +56,23 @@ mod bridge_tests {
             AgentAction::Disconnect.bridge(),
             Some(local_agent::LocalAgentAction::Disconnect)
         ));
-        assert!(matches!(
-            AgentAction::Reassign {
-                assignment: "a1".into(),
-                to: None,
-                cancel: true,
-            }
-            .bridge(),
-            Some(local_agent::LocalAgentAction::Reassign { .. })
-        ));
+        // The hosted bridge keeps the release opt-in and its default; deleting
+        // this assertion lost that mapping check once already.
+        for release_lane in [false, true] {
+            assert!(matches!(
+                AgentAction::Reassign {
+                    assignment: "a1".into(),
+                    to: None,
+                    cancel: true,
+                    release_lane,
+                }
+                .bridge(),
+                Some(local_agent::LocalAgentAction::Reassign {
+                    release_lane: expected,
+                    ..
+                }) if expected == release_lane
+            ));
+        }
         assert!(AgentAction::List {
             all: false,
             state: vec![],
@@ -120,6 +134,150 @@ impl WaitUntil {
             Self::Any => "any",
         }
     }
+}
+
+// Arguments of `agent join`. Boxed inside `AgentAction` so the command
+// enum stays the size of its other variants; this is the same payload as
+// the root `join` command, parsed once per process.
+#[derive(clap::Args)]
+pub(super) struct AgentJoin {
+    /// Group handle — the PM agent's alias or native session id.
+    pub(super) group: String,
+    /// Worker provider: devin, codex, claude, pi, cursor or fake.
+    pub(super) provider: String,
+    /// Resume an existing native session as the worker (devin slug,
+    /// a Claude session id with --tui, or a Cursor chat id).
+    #[arg(short = 'r', long)]
+    pub(super) resume: Option<String>,
+    /// Run the worker's interactive terminal in an owned tmux pane
+    /// — the provider's pty endpoint (claude: `cadence agent join <pm>
+    /// claude --tui`; devin is always a TUI and needs no flag).
+    #[arg(long)]
+    pub(super) tui: bool,
+    /// Do not attach this terminal once the endpoint is up.
+    #[arg(long)]
+    pub(super) detach: bool,
+    /// Working directory for the worker [default: the group agent's cwd].
+    #[arg(long)]
+    pub(super) cwd: Option<PathBuf>,
+    /// Routing alias [default: <provider>-<random>].
+    #[arg(long)]
+    pub(super) alias: Option<String>,
+    /// pm, worker, or reviewer. `reviewer` is who a delivery review
+    /// may be routed to; it does not grant PM authority.
+    #[arg(long, default_value = "worker")]
+    pub(super) role: String,
+    /// Worker filesystem sandbox, recorded on registration. Codex
+    /// sends it on `thread/start`; for a codex worker the default
+    /// is workspace-write — `read-only` only when asked. Other
+    /// providers store the value without consuming it and keep the
+    /// read-only default.
+    #[arg(long, value_parser = ["read-only", "workspace-write"])]
+    pub(super) sandbox: Option<String>,
+    /// File with role instructions, embedded in the worker's briefing
+    /// under a role-instructions section (codex also receives them
+    /// natively as developer instructions). Refused with
+    /// `--no-bootstrap` on every provider but codex — the briefing is
+    /// their only delivery channel there.
+    #[arg(long)]
+    pub(super) instructions_file: Option<PathBuf>,
+    /// Saved Agents settings profile. Its instructions and defaults are
+    /// resolved by the daemon and snapshotted for this new session.
+    #[arg(long, conflicts_with_all = ["instructions_file", "no_bootstrap"])]
+    pub(super) profile: Option<String>,
+    /// Run the worker in an isolated checkout of the PM's repo:
+    /// `git worktree add <repo>/.cadence/wt/<name> -b cadence/<name>`.
+    #[arg(long)]
+    pub(super) worktree: Option<String>,
+    /// Skip the briefing file, AGENTS.md block and bootstrap
+    /// message entirely.
+    #[arg(long)]
+    pub(super) no_bootstrap: bool,
+    /// Opt the worker into verified auto-ready (pty providers only):
+    /// the daemon probes the pane and self-claims when visibly idle.
+    #[arg(long)]
+    pub(super) auto_ready: bool,
+    /// Write the cadence marker block into the worker's repo
+    /// AGENTS.md once the endpoint opens (persisted, re-applied on
+    /// resume). Off by default — joins leave the repo untouched.
+    #[arg(long)]
+    pub(super) agents_md: bool,
+    /// Model flag for providers `claude`, `cursor`, `codex` and `pi`
+    /// (e.g. sonnet, haiku, gpt-5.6-luna, anthropic/claude-sonnet-4).
+    #[arg(long)]
+    pub(super) model: Option<String>,
+    /// Use the provider's native model instead of a daemon default.
+    /// This does not pass a model argument to the provider.
+    #[arg(long, conflicts_with = "model")]
+    pub(super) provider_default_model: bool,
+    /// Team role used only to look up a model default. Does not
+    /// change runtime pm/worker authorization. `ops` is stored as
+    /// `devops`.
+    #[arg(long)]
+    pub(super) team_role: Option<String>,
+    /// Reasoning effort for providers `claude`, `codex` and `pi`
+    /// (`--effort`; pi's `set_thinking_level` vocabulary also takes
+    /// `off` and `minimal`). Each provider's vocabulary is validated
+    /// against the launch params at registration; for pi the
+    /// adapter also verifies what stuck through `get_state`.
+    #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
+    pub(super) effort: Option<String>,
+    /// Codex approval policy, stored in params and replayed on
+    /// resume [default: never]. Refused for other providers.
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+        registry::CODEX_APPROVAL_POLICIES.iter().copied()))]
+    pub(super) approval_policy: Option<String>,
+    /// Permission mode, replayed on resume. Claude takes its own
+    /// modes [default: manual]; devin takes auto, accept-edits,
+    /// smart or dangerous; cursor takes auto-review or force.
+    /// Refused with `--cloud`.
+    #[arg(long)]
+    pub(super) permission_mode: Option<String>,
+    /// Extra auto-allowed tool patterns for provider `claude`;
+    /// repeatable. `Bash(cadence *)` is always included.
+    #[arg(long)]
+    pub(super) allow: Vec<String>,
+    /// Permission-mode shortcut: bypassPermissions for claude,
+    /// dangerous for devin, force for cursor.
+    #[arg(long, conflicts_with = "permission_mode")]
+    pub(super) bypass: bool,
+    /// Seconds without any provider event before a claude, codex or
+    /// pi turn is declared unknown [default: 900]. Managed endpoint only.
+    #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
+    pub(super) turn_idle_secs: Option<u64>,
+    /// Optional absolute turn cap in seconds for provider `claude`,
+    /// `codex` or `pi`. Managed endpoint only.
+    #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
+    pub(super) turn_max_secs: Option<u64>,
+    /// Broker a claude worker's tool-permission prompts through
+    /// `agent requests` / `agent respond` instead of auto-denying
+    /// them. Managed endpoint only; refused with `--bypass` and
+    /// `--tui`.
+    #[arg(long, conflicts_with_all = ["bypass", "tui"])]
+    pub(super) broker_approvals: bool,
+    /// Seconds a brokered prompt waits on an operator decision
+    /// before the tool call is denied [default: 900].
+    #[arg(long, requires = "broker_approvals", value_parser = clap::value_parser!(u64).range(1..))]
+    pub(super) permission_timeout_secs: Option<u64>,
+    /// Open a Devin Cloud session instead of a local pty. Provider
+    /// must be `devin`.
+    #[arg(long)]
+    pub(super) cloud: bool,
+    /// Semicolon-separated cloud create params. Requires `--cloud`.
+    #[arg(long, value_name = "PARAMS", requires = "cloud")]
+    pub(super) cloud_params: Option<String>,
+    /// Landlock-confine the worker (provider `pi`, CAD-556): the
+    /// child sees only its worktree, the repo's shared git dir and
+    /// dep caches, the toolchain, its own state dir and the PM
+    /// tracker — `agent show` prints the emitted policy. Refused
+    /// on a host without Landlock; unset defers to the pm.yaml
+    /// `[host] confine_pi_workers` default.
+    #[arg(long)]
+    pub(super) confine: bool,
+    /// Explicitly unconfined — overrides a `[host]
+    /// confine_pi_workers` default for this one worker.
+    #[arg(long, conflicts_with = "confine")]
+    pub(super) no_confine: bool,
 }
 
 #[derive(Subcommand)]
@@ -305,6 +463,25 @@ pub(crate) enum AgentAction {
     },
     /// List the catalogue roles (id, title, job) a hire can use. Read-only.
     Roles,
+    /// List this workspace's agent profiles. Read-only: a profile is a
+    /// description a runtime registers against, never a credential.
+    Profiles,
+    /// Read, create, edit or archive one agent profile (CAD-2101). The board
+    /// decides who may; a managed agent is refused here and proposes the
+    /// change instead.
+    Profile {
+        #[command(subcommand)]
+        action: super::agent_profile::ProfileAction,
+    },
+    /// Print one agent profile's context: the profile and the job a runtime
+    /// registered against it (`cadence join <group> <provider> --profile <id>`) is
+    /// briefed with. A hosted org adds the wiki pages under
+    /// `agents/<id>/{profile,knowledge,memory}` the caller's own access allows.
+    /// Read-only; it authenticates nobody.
+    Context {
+        /// The profile id the board prints (the alias locally, `ap_…` hosted).
+        id: String,
+    },
     /// Propose hiring a catalogue role (the master, on its live turn): the
     /// operator reviews a card and hires from it. Registers nothing.
     ProposeHire {
@@ -510,6 +687,21 @@ pub(crate) enum AgentAction {
         #[arg(long = "expect-rev")]
         expected: Vec<String>,
     },
+    /// Join a new worker agent to a group. `<group>` is the PM agent —
+    /// its alias or provider-native id — and `<provider>` is devin,
+    /// codex, claude, pi, cursor or fake. The worker's results route back
+    /// to the PM by default (its params gain `"upstream"`). This
+    /// terminal attaches once the endpoint is open, same rules as
+    /// `cadence devin`. `--cloud` (provider devin) opens a Devin Cloud
+    /// session; `--cloud-params` is the same semicolon-separated
+    /// `key=value` list as `cadence devin --cloud-params`. From inside
+    /// an agent's pane only a group root (no upstream) may join, and
+    /// only into its own group (CAD-149). This is the canonical path;
+    /// the root `join` spelling still parses.
+    Join {
+        #[command(flatten)]
+        args: Box<AgentJoin>,
+    },
     /// List a hosted workspace directory page. Presence is observed, not execution capability.
     Directory {
         /// Previous page's after_id (lag_<UUID>); null means exhausted.
@@ -543,19 +735,36 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         clear: bool,
     },
-    /// Bind this machine's local actor to the selected hosted org and
-    /// claim queued work. Local execution by definition; `--org` names
-    /// the board, never the placement.
+    /// Bind this machine to a hosted workspace.
+    ///
+    /// `--local` (the default) claims queued work and runs it here.
+    /// `--cloud` connects that workspace's Worker/Pi agent and is the
+    /// consent for paid model turns. A turn is `cadence send <alias>`.
     Connect {
-        /// Local daemon alias that will read the issue.
+        /// Connect the workspace's Worker/Pi agent. Consents to paid
+        /// model turns. The alias defaults to `cloud`.
+        #[arg(long, conflicts_with = "local")]
+        cloud: bool,
+        /// Claim hosted work and run it on this machine. This is the default.
+        #[arg(long, conflicts_with = "cloud")]
+        local: bool,
+        /// Local alias. For `--local`, the actor that reads the issue.
+        /// For `--cloud`, the Threads alias [default: cloud].
         #[arg(long)]
         alias: Option<String>,
+        /// Saved workspace slug for `--cloud`. Defaults to the only saved
+        /// login; required when more than one is saved.
+        #[arg(long, requires = "cloud")]
+        workspace: Option<String>,
         /// Local git checkout. Without it the alias is only saved.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "cloud")]
         repo: Option<PathBuf>,
         /// Lane slug. Defaults to `work`.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "cloud")]
         name: Option<String>,
+        /// Register this explicit agent for FYI only; preserve the assignment default.
+        #[arg(long, conflicts_with = "cloud")]
+        fyi_only: bool,
     },
     /// Keep picking up later assignments until disconnected or interrupted.
     Watch,
@@ -571,6 +780,39 @@ pub(crate) enum AgentAction {
         to: Option<String>,
         #[arg(long)]
         cancel: bool,
+        /// After cancellation, try to release its merged, clean, idle lane.
+        /// Cancellation does not stop the actor, even if release is refused.
+        #[arg(long, requires = "cancel", conflicts_with = "to")]
+        release_lane: bool,
+    },
+    /// Clear a local release guard for an already absent, unregistered lane.
+    /// Does not delete a branch or verify merge evidence.
+    ReconcileRelease { assignment: String },
+    /// Report a claim this machine already holds.
+    Report {
+        assignment: String,
+        /// `running`, `blocked`, `failed`, or `result`.
+        #[arg(long)]
+        state: String,
+        #[arg(long)]
+        text: Option<String>,
+        /// 40 or 64 lowercase hex characters. Required for result.
+        #[arg(long)]
+        head: Option<String>,
+    },
+    /// Save one optional legacy tool/publisher credential; does not activate tooling.
+    Tool {
+        /// Legacy `provider.draft` or `publish.send`; normal account images need neither.
+        #[arg(long)]
+        lane: String,
+    },
+    /// Inspect or reconcile a Worker/Pi connection. Connecting is
+    /// `agent connect --cloud`, not a verb here. `--placement cloud` is
+    /// only a list filter. A turn is `cadence send <alias>`.
+    #[command(name = "cloud")]
+    Cloud {
+        #[command(subcommand)]
+        action: cloud_agent::CloudAgentAction,
     },
 }
 
@@ -581,11 +823,18 @@ impl AgentAction {
     pub(crate) fn bridge(&self) -> Option<local_agent::LocalAgentAction> {
         use local_agent::LocalAgentAction as L;
         Some(match self {
-            Self::Connect { alias, repo, name } => L::Connect {
+            Self::Connect { cloud: true, .. } => return None,
+            Self::Connect {
+                alias,
+                repo,
+                name,
+                fyi_only,
+                ..
+            } => L::Connect {
                 alias: alias.clone(),
                 repo: repo.clone(),
                 name: name.clone(),
-                fyi_only: false,
+                fyi_only: *fyi_only,
             },
             Self::Directory { after_id } => L::Directory {
                 after_id: after_id.clone(),
@@ -611,11 +860,28 @@ impl AgentAction {
                 assignment,
                 to,
                 cancel,
+                release_lane,
             } => L::Reassign {
                 assignment: assignment.clone(),
                 to: to.clone(),
                 cancel: *cancel,
+                release_lane: *release_lane,
             },
+            Self::ReconcileRelease { assignment } => L::ReconcileRelease {
+                assignment: assignment.clone(),
+            },
+            Self::Report {
+                assignment,
+                state,
+                text,
+                head,
+            } => L::Report {
+                assignment: assignment.clone(),
+                state: state.clone(),
+                text: text.clone(),
+                head: head.clone(),
+            },
+            Self::Tool { lane } => L::Tool { lane: lane.clone() },
             _ => return None,
         })
     }
@@ -913,7 +1179,7 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         AgentAction::Capture { alias } => {
             let out = client::rpc(&state_dir, "agent_capture", json!({"alias": alias}))?;
             if let Some(text) = out["capture"].as_str() {
-                println!("{text}");
+                print_line(text);
                 return Ok(0);
             }
             out
@@ -939,6 +1205,16 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 .collect();
             print_json(&json!({"roles": roles}));
             return Ok(0);
+        }
+        AgentAction::Profiles => {
+            let list = client::rpc(&state_dir, "agent_list", json!({}))?;
+            json!({"profiles": list["profiles"]})
+        }
+        AgentAction::Context { id } => {
+            client::rpc(&state_dir, "agent_profile_context", json!({"id": id}))?
+        }
+        AgentAction::Profile { action } => {
+            return super::agent_profile::run_native(state_dir, &action);
         }
         AgentAction::ProposeHire { role, name, job_file } => {
             // The job is read through the master's command-file rules, never
@@ -1015,6 +1291,82 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 .collect();
             client::rpc(&state_dir, "agent_restore", json!({"expected": entries}))?
         }
+        AgentAction::Join { args } => {
+            let AgentJoin {
+                group,
+                provider,
+                resume,
+                tui,
+                detach,
+                cwd,
+                alias,
+                role,
+                sandbox,
+                instructions_file,
+                worktree,
+                no_bootstrap,
+                auto_ready,
+                agents_md,
+                model,
+                provider_default_model,
+                team_role,
+                effort,
+                approval_policy,
+                permission_mode,
+                allow,
+                bypass,
+                turn_idle_secs,
+                turn_max_secs,
+                broker_approvals,
+                permission_timeout_secs,
+                cloud,
+                cloud_params,
+                confine,
+                no_confine,
+                profile,
+            } = *args;
+            return join::run(
+                state_dir,
+                group,
+                provider,
+                resume,
+                tui,
+                detach,
+                cwd,
+                alias,
+                role,
+                sandbox,
+                instructions_file,
+                worktree,
+                no_bootstrap,
+                auto_ready,
+                agents_md,
+                model,
+                provider_default_model,
+                team_role,
+                effort,
+                approval_policy,
+                permission_mode,
+                allow,
+                bypass,
+                turn_idle_secs,
+                turn_max_secs,
+                broker_approvals,
+                permission_timeout_secs,
+                cloud,
+                cloud_params,
+                confine,
+                no_confine,
+                profile,
+            );
+        }
+        AgentAction::Cloud { action } => return cloud_agent::run(state_dir, action),
+        AgentAction::Connect {
+            cloud: true,
+            workspace,
+            alias,
+            ..
+        } => return cloud_agent::connect(state_dir, workspace, alias),
         // Routed before this function by the caller; refused here so a
         // future routing bypass cannot claim locally.
         AgentAction::Connect { .. }
@@ -1024,9 +1376,12 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         | AgentAction::Watch
         | AgentAction::Assignments
         | AgentAction::Disconnect
-        | AgentAction::Reassign { .. } => {
+        | AgentAction::Reassign { .. }
+        | AgentAction::ReconcileRelease { .. }
+        | AgentAction::Report { .. }
+        | AgentAction::Tool { .. } => {
             return Err(Error::usage(
-                "agent connect/watch/assignments/disconnect/reassign/directory/notify/inbox require a selected hosted org. Nothing was sent or claimed.",
+                "agent connect/watch/assignments/disconnect/reassign/reconcile-release/directory/notify/inbox/report/tool require a selected hosted org. Nothing was sent or claimed.",
             ))
         }
     };

@@ -6,6 +6,26 @@ Creating or selecting a connection grants no worker, app or run permissions.
 The Settings Connections page and executable app bindings are separate work.
 These provider accounts are different from local organization/socket routing.
 
+## Custom MCP setup from chat
+
+The owner opens the connection card and approves the requested scopes at the
+provider. On return, Cadence checks the connection, endpoint, owner and required
+scopes before showing **Continue in chat**. Continuing does not enable tools or
+approve any action.
+Retrying **Continue in chat** after a lost response resumes the same turn.
+
+Use **Review tool access** on the card to enable a specific tool offered for
+read access. The tool can then run without per-call approval, subject to existing
+workspace and agent policies. Disabled tools and tools with unreviewed changes
+stay disabled or held for review. If the reviewed snapshot changes before the
+update, Cadence leaves permissions unchanged. Refresh and review the current
+tool before enabling it, or use **Manage in Connections** for the full settings.
+
+If authorization fails, retry or choose **Edit endpoint** to correct the path
+on the same server and start a fresh sign-in. Ask for a new setup card to use a
+different server origin. A return opened in another tab of the same browser
+profile can recover the original setup; a callback URL alone cannot resume chat.
+
 ## Inspect configuration
 
 ```sh
@@ -154,6 +174,49 @@ These owner commands are not chat-driven setup or CLI browser enrollment.
 Trusted credential-entry components, isolated agent access and hosted encrypted
 execution are separate requirements; never paste credentials into agent chat.
 
+## Protected entry on a dedicated public board
+
+A dedicated Linux deployment can use AgenticOS for owner sign-in without
+running its board or saving its workspace in AgenticOS. The daemon, SQLite,
+workspace files and credential custody stay on the VPS. HTTPS ingress may be
+Cloudflare or another reverse proxy; its authentication is not the board's
+custody authority. Use a separate registrable domain from the AgenticOS
+portal and API.
+
+1. Have the platform operator register the exact public HTTPS origin, the
+   AgenticOS workspace ID, a unique deployment ID, and the SHA-256 digest of a
+   randomly generated 32-byte key encoded as lowercase hex. Only the daemon
+   receives the key itself. Never put it in a UI unit, app configuration, or
+   agent environment.
+2. Configure the same `AGENTICOS_DEDICATED_BOARD_DEPLOYMENT`,
+   `AGENTICOS_BOARD_HOST`, `AGENTICOS_BOARD_COMPANY` and
+   `AGENTICOS_BOARD_ISSUER` on the board and daemon. The issuer is the public
+   HTTPS API origin. Set the board's `AGENTICOS_BOARD_AUTHORIZE_URL` to the
+   AgenticOS **portal** origin followed by `/v2/board/authorize`.
+   `CADENCE_BOARD_PUBLIC_ONLY=1` is required on the board; separate-origin
+   device credential entry is not an alternative to public owner proof. Do not set
+   native hosted placement flags. Persist the settings in the service
+   configuration: a board/daemon mode mismatch refuses new browser sessions,
+   including after a restart.
+3. Set `AGENTICOS_DEDICATED_BOARD_VERIFIER_FILE` only for the daemon. Point it
+   at its private verifier credential file; protect the file from both agents
+   and the browser-facing process. With systemd, prefer `LoadCredential=` in
+   the daemon unit. Do not copy it into the workspace or commit it.
+4. Keep the daemon and board loopback-bound behind HTTPS ingress. Sign in at
+   the board URL in a browser, then open protected credential entry as the
+   AgenticOS workspace owner. Keep the existing signed-release and custody
+   enablement policy; no sign-in unlocks custody, authorizes a model/tool call,
+   or grants any billing permission by itself.
+5. For qualification, verify the one-use entry handoff and saved encrypted
+   credential on the private entry host before enabling a real provider call.
+   Sign out of the original AgenticOS session and verify that an already-open
+   entry form can no longer submit. Qualify the provider, tools and billing
+   independently; a ready guest by itself does not prove any of them.
+
+Loss of the exact original AgenticOS session, owner membership, or deployment
+registration closes protected access. An unavailable platform refuses public
+authority rather than falling back to the last verified role. Existing local
+operator access stays independent.
 
 ## HTTP contract
 

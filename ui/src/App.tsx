@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
 import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
+import type { AgentTab } from "./features/agents/agentTabModel";
 import "./features/agents/recruit.css";
 import Apps from "./features/apps/Apps";
 import { installationAppHref } from "./features/apps/appViewModel";
@@ -9,11 +10,14 @@ import AppDetail from "./features/apps/AppDetail";
 import Explorer from "./features/explorer/Explorer";
 import CatalogDetail from "./features/explorer/CatalogDetail";
 import ManageApp from "./features/explorer/ManageApp";
-import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
+import AppShell, { type ActiveInstallation, type AppShellHeaderTargets } from "./features/app-shell/AppShell";
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
-import { noteAppScreen } from "./features/app-shell/sidebarPrefs";
+import { useCanvasChrome } from "./features/canvas/canvasChrome";
+import { noteAppScreen, updateSidebarPrefs, useSidebarPrefs } from "./features/app-shell/sidebarPrefs";
+import { parseAppDisplayI18n } from "./features/workspace-apps/appLocale";
+import { parseNavigation } from "./features/workspace-apps/screen/screenLifecycle";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
@@ -22,37 +26,57 @@ import Board from "./features/projects/Board";
 import WorkItemDetail from "./features/work-items/WorkItemDetail";
 import { restoreDetailFocus } from "./features/work-items/focus";
 import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen, type MyWorkDraft, type WorkItemOrigin } from "./lib/workItems";
+import ProjectSettings from "./features/projects/ProjectSettings";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
+import Timeline from "./features/projects/Timeline";
 import MasterPermissions from "./features/settings/MasterPermissions";
 import CanvasDrawer from "./features/canvas/CanvasDrawer";
+import { onBrowserAlert } from "./features/canvas/browserStore";
 import Memory from "./features/settings/Memory";
+import Members from "./features/settings/Members";
+import DocumentTypes from "./features/settings/DocumentTypes";
+import { documentsNavHidden, documentsProbe } from "./features/documents/documentsProbe";
+import DocumentsScreen from "./features/documents/DocumentsScreen";
+import { documentsViewer } from "./features/documents/documentsAccess";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import Connections from "./features/settings/Connections";
+import CredentialEntry from "./features/connections/CredentialEntry";
+import CredentialAuthorize from "./features/connections/CredentialAuthorize";
 import EmailSending from "./features/settings/EmailSending";
 import SettingsLayout from "./features/settings/SettingsLayout";
+import General from "./features/settings/General";
+import HostedStatus from "./features/settings/HostedStatus";
+import AdvancedCustody from "./features/settings/AdvancedCustody";
+import { settingsLabel, settingsNavGroups, settingsRedirect } from "./features/settings/settingsNav";
+import Preferences from "./features/settings/Preferences";
+import Security from "./features/settings/Security";
 import Templates from "./features/templates/Templates";
+import { useHostedTemplatePendingCount } from "./features/templates/HostedTemplateReview";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
-import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
-import DecisionsPanel from "./features/decisions/DecisionsPanel";
+import type { DocumentFollowUpState } from "./features/home/NeedsRail";
+import { ownerDecisionsOn, useDecisions } from "./features/decisions/useDecisions";
 import MyWork from "./features/home/MyWork";
 import { useHomeCount } from "./features/home/todoLocal";
 import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
+import MobileNavigation from "./ui/MobileNavigation";
 import { NavList, ProjectsSection } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
-import ProjectFilter from "./ui/ProjectFilter";
+import Button from "./ui/Button";
 import PageState from "./ui/PageState";
+import { wikiAvailable } from "./lib/wikiAvailable";
+import { boardSupports } from "./lib/capabilities";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import AccountMenu from "./ui/AccountMenu";
@@ -68,7 +92,13 @@ import SetupNudge from "./features/setup/SetupNudge";
 import AuthBoundary from "./features/auth/AuthBoundary";
 import SignIn from "./features/auth/SignIn";
 import { metaAccess, wakingBanner } from "./features/auth/access";
-import { hireBlock, kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
+import {
+  hireBlock,
+  kickoffBlock as operatorKickoffBlock,
+  policyBlock,
+  sessionAdmissible,
+  writeBlock,
+} from "./features/auth/gate";
 import { HireBlock, WriteGate } from "./features/auth/WriteGate";
 import { sessionHeaders } from "./lib/sessionKey";
 import { onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "./lib/privateSession";
@@ -76,12 +106,15 @@ import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
-import { IconList } from "./ui/icons";
+import { IconList, IconSidebarCollapse, IconSidebarExpand } from "./ui/icons";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
 import { RESOURCE_NAMES } from "./lib/cache";
 import { noteThreadsChanged } from "./features/threads/threadsClient";
 import { noteMasterChanged } from "./lib/masterChanged";
+import { applyThemePref } from "./lib/theme";
+import PrintView from "./features/print/PrintView";
+import { isPrintPath } from "./features/print/printRequest";
 import { useHomeUnread } from "./features/app-shell/chat/homeUnread";
 import { AssistantUnreadProbes } from "./features/app-shell/chat/unreadShell";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
@@ -90,44 +123,63 @@ import { cache, onIssueUnavailable, resources, type MyWorkList } from "./lib/res
 import { agentRowForEvent } from "./lib/agentOn";
 import { useMaybeResource, useResource } from "./lib/useResource";
 import {
+  appNavigationSearch,
   goTo,
   locationHref,
+  matchRoute,
   openProject,
-  projectScope,
   readLocation,
-  showProjectChoices,
+  stripAppRouteParams,
   withProject,
   type AppLocation,
   type Route,
   type Screen,
+  type SectionQueryInput,
 } from "./lib/router";
 import { humanThreadsAvailable } from "./lib/humanThreads";
 import { navigate, useHref } from "./lib/useLocation";
 import { NavigationProvider } from "../screen-ui/src/navigation";
 import { hostNavigation } from "./ui/hostNavigation";
-import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./features/projects/projectContextGuard";
 import {
   browserStoredProjectView,
   persistBrowserProjectView,
   type ProjectView,
 } from "./lib/urlState";
-import type { Health, IssueCard, Meta, ProjectContext } from "./lib/types";
+import type { Health, IssueCard, Meta } from "./lib/types";
 
 /** The location as the app reads it — the URL is the only copy. */
 function currentLocation(): AppLocation {
   return readLocation(location.pathname, location.search, browserStoredProjectView());
 }
 
+/** Active section query keys reported by the mounted workspace app or installed menu apps, cleared on exit or reset. */
+let mountedAppSectionQueries: readonly string[] = [];
+
+function navigationSearch(
+  from: Route,
+  to: Route,
+  rawSearch: string,
+  sectionQueries?: SectionQueryInput,
+): string {
+  return appNavigationSearch(
+    from,
+    to,
+    contextNavigationSearch(from, to, rawSearch),
+    sectionQueries ?? mountedAppSectionQueries,
+  );
+}
+
 /** Move to a new location built from the current one. */
 function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: boolean }): void {
   const current = currentLocation();
   const next = fn(current);
-  navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search), current.route), opts);
+  navigate(locationHref(next, navigationSearch(current.route, next.route, location.search), current.route), opts);
 }
+
+const settingsHomeRoute: Route = { screen: "settings", section: "models" };
 
 const SCREEN_LABEL: Record<Screen, string> = {
   home: "home",
-  overview: "overview",
   projects: "projects",
   apps: "apps",
   appsExplore: "explore",
@@ -139,16 +191,17 @@ const SCREEN_LABEL: Record<Screen, string> = {
   threads: "threads",
   myWork: "my work",
   wiki: "wiki",
+  documents: "documents",
   outbox: "outbox",
   setup: "setup",
   settings: "settings",
+  credentialEntry: "secure form",
+  credentialAuthorize: "authorize entry",
   login: "sign in",
   issue: "issue",
   notFound: "not found",
 };
 
-/** Screens that read the overview: Home's Needs-you rail and the full overview. */
-const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 /** Patch a loaded queue row in place; an issue that left the caller drops out. */
 function mergePersonalCard(previous: MyWorkList, card: IssueCard): MyWorkList {
@@ -175,25 +228,46 @@ function mergePersonalCard(previous: MyWorkList, card: IssueCard): MyWorkList {
 }
 
 export default function App() {
+  // CAD-1085: the trusted entry page is deliberately OUTSIDE AuthBoundary.
+  // It holds no credential, renders its selector-only "continue on the
+  // board" handoff even when signed out, and the auth POST document mounts
+  // it with the memory-only entry key.
+  const entry = matchRoute(window.location.pathname);
+  if (entry.screen === "credentialEntry") {
+    return (
+      <NavigationProvider adapter={hostNavigation}>
+        <CredentialEntry requestId={entry.requestId} />
+      </NavigationProvider>
+    );
+  }
+  // AOS-711: the snapshot renderer's page — one app view, no chrome, under the signed-in viewer's own session.
+  if (isPrintPath(window.location.pathname)) {
+    applyThemePref("light");
+    return <NavigationProvider adapter={hostNavigation}><AuthBoundary>{() => <PrintView search={window.location.search} />}</AuthBoundary></NavigationProvider>;
+  }
   // Private room alerts share the admitted workspace's concealment and reset lifecycle.
   return <NavigationProvider adapter={hostNavigation}><AuthBoundary>{(meta, recheck) => <NotificationToastProvider><Workspace meta={meta} recheck={recheck} /></NotificationToastProvider>}</AuthBoundary></NavigationProvider>;
 }
 
 /** All private routes, subscriptions and effects live below read admission. */
 function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boolean> }) {
-  const { t } = useLocale();
+  const { locale, t } = useLocale();
   // App selection lives in the URL — the route (`/projects/cadence`) plus
   // `?view=list&issue=CAD-16` — so a refresh or pasted link restores it.
   const href = useHref();
   const loc = useMemo(() => currentLocation(), [href]);
-  const { route, view, project, openId, filters } = loc;
+  const { route: matchedRoute, view, project, openId, filters } = loc;
+  const hostedBoard = meta.hosted === true || meta.session?.origin === "public";
+  const route: Route = hostedBoard && matchedRoute.screen === "settings" && matchedRoute.section === "templates"
+    ? { screen: "notFound", path: window.location.pathname }
+    : matchedRoute;
   const screen = route.screen;
   useHomeUnread(screen === "home");
-  const fullHeight = screen === "home" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
+  const fullHeight = screen === "home" || screen === "agents" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
-  /** The href of a route, carrying the scope and drawer like `goTo`. */
-  const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search), route);
+  const [activeApp, setActiveApp] = useState<ActiveInstallation | null>(null);
+  const onAppScreen = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
   const setView = useCallback(
     (v: ProjectView) => update((c) => ({ ...c, view: v }), { replace: true }),
     [],
@@ -203,10 +277,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     [],
   );
   const goRoute = useCallback((r: Route) => update((c) => goTo(c, r)), []);
-  const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
-  const [projectContextLoading, setProjectContextLoading] = useState(false);
-  const projectContextRequest = useRef(0);
-  const observedContextRevisions = useRef<Record<string, string>>({});
   const [query, setQuery] = useState("");
   // Per-resource state (lib/cache.ts): loading, failed and empty stay
   // distinct, and a failed refresh keeps the last good payload as stale.
@@ -215,11 +285,27 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const agentsState = useResource(resources.agents);
   const overviewState = useResource(resources.overview);
   // The Home badge counts pending To do items only (CAD-1216).
-  const homeCount = useHomeCount(overviewState.data?.needs_me);
+  // CAD-2186: the owner's staged decisions count here too. Only a signed-in
+  // viewer of a hosted board who is not a member is asked; every other board
+  // is never queried.
+  const viewerSub = meta?.session?.user?.sub ?? null;
+  const viewerIsMember = meta?.session?.user?.role === "member";
+  const privateAssistantView = Boolean(
+    hostedBoard && viewerSub !== null && (viewerIsMember || (route.screen === "home" && route.privateChat === true)),
+  );
+  const decisionsOn = ownerDecisionsOn(meta);
+  const decisions = useDecisions(decisionsOn);
+  const otherHomeCount = useHomeCount(
+    privateAssistantView ? undefined : overviewState.data?.needs_me,
+    decisions.pending.length,
+    privateAssistantView ? undefined : overviewState.data,
+  );
+  const templatePendingCount = useHostedTemplatePendingCount();
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
   const [health, setHealth] = useState<Health | null | "unavailable">(null);
+  const [partialUpdates, setPartialUpdates] = useState(false);
   const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
@@ -238,14 +324,35 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // screen showing it. An explicit open records its own origin.
   const effectiveOrigin: WorkItemOrigin = workOrigin ??
     (screen === "home" ? "home" : screen === "myWork" ? "myWork" : screen === "threads" ? "threads" : "issue");
-  const personalState = useMaybeResource(screen === "myWork" ? resources.myWork : null);
+  const myWorkOn = boardSupports(meta, "my_work");
+  const milestonesOn = boardSupports(meta, "milestones");
+  const workflowsOn = boardSupports(meta, "workflows");
+  const workConversationsOn = boardSupports(meta, "work_conversations");
+  const humanThreadsOn = boardSupports(meta, "human_threads");
+  const credentialRequestsOn = boardSupports(meta, "credential_requests");
+  const automaticUpdatesOn = boardSupports(meta, "app_automatic_updates");
+  // CAD-2286: the document lifecycle is hosted only. Only a hosted board is
+  // probed; the nav shows Documents once the probe answers `available`.
+  const documentsHosted = meta?.hosted === true;
+  const managedFiles = documentsHosted && meta?.wiki_managed_files === true && wikiAvailable(meta);
+  const documentsProbeState = useMaybeResource(documentsHosted ? documentsProbe : null);
+  const hiddenScreens: Screen[] = [
+    ...(!myWorkOn ? ["myWork" as const] : []),
+    ...(!workConversationsOn && !humanThreadsOn ? ["threads" as const] : []),
+    ...(managedFiles || documentsNavHidden(documentsHosted, documentsProbeState?.data) ? ["documents" as const] : []),
+  ];
+
+  const personalState = useMaybeResource(screen === "myWork" && myWorkOn ? resources.myWork : null);
   // The peek's membership: one issue, asked of the server (the list holds one page).
-  const membershipState = useMaybeResource(screen === "myWork" && openId ? resources.myWorkIssue(openId) : null);
-  const personalWanted = useRef(screen === "myWork");
-  personalWanted.current = screen === "myWork";
+  const membershipState = useMaybeResource(screen === "myWork" && myWorkOn && openId ? resources.myWorkIssue(openId) : null);
+  const personalWanted = useRef(screen === "myWork" && myWorkOn);
+  personalWanted.current = screen === "myWork" && myWorkOn;
   const [personalDrafts] = useState(() => new Map<string, MyWorkDraft>());
   const [, notifyPersonalDrafts] = useState(0);
-  useEffect(() => onPrivateSessionReset(() => personalDrafts.clear()), [personalDrafts]);
+  useEffect(() => onPrivateSessionReset(() => {
+    personalDrafts.clear();
+    mountedAppSectionQueries = [];
+  }), [personalDrafts]);
   useEffect(() => onIssueUnavailable((id) => {
     const suffix = `:${id}`;
     let changed = false;
@@ -259,6 +366,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const restorePersonal = useRef(false);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+  // A full-width canvas folds the sidebar to its rail without touching the person's own preference (CAD-2657).
+  const { collapsed: sidebarPref } = useSidebarPrefs();
+  const canvasFull = useCanvasChrome().full;
+  const sidebarCollapsed = sidebarPref || canvasFull;
+  const sidebarCollapseRef = useRef<HTMLButtonElement>(null);
+  const setSidebarCollapsed = (collapsed: boolean) => {
+    updateSidebarPrefs((prefs) => ({ ...prefs, collapsed }));
+    requestAnimationFrame(() => sidebarCollapseRef.current?.focus());
+  };
   const [accountOpen, setAccountOpen] = useState(false);
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
@@ -271,13 +388,47 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const boardReadOnly = meta?.read_only ?? false;
   const block = writeBlock(meta);
   const readOnly = block !== null;
+  const documentFollowUps: DocumentFollowUpState | undefined = managedFiles && meta?.signed_in === true
+    ? overviewState.status === "failed"
+      ? { status: "unavailable" }
+      : overviewState.data?.document_follow_ups ??
+        (overviewState.data ? { status: "unavailable" } : { status: "loading" })
+    : undefined;
+  const hosted = meta ? meta.hosted === true : undefined;
+  const templateReviewEnabled = Boolean(hostedBoard && meta?.signed_in === true && meta.session?.origin === "public" && sessionAdmissible(meta.session) && viewerSub && !viewerSub.startsWith("operator-token:"));
+  const templateReviewCanApprove = templateReviewEnabled && meta?.session?.user?.role === "operator" && meta?.operator === true && !readOnly;
+  const homeCount =
+    otherHomeCount +
+    (!readOnly && documentFollowUps?.status === "ready" ? documentFollowUps.pending.length : 0) +
+    (templateReviewCanApprove ? templatePendingCount : 0);
   const actor = meta?.actor ?? "operator (ui)";
+  // Platform operator sessions do not own a private app-agent setting.
+  const appAgentSession = hosted && meta?.signed_in && meta.session?.id && viewerSub && !viewerSub.startsWith("operator-token:")
+    ? JSON.stringify([meta.session.id, viewerSub])
+    : null;
   // CAD-1423: change signal for the notification inbox. The verified identity is
   // still read from the daemon by the inbox itself; this only says when to re-check.
   const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
   const personalGeneration = privateSessionGeneration();
   const personalIdentity = JSON.stringify([personalGeneration, meta.session?.id, meta.session?.user?.sub, meta.actor]);
+  // The routine `refresh` below is the only probe: it runs on mount and on
+  // every recheck, so a mount probes once. A latched `unavailable` answer
+  // makes no request for the rest of the session.
 
+  // A board that says what Settings it serves never shows a page it doesn't.
+  const settingsTarget = route.screen === "settings" ? settingsRedirect(route.section, meta) : null;
+  useEffect(() => {
+    if (settingsTarget) {
+      const targetRoute: Route = { screen: "settings", section: settingsTarget };
+      navigate(locationHref(goTo(loc, targetRoute), navigationSearch(route, targetRoute, search, null), route), { replace: true });
+    }
+  }, [settingsTarget]);
+  const legacyDocumentsHref = managedFiles && route.screen === "documents"
+    ? route.archived ? "/wiki?archived=1" : "/wiki"
+    : null;
+  useEffect(() => {
+    if (legacyDocumentsHref) navigate(legacyDocumentsHref, { replace: true });
+  }, [legacyDocumentsHref]);
   // CAD-1312: the header's organisation label is the hosted board's
   // configured company display name (`GET /api/platform-account`, already
   // projected server-side). Local and tailnet boards have no configured
@@ -308,45 +459,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     persistBrowserProjectView(view);
   }, [view]);
 
-  // The overview payload costs a daemon probe + gh cache read, so it
-  // only fetches while a screen that reads it is on screen: Home, the
-  // overview, or an Apps screen (the cards' live lines and the app
-  // page's Needs-you strip mark runs against it). The refs keep
-  // `refresh` and the stream handler stable.
-  const overviewWanted = overviewOn(screen) || screen === "apps";
+  // Home and Apps consume the overview payload.
+  const overviewWanted = screen === "home" || screen === "apps";
   const overviewWantedRef = useRef(overviewWanted);
   overviewWantedRef.current = overviewWanted;
-  // Repository guidance is only used by the compact overview.
-  const contextOn = screen === "overview";
 
-  useEffect(() => {
-    const request = ++projectContextRequest.current;
-    setProjectContext(null);
-    if (!contextOn || project === "all") {
-      setProjectContextLoading(false);
-      return;
-    }
-    setProjectContextLoading(true);
-    const expectedRevision = observedContextRevisions.current[project];
-    api
-      .projectContext(project, "pm", expectedRevision)
-      .then((next) => {
-        if (!responseBelongsToRequest(request, projectContextRequest.current, project, next.project)) return;
-        setProjectContext(next);
-        if (next.snapshot.head_revision) {
-          observedContextRevisions.current[project] = next.snapshot.head_revision;
-        }
-      })
-      .catch(() => {
-        if (!requestIsCurrent(request, projectContextRequest.current, project, project)) return;
-        setProjectContext(null);
-      })
-      .finally(() => {
-        if (requestIsCurrent(request, projectContextRequest.current, project, project)) {
-          setProjectContextLoading(false);
-        }
-      });
-  }, [project, contextOn]);
 
   // The peek's id and the issue page's id, read through refs so the
   // stream and poll handlers stay stable. The page clears `openId`, so
@@ -356,10 +473,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   openIdRef.current = openId;
   const pageIssueRef = useRef<string | null>(route.screen === "issue" ? route.id : null);
   pageIssueRef.current = route.screen === "issue" ? route.id : null;
+  const hostedRef = useRef(meta?.hosted === true);
+  hostedRef.current = meta?.hosted === true;
   const loadDetail = useCallback(() => {
     for (const id of refreshIssueIds(openIdRef.current, pageIssueRef.current)) {
       void resources.issue(id).invalidate();
-      void resources.lane(id).invalidate();
+      if (!hostedRef.current) void resources.lane(id).invalidate();
     }
     // The peek's quick actions need a current membership too, so a refresh
     // recovers a failed membership read without reopening the peek.
@@ -440,9 +559,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       void resources.agents.refresh();
       if (overviewWantedRef.current) void resources.overview.refresh();
       if (personalWanted.current) void resources.myWork.refresh();
+      // CAD-2286: a probe that failed recovers on the routine recheck; a
+      // latched `unavailable` answers from the store without a request.
+      if (documentsHosted) void documentsProbe.revalidate();
       loadDetail();
     });
-  }, [loadDetail, recheck]);
+  }, [loadDetail, recheck, documentsHosted]);
   const retryAccess = useCallback(() => { void recheck(); }, [recheck]);
   // An unsigned reader (admitted only by --allow-anonymous-reads) is a
   // resolved non-operator: the server omits `operator` for it. Only a
@@ -477,6 +599,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   useEffect(() => {
     const updates = new LiveUpdates({
       resync: reconcile,
+      onDegraded: setPartialUpdates,
       invalidate: (key) => {
         // Main refetches the lane store when a frame names issue, agents,
         // or jobs. Entity patches queue that through LiveUpdates; legacy
@@ -526,6 +649,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             daemon: data.daemon as AgentsPayload["daemon"],
             totals: data.totals as AgentsPayload["totals"],
             by_issue: data.by_issue as AgentsPayload["by_issue"],
+            profiles: Array.isArray(data.profiles) ? (data.profiles as AgentsPayload["profiles"]) : value.profiles,
           }));
           // Issue-page lane stores depend on runtime state, including
           // changes which leave their issue card unchanged.
@@ -535,7 +659,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     });
     liveUpdates.current = updates;
     const sub = subscribeSse({
-      url: "/api/stream?entities=1",
+      url: "/api/stream?entities=1&accept_degraded=1",
       events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan", "aggregates", "threads", "master"],
       onEvent: updates.event,
       onOpen: updates.opened,
@@ -603,28 +727,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 4200);
   }, []);
+  // CAD-2103: the Browser tab's failures reach the person here.
+  useEffect(() => onBrowserAlert((text) => say("err", t(text))), [say, t]);
 
-  const ackMonitor = useCallback(
-    (monitor: string, seq: number) => {
-      if (block) {
-        say("err", `monitor acknowledgements are disabled — ${block}`);
-        return;
-      }
-      api
-        .monitorAck(monitor, seq)
-        .then(() => {
-          say("ok", `${monitor} alert ${seq} acknowledged`);
-          return resources.overview.invalidate();
-        })
-        .catch((e) =>
-          say(
-            "err",
-            `monitor alert acknowledgement failed: ${String(e.message ?? e)}`,
-          ),
-        );
-    },
-    [block, say],
-  );
 
   /// A write response is authoritative: merge the fresh card into the
   /// board and the fresh detail into the drawer — no second fetch.
@@ -717,6 +822,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   }, []);
   const openIssue = useCallback((id: string) => openWorkItem(id, "issue"), [openWorkItem]);
   const openHomeWork = useCallback((id: string) => openWorkItem(id, "home"), [openWorkItem]);
+  const openThreadsWork = useCallback((id: string) => openWorkItem(id, "threads"), [openWorkItem]);
   const closeIssue = useCallback(() => update((c) => ({ ...c, openId: null })), []);
   const rememberPersonal = useCallback((id: string) => {
     personalReturn.current = { id, scroll: window.scrollY };
@@ -755,7 +861,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     else openWorkItem(id, "home", outcome.next);
   }, [effectiveOrigin, closeWorkItem, openWorkItem]);
   const openAgent = useCallback(
-    (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
+    (alias: string | null, tab?: AgentTab, profileId?: string) =>
+      update((c) => ({ ...c, route: { screen: "agents", alias, profileId, ...(tab && tab !== "overview" ? { tab } : {}) } })),
     [],
   );
   // CAD-561: the draining banner. Cheap (the daemon's own view), polled
@@ -798,31 +905,20 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     };
   }, []);
 
-  // The sidebar and the phone menu open a project page. The chip row
-  // and the memory picker filter the screen, and only a screen that has one.
-  const projectHref = (key: string) => {
-    const next = openProject(loc, key);
-    return locationHref(next, contextNavigationSearch(route, next.route, search));
-  };
-  const filterHref = (key: string) => {
-    const next = withProject(loc, key);
-    return locationHref(next, contextNavigationSearch(route, next.route, search));
-  };
   const navProject = route.screen === "projects" ? project : null;
-  const projectSlug = project === "all" ? null : project;
   // Board-level Apps menu (CAD-784, CAD-1116): the installed apps come
   // from the verified installation list (or the shell's receipt for the
   // open one), never from the bare route, so a forged installId in the
   // URL produces no entry. The active or last-used app also lists its
   // sections, and that stays on every screen.
-  const [activeApp, setActiveApp] = useState<ActiveInstallation | null>(null);
   const reportInstallation = useCallback((info: ActiveInstallation | null) => {
     setActiveApp((prev) => {
       if (prev === null && info === null) return prev;
       if (
         prev !== null && info !== null &&
         prev.installId === info.installId && prev.kind === info.kind && prev.title === info.title &&
-        JSON.stringify(prev.navigation) === JSON.stringify(info.navigation)
+        JSON.stringify(prev.navigation) === JSON.stringify(info.navigation) &&
+        JSON.stringify(prev.i18n) === JSON.stringify(info.i18n)
       ) {
         return prev;
       }
@@ -846,13 +942,21 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // CAD-1537: a member resolves app keys from `/api/app-home`, never the
   // operator-only installed-app list.
   const memberHome = screenReader && !boardReadOnly;
-  const installations = useInstallations(listReader, `${route.screen}:${appsTick}`, memberHome ? "home" : "list");
+  const installationsRefreshKey = `${route.screen === "apps" || route.screen === "appsExplore" ? route.screen : "steady"}:${appsTick}`;
+  const installations = useInstallations(listReader, installationsRefreshKey, memberHome ? "home" : "list");
   // A removed or disabled app is not an app to open: drop it from the menu.
   // It stays visible on the Apps surface, which is where it is managed.
   const installed: VerifiedApp[] = useMemo(
     () => (installations.list ?? [])
       .filter((i) => i.removed == null && (i.state ?? "active") === "active")
-      .map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
+      .map((i) => ({
+        installId: i.install_id,
+        kind: i.name,
+        title: i.title || i.name,
+        navigation: parseNavigation(i.navigation),
+        i18n: parseAppDisplayI18n(i.i18n, { wire: true }),
+        listing: i.listing ?? null,
+      })),
     [installations.list],
   );
   const keyInstallations = route.screen === "workspaceAppKey"
@@ -874,11 +978,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     (installId: string) => installationAppHref(installations.list, installId),
     [installations.list],
   );
-  const onAppScreen = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
+  const [appBreadcrumbTarget, setAppBreadcrumbTarget] = useState<HTMLSpanElement | null>(null);
+  const [appActionsTarget, setAppActionsTarget] = useState<HTMLDivElement | null>(null);
   const receipt = onAppScreen && activeApp !== null && activeApp.installId === routeInstallId ? activeApp : null;
   const menuApps = receipt === null ? installed
     : installed.some((a) => a.installId === receipt.installId)
-      ? installed.map((app) => app.installId === receipt.installId ? { ...app, navigation: receipt.navigation } : app)
+      ? installed.map((app) => app.installId === receipt.installId
+          ? {
+              ...app,
+              navigation: receipt.navigation ?? app.navigation,
+              i18n: receipt.i18n ?? app.i18n,
+            }
+          : app)
       : [...installed, receipt];
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
@@ -898,18 +1009,73 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const selectedMenuApp = menuApps.find((app) => app.installId === activeId);
+  const rememberedSectionQuery = onAppScreen && last?.sectionQuery && (
+    (route.screen === "workspaceApp" && last.installId === route.installId) ||
+    (route.screen === "workspaceAppKey" && last.appKey === route.appKey)
+  ) ? last.sectionQuery : null;
+  const keyMatchedSectionQuery = route.screen === "workspaceAppKey"
+    ? installed.find((app) => app.kind === route.appKey)?.navigation?.section_query ?? null
+    : null;
+  const currentSectionQuery = onAppScreen
+    ? (selectedMenuApp?.navigation?.section_query ??
+        receipt?.navigation?.section_query ??
+        keyMatchedSectionQuery ??
+        rememberedSectionQuery)
+    : null;
+  const activeSectionQueries = useMemo(() => {
+    if (!onAppScreen) return [];
+    const set = new Set<string>();
+    if (currentSectionQuery) set.add(currentSectionQuery);
+    for (const app of menuApps) {
+      if (app.navigation?.section_query) set.add(app.navigation.section_query);
+    }
+    return Array.from(set);
+  }, [onAppScreen, currentSectionQuery, menuApps]);
+  useEffect(() => {
+    mountedAppSectionQueries = activeSectionQueries;
+    return () => {
+      mountedAppSectionQueries = [];
+    };
+  }, [activeSectionQueries]);
+  const activeAppKey = selectedMenuApp?.kind ?? receipt?.kind ?? (route.screen === "workspaceAppKey" ? route.appKey : null);
+  const activeDeclaredSectionQuery = selectedMenuApp?.navigation?.section_query ?? receipt?.navigation?.section_query ?? null;
   const activeSection = selectedMenuApp ? sectionFromSearch(search, selectedMenuApp.navigation) : null;
   useEffect(() => {
     if (activeId === null) return;
     setLast((prev) => {
-      if (prev !== null && prev.installId === activeId && prev.section === activeSection) return prev;
-      const next = { installId: activeId, section: activeSection };
+      if (
+        prev !== null &&
+        prev.installId === activeId &&
+        prev.section === activeSection &&
+        (prev.appKey ?? null) === activeAppKey &&
+        (prev.sectionQuery ?? null) === activeDeclaredSectionQuery
+      ) {
+        return prev;
+      }
+      const next: LastApp = {
+        installId: activeId,
+        section: activeSection,
+        ...(activeAppKey ? { appKey: activeAppKey } : {}),
+        ...(activeDeclaredSectionQuery ? { sectionQuery: activeDeclaredSectionQuery } : {}),
+      };
       writeLastApp(next);
       return next;
     });
-  }, [activeId, activeSection]);
+  }, [activeId, activeSection, activeAppKey, activeDeclaredSectionQuery]);
   // CAD-1692: the sidebar unfolds Apps on entering an app, judged from the route.
   useEffect(() => { noteAppScreen(onAppScreen, activeId); }, [onAppScreen, activeId]);
+  /** The href of a route, carrying the scope and drawer like `goTo`. */
+  const hrefFor = (r: Route) => locationHref(goTo(loc, r), navigationSearch(route, r, search, activeSectionQueries), route);
+  // The sidebar and the phone menu open a project page. The chip row
+  // and the memory picker filter the screen, and only a screen that has one.
+  const projectHref = (key: string) => {
+    const next = openProject(loc, key);
+    return locationHref(next, navigationSearch(route, next.route, search, activeSectionQueries), route);
+  };
+  const filterHref = (key: string) => {
+    const next = withProject(loc, key);
+    return locationHref(next, navigationSearch(route, next.route, search, activeSectionQueries), route);
+  };
   const appMenu = {
     ...buildAppNav({
       apps: menuApps,
@@ -917,6 +1083,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       activeId,
       activeHref: href,
       last,
+      locale,
+      t,
       installHref: (installId) => {
         // CAD-1438: app menu entries emit only the canonical key route.
         // A receipt-only app (in the menu but not the list) or a shared
@@ -927,12 +1095,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         // `installationAppHref` returns the encoded path; the route stores
         // the decoded key, and valid keys carry no encodable characters.
         const next: Route = { screen: "workspaceAppKey", appKey: decodeURIComponent(href2.slice("/apps/".length)) };
-        const targetSearch = new URLSearchParams(search);
-        if (installId !== activeId) {
-          for (const key of ["crm", "record", "ctx", "appview", "segment", "conversation", "install"]) targetSearch.delete(key);
+        if (installId === activeId) {
+          return locationHref(goTo(loc, next), contextNavigationSearch(route, next, search), next);
         }
-        const nextSearch = targetSearch.toString();
-        return locationHref(goTo(loc, next), contextNavigationSearch(route, next, nextSearch));
+        const targetSectionQuery = menuApps.find((app) => app.installId === installId)?.navigation?.section_query ?? null;
+        return locationHref(
+          goTo(loc, next),
+          stripAppRouteParams(navigationSearch(route, next, search, activeSectionQueries), targetSectionQuery),
+          route,
+        );
       },
     }),
     notice: installations.retrying
@@ -964,12 +1135,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       : hireBlock(meta)}>
     <div
       data-app-shell
-      className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
+      data-sidebar-collapsed={sidebarCollapsed || undefined}
+      className={`app-shell-root grid bg-ink-900 ${
         fullHeight ? "app-workspace h-[100dvh] grid-rows-[minmax(0,1fr)] overflow-hidden" : "min-h-screen"
       }`}
     >
       <Sidebar
-        hosted={meta?.hosted === true}
+        collapsed={sidebarCollapsed}
+        onExpand={() => setSidebarCollapsed(false)}
+        noWiki={!wikiAvailable(meta)}
+        hiddenScreens={hiddenScreens}
         screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
         navHref={hrefFor}
         appMenu={appMenu}
@@ -979,17 +1154,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         projects={projects}
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
+        hosted={meta?.hosted === true}
         signedIn={meta?.signed_in ?? null}
         accountOpen={accountOpen}
         account={<AccountMenu
           onOpenChange={setAccountOpen}
           meta={meta}
-          actor={actor}
-          mayWrite={!readOnly}
           onChange={refresh}
           trigger="row"
           placement="above-start"
-          settingsHref={hrefFor({ screen: "settings", section: "models" })}
+          settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+          securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
           footer={versionLine}
         />}
       />
@@ -997,7 +1172,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       {/* Workspaces fill the dynamic viewport; their panes own scrolling.
           Other screens retain the natural document flow. */}
       <div data-canvas-main className={`min-w-0 flex flex-col ${fullHeight ? "h-full min-h-0" : ""}`}>
-        <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+        <header data-home-header={screen === "home" || undefined} data-installed-app={onAppScreen || undefined} className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:pr-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}
             className="header-menu header-icon -ml-1 shrink-0 gap-1 text-ink-200"
@@ -1007,7 +1182,19 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           >
             <IconList size={16} />
           </button>
+          <div className="desktop-collapse-control">
+            <button ref={sidebarCollapseRef} type="button" className="header-icon text-ink-400" aria-label={t(sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar")} aria-expanded={!sidebarCollapsed} aria-controls="desktop-sidebar" title={t(sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar")} onClick={() => setSidebarCollapsed(!sidebarCollapsed)}>
+              {sidebarCollapsed ? <IconSidebarExpand size={16} /> : <IconSidebarCollapse size={16} />}
+            </button>
+          </div>
           <nav className="header-breadcrumb min-w-0 flex-1" aria-label={t("Breadcrumb")}>
+            {onAppScreen ? (
+              <>
+                <Link href={hrefFor({ screen: "apps", project: null, name: null })}>{t("Apps")}</Link>
+                <span ref={setAppBreadcrumbTarget} className="app-header-location-target" />
+              </>
+            ) : (
+              <>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}
             <span className="header-org hidden truncate font-medium text-ink-100 sm:inline" title={orgName}>{orgName}</span>
@@ -1018,14 +1205,21 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
                 <span className="truncate text-ink-100" title={route.slug}>{route.slug}</span>
               </>
+            ) : route.screen === "settings" && settingsLabel(route.section) ? (
+              <>
+                <Link href={hrefFor(settingsHomeRoute)} className="hidden sm:inline truncate text-ink-400">{t("Settings")}</Link>
+                <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
+                <span className="truncate text-ink-100">{t(settingsLabel(route.section) ?? "")}</span>
+              </>
             ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : t(SCREEN_LABEL[screen])}</span>}
+              </>
+            )}
           </nav>
 
-          <HeaderSearch hosted={meta?.hosted === true} issues={issuesState} route={route} navHref={hrefFor} />
+          <HeaderSearch noWiki={!wikiAvailable(meta)} issues={issuesState} route={route} navHref={hrefFor} />
 
-          <div className="ml-auto flex items-center gap-1 shrink-0">
-            {screen === "home" && meta?.signed_in === true && <DecisionsPanel />}
-            {humanThreadsAvailable(meta) && <NotificationInbox authEpoch={authEpoch} />}
+          {humanThreadsAvailable(meta) && <NotificationInbox authEpoch={authEpoch} />}
+          <div className="app-header-utilities ml-auto flex items-center gap-1 shrink-0">
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}
@@ -1041,15 +1235,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             {/* Desktop identity lives in the sidebar footer row; signed-out viewers keep the one-click theme button. */}
             {meta?.signed_in === true ? <div className="flex lg:hidden"><AccountMenu
               meta={meta}
-              actor={actor}
-              mayWrite={!readOnly}
               onChange={refresh}
               trigger="avatar"
               placement="below-end"
-              settingsHref={hrefFor({ screen: "settings", section: "models" })}
+              settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+              securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
               footer={versionLine}
-            /></div> : <><LocalLanguage /><ThemeToggle /></>}
+            /></div> : <div className="header-local-preferences contents"><LocalLanguage /><ThemeToggle /></div>}
           </div>
+          {onAppScreen && <div ref={setAppActionsTarget} className="app-header-actions-target" />}
         </header>
 
         <AssistantUnreadProbes apps={installed} />
@@ -1062,15 +1256,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
 
         {menuOpen && (
-          <div id="mobile-navigation" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
+          <MobileNavigation onClose={closeMenu}>
             <NavList
-              hosted={meta?.hosted === true}
+              noWiki={!wikiAvailable(meta)}
+              hiddenScreens={hiddenScreens}
               screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
               navHref={hrefFor}
               appMenu={appMenu}
               homeCount={homeCount}
               label={t("Workspace")}
-              onNavigate={() => setMenuOpen(false)}
+              onNavigate={closeMenu}
             />
             <div className="pt-2">
               <ProjectsSection
@@ -1079,7 +1274,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 projects={projects}
                 issues={issuesState}
                 projectsError={projectsState.status === "failed" ? projectsState.error : null}
-                onNavigate={() => setMenuOpen(false)}
+                hosted={meta?.hosted === true}
+                onNavigate={closeMenu}
               />
             </div>
             {/* The header carries these as icons under lg — here they keep
@@ -1094,54 +1290,67 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 onRefresh={refresh}
               >
                 <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
+                {staleBuild !== null && staleBuild !== dismissedBuild && (
+                  <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
+                )}
               </StatusChips>
             </div>
-          </div>
+            {meta?.signed_in === true && <div className="mt-3 border-t border-ink-700 pt-2" onClick={(event) => { if ((event.target as Element).closest("a")) closeMenu(); }}><AccountMenu
+              meta={meta}
+              onChange={refresh}
+              trigger="row"
+              placement="above-start"
+              settingsHref={hrefFor({ screen: "settings", section: "preferences" })}
+              securityHref={meta?.settings_sections?.includes("security") ? hrefFor({ screen: "settings", section: "security" }) : undefined}
+              footer={versionLine}
+            /></div>}
+            {meta?.signed_in !== true && <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-ink-700 pt-2">
+              <LocalLanguage />
+              <ThemeToggle />
+            </div>}
+          </MobileNavigation>
         )}
 
-        {projectScope(route) === "chips" && showProjectChoices(projects.length, project) && (
-          <div className="px-4 lg:px-8 pt-4">
-            <ProjectFilter project={project} projects={projects} hrefFor={filterHref} />
-          </div>
-        )}
         {route.screen === "myWork" && (
-          <MyWork
-            view={route.view ?? {}}
-            onView={(view) => update((c) => ({ ...c, route: { screen: "myWork", view } }), { replace: true })}
-            onOpen={openPersonal}
-            onDetails={rememberPersonal}
-          />
+          myWorkOn ? (
+            <MyWork
+              view={route.view ?? {}}
+              onView={(view) => update((c) => ({ ...c, route: { screen: "myWork", view } }), { replace: true })}
+              onOpen={openPersonal}
+              onDetails={rememberPersonal}
+            />
+          ) : (
+            <PageState title={t("My work is not available here")} actions={<Button href="/">{t("Home")}</Button>}>
+              {t("This hosted workspace does not serve a personal work queue.")}
+            </PageState>
+          )
         )}
 
         {screen === "home" && (
           <Home
             readOnly={readOnly}
+            privateChat={route.screen === "home" && route.privateChat === true}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
-            viewerSub={meta?.session?.user?.sub ?? null}
-            viewerIsMember={meta?.session?.user?.role === "member"}
+            credentialRequestsEnabled={credentialRequestsOn}
+            viewerSub={viewerSub}
+            viewerIsMember={viewerIsMember}
             sessionId={meta?.session?.id ?? null}
+            operator={meta?.operator === true}
+            templateReviewEnabled={templateReviewEnabled}
+            templateReviewCanApprove={templateReviewCanApprove}
             overview={overviewState}
+            documentFollowUps={documentFollowUps}
             onOpenIssue={openHomeWork}
             onOpenDecision={openDecision}
-            overviewHref={hrefFor({ screen: "overview" })}
+            decisions={decisionsOn}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
             resolveAppPath={resolveAppPath}
-            setupNotice={<SetupNudge readOnly={meta ? boardReadOnly : null} />}
-          />
-        )}
-        {screen === "overview" && (
-          <OverviewView
-            state={overviewState}
-            issues={issuesState}
-            onRetry={() => void resources.overview.refresh()}
-            project={project}
-            projects={projects}
-            context={visibleContext(project, projectContext)}
-            contextLoading={projectContextLoading}
-            readOnly={readOnly}
-            onAck={ackMonitor}
-            onOpenContext={() => goRoute({ screen: "projects", slug: projectSlug, section: "context" })}
-            hosted={meta?.hosted === true}
+            setupNotice={
+              <SetupNudge
+                readOnly={meta ? boardReadOnly : null}
+                hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
+              />
+            }
           />
         )}
         {(route.screen === "issue" || (route.screen === "projects" && route.slug)) && (
@@ -1153,6 +1362,16 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 href: hrefFor({ screen: "projects", slug: route.screen === "issue" ? route.project : route.slug, section: "overview" }),
                 on: route.screen === "projects" && route.section === "overview",
               },
+              // CAD-2240: the project timeline is a hosted-board read.
+              ...(meta?.hosted !== true ? [] : [{
+                label: "Timeline",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "timeline",
+                }),
+                on: route.screen === "projects" && route.section === "timeline",
+              }]),
               {
                 label: "Issues",
                 href: hrefFor({
@@ -1171,7 +1390,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 }),
                 on: route.screen === "projects" && route.section === "epics",
               },
-              {
+              ...(!milestonesOn ? [] : [{
                 label: "Milestones",
                 href: hrefFor({
                   screen: "projects",
@@ -1179,8 +1398,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                   section: "milestones",
                 }),
                 on: route.screen === "projects" && route.section === "milestones",
-              },
-              {
+              }]),
+              ...(!workflowsOn ? [] : [{
                 label: "Workflows",
                 href: hrefFor({
                   screen: "projects",
@@ -1188,8 +1407,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                   section: "workflows",
                 }),
                 on: route.screen === "projects" && route.section === "workflows",
-              },
-              ...(meta?.hosted === true ? [] : [{
+              }]),
+              ...(!wikiAvailable(meta) ? [] : [{
                 label: "Context",
                 href: hrefFor({
                   screen: "projects",
@@ -1198,11 +1417,47 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 }),
                 on: route.screen === "projects" && route.section === "context",
               }]),
+              // CAD-1950: access is a property of the project, so its
+              // control lives on the project page rather than in a list.
+              {
+                label: "Settings",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "settings",
+                }),
+                on: route.screen === "projects" && route.section === "settings",
+              },
             ]}
           />
         )}
         {route.screen === "projects" && route.section === "overview" && (
-          <ProjectsOverview project={project} projects={projects} issues={issuesState} onOpenIssue={openIssue} onRetry={() => void resources.issues.refresh()} />
+          <ProjectsOverview
+            project={project}
+            projects={projects}
+            issues={issuesState}
+            onOpenIssue={openIssue}
+            onRetry={() => void resources.issues.refresh()}
+            milestonesEnabled={milestonesOn}
+            workflowsEnabled={workflowsOn}
+          />
+        )}
+        {route.screen === "projects" && route.slug && route.section === "timeline" && hosted !== undefined && (
+          <Timeline
+            key={route.slug}
+            project={route.slug}
+            hosted={hosted}
+            onOpenIssue={openIssue}
+            browseHref={hrefFor({ screen: "projects", slug: route.slug, section: "issues" })}
+          />
+        )}
+        {route.screen === "projects" && route.slug && route.section === "settings" && (
+          <ProjectSettings
+            project={route.slug}
+            block={policyBlock(meta)}
+            hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
+            onToast={(text) => say("ok", text)}
+          />
         )}
         {route.screen === "issue" && (
           <IssuePage
@@ -1215,6 +1470,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             readOnly={readOnly}
             writeBlock={block}
             kickoffBlock={operatorKickoffBlock(meta)}
+            hosted={meta?.hosted === true}
+            managedFiles={managedFiles}
+            projectRepos={projects.find((p) => p.key === route.project)?.repos ?? null}
+            stagedActions={decisions.rows}
             onWrite={applyWrite}
             onError={writeError}
             onOpen={(issueId) => {
@@ -1266,20 +1525,35 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "projects" && route.slug && route.section === "milestones" && (
-          <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
+          milestonesOn ? (
+            <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
+          ) : (
+            <PageState title={t("Milestones are not available here")} actions={<Button href={hrefFor({ screen: "projects", slug: route.slug, section: "overview" })}>{t("Project overview")}</Button>}>
+              {t("This hosted workspace does not serve project milestones.")}
+            </PageState>
+          )
         )}
         {route.screen === "projects" && route.slug && route.section === "workflows" && (
-          <Workflows
-            project={route.slug}
-            viewer={viewer}
-            onOpenIssue={openIssue}
-            onHome={() => goRoute({ screen: "home" })}
-          />
+          workflowsOn ? (
+            <Workflows
+              project={route.slug}
+              viewer={viewer}
+              onOpenIssue={openIssue}
+              onHome={() => goRoute({ screen: "home" })}
+            />
+          ) : (
+            <PageState title={t("Workflows live in Apps")} actions={<Button href="/apps">{t("Apps")}</Button>}>
+              {t("Hosted workspaces run workflows through installed apps.")}
+            </PageState>
+          )
         )}
         {route.screen === "projects" && route.section === "context" && (
           <Context
-            hosted={meta?.hosted === true}
+            noWiki={!wikiAvailable(meta)}
+            hosted={hosted}
+            viewerSub={viewerSub}
             readOnly={readOnly}
+            readOnlyReason={block}
             actor={actor}
             onToast={say}
             navHref={hrefFor}
@@ -1296,7 +1570,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <CatalogDetail id={route.id} viewer={viewer} />
         )}
         {route.screen === "appsManage" && (
-          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} />
+          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} automaticUpdatesEnabled={automaticUpdatesOn} appAgentSession={appAgentSession} hosted={hostedBoard} />
         )}
         {(route.screen === "workspaceApp" || route.screen === "workspaceAppKey") && (
           <WorkspaceAppEntry
@@ -1310,7 +1584,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             recheckFinished={recheckFinished}
             onRetryWorkspace={reload}
             onInstallation={reportInstallation}
+            header={{ breadcrumbs: appBreadcrumbTarget, actions: appActionsTarget }}
             onBack={() => goRoute({ screen: "apps", project: null, name: null })}
+            automaticUpdatesEnabled={automaticUpdatesOn}
           />
         )}
         {route.screen === "apps" && route.project && route.name && (
@@ -1324,20 +1600,28 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "agents" && (
           <Agents
+            key={meta.session?.id ?? ""}
+            operator={access.operator}
+            onRetryAccess={retryAccess}
+            hostedBoard={meta.hosted === true}
+            viewerSub={meta.signed_in && viewerSub && !viewerSub.startsWith("operator-token:") ? viewerSub : null}
             state={agentsState}
             issues={issuesState}
             open={route.alias}
+            openProfileId={route.profileId}
             tab={route.tab ?? "overview"}
+            routineAgent={route.routineAgent}
             recruit={route.recruit === true}
             ask={route.ask === true}
             onAsk={() =>
               update((c) => ({ ...c, route: { screen: "agents", alias: null, ask: true } }))
             }
             onOpenAgent={openAgent}
+            onToast={say}
             onTab={(tab) =>
               update((c) => ({
                 ...c,
-                route: { screen: "agents", alias: route.alias, ...(tab === "overview" ? {} : { tab }) },
+                route: { ...route, tab: tab === "overview" ? undefined : tab },
               }))
             }
             onRecruit={(on) =>
@@ -1348,7 +1632,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "wiki" && (
-          meta?.hosted === true ? (
+          !wikiAvailable(meta) ? (
             <PageState
               title={t("The wiki isn’t available on this board.")}
               actions={<Link href={hrefFor({ screen: "home" })}>{t("Back to Home")}</Link>}
@@ -1357,58 +1641,110 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             </PageState>
           ) : (
             <Wiki
+              hosted={hosted}
+              viewerSub={viewerSub}
+              operator={meta?.operator ?? null}
               route={route}
               navHref={hrefFor}
               readOnly={readOnly || meta === null}
+              readOnlyReason={block}
               actor={actor}
+              managedFiles={managedFiles}
+              onManagedChange={() => void resources.overview.refresh()}
               onToast={say}
             />
           )
         )}
         {route.screen === "threads" && (
-          <ThreadsPage
-            key={meta.session?.id ?? ""}
-            operator={meta.operator === true}
-            onOpenWorkItem={(id) => openWorkItem(id, "threads")}
-          />
+          workConversationsOn || humanThreadsOn ? (
+            <ThreadsPage
+              key={meta.session?.id ?? ""}
+              operator={meta.operator === true}
+              onOpenWorkItem={openThreadsWork}
+              workConversationsEnabled={workConversationsOn}
+              humanThreadsEnabled={humanThreadsOn}
+            />
+          ) : (
+            <PageState title={t("Threads are not available here")} actions={<Button href="/">{t("Home")}</Button>}>
+              {t("This hosted workspace does not serve agent or human thread rooms.")}
+            </PageState>
+          )
+        )}
+        {route.screen === "credentialEntry" && (
+          <CredentialEntry key={route.requestId} requestId={route.requestId} />
+        )}
+        {route.screen === "credentialAuthorize" && (
+          <CredentialAuthorize key={route.requestId} requestId={route.requestId} />
         )}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
+        {/* CAD-2286: hosted only. A native board, or a hosted one whose probe is
+            not available, gets the screen's unavailable state, never a blank body. */}
+        {route.screen === "documents" && !managedFiles && (
+          <DocumentsScreen
+            hosted={documentsHosted}
+            viewer={documentsViewer({ sub: viewerSub, operator: access.operator, readOnly })}
+            archived={route.archived}
+            stage={route.stage}
+            hrefFor={hrefFor}
+          />
+        )}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}
         {route.screen === "settings" && (
           <SettingsLayout
-            groups={[
-              {
-                label: "Workspace",
-                items: [
-                  { label: "Agents", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
-                  { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
-                  { label: "Email sending", href: hrefFor({ screen: "settings", section: "email" }), on: route.section === "email" },
-                ],
-              },
-              {
-                label: "System",
-                items: [
-                  { label: "Status", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
-                  ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),
-                  { label: "Master permissions", href: hrefFor({ screen: "settings", section: "permissions" }), on: route.section === "permissions" },
-                ],
-              },
-            ]}
+            groups={settingsNavGroups({ ...meta, hosted: hostedBoard }).map((group) => ({
+              label: group.label,
+              items: group.items.map((item) => ({
+                label: item.label,
+                icon: item.icon,
+                href: hrefFor({ screen: "settings", section: item.section }),
+                on: route.section === item.section,
+              })),
+            }))}
           >
+            {/* Mount nothing that's about to redirect: its failed read would flash first. */}
+            {!settingsTarget && !(route.section === "models" && meta === null) && (<>
             {route.section === "memory" && (
               <Memory project={project} projects={projects} projectHref={filterHref} onError={writeError} />
             )}
             {route.section === "models" && <ModelDefaults />}
-            {route.section === "connections" && (
-              <Connections viewer={viewer} page={route.page} />
+            {/* CAD-2115: Members is hosted-only. The board names it in
+                `settings_sections` when it serves the page, and a native board
+                never does — so a direct link here mounts nothing, and
+                `settingsRedirect` has already moved the URL off. */}
+            {route.section === "members" && meta?.settings_sections?.includes("members") && (
+              <Members viewer={viewer} />
             )}
-            {route.section === "email" && <EmailSending viewer={viewer} />}
-            {route.section === "templates" && <Templates />}
+            {/* CAD-2286: hosted only, offered while the board names `documents`
+                in `settings_sections`. The page reads the shared probe and
+                says when the lifecycle is unavailable or unsupported. */}
+            {route.section === "documents" && meta?.settings_sections?.includes("documents") && (
+              <DocumentTypes hosted={documentsHosted} viewer={viewer} viewerSub={viewerSub} />
+            )}
+            {route.section === "connections" && (
+              <Connections viewer={viewer} page={route.page} hostedBoard={Boolean(meta?.settings_sections)} />
+            )}
+            {route.section === "email" && <EmailSending viewer={viewer} fixedUnsubscribeAddress={Boolean(meta?.settings_sections)} />}
+            {route.section === "templates" && (
+              <Templates viewer={{ operator: viewer.operator, hosted: false }} />
+            )}
+            {route.section === "preferences" && <Preferences organizationDefault={!meta?.settings_sections} />}
+            {route.section === "security" && meta?.settings_sections?.includes("security") && (
+              <Security onSessionInvalidated={refresh} />
+            )}
+            {route.section === "general" && <General documentPolicy={
+              managedFiles && viewer.operator === true && !readOnly && viewerSub && !viewerSub.startsWith("operator-token:")
+                ? { hosted: documentsHosted, viewer, viewerSub }
+                : undefined
+            } />}
             {route.section === "account" && <PlatformAccount />}
-            {route.section === "update" && <Update viewer={viewer} health={health} />}
+            {route.section === "update" && (meta?.settings_sections
+              ? <HostedStatus meta={meta} canReadConnections={viewer.operator === true} partialUpdates={partialUpdates} />
+              : <Update viewer={viewer} health={health} />)}
+            {route.section === "custody" && <AdvancedCustody viewer={viewer} />}
             {route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
+            </>)}
           </SettingsLayout>
         )}
         {screen === "notFound" && (
@@ -1429,6 +1765,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           key={`${openId}:${decision?.need.key ?? ""}`}
           id={openId}
           origin={effectiveOrigin}
+          managedFiles={managedFiles}
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readState={detailState}
           onRetry={() => {
@@ -1467,19 +1804,24 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               if (privateSessionGeneration() === personalGeneration) notifyPersonalDrafts((version) => version + 1);
             },
           } : undefined}
-          href={(() => {
+          {...(() => {
             const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
             const fromCard = personalState?.data?.issues.find((row) => row.id === openId)?.project
               ?? issues.find((i) => i.id === openId)?.project ?? null;
             const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
-            return key ? issuePath(key, openId) : null;
+            return {
+              href: key ? issuePath(key, openId) : null,
+              projectRepos: key ? projects.find((p) => p.key === key)?.repos ?? null : null,
+            };
           })()}
+          hosted={meta?.hosted === true}
+          stagedActions={decisions.rows}
           onClose={closeWorkItem}
         />
       )}
 
       <Toast msg={toast} />
-      <CanvasDrawer />
+      <CanvasDrawer hosted={hostedBoard} templateReviewEnabled={templateReviewEnabled} />
     </div>
     </HireBlock.Provider>
     </WriteGate.Provider>
@@ -1495,7 +1837,9 @@ function WorkspaceAppEntry({
   recheckFinished,
   onRetryWorkspace,
   onInstallation,
+  header,
   onBack,
+  automaticUpdatesEnabled,
 }: {
   route: Extract<Route, { screen: "workspaceApp" | "workspaceAppKey" }>;
   /** The current query — the `install` pin is read from it. */
@@ -1508,7 +1852,9 @@ function WorkspaceAppEntry({
   recheckFinished: boolean;
   onRetryWorkspace: () => void;
   onInstallation: (installation: ActiveInstallation | null) => void;
+  header: AppShellHeaderTargets;
   onBack: () => void;
+  automaticUpdatesEnabled: boolean;
 }) {
   const { t } = useLocale();
   if (viewer.operator === null) {
@@ -1632,8 +1978,9 @@ function WorkspaceAppEntry({
       installId={installation.install_id}
       viewer={viewer}
       onInstallation={onInstallation}
+      header={header}
     >
-      {(onMediaAttach, contextId, screen) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} contextId={contextId} onMediaAttach={onMediaAttach} onScreenDrawer={screen.onScreenDrawer} presentation={screen.presentation} onScreenClosed={screen.onScreenClosed} drawerTarget={screen.drawerTarget} />}
+      {(onMediaAttach, contextId, screen) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} contextId={contextId} onMediaAttach={onMediaAttach} onScreenDrawer={screen.onScreenDrawer} presentation={screen.presentation} onScreenClosed={screen.onScreenClosed} drawerTarget={screen.drawerTarget} restoreDrawer={screen.restoreDrawer} onRestoreDrawerConsumed={screen.onRestoreDrawerConsumed} automaticUpdatesEnabled={automaticUpdatesEnabled} />}
     </AppShell>
   );
 }

@@ -27,8 +27,6 @@ use crate::issue::{app_screen_decl, model};
 pub const SCREENS_DIR: &str = "screens";
 /// The declaration filename (the app-screens/v1 manifest) within a tag dir.
 pub const SCREEN_MANIFEST: &str = "screens.json";
-/// Most screen tags one bundle may declare — the count a scan accepts.
-const MAX_SCREENS: usize = 8;
 
 /// One screen package, integrity-checked against the live bundle bytes.
 /// Carries the validated assets and the declared app tag; never paths,
@@ -59,6 +57,8 @@ pub struct ScreenPackage {
     pub tools: BTreeMap<String, String>,
     pub operations: Vec<app_screen_decl::ScreenOperation>,
     pub navigation: Option<app_screen_decl::ScreenNavigation>,
+    /// CAD-2710: the declared app views, so the board can read their option labels.
+    pub views: Option<Vec<app_screen_decl::ScreenView>>,
 }
 
 /// `true` when `tag` is a legal screen tag (the bundle's tag grammar).
@@ -83,7 +83,8 @@ pub fn leaf_ok(leaf: &str) -> bool {
 
 /// The screen tags a live bundle carries — the `screens/<tag>/` dirs
 /// that contain a `screens.json`, derived from the file list only.
-/// Bounded at [`MAX_SCREENS`]; a malformed or oversized set refuses.
+/// Bounded at [`app_screen_decl::MAX_SCREENS`]; a malformed or oversized set
+/// refuses.
 pub fn tags_in(files: &BTreeMap<String, String>) -> Result<Vec<String>> {
     let prefix = format!("{SCREENS_DIR}/");
     let mut tags = Vec::new();
@@ -102,9 +103,9 @@ pub fn tags_in(files: &BTreeMap<String, String>) -> Result<Vec<String>> {
                 "screen tag {tag:?} is not a valid tag"
             )));
         }
-        if !tags.contains(&tag.to_string()) {
+        if !tags.iter().any(|seen| seen == tag) {
             tags.push(tag.to_string());
-            if tags.len() > MAX_SCREENS {
+            if tags.len() > app_screen_decl::MAX_SCREENS {
                 return Err(Error::rejected("too many screen packages in one bundle"));
             }
         }
@@ -139,6 +140,46 @@ pub fn declares_whatsapp_door(files: &BTreeMap<String, String>, app: &str) -> bo
                 .is_ok_and(|pkg| pkg.app == app && pkg.operations.iter().any(|op| op.is_whatsapp()))
         })
     })
+}
+
+/// The bundle's one valid screen package whose `app` matches `app`.
+fn single_screen_package(files: &BTreeMap<String, String>, app: &str) -> Option<ScreenPackage> {
+    let tags = tags_in(files).ok()?;
+    let [tag] = tags.as_slice() else {
+        return None;
+    };
+    extract(files, tag).ok().filter(|pkg| pkg.app == app)
+}
+
+/// The declared `navigation` and (CAD-2710) `views` of the bundle's single
+/// valid screen package whose `app` matches `app`, as JSON; `Value::Null` for
+/// each the package does not declare or when there is no such package.
+pub fn single_screen_navigation_and_views(
+    files: &BTreeMap<String, String>,
+    app: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let json = |v: Option<serde_json::Result<serde_json::Value>>| {
+        v.and_then(std::result::Result::ok)
+            .unwrap_or(serde_json::Value::Null)
+    };
+    match single_screen_package(files, app) {
+        Some(pkg) => (
+            json(pkg.navigation.map(serde_json::to_value)),
+            json(pkg.views.map(serde_json::to_value)),
+        ),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    }
+}
+
+/// Extract declared `navigation` when the bundle carries a single valid screen
+/// package whose `app` matches `app`. Returns `Value::Null` otherwise.
+pub fn single_screen_navigation(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
+    single_screen_navigation_and_views(files, app).0
+}
+
+/// CAD-2710: the declared `views` of that same single screen package.
+pub fn single_screen_views(files: &BTreeMap<String, String>, app: &str) -> serde_json::Value {
+    single_screen_navigation_and_views(files, app).1
 }
 
 /// CAD-1827: how one installed bundle relates to the campaign-work contract.
@@ -208,6 +249,21 @@ pub fn campaign_work_source(files: &BTreeMap<String, String>) -> CampaignWorkSou
         }
     }
     CampaignWorkSource::Unavailable("no screen package declares campaign-work.show")
+}
+
+/// CAD-2379: does any screen package in this bundle declare `operation`?
+/// The consent page asks it of the bundle itself, because the host (not the
+/// bundle) decides what the declaration means to the person installing. A
+/// package that fails integrity declares nothing here: install refuses it.
+pub fn bundle_declares(
+    files: &BTreeMap<String, String>,
+    operation: app_screen_decl::ScreenOperation,
+) -> bool {
+    tags_in(files).is_ok_and(|tags| {
+        tags.iter()
+            .filter_map(|tag| extract(files, tag).ok())
+            .any(|pkg| pkg.operations.contains(&operation))
+    })
 }
 
 /// Re-prove one screen package against the live bundle snapshot./// Re-prove one screen package against the live bundle snapshot.
@@ -316,6 +372,7 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
         tools: checked.tools().clone(),
         operations: checked.operations().to_vec(),
         navigation: checked.navigation().cloned(),
+        views: checked.views().map(<[_]>::to_vec),
     })
 }
 
@@ -569,6 +626,37 @@ mod tests {
         assert!(extract(&with(&paired, &["campaign-work.send"], None), "a").is_err());
     }
 
+    /// CAD-2379: a package that declares `calendar.query` parses and the
+    /// bundle says it declares it; a package that does not still refuses the
+    /// operation (the services guard requires it in `pkg.operations`).
+    #[test]
+    fn cad2379_calendar_query_parses_and_an_undeclared_bundle_does_not_declare_it() {
+        let js = "x";
+        let op = app_screen_decl::ScreenOperation::CalendarQuery;
+        let declared = bundle_with(
+            "a",
+            &decl_records(&[("client.js", js)], &["calendar.query"]),
+            &[("client.js", js)],
+        );
+        let pkg = extract(&declared, "a").unwrap();
+        assert_eq!(pkg.operations, vec![op]);
+        assert!(bundle_declares(&declared, op));
+        let undeclared = bundle_with(
+            "a",
+            &decl_records(&[("client.js", js)], &["records.list"]),
+            &[("client.js", js)],
+        );
+        assert!(!extract(&undeclared, "a").unwrap().operations.contains(&op));
+        assert!(!bundle_declares(&undeclared, op));
+        // The closed vocabulary still refuses a neighbour at parse time.
+        let unknown = bundle_with(
+            "a",
+            &decl_records(&[("client.js", js)], &["calendar.update"]),
+            &[("client.js", js)],
+        );
+        assert!(extract(&unknown, "a").is_err());
+    }
+
     #[test]
     fn cad1827_campaign_work_source_is_a_three_way_classification() {
         let js = "x";
@@ -621,6 +709,87 @@ mod tests {
         assert_eq!(
             campaign_work_source(&no_manifest),
             CampaignWorkSource::Unavailable("installation manifest is unreadable")
+        );
+    }
+
+    #[test]
+    fn single_screen_navigation_projects_i18n_and_ignores_multi_or_mismatch() {
+        let js = "console.log(1);";
+        let mut with_nav: serde_json::Value =
+            serde_json::from_str(&decl_records(&[("client.js", js)], &[])).unwrap();
+        with_nav["navigation"] = json!({"section_query":"section","default_section":"customers","sections":[{"id":"customers","label":"Customers","i18n":{"zh-TW":{"label":"客戶"}}}]});
+        let files = bundle_with("main", &with_nav.to_string(), &[("client.js", js)]);
+        let projected = single_screen_navigation(&files, "crm");
+        assert_eq!(
+            (
+                &projected["default_section"],
+                &projected["sections"][0]["i18n"]["zh-TW"]["label"]
+            ),
+            (&json!("customers"), &json!("客戶"))
+        );
+        assert!(single_screen_navigation(&files, "other").is_null());
+        assert!(single_screen_views(&files, "crm").is_null());
+        let mut with_views = with_nav.clone();
+        with_views["views"] = json!([{"id":"pnl","label":{"en":"P&L"},"section":"customers","params":{"compare":{"type":"enum","values":["prior_year"],"labels":{"prior_year":{"zh-TW":"對比去年"}}}}}]);
+        let viewed = bundle_with("main", &with_views.to_string(), &[("client.js", js)]);
+        assert_eq!(
+            single_screen_views(&viewed, "crm")[0]["params"]["compare"]["labels"]["prior_year"]
+                ["zh-TW"],
+            json!("對比去年")
+        );
+        assert!(single_screen_views(&viewed, "other").is_null());
+        assert!(single_screen_navigation(
+            &bundle_with("main", &decl(&[("client.js", js)]), &[("client.js", js)]),
+            "crm"
+        )
+        .is_null());
+        let mut two = files.clone();
+        two.insert(
+            "screens/second/screens.json".to_string(),
+            with_nav.to_string(),
+        );
+        two.insert("screens/second/client.js".to_string(), js.to_string());
+        assert!(single_screen_navigation(&two, "crm").is_null());
+    }
+    /// AOS-714 / CAD-2710: the cases shared byte-for-byte with agenticos-v2's
+    /// hosted reader (`apps/api/src/tenant-board/cad2710-view-option-labels.fixture.json`).
+    #[test]
+    fn cad2710_shared_view_label_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/cad2710-view-option-labels.fixture.json"
+        ))
+        .unwrap();
+        let js = "console.log(1);";
+        let bundle = |views: &serde_json::Value| {
+            let mut decl: serde_json::Value =
+                serde_json::from_str(&decl_records(&[("client.js", js)], &[])).unwrap();
+            let sections: Vec<_> = fixture["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| json!({"id": id, "label": "S"}))
+                .collect();
+            decl["navigation"] = json!({"section_query":"section","default_section":"customers","sections":sections});
+            decl["views"] = views.clone();
+            bundle_with("main", &decl.to_string(), &[("client.js", js)])
+        };
+        let mut disagree = Vec::new();
+        for (key, accepted) in [("valid", true), ("invalid", false)] {
+            for case in fixture[key].as_array().unwrap() {
+                let files = bundle(&json!([case["view"]]));
+                if extract(&files, "main").is_ok() != accepted {
+                    disagree.push(format!("{key}: {}", case["name"]));
+                }
+            }
+        }
+        let projection = &fixture["projection"];
+        assert_eq!(
+            single_screen_views(&bundle(&projection["views_in"]), "crm"),
+            projection["views_out"]
+        );
+        assert!(
+            disagree.is_empty(),
+            "cases the Rust reader disagrees on: {disagree:?}"
         );
     }
 }

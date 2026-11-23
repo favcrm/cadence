@@ -62,30 +62,13 @@ async function main() {
     assert(refused, "envelope-wrapped, foreign-identity, self-contradicting or bad-digest versions are refused");
   }
 
-  // The release fetch pins the exact selected release and fails closed
-  // when the staged bytes do not match it.
+  // CAD-1942: catalogue check and apply name the release; the board fetches
+  // and verifies its bytes server-side, so the browser never downloads the
+  // release (the digest-mismatch refusal moved to the board, src/ui/apps.rs).
   const installableApp = { ...app, digest, installable: true };
   const selectedRelease = { version: "1.2.3", digest, installable: true, unavailableReason: null, release_notes: null };
   const seen: string[] = [];
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    seen.push(`${url} ${init?.method ?? "GET"}`);
-    if (url.includes("/release?")) {
-      const query = new URL(url, "http://localhost").searchParams;
-      assert(query.get("version") === "1.2.3" && query.get("digest") === digest, "the release fetch pins both version and digest");
-      assert(query.getAll("version").length === 1 && query.getAll("digest").length === 1, "the release query has no duplicate pins");
-      return new Response(JSON.stringify({ files: { "app.md": "guide" }, expected_digest: digest }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  }) as typeof fetch;
-  const files = await panel.loadReleaseFiles(app.id, selectedRelease, new AbortController().signal);
-  assert(files["app.md"] === "guide", "the staged release reads as a file bundle");
-  for (const body of [{ files: {}, expected_digest: digest }, { files: { "app.md": "guide" }, expected_digest: `sha256:${"cd".repeat(32)}` }, { files: { "app.md": 7 }, expected_digest: digest }]) {
-    globalThis.fetch = (async () => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof fetch;
-    let refused = false;
-    try { await panel.loadReleaseFiles(app.id, selectedRelease, new AbortController().signal); } catch { refused = true; }
-    assert(refused, "an empty bundle, a digest mismatch or non-text files never reach the check");
-  }
+  assert(!("loadReleaseFiles" in panel), "the browser no longer reads release files");
 
   // A checked install applies once, pins the locator, and only succeeds
   // when the committed row and a readback both name the release.
@@ -93,7 +76,6 @@ async function main() {
     kind: "install",
     sessionGeneration: session.privateSessionGeneration(),
     release: selectedRelease,
-    files: { "app.md": "guide" },
     install: null,
     expectedDigest: null,
     expectedGeneration: null,
@@ -112,6 +94,7 @@ async function main() {
     seen.push(`${url} ${init?.method ?? "GET"}`);
     if (url.endsWith("/api/app-installations/upload")) {
       const body = JSON.parse(String(init?.body)) as { expected_digest?: string; catalogue?: { id: string; version: string; digest: string } };
+      assert(!("files" in body), "a catalogue apply sends the locator, never the package files");
       assert(body.expected_digest === digest, "the upload pins the release digest");
       assert(body.catalogue?.id === installableApp.id && body.catalogue.version === "1.2.3" && body.catalogue.digest === digest, "the upload names the catalogue release");
       return new Response(JSON.stringify({
@@ -133,6 +116,29 @@ async function main() {
   const row = await panel.applyCheckedRelease(installableApp, selectedRelease, receipt);
   assert(row.install_id === "install-1", "a pinned catalogue apply returns the committed row");
   assert(seen.filter((line) => line.includes("/upload")).length === 1, "a successful catalogue apply uploads once");
+  assert(!seen.some((line) => line.includes("/release?")), "the apply never downloads the release");
+
+  // A catalogue update apply carries the locator and pins only.
+  let upgradeBody: Record<string, unknown> | null = null;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/app-installations/install-1/upgrade")) {
+      upgradeBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ error: "synthetic stop" }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  const updateReceipt: ReleasePanel.Receipt = {
+    ...receipt,
+    kind: "update",
+    install: { install_id: "install-1" } as ReleasePanel.Receipt["install"],
+    expectedDigest: `sha256:${"cd".repeat(32)}`,
+    expectedGeneration: "synthetic-generation-1",
+  };
+  try { await panel.applyCheckedRelease(installableApp, selectedRelease, updateReceipt); } catch { /* the synthetic 500 */ }
+  const sentUpgrade = upgradeBody as Record<string, unknown> | null;
+  assert(sentUpgrade !== null && !("files" in sentUpgrade), "a catalogue update sends no package files");
+  assert(sentUpgrade.expected_new_digest === digest && (sentUpgrade.catalogue as { digest?: string })?.digest === digest, "a catalogue update pins the locator and the new digest");
 
   // Identity readback cannot replace the mutation's own commit acknowledgement.
   for (const committed of [false, undefined]) {
@@ -213,6 +219,61 @@ async function main() {
   refused = false;
   try { await directory.loadPublicApp(app.id, new AbortController().signal); } catch { refused = true; }
   assert(refused, "a detail response for another identity is not the requested app");
+
+  const maxSummary = `${"說".repeat(70)}\n${"附".repeat(69)}${"x".repeat(140)}`;
+  const validI18n = directory.parsePublicApp({
+    ...app, i18n: { "zh-TW": { title: "範例", summary: maxSummary, tagline: "輕" } },
+    listing: { i18n: { "zh-TW": { title: "範例", summary: maxSummary, about: "一\n二", can: ["a", "b"], access_notes: { "notes.read": "r" } } } },
+  });
+  assert(validI18n?.listing.i18n?.["zh-TW"]?.can?.length === 2 && validI18n.i18n?.["zh-TW"]?.summary === maxSummary, "280-char summary");
+  const emptyParsed = directory.parsePublicList({ ok: true, data: { apps: [{ ...app, i18n: {}, listing: { i18n: {} } }] } });
+  assert(emptyParsed.length === 1 && !emptyParsed[0].i18n && !emptyParsed[0].listing.i18n, "{} i18n");
+  const wireTolerated = directory.parsePublicList({
+    ok: true,
+    data: {
+      apps: [{
+        ...app,
+        i18n: { "zh-TW": {}, ja: { title: null } },
+        listing: {
+          i18n: {
+            "zh-TW": { title: "範例", summary: null, tagline: null, about: null, can: [], access_notes: {} },
+            "zh-HK": { access_notes: { "CRM Read / Write": "唯讀" } },
+            ja: {},
+          },
+        },
+      }],
+    },
+  });
+  assert(
+    wireTolerated.length === 1
+      && !wireTolerated[0].i18n
+      && wireTolerated[0].listing.i18n?.["zh-TW"]?.title === "範例"
+      && wireTolerated[0].listing.i18n?.["zh-HK"]?.access_notes?.["CRM Read / Write"] === "唯讀"
+      && !wireTolerated[0].listing.i18n?.ja,
+    "agenticos-v2 wire-compatible nullish/empty i18n",
+  );
+  let deep: Record<string, unknown> = { ok: true };
+  for (let i = 0; i < 35; i++) deep = { child: deep };
+  const badPatches: [string, Record<string, unknown>][] = [
+    ["pricing", { listing: { details: { pricing: { m: 10 } } } }],
+    ["cost", { listing: { items: [{ cost: 5 }] } }],
+    ["artifact", { listing: { nested: { artifact: "f" } } }],
+    ["path", { listing: { nested: { path: "/etc/passwd" } } }],
+    ["depth>32", { listing: deep }], ["non-obj", { listing: "bad" }],
+    ["__proto__", { listing: JSON.parse('{"__proto__":{"p":1}}') }],
+    ["getter", { listing: Object.defineProperty({}, "safe", { enumerable: true, get: () => "x" }) }],
+    ["dup", { i18n: { "zh-tw": { title: "A" }, "zh-TW": { title: "B" } } }],
+    ["row>280", { i18n: { "zh-TW": { summary: "x".repeat(281) } } }],
+    ["extra", { listing: { i18n: { "zh-TW": { extra: "bad" } } } }],
+    ["can>5", { listing: { i18n: { "zh-TW": { can: ["1", "2", "3", "4", "5", "6"] } } } }],
+    ["list>280", { listing: { i18n: { "zh-TW": { summary: "x".repeat(281) } } } }],
+    ["bad-note-empty", { listing: { i18n: { "zh-TW": { access_notes: { "": "x" } } } } }],
+    ["bad-note-65", { listing: { i18n: { "zh-TW": { access_notes: { ["k".repeat(65)]: "x" } } } } }],
+    ["bad-note-ctrl", { listing: { i18n: { "zh-TW": { access_notes: { "bad\nkey": "x" } } } } }],
+    ["bad-title-num", { i18n: { "zh-TW": { title: 123 } } }],
+  ];
+  for (const [why, patch] of badPatches) assert(directory.parsePublicApp({ ...app, ...patch }) === null, why);
+
   console.log("public directory boundary checks passed");
 }
 void main().catch((error) => { console.error(error); throw error; });

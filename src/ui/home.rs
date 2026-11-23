@@ -333,17 +333,21 @@ pub(super) fn prove_operator_peer(
     let peer = request
         .remote_addr()
         .ok_or_else(|| refuse("the request has no peer address".to_string()))?;
+    // CAD-760: the client socket is matched on the full four-tuple; a
+    // board with no concrete bound address cannot prove its peer.
+    let server = super::operator::concrete_board_server(opts).map_err(refuse)?;
     // A signed-in operator whose browser is reached through an ssh
     // forward: the socket is still open, but its process is not in this
     // pid namespace. A closed socket and every visible process still go
     // through the positive proof below. Callers of this function already
     // require the operator session.
-    if crate::peer::loopback_ownerless(opts.port, *peer) {
+    if crate::peer::loopback_ownerless(server, *peer) {
         return Ok(());
     }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    crate::peer::tcp_peer_operator_proof(opts.port, *peer, uid, daemon_pid, &roots).map_err(refuse)
+    crate::peer::tcp_peer_operator_proof(server, *peer, uid, daemon_pid, &roots, state_dir)
+        .map_err(refuse)
 }
 
 /// Daemon error → HTTP for the relayed operator RPCs.
@@ -910,6 +914,60 @@ pub(super) fn agent_action(
                 Err(e) => rpc_err(&e, "agent_instructions_set"),
             };
         }
+        // CAD-2092: replace the agent's selected bundled skills. Operator-only
+        // on the board and in the daemon; body is `{skills: [...]}` only.
+        "skills" => {
+            let body: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return err_response(400, "skills takes {\"skills\": [...]}"),
+            };
+            let obj = body.as_object();
+            let Some(skills) = obj.and_then(|o| o.get("skills")).and_then(Value::as_array) else {
+                return err_response(400, "skills needs an array of bundled skill names");
+            };
+            if let Some(extra) = obj.and_then(|o| o.keys().find(|k| k.as_str() != "skills")) {
+                return err_response(
+                    400,
+                    &format!("skills takes the list only — '{extra}' is not accepted"),
+                );
+            }
+            if !skills.iter().all(Value::is_string) {
+                return err_response(400, "skills entries must be strings");
+            }
+            (
+                "agent_skills_set",
+                json!({"alias": alias, "skills": skills}),
+            )
+        }
+        // CAD-2092: replace the agent's disabled built-in tools. Operator-only
+        // on the board and in the daemon; body is `{disabled_tools: [...]}` only.
+        "tools" => {
+            let body: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return err_response(400, "tools takes {\"disabled_tools\": [...]}"),
+            };
+            let obj = body.as_object();
+            let Some(disabled) = obj
+                .and_then(|o| o.get("disabled_tools"))
+                .and_then(Value::as_array)
+            else {
+                return err_response(400, "tools needs an array of disabled tool names");
+            };
+            if let Some(extra) = obj.and_then(|o| o.keys().find(|k| k.as_str() != "disabled_tools"))
+            {
+                return err_response(
+                    400,
+                    &format!("tools takes disabled_tools only — '{extra}' is not accepted"),
+                );
+            }
+            if !disabled.iter().all(Value::is_string) {
+                return err_response(400, "disabled_tools entries must be strings");
+            }
+            (
+                "agent_tools_set",
+                json!({"alias": alias, "disabled_tools": disabled}),
+            )
+        }
         _ => return err_response(404, "no such agent route"),
     };
     match client::rpc(state_dir, method, params) {
@@ -922,6 +980,7 @@ pub(super) fn agent_action(
 pub(super) fn master_summary(
     state_dir: &std::path::Path,
     query: &dyn Fn(&str) -> Option<String>,
+    policy_actor: &str,
 ) -> HttpResp {
     let Some(since) = query("since")
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -929,7 +988,11 @@ pub(super) fn master_summary(
     else {
         return err_response(400, "since must be epoch seconds");
     };
-    match client::rpc(state_dir, "master_summary", json!({ "since": since })) {
+    match client::rpc(
+        state_dir,
+        "master_summary",
+        json!({ "since": since, "read_as": policy_actor }),
+    ) {
         Ok(out) => json_response(out),
         Err(e) => rpc_err(&e, "master_summary"),
     }
@@ -939,9 +1002,40 @@ pub(super) fn master_summary(
 /// chips (model/effort/context) and in-flight turn. A plain read like
 /// `/api/threads/<alias>`; a daemon without `master_state` answers 501
 /// and the UI falls back to the agents payload.
-pub(super) fn master_state(state_dir: &std::path::Path, operator: bool) -> HttpResp {
-    match client::rpc(state_dir, "master_state", json!({})) {
+///
+/// CAD-2215: the daemon answers for the reader this request proved, so the
+/// relay carries that proof (a member's signed session, the anonymous
+/// service identity, or nothing at all for a proven operator) and never a
+/// member/app field of its own. The board-level redaction below stays as
+/// defence in depth: it is not what decides authority.
+pub(super) fn master_state(
+    state_dir: &std::path::Path,
+    operator: bool,
+    proof: &super::operator::ReadRelayProof,
+) -> HttpResp {
+    use cadence_core::board_api::{MASTER_STATE_SCOPE_ACK, READER_SCOPE_FIELD};
+    let mut params = json!({});
+    proof.attach(&mut params);
+    let relayed = !matches!(proof, super::operator::ReadRelayProof::Operator);
+    match client::rpc(state_dir, "master_state", params) {
         Ok(mut out) => {
+            // CAD-2215: a relayed NON-operator answer must carry the ack; a
+            // daemon without it is a mixed-version daemon that may have
+            // ignored the proof and built the global document. That answer
+            // is unavailable — never an empty (or full) "success". A
+            // proven operator's own relay is exempt: its full document is
+            // correct for it either way.
+            let ack = out
+                .as_object_mut()
+                .and_then(|fields| fields.remove(READER_SCOPE_FIELD));
+            let confirmed = ack.as_ref().and_then(Value::as_str) == Some(MASTER_STATE_SCOPE_ACK);
+            if relayed && !operator && !confirmed {
+                return err_response(
+                    503,
+                    "master state unavailable for this reader — the daemon did not \
+                     confirm a reader-scoped answer",
+                );
+            }
             if !operator {
                 super::member_view::redact_master_state(&mut out);
             }
@@ -1082,6 +1176,68 @@ fn master_command_err(e: &Error) -> HttpResp {
             | "message_required"),
         ) => coded_response(409, code, &e.to_string(), None),
         _ => rpc_err(e, "master_command"),
+    }
+}
+
+/// `POST /api/master/identity` (CAD-1817) — the operator's bounded workspace
+/// identity write, relayed to the daemon's `master_identity_set`.
+///
+/// The relay is no wider than the native verb: the closed field set, the
+/// required revision, a string-only name/tone and the canonical look list are
+/// checked here before the daemon is asked, and the daemon re-proves the
+/// operator connection (an agent cannot reach it).
+pub(super) fn master_identity(request: &mut Request, state_dir: &std::path::Path) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return err_response(400, "body must be a JSON object"),
+    };
+    let Some(object) = body.as_object() else {
+        return err_response(400, "body must be a JSON object");
+    };
+    const FIELDS: [&str; 4] = ["expected_revision", "name", "tone", "look"];
+    if let Some(field) = object.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+        return err_response(400, &format!("unknown field '{field}'"));
+    }
+    let Some(expected_revision) = object
+        .get("expected_revision")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    else {
+        return err_response(400, "expected_revision must be a non-empty string");
+    };
+    let mut params = json!({"expected_revision": expected_revision});
+    for key in ["name", "tone"] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else {
+            return err_response(400, &format!("{key} must be a string"));
+        };
+        if text.chars().count() > 240 {
+            return err_response(400, &format!("{key} is too long"));
+        }
+        params[key] = json!(text);
+    }
+    if let Some(value) = object.get("look") {
+        let Some(text) = value.as_str() else {
+            return err_response(400, "look must be a string");
+        };
+        let Some(look) = crate::agent_roles::canonical_look(text.trim()) else {
+            return err_response(400, &format!("unknown look '{text}'"));
+        };
+        params["look"] = json!(look);
+    }
+    if !object.contains_key("name") && !object.contains_key("tone") && !object.contains_key("look")
+    {
+        return err_response(400, "at least one of name, tone, look is required");
+    }
+    match client::rpc(state_dir, "master_identity_set", params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "master_identity_set"),
     }
 }
 

@@ -1,9 +1,14 @@
-import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CLOSE, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseActionRefusal, parseChild, parseInit, parseScreenAudioCapture, parseScreenAudioSessionSnapshot, pushedAssetRefs, shapeFor, shapeOf,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_AUDIO_V1, SCREEN_AUDIO_V2, SCREEN_DRAWER_CHILD_VERBS, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, SCREEN_CANVAS_V1, SCREEN_ROUTE_PARAMS_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
-  type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
-  type ScreenDrawerVerb, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
+  type ScreenSection,
+  type ScreenSectionI18n,
+  type ActionResult, type AssetReply, type AudioRequest, type AudioSessionEvent, type AudioSessionRequest, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenAudioMode, type ScreenAudioSessionSnapshot, type ScreenPush,
+  type ScreenDrawerVerb, type ScreenDrawerSize, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
+import { SCREEN_WHATSAPP_COMPOSE_V1, SCREEN_WHATSAPP_MEDIA_V1, SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V1, SCREEN_WHATSAPP_REPLY_LAYOUT_V2, WHATSAPP_REPLY_INSET_MAX, type WhatsAppComposeProvider, type WhatsAppMediaReply, type WhatsAppMediaRequest, type WhatsAppReplyAvailability, type WhatsAppReplyBounds } from "./screenProtocol";
+import type { WhatsAppMediaDownloadResult } from "./screenServices";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
+import { isPlainJsonObject, parseLocaleEntries } from "../appLocale";
 
 /** Resolves one pushed asset ref to a downscaled `data:` URL, or `null`
  *  when it cannot be loaded now. Supplied by the board; never by the frame. */
@@ -42,6 +47,11 @@ export interface ScreenActions {
      *  the geometry. Absent (no shell behind this frame) the verb refuses. */
     openScreenDrawer?(surface: string): boolean;
     closeScreenDrawer?(): boolean;
+    /** The surface this frame is mounted as, host-derived; set only for a
+     *  drawer child, so a connect started there returns to that drawer. */
+    returnSurface?: string;
+    /** The width that drawer was opened with, so the return reopens it alike. */
+    returnSize?: ScreenDrawerSize;
   }): Promise<ActionResult>;
   /** Validate a spend verb, fetch what the host must check, and name the work. */
   planner: Planner;
@@ -54,16 +64,28 @@ export interface ScreenActions {
    *  `screen-surfaces.v1` capability: an independent open mounts a separate
    *  drawer frame in the shell's own fixed overlay instead of promoting
    *  this frame. */
-  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean): void;
+  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean, size?: ScreenDrawerSize, context?: unknown): void;
+  onWhatsAppCompose?(conversationId: string | null, nomination: number | null, provider?: WhatsAppComposeProvider): void;
+  onWhatsAppReplyLayout?(bounds: WhatsAppReplyBounds | null): void;
+  onWhatsAppReplyInsetApplied?(px: number, seq: number): void;
+  onWhatsAppMediaDownload?(conversationId: string, messageId: string, signal: AbortSignal): Promise<WhatsAppMediaDownloadResult>;
+  onWhatsAppMediaSave?(bytes: ArrayBuffer, mimeType: string, fileName: string): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
   invoke?(alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope): Promise<ActionResult>;
+  /** CAD-2272: open the generic host-mediated audio capture/upload modal under
+   *  this mount's server-bound action context. Raw audio stays on the host. */
+  captureAudio?(mode: ScreenAudioMode, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
+  /** CAD-2281: dispatch a headless inline audio session command (`screen-audio.v2`). */
+  audioSession?(request: AudioSessionRequest, ui: { actionToken: string; signal: AbortSignal }): Promise<ActionResult>;
+  disposeAudioSession?(): void;
 }
 /** Most calls one frame may have outstanding; one more closes it. */
 export const CALL_QUEUE_MAX = 8;
 /** A reply's data is at most this many bytes of JSON. */
 const REPLY_BYTES_MAX = 64 * 1024;
+const AUDIO_REPLY_BYTES_MAX = 256 * 1024;
 const RECORD_REPLY_BYTES_MAX = 1048576;
 const RECORD_REPLY_WIRE_BYTES_MAX = RECORD_REPLY_BYTES_MAX + 1024;
 const jsonBytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
@@ -99,7 +121,8 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   tools?: string[];
   /** CAD-1365: host-held media metadata for a `screen-media.v1` package
    *  — the daemon-minted record of the media permissions the screen
-   *  DECLARED (`media.read` / `media.publish`, either or both, never
+   *  DECLARED (`media.read` / `media.publish` / `media.import`, any
+   *  subset, never
    *  wider). Declaration metadata only: dispatch still requires the
    *  mount's action token and the child's `screen-media.v1` opt-in, and
    *  the daemon re-proves the declaration natively on every call. */
@@ -111,12 +134,49 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   display_session_key?: string;
   install_id?: string; context_id?: string | null; digest?: string;
   remote_images?: string[] };
+const SECTION_CTRL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const SECTION_I18N_KEYS = new Set(["label"]);
+const RESERVED_SECTION_QUERIES = new Set([
+  "app", "install", "install_id", "context", "context_id", "ctx", "actor", "identity",
+  "auth", "token", "key", "session", "session_key", "origin", "project", "workspace",
+  "conversation", "thread", "message", "view", "appview", "record", "record_id",
+  "segment", "segment_id", "screen", "contract-preview", "nonce", "proof",
+  "generation", "digest",
+]);
+
+function parseSectionI18n(raw: unknown): Record<string, ScreenSectionI18n> | undefined | null {
+  if (raw === undefined || raw === null) return undefined;
+  if (!isPlainJsonObject(raw)) return null;
+  // agenticos-v2 permits empty `{}` maps on the wire; treat as absent.
+  if (Object.keys(raw).length === 0) return undefined;
+  return parseLocaleEntries(raw, SECTION_I18N_KEYS, (entry) => {
+    const label = entry.label;
+    return typeof label === "string" && label.trim().length > 0 && label.length <= 40 && !SECTION_CTRL_RE.test(label)
+      ? { label }
+      : null;
+  });
+}
+
 export function parseNavigation(value: unknown): ScreenNavigation | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const nav = value as ScreenNavigation;
-  const reserved = new Set(["app", "install", "install_id", "context", "context_id", "ctx", "actor", "identity", "auth", "token", "key", "session", "session_key", "origin", "project", "workspace", "conversation", "thread", "message", "view", "appview", "record", "record_id", "segment", "segment_id", "screen", "contract-preview", "nonce", "generation", "digest"]);
-  if (Object.keys(nav).sort().join() !== "default_section,section_query,sections" || typeof nav.section_query !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(nav.section_query) || reserved.has(nav.section_query) || !Array.isArray(nav.sections) || nav.sections.length < 1 || nav.sections.length > 8 || new Set(nav.sections.map(s => s?.id)).size !== nav.sections.length || !nav.sections.every(s => s && Object.keys(s).sort().join() === "id,label" && typeof s.id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(s.id) && typeof s.label === "string" && s.label.trim().length > 0 && s.label.length <= 40) || !nav.sections.some(s => s.id === nav.default_section)) return null;
-  return nav;
+  const nav = value as Record<string, unknown>;
+  if (Object.keys(nav).sort().join() !== "default_section,section_query,sections" || typeof nav.section_query !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(nav.section_query) || RESERVED_SECTION_QUERIES.has(nav.section_query) || typeof nav.default_section !== "string" || !Array.isArray(nav.sections) || nav.sections.length < 1 || nav.sections.length > 8) return null;
+  const seen = new Set<string>();
+  const sections: ScreenSection[] = [];
+  for (const rawSection of nav.sections) {
+    if (!rawSection || typeof rawSection !== "object" || Array.isArray(rawSection)) return null;
+    const s = rawSection as Record<string, unknown>;
+    const keys = Object.keys(s);
+    if (!keys.includes("id") || !keys.includes("label") || keys.some((k) => k !== "id" && k !== "label" && k !== "i18n")) return null;
+    if (typeof s.id !== "string" || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(s.id) || seen.has(s.id)) return null;
+    seen.add(s.id);
+    if (typeof s.label !== "string" || s.label.trim().length === 0 || s.label.length > 40 || SECTION_CTRL_RE.test(s.label)) return null;
+    const i18n = parseSectionI18n(s.i18n);
+    if (i18n === null) return null;
+    sections.push(i18n ? { id: s.id, label: s.label, i18n } : { id: s.id, label: s.label });
+  }
+  if (!seen.has(nav.default_section)) return null;
+  return { section_query: nav.section_query, default_section: nav.default_section, sections };
 }
 export function parseMount(value: unknown, tag: string): MountReceipt | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -130,14 +190,14 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
   const toolsOk = tools === undefined || (Array.isArray(tools) && tools.length <= 32 &&
     new Set(tools).size === tools.length && tools.every(a => typeof a === "string" && TOOL_ALIAS.test(a)));
   // `media` is a closed object when present: exactly
-  // {contract:"screen-media.v1", may:[1..2 distinct declared verbs]}.
+  // {contract:"screen-media.v1", may:[1..4 distinct declared verbs]}.
   const media = v.media;
   const mediaOk = media === undefined || (typeof media === "object" && media !== null && !Array.isArray(media) &&
     Object.keys(media as Record<string, unknown>).sort().join() === "contract,may" &&
     (media as Record<string, unknown>).contract === SCREEN_MEDIA_V1 &&
     Array.isArray((media as Record<string, unknown>).may) &&
     ((media as Record<string, unknown>).may as unknown[]).length >= 1 &&
-    ((media as Record<string, unknown>).may as unknown[]).length <= 3 &&
+    ((media as Record<string, unknown>).may as unknown[]).length <= 4 &&
     new Set((media as Record<string, unknown>).may as unknown[]).size === ((media as Record<string, unknown>).may as unknown[]).length &&
     ((media as Record<string, unknown>).may as unknown[]).every(m => isMediaVerb(m as string)));
   const action = v.action_token;
@@ -188,11 +248,20 @@ export abstract class FrameChannel {
   protected tool(_request: ToolRequest): void { this.close(true); }
   protected recordsRights(): readonly string[] | undefined { return undefined; }
   /** CAD-1777 — whether this frame may use the host's local drawer UI verbs,
-   *  and which of them. Only the records channel can ever say yes; a
+   *  and which of them. Only the screen channel can ever say yes; a
    *  primary admits both, a drawer frame only `close`. */
   protected drawerCapable(): boolean | readonly ScreenDrawerVerb[] { return false; }
   /** Opaque state is ignored unless this frame kind explicitly understands it. */
   protected state(_data: string): void {}
+  /** screen.v2 unsaved-edit leave warning hint: a frame kind without it closes. */
+  protected leave(_unsaved: boolean): void { this.close(true); }
+  protected whatsappCompose(_conversationId: string | null, _provider?: WhatsAppComposeProvider): void { this.close(true); }
+  protected whatsappReplyLayout(_nomination: number, _bounds: WhatsAppReplyBounds | null): void { this.close(true); }
+  protected whatsappReplyInsetReady(_nomination: number, _seq: number, _px: number): void { this.close(true); }
+  protected whatsappMedia(_request: WhatsAppMediaRequest): void { this.close(true); }
+  /** screen.v2 host-mediated audio capture/upload: a frame kind without it closes. */
+  protected audio(_request: AudioRequest): void { this.close(true); }
+  protected audioSession(_request: AudioSessionRequest): void { this.close(true); }
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
     if (this.closed || event.source !== this.source) return;
     if (event.origin !== "null") {
@@ -208,7 +277,10 @@ export abstract class FrameChannel {
     this.port.onmessage = event => {
       if (this.closed) return;
       const child = parseChild(event.data, this.recordsRights(), this.drawerCapable());
-      if (!child || child.op === "state" && !this.ready) { this.close(true); return; }
+      if (!child || child.op === "state" && !this.ready) {
+        console.warn("screen frame closed: protocol violation (unparsable or early message)");
+        this.close(true); return;
+      }
       if (child.op === "ready") {
         if (this.ready || !this.accept(child)) { this.close(true); return; }
         this.ready = true;
@@ -218,6 +290,34 @@ export abstract class FrameChannel {
       if (child.op === "asset") {
         if (!this.ready) { this.close(true); return; }
         this.asset(child.ref);
+      }
+      if (child.op === "leave") {
+        if (!this.ready) { this.close(true); return; }
+        this.leave(child.unsaved);
+      }
+      if (child.op === "audio") {
+        if (!this.ready) { this.close(true); return; }
+        this.audio(child);
+      }
+      if (child.op === "audio-session") {
+        if (!this.ready) { this.close(true); return; }
+        this.audioSession(child);
+      }
+      if (child.op === "whatsapp-compose") {
+        if (!this.ready) { this.close(true); return; }
+        this.whatsappCompose(child.conversation_id, child.provider);
+      }
+      if (child.op === "whatsapp-reply-layout") {
+        if (!this.ready) { this.close(true); return; }
+        this.whatsappReplyLayout(child.nomination, child.bounds);
+      }
+      if (child.op === "whatsapp-reply-inset-ready") {
+        if (!this.ready) { this.close(true); return; }
+        this.whatsappReplyInsetReady(child.nomination, child.seq, child.px);
+      }
+      if (child.op === "whatsapp-media") {
+        if (!this.ready) { this.close(true); return; }
+        this.whatsappMedia(child);
       }
       if (child.op === "call" || child.op === "slot" || child.op === "tool") {
         if (!this.ready) { this.close(true); return; }
@@ -245,8 +345,43 @@ export abstract class FrameChannel {
 /** Each instance owns one frame generation. Teardown precedes replacement. */
 /** Verbs whose planner runs against the consumed mount receipt: the original download and
  *  the social publish relays send the host-held action token, never a frame-supplied credential. */
-const RECEIPT_TOKEN_VERBS: readonly string[] = [ORIGINAL_DOWNLOAD_VERB, "publish.draft.confirm",
-  "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel"];
+const RECEIPT_TOKEN_VERBS: readonly string[] = [ORIGINAL_DOWNLOAD_VERB, "publish.draft.confirm", "publish.draft.schedule"];
+
+export function admitsWhatsAppComposer(receipt: MountReceipt): boolean {
+  return receipt.tag === "waba" && receipt.host_contract === SCREEN_RECORDS_V1 && !!receipt.action_token &&
+    ["whatsapp.conversations.show", "whatsapp.reply.prepare", "whatsapp.reply.send", "whatsapp.reply.status"].every(verb => receipt.operations?.includes(verb));
+}
+
+export function admitsWhatsAppMediaDownload(receipt: MountReceipt): boolean {
+  return receipt.tag === "waba" && receipt.host_contract === SCREEN_RECORDS_V1 && !!receipt.action_token &&
+    !!receipt.operations?.includes("whatsapp.messages");
+}
+
+const WHATSAPP_MEDIA_FALLBACK_FILENAMES: Readonly<Record<string, string>> = {
+  "image/jpeg": "whatsapp-image.jpg",
+  "image/png": "whatsapp-image.png",
+  "image/webp": "whatsapp-image.webp",
+  "video/mp4": "whatsapp-video.mp4",
+  "video/webm": "whatsapp-video.webm",
+  "video/3gpp": "whatsapp-video.3gp",
+  "video/quicktime": "whatsapp-video.mov",
+  "audio/mpeg": "whatsapp-audio.mp3",
+  "audio/ogg": "whatsapp-audio.ogg",
+  "audio/mp4": "whatsapp-audio.m4a",
+  "audio/aac": "whatsapp-audio.aac",
+  "audio/wav": "whatsapp-audio.wav",
+  "audio/webm": "whatsapp-audio.webm",
+  "application/pdf": "whatsapp-document.pdf",
+  "text/plain": "whatsapp-document.txt",
+  "text/csv": "whatsapp-document.csv",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "whatsapp-document.docx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "whatsapp-document.xlsx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "whatsapp-document.pptx",
+};
+
+function fallbackWhatsAppMediaFileName(mimeType: string): string {
+  return WHATSAPP_MEDIA_FALLBACK_FILENAMES[mimeType] ?? "whatsapp-media.bin";
+}
 
 export class ScreenChannel extends FrameChannel {
   /** Set once, by the child's `ready`: the PUSH shape it negotiated. */
@@ -266,14 +401,37 @@ export class ScreenChannel extends FrameChannel {
     super(source, receipt, removeFrame, failed, onReady);
   }
   private records = false;
-  private crmLocale = false;
+  private wantsLocale = false;
   private wantsPresentation = false;
   private wantsSurfaces = false;
+  private wantsCanvas = false;
+  /** CAD-2555 — the frame opted into `params` on its route (`screen-route-params.v1`). */
+  private wantsRouteParams = false;
+  private wantsWhatsAppCompose = false;
+  private wantsReplyAvailability = false;
+  private wantsReplyLayout = false;
+  private wantsReplyOverlay = false;
+  private replyInset: number | undefined;
+  private replyInsetSeq = 0;
+  private replyInsetAcknowledged = false;
+  get whatsappReplyOverlay(): boolean { return this.wantsReplyOverlay; }
+  private whatsappSelected = false;
+  // Both ends count the existing selections (including clears) on the ordered port.
+  private whatsappNomination = 0;
   /** CAD-1777 — the host-derived surface role of this mount. The outlet
    *  sets it from its own mount request (a drawer only exists behind a
    *  private parent token); the ready opt-in and call args cannot choose
    *  it. */
   surfaceRole: ScreenSurfaceRole = "primary";
+  /** SOC-55 — the bounded context this host-created drawer child was opened
+   *  with. It is host-local data, never authority, and lives only on this
+   *  child mount; a reopen starts with a new channel. */
+  drawerContext: unknown = null;
+  setDrawerContext(context: unknown): void { this.drawerContext = context ?? null; }
+  /** CAD-2525 — this mount is the chat canvas's read-only app view. Host-
+   *  derived like the role; told to the frame only if it opted into
+   *  `screen-canvas.v1`. */
+  canvasReadOnly = false;
   private surfaceState: { role: ScreenSurfaceRole; modal: boolean } | null = null;
   private surfaceSent: string | null = null;
   /** CAD-1615 — tell the child which surface its frame is in (legacy). The
@@ -287,57 +445,94 @@ export class ScreenChannel extends FrameChannel {
    *  child. `send()` posts it before the first projection, so a primary
    *  never flashes list content when it is meant to draw a drawer; every
    *  later change is posted once. */
-  surface(role: ScreenSurfaceRole, modal: boolean): void {
-    if (this.surfaceState?.role === role && this.surfaceState.modal === modal) return;
+  surface(role: ScreenSurfaceRole, modal: boolean, drawerSurface?: string): void {
+    if (this.surfaceState?.role === role && this.surfaceState.modal === modal && this.drawerSurface === drawerSurface) return;
     this.surfaceState = { role, modal };
+    this.drawerSurface = drawerSurface;
     this.postSurface();
   }
+  /** CAD-1777 — the closed surface idiom a mounted drawer child draws. */
+  private drawerSurface: string | undefined;
   private postSurface(): void {
     if (this.closed || !this.ready || !this.port || !this.wantsSurfaces) return;
     this.surfaceState ??= { role: this.surfaceRole, modal: false };
-    const key = `${this.surfaceState.role}:${this.surfaceState.modal ? 1 : 0}`;
+    const named = this.surfaceState.role === "drawer" && this.drawerSurface ? this.drawerSurface : undefined;
+    // CAD-2525 — only a frame that opted into `screen-canvas.v1` is told it is
+    // in the canvas; every other frame keeps `primary` and no `readOnly`.
+    const canvas = this.wantsCanvas && this.canvasReadOnly && this.surfaceState.role === "primary";
+    const role: ScreenSurfaceRole = canvas ? "canvas" : this.surfaceState.role;
+    const key = `${role}:${this.surfaceState.modal ? 1 : 0}:${named ?? ""}`;
     if (this.surfaceSent === key) return;
     this.surfaceSent = key;
-    const message: ScreenSurface = { v: 1, op: "surface", role: this.surfaceState.role, modal: this.surfaceState.modal };
+    const message: ScreenSurface = { v: 1, op: "surface", role, modal: this.surfaceState.modal, ...(named ? { surface: named } : {}), ...(canvas ? { readOnly: true as const } : {}) };
     this.port.postMessage(message);
   }
-  protected state(data: string): void {
-    // Any records-contract screen may publish the hint; the payload's own
-    // `contract` field is the declaration (CAD-1543), never the app name.
-    if (!this.ready || this.closed || !this.records || data.length > 128 ||
-        new TextEncoder().encode(data).byteLength > 128) return;
-    // This closed boolean is a warning hint, never navigation/effect authority.
-    // Unknown or malformed opaque state must not clear an existing warning.
-    try {
-      const value: unknown = JSON.parse(data);
-      if (!value || typeof value !== "object" || Array.isArray(value)) return;
-      const state = value as Record<string, unknown>;
-      if (Object.keys(state).sort().join() !== "contract,unsaved" ||
-          state.contract !== "crm-leave.v1" || typeof state.unsaved !== "boolean") return;
-      this.onUnsaved?.(state.unsaved);
-    } catch { /* Ignore other opaque state, without changing the warning. */ }
+  protected leave(unsaved: boolean): void {
+    // Any screen.v2 frame may publish the boolean warning hint; it carries no
+    // navigation or effect authority, and non-v2 mounts close on v2 ops.
+    if (!this.ready || this.closed || this.shape !== "v2") { this.close(true); return; }
+    this.onUnsaved?.(unsaved);
+  }
+  protected whatsappCompose(conversationId: string | null, provider?: WhatsAppComposeProvider): void {
+    if (!this.wantsWhatsAppCompose || !this.actions?.onWhatsAppCompose) { this.close(true); return; }
+    this.whatsappSelected = conversationId !== null;
+    this.replyInset = undefined;
+    this.replyInsetSeq = 0;
+    this.actions.onWhatsAppCompose(conversationId, this.wantsReplyAvailability ? ++this.whatsappNomination : null, provider);
+  }
+  protected whatsappReplyLayout(nomination: number, bounds: WhatsAppReplyBounds | null): void {
+    if (!this.wantsReplyLayout || !this.actions?.onWhatsAppReplyLayout) { this.close(true); return; }
+    if (this.whatsappSelected && nomination === this.whatsappNomination) this.actions.onWhatsAppReplyLayout(bounds);
+  }
+  protected whatsappReplyInsetReady(nomination: number, seq: number, px: number): void {
+    if (!this.wantsReplyOverlay || !this.actions?.onWhatsAppReplyInsetApplied) { this.close(true); return; }
+    if (!this.whatsappSelected || nomination !== this.whatsappNomination ||
+        seq !== this.replyInsetSeq || px !== this.replyInset || this.replyInsetAcknowledged) return;
+    this.replyInsetAcknowledged = true;
+    this.actions.onWhatsAppReplyInsetApplied(px, seq);
+  }
+  whatsappComposeState(dirty: boolean, refresh: boolean): void {
+    if (!this.closed && this.ready && this.wantsWhatsAppCompose)
+      this.port?.postMessage({ v: 2, op: "whatsapp-compose-state", dirty, refresh });
+  }
+  whatsappReplyAvailability(nomination: number, state: WhatsAppReplyAvailability): void {
+    if (!this.closed && this.ready && this.wantsReplyAvailability && nomination === this.whatsappNomination)
+      this.port?.postMessage({ v: 2, op: "whatsapp-reply-availability", nomination, state });
+  }
+  whatsappReplyInset(nomination: number, px: number): number | undefined {
+    if (this.closed || !this.ready || !this.port || !this.wantsReplyOverlay || !this.whatsappSelected ||
+        nomination !== this.whatsappNomination || !Number.isSafeInteger(px) || px < 0 || px > WHATSAPP_REPLY_INSET_MAX) return;
+    if (px !== this.replyInset) {
+      this.replyInset = px;
+      this.replyInsetAcknowledged = false;
+      this.port.postMessage({ v: 2, op: "whatsapp-reply-inset", nomination, seq: ++this.replyInsetSeq, px });
+    }
+    return this.replyInsetSeq;
   }
   private csvBusy = false;
   private csvSlot: string | null = null;
   protected recordsRights(): readonly string[] | undefined { return this.records ? this.receipt.operations ?? [] : undefined; }
-  /** CAD-1777 — the host-local presentation capability of THIS live mount:
-   *  a records frame that negotiated `screen-presentation.v1` or
-   *  `screen-surfaces.v1`, has an admitted action host and a live shell
-   *  drawer callback. A read-only viewer's shell withholds the callback, so
-   *  it never inherits geometry authority from a records receipt. A primary
-   *  admits both verbs; a drawer frame admits only its own close. */
+  /** CAD-1777 / CAD-1932 — the host-local presentation capability of THIS
+   *  live mount: any screen.v2 frame (records or not) that negotiated
+   *  `screen-presentation.v1` or `screen-surfaces.v1`, has an admitted
+   *  action host, a live action context and a live shell drawer callback.
+   *  A read-only viewer's shell withholds the callback, so it never
+   *  inherits geometry authority from a receipt. A primary admits both
+   *  verbs; a drawer frame admits only its own close. */
   private drawerVerbs(): readonly ScreenDrawerVerb[] | null {
-    if (!this.records || this.shape !== "v2" || !(this.wantsPresentation || this.wantsSurfaces) ||
+    if (this.shape !== "v2" || !(this.wantsPresentation || this.wantsSurfaces) ||
         !this.actions?.onScreenDrawer || !this.receipt.action_token) return null;
-    return this.surfaceRole === "drawer" ? [SCREEN_DRAWER_CLOSE] : SCREEN_DRAWER_VERBS;
+    return this.surfaceRole === "drawer" ? SCREEN_DRAWER_CHILD_VERBS : SCREEN_DRAWER_VERBS;
   }
   protected drawerCapable(): readonly ScreenDrawerVerb[] | false { return this.drawerVerbs() ?? false; }
   /** One validated host-local presentation request. It is never dispatched
-   *  to a records service, never spends and never widens rights; malformed
-   *  arguments are refused in place so the frame (and its draft) survives. */
+   *  to a records service or an app action, never spends and never widens
+   *  rights; malformed arguments are refused in place so the frame (and its
+   *  draft) survives. A verb outside this mount's admitted subset (a drawer
+   *  frame's open) closes, as on the records parser. */
   private drawerCall(request: CallRequest & { verb: ScreenDrawerVerb }): void {
     const onDrawer = this.actions?.onScreenDrawer;
-    if (!this.drawerVerbs() || !onDrawer) { this.close(true); return; }
+    if (!this.drawerVerbs()?.includes(request.verb) || !onDrawer) { this.close(true); return; }
     const independent = this.wantsSurfaces;
     const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
     const parsed = parseScreenDrawerCall(request.verb, request.args);
@@ -345,12 +540,20 @@ export class ScreenChannel extends FrameChannel {
       reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "bad_args", text: "That request is not valid." } });
       return;
     }
+    if (parsed.mode === "context") {
+      reply({ v: 2, op: "reply", id: request.id, ok: true, data: { context: this.drawerContext } });
+      return;
+    }
+    if (parsed.mode === "drawer" && "context" in parsed && !independent) {
+      reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "This app cannot pass context to a drawer here." } });
+      return;
+    }
     if (parsed.mode === "outlet") {
       onDrawer("outlet", undefined, independent);
       reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "outlet" } });
       return;
     }
-    onDrawer("drawer", parsed.surface, independent);
+    onDrawer("drawer", parsed.surface, independent, parsed.size, parsed.context);
     reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "drawer", surface: parsed.surface } });
   }
   private calls = 0;
@@ -377,11 +580,24 @@ export class ScreenChannel extends FrameChannel {
   /** Only a v2 child with an action host; the verb set was closed by the parser. */
   protected call(request: CallRequest): void {
     const actions = this.actions;
-    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    if (this.wantsLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    // CAD-2555 — route params are the capability's alone: a frame that did not opt in never sends them.
+    if (!this.wantsRouteParams && request.verb === "screen.route.patch" && Object.hasOwn(request.args, "params")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
-    // CAD-1777 — a records frame's drawer request is host-local UI, never a
-    // records operation: it is answered here and never reaches the services.
-    if (this.records && isScreenDrawerVerb(request.verb)) { this.drawerCall(request as CallRequest & { verb: ScreenDrawerVerb }); return; }
+    // CAD-1777 / CAD-1932 — a drawer request is host-local UI, never a
+    // records operation or an app action: a capable frame (records or not)
+    // is answered here and never reaches the services. A non-records
+    // `screen-presentation.v1` peer without that capability keeps its
+    // CAD-1615 path below; any other non-records frame (no opt-in, or a
+    // surfaces frame without a live action context or shell callback) is
+    // refused in place.
+    if (isScreenDrawerVerb(request.verb)) {
+      if (this.records || this.drawerVerbs()) { this.drawerCall(request as CallRequest & { verb: ScreenDrawerVerb }); return; }
+      if (!this.wantsPresentation || this.wantsSurfaces) {
+        this.port?.postMessage({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "This app cannot open a board drawer here." } });
+        return;
+      }
+    }
     const csv = this.records && request.verb === "records.csv.preview";
     if (csv && (this.csvBusy || this.csvSlot)) { this.close(true); return; }
     if (csv) this.csvBusy = true;
@@ -407,8 +623,11 @@ export class ScreenChannel extends FrameChannel {
         const size = jsonBytes(result.data ?? null);
         if (size > Math.max(this.records ? RECORD_REPLY_BYTES_MAX : REPLY_BYTES_MAX, previewBytes)) reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That is too large to show." } });
         else {
-          this.rememberDraftAssetRefs(result.data,request.args);
-          reply({ v: 2, op: "reply", id: request.id, ok: true, data: result.data ?? null });
+          const admitted = this.rememberDraftAssetRefs(result.data,request.args);
+          // CAD-1921: name the draft-image refs this reply made requestable, so the app can ask at
+          // once instead of waiting for the next PUSH. Older receivers ignore extra reply keys; a
+          // records frame (whose bridge is exact-key) never gets it, and an older host never sends it.
+          reply({ v: 2, op: "reply", id: request.id, ok: true, data: result.data ?? null, ...(admitted.length && !this.records ? { asset_refs: admitted } : {}) });
         }
       })
       .finally(() => {
@@ -419,7 +638,7 @@ export class ScreenChannel extends FrameChannel {
 /** Only a v2 child with an action host. At most one live slot per frame. */
   protected slot(request: SlotRequest): void {
     const actions = this.actions;
-    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    if (this.wantsLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || (this.records ? !this.receipt.operations?.includes(request.verb) || !(RECORD_SLOT_VERBS as readonly string[]).includes(request.verb) : !(SLOT_VERBS as readonly string[]).includes(request.verb))) { this.close(true); return; }
     const csv = this.records && (request.verb === "records.csv.import" || request.verb === "records.csv.confirm");
     if (csv && (this.csvBusy || this.csvSlot !== null && this.csvSlot !== request.id)) { this.close(true); return; }
@@ -444,7 +663,170 @@ export class ScreenChannel extends FrameChannel {
    *  frame's choice. One outstanding tool call at a time. */
   private wantsTools = false;
   private wantsMedia = false;
+  private wantsAudio = false;
+  private wantsAudioV2 = false;
   private toolBusy = false;
+  private audioBusy = false;
+  private audioRetire: AbortController | null = null;
+  private audioSessionRetire = new Set<AbortController>();
+  private wantsWhatsAppMedia = false;
+  private whatsappMediaRetire = new Set<AbortController>();
+  protected whatsappMedia(request: WhatsAppMediaRequest): void {
+    const download = this.actions?.onWhatsAppMediaDownload;
+    if (!this.wantsWhatsAppMedia || !download) {
+      this.close(true);
+      return;
+    }
+    const reply = (message: WhatsAppMediaReply, transfer: Transferable[] = []) => {
+      if (!this.closed) this.port?.postMessage(message, transfer);
+    };
+    const isSave = request.disposition === "download";
+    const save = this.actions?.onWhatsAppMediaSave;
+    if (isSave && !save) {
+      reply({
+        v: 2,
+        op: "whatsapp-media-reply",
+        id: request.id,
+        ok: false,
+        refusal: { code: "unavailable", text: "Downloads are unavailable on this screen." },
+      });
+      return;
+    }
+    if (this.whatsappMediaRetire.size >= 4) {
+      reply({
+        v: 2,
+        op: "whatsapp-media-reply",
+        id: request.id,
+        ok: false,
+        refusal: { code: "busy", text: "Too many downloads in progress." },
+      });
+      return;
+    }
+    const retire = new AbortController();
+    this.whatsappMediaRetire.add(retire);
+    void download(request.conversation_id, request.message_id, retire.signal)
+      .catch((): WhatsAppMediaDownloadResult => ({ ok: false, refusal: { code: "failed", text: "Download failed." } }))
+      .then(result => {
+        this.whatsappMediaRetire.delete(retire);
+        if (this.closed) return;
+        if (!result.ok) {
+          reply({ v: 2, op: "whatsapp-media-reply", id: request.id, ok: false, refusal: result.refusal });
+          return;
+        }
+        if (isSave && save) {
+          const fileName = result.fileName ?? fallbackWhatsAppMediaFileName(result.mimeType);
+          save(result.bytes, result.mimeType, fileName);
+          reply({
+            v: 2,
+            op: "whatsapp-media-reply",
+            id: request.id,
+            ok: true,
+            saved: true,
+            mime_type: result.mimeType,
+            file_name: fileName,
+            sha256: result.sha256,
+          });
+          return;
+        }
+        reply(
+          {
+            v: 2,
+            op: "whatsapp-media-reply",
+            id: request.id,
+            ok: true,
+            bytes: result.bytes,
+            mime_type: result.mimeType,
+            file_name: result.fileName,
+            sha256: result.sha256,
+          },
+          [result.bytes],
+        );
+      });
+  }
+  sendAudioSessionEvent(state: ScreenAudioSessionSnapshot): void {
+    if (this.closed || !this.ready || this.shape !== "v2" || !this.wantsAudioV2) return;
+    const parsed = parseScreenAudioSessionSnapshot(state);
+    if (!parsed || jsonBytes(parsed) > AUDIO_REPLY_BYTES_MAX) return;
+    const message: AudioSessionEvent = { v: 2, op: "audio-session-event", state: parsed };
+    this.port?.postMessage(message);
+  }
+  protected audioSession(request: AudioSessionRequest): void {
+    if (this.shape !== "v2" || !this.wantsAudioV2) {
+      this.close(true); return;
+    }
+    const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
+    const dispatchSession = this.actions?.audioSession;
+    const token = this.receipt.action_token;
+    if (!dispatchSession || !token || !this.hasBaseActions()) {
+      reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "Audio capture is unavailable on this screen." } });
+      return;
+    }
+    if (this.audioSessionRetire.size >= CALL_QUEUE_MAX) {
+      this.close(true); return;
+    }
+    const retire = new AbortController();
+    this.audioSessionRetire.add(retire);
+    void dispatchSession(request, { actionToken: token, signal: retire.signal })
+      .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "That didn't work." } }))
+      .then(result => {
+        this.audioSessionRetire.delete(retire);
+        if (this.closed) return;
+        if (!result.ok) {
+          const safeRefusal = parseActionRefusal(result.refusal) ?? { code: "failed", text: "Audio session failed." };
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: safeRefusal });
+          return;
+        }
+        const parsed = parseScreenAudioSessionSnapshot(result.data);
+        if (!parsed) {
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "failed", text: "Audio session returned an invalid state." } });
+          return;
+        }
+        if (jsonBytes(parsed) > AUDIO_REPLY_BYTES_MAX) {
+          reply({ v: 2, op: "audio-session-reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That transcript is too large to return." } });
+          return;
+        }
+        reply({ v: 2, op: "audio-session-reply", id: request.id, ok: true, data: parsed });
+      });
+  }
+  protected audio(request: AudioRequest): void {
+    if (this.shape !== "v2" || !this.wantsAudio) {
+      this.close(true); return;
+    }
+    const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
+    const capture = this.actions?.captureAudio;
+    const token = this.receipt.action_token;
+    if (!capture || !token) {
+      reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: { code: "unavailable", text: "Audio capture is unavailable on this screen." } });
+      return;
+    }
+    if (this.audioBusy) {
+      reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: { code: "conflict", text: "Audio capture is already open." } });
+      return;
+    }
+    this.audioBusy = true;
+    const retire = new AbortController();
+    this.audioRetire = retire;
+    void capture(request.mode, { actionToken: token, signal: retire.signal })
+      .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "That didn't work." } }))
+      .then(result => {
+        if (this.audioRetire === retire) {
+          this.audioRetire = null;
+          this.audioBusy = false;
+        }
+        if (this.closed) return;
+        if (!result.ok) { reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: result.refusal }); return; }
+        const parsed = parseScreenAudioCapture(result.data);
+        if (!parsed) {
+          reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: { code: "failed", text: "Audio capture returned an invalid result." } });
+          return;
+        }
+        if (jsonBytes(parsed) > AUDIO_REPLY_BYTES_MAX) {
+          reply({ v: 2, op: "audio-reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That transcript is too large to return." } });
+          return;
+        }
+        reply({ v: 2, op: "audio-reply", id: request.id, ok: true, data: parsed });
+      });
+  }
   protected tool(request: ToolRequest): void {
     const actions = this.actions;
     if (this.shape !== "v2" || !this.wantsTools || !actions?.invoke || this.toolBusy) {
@@ -481,6 +863,14 @@ export class ScreenChannel extends FrameChannel {
   close(report = false): void {
     for (const retire of this.callRetire) retire.abort();
     this.callRetire = [];
+    for (const retire of this.audioSessionRetire) retire.abort();
+    this.audioSessionRetire.clear();
+    for (const retire of this.whatsappMediaRetire) retire.abort();
+    this.whatsappMediaRetire.clear();
+    this.actions?.disposeAudioSession?.();
+    this.audioRetire?.abort();
+    this.audioRetire = null;
+    this.audioBusy = false;
     this.slots?.close();
     super.close(report);
   }
@@ -490,9 +880,34 @@ export class ScreenChannel extends FrameChannel {
     if (!shape) return false;
     const accepts: readonly string[] = ready.accepts ?? [];
     const records = accepts.includes(SCREEN_RECORDS_V1);
+    const wantsLocale = accepts.includes(SCREEN_LOCALE_V1);
+    const wantsAudio = accepts.includes(SCREEN_AUDIO_V1);
+    const wantsAudioV2 = accepts.includes(SCREEN_AUDIO_V2);
+    if (wantsAudio && wantsAudioV2) return false;
+    if (wantsLocale && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
+    // CAD-2555 — the route (and so its params) exists only on a records screen.
+    const wantsRouteParams = accepts.includes(SCREEN_ROUTE_PARAMS_V1);
+    if (wantsRouteParams && !records) return false;
+    if ((wantsAudio || wantsAudioV2) && (shape !== "v2" || !accepts.includes(SCREEN_V2))) return false;
     if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
+    const wantsWhatsAppCompose = accepts.includes(SCREEN_WHATSAPP_COMPOSE_V1);
+    if (wantsWhatsAppCompose && (!records || this.surfaceRole !== "primary" || !admitsWhatsAppComposer(this.receipt) ||
+        this.projection.installation.name !== "waba" || !this.actions?.onWhatsAppCompose)) return false;
+    this.wantsWhatsAppCompose = wantsWhatsAppCompose;
+    this.wantsReplyAvailability = accepts.includes(SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1);
+    if (this.wantsReplyAvailability && !wantsWhatsAppCompose) return false;
+    this.wantsReplyOverlay = accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2);
+    this.wantsReplyLayout = this.wantsReplyOverlay || accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1);
+    if (this.wantsReplyLayout && (!this.wantsReplyAvailability || !this.actions?.onWhatsAppReplyLayout)) return false;
+    const wantsWhatsAppMedia = accepts.includes(SCREEN_WHATSAPP_MEDIA_V1);
+    if (wantsWhatsAppMedia && (!records || !admitsWhatsAppMediaDownload(this.receipt) ||
+        this.projection.installation.name !== "waba" || !this.actions?.onWhatsAppMediaDownload)) return false;
+    this.wantsWhatsAppMedia = wantsWhatsAppMedia;
     this.records = records;
-    this.crmLocale = records && accepts.includes(CRM_LOCALE_V1);
+    this.wantsLocale = wantsLocale;
+    this.wantsRouteParams = wantsRouteParams;
+    this.wantsAudio = wantsAudio;
+    this.wantsAudioV2 = wantsAudioV2;
     this.shape = shape;
     // Record the tool/action opt-in: the child may then send `tool` ops,
     // which only run when the host holds a live mount action context.
@@ -510,12 +925,20 @@ export class ScreenChannel extends FrameChannel {
     // primary or a drawer; a frame that does not advertise it never sees
     // the message.
     this.wantsSurfaces = accepts.includes(SCREEN_SURFACES_V1);
+    // CAD-2525 — canvas/readOnly ride on the surface push, never alone.
+    this.wantsCanvas = this.wantsSurfaces && accepts.includes(SCREEN_CANVAS_V1);
     return true;
   }
-  /** Only a v2 child, for a ref the last PUSH carried; anything else closes. */
+  /** Only a v2 child, for a ref the last PUSH carried or a call reply just
+   *  returned (CAD-1324); anything else closes. */
   protected asset(ref: string): void {
-    if (this.shape !== "v2" || !this.refs.has(ref) ||
-        (!this.assets.has(ref) && this.assets.size >= ASSET_QUEUE_MAX)) { this.close(true); return; }
+    if (this.shape !== "v2" || !(this.refs.has(ref) || this.dynamicDraftRefs.has(ref)) ||
+        (!this.assets.has(ref) && this.assets.size >= ASSET_QUEUE_MAX)) {
+      // The ref class only: a full ref names a draft, and nothing else about the request is logged.
+      const kind = ref.startsWith("draft-image:") ? "draft-image" : this.refs.has(ref) ? "pushed" : "unknown";
+      console.warn(`screen frame closed: asset request refused (${this.shape === "v2" ? kind : "not v2"})`);
+      this.close(true); return;
+    }
     if (!this.assets.has(ref)) { this.assets.add(ref); this.queue.push(ref); this.pump(); }
   }
   update(projection: ScreenPush): void {
@@ -550,6 +973,9 @@ export class ScreenChannel extends FrameChannel {
     if (!advertised.length || !projection.actions?.length) return projection;
     return { ...projection, actions: [...projection.actions, ...advertised] };
   }
+  private hasBaseActions(): boolean {
+    return this.records ? Boolean(this.receipt.operations?.length) : Boolean(this.projection.actions?.length);
+  }
   /** Send the negotiated shape, or close when it cannot be sent within bounds. */
   protected send(): void {
     // DSN-1: `run_receipts` is a host-derived marker, never forwarded. Any
@@ -560,6 +986,7 @@ export class ScreenChannel extends FrameChannel {
     // the slot path still validates, plans and confirms natively.
     // CAD-1447: the marker also requires the child's `screen-media.v1` opt-in —
     // the released `screen-actions.v1` SDK rejects the unknown root field.
+    const hasBaseActions = this.hasBaseActions();
     const projection: ScreenPush = this.records ? { ...this.projection, actions: [...(this.receipt.operations ?? [])] } : { ...this.projection };
     // CAD-1777 — the host-local presentation verbs are advertised beside
     // the receipt's records operations, and only to a frame that has both
@@ -572,7 +999,9 @@ export class ScreenChannel extends FrameChannel {
       projection.actions = [...advertised, ...drawerVerbs.filter(verb => !advertised.includes(verb))];
     }
     // Presentation negotiation grants no actions. Older/other peers retain their exact shape.
-    if (!this.crmLocale || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
+    if (!this.wantsLocale || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
+    // CAD-2555 — a frame without `screen-route-params.v1` is pushed the route exactly as before.
+    if (!this.wantsRouteParams && projection.route?.params) { const { params: _params, ...route } = projection.route; projection.route = route; }
     delete projection.run_receipts;
     if (!this.records && this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
       projection.run_receipts = 1;
@@ -582,9 +1011,11 @@ export class ScreenChannel extends FrameChannel {
     delete projection.original_downloads;
     delete projection.media_previews;
     delete projection.media_chat_references;
+    delete projection.audio_capture;
     if (this.shape === "v2" && this.originalDownloadAdmits() && projection.actions?.length) projection.original_downloads = 1;
     if (this.shape === "v2" && this.mediaAdmits("media.read")) projection.media_previews = 1;
     if (this.shape === "v2" && this.mediaAdmits("media.chat.attach")) projection.media_chat_references = 1;
+    if (this.shape === "v2" && ((this.wantsAudio && this.actions?.captureAudio) || (this.wantsAudioV2 && this.actions?.audioSession)) && this.receipt.action_token && hasBaseActions) projection.audio_capture = 1;
     const push = shapeFor(this.records ? projection : this.withMediaVerbs(this.withToolAliases(projection)), this.shape);
     if (!push) { this.close(true); return; }
     this.refs = this.shape === "v2" ? pushedAssetRefs(push) : new Set();
@@ -595,9 +1026,10 @@ export class ScreenChannel extends FrameChannel {
     this.postSurface();
     this.port?.postMessage(push);
   }
-  private rememberDraftAssetRefs(data:unknown,args:Record<string,unknown>):void {
+  private rememberDraftAssetRefs(data:unknown,args:Record<string,unknown>):string[] {
+    const admitted:string[]=[];
     const alias=args.alias;
-    if(typeof alias!=="string"||!TOOL_ALIAS.test(alias)) return;
+    if(typeof alias!=="string"||!TOOL_ALIAS.test(alias)) return admitted;
     const values=Array.isArray((data as Record<string,unknown>|null)?.drafts)?(data as {drafts:unknown[]}).drafts:[data];
     for(const value of values){
       if(!value||typeof value!=="object"||Array.isArray(value)) continue;
@@ -607,9 +1039,10 @@ export class ScreenChannel extends FrameChannel {
       for(const ref of this.dynamicDraftRefs) if(ref.startsWith(prefix)) this.dynamicDraftRefs.delete(ref);
       if(typeof row.asset_id==="string"&&row.asset_id.length>0){
         const ref=`draft-image:${id}:${alias}`;
-        if(ASSET_REF.test(ref)&&this.dynamicDraftRefs.size<128)this.dynamicDraftRefs.add(ref);
+        if(ASSET_REF.test(ref)&&this.dynamicDraftRefs.size<128){this.dynamicDraftRefs.add(ref);admitted.push(ref);}
       }
     }
+    return admitted;
   }
   private pump(): void {
     while (!this.closed && this.loading < ASSET_PARALLEL && this.queue.length) {

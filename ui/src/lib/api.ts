@@ -1,4 +1,5 @@
 import type { LanePayload } from "../features/issues/lane";
+import { sendMasterMessageViaSocket } from "./boardSocket";
 import { ConditionalGet } from "./conditionalGet";
 import { ApiError, errorMessage } from "./apiError";
 import { sessionKey, sessionHeaders } from "./sessionKey";
@@ -12,24 +13,54 @@ import {
   type PrivateOperation,
 } from "./privateSession";
 import type {
+  AgentAccess,
   AgentDetail,
   AgentRegisterBody,
+  AgentProfileBody,
+  HiredProfile,
+  StoredAgentProfile,
+  WorkspaceSkillRead,
+  WorkspaceSkillSummary,
   AgentRolesPayload,
+  AgentSkillsResult,
+  AgentToolsResult,
   InstructionsResult,
   AgentsPayload,
   AppDetail,
   AppOutputsPayload,
   AppRunsPayload,
   AppsPayload,
+  ConnectionAssetPayload,
+  ConnectionAssetsPayload,
   ConnectionPayload,
   ConnectionProvidersPayload,
+  ConnectionSitePayload,
+  ConnectionSitesPayload,
   ConnectionsPayload,
   ConnectionVerificationPayload,
+  CredentialRequest,
+  CustomMcpAuthKind,
+  CustomMcpConnectionPayload,
+  CustomMcpCreatePayload,
+  CustomMcpGuideImportPayload,
+  CustomMcpListPayload,
+  CustomMcpOAuthStartPayload,
+  CustomMcpRevokePayload,
+  CustomMcpToolMode,
+  TempChannelAuditDetailPayload,
+  TempChannelAuditListPayload,
+  TempChannelClosePayload,
+  TempChannelDecidePayload,
+  TempChannelDecision,
+  TempChannelRotatePeerPayload,
   Health,
+  ProjectTimeline,
+  ProtectedEntry,
   IssueCard,
   IssueDetail,
   IssueHistoryEntry,
   MasterCommandResult,
+  MasterIdentity,
   MasterModels,
   MasterState,
   MemoryCard,
@@ -53,11 +84,110 @@ import type {
   ThreadRef,
   WorkflowPreview,
   WorkflowsPayload,
+  AvatarLook,
 } from "./types";
 
-/** The daemon-minted retained-file row `POST /api/chat/upload` answers
- *  (CAD-1168): the id is the only handle; metadata is server-derived. */
-export interface ChatFileRow {
+export interface HostedStepUpVerified {
+  ok: true;
+  authenticated_at: number;
+  fresh_until: number;
+}
+
+export type ApproveCardState =
+  | "ready"
+  | "needs_1"
+  | "needs_n"
+  | "merging"
+  | "merged"
+  | "head_moved"
+  | "ejected"
+  | "unavailable";
+
+export interface GateChecklistItem {
+  id: string;
+  label: string;
+  status: "pass" | "fail" | "pending" | "info";
+  summary: string;
+}
+
+export interface HostedCheckProof {
+  context: string;
+  workflow_path: string;
+  run_url: string;
+}
+
+export interface HostedCountedVerdict {
+  kind?: string;
+  outcome?: string;
+  principal?: string;
+  github_login?: string | null;
+  identity_source?: string;
+  head_sha?: string;
+  recorded_at?: string;
+}
+
+export interface ApproveCardView {
+  ok: true;
+  project: string;
+  issue: string;
+  repo: string;
+  pr: number;
+  title: string;
+  pr_url: string;
+  state: ApproveCardState;
+  headline: string;
+  progress_stage: "checks" | "approved" | "in_queue" | "merged" | null;
+  can_approve_and_merge: boolean;
+  can_revoke: boolean;
+  can_send_back: boolean;
+  step_up_fresh: boolean;
+  checklist: GateChecklistItem[];
+  details: {
+    head_sha: string;
+    base_ref: string;
+    base_sha: string;
+    merge_base_sha: string | null;
+    delivery_class: string;
+    policy_digest: string | null;
+    approval_kind: string | null;
+    approval_id: string | null;
+    evidence_id: string | null;
+    reasons: string[];
+    check_proofs: HostedCheckProof[];
+    counted_verdicts: HostedCountedVerdict[];
+  };
+}
+
+export interface HostedMergeReceipt {
+  ok: true;
+  state: "merging";
+  approval_id: string;
+  evidence_id: string;
+  recorded_via: string;
+  board_revocable: boolean;
+  queued: boolean;
+  auto_merge_enabled: boolean;
+  comment_url: string | null;
+}
+
+export interface HostedSendBackReceipt {
+  ok: true;
+  state: "sent_back";
+  issue: string;
+  ticket: unknown;
+  outcome?: "stopped" | "already_merged" | "dequeue_unavailable";
+}
+
+export interface HostedStepUpChallenge {
+  challenge_id: string;
+  expires_at: number;
+  email_hint: string;
+}
+
+/** The native daemon-minted retained-file row `POST /api/chat/upload` answers
+ *  (CAD-1168): the id is the only handle; metadata is server-derived. A hosted
+ *  board answers `HostedChatFileReceipt` instead. */
+export interface NativeChatFileRow {
   id: string;
   sha256: string;
   size: number;
@@ -72,14 +202,35 @@ export interface ChatFileRow {
   created: number;
 }
 
-/** Validate the daemon's ChatFile::to_json receipt before a row can become
+/** The hosted tenant board's `POST /api/chat/upload` receipt (AOS-510,
+ *  agenticos-v2 `upload-routes.ts`): no native scope/user/thread proofs
+ *  exist there, only the `chf-` id, the content hash and the conversation
+ *  the file was stored under. A send names it by `attachments: [{id}]`. */
+export interface HostedChatFileReceipt {
+  id: string;
+  sha256: string;
+  size: number;
+  mime: string;
+  name: string;
+  conversation: string;
+  created: number;
+}
+
+/** A send carries only `{id}`; the composer store also keeps `name` and `mime`, which both receipts carry. */
+export type ChatFileRow = NativeChatFileRow | HostedChatFileReceipt;
+
+/** Validate the upload receipt (native ChatFile::to_json or the hosted receipt) before a row can become
  *  ready. This checks the wire shape only; native scope proofs remain the
  *  authority for upload and later reads. */
-function decodeChatFileRow(value: unknown): ChatFileRow {
+export function decodeChatFileRow(value: unknown): ChatFileRow {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
   }
   const row = value as Record<string, unknown>;
+  // The two receipts are told apart by `conversation`, which no native row
+  // carries. A row naming it is held to the hosted shape alone and may not
+  // also carry native identity fields; neither shape borrows the other's.
+  if ("conversation" in row) return decodeHostedReceipt(row);
   if (
     typeof row.id !== "string" || !/^chf-[0-9a-f]{32}$/.test(row.id) ||
     typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256) ||
@@ -96,7 +247,23 @@ function decodeChatFileRow(value: unknown): ChatFileRow {
   ) {
     throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
   }
-  return row as unknown as ChatFileRow;
+  return row as unknown as NativeChatFileRow;
+}
+
+function decodeHostedReceipt(row: Record<string, unknown>): HostedChatFileReceipt {
+  if (
+    typeof row.id !== "string" || !/^chf-[0-9a-f]{32}$/.test(row.id) ||
+    typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256) ||
+    typeof row.size !== "number" || !Number.isSafeInteger(row.size) || row.size <= 0 ||
+    typeof row.mime !== "string" || row.mime.length === 0 ||
+    typeof row.name !== "string" || row.name.trim().length === 0 ||
+    typeof row.conversation !== "string" || row.conversation.length === 0 ||
+    typeof row.created !== "number" || !Number.isFinite(row.created) ||
+    ["scope", "context_id", "uploader", "user_id", "thread_id", "location_version"].some((k) => k in row)
+  ) {
+    throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
+  }
+  return row as unknown as HostedChatFileReceipt;
 }
 
 /** Immutable native selector for a retained file. Home may carry its
@@ -120,6 +287,13 @@ export interface ThreadPage {
   cursor?: number;
   /** Backward reads (`tail`/`before`): older entries remain. */
   more_before?: boolean;
+  /** Backward reads: the lowest seq the page scanned — the `before`
+   *  continuation past rows a projection filtered out. */
+  scanned_before?: number;
+  /** Forward reads: the scan filled the page, so raw rows may remain. */
+  more_after?: boolean;
+  /** Cloud content is incomplete/unavailable; ordinary rows and cursors remain usable. */
+  cloud_withheld?: string;
   /** CAD-1700: the complete thread's newest visible assistant reply seq
    *  (0 when none), independent of the page cursor. */
   reply_seq?: number;
@@ -139,19 +313,79 @@ export interface MemberAssistState {
     authority_rev?: number;
     created?: number;
     updated?: number;
+    /** CAD-1817: the binding's committed identity. `name`/`tone` null
+     *  mean unset; `look` is always a canonical catalog slug; `revision`
+     *  is the binding's integer bootstrap revision. An unreadable
+     *  identity fails the read rather than silently reporting unset. */
+    identity: MemberAssistantIdentity;
   };
   conversation_id: string | null;
 }
 
-/** `POST /api/member-assistant/history` — the member's bound conversation
- *  page. `entries` carry the stored `role`/`kind`/`seq`; `cursor` is the
- *  forward resume watermark. A member names no thread — the binding's
- *  own conversation is always the read. */
+/** The private assistant's committed identity projection. User address
+ *  and preferences are deliberately absent — they stay private and are
+ *  not part of the displayed identity. */
+export interface MemberAssistantIdentity {
+  name: string | null;
+  tone: string | null;
+  look: AvatarLook;
+  revision: number;
+}
+
+export type MemberAssistProfileAction = "update" | "complete" | "defer" | "resume";
+
+/** CAD-2269 / AOS-570: `POST /api/member-assistant/profile` — zero-token
+ *  fenced update of the signed-in subject's personal assistant identity
+ *  (`name`, `look`) and `bootstrap_state` lifecycle. */
+export interface MemberAssistProfileRequest {
+  expected_revision: number;
+  action: MemberAssistProfileAction;
+  name?: string;
+  look?: AvatarLook;
+  /** CAD-2354: the member's own instructions; blank clears, omitted keeps. */
+  instructions?: string;
+}
+
+/** CAD-2354: `POST /api/master/instructions` (owners) and
+ *  `POST /api/member-assistant/instructions` (the caller). The workspace
+ *  revision is a decimal string, the personal one a number. */
+export interface InstructionsRead<R> {
+  instructions: string | null;
+  revision: R;
+  built_in_instruction_tokens?: number;
+}
+
+export interface MemberAssistProfileResult extends MemberAssistState {
+  action: MemberAssistProfileAction;
+  applies: "next_turn";
+}
+
+/** `POST /api/master/identity` (CAD-1817): the proven operator's
+ *  workspace-identity edit. Only the supplied fields change; an empty
+ *  string clears `name`/`tone`. */
+export interface MasterIdentityUpdate {
+  expected_revision: string;
+  name?: string;
+  tone?: string;
+  look?: AvatarLook;
+  /** CAD-2354: the company instructions; blank clears, omitted keeps. */
+  instructions?: string;
+}
+
+/** The committed result and when it takes effect for the coordinator. */
+export interface MasterIdentityUpdateResult {
+  identity: MasterIdentity;
+  applies: "next_turn";
+}
+
+/** The member's bound assistant history, with opaque page positions. */
 export interface MemberAssistHistory {
-  conversation: { id: string; alias: string; created?: string; updated?: string } | null;
+  conversation: { id: string; alias: string };
   entries: unknown[];
-  cursor?: number;
-  more_before?: boolean;
+  cursor: string | null;
+  before_cursor: string | null;
+  more_before: boolean | null;
+  more_after: boolean | null;
 }
 
 /** `POST /api/member-assistant/send` receipt: the accepted message id and
@@ -223,6 +457,8 @@ export interface WriteResp {
   issue: IssueDetail;
   card: IssueCard;
   warnings?: string[];
+  /** Create only: the idempotency key answered a ticket an earlier call made. */
+  replayed?: boolean;
 }
 
 /** `GET /api/issues/<id>/kickoff` — enough for the drawer confirm. */
@@ -270,6 +506,31 @@ async function write<T extends object | undefined>(
   });
 }
 
+function unwrapPostJson<T>(status: number, fallbackMessage: string, parsed: unknown): T {
+  if (status < 200 || status >= 300) {
+    const record =
+      parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    const nested =
+      record && typeof record.error === "object" && record.error !== null && !Array.isArray(record.error)
+        ? (record.error as Record<string, unknown>)
+        : null;
+    const nestedCode =
+      typeof record?.code === "string"
+        ? record.code
+        : typeof nested?.code === "string"
+          ? nested.code
+          : undefined;
+    throw new ApiError(
+      errorMessage(parsed, fallbackMessage),
+      status,
+      record ? { ...record, ...(nestedCode === undefined ? {} : { code: nestedCode }) } : undefined,
+    );
+  }
+  return parsed as T;
+}
+
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
 async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
   return usingPrivateOperation(operation, async (op) => {
@@ -284,14 +545,41 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
     }, op);
     const parsed = await resp.json().catch(() => null);
     op.assertCurrent();
-    if (!resp.ok) {
-      throw new ApiError(
-        errorMessage(parsed, `${resp.status} ${resp.statusText}`),
-        resp.status,
-        parsed ?? undefined,
-      );
-    }
-    return parsed as T;
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
+  });
+}
+
+/** A board write whose verb is PUT and which answers its own JSON. */
+async function put<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
+  });
+}
+
+/** A board delete whose response is its own JSON. */
+async function del<T>(path: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "DELETE",
+      headers: {
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    return unwrapPostJson<T>(resp.status, `${resp.status} ${resp.statusText}`, parsed);
   });
 }
 
@@ -399,6 +687,88 @@ export interface MyWorkMembership {
 }
 
 
+type CredentialRequestWire = Record<string, unknown>;
+
+/**
+ * CAD-1085 projection adapter. The native board returns the full
+ * `CredentialRequest`; the hosted custody board returns the normative
+ * `{provider_kind, allowed_verb, ...}` projection. The card and form read
+ * one local shape, so normalize at the client boundary. Unknown fields are
+ * ignored; native-only fields absent from the hosted projection get inert
+ * defaults, never fabricated authority.
+ */
+export function normalizeCredentialRequest(raw: unknown): CredentialRequest {
+  const row = (raw ?? {}) as CredentialRequestWire;
+  const nativeVerb = row.verb;
+  if (
+    typeof row.request_id === "string" &&
+    typeof row.provider === "string" &&
+    (nativeVerb === "enroll" || nativeVerb === "rotate" || nativeVerb === "verify")
+  ) {
+    return row as unknown as CredentialRequest;
+  }
+  const provider = typeof row.provider_kind === "string" ? row.provider_kind : "";
+  const verb =
+    row.allowed_verb === "rotate" ||
+    row.allowed_verb === "verify" ||
+    row.allowed_verb === "enroll"
+      ? row.allowed_verb
+      : "enroll";
+  const state =
+    row.state === "pending" ||
+    row.state === "submitting" ||
+    row.state === "done" ||
+    row.state === "cancelled" ||
+    row.state === "expired" ||
+    row.state === "unknown"
+      ? row.state
+      : "unknown";
+  const shape =
+    provider === "smtp"
+      ? "smtp"
+      : provider === ""
+        ? null
+        : provider === "openrouter"
+          ? "token"
+          : null;
+  return {
+    request_id: typeof row.request_id === "string" ? row.request_id : "",
+    request_revision: 0,
+    provider,
+    verb,
+    connection_id: null,
+    target_id: "",
+    display_alias: typeof row.display_alias === "string" ? row.display_alias : provider,
+    shape,
+    scopes: [],
+    expected_credential_revision: null,
+    expected_authorization_revision: null,
+    custody_domain: "",
+    custody_epoch: 0,
+    context_digest: "",
+    requester_kind: "operator_ui",
+    requester_participant: null,
+    conversation_id: null,
+    target_agent_uid: null,
+    state,
+    status: typeof row.status === "string" ? row.status : "",
+    result_code: null,
+    verification_request_id: null,
+    entry_url: typeof row.entry_url === "string" ? row.entry_url : null,
+    created_at_ms: 0,
+    updated_at_ms: 0,
+    expires_at_ms: typeof row.expires_at_ms === "number" ? row.expires_at_ms : 0,
+    entry_path: "",
+    readiness: undefined,
+  };
+}
+
+function normalizeRequestReply<T extends { request: unknown }>(
+  value: T,
+): Omit<T, "request"> & { request: CredentialRequest } {
+  return { ...value, request: normalizeCredentialRequest(value.request) };
+}
+
 export const api = {
   health: () => get<Health>("/api/health"),
   /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load.
@@ -410,6 +780,26 @@ export const api = {
   myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
   myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
+  /** `GET /api/projects/<key>/policy` — the board's own policy record. The
+   *  native and hosted shapes differ (CAD-2255), so this is handed back
+   *  untyped and `features/projects/policyContract` validates it. */
+  projectPolicy: (project: string) =>
+    get<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`),
+  /** `POST /api/projects/<key>/policy` (CAD-1950, native) — the same writer
+   *  the CLI calls. `members` is the full grant list. */
+  setProjectPolicyNative: (
+    project: string,
+    req: { visibility: "workspace-visible" | "private"; members: string[] },
+  ) =>
+    post<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`, req),
+  /** `PUT /api/projects/<key>/policy` (AOS-530, hosted) — `grants` are
+   *  verified member subject ids and `if_rev` pins the stored revision
+   *  (`""` for a project with no row yet). */
+  setProjectPolicyHosted: (
+    project: string,
+    req: { visibility: "workspace-visible" | "private"; grants: string[]; if_rev: string },
+  ) =>
+    put<unknown>(`/api/projects/${encodeURIComponent(project)}/policy`, req),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });
     if (expectedRevision) query.set("expected_revision", expectedRevision);
@@ -438,8 +828,6 @@ export const api = {
   agents: () => get<AgentsPayload>("/api/agents"),
   agent: (alias: string) =>
     get<AgentDetail>(`/api/agents/${encodeURIComponent(alias)}`),
-  monitorAck: (monitor: string, alert: number) =>
-    post<{ ok: boolean; alert: unknown }>(`/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`, {}),
   memories: (opts: { project?: string; status?: string; type?: string } = {}) => {
     const q = new URLSearchParams();
     if (opts.project) q.set("project", opts.project);
@@ -465,6 +853,8 @@ export const api = {
     blocked_by?: string[];
     /** CAD-140: the report/idea description, filed with the issue. */
     body?: string;
+    /** CAD-2188: a retry with the same key answers the ticket the first call made. */
+    idempotency_key?: string;
   }) => write("POST", "/api/issues", req),
 
   patch: (
@@ -573,7 +963,7 @@ export const api = {
    *  authority: the contextual Threads reply pins the recorded sender it
    *  is answering, and the daemon refuses before any side effect when
    *  the alias now names a different uid. Ordinary sends omit it. */
-  threadSend: (
+  threadSend: async (
     alias: string,
     text: string,
     message: string,
@@ -584,26 +974,40 @@ export const api = {
     operation?: PrivateOperation,
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     expectedRecipientUid?: string,
-  ) =>
-    post<Record<string, unknown>>(
+  ): Promise<Record<string, unknown>> => {
+    const payload: Record<string, unknown> = {
+      text,
+      message,
+      ...(refs && refs.length > 0 ? { refs } : {}),
+      ...(app ? { app } : {}),
+      // CAD-1098: only a selector; the daemon resolves scope, subject and install.
+      ...(conversation ? { conversation } : {}),
+      // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
+      // grammar and existence, never the client's metadata.
+      ...(attachments && attachments.length > 0
+        ? { attachments: attachments.map((a) => ({ id: a.id })) }
+        : {}),
+      ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
+      ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
+    };
+    const hasNativeOnlyContext =
+      (refs !== undefined && refs.length > 0) ||
+      (mediaRefs !== undefined && mediaRefs.length > 0) ||
+      Boolean(expectedRecipientUid);
+    if (alias === "master" && !hasNativeOnlyContext) {
+      const viaSocket = await sendMasterMessageViaSocket(alias, payload, operation);
+      if (viaSocket !== null) {
+        return unwrapPostJson<Record<string, unknown>>(viaSocket.status, `${viaSocket.status}`, viaSocket.body);
+      }
+    }
+    return post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
-      {
-        text,
-        message,
-        ...(refs && refs.length > 0 ? { refs } : {}),
-        ...(app ? { app } : {}),
-        // CAD-1098: only a selector; the daemon resolves scope, subject and install.
-        ...(conversation ? { conversation } : {}),
-        // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
-        // grammar and existence, never the client's metadata.
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
-        ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
-        ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
-      },
+      payload,
       operation,
-    ),
+    );
+  },
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
-   *  Operator-only multipart; returns the daemon-minted row. `signal`
+   *  Operator-only multipart; returns the native daemon row or the hosted receipt. `signal`
    *  aborts only this upload's transport (a canceled row's late answer
    *  is ignored by its caller); it never deletes a retained blob. */
   chatFileUpload: (
@@ -690,12 +1094,19 @@ export const api = {
    *  assistant envelope server-side. Body is `{}`. */
   memberAssistState: () =>
     post<MemberAssistState>(`/api/member-assistant/state`, {}),
+  /** CAD-2269 / AOS-570: `POST /api/member-assistant/profile` — fenced
+   *  actor-bound personal identity and bootstrap lifecycle update. */
+  memberAssistProfileUpdate: (body: MemberAssistProfileRequest) =>
+    post<MemberAssistProfileResult>(`/api/member-assistant/profile`, body),
+  /** CAD-2354: `POST /api/member-assistant/instructions` — the caller's own
+   *  instructions and the revision to write at. A board without it answers 404/405. */
+  memberAssistInstructions: () =>
+    post<InstructionsRead<number>>(`/api/member-assistant/instructions`, {}),
   /** `POST /api/member-assistant/history` — a page of the member's bound
-   *  conversation. `after`/`before`/`tail`/`limit` match the daemon's own
-   *  fields; a member never names a thread (the binding owns it). */
+   *  conversation. Positions are opaque; the binding owns the thread. */
   memberAssistHistory: (page: {
-    after?: number;
-    before?: number;
+    after?: string;
+    before?: string;
     tail?: boolean;
     limit?: number;
   }) => post<MemberAssistHistory>(`/api/member-assistant/history`, { ...page }),
@@ -803,13 +1214,49 @@ export const api = {
    * endpoint kind to `sandbox`.
    */
   registerAgent: (body: AgentRegisterBody) => post<Record<string, unknown>>("/api/agents", body),
-  /** `GET /api/agent-roles` (CAD-1752) — the role catalogue, the install's
-   *  runtime and the model each role would launch on. Any signed-in viewer. */
+  /** `POST /api/agent-profiles` (CAD-1989) - a hire saves a profile and
+   *  launches nothing. Operator only. */
+  createAgentProfile: (body: AgentProfileBody) =>
+    post<{ profile: HiredProfile }>("/api/agent-profiles", body),
+  /** `GET /api/agent-profiles/<id>` - the stored profile and its revision. A
+   *  hosted member may read an active one. */
+  agentProfile: (id: string) =>
+    get<{ profile: StoredAgentProfile }>(`/api/agent-profiles/${encodeURIComponent(id)}`),
+  /** `POST /api/agent-profiles/<id>` - the whole profile and the revision it
+   *  was read at. Owner only; a stale revision answers 409. */
+  saveAgentProfile: (id: string, body: object) =>
+    post<{ profile: StoredAgentProfile }>(`/api/agent-profiles/${encodeURIComponent(id)}`, body),
+  /** `GET /api/workspace-skills` (CAD-2419) - the hosted workspace skill
+   *  library. Any member; a board without it answers 404 or 501. */
+  workspaceSkills: () => get<{ skills: WorkspaceSkillSummary[] }>("/api/workspace-skills"),
+  /** `GET /api/workspace-skills/<name>[?revision=N]` - one revision, the latest by default. */
+  workspaceSkill: (name: string, revision?: number) =>
+    get<WorkspaceSkillRead>(
+      `/api/workspace-skills/${encodeURIComponent(name)}${revision === undefined ? "" : `?revision=${revision}`}`,
+    ),
+  /** `POST /api/workspace-skills/<name>/approve` - owner only: exactly the revision read, by its digest. */
+  approveWorkspaceSkill: (name: string, revision: number, digest: string) =>
+    post<{ skill: WorkspaceSkillSummary }>(`/api/workspace-skills/${encodeURIComponent(name)}/approve`, { revision, digest }),
+  /** `POST /api/workspace-skills/<name>/revoke` - owner only: the approval read, by its digest. */
+  revokeWorkspaceSkill: (name: string, digest: string) =>
+    post<{ skill: WorkspaceSkillSummary }>(`/api/workspace-skills/${encodeURIComponent(name)}/revoke`, { digest }),
+  /** `POST /api/workspace-skills/<name>/delete` - owner only: an unapproved skill, at its latest revision. */
+  deleteWorkspaceSkill: (name: string, expectedRevision: number) =>
+    post<{ name: string; deleted: true }>(`/api/workspace-skills/${encodeURIComponent(name)}/delete`, { expectedRevision }),
+  /** `GET /api/agent-roles` (CAD-1752) — the role catalogue. Any signed-in viewer. */
   agentRoles: () => get<AgentRolesPayload>("/api/agent-roles"),
   /** `POST /api/agents/<alias>/instructions` (CAD-1752) — replace the
    *  agent's standing instructions. Operator only. */
   setAgentInstructions: (alias: string, instructions: string) =>
     post<InstructionsResult>(`/api/agents/${encodeURIComponent(alias)}/instructions`, { instructions }),
+  /** `POST /api/agents/<alias>/skills` (CAD-2092) — replace the native
+   *  agent's selected bundled skills. Operator only; applies next session. */
+  setAgentSkills: (alias: string, skills: string[]) =>
+    post<AgentSkillsResult>(`/api/agents/${encodeURIComponent(alias)}/skills`, { skills }),
+  /** `POST /api/agents/<alias>/tools` (CAD-2092) — replace the native
+   *  agent's disabled built-in tools. Operator only; applies next session. */
+  setAgentTools: (alias: string, disabled_tools: string[]) =>
+    post<AgentToolsResult>(`/api/agents/${encodeURIComponent(alias)}/tools`, { disabled_tools }),
   /** `POST /api/plans/<epic>/approve|reject` — operator-only (CAD-328). */
   decidePlan: (epic: string, verb: "approve" | "reject", reason?: string) => {
     let req: ReturnType<typeof planDecision>;
@@ -944,11 +1391,60 @@ export const api = {
       `/api/connection-providers/${encodeURIComponent(provider)}/connect`,
       {},
     ),
+  /**
+   * `GET /api/connection-custody/status` — the custody facts as the daemon
+   * reports them: configured/unlocked/fenced, the isolation kind and whether
+   * the deployment is protected. Never credential material, never a probe.
+   */
+  connectionCustodyStatus: () =>
+    get<{
+      custody: {
+        configured: boolean;
+        unlocked: boolean;
+        fenced: boolean;
+        isolation: string;
+        protected: boolean;
+      };
+    }>("/api/connection-custody/status"),
+  /**
+   * `GET /api/agents/<alias>/access` — one agent's durable grant rows and
+   * connection metadata, plus the daemon's reported custody facts. No
+   * credential, ciphertext reference or provider response is included.
+   */
+  agentAccess: (alias: string) =>
+    get<AgentAccess>(`/api/agents/${encodeURIComponent(alias)}/access`),
   /** `GET /api/connections` — every exact provider account (operator-only). */
   connections: () => get<ConnectionsPayload>("/api/connections"),
   /** `GET /api/connections/<id>` — one connection's metadata (operator-only). */
   connection: (id: string) =>
     get<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}`),
+  /**
+   * `GET /api/connections/<id>/sites` — the live Search Console properties
+   * and the current connection-level pin (operator-only). A provider
+   * refusal is an error, never an empty list.
+   */
+  connectionSites: (id: string) =>
+    get<ConnectionSitesPayload>(`/api/connections/${encodeURIComponent(id)}/sites`),
+  /**
+   * `POST /api/connections/<id>/site` — pin one verified Search Console
+   * property (operator-only). The server re-reads the provider list before
+   * storing the exact identifier.
+   */
+  connectionSelectSite: (id: string, body: { site_url: string }) =>
+    post<ConnectionSitePayload>(`/api/connections/${encodeURIComponent(id)}/site`, body),
+  /**
+   * `GET /api/connections/<id>/assets` — live provider assets (Search Console
+   * properties, Meta ad accounts, Google Ads customers) and the current
+   * connection-level pin (operator-only).
+   */
+  connectionAssets: (id: string) =>
+    get<ConnectionAssetsPayload>(`/api/connections/${encodeURIComponent(id)}/assets`),
+  /**
+   * `POST /api/connections/<id>/asset` — pin one verified provider asset
+   * (operator-only). The server re-reads live provider assets before storing.
+   */
+  connectionSelectAsset: (id: string, body: { value: string }) =>
+    post<ConnectionAssetPayload>(`/api/connections/${encodeURIComponent(id)}/asset`, body),
   /**
    * `POST /api/connections` — enroll a scoped token for a supported
    * provider (CAD-688). Operator-only. The token crosses this one
@@ -970,6 +1466,16 @@ export const api = {
     scopes: string[];
     accept_same_uid_risk?: boolean;
   }) => post<ConnectionPayload>("/api/connections", body),
+  /**
+   * `POST /api/connections/<id>/visibility` (CAD-2428) — share a hosted
+   * platform account with the company or make it personal again. Owner
+   * only; never revokes or clears a credential.
+   */
+  connectionVisibility: (id: string, body: { visibility: "personal" | "shared" }) =>
+    post<{ ok: boolean; visibility: string }>(
+      `/api/connections/${encodeURIComponent(id)}/visibility`,
+      body,
+    ),
   /**
    * `POST /api/connections/<id>/rotate` — replace the credential,
    * preserving the connection's identity (operator-only). Omitting
@@ -995,6 +1501,115 @@ export const api = {
     post<{ connection_id: string; revoked: boolean }>(
       `/api/connections/${encodeURIComponent(id)}/revoke`,
       {},
+    ),
+  /** CAD-2556 / AOS-682: Custom MCP connectors on a hosted workspace. */
+  customMcpList: (details = true, operation?: PrivateOperation) =>
+    get<CustomMcpListPayload>(details ? "/api/connections/mcp" : "/api/connections/mcp?details=false", undefined, operation),
+  customMcpCreate: (body: {
+    name: string;
+    endpoint_url: string;
+    auth_kind?: CustomMcpAuthKind;
+    visibility?: "shared" | "personal";
+    bearer_token?: string;
+    custom_headers?: Array<{ name: string; value: string }>;
+    oauth_client?: { client_id: string; client_secret?: string; scopes?: string[] };
+    required_scopes?: string[];
+    return_to?: string;
+  }) => post<CustomMcpCreatePayload>("/api/connections/mcp", body),
+  customMcpOAuthStart: (id: string, body?: { return_to?: string }) =>
+    post<CustomMcpOAuthStartPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/oauth/start`,
+      body ?? {},
+    ),
+  customMcpSync: (id: string) =>
+    post<CustomMcpConnectionPayload>(`/api/connections/mcp/${encodeURIComponent(id)}/sync`, {}),
+  customMcpUpdateTools: (
+    id: string,
+    tools: Array<{ tool_name: string; mode: CustomMcpToolMode }>,
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/tools`,
+      { tools },
+    ),
+  customMcpEnableReviewedRead: (
+    id: string,
+    toolName: string,
+    readGuard: { snapshot_revision: number; tool_digest: string; tool_updated_at: number },
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/tools`,
+      { tools: [{ tool_name: toolName, mode: "read" }], read_guard: readGuard },
+    ),
+  customMcpAcceptDrift: (
+    id: string,
+    tools?: Array<{ tool_name: string; mode: CustomMcpToolMode }>,
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/accept-drift`,
+      tools ? { tools } : {},
+    ),
+  customMcpRotateAuth: (
+    id: string,
+    body: {
+      auth_kind: "bearer" | "header" | "none";
+      bearer_token?: string;
+      custom_headers?: Array<{ name: string; value: string }>;
+    },
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/auth`,
+      body,
+    ),
+  customMcpUpdateGuide: (
+    id: string,
+    body: { markdown: string; source?: string | null },
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/guide`,
+      body,
+    ),
+  customMcpImportGuide: (id: string, url: string) =>
+    post<CustomMcpGuideImportPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/guide/import`,
+      { url },
+    ),
+  customMcpRevoke: (id: string) =>
+    del<CustomMcpRevokePayload>(`/api/connections/mcp/${encodeURIComponent(id)}`),
+  /** AOS-693 / CAD-2627: Temp channels Inspect & Audit on a hosted workspace. */
+  tempChannelsList: (
+    params?: { status?: string; q?: string; limit?: number; offset?: number },
+    signal?: AbortSignal,
+  ) => {
+    const query = new URLSearchParams();
+    if (params?.status) query.set("status", params.status);
+    if (params?.q) query.set("q", params.q);
+    if (params?.limit !== undefined) query.set("limit", String(params.limit));
+    if (params?.offset !== undefined) query.set("offset", String(params.offset));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return get<TempChannelAuditListPayload>(`/api/connections/temp-channels${suffix}`, signal);
+  },
+  tempChannelDetail: (id: string, signal?: AbortSignal) =>
+    get<TempChannelAuditDetailPayload>(
+      `/api/connections/temp-channels/${encodeURIComponent(id)}`,
+      signal,
+    ),
+  tempChannelDecide: (
+    id: string,
+    body: { message_id: string; decision: TempChannelDecision; summary: string; body?: string },
+  ) =>
+    post<TempChannelDecidePayload>(
+      `/api/connections/temp-channels/${encodeURIComponent(id)}/decide`,
+      body,
+    ),
+  tempChannelRotatePeer: (id: string) =>
+    post<TempChannelRotatePeerPayload>(
+      `/api/connections/temp-channels/${encodeURIComponent(id)}/rotate-peer`,
+      {},
+    ),
+  tempChannelClose: (id: string, body?: { reason?: string }) =>
+    post<TempChannelClosePayload>(
+      `/api/connections/temp-channels/${encodeURIComponent(id)}/close`,
+      body ?? {},
     ),
   /**
    * `POST /api/connections/<id>/status` — the local configuration
@@ -1025,6 +1640,165 @@ export const api = {
       expected,
     ),
   /**
+   * `GET /api/credential-requests` — metadata-only human credential
+   * requests (CAD-1085), newest first. With `conversation`, exactly that
+   * conversation's; without, the recent operator list. Operator-only.
+   */
+  credentialRequests: (params?: { conversation?: string; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.conversation) query.set("conversation", params.conversation);
+    if (params?.limit !== undefined) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return get<{ requests: unknown[] }>(`/api/credential-requests${suffix}`).then(
+      (reply) => ({
+        ...reply,
+        requests: (reply.requests ?? []).map(normalizeCredentialRequest),
+      }),
+    );
+  },
+  /** `GET /api/credential-requests/<id>` — one request, metadata only. */
+  credentialRequest: (id: string) =>
+    get<{ request: unknown }>(
+      `/api/credential-requests/${encodeURIComponent(id)}`,
+    ).then(normalizeRequestReply),
+  /**
+   * `POST /api/credential-requests` — create a metadata-only request.
+   * The secret is NOT a field here: the operator types it on the trusted
+   * entry page, which the returned `entry_url` opens (absolute, pinned
+   * origin plus the request selector only).
+   */
+  credentialRequestCreate: (
+    body:
+      | {
+          provider: string;
+          verb: "enroll" | "rotate" | "verify";
+          connection_id?: string;
+          account?: string;
+          shape?: "token" | "smtp" | "native-model-api-key" | "native-model-devin-credentials";
+          scopes?: string[];
+          host?: string;
+          port?: number;
+          tls_mode?: string;
+          username?: string;
+          sender?: string;
+          sender_name?: string;
+          expected_credential_revision?: number;
+          expected_authorization_revision?: number;
+          /** Opaque broker-owned source selector for a native-model rotate. */
+          target_id?: string;
+        }
+      | {
+          /** Hosted normative create body; passed through unchanged. */
+          v: 1;
+          provider_kind: "smtp" | "openrouter";
+          allowed_verb: "enroll" | "rotate" | "verify";
+          connection_id?: string;
+          expected_credential_revision?: number;
+          expected_authorization_revision?: number;
+        },
+  ) =>
+    post<{ request: unknown }>("/api/credential-requests", body).then(
+      normalizeRequestReply,
+    ),
+  /**
+   * `POST /api/credential-requests/<id>/session` — bind this live
+   * operator session to a fresh, one-use form nonce. The nonce is the
+   * only value the submit endpoint needs besides the credential itself.
+   */
+  credentialRequestSession: (id: string) =>
+    post<{
+      request: unknown;
+      nonce: string;
+      nonce_expires_in_ms: number;
+    }>(`/api/credential-requests/${encodeURIComponent(id)}/session`, {}).then((reply) => {
+      const request = normalizeCredentialRequest(reply.request);
+      if (!request.expires_at_ms) {
+        request.expires_at_ms = Date.now() + reply.nonce_expires_in_ms;
+      }
+      return { ...reply, request };
+    }),
+  /**
+   * `POST /api/credential-requests/<id>/submit` — one attempt. The
+   * server claims the nonce before anything is forwarded; a lost or
+   * ambiguous outcome is `outcome_unknown`, never a retry.
+   */
+  credentialRequestSubmit: (
+    id: string,
+    body: {
+      nonce: string;
+      secret?: string;
+      transport?: {
+        host: string;
+        port: number;
+        tls_mode: string;
+        username: string;
+        sender: string;
+        sender_name?: string;
+      };
+    },
+  ) =>
+    post<{ request: unknown; status: string }>(
+      `/api/credential-requests/${encodeURIComponent(id)}/submit`,
+      body,
+    ).then(normalizeRequestReply),
+  /** `POST /api/credential-requests/<id>/cancel` — close an unclaimed request. */
+  credentialRequestCancel: (id: string) =>
+    post<{ request: unknown }>(
+      `/api/credential-requests/${encodeURIComponent(id)}/cancel`,
+      {},
+    ).then(normalizeRequestReply),
+  /**
+   * `POST /api/credential-entry/prepare` — the trusted Board Continue.
+   * Requires the ordinary signed-in Board operator (same-origin + CSRF);
+   * returns ONE purpose/RID-bound one-use nonce for the auth-only form
+   * POST. No credential and no URL nonce.
+   */
+  credentialEntryPrepare: (requestId: string) =>
+    post<{ nonce: string; expires_in: number }>(
+      "/api/credential-entry/prepare",
+      { request_id: requestId },
+    ),
+  /** `GET /api/protected-entry` — the deployment's trusted credential
+   *  origin. `origin: null` means trusted entry is unsupported here. */
+  protectedEntry: (signal?: AbortSignal) =>
+    get<ProtectedEntry>("/api/protected-entry", signal),
+  /**
+   * `POST /api/protected-management/session` — one one-use management nonce
+   * bound to the live operator session and the exact action parameters.
+   */
+  protectedManagementSession: (body: {
+    action: string;
+    params?: Record<string, unknown>;
+  }) =>
+    post<{
+      attempt_id: string;
+      nonce: string;
+      nonce_expires_in_ms: number;
+      owner_epoch: number;
+      workspace_id: string;
+      action: string;
+    }>("/api/protected-management/session", body),
+  /**
+   * `POST /api/protected-management/action` — claim the nonce and run the
+   * typed action once. A lost/ambiguous outcome is `outcome_unknown` and is
+   * reconciled through the status route, never retried.
+   */
+  protectedManagementAction: (body: {
+    attempt_id: string;
+    nonce: string;
+    action: string;
+    params?: Record<string, unknown>;
+  }) => post<Record<string, unknown>>("/api/protected-management/action", body),
+  /** `GET /api/protected-management/status?attempt_id=…` — metadata only. */
+  protectedManagementStatus: (attemptId: string) =>
+    get<{
+      attempt_id: string;
+      action: string;
+      state: "issued" | "claimed" | "applied" | "refused" | "unknown";
+      code: string | null;
+      expires_at_ms: number;
+    }>(`/api/protected-management/status?attempt_id=${encodeURIComponent(attemptId)}`),
+  /**
    * `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
    * what `plan propose --workflow` renders for these inputs. The query
    * is built by hand (encodeURIComponent, not URLSearchParams) because
@@ -1048,6 +1822,16 @@ export const api = {
   /** `GET /api/milestones?project=` — progress and worst health per milestone. */
   milestones: (project: string) =>
     get<{ milestones: MilestoneRow[] }>(`/api/milestones?project=${encodeURIComponent(project)}`),
+  /** CAD-2240: `GET /api/projects/<key>/timeline` — hosted boards only; any other board answers 501. */
+  projectTimeline: (project: string, query: { before?: string | null; kinds?: string[]; open?: boolean; limit?: number }, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    if (query.limit) params.set("limit", String(query.limit));
+    if (query.before) params.set("before", query.before);
+    if (query.kinds?.length) params.set("kind", query.kinds.join(","));
+    if (query.open) params.set("open", "1");
+    const qs = params.toString();
+    return get<ProjectTimeline>(`/api/projects/${encodeURIComponent(project)}/timeline${qs ? `?${qs}` : ""}`, signal);
+  },
   /** `POST /api/epics/<id>/stage` — relays `epic_stage`; operator-only on the board. */
   moveStage: (epic: string, stage: string, note?: string) =>
     post<{ epic: string; from: string; to: string; by: string; at: string }>(
@@ -1068,16 +1852,55 @@ export const api = {
    *  reason (CAD-140); the worker loop stands down. */
   declineDelivery: (issue: string, reason: string) =>
     post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/decline`, { reason }),
+  /** Hosted tenant board's `GET /api/approvals/gate` (`CAD-1946`) — server-side merge gate card state. */
+  approvalGate: (repo: string, pr: number, context?: { issue?: string; project?: string; head?: string }) =>
+    get<ApproveCardView>(
+      `/api/approvals/gate?repo=${encodeURIComponent(repo)}&pr=${pr}${context?.project ? `&project=${encodeURIComponent(context.project)}` : ""}${context?.issue ? `&issue=${encodeURIComponent(context.issue)}` : ""}${context?.head ? `&head=${encodeURIComponent(context.head)}` : ""}`,
+    ),
+  /** Hosted tenant board's `POST /api/approvals/merge` (`CAD-1946`) — record approval + enqueue atomically (requires fresh OTP step-up). */
+  approveAndMerge: (body: {
+    repo: string;
+    pr: number;
+    head: string;
+    issue?: string;
+    project?: string;
+    request_id?: string;
+  }) => post<HostedMergeReceipt>("/api/approvals/merge", body),
+  /** Hosted tenant board's `POST /api/approvals/send-back` (`CAD-1946`) — send ticket back and dequeue PR if queued. */
+  sendBackApproval: (body: {
+    project: string;
+    issue: string;
+    reason: string;
+    repo?: string;
+    pr?: number;
+  }) => post<HostedSendBackReceipt>("/api/approvals/send-back", body),
+  /** Hosted tenant board's `POST /api/approvals/step-up/send` (`CAD-1946`) — start a 6-digit email OTP step-up challenge. */
+  sendApprovalStepUp: () => post<HostedStepUpChallenge>("/api/approvals/step-up/send", {}),
+  /** Hosted tenant board's `POST /api/approvals/step-up/verify` (`CAD-1946`) — complete 6-digit email OTP step-up for 15 minutes. */
+  verifyApprovalStepUp: (challenge_id: string, code: string) =>
+    post<HostedStepUpVerified>("/api/approvals/step-up/verify", { challenge_id, code }),
   /** `POST /api/approvals/approve` (CAD-1218) — records the operator's
    *  merge approval for the exact head the drawer showed. A moved head
    *  refuses with 409 `head_moved`; a head with an earlier record refuses. */
-  approveHead: (repo: string, pr: number, head: string) =>
-    post<{ approval_id: string }>("/api/approvals/approve", { repo, pr, head }),
+  approveHead: (repo: string, pr: number, head: string, context?: { issue?: string; project?: string }) =>
+    post<{ approval_id: string }>("/api/approvals/approve", {
+      repo,
+      pr,
+      head,
+      ...(context?.issue ? { issue: context.issue } : {}),
+      ...(context?.project ? { project: context.project } : {}),
+    }),
   /** `GET /api/approvals/state` (CAD-1218) — whether this head has an
    *  approval in force, revoked, or none. */
-  approvalState: (repo: string, pr: number, head: string) =>
-    get<{ state: "in-force" | "revoked" | "missing"; approval_id?: string; board_revocable?: boolean }>(
-      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}`,
+  approvalState: (repo: string, pr: number, head: string, context?: { issue?: string; project?: string }) =>
+    get<{
+      state: "in-force" | "revoked" | "missing";
+      approval_id?: string;
+      board_revocable?: boolean;
+      verdicts?: unknown[];
+      precheck?: { verdicts?: unknown[] };
+    }>(
+      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}${context?.issue ? `&issue=${encodeURIComponent(context.issue)}` : ""}${context?.project ? `&project=${encodeURIComponent(context.project)}` : ""}`,
     ),
   /** `POST /api/approvals/<id>/revoke` (CAD-1218) — withdraw that approval. */
   revokeApproval: (id: string, reason: string) =>
@@ -1087,11 +1910,21 @@ export const api = {
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),
   /** `GET /api/master/state` — session chips + in-flight turn (CAD-551);
    *  501 on a daemon that predates it. */
-  masterState: () => get<MasterState>("/api/master/state"),
+  masterState: (conversation?: string) =>
+    get<MasterState>(conversation === undefined ? "/api/master/state" : `/api/master/state?conversation=${encodeURIComponent(conversation)}`),
+  /** `POST /api/master/identity` (CAD-1817) — the proven operator edits
+   *  the workspace coordinator's name/personality/avatar. The response is
+   *  the committed identity plus when it applies; the UI never assumes a
+   *  save from the request alone. */
+  masterIdentityUpdate: (body: MasterIdentityUpdate) =>
+    post<MasterIdentityUpdateResult>("/api/master/identity", body),
+  /** CAD-2354: `POST /api/master/instructions` — the company Master's
+   *  instructions, owners only (403 otherwise). */
+  masterInstructions: () => post<InstructionsRead<string>>("/api/master/instructions", {}),
   /** `POST /api/master/command` — an allowlisted session verb (CAD-551);
    *  operator-only, 400 `unknown_command` outside the board's set. */
-  masterCommand: (command: string, arg?: string, wait?: number, message?: string) =>
-    post<MasterCommandResult>("/api/master/command", {
+  masterCommand: (command: string, arg?: string, wait?: number, message?: string, conversation?: string) =>
+    post<MasterCommandResult>(`/api/master/command${conversation ? `?conversation=${encodeURIComponent(conversation)}` : ""}`, {
       command,
       ...(arg ? { arg } : {}),
       ...(wait !== undefined ? { wait } : {}),

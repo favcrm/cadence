@@ -80,11 +80,12 @@ cadence --org <workspace> app catalog reconcile <uuid>
 
 A current owner can discover/reconcile a pending operation even after its creator
 leaves. Recovery observes the native catalog or cancels an undispatched preparation;
-it never repeats a mutation. `prepared`/`dispatched` do not mean executed. Exit 5
-means unresolved; exit 3 means refusal/unavailable. A lost response does not
-authorize retrying with a new UUID. The same operation binds the same actor,
-release, old installation pins, and checked review; changed input conflicts.
-Installation grants no send/deploy, worker registration, or run approval.
+it never repeats a mutation. `prepared`/`dispatched` do not mean executed. An
+unconfirmed mutation exits 1 (unknown); a read reporting an unresolved operation
+exits 5, and a definite refusal exits 3. A lost response does not authorize retrying
+with a new UUID. The same operation binds the same actor, release, old installation
+pins, and checked review; changed input conflicts. Installation grants no
+send/deploy, worker registration, or run approval.
 Native install/run/business records remain native-owned; this is not their migration.
 
 ## Offline byte validation: `cadence app check`
@@ -93,15 +94,71 @@ Native install/run/business records remain native-owned; this is not their migra
 daemon, no store and no PM read or write — usable in an app repo's CI before
 anything talks to a host. The `builtin:<catalog-id>` source form is retired
 (CAD-1422) and refused at the source stage (`app_check_source`). It runs the same bundle snapshot and content
-validation `install-check` runs (entry grammar, per-file caps — 384 KiB for a
-screen JS/CSS asset and 256 KiB elsewhere — the 2 MiB aggregate, the manifest
-including `summary`, descriptor forbidden keys, workflow checks, the full
+validation `install-check` runs (entry grammar, per-file caps — screen JS, CSS,
+SVG and JSON assets share the 2 MiB aggregate app budget; `screens.json` is
+limited to 32 KiB; skill members to 16 KiB and `skill.json` to 4 KiB; other
+files to 256 KiB — the 2 MiB aggregate, the manifest including `summary`,
+descriptor forbidden keys, workflow checks, the full
 `app-screens/v1|v2` declaration integrity for every `screens/<tag>/` package
 (`screens.json` body, declared↔supplied asset set, sha256+size matches — the
-same `app_screen_pkg::extract` the mount RPC re-runs), `requires`
+same `app_screen_pkg::extract` the mount RPC re-runs), every `skills/<tag>/`
+package through the one manifest validator, `requires`
 against this build's contract registry, and the secret guard) and reports the
 same `sha256:` bundle digest. A git/URL source is refused: fetching is a
 transport the daemon vets, not bytes in hand.
+
+The version-2 bundle member grammar also recognizes the root
+`app-storage.json` and flat `storage/<tag>.json` migration members. The tag uses
+the same lowercase ASCII/digit/hyphen grammar as other app tags (1–32 bytes,
+no leading hyphen); links, nested storage directories and alternate extensions
+are refused. Storage members require exactly
+`needs.requires.contracts: {app-storage: [1]}`, and that requirement needs its
+root declaration. The current generated document is
+`contracts/bundle-grammar/v4/grammar.json`; versions 1–3 remain historical
+artifacts, not a second current admission path.
+
+Version 4 preserves the version-3 path grammar and publishes the screen asset,
+declaration, count and aggregate bounds. Individual screen assets no longer
+have smaller JS, CSS, SVG or JSON quotas; every file still counts toward the
+whole app's 2 MiB budget. Frame documents may exceed the old 768 KiB limit
+when their approved package fits that budget.
+
+The version-3 grammar adds one directory, `skills/<tag>/`: an installed skill
+package. It holds a required `skill.json` manifest, flat root text leaves
+(`md`, `txt`, `json`, `yaml`, `yml`, `csv`, `css`, `svg`), and may include
+both a `scripts/` subdirectory (`py`, `sh`, `js`, `mjs`) and a `references/`
+subdirectory (`md`, `txt`). Nothing nests deeper, dotfiles and links refuse,
+and the caps are
+16 declared members, 16 KiB per member, 4 KiB for the manifest and 32 KiB per
+package including the manifest. The manifest is a closed decode
+(`{"schema":1,"name":"<tag>","files":[...]}`) and must declare `SKILL.md`; its
+declared set must equal the set actually present in both directions, each
+mismatch naming the path. Every declared text file is scanned for tokens that
+name package material (`scripts/…`, `references/…`, `skills/<tag>/…`, `./`
+forms, and a bare `name.ext` with an allowed extension); a token naming an
+undeclared member refuses. That scan is a declared-inventory contract, not
+import analysis, so a path assembled at run time is invisible to it. The same
+validator (`crate::issue::app::skill_package`) runs at install and again at run
+creation, so the two cannot disagree about what a complete package is.
+
+This is package grammar support, **not** host-side script execution. The host
+freezes a package's bytes into a run's snapshot and hands them to the assigned
+worker; it never executes `scripts/` itself, never sandboxes them and never
+attests what they did. A frozen digest proves which bytes a run received, not
+that a worker ran them. See `docs/guides/app-runs.md` for the run contract and
+`docs/guides/app-development.md` for authoring one.
+
+This is package grammar support, **not a native storage runtime**. The native
+host does not advertise `app-storage`, execute these migrations or claim schema
+validation. `cadence app check` inventories the new members and returns the
+explicit incompatible-host receipt for a storage-bearing package. A hosted
+implementation must separately validate the declaration and checksums, enforce
+its tenant-local storage contract and bind activation to the same immutable
+bundle. An unknown requirement is never treated as supported.
+Explicit approval of edited installed bytes rechecks the same requirement and
+storage-member pairing before recording execution authority. Unsupported bytes
+remain inspectable; an operator approval cannot supply a missing runtime.
+
 
 The JSON report carries `ok`, a stable `refusal.code` (`app_check_transport`,
 `app_check_source`, `app_check_inventory`, `app_check_content`), `digest`,
@@ -227,8 +284,8 @@ cadence app catalog show <install-id>
 ```
 
 The source must be an A1 bundle: `app.md`, checked workflow Markdown under
-`workflows/`, and supported optional `rubrics/`, `templates/` and `views/`
-files. `views/` may carry exactly one file — `views/app-views-v1.json`, a
+`workflows/`, and supported optional `rubrics/`, `templates/`, `skills/` and
+`views/` files. `views/` may carry exactly one file — `views/app-views-v1.json`, a
 data-only [app-views/v1](../../contracts/app-views/v1/README.md) descriptor —
 and only when `app.md` declares it with `needs.views.contract: app-views/v1`.
 The declaration and the file pair up: either alone refuses install, and the
@@ -396,6 +453,18 @@ directory card opens `/apps/catalog/<id>` with its overview, features, releases
 and workspace panel; installed-gallery cards open the app at `/apps/<key>`, with
 a small operator settings action to `/apps/manage/<id>`.
 
+On a compatible hosted board, use **Manage → Default app agent** to select an
+existing active profile for your own conversations in an approved installation.
+The choice adds context, not tool access, and does not change another owner's
+selection. Platform operator sessions cannot manage this private setting. Use
+**No default agent** to clear it. A package update reloads the current setting
+without applying an unsaved choice. If a save cannot be confirmed, check what
+the board read back before trying again.
+
+Ask questions about installed apps in the regular Home chat. The assistant
+can use the app tools available to that conversation. Proposals still follow
+the existing review and approval flow.
+
 A verified operator selects an immutable published release, chooses **Review
 installation** or **Review update**, reviews the checked package and access
 changes, then explicitly confirms Apply. Fresh installs may choose an older
@@ -497,6 +566,46 @@ records. Each adapter supplies its real host version and supported contract
 profile. The hosted build pins the canonical native Git revision and verifies
 its source/artifact hashes rather than maintaining a second rule engine.
 
+The `app.requirements.evaluate` command accepts the exact manifest and an
+explicit target profile: host `core` version and `contracts` with their majors
+and `validator` or `sandboxed` stage. It returns the native compatibility
+receipt against that profile. The caller must establish that the profile is
+the target's current, authentic profile; the rules-core release version is not
+the host version. Envelope `ok` means evaluation succeeded, not compatibility;
+read `value.compatible`. A legacy manifest declares no requirements, so it
+returns `declared: false` and no checks, not proof that a target can run it.
+Package inspection, tenant state and authorization are separate decisions.
+
+The `app.screen.integrity` command runs the same screen declaration/integrity
+guard natively (`src/issue/app_screen_decl.rs` is now a re-export of
+`crates/cadence-core/src/app_screen_decl.rs`) for a host that will not hand the
+rules core its asset bodies. It takes the exact `screens.json` text plus
+host-computed `size`/`sha256` facts for every installed asset leaf, and the
+number of `screens/<tag>/` packages the app declares — bounded by the one
+`MAX_SCREENS` the native bundle scan enforces, and checked before any
+declaration work. It returns the declared app tag only when the declaration and
+those facts agree. The facts and the count are the caller's report — the caller
+must hash the exact bytes it installed — and `invalid_manifest` refuses a wrong
+digest or size, an undeclared or missing leaf, a repeated object key, an
+over-count app, or any grammar/bound violation. The command accepts no asset
+bodies, so a multi-megabyte leaf cannot ride the ABI, and it grants no install,
+mount, execution or effect authority.
+
+The `app.screen.asset-integrity` command is the same check under the
+host-owned operation admission. It takes the identical declaration, facts and
+screen count, and every shared rule still applies: the byte/depth/node/asset
+bounds, the closed declaration grammar, repeated-key and repeated-operation
+refusal, and the exact declared↔supplied size/sha256 comparison. It differs
+only in the declaration's `operations` list — each name is checked as a
+bounded, typed, duplicate-free host token, and the rules core neither knows
+nor infers which operations a host serves or whether one is a call or a
+host-confirmed slot. A host that uses it must still check every declared
+operation against its own closed operation set and its own call/slot
+permission classification at each publication, install and revalidation entry
+point. The command returns only the app tag: it grants no operation, install,
+mount, execution or effect authority. `app.screen.integrity` keeps the native
+vocabulary unchanged and still refuses an operation this core does not serve.
+
 ## Offline screen-frame previews and projection fixtures
 
 `cadence app frame-kit --out <dir> [--bundle <local-app-bundle>] [--parent-origin <origin>]`
@@ -532,3 +641,9 @@ possible future app-domain input path: contract review and consumer regressions
 remain necessary. CI compares against the trusted event base (fetching only
 that exact missing base commit in CI) and refuses when the base or its baseline
 is unavailable or malformed.
+
+Type-only edits to an included module still change its dependency hash, even
+when the emitted producer and canonical golden are identical. Regenerate the
+derived baseline with `node ui/scripts/build-app-fixtures.mjs --write` and
+review its dependency changes; retain the artifact, golden, trusted-base and
+version checks rather than bypassing freshness verification.

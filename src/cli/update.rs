@@ -291,7 +291,9 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
         print_json(&body);
     } else {
         for line in guidance::lines(&guidance) {
-            println!("{line}");
+            // The guidance precedes a possible rollback status: a closed
+            // stdout must not panic it into success.
+            print_line(&line);
         }
     }
     if report.rolled_back {

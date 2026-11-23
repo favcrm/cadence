@@ -6,12 +6,19 @@
 export const REFUSAL_STATUS = Object.freeze({
   invalid: 400,
   refused: 400,
+  cancelled: 400,
   unauthorized: 401,
   forbidden: 403,
+  owner_required: 403,
   not_found: 404,
   missing: 404,
   stale_revision: 409,
   conflict: 409,
+  confirmation_required: 409,
+  confirmation_invalid: 409,
+  quote_changed: 409,
+  grant_changed: 409,
+  uncertain: 409,
   unavailable: 503,
   timeout: 504,
 });
@@ -50,6 +57,17 @@ export class ScreenTimeoutError extends Error {
     this.code = "timeout";
     this.status = 504;
     this.id = id;
+  }
+}
+
+/** Structured application-level bridge error carrying HTTP-aligned status and
+ *  optional refusal code without coupling `app-kit` to any UI package. */
+export class ScreenBridgeError extends Error {
+  constructor(message, status = 502, options = {}) {
+    super(message);
+    this.name = "ScreenBridgeError";
+    this.status = status;
+    this.code = typeof options?.code === "string" ? options.code : undefined;
   }
 }
 

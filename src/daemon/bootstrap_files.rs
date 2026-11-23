@@ -9,14 +9,16 @@
 //! rename it over the target inside the same root. Nothing is truncated in
 //! place. No network, no generic document framework.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::fd_fs::DirFd;
 
 /// The platform-supplied, one-time setup file.
 pub const BOOTSTRAP: &str = "BOOTSTRAP.md";
@@ -39,16 +41,25 @@ const USER_TEMPLATE: &str = include_str!("../../agents/member-assistant/USER.md"
 const AGENTS_TEMPLATE: &str = include_str!("../../agents/member-assistant/AGENTS.md");
 
 /// The closed profile object a member may agree to.
+///
+/// `name` and `tone` are the ASSISTANT's display name and agreed way of
+/// speaking (IDENTITY.md, SOUL.md). `user_name` is how the assistant addresses
+/// the USER and lives in its own USER.md section — never IDENTITY.md.
+/// `preferences` holds other agreed user preferences. `look` is the avatar
+/// slug (`params.look`, not a file) and must be one of the catalogue's eleven.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Profile {
     pub name: Option<String>,
     pub tone: Option<String>,
     pub preferences: Option<String>,
+    pub user_name: Option<String>,
+    pub look: Option<String>,
 }
 
 impl Profile {
     /// Refuse unknown fields, non-strings and oversized values before any
     /// effect. Reserved managed-section markers are refused, not stored.
+    /// An empty `name`/`tone`/`user_name` is the explicit clear.
     pub fn parse(object: &serde_json::Map<String, serde_json::Value>) -> Result<Self> {
         let mut total = 0usize;
         let mut out = Profile::default();
@@ -65,17 +76,34 @@ impl Profile {
                 ));
             }
             total += text.len();
+            if key == "look" {
+                let look = crate::agent_roles::canonical_look(text.trim()).ok_or_else(|| {
+                    Error::rejected(format!(
+                        "bootstrap profile look '{text}' is not one of: {}",
+                        crate::agent_roles::LOOKS.join(", ")
+                    ))
+                })?;
+                out.look = Some(look.to_string());
+                continue;
+            }
             let slot = match key.as_str() {
                 "name" => &mut out.name,
                 "tone" => &mut out.tone,
                 "preferences" => &mut out.preferences,
+                "user_name" => &mut out.user_name,
                 other => {
                     return Err(Error::rejected(format!(
                         "bootstrap profile field '{other}' is not accepted"
                     )))
                 }
             };
-            *slot = Some(clean(text));
+            let cleaned = crate::managed_section::clean(text);
+            if cleaned.len() > crate::managed_section::VALUE_MAX {
+                return Err(Error::rejected(
+                    "bootstrap profile field is too long after escaping",
+                ));
+            }
+            *slot = Some(cleaned);
         }
         if total > PROFILE_MAX {
             return Err(Error::rejected("bootstrap profile is too long"));
@@ -84,32 +112,37 @@ impl Profile {
     }
 }
 
-/// One managed line per field: control characters removed and any HTML
-/// comment opener neutralised, so a value can never open or close a section.
-fn clean(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .replace("<!--", "&lt;!--")
-        .replace("-->", "--&gt;")
-        .trim()
-        .to_string()
+/// The committed scalar identity of one member assistant.
+///
+/// Read from the managed sections only: `name` from IDENTITY.md and `tone`
+/// from SOUL.md. `None` means the file has no block or the agreed value is
+/// empty/the seeded placeholder; a malformed block or a read failure is an
+/// error, never a silent unset.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub name: Option<String>,
+    pub tone: Option<String>,
+}
+
+/// Read the effective identity from the assistant's private root.
+pub fn read_identity(root: &Path) -> Result<Identity> {
+    let identity = read_profile_file(root, IDENTITY)?;
+    let soul = read_profile_file(root, SOUL)?;
+    Ok(Identity {
+        name: crate::managed_section::value(&identity, "name")?,
+        tone: crate::managed_section::value(&soul, "tone")?,
+    })
 }
 
 /// Open `root` as a directory fd, refusing a symlink at the root itself.
-fn open_root(root: &Path) -> Result<OwnedFd> {
-    let name = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| Error::rejected("bootstrap root contains an interior nul"))?;
-    let fd = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected("bootstrap root is missing or a symlink"));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+fn open_root(root: &Path) -> Result<DirFd> {
+    DirFd::open_nofollow(root).map_err(|err| {
+        if err.kind() == ErrorKind::InvalidInput {
+            Error::rejected("bootstrap root contains an interior nul")
+        } else {
+            Error::rejected("bootstrap root is missing or a symlink")
+        }
+    })
 }
 
 fn literal(name: &str) -> Result<CString> {
@@ -123,28 +156,22 @@ fn literal(name: &str) -> Result<CString> {
 
 /// Open a managed file read-only, no-follow, non-blocking, and require a
 /// regular file. `Ok(None)` only for a genuinely absent file.
-fn open_read(root: &OwnedFd, name: &str) -> Result<Option<File>> {
+fn open_read(root: &DirFd, name: &str) -> Result<Option<File>> {
     let cname = literal(name)?;
-    let fd = unsafe {
-        libc::openat(
-            root.as_raw_fd(),
-            cname.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
+    let file = match root.open_readonly_nofollow(&cname) {
+        Ok(file) => file,
+        Err(err) => {
+            return match err.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                Some(libc::ELOOP) => Err(Error::rejected(format!(
+                    "bootstrap file '{name}' is a symlink; refused"
+                ))),
+                _ => Err(Error::rejected(format!(
+                    "bootstrap file '{name}' could not be opened"
+                ))),
+            };
+        }
     };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        return match err.raw_os_error() {
-            Some(libc::ENOENT) => Ok(None),
-            Some(libc::ELOOP) => Err(Error::rejected(format!(
-                "bootstrap file '{name}' is a symlink; refused"
-            ))),
-            _ => Err(Error::rejected(format!(
-                "bootstrap file '{name}' could not be opened"
-            ))),
-        };
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
     if !file.metadata()?.file_type().is_file() {
         return Err(Error::rejected(format!(
             "bootstrap file '{name}' is not a regular file"
@@ -184,24 +211,19 @@ pub fn seed(root: &Path, include_bootstrap: bool) -> Result<()> {
     let mut created = false;
     for (name, text) in files {
         let cname = literal(name)?;
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                cname.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == ErrorKind::AlreadyExists {
-                continue;
+        let mut file = match dir.open_file_nofollow(
+            &cname,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(Error::rejected(format!(
+                    "bootstrap seed of '{name}' failed: {err}"
+                )));
             }
-            return Err(Error::rejected(format!(
-                "bootstrap seed of '{name}' failed: {err}"
-            )));
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        };
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         created = true;
@@ -215,79 +237,35 @@ pub fn seed(root: &Path, include_bootstrap: bool) -> Result<()> {
 /// Flush the trusted root's directory entry (a create or a rename) to disk.
 /// A failure is returned, so the caller never commits state on an unflushed
 /// directory entry.
-fn fsync_dir(root: &OwnedFd) -> Result<()> {
-    if unsafe { libc::fsync(root.as_raw_fd()) } != 0 {
-        return Err(Error::rejected(
-            "bootstrap directory sync failed; state is not committed",
-        ));
-    }
-    Ok(())
-}
-
-/// Replace one managed section (or append it), keeping all other text.
-fn set_section(text: &str, marker: &str, body: &str) -> String {
-    let begin = format!("<!-- cadence:managed-begin {marker} -->");
-    let end = format!("<!-- cadence:managed-end {marker} -->");
-    let block = format!("{begin}\n{body}\n{end}");
-    match (text.find(&begin), text.find(&end)) {
-        (Some(b), Some(e)) if e > b => {
-            let after = e + end.len();
-            format!("{}{}{}", &text[..b], block, &text[after..])
-        }
-        _ => {
-            let mut out = text.to_string();
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-            out.push_str(&block);
-            out.push('\n');
-            out
-        }
-    }
+fn fsync_dir(root: &DirFd) -> Result<()> {
+    root.sync_all()
+        .map_err(|_| Error::rejected("bootstrap directory sync failed; state is not committed"))
 }
 
 /// Replace one managed file atomically: bounded read, exclusive temp file,
 /// fsync, `renameat` within the trusted root. The temp name is removed on any
 /// failure. Existing content is never truncated in place.
-fn replace_file(root: &OwnedFd, name: &str, next: &str) -> Result<()> {
+fn replace_file(root: &DirFd, name: &str, next: &str) -> Result<()> {
     let cname = literal(name)?;
     let temp = format!(".{name}.{}.tmp", std::process::id());
-    let ctemp = CString::new(temp.clone()).map_err(|_| Error::rejected("bad temp name"))?;
-    let fd = unsafe {
-        libc::openat(
-            root.as_raw_fd(),
-            ctemp.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(format!(
-            "bootstrap temp for '{name}' could not be created"
-        )));
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    let ctemp = CString::new(temp).map_err(|_| Error::rejected("bad temp name"))?;
+    let mut file = root
+        .open_file_nofollow(&ctemp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)
+        .map_err(|_| {
+            Error::rejected(format!("bootstrap temp for '{name}' could not be created"))
+        })?;
     let written = file
         .write_all(next.as_bytes())
         .and_then(|()| file.sync_all());
     drop(file);
     if written.is_err() {
-        unsafe { libc::unlinkat(root.as_raw_fd(), ctemp.as_ptr(), 0) };
+        let _ = root.unlink_child(&ctemp);
         return Err(Error::rejected(format!(
             "bootstrap write of '{name}' failed"
         )));
     }
-    let rc = unsafe {
-        libc::renameat(
-            root.as_raw_fd(),
-            ctemp.as_ptr(),
-            root.as_raw_fd(),
-            cname.as_ptr(),
-        )
-    };
-    if rc != 0 {
-        unsafe { libc::unlinkat(root.as_raw_fd(), ctemp.as_ptr(), 0) };
+    if root.rename_child(&ctemp, &cname).is_err() {
+        let _ = root.unlink_child(&ctemp);
         return Err(Error::rejected(format!(
             "bootstrap rename of '{name}' failed"
         )));
@@ -300,10 +278,11 @@ fn replace_file(root: &OwnedFd, name: &str, next: &str) -> Result<()> {
 /// or symlinked target refuses rather than being created or followed.
 pub fn write_profile(root: &Path, profile: &Profile) -> Result<()> {
     let dir = open_root(root)?;
-    let plan: [(&str, &str, Option<&String>); 3] = [
+    let plan: [(&str, &str, Option<&String>); 4] = [
         (IDENTITY, "name", profile.name.as_ref()),
         (SOUL, "tone", profile.tone.as_ref()),
         (USER, "preferences", profile.preferences.as_ref()),
+        (USER, "user_name", profile.user_name.as_ref()),
     ];
     for (name, marker, value) in plan {
         let Some(value) = value else { continue };
@@ -311,7 +290,11 @@ pub fn write_profile(root: &Path, profile: &Profile) -> Result<()> {
             .ok_or_else(|| Error::rejected(format!("bootstrap file '{name}' is missing")))?;
         let current = read_bounded(&mut file, name)?;
         drop(file);
-        let next = set_section(&current, marker, &format!("{marker}: {value}"));
+        let next = crate::managed_section::set(
+            &current,
+            marker,
+            &crate::managed_section::line(marker, value),
+        )?;
         if next.len() as u64 > FILE_MAX {
             return Err(Error::rejected(format!(
                 "bootstrap file '{name}' would exceed the cap"
@@ -327,17 +310,13 @@ pub fn write_profile(root: &Path, profile: &Profile) -> Result<()> {
 pub fn remove_bootstrap(root: &Path) -> Result<()> {
     let dir = open_root(root)?;
     let cname = literal(BOOTSTRAP)?;
-    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
-    if rc == 0 {
-        return Ok(());
+    match dir.unlink_child(&cname) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(Error::rejected(
+            "bootstrap file cleanup failed (state is already committed)",
+        )),
     }
-    let err = std::io::Error::last_os_error();
-    if err.kind() == ErrorKind::NotFound {
-        return Ok(());
-    }
-    Err(Error::rejected(
-        "bootstrap file cleanup failed (state is already committed)",
-    ))
 }
 
 /// Read one managed file for prompt context. Only a genuinely absent file is

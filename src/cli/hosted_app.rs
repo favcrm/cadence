@@ -35,9 +35,30 @@ fn checked_review(path: &Path, action: &Value) -> Result<Value> {
     Ok(data["review"].clone())
 }
 
+fn unsupported_remote_app_action(org: &str, action: &AppAction) -> Error {
+    let guidance = match action {
+        AppAction::Record { .. } => format!(
+            "selected-remote `app record` is unsupported (project, record and execution commands remain native and were not run locally). For hosted `--org {org}`, discover schemas with `cadence --org {org} app describe <app>` and run record operations with `cadence --org {org} app call <app> records.list|records.show|records.create|records.update|records.aggregate|records.batch --args '{{...}}'`"
+        ),
+        AppAction::Audience { .. } => format!(
+            "selected-remote `app audience` is unsupported (project, record and execution commands remain native and were not run locally). For hosted `--org {org}`, use `cadence --org {org} app describe <app>` and `cadence --org {org} app call <app> segments.list|segments.show|segments.save|audience.preview|audience.show --args '{{...}}'`"
+        ),
+        AppAction::Content { .. } => format!(
+            "selected-remote `app content` is unsupported (project, record and execution commands remain native and were not run locally). For hosted `--org {org}`, use `cadence --org {org} app describe <app>` and `cadence --org {org} app call <app> content.list|content.show|content.save|content.clone|proposals.list --args '{{...}}'`"
+        ),
+        AppAction::Assistant { .. } => format!(
+            "selected-remote `app assistant` is unsupported (project, record and execution commands remain native and were not run locally). For hosted `--org {org}`, discover actions with `cadence --org {org} app describe <app>` and run them with `cadence --org {org} app call <app> <operation> --args '{{...}}'`"
+        ),
+        _ => format!(
+            "selected-remote app supports only bounded catalog published-release lifecycle; project, record and execution commands remain native and were not run locally (use `cadence --org {org} app catalog ...`, `app describe`, `app call`, `app skill`, or `app pending`)"
+        ),
+    };
+    Error::usage(guidance)
+}
+
 pub(super) fn run(target: &RemoteTarget, action: &AppAction) -> Result<i32> {
     let AppAction::Catalog { action } = action else {
-        return Err(Error::usage("selected-remote app supports only bounded catalog published-release lifecycle; project, record and execution commands remain native and were not run locally"));
+        return Err(unsupported_remote_app_action(&target.org, action));
     };
     let mut operation_id: Option<&str> = None;
     let (method, suffix, body) = match action {
@@ -79,13 +100,13 @@ pub(super) fn run(target: &RemoteTarget, action: &AppAction) -> Result<i32> {
     };
     // Printed before the network boundary so even a lost/non-JSON reply retains recovery identity.
     if let Some(id) = operation_id {
-        eprintln!(
+        cadence_agent::output::eprint_format_line(format_args!(
             "operation_id={id}; if uncertain, read/reconcile this ID, never redispatch blindly"
-        );
+        ));
     }
     let reply = cadence_agent::hosted_app_cli::request(target, method, &suffix, body.as_ref())?;
     if let Some(id) = &reply.operation_id {
-        eprintln!("operation_id={id}");
+        cadence_agent::output::eprint_format_line(format_args!("operation_id={id}"));
     }
     if let CatalogAction::Show { install_id } = action {
         if reply.status == 200 && reply.body["ok"] == true && reply.body["data"]["state"] == "ready"
@@ -124,4 +145,105 @@ pub(super) fn run(target: &RemoteTarget, action: &AppAction) -> Result<i32> {
     } else {
         0
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::app::{AssistantAction, AudienceAction, ContentAction, RecordAction};
+    use clap::Subcommand as _;
+
+    fn target() -> RemoteTarget {
+        RemoteTarget {
+            org: "fav-limited".into(),
+            endpoint: "https://fav-limited.cadencecloud.app".into(),
+            org_id: "org-fav".into(),
+            identity: None,
+        }
+    }
+
+    #[test]
+    fn selected_remote_app_refusals_guide_to_describe_and_call() {
+        let t = target();
+        let cases = [
+            (
+                AppAction::Record {
+                    action: RecordAction::Ls {
+                        install_id: "install_crm".into(),
+                        context_id: "default".into(),
+                    },
+                },
+                "records.list",
+            ),
+            (
+                AppAction::Audience {
+                    action: AudienceAction::SegmentLs {
+                        install_id: "install_crm".into(),
+                        context_id: "default".into(),
+                    },
+                },
+                "segments.list",
+            ),
+            (
+                AppAction::Content {
+                    action: ContentAction::AutonomyShow,
+                },
+                "content.list",
+            ),
+            (
+                AppAction::Assistant {
+                    action: AssistantAction::Actions {
+                        install_id: Some("install_crm".into()),
+                        context_id: Some("default".into()),
+                        message: None,
+                        token: None,
+                    },
+                },
+                "app call <app> <operation>",
+            ),
+        ];
+        for (action, needle) in cases {
+            let err = run(&t, &action).unwrap_err().to_string();
+            assert!(
+                err.contains("remain native and were not run locally"),
+                "{err}"
+            );
+            assert!(
+                err.contains("cadence --org fav-limited app describe <app>"),
+                "{err}"
+            );
+            assert!(err.contains(needle), "{err}");
+        }
+        let other = run(&t, &AppAction::Ls { project: None })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            other.contains("remain native and were not run locally"),
+            "{other}"
+        );
+        assert!(
+            other.contains("cadence --org fav-limited app catalog"),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn app_cli_help_marks_native_only_subcommands() {
+        let cmd = AppAction::augment_subcommands(clap::Command::new("app"));
+        for name in [
+            "record",
+            "audience",
+            "content",
+            "assistant",
+            "binding",
+            "effect",
+            "context",
+            "works",
+            "run",
+        ] {
+            let sub = cmd.find_subcommand(name).expect(name);
+            let about = sub.get_about().expect("about").to_string();
+            assert!(about.starts_with("[native daemon only]"), "{name}: {about}");
+        }
+    }
 }

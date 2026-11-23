@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import Button from "../../ui/Button";
 import Select, { type SelectOption } from "../../ui/Select";
-import { WorkspaceDialog } from "./WorkspaceDialog";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import { ApiError } from "../../lib/api";
 import { workspaceApps, type CapabilityQuote } from "./workspaceApps";
 import { effectivePrompt, promptDefault, promptError } from "./promptFields";
@@ -168,7 +168,18 @@ export function NewPost({
     });
   };
   return (
-    <WorkspaceDialog title={t("New post")} onClose={onClose}>
+    <DrawerShell
+      kind="new-post"
+      scrim="board"
+      modal
+      trapFocus
+      size="lg"
+      preventClose={busy}
+      label={t("New post")}
+      title={t("New post")}
+      closeLabel={t("Close {title}").replace("{title}", () => t("New post"))}
+      onClose={onClose}
+    >
       <form className="wa-stack" onSubmit={submit}>
         <p className="wa-muted">
           {sourceChoice ? t("Review the chosen retained Instagram post before making a new caption. An image option appears when a draft provider is bound.") : t("Paste the facts your team should use. You’ll review the frozen plan")}
@@ -339,6 +350,6 @@ export function NewPost({
           {t("Create plan")}
         </Button>
       </form>
-    </WorkspaceDialog>
+    </DrawerShell>
   );
 }

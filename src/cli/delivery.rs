@@ -40,6 +40,56 @@ pub(crate) enum DeliveryAction {
         #[arg(long)]
         json: bool,
     },
+    /// List private job deliveries the proven operator may see. An agent
+    /// connection sees nothing. Native daemon read.
+    #[command(name = "private-ls")]
+    PrivateLs {
+        /// Only this ticket.
+        #[arg(long)]
+        issue: Option<String>,
+    },
+    /// Publish selected results of one private job delivery to its bound
+    /// shared ticket as a board comment. Operator only; the selection is
+    /// explicit and every result must belong to that delivery.
+    Publish {
+        /// Delivery id (`cadence delivery private-ls`).
+        delivery: String,
+        /// The ticket the delivery is bound to.
+        #[arg(long)]
+        issue: String,
+        /// That ticket's project key.
+        #[arg(long)]
+        project: String,
+        /// Result message id to publish; repeatable, no "all" shorthand.
+        #[arg(long = "result", required = true, value_delimiter = ',')]
+        results: Vec<String>,
+    },
+    /// Operator recovery: records whose provenance could not be verified.
+    /// Strict local read; never served to a board reader.
+    #[command(name = "legacy-ls")]
+    LegacyLs {
+        /// Only this ticket.
+        #[arg(long)]
+        issue: Option<String>,
+    },
+    /// Retry private-ledger recovery from native rows; operator only.
+    /// Idempotent, never reruns a task, reports unavailability truthfully.
+    #[command(name = "private-reconcile")]
+    PrivateReconcile {
+        /// Only this job.
+        #[arg(long)]
+        job: Option<String>,
+    },
+    /// Reconcile one pending publication attempt (operator only): verify
+    /// or write its exact keyed comment, then settle it.
+    #[command(name = "publish-reconcile")]
+    PublishReconcile {
+        /// Private delivery id.
+        delivery: String,
+        /// The receipt's attempt id.
+        #[arg(long)]
+        attempt: String,
+    },
     /// Derive delivery requirements from the ticket, current PR and approved policy.
     Requirements {
         /// The ticket id.
@@ -91,6 +141,57 @@ pub(crate) enum DeliveryAction {
         /// Why.
         #[arg(long)]
         reason: String,
+    },
+    /// Hosted (CAD-1946): evaluate the server-side merge gate for a PR
+    /// without recording an approval or posting a signature. Exits 0 only
+    /// when every gate passes.
+    Check {
+        /// Project key (optional; server resolves or verifies when given).
+        #[arg(long)]
+        project: Option<String>,
+        /// Tracker issue id (optional; verified against the PR when given).
+        #[arg(long)]
+        issue: Option<String>,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA to pin (optional for read-only check).
+        #[arg(long)]
+        head: Option<String>,
+        /// Require fresh Browser QA attestation for UI changes.
+        #[arg(long)]
+        browser_qa: bool,
+    },
+    /// Hosted (CAD-1946): evaluate the merge gate server-side, record an
+    /// owner approval + immutable `tenant_delivery_evidence`, sign `v2`
+    /// SSHSIG, comment on the PR and enable auto-merge (operator only).
+    Enqueue {
+        /// Project key (optional; server resolves or verifies when given).
+        #[arg(long)]
+        project: Option<String>,
+        /// Tracker issue id (optional; verified against the PR when given).
+        #[arg(long)]
+        issue: Option<String>,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact full 40-hex head SHA being approved and enqueued.
+        #[arg(long)]
+        head: String,
+        /// Require fresh Browser QA attestation for UI changes.
+        #[arg(long)]
+        browser_qa: bool,
+        /// Record the owner's merge approval of this exact head, with this
+        /// source, in the same call, so no separate `audit approve` is needed
+        /// (CAD-2047). Nothing is recorded when any other gate rule fails.
+        #[arg(long = "approve", value_name = "SOURCE")]
+        approve: Option<String>,
     },
 }
 
@@ -154,6 +255,35 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             )?;
             out
         }
+        DeliveryAction::PrivateLs { issue } => {
+            client::rpc(state_dir, "delivery_private_list", json!({"issue": issue}))?
+        }
+        DeliveryAction::Publish {
+            delivery,
+            issue,
+            project,
+            results,
+        } => client::rpc(
+            state_dir,
+            "delivery_publish",
+            json!({
+                "delivery": delivery,
+                "issue": issue,
+                "project": project,
+                "results": results,
+            }),
+        )?,
+        DeliveryAction::LegacyLs { issue } => {
+            client::rpc(state_dir, "delivery_legacy_list", json!({"issue": issue}))?
+        }
+        DeliveryAction::PrivateReconcile { job } => {
+            client::rpc(state_dir, "delivery_private_reconcile", json!({"job": job}))?
+        }
+        DeliveryAction::PublishReconcile { delivery, attempt } => client::rpc(
+            state_dir,
+            "delivery_publish_reconcile",
+            json!({"delivery": delivery, "attempt": attempt}),
+        )?,
         DeliveryAction::Requirements {
             issue,
             pr,
@@ -168,8 +298,18 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             None => delivery::sync(state_dir, issue.as_deref(), delivery::GH)?,
             Some(secs) => loop {
                 match delivery::sync(state_dir, issue.as_deref(), delivery::GH) {
-                    Ok(v) => println!("{v}"),
-                    Err(e) => eprintln!("delivery sync: {e}"),
+                    Ok(v) => {
+                        println!("{v}");
+                        if cadence_agent::output::stdout_closed() {
+                            return Ok(0);
+                        }
+                    }
+                    Err(e) => {
+                        if cadence_agent::output::stdout_closed() {
+                            return Err(e);
+                        }
+                        eprintln!("delivery sync: {e}");
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_secs(secs.max(5)));
             },
@@ -201,6 +341,18 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             "delivery_decline",
             json!({"issue": issue, "reason": reason}),
         )?,
+        DeliveryAction::Check { .. } => {
+            return Err(Error::rejected(
+                "delivery check is hosted-only: select a hosted org with `--org <org>`, \
+                 or run `scripts/enqueue-reviewed --dry-run` in local mode",
+            ));
+        }
+        DeliveryAction::Enqueue { .. } => {
+            return Err(Error::rejected(
+                "delivery enqueue is hosted-only: select a hosted org with `--org <org>`, \
+                 or run `scripts/enqueue-reviewed` in local mode",
+            ));
+        }
     };
     print_json(&result);
     Ok(0)

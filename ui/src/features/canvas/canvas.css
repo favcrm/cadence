@@ -9,7 +9,7 @@
   bottom: 0;
   z-index: 15;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   max-width: 100vw;
   min-width: 0;
   background: var(--color-ink-875);
@@ -17,12 +17,15 @@
   animation: canvas-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 .canvas-drawer[data-mode="cover"] { box-shadow: -18px 0 40px rgb(0 0 0 / 0.35); }
+.canvas-drawer[data-full] { box-shadow: none; }
+/* App canvases fade within the workspace, never sliding over right-docked chat. */
+.canvas-drawer[data-surface="app"][data-mode="cover"] { animation-name: canvas-app-in; }
 .canvas-drawer[data-mode="sheet"] { width: 100%; left: 0; border-left: 0; animation-name: sheet-in; }
 @keyframes canvas-in { from { transform: translateX(24px); opacity: 0; } }
+@keyframes canvas-app-in { from { opacity: 0; } }
 @keyframes sheet-in { from { transform: translateY(24px); opacity: 0; } }
 @media (prefers-reduced-motion: reduce) {
   .canvas-drawer { animation: none; }
-  .cv-bar-run, .cv-stage li[data-s="now"]::before { animation: none; }
 }
 /* push: the page keeps room for the drawer; Home's to-do rail and its floating
    button step aside while the canvas is open. */
@@ -38,23 +41,32 @@
 .cv-grip:hover::after, .cv-grip:focus-visible::after { background: var(--color-accent); }
 .cv-grip:focus-visible { outline: none; }
 
-/* Tabs (only with more than one artifact open). */
-.cv-tabs { display: flex; min-width: 0; overflow-x: auto; gap: 4px; padding: 6px 8px 0; background: var(--color-ink-850); scrollbar-width: thin; }
-.cv-tab { display: inline-flex; flex-shrink: 0; align-items: center; max-width: 14rem; border-radius: 6px 6px 0 0; color: var(--color-ink-400); }
-.cv-tab[data-active] { background: var(--color-ink-875); color: var(--color-ink-100); }
-.cv-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 4px 4px 4px 10px; font-size: var(--text-micro); }
-.cv-tab-close { display: inline-grid; place-items: center; min-width: 1.5rem; min-height: 1.5rem; color: var(--color-ink-500); }
+/* Tabs (only with more than one view open): the mark and the short title, the open one underlined in the accent. */
+.cv-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; container: cv-main / inline-size; }
+.cv-tabrow { display: flex; align-items: center; min-width: 0; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-875); }
+.cv-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; gap: 4px; padding: 0 8px; scrollbar-width: thin; }
+.cv-tab { display: inline-flex; flex-shrink: 0; align-items: center; max-width: 14rem; border-bottom: 2px solid transparent; color: var(--color-ink-400); }
+.cv-tab[data-active] { border-bottom-color: var(--color-accent); color: var(--color-ink-100); }
+.cv-tab-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 8px 4px 8px 8px; font-size: var(--text-micro); }
+.cv-tab-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-tab-close { display: inline-grid; place-items: center; min-width: 1.5rem; min-height: 1.5rem; color: var(--color-ink-500); opacity: 0; }
+.cv-tab:hover .cv-tab-close, .cv-tab[data-active] .cv-tab-close, .cv-tab-close:focus-visible { opacity: 1; }
 .cv-tab-close:hover { color: var(--color-ink-100); }
+.cv-mark { display: inline-flex; flex: none; }
+.cv-mark .app-glyph-icon { width: 1rem; height: 1rem; border-radius: 4px; }
+.cv-vhead .cv-mark .app-glyph-icon { width: 1.5rem; height: 1.5rem; border-radius: 6px; }
 
 /* Header: kind badge, title + status, close; version buttons and actions below. */
-.cv-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; padding: 8px 8px 8px 12px; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-850); }
+.cv-head { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; padding: 8px 8px 8px 12px; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-850); }
 .cv-title { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; min-width: 0; flex: 1; overflow: hidden; }
 .cv-title b { color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cv-title > span { display: flex; align-items: center; gap: 6px; color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); white-space: nowrap; }
 .cv-iconbtn { display: inline-grid; place-items: center; width: 1.75rem; height: 1.75rem; border-radius: 6px; color: var(--color-ink-400); }
 .cv-iconbtn:hover { color: var(--color-ink-100); background: var(--color-ink-800); }
 .cv-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; flex: 1 0 100%; min-width: 0; }
-.cv-tools .vers { margin-right: auto; }
+.cv-pick { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-right: auto; min-width: 0; }
+.vers.cv-view button { font-family: var(--font-sans); }
+.vers button:disabled { opacity: 0.5; cursor: default; }
 
 .arttype { display: grid; place-items: center; flex-shrink: 0; width: 36px; height: 40px; border-radius: 6px; border: 1px solid var(--color-ink-700); background: var(--color-ink-875); color: var(--color-accent); font: 600 9px/1 var(--font-mono); letter-spacing: 0.05em; }
 .artbadge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--color-accent) 16%, transparent); color: var(--color-accent); font: 500 var(--text-micro) var(--font-sans); }
@@ -65,35 +77,33 @@
 .vers button[aria-pressed="true"] { background: var(--color-ink-800); color: var(--color-ink-100); }
 .vers button:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
 
-/* Working view: the agent's words, the steps so far, the live step, a bar. */
-.cv-work { display: grid; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--color-ink-800); }
-.cv-plan { margin: 0; color: var(--color-ink-200); font-size: var(--text-label); white-space: pre-wrap; max-height: 5rem; overflow: auto; }
-.cv-stage { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: var(--text-micro); color: var(--color-ink-500); }
-.cv-stage li { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cv-stage li::before { content: ""; flex-shrink: 0; width: 8px; height: 8px; border-radius: 9999px; border: 1px solid var(--color-ink-600); }
-.cv-stage li[data-s="done"] { color: var(--color-ink-300); }
-.cv-stage li[data-s="done"]::before { background: var(--color-ok); border-color: var(--color-ok); }
-.cv-stage li[data-s="now"] { color: var(--color-ink-100); }
-.cv-stage li[data-s="now"]::before { background: var(--color-accent); border-color: var(--color-accent); animation: cv-pulse 1.4s ease-in-out infinite; }
-@keyframes cv-pulse { 50% { opacity: 0.35; } }
-.cv-live { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--color-ink-400); font: var(--text-micro) var(--font-mono); }
-.cv-live > span:not(.workdot):not(.artbadge) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cv-bar { height: 3px; border-radius: 9999px; background: var(--color-ink-800); overflow: hidden; }
+/* A running turn: a thin bar on the header's edge, so the document never moves. */
+.cv-bar { position: absolute; inset: auto 0 0; height: 2px; background: var(--color-ink-800); overflow: hidden; }
 .cv-bar-run { display: block; height: 100%; width: 35%; background: var(--color-accent); animation: cv-run 1.4s ease-in-out infinite; }
 @keyframes cv-run { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+@media (prefers-reduced-motion: reduce) {
+  .cv-bar-run { width: 100%; animation: none; }
+}
 
 .cv-body { position: relative; flex: 1; min-height: 0; overflow: auto; background: var(--color-ink-900); padding: 12px; display: flex; flex-direction: column; }
 .canvas-doc { min-width: 0; }
 .cv-csv { display: flex; flex: 1; flex-direction: column; gap: 6px; min-height: 0; }
 .cv-csv-scroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--color-ink-800); border-radius: 6px; }
+[data-artifact-view="csv"] :is(.cv-csv-scroll, pre):focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
 .cv-csv table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font: var(--text-micro) var(--font-mono); color: var(--color-ink-200); }
 .cv-csv th, .cv-csv td { padding: 4px 10px; border-bottom: 1px solid var(--color-ink-800); text-align: left; white-space: nowrap; max-width: 28rem; overflow: hidden; text-overflow: ellipsis; }
 .cv-csv th { position: sticky; top: 0; z-index: 1; background: var(--color-ink-850); color: var(--color-ink-100); font-weight: 600; }
 .cv-csv tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--color-ink-850) 50%, transparent); }
+/* An HTML artifact's source: the code surface fills the body and scrolls both ways. */
+.cv-source { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.cv-source .codeblock { display: flex; flex: 1; flex-direction: column; min-height: 0; margin: 0; }
+.cv-source pre { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.cv-source code { display: block; width: max-content; color: var(--color-ink-200); font: var(--text-label)/1.6 var(--font-mono); white-space: pre; }
 .canvas-frame { flex: 1; width: 100%; min-height: 20rem; border: 0; background: white; }
 .canvas-pdf { display: grid; gap: 6px; align-content: start; }
 .canvas-image { max-width: 100%; height: auto; }
 .cv-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 7px 12px; border-top: 1px solid var(--color-ink-800); background: var(--color-ink-850); color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); }
+.cv-foot-ro { min-width: 0; overflow-wrap: anywhere; }
 
 /* The thread's artifact card. */
 .artcard { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; max-width: min(100%, 26rem); padding: 9px 10px; border: 1px solid var(--color-ink-700); border-radius: 10px; background: var(--color-ink-850); cursor: pointer; transition: border-color 0.15s ease; }
@@ -110,7 +120,303 @@
    they cannot paint over the canvas (15). */
 [data-chat-panel] { isolation: isolate; }
 
-/* Working view: the raw steps stay behind "details". */
-.cv-details { color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); }
-.cv-details summary { cursor: pointer; width: max-content; font-family: var(--font-sans); }
-.cv-details ul { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 2px; overflow-wrap: anywhere; }
+/* A generated image in the thread (CAD-2069). One box at the final shape from
+   first paint, so the picture replaces the placeholder with nothing moving. */
+.turn-image { flex: 1 1 100%; min-width: 0; }
+.imgblock { width: 100%; max-width: 22.5rem; margin: 0.25rem 0; }
+.imgblock[data-shape="16:9"] { max-width: 30rem; }
+.imgblock[data-shape="3:2"] { max-width: 27rem; }
+.imgblock[data-shape="9:16"], .imgblock[data-shape="2:3"] { max-width: 15rem; }
+.imgbox { position: relative; display: block; width: 100%; overflow: hidden; border: 1px solid var(--color-edge, var(--color-ink-700)); border-radius: 12px; background: var(--color-ink-850); aspect-ratio: 1 / 1; }
+.imgblock[data-shape="16:9"] .imgbox { aspect-ratio: 16 / 9; }
+.imgblock[data-shape="3:2"] .imgbox { aspect-ratio: 3 / 2; }
+.imgblock[data-shape="9:16"] .imgbox { aspect-ratio: 9 / 16; }
+.imgblock[data-shape="2:3"] .imgbox { aspect-ratio: 2 / 3; }
+/* Failed and unclear are short cards, not a picture's worth of empty box. */
+.imgblock .imgbox[data-compact] { aspect-ratio: auto; }
+.imgopen { position: absolute; inset: 0; display: block; width: 100%; height: 100%; padding: 0; border: 0; background: none; cursor: zoom-in; }
+.imgopen:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.imgopen img { display: block; width: 100%; height: 100%; object-fit: contain; animation: img-in 0.22s ease-out; }
+@keyframes img-in { from { opacity: 0; } }
+.imgwait { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 16px; text-align: center; background: linear-gradient(100deg, transparent 30%, color-mix(in srgb, var(--color-ink-700) 45%, transparent) 50%, transparent 70%) 0 0 / 250% 100%; animation: img-sweep 2.4s linear infinite; }
+@keyframes img-sweep { from { background-position: 125% 0; } to { background-position: -125% 0; } }
+.imgwait b { color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; }
+.imgwait small { max-width: 16rem; color: var(--color-ink-500); font-size: var(--text-micro); }
+.imgclock { color: var(--color-ink-400); font-size: var(--text-micro); line-height: 1; }
+.imgdots { display: inline-flex; gap: 5px; }
+.imgdots i { width: 6px; height: 6px; border-radius: 9999px; background: var(--color-accent); animation: img-dot 1.2s ease-in-out infinite; }
+.imgdots i:nth-child(2) { animation-delay: 0.16s; }
+.imgdots i:nth-child(3) { animation-delay: 0.32s; }
+@keyframes img-dot { 0%, 60%, 100% { opacity: 0.35; } 30% { opacity: 1; } }
+.imgstate { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 14px; }
+.imgstate > div { flex: 1 1 12rem; min-width: 0; }
+.imgstate b { display: block; color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; }
+.imgstate small { display: block; color: var(--color-ink-400); font-size: var(--text-secondary); }
+.imgstate[data-tone="fail"] b { color: var(--color-fail); }
+.imgstate[data-tone="warn"] b { color: var(--color-warn); }
+.imgact { min-height: 1.75rem; padding: 3px 10px; border: 1px solid var(--color-edge, var(--color-ink-700)); border-radius: 8px; background: var(--color-ink-850); color: var(--color-ink-200); font-size: var(--text-micro); cursor: pointer; }
+.imgact:hover { background: var(--color-ink-800); }
+.imgact:disabled { opacity: 0.5; cursor: default; }
+.imgact:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.imgquiet { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; padding: 16px; color: var(--color-ink-500); font-size: var(--text-micro); text-align: center; }
+
+/* The overlay sits on a picture, not on the theme: its colours are fixed. It
+   shows on hover and on keyboard focus anywhere inside the picture. Touch has
+   no hover, so the thread skips it (a tap opens the canvas) and the canvas
+   always shows it. */
+.imgover { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: flex-end; gap: 8px; padding: 32px 10px 8px; background: linear-gradient(to top, rgb(0 0 0 / 0.68), rgb(0 0 0 / 0.4) 55%, transparent); color: #fff; opacity: 0; pointer-events: none; transition: opacity 0.12s; }
+.imgbox:hover .imgover, .imgbox:focus-within .imgover, .imgshot:hover .imgover, .imgshot:focus-within .imgover { opacity: 1; }
+.imgover .imgtool { pointer-events: auto; }
+.imgcap { flex: 1; min-width: 0; color: rgb(255 255 255 / 0.78); font-size: var(--text-micro); }
+.imgcap b { display: block; overflow: hidden; color: #fff; font-size: var(--text-label); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.imgcap span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.imgtool { display: grid; flex: none; place-items: center; width: 1.875rem; height: 1.875rem; padding: 0; border: 0; border-radius: 8px; background: none; color: #fff; cursor: pointer; }
+.imgtool:hover { background: rgb(255 255 255 / 0.18); }
+.imgtool:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+@media (hover: none) {
+  .imgbox .imgover { display: none; }
+  .imgshot .imgover { opacity: 1; }
+  .imgshot .imgtool { pointer-events: auto; }
+}
+
+/* A generated video in the thread. It shares the image block's box, wait and
+   cards; a finished one is a poster with a play button, played inline. */
+.vidblock[data-shape="auto"] { max-width: 30rem; }
+.vidblock[data-shape="auto"] .imgbox:not([data-compact]) { aspect-ratio: 16 / 9; }
+.vidbox { background: #000; }
+.vidbox[data-compact], .vidbox:has(.imgquiet), .vidbox:has(.imgwait) { background: var(--color-ink-850); }
+.vidopen { position: absolute; inset: 0; display: grid; place-items: center; width: 100%; height: 100%; padding: 0; border: 0; background: linear-gradient(135deg, #2b303b, #0d0f14); color: #fff; cursor: pointer; }
+.vidopen:disabled { cursor: progress; }
+.vidopen:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.vidplay { display: grid; place-items: center; width: 3.25rem; height: 3.25rem; border-radius: 9999px; background: rgb(0 0 0 / 0.55); transition: background 0.12s; }
+.vidopen:hover .vidplay { background: rgb(0 0 0 / 0.75); }
+.viddur { position: absolute; right: 8px; bottom: 8px; padding: 2px 6px; border-radius: 6px; background: rgb(0 0 0 / 0.6); color: #fff; font-size: var(--text-micro); line-height: 1.3; }
+.vidplayer { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+/* The caption is at the top, clear of the native controls along the bottom. */
+.vidover { position: absolute; left: 0; right: 0; top: 0; display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px 28px; background: linear-gradient(to bottom, rgb(0 0 0 / 0.68), rgb(0 0 0 / 0.4) 55%, transparent); color: #fff; opacity: 0; pointer-events: none; transition: opacity 0.12s; }
+.vidbox:hover .vidover, .vidbox:focus-within .vidover { opacity: 1; }
+.vidover .imgtool { pointer-events: auto; }
+.vidretry { position: absolute; left: 8px; right: 8px; bottom: 2.25rem; margin: 0; padding: 4px 8px; border-radius: 6px; background: rgb(0 0 0 / 0.7); color: #fff; font-size: var(--text-micro); text-align: center; }
+@media (hover: none) {
+  .vidover { opacity: 1; }
+  .vidbox[data-playing] .vidover { opacity: 0; }
+}
+
+/* The same picture in the canvas: contained, never cropped. */
+.canvas-doc[data-artifact-view="image"] { display: flex; flex: 1; align-items: center; justify-content: center; min-height: 0; }
+.imgshot { position: relative; display: block; max-width: 100%; overflow: hidden; border-radius: 8px; }
+.imgshot .canvas-image { display: block; max-width: 100%; max-height: calc(100dvh - 9rem); width: auto; height: auto; object-fit: contain; }
+
+@media (prefers-reduced-motion: reduce) {
+  .imgwait, .imgdots i, .imgopen img { animation: none; }
+  .imgwait { background: none; }
+  .imgdots i { opacity: 0.7; }
+  .imgover, .vidover, .vidplay { transition: none; }
+}
+
+/* ---- CAD-2103: the Browser tab (session-backed; mockups/browser-canvas-tab) ----
+   Kept at the end of the file, apart from the artifact rules above. */
+.bz-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.cv-pane[hidden], .bz-panel[hidden] { display: none; }
+.bz-panel { position: relative; }
+.bz-dot { flex: none; width: 7px; height: 7px; border-radius: 9999px; background: var(--c, var(--color-ink-500)); }
+.bz-dot[data-pulse] { animation: bz-pulse 1.4s ease-in-out infinite; }
+.cv-tab[data-kind="session"] .cv-tab-label { display: inline-flex; align-items: center; gap: 6px; }
+.cv-tab[data-kind="session"] .cv-tab-label svg { flex: none; }
+@keyframes bz-pulse { 50% { opacity: 0.35; } }
+.bz-badge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 9999px; background: color-mix(in srgb, var(--c, var(--color-accent)) 16%, transparent); color: var(--c, var(--color-accent)); font: 500 var(--text-micro) var(--font-sans); }
+.arttype:has(> svg), .bz-globe { color: var(--color-accent); }
+.bz-title b[tabindex]:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: 2px; }
+.canvas-drawer:focus { outline: none; }
+
+/* The header is one row: globe, name and state, the address in the flexible middle, the
+   actions, then the canvas controls. During a stop confirmation, the actions take a full row underneath. */
+.bz-head { flex-wrap: nowrap; gap: 8px; }
+.bz-head[data-confirm] { flex-wrap: wrap; }
+.bz-globe { display: inline-flex; flex: none; }
+.bz-title { display: flex; flex: none; align-items: baseline; gap: 6px; }
+.bz-title b { color: var(--color-ink-100); font-size: var(--text-label); font-weight: 500; }
+.bz-gap { flex: 1; }
+/* One line, never wrapping: the path gives way first, then the host is clipped from its START. */
+.bz-addr { flex: 1 1 0; min-width: 0; display: flex; align-items: baseline; white-space: nowrap; overflow: hidden; font: var(--text-label) var(--font-mono); color: var(--color-ink-500); }
+.bz-host { flex: 0 0 auto; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; color: var(--color-ink-100); font-weight: 600; }
+.bz-rest { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* The address keeps the first row only while its whole host fits there (BrowserPanel measures it,
+   `data-addr`); otherwise it takes its own row under the header, so a host is never cut to its last
+   few characters at a laptop width. The title then pushes the actions and canvas controls right. */
+.bz-head[data-addr="below"] { flex-wrap: wrap; row-gap: 4px; }
+.bz-head[data-addr="below"] > .bz-title { margin-right: auto; }
+.bz-head[data-addr="below"] > .bz-actions { margin-left: auto; }
+.bz-head[data-addr="below"] > .bz-addr { order: 10; flex: 1 0 100%; }
+/* A panel 480 px wide or less (a phone's sheet, or a small window's drawer) shows the actions as
+   icons; each keeps its accessible name. The labelled actions and the canvas controls need about
+   460 px in the longest locale (English), so wider panels keep the labels on one row. */
+.bz-panel { container: bz-panel / inline-size; }
+@container bz-panel (max-width: 480px) { .bz-actions .bz-lbl { display: none; } }
+
+.bz-body { gap: 12px; }
+.bz-body .sempty { flex: none; text-align: center; }
+.bz-body[data-frame] { padding: 0; overflow: hidden; }
+
+/* The assistant's words: plain text, attributed so they do not read as the board's. */
+.bz-says { flex: none; display: grid; gap: 2px; }
+.bz-says small { color: var(--color-ink-500); font-size: var(--text-micro); }
+.bz-says p { margin: 0; max-height: 9rem; overflow-y: auto; color: var(--color-ink-100); font-size: var(--text-body); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* The actions that apply, in the header. */
+.bz-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+.bz-actions:focus-visible { outline: 2px solid var(--color-accent); }
+.bz-actions .btn { display: inline-flex; align-items: center; gap: 5px; }
+.bz-ask { color: var(--color-ink-300); font-size: var(--text-label); }
+.bz-head[data-confirm] .bz-actions { order: 9; flex: 1 0 100%; flex-wrap: wrap; }
+/* The two answers stay together and at the right edge, beside the question or under it. */
+.bz-answers { display: inline-flex; flex: none; gap: 6px; margin-left: auto; }
+
+/* The live view fills the panel: a frame to the provider's own page, scoped by frame-src. */
+.bz-viewer { flex: 1; min-height: 0; display: flex; }
+.bz-viewer:focus-within { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.bz-viewer iframe { flex: 1; min-width: 0; min-height: 14rem; border: 0; background: var(--color-ink-100); }
+.bz-viewer[data-phase="loading"] iframe { background: var(--color-ink-900); }
+
+/* The card's host: its own line, wrapped, and clipped from the START (the last
+   lines stay visible), so the registrable end is always readable. */
+.bz-card-host { display: flex; flex-direction: column-reverse; line-height: 1.4; max-height: 2.8em; overflow: hidden; white-space: normal; overflow-wrap: anywhere; color: var(--color-ink-200); }
+.bz-card-wrap { padding: 4px 0; }
+.bz-card { grid-template-columns: auto minmax(0, 1fr); width: 100%; text-align: left; }
+.bz-card:has(> .artopen) { grid-template-columns: auto minmax(0, 1fr) auto; }
+.bz-card:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .bz-dot[data-pulse], .cv-bar-run { animation: none; }
+}
+.canvas-drawer[data-mode="sheet"] .cv-iconbtn,
+.canvas-drawer[data-mode="sheet"] .bz-actions .btn { min-width: 2.25rem; min-height: 2.25rem; }
+.canvas-drawer[data-mode="sheet"] .cv-tab-close { min-width: 2.25rem; min-height: 2.25rem; }
+/* A phone's canvas is the whole screen with its actions in the header: the toast stays at the foot, clear of them.
+   Narrow: the address goes first (the actions then keep the right edge), then the action labels (the
+   container rule above). */
+@media (max-width: 520px) {
+  .canvas-drawer[data-mode="sheet"] .bz-addr { display: none; }
+  .canvas-drawer[data-mode="sheet"] .bz-title { margin-right: auto; }
+}
+
+/* CAD-2436: the artifact card gives its title two lines, its meta line the
+   chat font, and Open the shape of a button. */
+.artcard { padding: 10px 12px; border-radius: 12px; }
+.arttype { width: 40px; height: 46px; border-radius: 8px; border: 0; background: color-mix(in srgb, var(--color-accent) 16%, var(--color-ink-875)); font: 600 10px/1 var(--font-chat); }
+.arttext b { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: .875rem; line-height: 1.35; }
+.artmeta { font-family: var(--font-chat); font-size: .75rem; color: var(--color-ink-400); }
+.artopen { padding: 5px 12px; border: 1px solid var(--color-ink-700); border-radius: 8px; color: var(--color-ink-100); font-weight: 500; }
+.artcard:hover .artopen { background: var(--color-ink-800); }
+
+/* ---- CAD-2471: an app view (an installed app's screen, read-only) ---- */
+/* The record view's source line is one line with an ellipsis. */
+.cv-title > .cv-appview-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.cv-appview-body { padding: 0; position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.cv-appview-note { display: grid; gap: 8px; justify-items: start; margin: 0; padding: 12px; min-width: 0; overflow-wrap: anywhere; color: var(--color-ink-300); font-size: var(--text-label); }
+.cv-appview-note p { margin: 0; }
+/* The app workspace sizes its assistant aside to 100%; the canvas is anchored by top and bottom,
+   so a full-height box starting below the header would end under the viewport and hide the footer. */
+.app-workspace > aside.canvas-drawer { height: auto; }
+
+/* ---- CAD-2543: a record view (a read-only email reader) ---- */
+.cv-record-body { gap: 10px; min-width: 0; overflow: auto; }
+.cv-record-body > * { flex: none; }
+.rv-meta { display: grid; gap: 2px; margin: 0; min-width: 0; font-size: var(--text-label); }
+.rv-metarow { display: grid; grid-template-columns: 3.5rem minmax(0, 1fr); gap: 8px; min-width: 0; }
+.rv-metarow dt { color: var(--color-ink-500); }
+.rv-metarow dd { min-width: 0; margin: 0; color: var(--color-ink-200); overflow-wrap: anywhere; }
+.rv-subject { min-width: 0; margin: 0; color: var(--color-ink-100); font-size: 1rem; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.rv-text { min-width: 0; color: var(--color-ink-200); font-size: var(--text-label); line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
+.rv-trunc { margin: 0; color: var(--color-ink-500); font-size: var(--text-micro); font-style: italic; }
+.rv-files { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; margin: 0; padding: 0; list-style: none; }
+.rv-file { max-width: 100%; padding: 2px 10px; border: 1px solid var(--color-ink-700); border-radius: 999px; background: color-mix(in srgb, var(--color-ink-400) 12%, transparent); color: var(--color-ink-300); font-size: var(--text-micro); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-acts { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 4px; }
+
+/* ---- CAD-2657 / CAD-2690: the app view's header, and the full-width canvas ---- */
+/* Its own row (back or mark, title, actions) exists where no tab bar leads; under it, one quiet "<App> · <options> · Read-only" line.
+   Docked under a tab bar, the header is that line alone and the actions sit at the tab bar's right end. */
+.cv-vhead { display: flex; flex-direction: column; align-items: stretch; flex-wrap: nowrap; gap: 4px; padding: 6px 8px 6px 12px; background: var(--color-ink-875); }
+.cv-vhead[data-docked] { padding-top: 5px; padding-bottom: 5px; }
+.cv-vrow { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 2.25rem; }
+.cv-tabactions { display: flex; flex: none; align-items: center; gap: 8px; padding-right: 8px; }
+.cv-tabactions:empty { display: none; }
+/* The title is what truncates in the row (an ellipsis, never a second row). */
+.cv-vtitle { flex: 0 1 auto; min-width: 2.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ink-100); font-size: var(--text-label); font-weight: 600; }
+.cv-meta { display: flex; align-items: baseline; gap: 6px; min-width: 0; margin: 0; color: var(--color-ink-400); font-size: var(--text-micro); line-height: 1.4; }
+.cv-meta-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-meta-dot { flex: none; }
+.cv-ro { position: relative; flex: none; border-radius: 4px; color: var(--color-ink-300); }
+.cv-ro:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.cv-gap { flex: 1 1 0; min-width: 0; }
+.cv-sep { flex: none; width: 1px; height: 1.125rem; background: var(--color-ink-700); }
+.cv-tip { display: none; position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; width: max-content; max-width: 16rem; padding: 6px 10px; border-radius: 8px; background: var(--color-ink-100); color: var(--color-ink-900); font-size: var(--text-micro); line-height: 1.4; }
+.cv-ro:hover .cv-tip, .cv-ro:focus .cv-tip { display: block; }
+.cv-open { display: inline-flex; flex: 0 1 auto; align-items: center; gap: 6px; min-width: 0; max-width: 40%; overflow: hidden; white-space: nowrap; border: 1px solid var(--color-ink-700); }
+.cv-open svg { flex: none; }
+.cv-open-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.cv-tabactions .cv-open { max-width: 14rem; }
+.cv-fold { display: none; flex: none; }
+.cv-back { display: inline-flex; align-items: center; width: auto; gap: 6px; }
+.cv-back[data-expanded] { padding: 0 8px; font-size: var(--text-label); color: var(--color-ink-200); }
+.cv-back kbd { padding: 0 5px; border: 1px solid var(--color-ink-600); border-radius: 4px; color: var(--color-ink-400); font: var(--text-micro) var(--font-mono); }
+/* As the pane narrows: "Open in" goes icon-only, then the actions fold into "⋯". */
+@container cv-main (max-width: 640px) {
+  .cv-open-label { display: none; }
+}
+@container cv-main (max-width: 480px) {
+  .cv-wide { display: none; }
+  .cv-fold { display: inline-flex; }
+}
+
+/* Expanded over the chat (Home): the board's sidebar folds to its rail (App.tsx) and the chat to a rail of its own
+   inside the canvas. The chat stays mounted and out of sight; opened, it is a drawer over the canvas. */
+.cv-rail { display: flex; flex: none; flex-direction: column; align-items: center; width: 48px; padding-top: 10px; border-right: 1px solid var(--color-ink-700); background: var(--color-ink-900); }
+.cv-rail-chat { position: relative; }
+.cv-dot { position: absolute; top: 3px; right: 3px; width: 8px; height: 8px; border-radius: 9999px; background: var(--color-accent); }
+[data-canvas-full] .home-workspace { visibility: hidden; }
+[data-canvas-full][data-canvas-peek] .home-workspace { visibility: visible; position: fixed; z-index: 16; top: 3rem; bottom: 0; left: 48px; width: 360px; max-width: calc(100vw - 48px); padding-inline: 16px; background: var(--color-ink-900); border-right: 1px solid var(--color-ink-700); box-shadow: 18px 0 40px rgb(0 0 0 / 0.35); }
+@media (width >= 1024px) {
+  [data-canvas-full][data-canvas-peek] .home-workspace { left: calc(64px + 48px); }
+}
+
+/* ---- CAD-2635: several views side by side ----
+   The stage is one 3x3 grid: the middle tracks are the dividers (0 where a layout has none).
+   Each view is one keyed child placed by its cell, so a move never reorders the DOM. Every pane is
+   its own container, so the header folds by the pane's width and not the canvas's. */
+.cv-panes { flex: 1; min-height: 0; min-width: 0; display: grid; position: relative; }
+.cv-panes[hidden] { display: none; }
+.cv-pane { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; container: cv-main / inline-size; }
+.cv-panes[data-panes] .cv-pane { border: 1px solid var(--color-ink-800); border-radius: 8px; }
+.cv-panes[data-panes] .cv-pane[data-focused] { border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700)); }
+.cv-divider-slot { position: relative; z-index: 2; min-width: 0; min-height: 0; }
+.cv-divider { position: absolute; inset: 0; touch-action: none; }
+.cv-divider[data-axis="cols"] { cursor: col-resize; }
+.cv-divider[data-axis="rows"] { cursor: row-resize; }
+.cv-divider::before { content: ""; position: absolute; inset: -4px; }
+.cv-divider::after { content: ""; position: absolute; border-radius: 9999px; background: var(--color-ink-600); transition: background 0.15s ease; }
+.cv-divider[data-axis="cols"]::after { top: 50%; left: 2px; width: 2px; height: 36px; margin-top: -18px; }
+.cv-divider[data-axis="rows"]::after { left: 50%; top: 2px; height: 2px; width: 36px; margin-left: -18px; }
+.cv-divider:hover::after, .cv-divider:focus-visible::after { background: var(--color-accent); }
+.cv-divider:focus-visible { outline: none; }
+.cv-tab[data-paned] .cv-tab-title::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 9999px; background: var(--color-accent); vertical-align: middle; }
+.cv-tab[draggable="true"] { cursor: grab; }
+.cv-layout { display: flex; flex: none; align-items: center; gap: 8px; padding: 0 8px; }
+.cv-switch { display: inline-flex; padding: 2px; gap: 2px; border: 1px solid var(--color-ink-700); border-radius: 8px; background: var(--color-ink-900); }
+.cv-switch-btn { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px; border-radius: 6px; color: var(--color-ink-400); font-size: var(--text-micro); }
+.cv-switch-btn:hover:not(:disabled) { color: var(--color-ink-100); }
+.cv-switch-btn[aria-pressed="true"] { background: var(--color-ink-800); color: var(--color-ink-100); }
+.cv-switch-btn:disabled { opacity: 0.45; cursor: default; }
+.cv-switch-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.cv-saved { padding: 1px 8px; border: 1px solid var(--color-ink-700); border-radius: 9999px; color: var(--color-ink-300); font-size: var(--text-micro); white-space: nowrap; }
+button.cv-saved:hover { color: var(--color-ink-100); border-color: var(--color-ink-500); }
+@container cv-main (max-width: 1100px) { .cv-switch-label { display: none; } }
+/* Drop zones sit above the frames (an iframe swallows a drop) and exist only while a tab is being dragged. */
+.cv-zones { position: absolute; inset: 0; z-index: 4; display: grid; grid-template-areas: "left replace right" "bottom bottom bottom"; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 7fr 3fr; gap: 6px; padding: 6px; background: color-mix(in srgb, var(--color-ink-900) 55%, transparent); }
+.cv-zone { display: grid; place-items: center; border: 1px dashed color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700)); border-radius: 10px; color: var(--color-ink-200); font-size: var(--text-label); text-align: center; }
+.cv-zone[data-over] { border-style: solid; background: color-mix(in srgb, var(--color-accent) 22%, transparent); color: var(--color-ink-100); }
+.cv-zone[data-disabled] { opacity: 0.35; border-color: var(--color-ink-700); }
+/* "Move to tab" lives in the "⋯" of a pane at every width. */
+.cv-fold[data-pane] { display: inline-flex; }
+.viewcard-placed { margin: 0; }
+@media (prefers-reduced-motion: reduce) { .cv-divider::after { transition: none; } }

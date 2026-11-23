@@ -229,6 +229,7 @@ mod cad1098_tests {
             id: None,
             file: None,
             status: None,
+            request_id: None,
         };
         let report = run(dir.clone(), None, None, None, None, None, None, Some(file));
         let issue = super::super::issue::run(dir, new);

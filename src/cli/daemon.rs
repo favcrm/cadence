@@ -36,6 +36,12 @@ pub(crate) enum DaemonAction {
     /// `daemon stop` is lease-free. A following start of the same
     /// build is also lease-free.
     Stop,
+    /// Bind the operator-provisioned scoped-cursor keyring record to this
+    /// workspace exactly once. The record is fixed at
+    /// `<state-dir>/scoped-cursors.json`; this verb carries no paths, keys or
+    /// identity fields. Idempotent when the same material is already bound;
+    /// any different material fails closed and is never rewritten.
+    CursorKeyInit,
     /// Stop, wait for exit, start, and report a before/after table of
     /// every agent's state (and pane pid for pty agents). The lease
     /// gates a build change and a schema crossing. This command still
@@ -84,7 +90,11 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             // Never keep the holder in the environment, even if the
             // parent shell exported it. Panes inherit the daemon's env.
             std::env::remove_var("CADENCE_ROLLOUT_AS");
-            std::fs::create_dir_all(&state_dir)?;
+            // CAD-1922: a state dir inside the consolidated home is
+            // created 0700 along with the home root; elsewhere this is
+            // the same create_dir_all. The mode check below stays: an
+            // existing state dir is tightened, never left wide.
+            cadence_agent::home::create_home_dir(&state_dir)?;
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
@@ -95,13 +105,13 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             // A sandbox shares $HOME with production, so it never
             // writes the skill there.
             if cadence_agent::sandbox::profile().is_some() {
-                eprintln!("skill: skipped (sandbox profile)");
+                eprint_line("skill: skipped (sandbox profile)");
             } else {
                 match home_dir().map(|h| cadence_agent::skill::sync(&h, false, None)) {
                     Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
-                        eprintln!("skill: refreshed {}", report["root"])
+                        eprint_line(&format!("skill: refreshed {}", report["root"]))
                     }
-                    Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
+                    Ok(Err(e)) => eprint_line(&format!("skill: refresh failed: {e}")),
                     _ => {}
                 }
             }
@@ -145,6 +155,11 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             Ok(0)
         }
         DaemonAction::Stop => daemon_stop(&state_dir),
+        DaemonAction::CursorKeyInit => {
+            let answer = client::rpc(&state_dir, "scoped_cursor_initialize", json!({}))?;
+            print_json(&answer);
+            Ok(0)
+        }
         DaemonAction::Restart {
             when_idle,
             timeout,
@@ -418,12 +433,12 @@ pub(crate) fn daemon_restart(
                     )));
                 }
                 if !stale_noted {
-                    eprintln!(
+                    eprint_line(&format!(
                         "when-idle: ignoring {} stale turn(s) on stopped or \
                          dead agents: {}",
                         stale.len(),
                         stale.join(", ")
-                    );
+                    ));
                     stale_noted = true;
                 }
                 for p in pairs {
@@ -443,7 +458,7 @@ pub(crate) fn daemon_restart(
                 )));
             }
             if Instant::now() >= next_report {
-                eprintln!("when-idle: waiting on {}", busy.join(", "));
+                eprint_line(&format!("when-idle: waiting on {}", busy.join(", ")));
                 next_report = Instant::now() + Duration::from_secs(30);
             }
             std::thread::sleep(Duration::from_secs(2));
@@ -463,8 +478,10 @@ pub(crate) fn daemon_restart(
     // `turn_adopted`/`turn_adopt_refused` to a busy agent's tail page,
     // and an older restart's events can never masquerade as this
     // one's.
-    let mut event_cursors: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut event_cursors: std::collections::HashMap<
+        String,
+        Option<super::events::AgentEventsAfter>,
+    > = std::collections::HashMap::new();
     // Aliases whose pre-stop tail read failed — the verdict cannot
     // bound their event history, so it must fail rather than silently
     // drop the check (CAD-694).
@@ -476,13 +493,19 @@ pub(crate) fn daemon_restart(
         let Some(alias) = a["alias"].as_str().map(str::to_string) else {
             continue;
         };
-        match client::rpc(
-            state_dir,
-            "agent_events",
-            json!({"alias": alias, "tail": true}),
-        ) {
-            Ok(v) => {
-                event_cursors.insert(alias, v["cursor"].as_i64().unwrap_or(0));
+        // CAD-2215: the pre-stop position is whatever the daemon says this
+        // reader may hold — a numeric sequence only for a proven operator,
+        // an opaque continuation otherwise. A page outside the protocol is a
+        // failed read, never a guessed zero.
+        let request = super::events::agent_events_request(&alias, None, true, 0);
+        let cursor = client::rpc(state_dir, "agent_events", request).and_then(|mut page| {
+            let reader = super::events::agent_events_ack(&mut page)?;
+            let page = super::events::agent_events_page(page, reader, None)?;
+            super::events::agent_events_next(&page, reader)
+        });
+        match cursor {
+            Ok(cursor) => {
+                event_cursors.insert(alias, cursor);
             }
             Err(_) => cursor_misses.push(alias),
         }
@@ -532,12 +555,12 @@ pub(crate) fn daemon_restart(
     let started_instance = started_instance(&started);
     let start_unbound = started["state"].as_str() != Some("started");
     if start_unbound {
-        eprintln!(
+        eprint_line(&format!(
             "restart: the start answered {} instead of `started` — that daemon is not \
              the one this restart spawned, so its recovery evidence is not bound to \
              this restart",
             started["state"].as_str().unwrap_or("without a state")
-        );
+        ));
     }
     // Wait until every agent that was live before leaves the
     // transitional states — `starting` (actor up, endpoint not open)
@@ -573,9 +596,9 @@ pub(crate) fn daemon_restart(
         std::thread::sleep(Duration::from_millis(500));
     };
     if let Some(ui_pid) = ui_was_running {
-        cadence_agent::ui::run_cli(
+        cadence_ui::run_cli(
             state_dir,
-            &cadence_agent::ui::UiAction::Stop {
+            &cadence_ui::UiAction::Stop {
                 tailscale_off: false,
                 as_identity: None,
             },
@@ -612,15 +635,15 @@ pub(crate) fn daemon_restart(
                     .to_string(),
             );
         }
-        cadence_agent::ui::run_cli(
+        cadence_ui::run_cli(
             state_dir,
-            &cadence_agent::ui::UiAction::Start {
+            &cadence_ui::UiAction::Start {
                 flags,
                 reset: false,
                 as_identity: None,
             },
         )?;
-        println!("ui: restarted");
+        print_line("ui: restarted");
     }
     // Before/after table: state then, state now, and for pty agents
     // whether the pane pid survived and whether an in-flight turn was
@@ -643,12 +666,14 @@ pub(crate) fn daemon_restart(
     // would only repeat that, so it is judged only for a spawned start.
     if !start_unbound {
         if let Some(reason) = recovery_record_verdict(state_dir, started_instance.as_deref()) {
-            eprintln!("restart: {reason}");
+            eprint_line(&format!("restart: {reason}"));
             bad = true;
         }
     }
     for alias in &cursor_misses {
-        eprintln!("restart: no pre-stop event cursor for {alias} — its verdict is unverified");
+        eprint_line(&format!(
+            "restart: no pre-stop event cursor for {alias} — its verdict is unverified"
+        ));
         bad = true;
     }
     let mut existing_fences = Vec::new();
@@ -679,41 +704,79 @@ pub(crate) fn daemon_restart(
             // missing cursor means the pre-stop fetch failed; paging
             // from zero could pick up an older restart's verdicts, so
             // the column stays `-` instead.
-            if let Some(cursor) = event_cursors.get(alias.as_str()).copied() {
-                let mut seq = cursor;
+            if let Some(cursor) = event_cursors.get(alias.as_str()).cloned() {
+                let mut position = cursor;
                 let mut kinds: Vec<String> = Vec::new();
                 // A failed page leaves this restart's verdict unknown —
                 // recorded and failed below, never silently skipped.
                 let mut pages_failed = false;
+                let mut reader: Option<super::events::AgentEventsReader> = None;
                 // Bounded: a restart's adopt verdicts land within a few
-                // events; 20 pages of 100 is far past any real gap and
-                // keeps a pathological event stream from looping.
+                // events; 20 pages of up to 100 visible events is far past
+                // any real gap and keeps a pathological event stream from
+                // looping.
                 for _ in 0..20 {
-                    let page = client::rpc(
-                        state_dir,
-                        "agent_events",
-                        serde_json::json!({"alias": alias, "after": seq}),
+                    let request = super::events::agent_events_request(
+                        alias.as_str(),
+                        position.as_ref(),
+                        false,
+                        0,
                     );
-                    let Ok(v) = page else {
+                    // Each page must name the reader it was scoped for; a
+                    // daemon that answers outside the protocol, changes the
+                    // reader, or serves numeric positions to a scoped
+                    // continuation leaves this restart's verdict unverified.
+                    let parsed =
+                        client::rpc(state_dir, "agent_events", request).and_then(|mut page| {
+                            let ack = super::events::agent_events_ack(&mut page)?;
+                            if reader.is_some_and(|established| established != ack) {
+                                return Err(Error::rejected(
+                                    "restart: the daemon changed the agent-event reader scope",
+                                ));
+                            }
+                            if ack == super::events::AgentEventsReader::Operator
+                                && matches!(
+                                    position.as_ref(),
+                                    Some(super::events::AgentEventsAfter::Token(_))
+                                )
+                            {
+                                return Err(Error::rejected(
+                                    "restart: an operator stream cannot continue from an \
+                                     opaque cursor",
+                                ));
+                            }
+                            let page =
+                                super::events::agent_events_page(page, ack, position.as_ref())?;
+                            Ok((ack, page))
+                        });
+                    let Ok((ack, page)) = parsed else {
                         pages_failed = true;
                         break;
                     };
-                    let events = v["events"].as_array().cloned().unwrap_or_default();
+                    reader = Some(ack);
+                    let events = page["events"].as_array().cloned().unwrap_or_default();
                     let n = events.len();
                     for e in &events {
                         if let Some(k) = e["kind"].as_str() {
                             kinds.push(k.to_string());
                         }
                     }
-                    seq = v["cursor"].as_i64().unwrap_or(seq);
-                    if n < 100 {
+                    let Ok(next) = super::events::agent_events_next(&page, ack) else {
+                        pages_failed = true;
+                        break;
+                    };
+                    position = next;
+                    // A short page is the end of the stream for both readers:
+                    // an operator page is 100 scanned rows and a scoped page
+                    // is up to 100 VISIBLE rows.
+                    if n < 100 || position.is_none() {
                         break;
                     }
                 }
                 if pages_failed {
-                    eprintln!(
+                    eprint_line(&format!(
                         "restart: event history unread for {alias} — its verdict is unverified"
-                    );
+                    ));
                     bad = true;
                 }
                 if kinds.iter().any(|k| k == "turn_adopt_refused") {
@@ -749,7 +812,9 @@ pub(crate) fn daemon_restart(
                     }
                 }
                 Err(e) => {
-                    eprintln!("restart: could not verify carried stale turn {sal}/{mid}: {e}");
+                    eprint_line(&format!(
+                        "restart: could not verify carried stale turn {sal}/{mid}: {e}"
+                    ));
                     bad = true;
                 }
             }
@@ -768,23 +833,28 @@ pub(crate) fn daemon_restart(
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let w = rows.iter().map(|r| r.0.len()).max().unwrap_or(5).max(5);
-    println!(
+    // The table is the report the failure verdict below refers to: a
+    // closed stdout must not panic that verdict into success.
+    print_line(&format!(
         "{:<w$}  {:<12}  {:<12}  {:<18}  TURN",
         "AGENT",
         "BEFORE",
         "AFTER",
         "PANE",
         w = w
-    );
+    ));
     for (alias, before_state, after_state, pane, turn) in &rows {
-        println!(
+        print_line(&format!(
             "{alias:<w$}  {before_state:<12}  {after_state:<12}  {pane:<18}  {turn}",
             w = w
-        );
+        ));
     }
     if !existing_fences.is_empty() {
         existing_fences.sort();
-        println!("Existing fences retained: {}", existing_fences.join(", "));
+        print_line(&format!(
+            "Existing fences retained: {}",
+            existing_fences.join(", ")
+        ));
     }
     if bad {
         Err(Error::rejected(

@@ -10,8 +10,9 @@
 //! plus a dirty worktree (ignored paths don't count), a branch that
 //! has not started (no commits beyond where it was cut — never
 //! "merged", CAD-275) and a branch whose work survives nowhere —
-//! merged into the repo's default branch by ancestry,
-//! patch-equivalent commits, a squash merge, or a merged PR, or
+//! merged into the repo's default branch by ancestry
+//! or a merged PR whose head is exactly the tip (CAD-2181: never
+//! content inference), or
 //! pushed. A busy owner working ELSEWHERE is not a reason. `--force`
 //! overrides each and is recorded as a `Forced:` trailer on the
 //! finish commit. Refs are kept as history, marked `closed: true`
@@ -31,6 +32,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+#[cfg(test)]
 use tempfile::TempDir;
 
 use crate::adapter::pty;
@@ -48,6 +50,7 @@ mod activity;
 mod evidence;
 mod git;
 mod guard;
+mod hosted;
 mod resolve;
 mod run;
 mod sweep;
@@ -60,8 +63,11 @@ use resolve::*;
 
 pub(crate) use activity::{comm_of, daemon_view, lane_in_use, with_probe_timeout, DaemonView};
 pub(crate) use evidence::{branch_tip, not_started};
-pub(crate) use git::{default_ref, git, git_branch, merge_rule};
+pub(crate) use git::{default_ref, git, git_branch, merge_rule, merged_claim};
 pub(crate) use guard::cwd_holder_aliases;
+#[cfg(test)]
+pub(crate) use hosted::BEFORE_FINAL_LOCK;
+pub(crate) use hosted::{gh_merged_prs, release_hosted_lane};
 pub(crate) use run::{run, FinishArgs};
 pub use sweep::sweep;
 pub(crate) use sweep::{lexical_path, registered_branch_path, same_path, sweep_selected};
@@ -310,5 +316,96 @@ mod tests {
         let mut probe2 = target("CAD-1");
         probe2.msg_refs.insert("gone".to_string());
         assert!(stale_probe_reason(&probe2, &target("CAD-1")).is_none());
+    }
+
+    /// CAD-2337: a daemon that exited leaves `cadence.sock` behind.
+    /// Bind and drop a listener to make exactly that file.
+    fn stale_socket_state() -> TempDir {
+        let state = TempDir::new().unwrap();
+        drop(std::os::unix::net::UnixListener::bind(client::socket_path(state.path())).unwrap());
+        assert!(client::socket_path(state.path()).exists());
+        state
+    }
+
+    fn lane_target(wt: &Path) -> Target {
+        let mut t = target("CAD-2337");
+        t.wt_dir = Some(wt.to_path_buf());
+        t
+    }
+
+    #[test]
+    fn a_stale_socket_is_a_stopped_daemon() {
+        let state = stale_socket_state();
+        let wt = TempDir::new().unwrap();
+        let view = daemon_view(state.path());
+        assert!(!view.up, "no listener means no daemon");
+        assert!(view.enum_unreachable.is_none() && view.enum_inconclusive.is_none());
+        let (blocks, deferred) = guard::in_use_blocks(&view, state.path(), &lane_target(wt.path()));
+        assert!(blocks.is_empty() && deferred.is_empty());
+    }
+
+    #[test]
+    fn a_stale_socket_still_blocks_on_a_process_in_the_worktree() {
+        let state = stale_socket_state();
+        let wt = TempDir::new().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(wt.path())
+            .spawn()
+            .unwrap();
+        let view = daemon_view(state.path());
+        let (blocks, _) = guard::in_use_blocks(&view, state.path(), &lane_target(wt.path()));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!view.up);
+        assert!(
+            blocks.iter().any(|b| b.tag == "proc-cwd"),
+            "the /proc scan must block"
+        );
+    }
+
+    #[test]
+    fn a_listening_daemon_that_fails_agent_list_still_blocks() {
+        use std::io::{BufRead, BufReader};
+        let state = TempDir::new().unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(client::socket_path(state.path())).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < end {
+                match listener.accept() {
+                    Ok((sock, _)) => {
+                        sock.set_nonblocking(false).unwrap();
+                        sock.set_read_timeout(Some(Duration::from_millis(500)))
+                            .unwrap();
+                        let mut line = String::new();
+                        // Take the request, then hang up with no answer.
+                        let _ = BufReader::new(&sock).read_line(&mut line);
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        let wt = TempDir::new().unwrap();
+        let view = daemon_view(state.path());
+        let (blocks, deferred) = guard::in_use_blocks(&view, state.path(), &lane_target(wt.path()));
+        assert!(view.up, "a listener that fails is still a daemon");
+        let all: Vec<_> = blocks.iter().chain(deferred.iter()).collect();
+        assert!(
+            !all.is_empty(),
+            "an answering-but-failing daemon must block"
+        );
+        drop(server); // detached; it ends at its own deadline
+    }
+
+    #[test]
+    fn the_remediation_never_suggests_a_bare_daemon_start() {
+        let e = Error::internal(
+            "Daemon is not reachable at /x/cadence.sock — start it with `cadence daemon start`",
+        );
+        let text = probe_text(&e);
+        assert!(text.contains("cadence --org local daemon start"), "{text}");
+        assert!(!text.contains("`cadence daemon start`"), "{text}");
     }
 }

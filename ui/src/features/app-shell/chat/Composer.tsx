@@ -2,6 +2,7 @@ import { askBody, askLabel, citesArtifact } from "../../canvas/askRefs";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -10,8 +11,10 @@ import {
 } from "react";
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
-import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
-import { ATTACH_ACCEPT, attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
+import { parseSlash, SLASH_COMMANDS, slashMatches, WORKSPACE_SKILLS_COMMAND, type SlashCommand } from "../../home/master";
+import type { PendingAttachment } from "../../home/thread";
+import WorkspaceSkillPicker from "../../home/WorkspaceSkillPicker";
+import { attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../../../lib/uiNotice";
 import {
   addFiles,
@@ -20,6 +23,7 @@ import {
   captureReady,
   composerDraftState,
   consumeSeed,
+  onComposerFocusRequest,
   removeAttach,
   reserveDraft,
   retryAttach,
@@ -61,8 +65,9 @@ import {
 export interface ComposerSend {
   body: string;
   refs: ThreadRef[];
-  /** CAD-1168: daemon-minted ids of the retained uploads that are `ready`. */
-  attachments?: { id: string }[];
+  /** CAD-1168: daemon-minted ids of the retained uploads that are `ready`
+   *  (plus local metadata so the pending bubble renders chips/previews). */
+  attachments?: PendingAttachment[];
   /** One host-resolved library image pin. Not a file upload. */
   mediaRefs?: { asset_id: string; revision: number; sha256: string }[];
 }
@@ -85,9 +90,12 @@ export interface ComposerProps {
   /**
    * Full density only: a complete `/verb [arg]` submits through here
    * (never to the thread). Compact panes with their own commands
-   * (`/new`) pass it too; without it every submission is a send.
+   * (`/new`) pass it too; without it every submission is a send. `false`
+   * means the words did not run and may be a message, so the box keeps them.
    */
-  onCommand?: (name: string, arg: string) => void;
+  onCommand?: (name: string, arg: string) => boolean | void;
+  /** The verbs the menu offers, when this board cannot run them all. */
+  commands?: readonly SlashCommand[];
   /** A real send completed validation — deliver `body` (with `refs`).
    *  The returned promise settles when the destination's pending row
    *  owns the envelope; a rejected promise keeps the draft and files. */
@@ -96,6 +104,8 @@ export interface ComposerProps {
   onSubmitted?: () => void;
   /** Focus the box after a send (the Home dock does). */
   refocusAfterSend?: boolean;
+  /** Reveal an owning pane before an external request focuses this composer. */
+  onReveal?: () => void;
   textareaId?: string;
   ariaLabel?: string;
   placeholder?: string;
@@ -125,6 +135,15 @@ export interface ComposerProps {
   onResolveOriginal?: () => void;
   /** Compact only: host actions (CAD-1431) listed in a More actions menu. */
   actions?: ComposerAction[];
+  /**
+   * CAD-1880: this pane's turn is stoppable. Stop takes the send slot while
+   * a turn runs — the dock no longer carries a working row, so the action
+   * that interrupts the turn sits where the next message would be sent.
+   * Absent while the stream is down (last known state) and in read-only.
+   */
+  stop?: { onStop: () => void } | null;
+  /** Optional Up-arrow handler when the composer is empty and no menu is open. */
+  onArrowUpEmpty?: () => boolean;
 }
 
 /** One host action behind the compact composer's More actions menu. */
@@ -132,6 +151,14 @@ export interface ComposerAction {
   label: string;
   onSelect: () => void;
 }
+
+/** CAD-2422: a message longer than this (UTF-8) is sent as a text attachment.
+ *  Large enough for any ordinary message; small next to the 256 KiB model request. */
+const LONG_TEXT_BYTES = 32 * 1024;
+/** CAD-2422: per composer key, the long text already copied into an
+ *  attachment row and that row, so the next send carries the row in its
+ *  place while the text itself never leaves the box until it is sent. */
+const pastedText = new Map<string, { text: string; itemKey: string }>();
 
 /** Draft attachment chips (CAD-1419): one icon slot per chip that
  *  becomes Remove on hover/focus and stays visible on touch. Up to three
@@ -193,14 +220,59 @@ function AttachChips({
                 <svg viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5zM14 3v6h5" /></svg>
               )}
             </span>
+            {/* A failed row keeps its warning glyph and puts Remove at the
+                trailing edge, so the way out is visible without hovering. */}
+            {a.status !== "failed" && (
+              <button
+                type="button"
+                className="app-chat-remove"
+                aria-label={`${t("Remove")} ${a.name}`}
+                title={`${t("Remove")} ${a.name}`}
+                onClick={(e: MouseEvent<HTMLButtonElement>) => {
+                  // Only keyboard or assistive activation (detail 0) on the
+                  // button that holds focus moves focus; a pointer click never does.
+                  const keyboard = e.detail === 0 && document.activeElement === e.currentTarget;
+                  onRemove(a, keyboard
+                    ? { removed: a.key, next: ordered[i + 1]?.key ?? null, prev: ordered[i - 1]?.key ?? null }
+                    : null);
+                }}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            )}
+          </span>
+          {/* One column holds the name/meta line and, when the file failed,
+              its reason: both share the left edge right of the icon slot. */}
+          <span className="app-chat-filebody">
+            <span className="app-chat-filename">
+              <span className="app-chat-chip-name">{a.name}</span>
+              <small>
+                {attachMeta(a.name, a.size, t)}
+                {a.status !== "ready" && (
+                  <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
+                )}
+              </small>
+            </span>
+            {a.status === "failed" && a.error && (
+              <small className="app-chat-upload-error" role="alert" title={displayAttachError(a.error, t)}>
+                {displayAttachError(a.error, t)}
+              </small>
+            )}
+          </span>
+          {a.status === "failed" && !a.permanent && (
+            <button type="button" className="lnk app-chat-chip-retry" onClick={() => onRetry(a)}>
+              {t("Retry")}
+            </button>
+          )}
+          {a.status === "failed" && (
             <button
               type="button"
-              className="app-chat-remove"
+              className="app-chat-remove app-chat-remove-trailing"
               aria-label={`${t("Remove")} ${a.name}`}
               title={`${t("Remove")} ${a.name}`}
               onClick={(e: MouseEvent<HTMLButtonElement>) => {
-                // Only keyboard or assistive activation (detail 0) on the
-                // button that holds focus moves focus; a pointer click never does.
                 const keyboard = e.detail === 0 && document.activeElement === e.currentTarget;
                 onRemove(a, keyboard
                   ? { removed: a.key, next: ordered[i + 1]?.key ?? null, prev: ordered[i - 1]?.key ?? null }
@@ -210,25 +282,6 @@ function AttachChips({
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M6 6l12 12M18 6L6 18" />
               </svg>
-            </button>
-          </span>
-          <span className="app-chat-filename">
-            <span className="app-chat-chip-name">{a.name}</span>
-            <small>
-              {attachMeta(a.name, a.size, t)}
-              {a.status !== "ready" && (
-                <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
-              )}
-            </small>
-          </span>
-          {a.status === "failed" && a.error && (
-            <small className="app-chat-upload-error" role="alert" title={displayAttachError(a.error, t)}>
-              {displayAttachError(a.error, t)}
-            </small>
-          )}
-          {a.status === "failed" && !a.permanent && (
-            <button type="button" className="lnk app-chat-chip-retry" onClick={() => onRetry(a)}>
-              {t("Retry")}
             </button>
           )}
         </div>
@@ -320,15 +373,37 @@ function IconSend({ disabled, title }: { disabled: boolean; title: string }) {
   );
 }
 
+/** The running turn's Stop (CAD-1880): same slot and footprint as Send,
+ *  danger-tinted so the interruption never reads as the primary action. */
+function IconStop({ onStop }: { onStop: () => void }) {
+  const { t } = useLocale();
+  return (
+    <button
+      type="button"
+      className="app-chat-send app-chat-stop"
+      aria-label={t("Stop this turn")}
+      title={t("Stop")}
+      onClick={onStop}
+    >
+      <span className="sr-only">{t("Stop")}</span>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="6" y="6" width="12" height="12" rx="2" />
+      </svg>
+    </button>
+  );
+}
+
 export default function Composer({
   density,
   block,
   storeKey,
   seed,
   onCommand,
+  commands,
   onSend,
   onSubmitted,
   refocusAfterSend,
+  onReveal,
   textareaId,
   ariaLabel,
   placeholder,
@@ -340,6 +415,8 @@ export default function Composer({
   originalUnresolved = false,
   onResolveOriginal,
   actions,
+  stop = null,
+  onArrowUpEmpty,
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
@@ -353,6 +430,7 @@ export default function Composer({
   const cell = useSyncExternalStore(subscribeDraftCell, readDraftCell);
   const draft = cell.text;
   const refs = cell.refs;
+  const hasArtifactRef = citesArtifact(refs);
   const libraryImage = cell.libraryImage;
   const libraryPin = libraryImage?.state === "ready" ? libraryImage.pin : null;
   const setDraft = (next: string) => setComposerDraft(key, next);
@@ -386,31 +464,68 @@ export default function Composer({
   // Esc dismisses the menu for THIS verb text — the next keystroke
   // reopens it (or a cleared draft does).
   const [menuOffFor, setMenuOffFor] = useState<string | null>(null);
+  const [skillsFor, setSkillsFor] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
+  const revealRef = useRef(onReveal);
+  revealRef.current = onReveal;
+  useLayoutEffect(() => {
+    let frame: number | null = null;
+    const off = onComposerFocusRequest((requestedKey) => {
+      if (requestedKey !== key) return;
+      revealRef.current?.();
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        box.current?.focus();
+      });
+    });
+    return () => {
+      off();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [key]);
   useEffect(() => {
     if (seed && seed.n > 0 && consumeSeed(key, seed)) {
       setComposerContent(key, seed.text, seed.refs ?? []);
       if (!block) box.current?.focus();
     }
   }, [seed]);
-  // The textarea grows with its content (auto-height), capped by the
-  // CSS max-height — past it the box scrolls. `resize:none` is the
-  // mock's rule: no bottom-right grip in either density.
-  useEffect(() => {
+  // The box can mount while its pane is hidden. Size it once visible and
+  // whenever its available width changes, as well as when its text changes.
+  const resizeBox = useCallback(() => {
     const el = box.current;
-    if (!el) return;
+    if (!el || el.clientWidth === 0) return;
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
-  }, [draft]);
+  }, []);
+  useEffect(() => {
+    resizeBox();
+  }, [draft, block, blockedPlaceholder, placeholder, compact, t, hasArtifactRef, resizeBox]);
+  useEffect(() => {
+    const el = box.current;
+    // No observer where the API is missing; the initial measure above stays.
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let width = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth === width) return;
+      width = el.clientWidth;
+      resizeBox();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [compact, resizeBox]);
 
   // Slash completion is a full-density extra (Home's commands); compact
   // mode routes slash verbs through onCommand without sending them
   // as ordinary chat.
-  const menu = !compact && onCommand !== undefined;
+  const skillsEnabled = !compact && commands?.includes(WORKSPACE_SKILLS_COMMAND);
+  const browse = skillsEnabled ? /^\/skills(?:\n([\s\S]*))?$/i.exec(draft.trim()) : null;
+  const skillPickerOpen = !block && browse !== null && draft === skillsFor;
+  const menu = !compact && (onCommand !== undefined || skillsEnabled);
   const slash = menu ? parseSlash(draft) : null;
   const verbDraft = menu && draft.startsWith("/") && !draft.includes(" ") ? draft.slice(1) : null;
   const matches =
-    verbDraft !== null && draft !== menuOffFor ? slashMatches(verbDraft.toLowerCase()) : [];
+    !skillPickerOpen && verbDraft !== null && draft !== menuOffFor ? slashMatches(verbDraft.toLowerCase(), commands) : [];
   useEffect(() => setHi(0), [verbDraft]);
   const hiClamped = Math.min(hi, Math.max(0, matches.length - 1));
 
@@ -419,11 +534,29 @@ export default function Composer({
     setMenuOffFor(null);
   };
 
+  // A command has gone: empty the box, which closes the menu, and keep focus.
+  const finishCommand = () => {
+    setDraft("");
+    setMenuOffFor(null);
+    if (refocusAfterSend) box.current?.focus();
+  };
+
+  // A bare refused verb is a typo, so the next keystroke replaces it instead of
+  // joining it (`/nosuch/new`). Words after a verb are the person's to edit.
+  const keepRefused = (arg: string) => {
+    if (arg === "") box.current?.select();
+  };
+
   const submit = () => {
     const body = draft.trim();
     // `block` is also "not an operator" in an app pane — the box and
     // Send are disabled and no submission leaves the composer.
     if (!body || block) return;
+    if (browse) {
+      setSkillsFor(draft);
+      setMenuOffFor(draft);
+      return;
+    }
     // An unresolved original submission owns this key: a new ordinary
     // submission is refused until the operator retries or discards it,
     // so the earlier intent can never be silently replaced. The newer
@@ -445,21 +578,48 @@ export default function Composer({
       onNotice?.(hold);
       return;
     }
+    // CAD-2422: a message is never compacted or shortened on its way to the
+    // model, so a very long one goes as a text file the assistant pages
+    // through instead (`chat_attachment_read`). The first send copies the
+    // text into an attachment row and stops; the text stays in the box, so a
+    // failed or removed upload never loses it. Once that row is ready, the
+    // next send carries the row with a short line instead of the text.
+    let outgoing = body;
+    const bodyBytes = new TextEncoder().encode(body).length;
+    if (bodyBytes > LONG_TEXT_BYTES && !parseSlash(body)) {
+      const kb = String(Math.ceil(bodyBytes / 1024));
+      if (!attachEnabled) {
+        onNotice?.({ key: "This message is too long to send ({kb} KB, the limit is 32 KB). Attach it as a text file instead.", slots: { kb } });
+        return;
+      }
+      const pasted = pastedText.get(key);
+      const row = pasted && storedAttachItems(key).some((item) => item.key === pasted.itemKey);
+      if (pasted && row && pasted.text === body) {
+        // The hold above already stopped a send while the row uploads or
+        // failed, so the row is ready here.
+        outgoing = t("Please read the attached text.");
+      } else {
+        // An edited text replaces its earlier copy rather than adding one.
+        if (pasted && row) removeAttach(key, pasted.itemKey);
+        const name = `pasted-text-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+        addFiles(key, [new File([body], name, { type: "text/plain" })], attachDestination);
+        const added = storedAttachItems(key).at(-1);
+        if (added) pastedText.set(key, { text: body, itemKey: added.key });
+        onNotice?.({ key: "The long text ({kb} KB) will be sent as {name}. Press Send again once it has uploaded; the text stays here until then.", slots: { kb, name } });
+        return;
+      }
+    }
     // Pin before a pending row or command card paints, so a follow
     // effect scrolls the working indicator into view.
     onSubmitted?.();
     const cmd = parseSlash(body);
-    if (cmd && !menu && onCommand !== undefined) {
-      // A compact pane with its own commands (`/new`): exact verb.
-      onCommand(cmd.name, cmd.arg);
-    } else if (cmd && !menu) {
-      // An unsupported slash verb is never forwarded as chat — the
-      // composer refuses it in place. Full-density menus cannot reach
-      // this: an exact verb already submitted above.
+    if (cmd && onCommand === undefined) {
+      // A verb that the host does not handle is not ordinary chat.
       onNotice?.({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name: cmd.name } });
       return;
     } else if (cmd) {
-      onCommand?.(cmd.name, cmd.arg);
+      if (onCommand?.(cmd.name, cmd.arg) !== false) finishCommand();
+      else keepRefused(cmd.arg);
     } else {
       // Capture the ready rows by key+generation, not by file id: two
       // distinct rows can legitimately share a dedup id, and a later row
@@ -491,7 +651,7 @@ export default function Composer({
         handoff = onSend({
           // A cited artifact is expanded into the body: refs are stored for the
           // board, only the body reaches the agent.
-          body: askBody(body, refs),
+          body: askBody(outgoing, refs),
           refs,
           // Only ready rows ride a send — gating above already withheld
           // it while anything unresolved remained.
@@ -507,6 +667,7 @@ export default function Composer({
         return;
       }
       const settle = (accepted: boolean) => {
+        if (accepted && outgoing !== body) pastedText.delete(key);
         if (accepted) {
           // Remove exactly the rows this send carried; a failed row, a
           // file queued after the send's resolution, or a later distinct
@@ -549,8 +710,14 @@ export default function Composer({
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         // An exact verb submits; a prefix completes to the highlighted row.
-        if (slash && SLASH_COMMANDS.some((c) => c.name === slash.name)) submit();
+        if (browse || (slash && SLASH_COMMANDS.some((c) => c.name === slash.name))) submit();
         else complete(matches[hiClamped]);
+        return;
+      }
+    }
+    if (e.key === "ArrowUp" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && draft === "" && !matches.length && !block) {
+      if (onArrowUpEmpty?.()) {
+        e.preventDefault();
         return;
       }
     }
@@ -598,11 +765,11 @@ export default function Composer({
       ref={box}
       id={textareaId}
       value={draft}
-      onChange={(e) => setDraft(e.target.value)}
+      onChange={(e) => { setSkillsFor(null); setDraft(e.target.value); }}
       onKeyDown={onKey}
-      rows={compact ? 1 : 2}
+      rows={1}
       disabled={!!block}
-      placeholder={t(block ? blockedPlaceholder : citesArtifact(refs) ? "Say what to change…" : (placeholder ?? ""))}
+      placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
       aria-label={t(ariaLabel ?? "Message to Assistant")}
       aria-expanded={matches.length > 0 || undefined}
       className={
@@ -619,7 +786,6 @@ export default function Composer({
       ref={fileInput}
       type="file"
       multiple
-      accept={ATTACH_ACCEPT}
       className="sr-only"
       aria-hidden="true"
       tabIndex={-1}
@@ -629,13 +795,15 @@ export default function Composer({
       }}
     />
   ) : null;
-  const attachButton = attach ? (
+  // CAD-2425: the control is named beside its icon (the approved
+  // chat-polish footer row); CSS shows the name from 640px.
+  const attachControl = (labelled: boolean) => attach ? (
     <button
       type="button"
       className="app-chat-attach"
-      aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
+      aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : t("unavailable")}`}
       title={attachEnabled
-        ? t("Attach files (txt, md, csv — up to 10 MiB each; PDF/image processing is not available yet)")
+        ? t("Attach files (text or PDF 10 MiB, video 20 MiB)")
         : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}
       disabled={!!block || !attachEnabled}
       onClick={() => fileInput.current?.click()}
@@ -643,6 +811,7 @@ export default function Composer({
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M21 12.5l-8.5 8.5a5.5 5.5 0 01-7.8-7.8l9-9a3.67 3.67 0 015.2 5.2l-8.5 8.5a1.83 1.83 0 01-2.6-2.6l7.8-7.8" />
       </svg>
+      {labelled && <span className="app-chat-attach-label" aria-hidden="true">{t("Attach file")}</span>}
     </button>
   ) : null;
   const sendHeld = unresolvedHint(attachHold(key), translateAttachText);
@@ -652,8 +821,8 @@ export default function Composer({
   // Retry or Discard.
   const reserved = cell.reserved;
   const imagePending = libraryImage?.state === "pending";
-  const sendBlocked = !!block || !draft.trim() || sendHeld !== null || reserved || originalUnresolved || imagePending;
-  const sendTitle = imagePending ? "Attaching image reference…" : sendHeld ?? (reserved ? "Sending…" : originalUnresolved ? "Retry or discard the previous message first" : null);
+  const sendBlocked = !!block || !draft.trim() || (!browse && (sendHeld !== null || reserved || originalUnresolved || imagePending));
+  const sendTitle = browse ? "Run command" : imagePending ? "Attaching image reference…" : sendHeld ?? (reserved ? "Sending…" : originalUnresolved ? "Retry or discard the previous message first" : null);
 
   // Drop handling is scoped to the composer surface itself — the same
   // selection path and limits as the picker; a drag that only crosses
@@ -723,9 +892,9 @@ export default function Composer({
           {boxEl}
           <div className="app-chat-composer-tools">
             {attachInput}
-            {attachButton}
+            {attachControl(true)}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
-            <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />
+            {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
           </div>
         </div>
       </form>
@@ -745,6 +914,19 @@ export default function Composer({
       }}
     >
       {block && <div className="text-label text-ink-300 mb-2 font-medium">{t("Read-only conversation")}</div>}
+      {skillPickerOpen && (
+        <WorkspaceSkillPicker
+          onSelect={(name) => {
+            setDraft(`/skill:${name} ${browse[1] ?? ""}`);
+            setSkillsFor(null);
+            box.current?.focus();
+          }}
+          onClose={(restoreFocus) => {
+            setSkillsFor(null);
+            if (restoreFocus) box.current?.focus();
+          }}
+        />
+      )}
       {matches.length > 0 && (
         <ul className="slashmenu" role="listbox" aria-label={t("slash commands")}>
           {matches.map((c, i) => (
@@ -757,7 +939,7 @@ export default function Composer({
               >
                 <span className="num text-accent shrink-0">/{c.name}</span>
                 {c.arg && <span className="num text-ink-500 shrink-0">{c.arg}</span>}
-                <span className="flex-1 min-w-0 truncate text-ink-500 text-left">{c.blurb}</span>
+                <span className="flex-1 min-w-0 truncate text-ink-500 text-left">{t(c.blurb)}</span>
                 <span
                   className={`chip shrink-0 ${
                     c.kind === "read"
@@ -777,9 +959,10 @@ export default function Composer({
       {refsRow}
       {attachChips}
       {boxEl}
-      <div className="flex items-center gap-2 mt-1.5">
+      {/* CAD-2425: one footer row — attach, the keyboard hint, then send. */}
+      <div className="composer-foot" data-composer-foot="">
         {attachInput}
-        {attachButton}
+        {attachControl(true)}
         {/* A held send's reason is on the failed file's own row; this
             line is only for a blocked (read-only) composer. */}
         {block ? (
@@ -787,9 +970,14 @@ export default function Composer({
             {t(block)}
           </p>
         ) : (
-          <span className="flex-1" />
+          <>
+            <span className="flex-1" />
+            <p className="composer-hint" data-composer-hint>
+              {t("Enter to send · Shift+Enter for a new line")}
+            </p>
+          </>
         )}
-        <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />
+        {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />}
       </div>
     </form>
   );

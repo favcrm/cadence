@@ -10,6 +10,8 @@
 //! - `GET  /api/threads/<alias>/stream[?after=<seq>]` — server-sent
 //!   events, one `entry` frame per entry with `id: <seq>`; a reconnect
 //!   resumes from `Last-Event-ID` (preferred) or `after`.
+//!   `cloud_withheld` frames report unavailable cloud history independently
+//!   of entries; `{"cloud_withheld":null}` clears the notice.
 //! - `GET  /api/app-installations/<id>/conversations` — the master's
 //!   conversations for that installation (CAD-1098; operator-gated in
 //!   serve.rs): `{alias, install_id, general, conversations: [...]}`;
@@ -151,6 +153,30 @@ fn cursor_arg(raw: Option<String>, what: &str) -> std::result::Result<i64, HttpR
     }
 }
 
+/// CAD-2215: may this daemon page be forwarded to the caller?
+///
+/// Strips the daemon's per-response reader-scope ack from `page` and answers
+/// whether the page may be trusted. Only a daemon that understood the relayed
+/// proof attaches it; a mixed-version daemon that ignored the proof returns
+/// the GLOBAL page, which this board cannot narrow (the project policy and the
+/// member-private-job denials live in the daemon), so the page is
+/// unavailable rather than exposed. An operator's own relay needs no ack (a
+/// full page is correct for it), and a direct local read never reaches this
+/// board. The ack is never part of a client's page.
+pub(super) fn thread_scope_confirmed(
+    page: &mut Value,
+    proof: &super::operator::ReadRelayProof,
+    operator: bool,
+) -> bool {
+    use cadence_core::board_api::{READER_SCOPE_FIELD, THREAD_SCOPE_ACK};
+    let ack = page
+        .as_object_mut()
+        .and_then(|fields| fields.remove(READER_SCOPE_FIELD));
+    let confirmed = ack.as_ref().and_then(Value::as_str) == Some(THREAD_SCOPE_ACK);
+    let relayed = !matches!(proof, super::operator::ReadRelayProof::Operator);
+    !relayed || operator || confirmed
+}
+
 /// `GET /api/threads/<alias>` — one page after `after`. `operator` is the
 /// board's proven-operator verdict for this request; anything else gets the
 /// member view ([`member_view`]).
@@ -159,6 +185,7 @@ pub(super) fn read(
     alias: &str,
     query: &dyn Fn(&str) -> Option<String>,
     operator: bool,
+    proof: &super::operator::ReadRelayProof,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
@@ -205,8 +232,16 @@ pub(super) fn read(
     if let Some(conversation) = query("conversation") {
         params["conversation"] = Value::String(conversation);
     }
+    proof.attach(&mut params);
     match client::rpc(state_dir, "thread_read", params) {
         Ok(mut page) => {
+            if !thread_scope_confirmed(&mut page, proof, operator) {
+                return err_response(
+                    502,
+                    "thread unavailable for this reader — the daemon did not confirm \
+                     a reader-scoped page",
+                );
+            }
             if !operator {
                 super::member_view::member_view(&mut page);
             }
@@ -243,16 +278,22 @@ pub(super) fn stream(
     };
     // CAD-1098: the stream follows one conversation when named.
     let conversation = query("conversation");
+    let proof = admission.relay_proof();
+    let with_proof = |mut p: Value| {
+        proof.attach(&mut p);
+        p
+    };
     let with_conversation = |mut p: Value| {
         if let Some(id) = &conversation {
             p["conversation"] = Value::String(id.clone());
         }
+        proof.attach(&mut p);
         p
     };
     // Fail before the stream opens when the alias or daemon is wrong —
     // a 404/501/503 beats an event stream that only ever errors.
     let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-    let first = match budget.read(
+    let mut first = match budget.read(
         state_dir,
         "thread_read",
         with_conversation(json!({"alias": alias, "after": cursor, "limit": 1})),
@@ -263,6 +304,17 @@ pub(super) fn stream(
             return;
         }
     };
+    // CAD-2215: prove the FIRST page was scoped by THIS daemon before a
+    // single byte (headers included) reaches the caller, so a mixed-version
+    // daemon's global page is refused rather than streamed.
+    if !thread_scope_confirmed(&mut first, &proof, operator) {
+        let _ = request.respond(err_response(
+            502,
+            "thread unavailable for this reader — the daemon did not confirm \
+             a reader-scoped page",
+        ));
+        return;
+    }
     // The same private read as GET /api/master/state. Put the authoritative
     // turn on this connection before any resumed entries, not on a racing
     // board stream whose asynchronous refresh may still hold the old turn.
@@ -272,8 +324,29 @@ pub(super) fn stream(
         .as_str()
         .is_some_and(crate::master::is_master)
     {
-        match budget.read(state_dir, "master_state", json!({})) {
+        match budget.read(state_dir, "master_state", with_proof(json!({}))) {
             Ok(mut state) => {
+                // CAD-2215: the same mixed-version refusal as
+                // `GET /api/master/state`. A snapshot the daemon did not
+                // confirm was scoped for this reader is never replayed as
+                // an empty (or global) success.
+                let ack = state
+                    .as_object_mut()
+                    .and_then(|fields| fields.remove(cadence_core::board_api::READER_SCOPE_FIELD));
+                let confirmed = ack.as_ref().and_then(Value::as_str)
+                    == Some(cadence_core::board_api::MASTER_STATE_SCOPE_ACK);
+                // A relayed non-operator snapshot must carry the daemon's
+                // ack; an operator's own relay is exempt (its full document
+                // is correct for it either way).
+                let relayed = !matches!(&proof, super::operator::ReadRelayProof::Operator);
+                if relayed && !operator && !confirmed {
+                    let _ = request.respond(err_response(
+                        503,
+                        "master state unavailable for this reader — the daemon did not \
+                         confirm a reader-scoped answer",
+                    ));
+                    return;
+                }
                 // CAD-1767: a non-operator never gets the operator's turn text.
                 if !operator {
                     super::member_view::redact_master_state(&mut state);
@@ -288,7 +361,7 @@ pub(super) fn stream(
     } else {
         None
     };
-    if !admission.still_live(state_dir) {
+    if !admission.still_live_before_frame(state_dir) {
         return;
     }
     let mut w = request.into_writer();
@@ -301,9 +374,23 @@ pub(super) fn stream(
     if !frame(&mut w, head.as_bytes()) {
         return;
     }
+    let cloud_notice = |w: &mut dyn Write, reason: Option<&str>| {
+        let data = json!({"cloud_withheld": reason});
+        frame(
+            w,
+            format!("event: cloud_withheld\ndata: {data}\n\n").as_bytes(),
+        )
+    };
+    let mut cloud_withheld = first["cloud_withheld"].as_str().map(str::to_owned);
+    if cloud_withheld.is_some()
+        && (!admission.still_live_before_frame(state_dir)
+            || !cloud_notice(&mut w, cloud_withheld.as_deref()))
+    {
+        return;
+    }
     if let Some(master) = master {
         let bytes = format!("event: master\ndata: {master}\n\n");
-        if !frame(&mut w, bytes.as_bytes()) {
+        if !admission.still_live_before_frame(state_dir) || !frame(&mut w, bytes.as_bytes()) {
             return;
         }
     }
@@ -319,32 +406,52 @@ pub(super) fn stream(
                 json!({"alias": alias, "after": cursor, "limit": 100, "wait": STREAM_WAIT}),
             ),
         );
-        if !admission.still_live(state_dir) {
+        if !admission.still_live_before_frame(state_dir) {
             return;
         }
         match page {
             Ok(mut page) => {
-                // The cursor follows the whole page, hidden entries included,
-                // so a page that is all operator-only never stalls the poll.
-                let seqs: Vec<i64> = page["entries"]
-                    .as_array()
-                    .map(|rows| rows.iter().filter_map(|e| e["seq"].as_i64()).collect())
-                    .unwrap_or_default();
+                // CAD-2215: every polled page proves its own scope; an
+                // unacked page is never forwarded (the stream ends without
+                // it, so a daemon replaced mid-stream cannot leak a global
+                // page under the previous daemon's proof).
+                if !thread_scope_confirmed(&mut page, &proof, operator) {
+                    return;
+                }
+                // The cursor follows what the daemon page SCANNED, never what
+                // this board kept. The page's own `cursor` is the last row the
+                // projection walked — hidden rows and another source's cloud
+                // rows included — so advancing by it is what lets a fully
+                // filtered page move on. Deriving the cursor from the kept
+                // entry seqs (the old shape) stalls that page: no entry comes
+                // back, the cursor never moves, and the poll re-reads the same
+                // hidden rows forever instead of reaching the history below
+                // them.
+                if let Some(scanned) = page["cursor"].as_i64() {
+                    cursor = cursor.max(scanned);
+                }
                 if !operator {
                     super::member_view::member_view(&mut page);
                 }
-                let entries = page["entries"].as_array().cloned().unwrap_or_default();
+                let reason = page["cloud_withheld"].as_str();
+                if reason != cloud_withheld.as_deref() {
+                    if !cloud_notice(&mut w, reason) {
+                        return;
+                    }
+                    cloud_withheld = reason.map(str::to_owned);
+                }
+                let entries = page["entries"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
                     return;
-                }
-                if let Some(top) = seqs.iter().max() {
-                    cursor = cursor.max(*top);
                 }
                 for entry in entries {
                     let Some(seq) = entry["seq"].as_i64() else {
                         continue;
                     };
-                    if !admission.still_live(state_dir) {
+                    if !admission.still_live_before_frame(state_dir) {
                         return;
                     }
                     let bytes = format!("id: {seq}\nevent: entry\ndata: {entry}\n\n");

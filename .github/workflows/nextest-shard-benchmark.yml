@@ -33,12 +33,12 @@ jobs:
         working-directory: ui
       - name: Install pinned nextest
         env:
-          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.150
           TMPDIR: ${{ runner.temp }}
         run: |
           scripts/install-cadence-nextest
           echo "CADENCE_SUITE_LOCK=$RUNNER_TEMP/cadence-suite.lock" >> "$GITHUB_ENV"
-          echo "CADENCE_NEXTTEST_BIN=$RUNNER_TEMP/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+          echo "CADENCE_NEXTTEST_BIN=$RUNNER_TEMP/cadence-nextest-0.9.150/cargo-nextest" >> "$GITHUB_ENV"
       - name: Cold baseline pipeline at dispatch main SHA
         id: measure
         run: python3 scripts/nextest-shard-benchmark.py baseline --output "$RUNNER_TEMP/measurement-baseline"
@@ -74,12 +74,12 @@ jobs:
         working-directory: ui
       - name: Install pinned nextest
         env:
-          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.150
           TMPDIR: ${{ runner.temp }}
         run: |
           scripts/install-cadence-nextest
           echo "CADENCE_SUITE_LOCK=$RUNNER_TEMP/cadence-suite.lock" >> "$GITHUB_ENV"
-          echo "CADENCE_NEXTTEST_BIN=$RUNNER_TEMP/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+          echo "CADENCE_NEXTTEST_BIN=$RUNNER_TEMP/cadence-nextest-0.9.150/cargo-nextest" >> "$GITHUB_ENV"
       - name: Cold prepare pipeline at dispatch main SHA
         id: measure
         run: python3 scripts/nextest-shard-benchmark.py prepare --output "$RUNNER_TEMP/measurement-prepare"
@@ -128,12 +128,12 @@ jobs:
         working-directory: ui
       - name: Install pinned nextest
         env:
-          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.150
           TMPDIR: ${{ runner.temp }}
         run: |
           scripts/install-cadence-nextest
           echo "CADENCE_SUITE_LOCK=$RUNNER_TEMP/cadence-suite.lock" >> "$GITHUB_ENV"
-          echo "CADENCE_NEXTTEST_BIN=$RUNNER_TEMP/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+          echo "CADENCE_NEXTTEST_BIN=$RUNNER_TEMP/cadence-nextest-0.9.150/cargo-nextest" >> "$GITHUB_ENV"
       - name: Download preparation evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

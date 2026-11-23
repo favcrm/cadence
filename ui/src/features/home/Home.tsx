@@ -1,12 +1,13 @@
-import { useWriteBlock } from "../auth/WriteGate";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useWriteBlock, WriteGate } from "../auth/WriteGate";
+import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { AttachmentNamesContext } from "./TurnRichCards";
+import { attachmentNames } from "./turnCards";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
-import type { SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
-import type { MasterAppOrigin, MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import {
@@ -14,7 +15,10 @@ import {
   kvRows,
   MASTER,
   masterStatus,
+  restingStatus,
+  offeredCommands,
   SLASH_COMMANDS,
+  type SlashCommand,
   START_COMMAND,
   RESUME_COMMAND,
   turnState,
@@ -22,24 +26,52 @@ import {
   type TurnState,
 } from "./master";
 import { useCanvasFeed } from "../canvas/feed";
+import { BrowserCard } from "../canvas/BrowserPanel";
+import { useBrowserFeed } from "../canvas/browserStore";
+import { ImageConversation } from "../canvas/imageConversation";
 import Composer from "./Composer";
+import {
+  AssistantAboutButton,
+  AssistantActorProvider,
+  AssistantBootstrapCard,
+  AssistantFace,
+  useAssistantActor,
+  useConversationActor,
+  useHostedPersonalBootstrap,
+} from "../assistant/AssistantIdentity";
+import { displayName, personalAssistantProfileHref, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
-import NeedsRail from "./NeedsRail";
-import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
+import NeedsRail, { type DocumentFollowUpState } from "./NeedsRail";
+import { homeDecisions } from "../decisions/useDecisions";
+import { StagedSourceContext } from "../../ui/StagedChip";
+import { askDraft, type HomeNeed } from "./needs";
 import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
+import PermissionsSlashCard from "./PermissionsSlashCard";
+import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "./PermissionCard";
+import { appendComposerDraft, ComposerFillContext } from "./composerFill";
+import { PdfPageTarget } from "./PdfPageAction";
 import Conversation from "../app-shell/chat/Conversation";
-import { TurnBar } from "../app-shell/chat/TurnBar";
-import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
+import { useDockHeight } from "./useDockHeight";
+import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "../app-shell/chat/TurnBar";
+import { composerDraftState, requestComposerFocus, setComposerDraft } from "../app-shell/chat/composerStore";
+import { usePendingPermissionRequest } from "../app-shell/chat/usePendingApproval";
+import PrivateAppReviewCards from "./PrivateAppReviewCards";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
-import { earlierStep, useThreadStream } from "../app-shell/chat/conversationThread";
+import { earlierStep, useThreadStream, type StreamLink } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
+import { useHostedTemplateReview, type HostedTemplateList, type HostedTemplateRail } from "../templates/HostedTemplateReview";
+import { consumeCanvasTemplateReview, onCanvasTemplateReview } from "../templates/canvasTemplateDraft";
+import { closeDrawer as closeCanvas } from "../canvas/canvasStore";
+import { useSendHandoff } from "./sendHandoff";
 import { memberScope } from "./memberThread";
-import { StreamBanner, time } from "./ThreadView";
+import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
+import { formatElapsed } from "./turnText";
+import CredentialRequestList from "../connections/CredentialRequestCard";
 import {
   initialFollow,
   motionBehavior,
@@ -57,6 +89,9 @@ import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
+  failWithdrawn,
+  inFlightTurnKey,
+  unnamedTurnAnswered,
   lastSeq,
   newMessageId,
   openStep,
@@ -65,6 +100,7 @@ import {
   threadItems,
   visibleWindow,
   WINDOW,
+  type PendingAttachment,
   type ThreadEntry,
   type ThreadItem,
 } from "./thread";
@@ -75,13 +111,6 @@ const EXAMPLES = [
   "Summarise what changed on the tracker since yesterday.",
 ];
 
-/** `42s` → `2m 5s` → `1h 3m` — the working row's elapsed read-out. */
-function fmtElapsed(secs: number): string {
-  if (secs < 60) return `${secs}s`;
-  const m = Math.floor(secs / 60);
-  if (m < 60) return `${m}m ${secs % 60}s`;
-  return `${Math.floor(m / 60)}h ${m % 60}m`;
-}
 
 /**
  * The in-flight turn line (CAD-551): the pulse and elapsed clock while a
@@ -125,7 +154,7 @@ function AssistantActivity({ since }: { since: number | null }) {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
-  const elapsed = since !== null && Number.isFinite(since) ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - since))) : null;
+  const elapsed = since !== null && Number.isFinite(since) ? formatElapsed(Math.max(0, Math.floor(now / 1000 - since)), t) : null;
   return (
     <span className="flex gap-1.5 items-center" data-assistant-activity>
       <span className="workdot live" aria-hidden />
@@ -144,9 +173,10 @@ function AssistantActivity({ since }: { since: number | null }) {
  *  one header. `at` is the anchored entry's own timestamp. */
 function AssistantNameRow({ at, live }: { at?: string; live: ReactNode }) {
   const t = useTranslate();
+  const actor = useAssistantActor();
   return (
     <div className="flex gap-2 items-center text-micro text-ink-400" data-kind="assistant-name">
-      <span className="text-ink-100 font-medium">{t("Assistant")}</span>
+      <span className="text-ink-100 font-medium">{displayName(actor.read, actor.scope, t)}</span>
       {at ? <span>{at}</span> : null}
       {/* The same `.chat-live` wrapper Bubble uses: right-aligned accent. */}
       <span className="chat-live num">{live}</span>
@@ -170,7 +200,7 @@ export function activityAnchor(items: ThreadItem[], message: string | undefined 
   for (const item of items) {
     // An artifact card sits after the run that put it (or between two runs'
     // cards): the header never rides on one while the run itself is there.
-    if (item.type === "artifact") {
+    if (item.type === "artifact" || item.type === "image" || item.type === "video") {
       if (item.entry.message === message) cardKey = item.key;
       continue;
     }
@@ -188,6 +218,106 @@ export function activityAnchor(items: ThreadItem[], message: string | undefined 
   // An answer bubble carries the indicator on its own timestamped name
   // row — prefer it over in-progress steps/commentary of the same turn.
   return answerKey ?? found ?? cardKey;
+}
+
+/** CAD-1881: on a narrow screen the model, effort and About affordances
+ *  move behind one overflow sheet, so the header is a single 56px row
+ *  instead of a four-line stack. Desktop keeps the chips inline. */
+function HeaderMenu({
+  master,
+  row,
+  readOnly,
+  canPickModel,
+  scope,
+  profileHref,
+}: {
+  master: MasterState | null | undefined;
+  row: Agent | undefined;
+  readOnly: boolean;
+  canPickModel: boolean;
+  /** The header's scope line, moved here on a narrow screen. */
+  scope: string;
+  profileHref?: string;
+}) {
+  const t = useTranslate();
+  const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  const panel = useRef<HTMLDivElement | null>(null);
+  // A modal sheet: focus enters it, Tab stays inside, Escape closes it, and
+  // the trigger gets the focus back — the About dialog's mechanics.
+  useEffect(() => {
+    if (!open) return;
+    const root = panel.current;
+    const focusables = () =>
+      Array.from(
+        root?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+    focusables()[0]?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOpen(false);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      trigger.current?.focus();
+    };
+  }, [open]);
+  return (
+    <span className="assistant-menu">
+      <button
+        ref={trigger}
+        type="button"
+        className="assistant-about-trigger assistant-menu-trigger"
+        aria-label={t("Assistant settings")}
+        title={t("Assistant settings")}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={() => setOpen(true)}
+      >
+        <span aria-hidden>⋯</span>
+      </button>
+      {open && (
+        <>
+          <button
+            type="button"
+            aria-hidden
+            tabIndex={-1}
+            className="assistant-menu-scrim"
+            onClick={() => setOpen(false)}
+          />
+          <div ref={panel} className="assistant-menu-panel" role="dialog" aria-modal="true" aria-label={t("Assistant settings")}>
+            <div className="assistant-menu-head">
+              <span className="text-label font-medium text-ink-200">{t("Assistant settings")}</span>
+              <button type="button" className="lnk text-label" onClick={() => setOpen(false)}>
+                {t("Close")}
+              </button>
+            </div>
+            <p className="assistant-scope" data-menu-scope>{scope}</p>
+            <MasterChips master={master} row={row} readOnly={readOnly} canPickModel={canPickModel} />
+            <AssistantAboutButton className="assistant-menu-about" profileHref={profileHref} />
+          </div>
+        </>
+      )}
+    </span>
+  );
 }
 
 /** The dock's one-line turn status (CAD-551, placed in `chatdock` by
@@ -248,6 +378,8 @@ function WorkingRow({
 /** A `/` command's answer card (CAD-551), kept client-side — a read's
  * result, a mutation's ack (the durable system line also lands via the
  * stream), or the failure the daemon returned. */
+const HOME_COMPOSER_ID = "cadence-home-composer";
+
 interface CmdResult {
   id: number;
   name: string;
@@ -255,6 +387,12 @@ interface CmdResult {
   running?: boolean;
   ok?: boolean;
   text?: string;
+  /** Composer-local rich slash cards handled completely in client state. */
+  kind?: "permissions";
+  /** This board cannot run the command: nothing was sent, and nothing failed. */
+  unavailable?: boolean;
+  /** The verb exists, but what was typed was not a use of it: nothing was sent. */
+  notRun?: boolean;
   /** A JSON answer — listed as fields, with raw JSON one toggle away. */
   value?: unknown;
 }
@@ -295,7 +433,17 @@ function CmdJson({ value }: { value: unknown }) {
   );
 }
 
-function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: string) => void }) {
+function CmdCard({
+  cmd,
+  onOpenIssue,
+  readOnly,
+  permissionsHref,
+}: {
+  cmd: CmdResult;
+  onOpenIssue: (id: string) => void;
+  readOnly: boolean;
+  permissionsHref: string;
+}) {
   const t = useTranslate();
   return (
     <div className="cmdcard card px-3 py-2 ml-8 min-w-0" data-cmd={cmd.name}>
@@ -306,13 +454,19 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
         </span>
         {cmd.running ? (
           <span className="steps-running text-ink-500">{t("running…")}</span>
+        ) : cmd.unavailable ? (
+          <span className="text-ink-500">{t("not available")}</span>
+        ) : cmd.notRun ? (
+          <span className="text-ink-500">{t("not run")}</span>
         ) : cmd.ok === false ? (
           <span className="text-fail">{t("failed")}</span>
         ) : (
           <span className="text-ink-500">{t("done")}</span>
         )}
       </div>
-      {cmd.value !== undefined ? (
+      {cmd.kind === "permissions" ? (
+        <PermissionsSlashCard readOnly={readOnly} permissionsHref={permissionsHref} />
+      ) : cmd.value !== undefined ? (
         <CmdJson value={cmd.value} />
       ) : (
         cmd.text && (
@@ -326,10 +480,12 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
 }
 
 /** `/help` — the catalog rendered as a GFM table. */
-function helpText(): string {
-  const rows = SLASH_COMMANDS.filter((c) => c.name !== "help").map(
+function helpText(commands: readonly SlashCommand[]): string {
+  const rows = commands.filter((c) => c.name !== "help").map(
     (c) => `| \`/${c.name}${c.arg ? ` ${c.arg}` : ""}\` | ${c.blurb} |`,
   );
+  // A board that runs nothing else has no table worth showing.
+  if (rows.length === 0) return "Just type your message. `/help` is the only command in this workspace right now.";
   return `**Commands**\n\n| command | what it does |\n|---|---|\n${rows.join("\n")}`;
 }
 
@@ -383,9 +539,10 @@ function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean 
 
 function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabled: boolean }) {
   const t = useTranslate();
+  const actor = useAssistantActor();
   return (
     <div className="card px-4 py-4" data-empty="thread">
-      <h2 className="text-cardtitle font-semibold text-ink-100">{t("Ask the master for work")}</h2>
+      <h2 className="text-cardtitle font-semibold text-ink-100">{`${t("Ask")} ${displayName(actor.read, actor.scope, t)}`}</h2>
       <p className="text-secondary text-ink-400 mt-1">{t("No conversation yet. Try one of these:")}</p>
       <div className="mt-3 grid gap-2">
         {EXAMPLES.map((ex) => (
@@ -403,13 +560,6 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
-const retry = (
-  message: string,
-  text: string,
-  refs?: ThreadRef[],
-  attachments?: { id: string }[],
-  conversation?: string,
-) => sendToMaster(text, message, refs, attachments, conversation);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
 
 /**
@@ -422,35 +572,45 @@ const discard = (message: string) => resources.masterThread.write((s) => discard
  */
 const ThreadList = memo(function ThreadList({
   items,
+  conversation,
   limit,
   moreBefore,
   loadingEarlier,
   onEarlier,
   readOnly,
+  hosted,
   onOpenIssue,
   liveAfter,
   onRetry,
   working,
+  queued,
   stale,
 }: {
   items: ThreadItem[];
+  /** The Home conversation this list shows (CAD-2228): its live preview
+   *  text paints on the turn that is generating. */
+  conversation: string | null;
   limit: number;
   moreBefore: boolean;
   loadingEarlier: boolean;
   onEarlier: () => void;
   readOnly: boolean;
+  hosted: boolean;
   onOpenIssue: (id: string) => void;
   liveAfter: number;
   onRetry: (
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
     conversation?: string,
   ) => void;
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
-  working: { message: string; since: number | null } | null;
+  /** `unnamed`: the host verified a turn is working but gave no id for it. */
+  working: { message: string | null; since: number | null; unnamed?: boolean } | null;
+  /** Messages still queued behind the running turn: a run's send skips them. */
+  queued: string[];
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
   stale: boolean;
 }) {
@@ -483,7 +643,26 @@ const ThreadList = memo(function ThreadList({
   const fallbackItem =
     working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
-  if (items.length === 0) return null;
+  // Once this send already has reasoning or tool rows, those rows ARE the
+  // turn. A second empty assistant (face, "now", dots) under them is the
+  // splash: hosted agent entries often carry no message id, so the anchor
+  // misses them and the fallback used to append another head.
+  const flightKey = inFlightTurnKey(shown, working?.message ?? null, working?.unnamed === true);
+  // A hire proposal paints as flat rows, never as a ThreadTurn, so the
+  // suppression below would leave that still-working turn with no
+  // indicator at all. Keep the fallback activity for a flat run.
+  const flightFlat = (() => {
+    if (flightKey === null) return false;
+    const start = shown.findIndex((item) => item.key === flightKey);
+    if (start < 0) return false;
+    for (let i = start; i < shown.length; i++) {
+      const item = shown[i];
+      if (item.type === "operator" || item.type === "pending") break;
+      if (item.type === "hire") return true;
+    }
+    return false;
+  })();
+  if (items.length === 0 && !moreBefore) return null;
   return (
     <>
       {stale && <StreamBanner onRetry={() => window.location.reload()} />}
@@ -496,15 +675,21 @@ const ThreadList = memo(function ThreadList({
       )}
       <Conversation
         mode={{ kind: "home" }}
+        highlightSkillCommand={hosted}
         items={shown}
+        conversation={conversation}
         readOnly={readOnly}
         liveAfter={liveAfter}
-        running={working?.message ?? null}
+        running={working?.message ?? null} /* null while a send is only submitting */
+        runningUnnamed={working?.unnamed === true}
+        queued={queued}
         legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
         onDiscard={discard}
         activity={(item) => {
+          if (flightKey !== null && !flightFlat) return null;
+          if (working?.unnamed === true && unnamedTurnAnswered(shown)) return null;
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
           // The anchored row shows this turn's own newest entry time. A
@@ -523,17 +708,20 @@ const ThreadList = memo(function ThreadList({
           // The answer bubble carries the indicator on its own name row;
           // a standalone row covers in-flight steps/commentary that have
           // none of their own, and the running turn when the row it would
-          // anchor to is another turn's reply (CAD-1533). A row that IS
-          // this turn's own — the operator's just-sent message, or the
-          // reply itself — keeps the indicator below it.
+          // anchor to is another turn's reply (CAD-1533). A turn with no
+          // stored entry yet has nothing to anchor to, so it shows the
+          // inline typing bubble after the operator's own message instead.
           if (item.type === "answer" && anchorItem !== null) return { kind: "header", node: live };
           const below = item.type === "operator" || item.type === "pending" || item.type === "answer";
+          const needsTypingTurn =
+            anchorItem === null || item.type === "operator" || item.type === "pending";
           return {
             kind: "row",
-            node: <AssistantNameRow at={at} live={live} />,
+            // One assistant turn: face, "now", and the typing bubble. HomeList
+            // paints it as its own row under the message, and keeps that row's
+            // key when the real steps arrive, so the head does not splash.
+            node: needsTypingTurn ? <ThreadTurn items={[]} running previewConversation={conversation} /> : <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
-            // A fallback row rides an EARLIER item; the run it lands in
-            // keeps the flat rendering so the row is not folded away.
             ...(anchorItem === null ? { fallback: true as const } : {}),
           };
         }}
@@ -545,6 +733,7 @@ const ThreadList = memo(function ThreadList({
           ) : null
         }
       />
+      <BrowserCard />
     </>
   );
 });
@@ -570,37 +759,54 @@ const ThreadList = memo(function ThreadList({
  */
 export default function Home({
   readOnly,
+  privateChat = false,
   hosted = null,
   viewerSub = null,
   viewerIsMember = false,
   sessionId = null,
   overview,
+  documentFollowUps,
   onOpenIssue,
   onOpenDecision,
-  overviewHref,
+  decisions = false,
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
+  operator = null,
+  credentialRequestsEnabled = true,
+  templateReviewEnabled = false,
+  templateReviewCanApprove = false,
 }: {
   readOnly: boolean;
+  privateChat?: boolean;
   hosted?: boolean | null;
+  credentialRequestsEnabled?: boolean;
+  templateReviewEnabled?: boolean;
+  templateReviewCanApprove?: boolean;
+  /** CAD-1817: the verified session proves operator authority, the only
+   *  viewer that may edit the workspace coordinator's identity. `null`
+   *  is unproven, never an operator. */
+  operator?: boolean | null;
   /** CAD-1485: the verified public session's subject — member or
    *  operator/owner — when the session names one. `?chat=assistant`
    *  keys the owner's private chat on it; a member's default view is
    *  already private. */
   viewerSub?: string | null;
-  /** The verified session's `role === "member"`. Members always land on
-   *  their own private assistant; owners/operators keep Master unless
-   *  they explicitly ask for their own assistant. */
+  /** The verified session's `role === "member"`. Members use the private
+   *  assistant layout; owners/operators keep the master-transport layout
+   *  unless they select the private layout. The backend still determines
+   *  the actual conversation actor. */
   viewerIsMember?: boolean;
   /** The verified session's id — scopes the member-chat store so a
    *  re-login as another member never reads the previous chat. */
   sessionId?: string | null;
   overview: ResourceState<Overview>;
+  documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
   /** Open a reading item in the shared work-item detail (App owns the mount). */
   onOpenDecision: (open: HomeDecisionOpen) => void;
-  overviewHref: string;
+  /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
+  decisions?: boolean;
   /** Settings → Master permissions (the standing "Always" rules). */
   permissionsHref: string;
   /** CAD-1438: resolves an install id to its unique canonical `/apps/<key>` path, or null. */
@@ -617,53 +823,102 @@ export default function Home({
   // sign-in) never enters it — those keep the Master workspace, exactly
   // like a standalone board. On a hosted board a member lands on their own
   // assistant by default; an owner reaches theirs only through the query.
-  const chatParam = new URLSearchParams(window.location.search).get("chat") === "assistant";
-  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || chatParam);
+  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || privateChat);
+  const composerKey = memberChat && viewerSub !== null ? `member-assist:${memberScope(sessionId, viewerSub)}` : "home";
+  const onCompose = useCallback((text: string) => {
+    if (readOnly) return;
+    closeCanvas();
+    setComposerDraft(composerKey, appendComposerDraft(composerDraftState(composerKey).text, text));
+    requestComposerFocus(composerKey);
+  }, [composerKey, readOnly]);
+  const review = useHostedTemplateReview({ enabled: templateReviewEnabled, canApprove: templateReviewCanApprove && !readOnly, onCompose: readOnly ? undefined : onCompose });
+  useEffect(() => {
+    if (!templateReviewEnabled) return;
+    const openPending = () => {
+      const request = consumeCanvasTemplateReview();
+      if (request) {
+        review.refresh();
+        review.open(request.target, request.opener?.isConnected ? request.opener : undefined);
+      }
+    };
+    openPending();
+    return onCanvasTemplateReview(openPending);
+  }, [templateReviewEnabled, review.open, review.refresh]);
   if (memberChat && viewerSub !== null) {
     const scope = memberScope(sessionId, viewerSub);
     return (
-      <MemberChat
-        key={scope}
-        scope={scope}
-        readOnly={readOnly}
-        onOpenIssue={onOpenIssue}
-      />
+      <>
+        <MemberChat
+          key={scope}
+          scope={scope}
+          readOnly={readOnly}
+          onOpenIssue={onOpenIssue}
+          decisions={decisions && operator === true && !viewerIsMember}
+          documentFollowUps={documentFollowUps}
+          templateRail={review.rail}
+          templateCount={review.pendingCount}
+          templateList={review.templateList}
+        />
+        {review.drawer}
+      </>
     );
   }
   return (
-    <MasterHome
-      readOnly={readOnly}
-      hosted={hosted}
-      overview={overview}
-      onOpenIssue={onOpenIssue}
-      onOpenDecision={onOpenDecision}
-      overviewHref={overviewHref}
-      permissionsHref={permissionsHref}
-      resolveAppPath={resolveAppPath}
-      setupNotice={setupNotice}
-    />
+    <>
+      <MasterHome
+        readOnly={readOnly}
+        hosted={hosted}
+        overview={overview}
+        documentFollowUps={documentFollowUps}
+        onOpenIssue={onOpenIssue}
+        onOpenDecision={onOpenDecision}
+        decisions={decisions}
+        permissionsHref={permissionsHref}
+        resolveAppPath={resolveAppPath}
+        setupNotice={setupNotice}
+        operator={operator}
+        credentialRequestsEnabled={credentialRequestsEnabled}
+        templateRail={review.rail}
+        templateCount={review.pendingCount}
+        templateList={review.templateList}
+      />
+      {review.drawer}
+    </>
   );
 }
 
-/** The Master workspace — unchanged, mounted only when the outer Home
- *  did NOT route to the member's private assistant. */
+/** The shared master-transport pane: Native coordinator or verified hosted
+ *  actor. The outer Home chooses the layout without changing recipients. */
 function MasterHome({
   readOnly,
   hosted = null,
   overview,
+  documentFollowUps,
   onOpenIssue,
   onOpenDecision,
-  overviewHref,
+  decisions = false,
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
+  operator = null,
+  credentialRequestsEnabled = true,
+  templateRail,
+  templateCount,
+  templateList,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  credentialRequestsEnabled?: boolean;
+  templateRail?: HostedTemplateRail;
+  templateCount?: number;
+  templateList?: HostedTemplateList;
+  operator?: boolean | null;
   overview: ResourceState<Overview>;
+  documentFollowUps?: DocumentFollowUpState;
   onOpenIssue: (id: string) => void;
   onOpenDecision: (open: HomeDecisionOpen) => void;
-  overviewHref: string;
+  /** Read the owner's staged decisions (App's predicate: signed in, hosted, not a member). */
+  decisions?: boolean;
   permissionsHref: string;
   resolveAppPath: (installId: string) => string | null;
   setupNotice?: ReactNode;
@@ -676,10 +931,7 @@ function MasterHome({
     text: "",
     n: 0,
   });
-  // CAD-574: the rail's collapse is a layout concern — the grid column
-  // narrows with it, so the state lives here and the rail renders it.
-  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
-  const [link, setLink] = useState<SseErrorState | "live" | null>("reconnecting");
+  const [link, setLink] = useState<StreamLink>("connecting");
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [cmds, setCmds] = useState<CmdResult[]>([]);
@@ -687,6 +939,17 @@ function MasterHome({
   // Same-row growth while the reader is in history (no count to show).
   const [activity, setActivity] = useState(false);
   const [glideTick, setGlideTick] = useState(0);
+  // Latest moves in the tab order as well as visually; desktop leaves
+  // it after the transcript. Match the narrow Home layout in styles.css.
+  const [compactHome, setCompactHome] = useState(false);
+  useLayoutEffect(() => {
+    const media = window.matchMedia?.("(width < 640px)");
+    if (!media) return;
+    const update = () => setCompactHome(media.matches);
+    media.addEventListener("change", update);
+    update();
+    return () => media.removeEventListener("change", update);
+  }, []);
   const cmdSeq = useRef(0);
   const follow = useRef<Follow>(initialFollow());
   const prevItems = useRef(0);
@@ -700,36 +963,81 @@ function MasterHome({
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
-  const writeBlock = useWriteBlock(readOnly);
+  const gateBlock = useContext(WriteGate);
+  const writeBlock = useWriteBlock(readOnly) ?? gateBlock;
   const block = composerBlock(writeBlock, status, hosted);
+  const effectiveReadOnly = readOnly || writeBlock !== null || operator !== true;
+  const offered = useMemo(() => offeredCommands(hosted, master.data?.commands), [hosted, master.data?.commands]);
+  const canPickModel = offered.some((c) => c.name === "model");
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
+  // The seq watermark for the enter animation: items at or below the mount
+  // tail are history and render still; only what lands after rises in. Set
+  // here, before the first loaded render paints its rows, not in an effect
+  // that runs after they have already animated.
+  if (liveAfter.current === null && loaded) {
+    liveAfter.current = lastSeq(thread.data) ?? 0;
+  }
   const moreBefore = thread.data?.moreBefore === true;
-  const homeConversation = thread.data?.conversation;
+  // The default master-state response already resolves Home before its first
+  // transcript exists. Keep that server-issued binding when the empty thread
+  // (or its first streamed entries) does not carry a thread ID yet.
+  const homeProjection = master.status === "ok" ? master.data?.actor_identity : null;
+  const homeConversation = thread.data?.conversation
+    ?? (homeProjection?.scope === "personal"
+      && typeof homeProjection.conversation_id === "string"
+      && readConversationIdentity(master.data, homeProjection.conversation_id).read.state === "ready"
+      ? homeProjection.conversation_id
+      : undefined);
+  useEffect(() => {
+    if (homeConversation === undefined || thread.data === null
+      || thread.data.conversation !== undefined
+      || resources.masterState.get().data !== master.data) return;
+    // Stream admission and turn controls use the same canonical binding.
+    // Never replace a transcript's ID or seed a superseded session's store.
+    resources.masterThread.mutate((current) => current.conversation === undefined
+      ? { ...current, conversation: homeConversation }
+      : current);
+  }, [homeConversation, thread.data, master.data]);
   const attachDestination: AttachDestination | undefined = loaded && !missing
     ? homeConversation ? { conversation: homeConversation } : {}
     : undefined;
   const canAttach = !readOnly && attachDestination !== undefined;
+  // Native public boards can report hosted metadata but do not publish the
+  // hosted master projection or serve the PDF renderer's assets.
+  const canCapturePdfPages = hosted === true && master.data !== null && Object.hasOwn(master.data, "actor_identity") &&
+    canAttach && !effectiveReadOnly && homeConversation !== undefined;
 
   const masterRow = agents.data?.agents.find((a) => a.alias === MASTER);
-  const submitting = (thread.data?.pending ?? []).some((p) => p.state !== "failed");
+  const handoff = useSendHandoff(thread.data?.entries ?? [], thread.data?.pending ?? [], master);
+  const submitting = handoff !== null || (thread.data?.pending ?? []).some((p) => p.state !== "failed");
   const turn = turnState(master.data, masterRow, submitting);
   // The turn bar (turnBar.ts) is the same derivation Conversation uses, so
   // the two surfaces cannot disagree: Stop only for the running turn's own
   // message, Cancel only for this surface's own queued message. Home uses
   // the server-issued thread ID, just as app conversations do.
   const threadEntries = thread.data?.entries ?? [];
-  const permissionPending = usePendingPermission(threadEntries);
+  // CAD-2463: a Sources chip names an attachment by the file the user sent.
+  const homeAttachmentNames = useMemo(() => attachmentNames(threadEntries), [threadEntries]);
+  const pendingPermission = usePendingPermissionRequest(threadEntries, hosted === false);
+  const permissionPending = pendingPermission !== null;
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
-  const streamReconnecting = link !== null && link !== "live";
+  // A first connection in progress is not an outage, so it shows no notice.
+  // Stop still waits for a live stream (`canStop`).
+  const streamReconnecting = link !== "live" && link !== "connecting";
   const turnBar = turnBarState(
     {
       master: master.data,
       entries: threadEntries,
-      pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
+      pendingMessages: [
+        ...(thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
+        ...(handoff !== null ? [handoff] : []),
+      ],
       awaitingApproval: permissionPending,
-      reconnecting: streamReconnecting,
+      // Actions stay off until the stream has proved the turn is current, even
+      // while a first connection shows no outage notice.
+      reconnecting: link !== "live",
       liveSince,
     },
     homeConversation ?? null,
@@ -744,6 +1052,29 @@ function MasterHome({
     turnBar.kind === "approval" ||
     turnBar.kind === "sending" ||
     turnBar.kind === "queued";
+  // The header's plain-word status. A state this list does not know is shown
+  // as it is, never rounded up to "Available".
+  const headerChip = (() => {
+    const warn = "bg-warn/10 text-warn";
+    const ok = "bg-ok/15 text-ok";
+    if (status.kind === "unknown") return { label: status.kind, tone: "bg-ink-800 text-ink-400" };
+    if (status.kind === "unavailable") return { label: t("Availability unknown"), tone: warn };
+    if (status.kind !== "running") return { label: status.kind === "absent" ? t("not started") : status.kind, tone: warn };
+    if (streamReconnecting && activeTurn) {
+      return { label: link === "stopped" ? t("stream stopped") : t("reconnecting…"), tone: warn };
+    }
+    if (turnBar.kind === "approval") return { label: t("Needs you"), tone: warn };
+    if (turnBar.kind === "queued") return { label: t("Queued"), tone: ok };
+    // A turn in another conversation still occupies this assistant.
+    if (activeTurn || master.data?.turn?.state === "working") return { label: t("Working"), tone: ok };
+    const word = restingStatus(status.state);
+    return word === null ? { label: status.state, tone: warn } : { label: t(word), tone: ok };
+  })();
+  // CAD-1880: Stop sits in the composer's send slot while this pane's own
+  // turn runs. Never while the stream is down: that state is last known.
+  const runningMessage =
+    turnBar.kind === "working" || turnBar.kind === "writing" ? turnBar.stopMessage : null;
+  const canStop = writeBlock === null && loaded && link === "live" && runningMessage !== null;
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
     master.data,
@@ -786,15 +1117,32 @@ function MasterHome({
     // The turn must be this conversation's own: an app-origin turn is not.
     running: turn.kind === "working" && turnOrigin === null ? turn.message : null,
   });
+  // CAD-2103: the browser is a hosted board's. A native board never feeds it,
+  // so it never reads /api/browser. The operator's Home is the same
+  // conversation the canvas is fed, so the card and tab follow it.
+  useBrowserFeed(hosted === true ? (homeConversation ?? null) : null, activeTurn && turnOrigin === null, `${lastSeq(thread.data) ?? 0}:${thread.data?.pending?.length ?? 0}`);
   // The running turn's name-row activity anchors to this turn's own
   // message id — the item holding its newest stored entry (a pending
   // row has no stored entry yet, so its row is the anchor while it
   // waits). Once the terminal `turn_result` lands the daemon flips
   // `turn.state` off working and the indicator clears with the reply.
+  // The inline typing bubble starts the moment the send begins: `submitting`
+  // is the composer's own POST in flight (no stored entry to anchor on yet),
+  // `working` the daemon's verified turn. A queued wait keeps the dock's
+  // honest "behind a turn" line instead of claiming to type.
   const workingActivity =
     turn.kind === "working"
-      ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
-      : null;
+      ? {
+          message: turn.message,
+          since: typeof turn.since === "number" ? turn.since : null,
+          // Hosted boards report a running turn with `message: null`.
+          unnamed: !turn.message,
+        }
+      : turn.kind === "submitting"
+        // Once the send is stored, rows of its turn may land before the state
+        // names it: this id makes them this turn, not an older one.
+        ? { message: handoff, since: null }
+        : null;
   // The ResizeObserver re-subscribes when the name-row indicator appears
   // or clears (its content lives inside the observed list): a running
   // turn with any row to ride, whether it anchors to its own entry or
@@ -804,18 +1152,21 @@ function MasterHome({
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a
-  // reconnect `streamInto` resumes with `?after=<last id>` and the
+  // reconnect the subscription resumes with `?after=<last id>` and the
   // reducer dedupes by seq: no gaps, no repeats.
-  useThreadStream(resources.masterThread, `/api/threads/${MASTER}/stream`, loaded && !missing, setLink);
-
-  // The seq watermark for the enter animation: items at or below the
-  // mount tail are history — they render still; only what lands after
-  // rises in.
-  useEffect(() => {
-    if (liveAfter.current === null && loaded) {
-      liveAfter.current = lastSeq(thread.data) ?? 0;
-    }
-  }, [loaded, thread.data]);
+  useThreadStream(
+    resources.masterThread,
+    `/api/threads/${MASTER}/stream`,
+    loaded && !missing && (master.data === null
+      || !Object.hasOwn(master.data, "actor_identity")
+      || thread.data?.conversation !== undefined),
+    setLink,
+    undefined,
+    undefined,
+    // CAD-2228: this stream's preview frames are the home conversation's
+    // in-flight text, shown only while that conversation generates.
+    homeConversation ?? null,
+  );
 
   // Keep master_state honest: it follows the agents resource's
   // invalidations (turn boundaries land there) and the `master` stream
@@ -825,6 +1176,13 @@ function MasterHome({
   useEffect(() => {
     if (master.status !== "failed") void resources.masterState.refresh();
   }, [agents.data, master.status]);
+  // A read already out may predate the stored send, so ask for one after it.
+  // Before the refresh below, which would otherwise join this one. A turn the
+  // state already names needs no read.
+  const handoffUnread = master.data?.turn ? null : handoff;
+  useEffect(() => {
+    if (handoffUnread !== null) void resources.masterState.invalidate();
+  }, [handoffUnread]);
   // Turn boundaries land on the thread stream before the agents row
   // moves — a `turn_result` or a queued `message` tail revalidates the
   // state immediately so the working row clears with the reply, not a
@@ -868,17 +1226,60 @@ function MasterHome({
     setUnseen(0);
     setActivity(false);
     setGlideTick((n) => n + 1);
+    // A command's answer lasts until the next send; one still running stays.
+    setCmds((c) => c.filter((x) => x.running));
   }, []);
+  const sendPersonalRequest = useCallback(async (text: string) => {
+    if (readOnly || block || homeConversation === undefined) throw new Error("Sending is unavailable.");
+    engage();
+    const receipt = await sendToMaster(text, newMessageId(), undefined, undefined, homeConversation);
+    if (!receipt.ok) throw new Error(receipt.error);
+  }, [readOnly, block, homeConversation, engage]);
+  const homePersonalRevision =
+    homeProjection?.scope === "personal" &&
+    homeProjection.identity !== null &&
+    typeof homeProjection.identity === "object" &&
+    "revision" in homeProjection.identity &&
+    typeof homeProjection.identity.revision === "number"
+      ? homeProjection.identity.revision
+      : null;
+  const personalBootstrap = useHostedPersonalBootstrap(
+    hosted === true && !readOnly && homeProjection?.scope === "personal",
+    homeConversation ?? null,
+    homePersonalRevision,
+  );
+  const actor = useConversationActor(
+    master,
+    operator === true && !readOnly,
+    homeConversation ?? null,
+    readOnly || !!block || homeConversation === undefined ? null : sendPersonalRequest,
+    !readOnly,
+    personalBootstrap.identity,
+  );
+  // A native public board is also hosted, but its daemon returns a native
+  // endpoint and no actor projection. Tenant Home needs a workspace projection
+  // for this conversation; a missing tenant projection proves nothing.
+  const nativePublicMaster = master.status === "ok" && master.data !== null &&
+    !Object.hasOwn(master.data, "actor_identity") &&
+    master.data.provider !== "cadence" && Boolean(master.data.endpoint_kind) &&
+    master.data.endpoint_kind !== "durable_object";
+  const workspaceProfile = hosted === false || (hosted === true && operator === true && (
+    nativePublicMaster || (homeProjection?.scope === "workspace" && homeProjection.conversation_id === homeConversation)
+  ));
+  const profileHref =
+    actor.scope === "workspace" && actor.read.state === "ready" && masterRow && workspaceProfile
+      ? `/agents/${MASTER}?tab=instructions`
+      : personalAssistantProfileHref(actor.scope, actor.read, agents);
   const onRetrySend = useCallback(
     (
       message: string,
       text: string,
       refs?: ThreadRef[],
-      attachments?: { id: string }[],
+      attachments?: PendingAttachment[],
       conversation?: string,
     ) => {
       engage();
-      retry(message, text, refs, attachments, conversation);
+      void sendToMaster(text, message, refs, attachments, conversation);
     },
     [engage],
   );
@@ -895,10 +1296,16 @@ function MasterHome({
     if (!el) return;
     const nearNow = () => atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
     const onScrollEnd = () => {
+      const wasProgrammatic = follow.current.programmatic;
       const settled = onScrollSettled(follow.current, nearNow());
       applyFollow(settled.state);
       if (settled.state.pinned) setActivity(false);
-      if (settled.scroll === "jump") scrollPanel("jump");
+      if (
+        settled.scroll === "jump" ||
+        (wasProgrammatic && settled.state.pinned && Math.abs(el.scrollTop - tailTop(el.scrollHeight, el.clientHeight)) > 1)
+      ) {
+        scrollPanel("jump");
+      }
     };
     // Only an in-flight send glide is cancelled here. Once it has
     // settled, the position check is what stops the pin.
@@ -985,25 +1392,13 @@ function MasterHome({
   // The dock's measured height is the thread's bottom padding and the
   // pill's floor (`--dock-h`, styles.css); while pinned, a growing dock
   // (a longer draft, a wrapped hint) keeps the tail in view.
-  useEffect(() => {
-    const dock = dockRef.current;
-    if (!dock || typeof ResizeObserver === "undefined") return;
-    const apply = () => {
-      // Judge "on the tail" before the new padding lands: a strip that
-      // appears (Queued) must not push the last bubble under the dock.
-      const el = scrollRef.current;
-      const onTail = el ? atTail(el.scrollTop, el.scrollHeight, el.clientHeight) : false;
-      document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`);
+  const keepDockTail = useCallback(
+    (onTail: boolean) => {
       if (follow.current.pinned || onTail) scrollPanel("jump");
-    };
-    const ro = new ResizeObserver(apply);
-    ro.observe(dock);
-    apply();
-    return () => {
-      ro.disconnect();
-      document.documentElement.style.removeProperty("--dock-h");
-    };
-  }, [scrollPanel]);
+    },
+    [scrollPanel],
+  );
+  useDockHeight(dockRef, scrollRef, keepDockTail);
 
   const lastKey = items.length ? items[items.length - 1].key : "";
   useEffect(() => {
@@ -1019,6 +1414,17 @@ function MasterHome({
     applyFollow(next.state);
     if (next.scroll === "jump") scrollPanel("jump");
   }, [items.length, lastKey, scrollPanel]);
+
+  // The resize observer re-baselines on the commit that mounts the typing
+  // row, so it never sees that growth. While the reader is pinned, stick
+  // to the tail after paint — the typing bubble and a growing answer stay
+  // in view. A glide in flight owns the scroll until it settles.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !follow.current.pinned || follow.current.programmatic) return;
+    const top = tailTop(el.scrollHeight, el.clientHeight);
+    if (Math.abs(el.scrollTop - top) > 1) el.scrollTop = top;
+  });
 
   // After the pending row, command card, or working indicator paints.
   // Already sitting on the tail skips the glide and drops the lock, so
@@ -1055,13 +1461,30 @@ function MasterHome({
   };
 
 
+  const handBackWithdrawn = useCallback((r: MasterCommandResult) => {
+    if (!r.withdrawn?.length) return;
+    const withdrawn = r.withdrawn;
+    const state = resources.masterThread.get().data;
+    if (state) {
+      resources.masterThread.write((current) =>
+        failWithdrawn(current ?? state, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
+      );
+    }
+    // A message sent from another tab has no row here to hand back.
+    if (!state || withdrawn.some((message) => !state.pending.some((row) => row.message === message))) {
+      // Its own card: the caller's card is about to take the command's result.
+      const id = ++cmdSeq.current;
+      setCmds((c) => [...c, { id, name: "stop", ok: true, text: t("A queued message was withdrawn too. Send it again if you still need it.") }]);
+    }
+  }, [t]);
+
   /** One `/` verb → the board's command route; its answer is a card. */
   const runCommand = useCallback(
-    (name: string, arg: string) => {
+    (name: string, arg: string): boolean | void => {
       const id = ++cmdSeq.current;
       if (name === "help") {
-        setCmds((c) => [...c, { id, name, ok: true, text: helpText() }]);
-        return;
+        setCmds((c) => [...c, { id, name, ok: true, text: t(helpText(offered)) }]);
+        return arg ? false : undefined;
       }
       const known = SLASH_COMMANDS.find((c) => c.name === name);
       if (!known) {
@@ -1069,12 +1492,32 @@ function MasterHome({
           ...c,
           { id, name, ok: false, text: `Unknown command — \`/help\` lists what the master accepts.` },
         ]);
+        return false;
+      }
+      if (!offered.includes(known)) {
+        setCmds((c) => [
+          ...c,
+          { id, name, unavailable: true, text: t("This command isn't available in this workspace. `/help` lists what is.") },
+        ]);
+        return arg ? false : undefined;
+      }
+      // `/new hire starts Monday` is a sentence, not a request to start over.
+      if (arg && known.arg === undefined) {
+        setCmds((c) => [
+          ...c,
+          { id, name, notRun: true, text: t("This command takes nothing after its name, so it did not run.") },
+        ]);
+        return false;
+      }
+      if (name === "permissions") {
+        setCmds((c) => [...c, { id, name, ok: true, kind: "permissions" }]);
         return;
       }
       setCmds((c) => [...c, { id, name, arg: arg || undefined, running: true }]);
       api
         .masterCommand(name, arg || undefined)
         .then((r) => {
+          handBackWithdrawn(r);
           const { text, value } = fmtCommandResult(r);
           setCmds((c) =>
             c.map((x) => (x.id === id ? { ...x, running: false, ok: r.ok, text, value } : x)),
@@ -1092,7 +1535,7 @@ function MasterHome({
           ),
         );
     },
-    [],
+    [offered, t, handBackWithdrawn],
   );
 
   const runTurnCommand = useCallback((command: "stop" | "cancel", message: string) => {
@@ -1102,10 +1545,11 @@ function MasterHome({
       .masterCommand(command, undefined, undefined, message)
       .then((r) => {
         void resources.masterState.refresh();
+        handBackWithdrawn(r);
         if (!r.ok) setCmds((c) => [...c, { id, name: command, ok: false, text: "The master did not accept the command." }]);
       })
       .catch((e: ApiError) => setCmds((c) => [...c, { id, name: command, ok: false, text: e.message }]));
-  }, [writeBlock]);
+  }, [writeBlock, handBackWithdrawn]);
 
   const onEarlier = useCallback(() => {
     const step = earlierStep(resources.masterThread, threadReader(MASTER), limit);
@@ -1127,27 +1571,56 @@ function MasterHome({
 
   const showNotStarted = status.kind === "absent" || status.kind === "stopped";
   const empty = loaded && !missing && items.length === 0;
+  const bootstrapCardIdentity =
+    !readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "pending"
+      ? personalBootstrap.identity ?? (actor.read.state === "ready" ? actor.read.identity : null)
+      : null;
 
   /** Ask master: a prefilled draft with the row's subject as refs —
    *  never sends; the operator reviews it in the composer. */
   const onAsk = (need: HomeNeed, lead?: string) => {
-    const draft = askDraft(need, lead);
+    const draft = askDraft(need, lead, hosted === false ? undefined : t("what should we do?"));
     setSeed((s) => ({ text: draft.text, refs: draft.refs, n: s.n + 1 }));
   };
-  const toggleRail = () => {
-    setRailCollapsed((c) => {
-      writeRailCollapsed(!c);
-      return !c;
-    });
-  };
+
+  const focusHomeComposer = useCallback(() => focusComposerById(dockRef.current, HOME_COMPOSER_ID), []);
+
+  const focusApprovalBar = useCallback(() => focusApprovalBarIn(dockRef.current), []);
+
+  const rejectAndReplyDraft = useCallback(
+    (command: string) => {
+      if (effectiveReadOnly) return;
+      const existing = composerDraftState("home").text;
+      setComposerDraft("home", appendRejectReplyDraft(existing, command));
+      focusHomeComposer();
+    },
+    [effectiveReadOnly, focusHomeComposer],
+  );
+
+  const fillComposer = useCallback(
+    (text: string) => {
+      if (effectiveReadOnly) return;
+      setComposerDraft("home", appendComposerDraft(composerDraftState("home").text, text));
+      focusHomeComposer();
+    },
+    [effectiveReadOnly, focusHomeComposer],
+  );
+
+  const latestLabel = showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : "";
 
   return (
+    <AssistantActorProvider actor={actor}>
+    <PermissionEnabledContext.Provider value={hosted === false}>
+    <PermissionReplyContext.Provider value={!effectiveReadOnly ? rejectAndReplyDraft : null}>
+    <ComposerFillContext.Provider value={!effectiveReadOnly ? fillComposer : null}>
+    <PdfPageTarget.Provider value={canCapturePdfPages && attachDestination
+      ? { key: "home", destination: attachDestination }
+      : null}>
+    {/* CAD-2364: answers name the rail's staged writes as chips that open its review card. */}
+    <StagedSourceContext.Provider value={decisions ? homeDecisions : null}>
+    <AttachmentNamesContext.Provider value={homeAttachmentNames}>
     <main
-      className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
-        railCollapsed
-          ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
-          : "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]"
-      }`}
+      className="home-workspace home-master px-4 lg:px-8 sm:pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)] flex-1 min-h-0"
     >
       {/* The rail is its own column (CAD-574), bounded by the panel's
           height (CAD-600): its `rail-scroll` scrolls independently of
@@ -1155,18 +1628,23 @@ function MasterHome({
       <aside className="absolute rail:static min-w-0 rail:order-2 rail:h-full rail:min-h-0">
         <NeedsRail
           overview={overview}
+          documentFollowUps={documentFollowUps}
+          templateRail={templateRail}
+          templateCount={templateCount}
+          templateList={templateList}
+          hasLiveAgents={(agents.data?.agents ?? []).some((a) => a.running > 0)}
           readOnly={readOnly}
+          scopedHost={hosted !== false}
+          hostedRoster={hosted === false ? undefined : agents.data ?? null}
           onOpenIssue={onOpenIssue}
-          overviewHref={overviewHref}
           permissionsHref={permissionsHref}
           onAsk={onAsk}
           onOpenDecision={onOpenDecision}
+          decisions={decisions}
           onAskAgent={(agent, update) => setSeed((s) => ({
             text: `Check in with ${agent.alias}${agentOn(agent).length ? ` on ${agentOn(agent).join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,
           }))}
-          collapsed={railCollapsed}
-          onToggleCollapse={toggleRail}
           onSent={engage}
         />
       </aside>
@@ -1179,24 +1657,63 @@ function MasterHome({
             bottom. It fills the height below the board header; the page
             itself never scrolls for the chat. */}
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
-          <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
-            <span className="text-accent text-section" aria-hidden>✳</span>
-            <h1 className="text-section font-semibold text-ink-100">{t("Assistant")}</h1>
-            <span
-              className={`chip ${
-                status.kind === "running"
-                  ? "bg-ok/15 text-ok"
-                  : status.kind === "unknown"
-                    ? "bg-ink-800 text-ink-400"
-                    : "bg-warn/10 text-warn"
-              }`}
-            >
-              {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
-            </span>
-            <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-            {streamReconnecting && activeTurn && status.kind === "running" && (
-              <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
-            )}
+          <div
+            className="master-heading assistant-heading pb-2.5 border-b border-ink-700/70"
+            data-assistant-identity={actor.scope ?? undefined}
+            data-identity-state={actor.read.state}
+          >
+            <AssistantFace size={30} active={status.kind === "running"} />
+            <div className="assistant-heading-text">
+              <div className="assistant-heading-name">
+                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, actor.scope, t)}</h1>
+                <span className={`chip chip-sans ${headerChip.tone}`} data-assistant-status>
+                  {headerChip.label}
+                </span>
+                {actor.scope === "personal" && personalBootstrap.bootstrap === "pending" && (
+                  <span className="text-micro text-ink-500">{t("first-time setup")}</span>
+                )}
+                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} canPickModel={canPickModel} />
+                <HeaderMenu
+                  master={master.data}
+                  row={masterRow}
+                  readOnly={readOnly}
+                  canPickModel={canPickModel}
+                  scope={scopeDescriptor(actor.scope, t)}
+                  profileHref={profileHref}
+                />
+              </div>
+              <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
+            </div>
+            <div className="assistant-heading-actions">
+              {compactHome && latestLabel && (
+                <button
+                  type="button"
+                  className="newpill"
+                  data-jump-to-latest
+                  aria-label={latestLabel}
+                  onClick={(event) => {
+                    if (document.activeElement === event.currentTarget) {
+                      scrollRef.current?.focus({ preventScroll: true });
+                    }
+                    jumpToLatest();
+                  }}
+                >
+                  <span aria-hidden="true">↓</span>{" "}
+                  {t("Latest")}{unseen > 0 ? ` · ${unseen}` : ""}
+                </button>
+              )}
+              {!readOnly && actor.scope === "personal" && personalBootstrap.bootstrap === "deferred" && (
+                <button
+                  type="button"
+                  className="lnk text-label"
+                  disabled={personalBootstrap.resuming}
+                  onClick={() => void personalBootstrap.resume()}
+                >
+                  {t("Finish setup")}
+                </button>
+              )}
+              <AssistantAboutButton profileHref={profileHref} />
+            </div>
           </div>
 
           {setupNotice}
@@ -1217,45 +1734,67 @@ function MasterHome({
             className="chat-scroll min-h-0 flex-1 overflow-y-auto pt-3"
             ref={scrollRef}
             onScroll={onPanelScroll}
+            tabIndex={compactHome ? 0 : undefined}
             data-chat-scroll
+            data-jump-pill={latestLabel ? "" : undefined}
           >
-            {showNotStarted && items.length === 0 && (
+            <CloudContentNotice withheld={thread.data?.cloudWithheld} />
+            {thread.data?.cloudWithheld == null && bootstrapCardIdentity !== null && (
+              <AssistantBootstrapCard
+                identity={bootstrapCardIdentity}
+                onComplete={personalBootstrap.complete}
+                onDefer={personalBootstrap.defer}
+              />
+            )}
+            {thread.data?.cloudWithheld == null && showNotStarted && items.length === 0 && bootstrapCardIdentity === null && (
               <div className="chat-empty">
                 <NotStarted status={status} hosted={hosted} />
               </div>
             )}
-            {empty && !showNotStarted && (
+            {thread.data?.cloudWithheld == null && empty && !showNotStarted && bootstrapCardIdentity === null && (
               <div className="chat-empty">
                 <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
               </div>
             )}
 
+            <CredentialRequestList conversationId={homeConversation} enabled={credentialRequestsEnabled} className="mx-1" />
+            <ImageConversation.Provider value={homeConversation ?? null}>
             <ThreadList
               items={items}
+              conversation={homeConversation ?? null}
               limit={limit}
               moreBefore={moreBefore}
               loadingEarlier={loadingEarlier}
               onEarlier={onEarlier}
-              readOnly={readOnly}
+              readOnly={effectiveReadOnly}
+              hosted={hosted === true}
               onOpenIssue={onOpenIssue}
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
               working={workingActivity}
+              queued={(master.data?.queue ?? []).map((q) => q.message)}
               stale={streamReconnecting && activeTurn}
             />
+            </ImageConversation.Provider>
+            <PrivateAppReviewCards enabled={decisions && !effectiveReadOnly && hosted === true} revision={lastSeq(thread.data) ?? 0} />
             {cmds.map((c) => (
-              <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
+              <CmdCard
+                key={c.id}
+                cmd={c}
+                onOpenIssue={onOpenIssue}
+                readOnly={effectiveReadOnly}
+                permissionsHref={permissionsHref}
+              />
             ))}
           </div>
 
-          {/* The status node stays mounted so a screen reader announces the
-              pill's arrival (a live region added with its text is not). */}
+          {/* Keep the live region mounted so its updated text is announced. */}
           <span role="status" aria-live="polite" className="sr-only">
-            {showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : ""}
+            {latestLabel}
           </span>
-          {showJumpPill(unseen, activity) && (
-            <button type="button" className="newpill num" onClick={jumpToLatest} data-jump-to-latest>
-              <span aria-hidden="true">↓</span> {jumpLabel(unseen, t)}
+          {!compactHome && latestLabel && (
+            <button type="button" className="newpill" onClick={jumpToLatest} data-jump-to-latest>
+              <span aria-hidden="true">↓</span> {latestLabel}
             </button>
           )}
 
@@ -1266,9 +1805,7 @@ function MasterHome({
             <TurnBar
               state={turnBar}
               reconnecting={streamReconnecting && activeTurn}
-              since={serverTurn?.since ?? null}
               actions={{
-                onStop: writeBlock === null ? (message) => runTurnCommand("stop", message) : undefined,
                 onCancel: writeBlock === null ? (message) => runTurnCommand("cancel", message) : undefined,
                 onRetry:
                   writeBlock === null && failedEntry !== null
@@ -1282,9 +1819,16 @@ function MasterHome({
                             ? [{ kind: r.kind, id: r.id }]
                             : [];
                         });
-                        const attachments = list("attachments").flatMap((item) => {
-                          const a = item as { id?: unknown };
-                          return typeof a.id === "string" ? [{ id: a.id }] : [];
+                        const attachments = list("attachments").flatMap((item): PendingAttachment[] => {
+                          const a = item as { id?: unknown; name?: unknown; size?: unknown; mime?: unknown };
+                          return typeof a.id === "string"
+                            ? [{
+                                id: a.id,
+                                ...(typeof a.name === "string" ? { name: a.name } : {}),
+                                ...(typeof a.size === "number" ? { size: a.size } : {}),
+                                ...(typeof a.mime === "string" ? { mime: a.mime } : {}),
+                              }]
+                            : [];
                         });
                         const mediaRefs = list("media_refs").flatMap((item) => {
                           if (!item || typeof item !== "object") return [];
@@ -1295,7 +1839,8 @@ function MasterHome({
                         });
                         const conversation =
                           typeof payload.conversation === "string" ? payload.conversation : undefined;
-                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation, undefined, mediaRefs.length ? mediaRefs : undefined);
+                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined,
+                          conversation, undefined, mediaRefs.length ? mediaRefs : undefined);
                       }
                     : undefined,
                 onView: turnBar.kind === "queued" && aheadHref !== null
@@ -1306,6 +1851,16 @@ function MasterHome({
                   card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
                 },
               }}
+              permission={
+                pendingPermission !== null
+                  ? {
+                      request: pendingPermission,
+                      readOnly: effectiveReadOnly,
+                      onRejectAndReply: (req) => rejectAndReplyDraft(req.command),
+                      onFocusComposer: focusHomeComposer,
+                    }
+                  : null
+              }
             />
             {/* Another conversation's turn (an app's), with its link: Home's
                 own turn is the turn bar above. */}
@@ -1321,7 +1876,11 @@ function MasterHome({
               block={block}
               seed={seed}
               onCommand={runCommand}
+              commands={offered}
               onSent={engage}
+              stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
+              textareaId={HOME_COMPOSER_ID}
+              onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly
@@ -1334,5 +1893,12 @@ function MasterHome({
         </div>
       </section>
     </main>
+    </AttachmentNamesContext.Provider>
+    </StagedSourceContext.Provider>
+    </PdfPageTarget.Provider>
+    </ComposerFillContext.Provider>
+    </PermissionReplyContext.Provider>
+    </PermissionEnabledContext.Provider>
+    </AssistantActorProvider>
   );
 }

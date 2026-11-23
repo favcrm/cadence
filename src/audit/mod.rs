@@ -60,6 +60,7 @@ pub use self::approval::{approval_check, scope_check, verdicts_check};
 pub(crate) use self::approval::{reviewer_identity, verdicts_in};
 pub use self::delegated::digest;
 pub use self::github::origin_slug;
+pub(crate) use self::store::APPROVAL_UNVERIFIED;
 
 use self::approval::*;
 use self::delegated::*;
@@ -319,17 +320,14 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
             since,
         );
     } else {
-        print!(
-            "{}",
-            render_text(
-                &repo,
-                &default_ref,
-                &rows,
-                flagged,
-                structural.as_ref(),
-                opts
-            )
-        );
+        crate::output::print_text(&render_text(
+            &repo,
+            &default_ref,
+            &rows,
+            flagged,
+            structural.as_ref(),
+            opts,
+        ));
     }
     Ok(if flagged > 0 { 1 } else { 0 })
 }

@@ -638,6 +638,14 @@ fn supported_kernel_abi(release: &str) -> bool {
         (6, 12),
         (6, 14),
         (6, 17),
+        // CAD-1967: the InstaBox CI kernel. It presents the same proof
+        // inputs as the supported 7.0 runner — kthreadd as PID 2 with
+        // PF_KTHREAD and PPid 0, a single full procfs root, the same
+        // ns/pid answers — and its one extra submount sits under
+        // /proc/sys, which `sensitive_proc_submount` does not treat as
+        // sensitive. The host acceptance tests prove the enumeration
+        // itself on that kernel; an unexplained denial still fails closed.
+        (6, 18),
         (7, 0),
     ];
     let Some((major, rest)) = release.split_once('.') else {

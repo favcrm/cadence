@@ -62,6 +62,90 @@ without approving an asset. Text-only workflows need no asset pin. Installing
 Social Content alone does not create a connection, consent, quote approval or
 release authority.
 
+## Skill material
+
+A step that needs packaged instructions and helper files names one installed
+skill package:
+
+```markdown
+## Draft
+agent: {{writer}}
+size: S
+action: local.text.produce
+skill: meeting-writer
+```
+
+`skill: <tag>` is static metadata. It is part of the workflow's gate digest,
+so it is part of the approval digest, and a `{{input}}` placeholder in it
+refuses. It must be the LAST metadata line of its step: the plan parser stops
+reading metadata at the first key it does not know, so a line written after
+`skill:` would land in the step body and never reach the run.
+
+The package lives in the installed bundle at `skills/<tag>/`:
+
+```
+skills/meeting-writer/skill.json
+skills/meeting-writer/SKILL.md
+skills/meeting-writer/references/style.md
+skills/meeting-writer/scripts/build.py
+```
+
+`skill.json` is the manifest and is the only authority on what the package
+ships:
+
+```json
+{"schema": 1, "name": "meeting-writer", "files": ["SKILL.md", "references/style.md", "scripts/build.py"]}
+```
+
+The manifest is closed: `schema` must be `1`, `name` must be the package's own
+directory name, `files` must declare `SKILL.md`, and an unknown field refuses.
+The declared set must equal the set actually present, in both directions — a
+declared member the bundle does not carry refuses, and a present member the
+manifest does not declare refuses, each naming the path. `skill.json` is never
+listed in its own `files`.
+
+Allowed members: a flat root leaf with `md`, `txt`, `json`, `yaml`, `yml`,
+`csv`, `css` or `svg`; `scripts/<stem>.py|sh|js|mjs`; `references/<stem>.md|txt`.
+Nothing nests deeper, dotfiles refuse, and a symlink refuses. Caps: 16 declared
+members, 16 KiB per member, 4 KiB for the manifest, 32 KiB per package
+including the manifest.
+
+Every declared text file is scanned for tokens that name package material —
+`scripts/…`, `references/…`, `skills/<tag>/…` (including `./`-prefixed forms)
+and a bare `name.ext` with an allowed extension. A token naming a member the
+manifest does not declare refuses. This is a declared-inventory contract, not
+import analysis: the scan reads names, never evaluates them, so a path built at
+run time (`os.path.join`, `importlib`, a variable) is invisible to it, and a
+bare word that happens to end in an allowed extension is treated as package
+material. Write prose that does not look like a path, or declare the file.
+
+At run creation each `skill:` tag is resolved from the installed bundle's own
+file map and frozen into the run as `{name, manifest, manifest_sha256, digest,
+files: [{path, sha256, text}]}` under `snapshot.workflow.steps[].skill`. The
+snapshot digest covers it, so approving the run approves that exact material.
+Creation refuses before any run row exists when a package is missing,
+incomplete, over bounds, when a declared reference is undeclared, or when the
+encoded kickoff would exceed the transport byte limit. Dispatch builds the
+kickoff envelope from the snapshot alone: the frozen bytes are what a worker
+receives, and updating the installed bundle afterwards cannot change what an
+existing run was given. The host writes no run-scoped directory and no copy of
+the material to disk — there is no host-owned file for a later writer to
+replace.
+
+**What this does not prove.** Script execution is agent-side and unattested.
+The host freezes the bytes and hands them to the assigned worker; it does not
+execute `scripts/` itself, does not sandbox them, and does not verify what they
+did. A frozen digest proves which bytes a run was given, not that the worker
+ran them or ran them honestly. A script in a package is material for the
+worker's own turn, under that worker's existing confinement — not a host
+capability, not an authorization, and never a substitute for the run, review or
+operator decision below.
+
+A `skill:` directive is refused, not silently dropped, on every path that does
+not freeze a package: `cadence workflow check`, `cadence plan propose
+--workflow <stored-name>` (including the unattended grant path) and `cadence
+plan propose --workflow <app>/<workflow>`.
+
 ## Operator flow
 
 ### Start from the board
@@ -250,6 +334,68 @@ Use `cadence app run cancel <run-id>` to prevent further execution, or
 `cadence app catalog revoke <installation-id> --digest <installed-digest>`
 to withdraw its local capability approval. Neither operation converts
 old results into new execution authority.
+
+A run frozen before snapshots recorded their team-role map cannot say
+which of its inputs bound a team role; while its values are unknown the
+app-team check holds any alias among them. A live run is withdrawn by
+`cadence app run cancel <run-id>`. A terminal (`succeeded`/`failed`) run
+cannot be cancelled, so `cadence app run retire-legacy <run-id>` records
+the operator's withdrawal instead: the lifecycle state and history are
+unchanged, and only the unproven role provenance stops constraining.
+
+## Operator decision and one selected ticket
+
+Installation approval, run approval, quality review, and outward release stay
+separate. `cadence app effect accept` still records a decision and releases
+the artifact. A post-review choice that must not publish is not an effect
+flag: `execute: false` stays off the CLI, because a stored non-execution is
+reconciled as an interrupted accept.
+
+Record the choice on the succeeded run instead:
+
+```sh
+cadence app run disposition <run-id> \
+  --request-id <request-id> \
+  --artifact-id <artifact-id> \
+  --digest <sha256-digest> \
+  --decision accept
+```
+
+`--decision` is `accept` or `decline`. The run must be succeeded and approved,
+the digest must be the stored artifact bytes, and an independent reviewer
+must have approved that digest. The producer approving their own artifact is
+refused. The command does not stage a release, does not write an effect row,
+and does not change upgrade readiness. One decision per run: the same request
+returns the stored row, and a different request or decision conflicts.
+`cadence app run show` includes the row after a daemon restart.
+
+An accepted artifact whose text has a `## Proposed next steps` section can
+become one host issue. The index is 1-based. At least two proposals are
+required, and only the chosen one is written:
+
+```sh
+cadence app run ticket <run-id> \
+  --request-id <ticket-request-id> \
+  --artifact-id <artifact-id> \
+  --digest <sha256-digest> \
+  --index 1 \
+  --project <project-key>
+```
+
+The daemon parses the section and reserves that suggestion. The CLI then
+creates one tracker issue through the existing issue writer. The body
+records the accept decision, run, artifact and digest, plus a
+`cadence-app-ticket-request:` marker, and the command binds the issue
+id. Repeating the command returns that issue. A different index or
+request conflicts, so the unselected proposals are not written. Decline
+cannot reserve a ticket.
+A crash after the issue commit and before the bind retries onto the marker
+instead of creating a second issue; two markers for one request refuse.
+The bind RPC checks the tracker before it writes. It records the issue only
+when that id is this reservation and the issue file is already committed and
+clean. A missing id, any other committed issue, or the same body still
+uncommitted or staged is refused: the reservation stays unbound, no bound
+event is written, and crash leftovers are left in place.
 
 ## Approval and recovery boundaries
 

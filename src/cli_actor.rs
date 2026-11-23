@@ -249,24 +249,32 @@ pub struct CliActor {
 }
 
 impl CliActor {
-    /// The project-policy spelling this actor is keyed by: the actor's
-    /// kind with its subject in the sanitized handle form the board
-    /// stores (`board_identity::handle_of`), which is also the only form
-    /// the store accepts — `Grant::parse` refuses a handle outside
-    /// `[A-Za-z0-9_-]{1,200}`.
-    ///
-    /// Deriving it here is what makes a grant recorded on either surface
-    /// match the caller arriving through the other. Keying on `actor`
-    /// verbatim would refuse a member whose subject needs sanitizing a
-    /// project the board admits it to: the envelope's
-    /// `users/auth0|usr:9/x` can never equal the store's
-    /// `users/auth0_usr_9_x`.
+    /// Legacy attribution spelling. Subject sanitization is lossy, so this
+    /// must not be used to authorize user access; use the verified subject.
     pub fn policy_spelling(&self) -> String {
         match self.actor.split_once('/') {
             Some((kind, _)) => format!("{kind}/{}", self.handle),
             // `operator` is not a `<kind>/<subject>` spelling; the
             // verified schema bounds the actor to these four forms.
             None => self.actor.clone(),
+        }
+    }
+
+    /// The project-policy spelling of this verified caller, or `None` when
+    /// its principal kind and actor prefix disagree (CAD-2321, operator
+    /// decision of 2026-11-15). Only a `users/` actor keys on the verified
+    /// `sub`; each kind is admitted with its own prefix alone, and any other
+    /// pair names no caller. Every project read of a CLI envelope — the
+    /// route's guards and the daemon's relayed reads — uses this one rule.
+    pub fn policy_actor(&self) -> Option<String> {
+        let prefix = self.actor.split_once('/').map(|(prefix, _)| prefix);
+        match (self.principal_kind.as_str(), prefix) {
+            ("user", None) if self.actor == "operator" => Some(self.actor.clone()),
+            ("user", Some("users")) => Some(crate::project_policy::policy_user_actor(&self.sub)),
+            ("agent", Some("agents")) | ("service", Some("service")) => {
+                Some(self.policy_spelling())
+            }
+            _ => None,
         }
     }
 }
@@ -345,7 +353,8 @@ fn public_scheme(host: &str) -> &'static str {
 /// `users/<sub>`/`service/<sub>`/`agents/<id>` map to their namespaced
 /// tail so the daemon-visible author can never read as `operator` or
 /// collide with a pane alias it does not own.
-pub(crate) fn handle_of(actor: &str, sub: &str) -> String {
+#[doc(hidden)]
+pub fn handle_of(actor: &str, sub: &str) -> String {
     let tail = actor.split_once('/').map(|(_, t)| t).unwrap_or(sub);
     crate::ident::sanitized(tail)
 }

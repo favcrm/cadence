@@ -32,14 +32,26 @@
 //!   safe: the refusal came back before the verb ran. `wake_failed`
 //!   (`runtime_stopped`/`not_found`/`unavailable`) and every other failure
 //!   end the command — never a redirect chase, never another org, never local.
+//!
+//! CAD-2001 adds the project-scoped review-evidence verbs
+//! ([`PROJECT_SCOPED_GATE_VERBS`]). Each carries an explicit `project`, and
+//! the two approvals also carry the `issue` they authorize, so no read can
+//! answer from another project's evidence and no write is authorized by a
+//! repo's first project. They are newer than the tenant that serves them: the
+//! release order is the tenant server first, then this client, and a tenant
+//! that does not know the name is refused by [`tenant_cannot_serve`] with
+//! that order named. The older repo-scoped verbs stay in the tenant for old
+//! clients; this build never sends them for the gate or the operator and
+//! never falls back to them when the project is known.
 
 use base64::Engine;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
@@ -78,15 +90,22 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// consumed. Anything else stays unresolved.
 ///
 /// The cli.write half (`issue_new`/`issue_comment`/`issue_set`/
-/// `project_policy`/`message_send`/`team_*`) rides the same envelope — the
-/// caller's authority never travels as a request field, only inside the
-/// verified, single-use envelope. A failed or ambiguous call is never retried
-/// by the client: the wake retry is the only loop, and it fires only on a
-/// pre-forward `waking` verdict. Anything else — a timeout, a dropped
-/// connection, a 5xx after forward — stays explicitly unresolved: the
-/// mutation may or may not have landed, so reconcile before blindly
-/// re-issuing. For `project_policy`, reconcile by reading the project record;
-/// a refusal is final. For `message_send`, the caller-chosen `message` id in
+/// `issue_attach`/`issue_review`/`project_policy`/`project_new`/
+/// `message_send`/`team_*`, platform calls, the settings write operations and
+/// the audit writes) rides the same envelope — the caller's authority never
+/// travels as a request field, only inside the verified, single-use envelope.
+/// A failed or ambiguous call is never retried by the client: the wake retry
+/// is the only loop, and it fires only on a pre-forward `waking` verdict.
+/// Every mutation is classified once in [`cli_effect`] / [`wiki_effect`]
+/// (with its reconciliation read), so a timeout, a dropped connection, a 5xx
+/// after forward, or a 2xx without a receipt stays explicitly unresolved.
+/// A 2xx must also carry the verb's own correlated receipt: issue, project,
+/// wiki and team writes name the thing written, and settings writes answer
+/// their own bounded receipt. A malformed or foreign receipt is the same
+/// unknown outcome, never a false success. The wiki `write` action is
+/// classified the same way on its own surface. A proven pre-effect refusal
+/// keeps its definite verdict. For `message_send`, the caller-chosen `message`
+/// id in
 /// `arguments` is the reconciliation key: `message_read` returns the
 /// principal's own durable message by id, and resubmitting the same id
 /// dedupes server-side — never a blind replay. A 2xx proves the enqueue
@@ -103,26 +122,157 @@ pub const REMOTE_VERBS: &[&str] = &[
     "my_work",
     "agent_list",
     "agent_show",
+    // CAD-1964: the role catalogue. A hosted org has no daemon, so the board
+    // answers from its pinned copy of this build's own catalogue.
+    "agent_roles",
+    // CAD-1964: reusable agent profiles. Reads only; the hosted board applies
+    // the caller's own role and wiki access, and returns no agent identity.
+    "agent_profile_list",
+    "agent_profile_context",
+    // CAD-2101: one stored profile with its revision.
+    "agent_profile_show",
+    // CAD-2396: a hosted workspace's own skills. `check` validates and saves
+    // nothing.
+    "workspace_skill_list",
+    "workspace_skill_show",
+    "workspace_skill_check",
     "issue_ls",
     "issue_show",
     "issue_history",
+    "issue_messages",
+    "issue_artifact",
+    // AOS-346: artifacts a worker or the assistant produced. The upload is its
+    // own multipart path, `upload_artifact`.
+    "artifact_find",
+    "artifact_show",
+    "artifact_read",
+    // CAD-2286: the workspace's document types and baseline. It is also the
+    // one probe that decides whether the document lifecycle is available
+    // ([`document_lifecycle_unavailable`]).
+    "document_types",
     "message_read",
     "message_inbox",
     "team_list",
     "team_invites",
+    // CAD-1999: the hosted org's own project registry — the projects a
+    // workspace has registered, plus the ones that exist only as their
+    // tickets' key. A read; the write beside it is `project_new`.
+    "project_ls",
+    // CAD-2240: one project's timeline (ticket changes, comments, messages,
+    // reviews), newest first. A read.
+    "project_timeline",
+    // CAD-2650: read one project's recorded access policy (`cli.read`).
+    "project_policy_read",
     // cli.write
     "issue_new",
     "issue_comment",
+    "issue_attach",
+    "issue_review",
+    "issue_message_send",
+    "issue_messages_read",
     "issue_set",
+    // CAD-2286: submit a file the caller saved into the document lifecycle.
+    // It rides a managed session's agent credential like any other verb: that
+    // credential carries the member's subject, which the creator check reads,
+    // and the board's read-only guard refuses a reader or reviewer session.
+    "document_submit",
+    // AOS-528: one link added or removed. The board applies the delta to the
+    // card it holds, so the client sends ids and a kind, never a whole card.
+    "issue_link",
+    "issue_unlink",
     "team_invite",
     "team_revoke_invite",
     "team_set_role",
     "team_remove",
     "project_policy",
+    // CAD-1999: register an empty project — its key, its human name and its
+    // issue-id prefix — before any card exists. The tenant Worker answers it
+    // from its own storage, and requires a live human owner: a project key
+    // and prefix are workspace structure every later card inherits.
+    "project_new",
+    // CAD-2101: define or edit an agent profile. The board requires a live
+    // human owner and owns the field limits and the revision fence.
+    "agent_profile_create",
+    "agent_profile_update",
+    // CAD-2396: any cli.write caller saves a draft; approving one revision by
+    // digest, and revoking it, need a live human owner on the board.
+    "workspace_skill_draft",
+    "workspace_skill_approve",
+    "workspace_skill_revoke",
+    // agenticos-v2 #2147: owner-only, removes an unapproved skill.
+    "workspace_skill_delete",
     "message_send",
+    "message_ack",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
+    // CAD-1678 / AOS-328: the hosted workspace's own tool catalog. `tools`
+    // needs `cli.read`, `call` needs `cli.write`; the Worker decides per
+    // operation, so this client asks for the historical pair.
+    // CAD-2226: `connection_providers`/`connection_list` are the owner's
+    // reads and `connection_start` the enrollment write; all three are
+    // refused to a managed caller here and the board requires a live human
+    // owner.
+    "platform_call",
+    // CAD-1946: the merge gate. Reads (cli.read) and the operator's merge
+    // approval (`audit.approve`, which only `cadence login --audit-approve`
+    // requests; the hosted org admits it for the human owner only).
+    "delivery_policy",
+    "delivery_policy_set",
+    "audit_approval",
+    "audit_verdicts",
+    "audit_verdict",
+    "audit_scope",
+    "audit_approve",
+    // AOS-473: the owner's reviewer attestations. The read is scoped like
+    // every other gate read; the write rides the same `audit.approve` login
+    // as the merge approval, because an attestation is the owner's own act.
+    "audit_reviewers",
+    "audit_reviewers_set",
+    // CAD-2001: the project-scoped review-evidence path. Every one of these
+    // carries an explicit `project` (and `issue` for the approvals), so a
+    // read can never answer from another project's evidence and a write can
+    // never be authorized by a repo's first project. The tenant serves the
+    // repo-scoped verbs above to old clients; this build never sends them for
+    // the gate or the operator, and a tenant that predates these names is
+    // refused with the release order named — never a silent fallback.
+    "audit_approval_project",
+    // CAD-2201: the owner-only findings read. A read scope is enough to ask;
+    // the tenant admits only the live human owner.
+    "audit_findings_project",
+    "audit_verdicts_project",
+    "audit_verdict_project",
+    "audit_approve_project",
+    // CAD-2197: the operator's head-pinned acceptance of a workflow revise.
+    "audit_accept_revise_project",
+    "audit_reviewers_project",
+    "audit_reviewers_project_set",
+    "audit_identities",
+    "audit_identities_set",
+    // CAD-1946: hosted merge gate evaluator, enqueue, scope/designate/digest/
+    // revoke and agent delegated approvals.
+    "delivery_check",
+    "delivery_enqueue",
+    "audit_revoke_project",
+    "audit_approve_scope_project",
+    "audit_scope_project",
+    "audit_designate_project",
+    "audit_designations_project",
+    "audit_digest_project",
+    "audit_approve_delegated_project",
+    // CAD-2316 / AOS-481: hosted HTML templates and document drafts. Source
+    // bytes ride `POST /__platform/templates/upload`; reads/writes ride `/__platform/cli/call`.
+    "template_list",
+    "template_show",
+    "template_blob_read",
+    "template_create",
+    "template_revise",
+    "template_sample",
+    "template_intake",
+    "template_approve",
+    "document_create",
+    "document_show",
+    "document_export",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -130,32 +280,384 @@ pub const REMOTE_VERBS: &[&str] = &[
 /// for the scope that verb requires.
 fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     match verb {
-        "team_list" | "team_invites" => &["cli.read"],
+        "team_list"
+        | "team_invites"
+        | "delivery_policy"
+        | "audit_approval"
+        | "audit_verdicts"
+        | "audit_reviewers"
+        | "audit_scope"
+        | "audit_approval_project"
+        | "audit_findings_project"
+        | "audit_verdicts_project"
+        | "audit_reviewers_project"
+        | "audit_identities"
+        | "delivery_check"
+        | "audit_scope_project"
+        | "audit_designations_project"
+        | "audit_digest_project"
+        | "agent_profile_list"
+        | "agent_profile_context"
+        | "agent_profile_show"
+        | "workspace_skill_list"
+        | "workspace_skill_show"
+        | "workspace_skill_check"
+        | "agent_roles"
+        | "project_ls"
+        | "project_timeline"
+        | "project_policy_read"
+        | "document_types"
+        | "template_list"
+        | "template_show"
+        | "template_blob_read"
+        | "document_show" => &["cli.read"],
+        // CAD-2286: the tenant admits `document_submit` with cli.write alone.
+        "document_submit" | "template_create" | "template_revise" | "template_sample"
+        | "template_intake" | "template_approve" | "document_create" | "document_export" => {
+            &["cli.write"]
+        }
+        // The owner's merge approval and the delivery inputs it binds both
+        // ride the opt-in `audit.approve` login (`cadence login --audit-approve`).
+        // A delegated approval is the designated agent's own act (`cli.write`),
+        // never spending the owner's `audit.approve` token.
+        "audit_verdict" | "audit_verdict_project" | "audit_approve_delegated_project" => {
+            &["cli.write"]
+        }
+        // CAD-1999: creating a project is a workspace-structure write; the
+        // board also requires a live human owner. Reading the registry is a
+        // plain cli.read above.
+        "project_new" | "agent_profile_create" | "agent_profile_update" => &["cli.write"],
+        "workspace_skill_draft"
+        | "workspace_skill_approve"
+        | "workspace_skill_revoke"
+        | "workspace_skill_delete" => &["cli.write"],
+        // CAD-2001: attesting project eligibility or a principal's GitHub
+        // identity decides whose verdicts count, so both writes need the same
+        // `audit.approve` login as the merge approval — and the tenant admits
+        // them for the live human owner only.
+        "audit_approve"
+        | "audit_approve_project"
+        | "audit_accept_revise_project"
+        | "audit_reviewers_set"
+        | "audit_reviewers_project_set"
+        | "audit_identities_set"
+        | "delivery_policy_set"
+        | "delivery_enqueue"
+        | "audit_revoke_project"
+        | "audit_approve_scope_project"
+        | "audit_designate_project" => &["cli.write", "audit.approve"],
         "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
+        // Asking for one scope makes a login without it a refusal at mint, which
+        // can be named. Asking for both would mint a narrower envelope, and the
+        // call would then get a bare 401 that reads like an expired login.
+        "issue_message_send" | "issue_messages_read" | "message_ack" => &["cli.write"],
+        "issue_messages" => &["cli.read"],
         _ => &["cli.read", "cli.write"],
     }
 }
 
-/// The four team mutations: the Worker commits them in the same D1 batch
-/// that records the receipt, so a lost or ambiguous answer follows a
-/// possible commit exactly as a lost send answer does. The two read-only
-/// team verbs (`team_list`, `team_invites`) change nothing.
-fn team_mutation_verb(verb: &str) -> bool {
-    matches!(
-        verb,
-        "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove"
-    )
+/// What one attempted hosted call can change, and — for a mutation — the read
+/// that reconciles an answer which does not prove its effect.
+///
+/// The classification is total: [`cli_effect`] names every verb in
+/// [`REMOTE_VERBS`], [`wiki_effect`] every action in [`WIKI_ACTIONS`], and an
+/// unlisted name fails closed as a possible mutation, so no call that may have
+/// been applied can be reported as a definite refusal. A read changes nothing,
+/// so its lost answer proves nothing ran.
+#[derive(Clone, Copy)]
+enum Effect {
+    Read,
+    Mutation { reconcile: &'static str },
 }
 
-/// A verb that can change server state. When the answer to one of these is
-/// lost or ambiguous, the mutation may already have landed, so the outcome
-/// is unknown and the caller must reconcile with a read before repeating it
-/// — never a plain refusal, and never a bare retry.
+impl Effect {
+    fn is_mutation(self) -> bool {
+        matches!(self, Self::Mutation { .. })
+    }
+
+    /// The read that reconciles a mutation whose answer was lost or did not
+    /// prove the write; `None` for a read, which has no effect to reconcile.
+    fn reconciliation(self) -> Option<&'static str> {
+        match self {
+            Self::Mutation { reconcile } => Some(reconcile),
+            Self::Read => None,
+        }
+    }
+}
+
+/// One mutating effect: the verb can change durable state, and `reconcile` is
+/// the read a caller runs before repeating it when the answer is lost or does
+/// not prove the write.
+fn mutation(reconcile: &'static str) -> Effect {
+    Effect::Mutation { reconcile }
+}
+
+// Reconciliation guidance for every mutation this build can send: what the
+// caller reads before repeating a write whose answer was lost, post-forward or
+// unusable. A note never claims the write failed and never invites a blind
+// retry.
+const RECONCILE_SEND: &str = "the send may or may not have been recorded";
+const RECONCILE_ISSUE_NEW: &str = "the ticket may or may not have been created — read `issue ls` for the same project (and `issue show` the id or title) before filing it again";
+const RECONCILE_ISSUE_COMMENT: &str = "the comment may or may not have been recorded — read `issue show` for the same issue before repeating it";
+const RECONCILE_ISSUE_SET: &str = "the edit may or may not have been applied — read `issue show` for the same issue (a new rev proves it) before repeating it";
+const RECONCILE_ISSUE_ATTACH: &str = "the attachment may or may not have been recorded — inspect the same issue and artifact before repeating it";
+const RECONCILE_ISSUE_REVIEW: &str = "the verdict may or may not have been recorded — read the same issue before repeating it; a reviewer holds one verdict per revision";
+const RECONCILE_ISSUE_MESSAGE_SEND: &str =
+    "the message may or may not have been stored — repeat `issue say` with the same \
+    --message, --to, --from and text: an identical retry reports `duplicate` and stores \
+    nothing new, and any difference is refused as a conflict";
+const RECONCILE_ISSUE_MESSAGES_READ: &str =
+    "the read point may or may not have moved — repeating the same call is safe, because \
+    it only moves forward";
+const RECONCILE_MESSAGE_ACK: &str =
+    "run `cadence inbox <alias> --peek` to check which messages remain unacknowledged";
+const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have been written — read the project's recorded policy again before repeating it";
+const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
+const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
+const RECONCILE_SKILL_DRAFT: &str = "the draft may or may not have been saved — read `workspace-skill show <name>` with the same explicit --org before repeating it; its latest revision says whether the draft landed";
+const RECONCILE_SKILL_DECISION: &str = "the decision may or may not have been recorded — read `workspace-skill show <name>` with the same explicit --org before repeating it; its approved revision and digest say whether it landed";
+const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applied — read `agent profile get <id>` with the same explicit --org before repeating it; the revision it shows says whether the edit landed";
+const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
+const RECONCILE_WHATSAPP_STATUS: &str = "check live WhatsApp connection state with `cadence --org <org> connection whatsapp status --provider <linked|official>` before repeating";
+const RECONCILE_APP_ACTION: &str = "the app action may or may not have been applied — inspect the app's records before repeating it; keep the same request and input, and do not use an unrecorded platform status as proof that no app write landed";
+const RECONCILE_PLATFORM_STAGE: &str = "the staged action may or may not have been recorded — nothing runs without an owner's approval, and `platform status` does not cover staged actions; repeat the same `platform stage` with the same `--request` key, which replays the same action instead of staging a second one";
+const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
+const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
+const RECONCILE_TEAM: &str =
+    "the team change may or may not have been applied — inspect `team list` or \
+     `team invites` with the same explicit --org before repeating it";
+const RECONCILE_SETTINGS: &str = "the settings change may or may not have been applied — read `settings agents show` (and `settings agents history`) with the same explicit --org before repeating it";
+const RECONCILE_SETTINGS_GRANTS: &str = "the grant change may or may not have been applied — read `settings agents grant list` with the same explicit --org before repeating it";
+const RECONCILE_MASTER_STATUS: &str = "the master resume may or may not have been applied — read `master status` with the same explicit --org before repeating it";
+const RECONCILE_AUDIT_APPROVE: &str = "the approval may or may not have been recorded — read `audit approval` for the same repo and head before repeating it";
+const RECONCILE_AUDIT_APPROVE_PROJECT: &str = "the approval may or may not have been recorded — read `audit approval` for the same issue, repo and head before repeating it";
+const RECONCILE_AUDIT_VERDICT: &str = "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it";
+const RECONCILE_AUDIT_REVIEWERS: &str = "the attestation may or may not have been recorded — read `audit reviewers` for the same repo before repeating it";
+const RECONCILE_AUDIT_REVIEWERS_PROJECT: &str = "the project's eligibility map may or may not have been recorded — read `audit reviewers` for the same project before repeating it";
+const RECONCILE_AUDIT_IDENTITIES: &str = "the identity attestations may or may not have been recorded — read `audit identities` before repeating it";
+const RECONCILE_DELIVERY_ENQUEUE: &str = "the PR may or may not have been approved and enqueued — run `delivery check` for the same repo, PR and head before repeating it";
+const RECONCILE_AUDIT_REVOKE_PROJECT: &str = "the revocation may or may not have been recorded — read `audit digest` (or `audit approval`) for the same project before repeating it";
+const RECONCILE_AUDIT_SCOPE_PROJECT: &str = "the scope pre-approval may or may not have been recorded — read `audit scope` for the same project and issue before repeating it";
+const RECONCILE_AUDIT_DESIGNATE_PROJECT: &str = "the designation may or may not have been updated — read `audit designations` for the same project before repeating it";
+const RECONCILE_AUDIT_APPROVE_DELEGATED: &str = "the delegated approval may or may not have been recorded — read `audit approval` for the same project, issue, repo and head before repeating it";
+const RECONCILE_WIKI_WRITE: &str = "the wiki write may or may not have been recorded — read the same path with `cadence wiki cat` (or resume the transfer job with `wiki cp --resume <job_id>`) before repeating it";
+const RECONCILE_DOCUMENT_SUBMIT: &str = "the submit may or may not have been recorded — repeat `artifact submit <id>`, which answers the document's current stage and does not submit it twice";
+const RECONCILE_WIKI_UPLOAD: &str = "the upload may or may not have been recorded — list the parent path with `cadence wiki ls` before uploading it again";
+const RECONCILE_TEMPLATE_WRITE: &str = "the template version may or may not have been created — read `template show` for the same template name before repeating it";
+const RECONCILE_TEMPLATE_APPROVE: &str = "the template approval may or may not have been recorded — read `template show` for the same template and version before repeating it";
+const RECONCILE_TEMPLATE_PREVIEW: &str = "the template preview/intake request did not return a usable answer — nothing was approved or issued";
+const RECONCILE_DOCUMENT_CREATE: &str = "the document draft may or may not have been created — check `artifact find` (if --save-artifact was set) before repeating it";
+const RECONCILE_DOCUMENT_EXPORT: &str = "the document export may or may not have been recorded — read `document show` for the same id before repeating it";
+const RECONCILE_UNKNOWN: &str =
+    "the action may or may not have been applied — read the same resource before repeating it";
+
+/// The effect of one allowlisted CLI verb. Every name in [`REMOTE_VERBS`] is
+/// classified here: the reads are listed explicitly, so a verb cannot become a
+/// read by omission, and the fallback is a possible mutation rather than a
+/// read — a name this table does not know must never turn a lost answer into a
+/// definite refusal. (An unlisted name is refused before any request anyway.)
 ///
-/// `message_send` is the historical member of this set; the team mutations
-/// join it for the reason above.
+/// The team mutations commit in the same D1 batch that records their receipt;
+/// the issue writes, `project_policy`, `delivery_policy_set`, the settings
+/// write operations and the audit writes each change durable state. A lost or
+/// ambiguous answer to any of them follows a possible commit, exactly as a
+/// lost send answer does.
+fn cli_effect(verb: &str) -> Effect {
+    match verb {
+        // cli.read: answered from state, changing none of it.
+        "status"
+        | "my_work"
+        | "agent_list"
+        | "agent_show"
+        | "agent_roles"
+        | "agent_profile_list"
+        | "agent_profile_context"
+        | "agent_profile_show"
+        | "workspace_skill_list"
+        | "workspace_skill_show"
+        | "workspace_skill_check"
+        | "issue_ls"
+        | "issue_show"
+        | "issue_history"
+        | "issue_messages"
+        | "issue_artifact"
+        | "artifact_find"
+        | "artifact_show"
+        | "artifact_read"
+        | "document_types"
+        | "message_read"
+        | "message_inbox"
+        | "team_list"
+        | "team_invites"
+        | "master_status"
+        | "delivery_policy"
+        | "audit_approval"
+        | "audit_verdicts"
+        | "audit_scope"
+        | "audit_reviewers"
+        | "audit_approval_project"
+        | "audit_verdicts_project"
+        | "audit_reviewers_project"
+        | "audit_identities"
+        | "delivery_check"
+        | "audit_scope_project"
+        | "audit_designations_project"
+        | "audit_digest_project"
+        | "project_ls"
+        | "project_timeline"
+        | "project_policy_read"
+        | "template_list"
+        | "template_show"
+        | "template_blob_read"
+        | "document_show" => Effect::Read,
+        "template_create" | "template_revise" => mutation(RECONCILE_TEMPLATE_WRITE),
+        "template_approve" => mutation(RECONCILE_TEMPLATE_APPROVE),
+        "template_sample" | "template_intake" => mutation(RECONCILE_TEMPLATE_PREVIEW),
+        "document_create" => mutation(RECONCILE_DOCUMENT_CREATE),
+        "document_export" => mutation(RECONCILE_DOCUMENT_EXPORT),
+        // cli.write: every one of these can change durable state.
+        "issue_new" => mutation(RECONCILE_ISSUE_NEW),
+        "issue_comment" => mutation(RECONCILE_ISSUE_COMMENT),
+        "issue_set" => mutation(RECONCILE_ISSUE_SET),
+        "issue_attach" => mutation(RECONCILE_ISSUE_ATTACH),
+        "issue_review" => mutation(RECONCILE_ISSUE_REVIEW),
+        "issue_message_send" => mutation(RECONCILE_ISSUE_MESSAGE_SEND),
+        "issue_messages_read" => mutation(RECONCILE_ISSUE_MESSAGES_READ),
+        "document_submit" => mutation(RECONCILE_DOCUMENT_SUBMIT),
+        "project_policy" => mutation(RECONCILE_PROJECT_POLICY),
+        "project_new" => mutation(RECONCILE_PROJECT_NEW),
+        "agent_profile_create" => mutation(RECONCILE_PROFILE_CREATE),
+        "agent_profile_update" => mutation(RECONCILE_PROFILE_UPDATE),
+        "workspace_skill_draft" => mutation(RECONCILE_SKILL_DRAFT),
+        "workspace_skill_approve" | "workspace_skill_revoke" | "workspace_skill_delete" => {
+            mutation(RECONCILE_SKILL_DECISION)
+        }
+        "platform_call" => mutation(RECONCILE_PLATFORM_CALL),
+        "message_send" => mutation(RECONCILE_SEND),
+        "message_ack" => mutation(RECONCILE_MESSAGE_ACK),
+        // `settings_agents` is refined per operation by [`call_effect`]; without
+        // the operation this is a write, the same fail-closed default
+        // [`settings_op_scope`] takes.
+        "settings_agents" => mutation(RECONCILE_SETTINGS),
+        "delivery_policy_set" => mutation(RECONCILE_DELIVERY_POLICY),
+        "audit_approve" => mutation(RECONCILE_AUDIT_APPROVE),
+        "audit_approve_project" => mutation(RECONCILE_AUDIT_APPROVE_PROJECT),
+        "audit_verdict" | "audit_verdict_project" => mutation(RECONCILE_AUDIT_VERDICT),
+        "audit_reviewers_set" => mutation(RECONCILE_AUDIT_REVIEWERS),
+        "audit_reviewers_project_set" => mutation(RECONCILE_AUDIT_REVIEWERS_PROJECT),
+        "audit_identities_set" => mutation(RECONCILE_AUDIT_IDENTITIES),
+        "delivery_enqueue" => mutation(RECONCILE_DELIVERY_ENQUEUE),
+        "audit_revoke_project" => mutation(RECONCILE_AUDIT_REVOKE_PROJECT),
+        "audit_approve_scope_project" => mutation(RECONCILE_AUDIT_SCOPE_PROJECT),
+        "audit_designate_project" => mutation(RECONCILE_AUDIT_DESIGNATE_PROJECT),
+        "audit_approve_delegated_project" => mutation(RECONCILE_AUDIT_APPROVE_DELEGATED),
+        "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
+            mutation(RECONCILE_TEAM)
+        }
+        _ => mutation(RECONCILE_UNKNOWN),
+    }
+}
+
+/// The effect of one wiki action. `write` is the only mutating action — a text
+/// put or a transfer `begin`/`chunk`/`apply`/`finish`; `enumerate`, `read` and
+/// `job_status` (status/export) change nothing.
+fn wiki_effect(action: &str) -> Effect {
+    match action {
+        "enumerate" | "read" | "job_status" => Effect::Read,
+        "write" => mutation(RECONCILE_WIKI_WRITE),
+        _ => mutation(RECONCILE_UNKNOWN),
+    }
+}
+
+/// The effect of one call on its surface. Settings operations have distinct
+/// scopes, while platform catalogue discovery is a read and a tool call can
+/// change state. Unknown operations fail closed as writes.
+fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> Effect {
+    match surface {
+        Surface::Cli if verb == REMOTE_SETTINGS_VERB => {
+            let operation = arguments
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // The hosted scope is deliberately broader than this read's effect.
+            if operation != "fleet.check" && settings_op_scope(operation) == "settings.write" {
+                mutation(settings_reconcile(operation))
+            } else {
+                Effect::Read
+            }
+        }
+        Surface::Cli if verb == "platform_call" => {
+            match arguments.get("operation").and_then(Value::as_str) {
+                Some(
+                    "tools"
+                    | "status"
+                    | "artifact"
+                    | "connection_providers"
+                    | "connection_list"
+                    | "whatsapp_status"
+                    | "whatsapp_inspect",
+                ) => Effect::Read,
+                // CAD-2226: starting an owner enrollment mints a one-time provider
+                // link, so its lost or unusable answer is a possible mutation; the
+                // read above the link (`connection ls`) is what reconciles it.
+                Some("connection_start") => mutation(RECONCILE_CONNECTION_START),
+                Some(
+                    "whatsapp_connect"
+                    | "whatsapp_start"
+                    | "whatsapp_stop"
+                    | "whatsapp_disconnect"
+                    | "whatsapp_link"
+                    | "whatsapp_rescope",
+                ) => mutation(RECONCILE_WHATSAPP_STATUS),
+                Some("connected_effect") => mutation(RECONCILE_PLATFORM_STAGE),
+                Some("call") => match arguments.get("tool").and_then(Value::as_str) {
+                    Some(
+                        "app_describe"
+                        | "app_skill"
+                        | "board_pending_actions"
+                        | "private_app_review_status"
+                        | "private_app_review_reconcile",
+                    ) => Effect::Read,
+                    Some("app_call") => mutation(RECONCILE_APP_ACTION),
+                    _ => cli_effect(verb),
+                },
+                _ => cli_effect(verb),
+            }
+        }
+        Surface::Cli => cli_effect(verb),
+        Surface::Wiki => wiki_effect(verb),
+    }
+}
+
+/// Operation-specific read for a settings mutation whose answer was lost or
+/// unusable. Ordinary config writes reconcile with `settings agents show`;
+/// grant mutations with `settings agents grant list` (where requests/grants
+/// live); the bounded master recovery with `master status`. Unknown operations
+/// take the conservative show/history default.
+fn settings_reconcile(operation: &str) -> &'static str {
+    match operation {
+        "master.resume" => RECONCILE_MASTER_STATUS,
+        "grant.request" | "grant.allow" | "grant.reject" | "grant.revoke" => {
+            RECONCILE_SETTINGS_GRANTS
+        }
+        _ => RECONCILE_SETTINGS,
+    }
+}
+
+/// A CLI verb that can change server state. When the answer to one of these is
+/// lost or ambiguous, the mutation may already have landed, so the outcome is
+/// unknown and the caller must reconcile with a read before repeating it —
+/// never a plain refusal, and never a bare retry.
 fn mutating_cli_verb(verb: &str) -> bool {
-    verb == "message_send" || team_mutation_verb(verb)
+    cli_effect(verb).is_mutation()
+}
+
+/// The read that reconciles a hosted mutation whose answer was lost or did not
+/// prove the write; `None` for a read. Crate-private so the verb-specific
+/// receipt checks outside this module (`delivery::hosted_gate`) name the same
+/// guidance as the transport classification here.
+pub(crate) fn mutation_reconcile(verb: &str) -> Option<&'static str> {
+    cli_effect(verb).reconciliation()
 }
 
 /// The read a caller must run before repeating a mutating verb whose answer
@@ -163,13 +665,15 @@ fn mutating_cli_verb(verb: &str) -> bool {
 /// the next step is a read of the same workspace, never a blind retry.
 /// `message_send` reconciles on its own stable id; the team mutations
 /// reconcile with the directory read.
+///
+/// Production code reads the note from the [`Effect`] it already classified
+/// (so `settings_agents` is judged by its operation and the wiki surface keeps
+/// its own note); this per-verb view is what the tests assert.
+#[cfg(test)]
 fn lost_mutation_note(verb: &str) -> &'static str {
-    if verb == "message_send" {
-        "the send may or may not have been recorded"
-    } else {
-        "the team change may or may not have been applied — inspect `team list` or \
-         `team invites` with the same explicit --org before repeating it"
-    }
+    // Callers only ask about a mutation; a read has no effect to reconcile,
+    // and says so rather than inventing one.
+    mutation_reconcile(verb).unwrap_or("nothing was changed — this verb is a read")
 }
 
 /// The board refused the call at its own gate, before the verb reached the
@@ -180,6 +684,1993 @@ fn board_gate_refused(body: Option<&Value>) -> bool {
     body.and_then(|b| b.pointer("/error/hop"))
         .and_then(Value::as_str)
         == Some("board")
+}
+
+/// The explicitly uncertain answers take precedence over any wake hint: a
+/// contradictory response cannot prove the write was not forwarded.
+fn explicit_mutation_uncertainty(body: Option<&Value>) -> Option<&str> {
+    match refusal_fields(body).0 {
+        Some(code @ ("mutation_outcome_uncertain" | "invite_email_uncertain")) => Some(code),
+        _ => None,
+    }
+}
+
+/// Only the documented 503 waking response authorizes a wake retry.
+fn worker_waking(status: u16, body: Option<&Value>) -> bool {
+    status == 503
+        && body.and_then(|b| b["state"].as_str()) == Some("waking")
+        && explicit_mutation_uncertainty(body).is_none()
+}
+
+/// The legacy CLI relay also reports a failed wake before forwarding.
+/// This state is not proof for separate upload endpoints.
+fn cli_wake_failed(status: u16, body: Option<&Value>) -> bool {
+    status == 503 && body.and_then(|b| b["state"].as_str()) == Some("wake_failed")
+}
+
+/// A 5xx after a possible commit is unknown unless the response proves it
+/// preceded the write. CLI wake failure and the native tracker's refusal are
+/// such proof only for the CLI route, not for separate upload endpoints.
+fn post_forward_failure(status: u16, body: Option<&Value>, cli_route: bool) -> bool {
+    status >= 500
+        && status != 501
+        && !worker_waking(status, body)
+        && !board_gate_refused(body)
+        && !(cli_route
+            && (cli_wake_failed(status, body) || tracker_unavailable_before_verb(status, body)))
+        && explicit_mutation_uncertainty(body).is_none()
+}
+
+/// The native CLI route opens its tracker before executing a verb and answers
+/// HTTP 503 `tracker_unavailable` when that open fails.
+fn tracker_unavailable_before_verb(status: u16, body: Option<&Value>) -> bool {
+    status == 503 && refusal_fields(body).0 == Some("tracker_unavailable")
+}
+
+/// A usable success body for a write is a JSON object: every hosted mutation
+/// answers a receipt object, so an absent, `null` or non-object 2xx body proves
+/// nothing about the write it answered.
+fn is_object_body(body: Option<&Value>) -> bool {
+    body.is_some_and(Value::is_object)
+}
+
+/// CAD-2226: the hosted connection operations answer with the relay's own
+/// `{ok:true,data:…}` envelope. A 2xx proves a read only when the complete
+/// documented row shape is present: an absent, foreign or malformed answer is
+/// not an empty list, and printing one would tell the person their workspace
+/// has no providers or connections when nobody saw the catalog. Unknown
+/// additive fields are tolerated so a newer server is not frozen out; a
+/// missing or mistyped documented field is not.
+fn connection_rows(answer: &Value, field: &str, row_ok: fn(&Value) -> bool) -> bool {
+    answer.get("ok").and_then(Value::as_bool) == Some(true)
+        && answer
+            .get("data")
+            .and_then(|data| data.get(field))
+            .and_then(Value::as_array)
+            .is_some_and(|rows| rows.iter().all(row_ok))
+}
+
+/// The hosted connector toolkit grammar (`connectorToolkitSlugSchema`): a
+/// lowercase identifier of at most 64 characters. The enrollment request, the
+/// provider rows and the enrolled-connection rows all use exactly this
+/// identity grammar. A hosted enrollment sends it verbatim, so a malformed one
+/// must refuse here — the relay would otherwise answer `invalid_request`, and
+/// that answer is reserved below for a server that predates the operation.
+pub fn connection_toolkit_slug(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 64
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn optional_pin(value: Option<&Value>) -> bool {
+    matches!(value, Some(Value::Null | Value::String(_)))
+}
+
+fn provider_read(read: &Value) -> bool {
+    read.as_object().is_some_and(|read| {
+        read.get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && read.get("qualified").is_some_and(Value::is_boolean)
+            && read.get("pinned").is_some_and(Value::is_boolean)
+            && read.get("projected").is_some_and(Value::is_boolean)
+    })
+}
+
+/// One provider row: the toolkit identity, its manifest state, whether
+/// enrollment can start, and the qualified-read projection (or `null`).
+fn connection_provider_row(row: &Value) -> bool {
+    row.as_object().is_some_and(|row| {
+        row.get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && row
+                .get("descriptor_available")
+                .is_some_and(Value::is_boolean)
+            && matches!(
+                row.get("manifest_status").and_then(Value::as_str),
+                Some("matched" | "missing")
+            )
+            && optional_pin(row.get("reviewed_pin"))
+            && optional_pin(row.get("reported_pin"))
+            && matches!(
+                row.get("enrollment").and_then(Value::as_str),
+                Some("available" | "read_unqualified")
+            )
+            && match row.get("read") {
+                Some(Value::Null) => true,
+                Some(read) => provider_read(read),
+                None => false,
+            }
+    })
+}
+
+/// The nested status of one enrolled connection. The two literal fields are
+/// the projection's own invariant, not a caller preference.
+fn connection_status(status: &Value) -> bool {
+    status.as_object().is_some_and(|status| {
+        status.get("adapter_registered").and_then(Value::as_bool) == Some(true)
+            && status
+                .get("descriptor_available")
+                .is_some_and(Value::is_boolean)
+            && status
+                .get("custody_available")
+                .is_some_and(Value::is_boolean)
+            && matches!(
+                status.get("manifest_status").and_then(Value::as_str),
+                Some("matched" | "missing")
+            )
+            && optional_pin(status.get("reviewed_pin"))
+            && optional_pin(status.get("reported_pin"))
+            && status
+                .get("execution_authority")
+                .is_some_and(Value::is_boolean)
+            && status.get("network_checked").and_then(Value::as_bool) == Some(false)
+    })
+}
+
+/// One enrolled connection row. `account` may be empty (no non-secret display
+/// name recorded); it is never a connected-account id.
+fn connection_row(row: &Value) -> bool {
+    row.as_object().is_some_and(|row| {
+        row.get("id").and_then(Value::as_str).is_some_and(|id| {
+            !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_graphic())
+        }) && row
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(connection_toolkit_slug)
+            && row.get("account").is_some_and(Value::is_string)
+            && row.get("kind").and_then(Value::as_str) == Some("enrolled")
+            && row.get("revision").is_some_and(Value::is_null)
+            && row.get("registration_digest").is_some_and(Value::is_null)
+            && row
+                .get("scopes")
+                .and_then(Value::as_array)
+                .is_some_and(|scopes| scopes.iter().all(Value::is_string))
+            && row.get("status").is_some_and(connection_status)
+    })
+}
+
+pub fn connection_providers_answer(answer: &Value) -> bool {
+    connection_rows(answer, "providers", connection_provider_row)
+}
+
+/// AOS-627: the strict `connected_effect` answer: `data` is exactly
+/// `{action_id, outcome, replayed, result?}`. It is the staged action's state,
+/// never a provider result.
+pub fn connected_effect_stage_answer(answer: &Value) -> bool {
+    let Some(data) = answer
+        .get("data")
+        .and_then(Value::as_object)
+        .filter(|_| answer.get("ok").and_then(Value::as_bool) == Some(true))
+    else {
+        return false;
+    };
+    data.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "action_id" | "outcome" | "replayed" | "result"
+        )
+    }) && data
+        .get("action_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        && matches!(
+            data.get("outcome").and_then(Value::as_str),
+            Some("pending" | "applied" | "failed" | "denied")
+        )
+        && data.get("replayed").is_some_and(Value::is_boolean)
+        && data.get("result").is_none_or(Value::is_object)
+}
+pub fn connection_list_answer(answer: &Value) -> bool {
+    connection_rows(answer, "connections", connection_row)
+}
+
+fn key_has_qr_token(key: &str) -> bool {
+    let chars: Vec<char> = key.chars().collect();
+    let mut token = String::new();
+    let mut matched = false;
+    let flush = |token: &mut String, matched: &mut bool| {
+        if token.eq_ignore_ascii_case("qr") {
+            *matched = true;
+        }
+        token.clear();
+    };
+    for (idx, &ch) in chars.iter().enumerate() {
+        if !ch.is_ascii_alphanumeric() {
+            flush(&mut token, &mut matched);
+            continue;
+        }
+        if !token.is_empty() && ch.is_ascii_uppercase() {
+            let prev = chars[idx - 1];
+            let next_is_lower = chars.get(idx + 1).is_some_and(|c| c.is_ascii_lowercase());
+            if prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_is_lower)
+            {
+                flush(&mut token, &mut matched);
+            }
+        }
+        token.push(ch);
+        if matched {
+            return true;
+        }
+    }
+    flush(&mut token, &mut matched);
+    matched
+}
+
+/// SEC-001: raw WhatsApp pairing QR payloads must never appear in CLI or MCP output.
+pub fn contains_qr_key(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, child)| key_has_qr_token(key) || contains_qr_key(child)),
+        Value::Array(items) => items.iter().any(contains_qr_key),
+        _ => false,
+    }
+}
+
+fn copy_opt_str_or_null(
+    src: &Map<String, Value>,
+    dst: &mut Map<String, Value>,
+    key: &str,
+) -> Option<()> {
+    let Some(val) = src.get(key) else {
+        return Some(());
+    };
+    match val {
+        Value::Null | Value::String(_) => {
+            dst.insert(key.into(), val.clone());
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn copy_opt_bool(src: &Map<String, Value>, dst: &mut Map<String, Value>, key: &str) -> Option<()> {
+    let Some(val) = src.get(key) else {
+        return Some(());
+    };
+    let b = val.as_bool()?;
+    dst.insert(key.into(), Value::Bool(b));
+    Some(())
+}
+
+fn project_whatsapp_binding(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let obj = value.as_object()?;
+    let status = obj.get("status").and_then(Value::as_str)?;
+    let mut out = Map::new();
+    out.insert("status".into(), Value::String(status.to_owned()));
+    copy_opt_str_or_null(obj, &mut out, "workspaceName")?;
+    Some(Value::Object(out))
+}
+
+fn project_whatsapp_webhook(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let obj = value.as_object()?;
+    let subscribed = obj.get("subscribed").and_then(Value::as_bool)?;
+    let mut out = Map::new();
+    out.insert("subscribed".into(), Value::Bool(subscribed));
+    copy_opt_str_or_null(obj, &mut out, "status")?;
+    Some(Value::Object(out))
+}
+
+/// Strict allowlist projection for hosted `whatsapp_*` CLI answers: refuses any
+/// response carrying a QR key token and emits only reviewed `data` fields.
+pub fn project_whatsapp_connection_answer(operation: &str, answer: &Value) -> Option<Value> {
+    if contains_qr_key(answer) || answer.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let data = answer.get("data")?.as_object()?;
+    let provider = data.get("provider").and_then(Value::as_str)?;
+    if !matches!(provider, "linked" | "official") {
+        return None;
+    }
+    let mut projected = Map::new();
+    projected.insert("provider".into(), Value::String(provider.to_owned()));
+
+    match operation {
+        "whatsapp_status" => {
+            let connected = data.get("connected").and_then(Value::as_bool)?;
+            projected.insert("connected".into(), Value::Bool(connected));
+            if provider == "linked" {
+                copy_opt_str_or_null(data, &mut projected, "state")?;
+            } else {
+                copy_opt_bool(data, &mut projected, "enabled")?;
+                if let Some(binding) = data.get("binding") {
+                    projected.insert("binding".into(), project_whatsapp_binding(binding)?);
+                }
+                copy_opt_str_or_null(data, &mut projected, "displayPhoneNumber")?;
+                copy_opt_str_or_null(data, &mut projected, "verifiedName")?;
+                if let Some(webhook) = data.get("webhook") {
+                    projected.insert("webhook".into(), project_whatsapp_webhook(webhook)?);
+                }
+            }
+        }
+        "whatsapp_inspect" => {
+            if provider != "official" {
+                return None;
+            }
+            let inspect = data.get("inspect")?.as_object()?;
+            let company_id = inspect.get("favcrmCompanyId").and_then(Value::as_str)?;
+            let workspace_name = inspect.get("workspaceName").and_then(Value::as_str)?;
+            let org_name = inspect.get("organisationName").and_then(Value::as_str)?;
+            let role = inspect.get("role").and_then(Value::as_str)?;
+            if !matches!(role, "owner" | "admin") {
+                return None;
+            }
+            let mut out = Map::new();
+            out.insert(
+                "favcrmCompanyId".into(),
+                Value::String(company_id.to_owned()),
+            );
+            out.insert(
+                "workspaceName".into(),
+                Value::String(workspace_name.to_owned()),
+            );
+            out.insert(
+                "organisationName".into(),
+                Value::String(org_name.to_owned()),
+            );
+            out.insert("role".into(), Value::String(role.to_owned()));
+            projected.insert("inspect".into(), Value::Object(out));
+        }
+        "whatsapp_connect"
+        | "whatsapp_start"
+        | "whatsapp_stop"
+        | "whatsapp_disconnect"
+        | "whatsapp_link"
+        | "whatsapp_rescope" => {
+            let expected_action = operation.strip_prefix("whatsapp_")?;
+            if data.get("action").and_then(Value::as_str) != Some(expected_action) {
+                return None;
+            }
+            projected.insert("action".into(), Value::String(expected_action.to_owned()));
+            copy_opt_str_or_null(data, &mut projected, "state")?;
+            copy_opt_bool(data, &mut projected, "connected")?;
+            copy_opt_bool(data, &mut projected, "enabled")?;
+            copy_opt_bool(data, &mut projected, "alreadyConnected")?;
+            copy_opt_bool(data, &mut projected, "disconnected")?;
+            if let Some(binding) = data.get("binding") {
+                projected.insert("binding".into(), project_whatsapp_binding(binding)?);
+            }
+            copy_opt_str_or_null(data, &mut projected, "expiresAt")?;
+            if let Some(url) = data.get("url") {
+                match url {
+                    Value::Null => {
+                        projected.insert("url".into(), Value::Null);
+                    }
+                    Value::String(u) if https_authorization_url(u) => {
+                        projected.insert("url".into(), Value::String(u.clone()));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    Some(json!({ "ok": true, "data": Value::Object(projected) }))
+}
+
+/// The one-time provider authorization link, only when the answer carries one
+/// this client can hand to a person: HTTPS, a real host, no embedded
+/// credentials, no control byte. Anything else is never printed and never
+/// becomes a success.
+pub fn connection_authorization_url(answer: &Value) -> Option<&str> {
+    if answer.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let url = answer.get("data")?.get("url")?.as_str()?;
+    https_authorization_url(url).then_some(url)
+}
+
+/// The same URI parse the browser-login links use (`remote_auth`), plus the
+/// explicit u16 port fit the URI crate does not enforce: it validates the
+/// authority's characters but accepts `host:999999` as an authority. The
+/// original string is returned unchanged, so a query is never re-encoded.
+fn https_authorization_url(url: &str) -> bool {
+    if url.is_empty() || url.len() > 4096 || !url.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return false;
+    }
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    if uri.scheme_str() != Some("https") {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let raw = authority.as_str();
+    if raw.contains('@') || uri.host().is_none_or(str::is_empty) {
+        return false;
+    }
+    // An IPv6 literal keeps its own colons; its port, if any, follows `]`.
+    let port = match raw.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((_, tail)) => tail.strip_prefix(':'),
+            None => return false,
+        },
+        None => raw.split_once(':').map(|(_, port)| port),
+    };
+    port.is_none_or(|port| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok()
+    })
+}
+
+/// The tenant's `requiredText` uses ECMAScript `String.trim`, whose whitespace
+/// differs from Rust's (notably U+FEFF is trimmed, while U+0085 is not).
+fn trim_tenant_text(value: &str) -> &str {
+    value.trim_matches(|c| {
+        matches!(
+            c,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    })
+}
+
+/// The issue-write receipt, correlated by the issue it names. The two surfaces
+/// answer two proven variants:
+///
+/// - native `write_reply` (`src/ui/cli_route.rs`): `{issue, card, warnings}`
+///   for `issue_new`, `issue_comment` and `issue_set`;
+/// - tenant `apps/api/src/tenant-board/cli.ts`: `{issue, card, warnings}` for
+///   `issue_new` (L683) and `issue_set` (L748), but
+///   `{comment, issue}` for `issue_comment` (L767-770) — no card, no warnings.
+///
+/// A reply whose `issue.id` is not the ticket this call wrote cannot prove the
+/// write landed, whatever else it carries.
+fn issue_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, Value>) -> bool {
+    let issue_id = reply.pointer("/issue/id").and_then(Value::as_str);
+    let card_id = reply.pointer("/card/id").and_then(Value::as_str);
+    let object = |key: &str| reply.get(key).is_some_and(Value::is_object);
+    let same = |sent: Option<&str>| {
+        issue_id.zip(sent).is_some_and(|(got, want)| {
+            !got.is_empty() && !want.is_empty() && got.eq_ignore_ascii_case(want)
+        })
+    };
+    if !object("issue") || issue_id.is_none_or(str::is_empty) {
+        return false;
+    }
+    match verb {
+        // A keyed tenant create is correlated by its immutable request receipt:
+        // the current issue's title and project may have changed since creation.
+        "issue_new" if arguments.contains_key("request_id") => {
+            object("card")
+                && card_id == issue_id
+                && arguments
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .zip(reply.get("request_id").and_then(Value::as_str))
+                    .is_some_and(|(sent, got)| sent == got)
+        }
+        // Unkeyed creates have no receipt, so bind the allocated id to the
+        // project and title. The tenant trims both; the native route preserves
+        // the title.
+        "issue_new" => {
+            let project = arguments
+                .get("project")
+                .and_then(Value::as_str)
+                .map(trim_tenant_text)
+                .filter(|project| !project.is_empty());
+            let sent_title = arguments.get("title").and_then(Value::as_str);
+            let title = reply.pointer("/card/title").and_then(Value::as_str);
+            object("card")
+                && card_id == issue_id
+                && reply
+                    .pointer("/card/project")
+                    .and_then(Value::as_str)
+                    .zip(project)
+                    .is_some_and(|(got, want)| got == want)
+                && sent_title
+                    .zip(title)
+                    .is_some_and(|(sent, got)| got == sent || got == trim_tenant_text(sent))
+        }
+        // Either variant must name the ticket the comment was sent to.
+        "issue_comment" => {
+            (object("comment") || object("card"))
+                && same(arguments.get("id").and_then(Value::as_str))
+        }
+        // An edit may legitimately be a no-op that keeps the revision, so only
+        // the ticket identity is required — never `rev != if_rev`.
+        "issue_set" => {
+            object("card")
+                && card_id == issue_id
+                && same(
+                    arguments
+                        .get("ids")
+                        .and_then(|ids| ids.get(0))
+                        .and_then(Value::as_str),
+                )
+        }
+        // A link write answers the card it changed, so the receipt must name
+        // the ticket the link was sent for — a 200 naming another card, or one
+        // naming none, cannot prove this link landed.
+        "issue_link" | "issue_unlink" => {
+            object("card")
+                && card_id == issue_id
+                && same(arguments.get("id").and_then(Value::as_str))
+        }
+        _ => false,
+    }
+}
+
+/// `project_policy` answers one of two proven success shapes: the tenant's
+/// `{state:"recorded", project, visibility, grants, revision}` and the native
+/// receipt must match the project, visibility and grants that were sent.
+fn policy_receipt_correlates(reply: &Value, arguments: &Map<String, Value>) -> bool {
+    let Some(project) = arguments.get("project").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(visibility) = arguments.get("visibility").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(grants) = arguments.get("grants").and_then(Value::as_array) else {
+        return false;
+    };
+    if reply["project"].as_str() != Some(project) {
+        return false;
+    }
+    let tenant = reply["state"].as_str() == Some("recorded")
+        && reply["revision"].as_u64().is_some()
+        && reply["visibility"].as_str() == Some(visibility)
+        && reply["grants"].as_array() == Some(grants);
+    let native_visibility = match visibility {
+        "workspace-visible" => "workspace_visible",
+        "private" => "private",
+        _ => return false,
+    };
+    let members = reply.pointer("/policy/members");
+    let native = reply["committed"].as_bool() == Some(true)
+        && reply
+            .pointer("/policy/version")
+            .and_then(Value::as_u64)
+            .is_some()
+        && reply.pointer("/policy/visibility").and_then(Value::as_str) == Some(native_visibility)
+        && members.map_or(grants.is_empty(), |value| value.as_array() == Some(grants));
+    tenant || native
+}
+
+/// Wiki servers return NFC paths even when a caller supplied decomposed text.
+fn wiki_path_matches(requested: &str, received: Option<&str>) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    !requested.is_empty() && received.is_some_and(|path| requested.nfc().eq(path.chars()))
+}
+
+/// A text `wiki write` receipt names the page it wrote: the tenant answers
+/// `{kind:"text", path, rev, size}` and the daemon's `wiki_write` answers the
+/// committed record (`committed: true` and its `rev`). A reply that does not
+/// echo the written path proves nothing. A transfer `write` op has its own
+/// `{job_id,…}`/`{outcome,…}` receipts and is not checked here.
+fn wiki_write_receipt_correlates(reply: &Value, arguments: &Map<String, Value>) -> bool {
+    let path = arguments.get("path").and_then(Value::as_str);
+    let echoes = path.is_some_and(|path| wiki_path_matches(path, reply["path"].as_str()));
+    let committed = reply
+        .get("rev")
+        .and_then(Value::as_str)
+        .is_some_and(|rev| !rev.is_empty())
+        || reply.get("committed").and_then(Value::as_bool) == Some(true);
+    echoes && committed
+}
+
+/// Does a lowercase/uppercase hex digest string name exactly `digest`? Compared
+/// pairwise, so the check allocates nothing.
+fn hex_digest_matches(hex: &str, digest: &[u8]) -> bool {
+    hex.len() == digest.len() * 2
+        && hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(digest)
+            .all(|(pair, byte)| {
+                let hi = (pair[0] as char).to_digit(16);
+                let lo = (pair[1] as char).to_digit(16);
+                matches!((hi, lo), (Some(hi), Some(lo)) if (hi * 16 + lo) as u8 == *byte)
+            })
+}
+
+/// A `write_blob` upload receipt must name the bytes and the path this call
+/// sent. Four legitimate success shapes are proven by the two surfaces:
+///
+/// - tenant text source (`worker/wiki-routes.ts`): `{path, kind:"text", rev,
+///   size}` — no digest, but `size` is the decoded text's byte length;
+/// - tenant blob: `{path, kind:"blob", sha256, size, mime, rev, status}`;
+/// - native text source (`src/ui/wiki.rs` relays `wiki_write`): `{rev,
+///   committed:true}`;
+/// - native blob (`wiki_put_blob`): `{rev, sha256}`.
+///
+/// A path the reply states must be the sent path. A digest it states is
+/// authoritative: a present but malformed or different digest, and a present
+/// `size` that is not an integer equal to the sent byte length, are
+/// contradictory evidence — unknown even when another success marker also
+/// matches. Truly absent optional fields stay absent (the tenant text variant
+/// has no digest; a native reply has no size). Absent a digest, one of the
+/// remaining bindings (text size+rev, native committed write) must match.
+/// Every proven upload reply names the written path, so a pathless or
+/// foreign-path receipt proves nothing.
+fn upload_receipt_correlates(
+    reply: &Value,
+    logical_path: &str,
+    expected_sha256: &[u8],
+    expected_size: u64,
+) -> bool {
+    if !wiki_path_matches(logical_path, reply["path"].as_str()) {
+        return false;
+    }
+    // A field the reply carries is authoritative: a present but malformed or
+    // mismatched `sha256`/`size` is contradictory evidence, never "absent", so
+    // no other success marker may override it. Truly absent optional fields
+    // stay absent (the tenant text variant has no digest; a native reply has no
+    // size).
+    let digest = match reply.get("sha256") {
+        Some(value) => match value.as_str() {
+            Some(stated) if hex_digest_matches(stated, expected_sha256) => true,
+            _ => return false,
+        },
+        None => false,
+    };
+    if let Some(size) = reply.get("size") {
+        if size.as_u64() != Some(expected_size) {
+            return false;
+        }
+    }
+    let text = reply.get("kind").and_then(Value::as_str) == Some("text")
+        && reply.get("size").is_some()
+        && reply
+            .get("rev")
+            .and_then(Value::as_str)
+            .is_some_and(|rev| !rev.is_empty());
+    let committed = reply.get("committed").and_then(Value::as_bool) == Some(true)
+        && reply
+            .get("rev")
+            .and_then(Value::as_str)
+            .is_some_and(|rev| !rev.is_empty());
+    digest || text || committed
+}
+
+/// A platform team mutation receipt names the entity this call changed, and
+/// the tenant parses it with the membership wire schema before answering:
+/// `{invite}` (id, email, role, status, createdAt, expiresAt), `{member}`
+/// (userId, name, email, role, joinedAt) and `{removed}` (the removed
+/// userId). The server normalizes an invite address to trimmed lowercase at
+/// its boundary and answers `201` for a new invite (the requested role) or
+/// `200` for an existing live pending invite, whose stored role may
+/// legitimately differ from the requested one. A reply that does not name
+/// the sent entity proves nothing about this write.
+fn team_receipt_correlates(
+    verb: &str,
+    status: u16,
+    reply: &Value,
+    arguments: &Map<String, Value>,
+) -> bool {
+    let invite = || reply.get("invite").filter(|value| value.is_object());
+    match verb {
+        "team_invite" => {
+            let (Some(invite), Some(email), Some(requested)) = (
+                invite(),
+                argument_text(arguments, "email"),
+                argument_text(arguments, "role"),
+            ) else {
+                return false;
+            };
+            let stored = membership_role(invite);
+            nonempty_text(invite.get("id")).is_some()
+                && nonempty_text(invite.get("email")).is_some()
+                && stored.is_some()
+                && nonempty_text(invite.get("createdAt")).is_some()
+                && nonempty_text(invite.get("expiresAt")).is_some()
+                && invite.get("status").and_then(Value::as_str) == Some("pending")
+                // `201` created the invite for the requested role; `200` is
+                // an existing live pending invite whose role is stored state.
+                && matches!(status, 200 | 201)
+                && (status != 201 || stored == Some(requested))
+                && invite
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .is_some_and(|got| normalized_email_matches(email, got))
+        }
+        "team_revoke_invite" => {
+            let (Some(invite), Some(id)) = (invite(), argument_text(arguments, "invite_id")) else {
+                return false;
+            };
+            status == 200
+                && nonempty_text(invite.get("email")).is_some()
+                && membership_role(invite).is_some()
+                && nonempty_text(invite.get("createdAt")).is_some()
+                && nonempty_text(invite.get("expiresAt")).is_some()
+                && invite.get("id").and_then(Value::as_str) == Some(id)
+                && invite.get("status").and_then(Value::as_str) == Some("revoked")
+        }
+        "team_set_role" => {
+            let (Some(member), Some(user), Some(requested)) = (
+                reply.get("member").filter(|value| value.is_object()),
+                argument_text(arguments, "user_id"),
+                argument_text(arguments, "role"),
+            ) else {
+                return false;
+            };
+            status == 200
+                && member.get("userId").and_then(Value::as_str) == Some(user)
+                && member.get("role").and_then(Value::as_str) == Some(requested)
+                && member.get("name").and_then(Value::as_str).is_some()
+                && member.get("email").and_then(Value::as_str).is_some()
+                && nonempty_text(member.get("joinedAt")).is_some()
+        }
+        "team_remove" => {
+            status == 200
+                && argument_text(arguments, "user_id")
+                    .is_some_and(|id| reply.get("removed").and_then(Value::as_str) == Some(id))
+        }
+        _ => false,
+    }
+}
+
+/// One sent argument, as the nonempty string the team argument shape
+/// already required.
+fn argument_text<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    arguments.get(key).and_then(Value::as_str)
+}
+
+/// A present wire string that the membership schema requires nonempty.
+fn nonempty_text(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+/// The stored membership role, when the reply carries the schema's enum.
+fn membership_role(value: &Value) -> Option<&str> {
+    value
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|role| matches!(*role, "owner" | "member"))
+}
+
+/// The tenant normalizes an invite address to trimmed lowercase
+/// (`createInviteRequestSchema`), so the receipt carries that canonical
+/// spelling; compare the sent address under the same normalization, without
+/// allocating.
+fn normalized_email_matches(sent: &str, received: &str) -> bool {
+    let received = trim_tenant_text(received);
+    !received.is_empty() && lowercase_chars(trim_tenant_text(sent)).eq(lowercase_chars(received))
+}
+
+fn lowercase_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().flat_map(char::to_lowercase)
+}
+
+// Seam note (CAD-2096): mirrors of native settings rules.
+// The receipt validators in this file re-state, read-only, what the native settings
+// path normalizes or projects. Owner: the native side. Families and counterparts:
+//   settings_snapshot_document          <- agent_settings::build_snapshot (shape)
+//   normalized_pin_pair / provider_pin_matches <- normalize_pin / parse_pin_text
+//   canonical_model_id                  <- model_defaults::validate_model_id
+//   settings_field/tri/trimmed matchers, opt_bool semantics <- settings_rpc::opt_bool
+//   settings_apply_scope                <- agent_settings::parse_overlay
+//   settings_apply_exact, settings_apply_pins_exact <- pi_pins and project_pi
+//   settings_pin_removed                <- the Pi-extension pin retention rule
+//   settings_same_id_set                <- post-apply id sets
+//   settings_rename_applied             <- the native same-id refusal
+//   settings_sync_files_exact           <- export_status
+// They are not shared code because the native functions return `Result` and write
+// state, while this side is a read-only, fail-closed check of what a hosted tenant
+// says it committed. Update rule: a change to native normalization OR projection
+// changes the matching validator here in the same PR, with receipt tests for the old
+// and new spelling, since a hosted tenant may lag the client.
+
+/// A native settings save answers the committed snapshot document: a
+/// nonempty revision token plus the `config` document it wrote. The native
+/// `build_snapshot` always carries the five row tables and the two maps, so a
+/// document that omits any of them is not that operation's receipt (and a
+/// missing table must never read as "the row was removed").
+fn settings_snapshot_document(reply: &Value) -> bool {
+    let Some(config) = reply.get("config").filter(|config| config.is_object()) else {
+        return false;
+    };
+    reply
+        .get("revision")
+        .and_then(Value::as_str)
+        .is_some_and(|revision| !revision.is_empty())
+        && ["harnesses", "providers", "models", "profiles", "pins"]
+            .iter()
+            .all(|table| config.get(*table).and_then(Value::as_array).is_some())
+        && ["scope", "roleDefaults"]
+            .iter()
+            .all(|map| config.get(*map).is_some_and(Value::is_object))
+}
+
+fn settings_text<'a>(reply: &'a Value, key: &str) -> Option<&'a str> {
+    reply
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+fn settings_payload_text<'a>(
+    payload: Option<&'a Map<String, Value>>,
+    key: &str,
+) -> Option<&'a str> {
+    payload
+        .and_then(|payload| payload.get(key))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+/// The rows of one config table, only when the document is well formed:
+/// every element is an object carrying a nonempty string identity. Native
+/// `parse_overlay` guarantees that shape for every successful save, so a
+/// malformed row means the snapshot cannot prove absence — a remove must
+/// never read a broken element as "the row is gone".
+fn settings_table<'a>(config: &'a Value, table: &str, identity: &str) -> Option<&'a [Value]> {
+    let rows = config.get(table).and_then(Value::as_array)?;
+    rows.iter()
+        .all(|row| nonempty_text(row.get(identity)).is_some())
+        .then_some(rows.as_slice())
+}
+
+fn settings_row<'a>(config: &'a Value, table: &str, id: &str) -> Option<&'a Value> {
+    settings_table(config, table, "id")?
+        .iter()
+        .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn settings_pin<'a>(config: &'a Value, pkg: &str, pinned: &str) -> Option<&'a Value> {
+    settings_table(config, "pins", "pkg")?.iter().find(|row| {
+        row.get("pkg").and_then(Value::as_str) == Some(pkg)
+            && row.get("pinned").and_then(Value::as_str) == Some(pinned)
+    })
+}
+
+/// `normalize_pin`'s canonical pair: `name@version` or `name version`.
+fn normalized_pin_pair(pin: &str) -> Option<(&str, &str)> {
+    if pin.is_empty() {
+        return None;
+    }
+    if let Some((name, version)) = pin.rsplit_once('@') {
+        if name.is_empty()
+            || version.is_empty()
+            || version.contains('@')
+            || name.chars().any(char::is_control)
+            || version.chars().any(char::is_control)
+        {
+            return None;
+        }
+        return Some((name, version));
+    }
+    let (name, version) = pin.split_once(' ')?;
+    if name.is_empty()
+        || version.is_empty()
+        || version.contains(' ')
+        || name.chars().any(char::is_control)
+        || version.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some((name, version))
+}
+
+/// `validate_model_id` trims a model id at the native boundary, so a request
+/// may carry surrounding spaces and still commit the canonical id.
+fn canonical_model_id(id: &str) -> &str {
+    id.trim()
+}
+
+/// `normalize_pin` keeps `name@version` and turns `name version` into
+/// `name@version`; an empty pin stays empty. A supplied pin is committed
+/// under that canonical spelling.
+fn provider_pin_matches(sent: &str, stored: &str) -> bool {
+    if sent.is_empty() {
+        return stored.is_empty();
+    }
+    if sent.contains('@') {
+        return stored == sent;
+    }
+    let Some((name, version)) = sent.split_once(' ') else {
+        return false;
+    };
+    !version.contains(' ')
+        && stored.len() == name.len() + 1 + version.len()
+        && stored.starts_with(name)
+        && stored.as_bytes().get(name.len()) == Some(&b'@')
+        && &stored[name.len() + 1..] == version
+}
+
+/// A supplied field the native merge stores verbatim must equal the committed
+/// row; an absent field keeps the stored value and is not checked.
+fn settings_field_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key) {
+        None => true,
+        Some(value) => stored.get(key) == Some(value),
+    }
+}
+
+/// `opt_bool` treats an absent or null `thinking`/`images` as "preserve", so
+/// only a supplied boolean is binding.
+fn settings_tri_field_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key) {
+        None | Some(Value::Null) => true,
+        Some(value) => stored.get(key) == Some(value),
+    }
+}
+
+/// A supplied model id (or a profile's model) commits under
+/// `validate_model_id`'s trimmed spelling.
+fn settings_canonical_model_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key).and_then(Value::as_str) {
+        None => true,
+        Some(value) => stored.get(key).and_then(Value::as_str) == Some(canonical_model_id(value)),
+    }
+}
+
+/// A profile job is rendered and parsed with `trim()`, so the committed job
+/// is the trimmed request.
+fn settings_trimmed_field_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key).and_then(Value::as_str) {
+        None => true,
+        Some(value) => stored.get(key).and_then(Value::as_str) == Some(value.trim()),
+    }
+}
+
+/// A supplied provider pin commits under `normalize_pin`'s canonical spelling;
+/// an absent pin keeps the stored value.
+fn settings_pin_field_matches(stored: &Value, sent: &Map<String, Value>) -> bool {
+    match sent.get("pin") {
+        None => true,
+        Some(value) => value.as_str().is_some_and(|sent_pin| {
+            stored
+                .get("pin")
+                .and_then(Value::as_str)
+                .is_some_and(|stored_pin| provider_pin_matches(sent_pin, stored_pin))
+        }),
+    }
+}
+
+/// `model.put`'s supplied scope is stored on the canonical model id; an
+/// absent scope keeps the stored value.
+fn settings_scope_matches(config: &Value, sent: &Map<String, Value>, id: &str) -> bool {
+    match sent.get("scope") {
+        None => true,
+        Some(value) => value.as_str().is_some_and(|scope| {
+            config
+                .get("scope")
+                .and_then(|scopes| scopes.get(id))
+                .and_then(Value::as_str)
+                == Some(scope)
+        }),
+    }
+}
+
+/// A patch `put` proves itself only when the committed row reflects every
+/// supplied field. The native merge stores supplied strings/bools verbatim,
+/// trims model ids and profile models, trims profile jobs, and normalizes a
+/// provider pin; a null `thinking`/`images` means "preserve".
+fn settings_put_applied(
+    operation: &str,
+    config: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    match operation {
+        "harness.put" => settings_payload_text(Some(payload), "id").is_some_and(|id| {
+            settings_row(config, "harnesses", id).is_some_and(|row| {
+                ["label", "cli", "note"]
+                    .iter()
+                    .all(|key| settings_field_matches(row, payload, key))
+            })
+        }),
+        "provider.put" => settings_payload_text(Some(payload), "id").is_some_and(|id| {
+            settings_row(config, "providers", id).is_some_and(|row| {
+                ["label", "kind", "note", "gate", "paid"]
+                    .iter()
+                    .all(|key| settings_field_matches(row, payload, key))
+                    && settings_pin_field_matches(row, payload)
+            })
+        }),
+        "model.put" => settings_payload_text(Some(payload), "id").is_some_and(|id| {
+            let id = canonical_model_id(id);
+            settings_row(config, "models", id).is_some_and(|row| {
+                ["provider", "ctx", "out"]
+                    .iter()
+                    .all(|key| settings_field_matches(row, payload, key))
+                    && ["thinking", "images"]
+                        .iter()
+                        .all(|key| settings_tri_field_matches(row, payload, key))
+                    && settings_scope_matches(config, payload, id)
+            })
+        }),
+        "profile.put" => settings_payload_text(Some(payload), "id").is_some_and(|id| {
+            settings_row(config, "profiles", id).is_some_and(|row| {
+                settings_field_matches(row, payload, "role")
+                    && settings_canonical_model_matches(row, payload, "model")
+                    && settings_trimmed_field_matches(row, payload, "job")
+            })
+        }),
+        "pin.put" => {
+            let (Some(pkg), Some(pinned)) = (
+                settings_payload_text(Some(payload), "pkg"),
+                settings_payload_text(Some(payload), "pinned"),
+            ) else {
+                return false;
+            };
+            settings_pin(config, pkg, pinned).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// A patch remove proves itself only when the table is well formed and no row
+/// carries the sent identity. A malformed element is unknown, never an absent
+/// row.
+fn settings_remove_applied(
+    operation: &str,
+    config: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    match operation {
+        "harness.remove" => settings_payload_text(Some(payload), "id")
+            .is_some_and(|id| settings_absent(config, "harnesses", id)),
+        "provider.remove" => settings_payload_text(Some(payload), "id")
+            .is_some_and(|id| settings_absent(config, "providers", id)),
+        "model.remove" => settings_payload_text(Some(payload), "id")
+            .is_some_and(|id| settings_absent(config, "models", canonical_model_id(id))),
+        "profile.remove" => settings_payload_text(Some(payload), "id")
+            .is_some_and(|id| settings_absent(config, "profiles", id)),
+        "pin.remove" => settings_payload_text(Some(payload), "pkg")
+            .is_some_and(|pkg| settings_pin_removed(config, pkg)),
+        _ => false,
+    }
+}
+
+fn settings_absent(config: &Value, table: &str, id: &str) -> bool {
+    settings_table(config, table, "id").is_some_and(|rows| {
+        rows.iter()
+            .all(|row| row.get("id").and_then(Value::as_str) != Some(id))
+    })
+}
+
+/// A removed pin may legitimately remain in the projected view when a
+/// Pi-extension provider row declares the same package (`pi_pins` re-adds
+/// provider pins). A remaining pin with no such provider source contradicts
+/// the removal.
+fn settings_pin_removed(config: &Value, pkg: &str) -> bool {
+    let Some(pins) = settings_table(config, "pins", "pkg") else {
+        return false;
+    };
+    let remaining: Vec<&Value> = pins
+        .iter()
+        .filter(|row| row.get("pkg").and_then(Value::as_str) == Some(pkg))
+        .collect();
+    if remaining.is_empty() {
+        return true;
+    }
+    settings_table(config, "providers", "id").is_some_and(|providers| {
+        remaining.iter().all(|row| {
+            let Some(pinned) = row.get("pinned").and_then(Value::as_str) else {
+                return false;
+            };
+            providers.iter().any(|provider| {
+                provider.get("kind").and_then(Value::as_str) == Some("Pi extension")
+                    && provider
+                        .get("pin")
+                        .and_then(Value::as_str)
+                        .and_then(normalized_pin_pair)
+                        == Some((pkg, pinned))
+            })
+        })
+    })
+}
+
+/// A rename proves itself only when the canonical new id is present and the
+/// old id is gone. Renaming to the same id is refused natively, so the two
+/// identities differ on success.
+fn settings_rename_applied(
+    operation: &str,
+    config: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let (table, canonical) = match operation {
+        "model.rename" => ("models", true),
+        "profile.rename" => ("profiles", false),
+        _ => return false,
+    };
+    let (Some(id), Some(to)) = (
+        settings_payload_text(Some(payload), "id"),
+        settings_payload_text(Some(payload), "to"),
+    ) else {
+        return false;
+    };
+    let (id, to) = if canonical {
+        (canonical_model_id(id), canonical_model_id(to))
+    } else {
+        (id, to)
+    };
+    settings_row(config, table, to).is_some() && settings_absent(config, table, id)
+}
+
+/// `present_overlay` never adds harnesses or profiles, so an applied document
+/// must be reflected as exactly the same identity set — an extra row is a
+/// stale or foreign receipt, not a policy projection.
+/// The applied identity sets are exact: `present_overlay` never adds
+/// harnesses or profiles, and after apply the policy is canonical to the sent
+/// overlay for providers and models. Model ids compare under
+/// `validate_model_id`'s trim; provider ids are exact.
+fn settings_same_id_set(config: &Value, table: &str, sent: &[Value], canonical: bool) -> bool {
+    let Some(stored) = settings_table(config, table, "id") else {
+        return false;
+    };
+    stored.len() == sent.len()
+        && stored.iter().all(|row| {
+            row.get("id").and_then(Value::as_str).is_some_and(|id| {
+                sent.iter().any(|sent| {
+                    sent.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|sent_id| {
+                            if canonical {
+                                canonical_model_id(sent_id) == id
+                            } else {
+                                sent_id == id
+                            }
+                        })
+                })
+            })
+        })
+        && sent.iter().all(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|sent_id| {
+                    let id = if canonical {
+                        canonical_model_id(sent_id)
+                    } else {
+                        sent_id
+                    };
+                    stored
+                        .iter()
+                        .any(|stored| stored.get("id").and_then(Value::as_str) == Some(id))
+                })
+        })
+}
+
+/// `apply` replaces the whole overlay. The receipt proves every sent row is
+/// reflected with its documented fields, exact identity sets for harnesses,
+/// profiles, providers and models, the filtered Pi scope and role defaults,
+/// and the full (pkg,pinned) pin union of explicit pins plus Pi-extension
+/// provider pins.
+fn settings_apply_applied(config: &Value, payload: Option<&Map<String, Value>>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let Some(sent) = payload.get("config").and_then(Value::as_object) else {
+        return false;
+    };
+    let (
+        Some(harnesses),
+        Some(providers),
+        Some(models),
+        Some(profiles),
+        Some(scope),
+        Some(roles),
+        Some(pins),
+    ) = (
+        sent.get("harnesses").and_then(Value::as_array),
+        sent.get("providers").and_then(Value::as_array),
+        sent.get("models").and_then(Value::as_array),
+        sent.get("profiles").and_then(Value::as_array),
+        sent.get("scope").and_then(Value::as_object),
+        sent.get("roleDefaults").and_then(Value::as_object),
+        sent.get("pins").and_then(Value::as_array),
+    )
+    else {
+        return false;
+    };
+    harnesses.iter().all(|row| {
+        let Some(sent) = row.as_object() else {
+            return false;
+        };
+        sent.get("id").and_then(Value::as_str).is_some_and(|id| {
+            settings_row(config, "harnesses", id).is_some_and(|stored| {
+                ["id", "label", "cli", "note"]
+                    .iter()
+                    .all(|key| settings_field_matches(stored, sent, key))
+            })
+        })
+    }) && settings_same_id_set(config, "harnesses", harnesses, false)
+        && providers.iter().all(|row| {
+            let Some(sent) = row.as_object() else {
+                return false;
+            };
+            sent.get("id").and_then(Value::as_str).is_some_and(|id| {
+                settings_row(config, "providers", id).is_some_and(|stored| {
+                    ["id", "label", "kind", "note", "gate", "paid"]
+                        .iter()
+                        .all(|key| settings_field_matches(stored, sent, key))
+                        && settings_pin_field_matches(stored, sent)
+                })
+            })
+        })
+        && models.iter().all(|row| {
+            let Some(sent) = row.as_object() else {
+                return false;
+            };
+            sent.get("id").and_then(Value::as_str).is_some_and(|id| {
+                let id = canonical_model_id(id);
+                settings_row(config, "models", id).is_some_and(|stored| {
+                    settings_canonical_model_matches(stored, sent, "id")
+                        && ["provider", "ctx", "out"]
+                            .iter()
+                            .all(|key| settings_field_matches(stored, sent, key))
+                        && ["thinking", "images"]
+                            .iter()
+                            .all(|key| settings_apply_field_matches(stored, sent, key))
+                })
+            })
+        })
+        && profiles.iter().all(|row| {
+            let Some(sent) = row.as_object() else {
+                return false;
+            };
+            sent.get("id").and_then(Value::as_str).is_some_and(|id| {
+                settings_row(config, "profiles", id).is_some_and(|stored| {
+                    settings_field_matches(stored, sent, "id")
+                        && settings_field_matches(stored, sent, "role")
+                        && settings_canonical_model_matches(stored, sent, "model")
+                        && settings_trimmed_field_matches(stored, sent, "job")
+                })
+            })
+        })
+        && settings_same_id_set(config, "profiles", profiles, false)
+        && settings_apply_scope(config, scope, models, providers)
+        && roles.iter().all(|(role, value)| {
+            value.as_str().is_some_and(|model| {
+                config
+                    .get("roleDefaults")
+                    .and_then(|roles| roles.get(role))
+                    .and_then(Value::as_str)
+                    == Some(model)
+            })
+        })
+        && pins.iter().all(|row| settings_apply_pin(config, row))
+        && settings_apply_exact(config, sent)
+}
+
+/// `apply` stores `thinking`/`images` as the tri-state value itself: absent or
+/// null becomes null, a boolean stays that boolean.
+fn settings_apply_field_matches(stored: &Value, sent: &Map<String, Value>, key: &str) -> bool {
+    match sent.get(key) {
+        None | Some(Value::Null) => stored.get(key).is_none_or(Value::is_null),
+        Some(value) => stored.get(key) == Some(value),
+    }
+}
+
+/// `parse_overlay` stores a scope only for a Pi-extension model; a native-CLI
+/// or unknown model's entry is dropped. Every stored Pi scope must reflect
+/// the sent mode.
+fn settings_apply_scope(
+    config: &Value,
+    scope: &Map<String, Value>,
+    models: &[Value],
+    providers: &[Value],
+) -> bool {
+    scope.iter().all(|(id, value)| {
+        let Some(model) = models.iter().find(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|model_id| canonical_model_id(model_id) == id.as_str())
+        }) else {
+            return true;
+        };
+        let Some(provider) = model.get("provider").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(kind) = providers
+            .iter()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(provider))
+            .and_then(|row| row.get("kind").and_then(Value::as_str))
+        else {
+            return false;
+        };
+        if kind == "native CLI" {
+            return true;
+        }
+        kind == "Pi extension"
+            && value.as_str().is_some_and(|mode| {
+                config
+                    .get("scope")
+                    .and_then(|scopes| scopes.get(id.as_str()))
+                    .and_then(Value::as_str)
+                    == Some(mode)
+            })
+    })
+}
+
+fn settings_apply_pin(config: &Value, sent: &Value) -> bool {
+    let Some(sent) = sent.as_object() else {
+        return false;
+    };
+    let (Some(pkg), Some(pinned)) = (
+        sent.get("pkg").and_then(Value::as_str),
+        sent.get("pinned").and_then(Value::as_str),
+    ) else {
+        return false;
+    };
+    settings_pin(config, pkg, pinned).is_some()
+}
+
+/// The post-apply projection is exact for the non-policy families and the
+/// filtered Pi scope/role defaults; pins may only add normalized Pi-extension
+/// provider specs.
+fn settings_apply_exact(config: &Value, sent: &Map<String, Value>) -> bool {
+    let (Some(providers), Some(models), Some(scope), Some(roles), Some(pins)) = (
+        sent.get("providers").and_then(Value::as_array),
+        sent.get("models").and_then(Value::as_array),
+        sent.get("scope").and_then(Value::as_object),
+        sent.get("roleDefaults").and_then(Value::as_object),
+        sent.get("pins").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    settings_same_id_set(config, "providers", providers, false)
+        && settings_same_id_set(config, "models", models, true)
+        && settings_apply_scope_exact(config, scope, models, providers)
+        && settings_apply_roles_exact(config, roles)
+        && settings_apply_pins_exact(config, pins, providers)
+}
+
+/// `parse_overlay` keeps a scope only for a Pi-extension model and drops
+/// native-CLI/unknown keys. The stored scope must equal that filtered map.
+fn settings_apply_scope_exact(
+    config: &Value,
+    scope: &Map<String, Value>,
+    models: &[Value],
+    providers: &[Value],
+) -> bool {
+    let mut expected: Vec<(&str, &str)> = Vec::new();
+    for (id, value) in scope {
+        let Some(model) = models.iter().find(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|model_id| canonical_model_id(model_id) == id.as_str())
+        }) else {
+            continue;
+        };
+        let Some(provider) = model.get("provider").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(kind) = providers
+            .iter()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(provider))
+            .and_then(|row| row.get("kind").and_then(Value::as_str))
+        else {
+            return false;
+        };
+        if kind == "native CLI" {
+            continue;
+        }
+        if kind != "Pi extension" {
+            return false;
+        }
+        let Some(mode) = value.as_str() else {
+            return false;
+        };
+        expected.push((id.as_str(), mode));
+    }
+    let Some(stored) = config.get("scope").and_then(Value::as_object) else {
+        return false;
+    };
+    stored.len() == expected.len()
+        && stored.iter().all(|(key, value)| {
+            value.as_str().is_some_and(|mode| {
+                expected
+                    .iter()
+                    .any(|(id, expected_mode)| *id == key.as_str() && *expected_mode == mode)
+            })
+        })
+}
+
+fn settings_apply_roles_exact(config: &Value, roles: &Map<String, Value>) -> bool {
+    let Some(stored) = config.get("roleDefaults").and_then(Value::as_object) else {
+        return false;
+    };
+    stored.len() == roles.len()
+        && roles.iter().all(|(role, value)| {
+            value.as_str().is_some_and(|model| {
+                stored.get(role.as_str()).and_then(Value::as_str) == Some(model)
+            })
+        })
+}
+
+/// The post-apply `config.pins` is built from the policy's provider specs, so
+/// it is exactly the full (pkg,pinned) union of explicit sent pins and
+/// normalized Pi-extension provider pins (deduped), never a pkg-only subset.
+fn settings_apply_pins_exact(config: &Value, sent: &[Value], providers: &[Value]) -> bool {
+    let Some(stored) = settings_table(config, "pins", "pkg") else {
+        return false;
+    };
+    let mut expected: Vec<(&str, &str)> = Vec::new();
+    for row in sent {
+        let (Some(pkg), Some(pinned)) = (
+            row.get("pkg").and_then(Value::as_str),
+            row.get("pinned").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        if !expected.iter().any(|(p, v)| *p == pkg && *v == pinned) {
+            expected.push((pkg, pinned));
+        }
+    }
+    for provider in providers {
+        if provider.get("kind").and_then(Value::as_str) != Some("Pi extension") {
+            continue;
+        }
+        let Some((pkg, pinned)) = provider
+            .get("pin")
+            .and_then(Value::as_str)
+            .and_then(normalized_pin_pair)
+        else {
+            continue;
+        };
+        if !expected.iter().any(|(p, v)| *p == pkg && *v == pinned) {
+            expected.push((pkg, pinned));
+        }
+    }
+    stored.len() == expected.len()
+        && stored.iter().enumerate().all(|(index, row)| {
+            let (Some(pkg), Some(pinned)) = (
+                row.get("pkg").and_then(Value::as_str),
+                row.get("pinned").and_then(Value::as_str),
+            ) else {
+                return false;
+            };
+            expected.iter().any(|(p, v)| *p == pkg && *v == pinned)
+                && !stored[..index].iter().any(|previous| {
+                    previous.get("pkg").and_then(Value::as_str) == Some(pkg)
+                        && previous.get("pinned").and_then(Value::as_str) == Some(pinned)
+                })
+        })
+        && expected.iter().all(|(pkg, pinned)| {
+            stored.iter().any(|row| {
+                row.get("pkg").and_then(Value::as_str) == Some(*pkg)
+                    && row.get("pinned").and_then(Value::as_str) == Some(*pinned)
+            })
+        })
+}
+
+/// The committed snapshot must show the effect this patch operation wrote:
+/// the row it put/removed/renamed, the scope it set, the role default it
+/// changed, or the document it applied. A snapshot that contradicts the
+/// operation proves nothing, so the outcome stays unknown.
+fn settings_target_applied(
+    operation: &str,
+    config: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    match operation {
+        "harness.put" | "provider.put" | "model.put" | "profile.put" | "pin.put" => {
+            settings_put_applied(operation, config, payload)
+        }
+        "harness.remove" | "provider.remove" | "model.remove" | "profile.remove" | "pin.remove" => {
+            settings_remove_applied(operation, config, payload)
+        }
+        "model.rename" | "profile.rename" => settings_rename_applied(operation, config, payload),
+        "model.scope" => payload.is_some_and(|payload| {
+            settings_payload_text(Some(payload), "id")
+                .is_some_and(|id| settings_scope_matches(config, payload, canonical_model_id(id)))
+        }),
+        "role.set" => settings_payload_text(payload, "role")
+            .zip(settings_payload_text(payload, "model"))
+            .is_some_and(|(role, model)| {
+                config
+                    .get("roleDefaults")
+                    .and_then(|roles| roles.get(role))
+                    .and_then(Value::as_str)
+                    == Some(model)
+            }),
+        "role.clear" => settings_payload_text(payload, "role").is_some_and(|role| {
+            config
+                .get("roleDefaults")
+                .and_then(|roles| roles.get(role))
+                .and_then(Value::as_str)
+                == Some("")
+        }),
+        "apply" => settings_apply_applied(config, payload),
+        _ => false,
+    }
+}
+
+/// `catalog.import` adds each returned id to `config.models` with the
+/// requested provider in the same transaction, so the saved snapshot must
+/// show that binding. A listed id that is absent or bound to another
+/// provider contradicts the receipt.
+fn catalog_import_visible(reply: &Value, payload: Option<&Map<String, Value>>) -> bool {
+    let Some(provider) = settings_payload_text(payload, "provider") else {
+        return false;
+    };
+    let Some(ids) = reply.get("imported").and_then(Value::as_array) else {
+        return false;
+    };
+    if !ids
+        .iter()
+        .all(|id| id.as_str().is_some_and(|id| !id.is_empty()))
+    {
+        return false;
+    }
+    if !catalog_import_selected(ids, payload) {
+        return false;
+    }
+    let config = &reply["snapshot"]["config"];
+    ids.iter().all(|id| {
+        id.as_str().is_some_and(|id| {
+            settings_row(config, "models", id)
+                .and_then(|row| row.get("provider").and_then(Value::as_str))
+                == Some(provider)
+        })
+    })
+}
+
+/// An explicit `models` selection bounds which ids may be reported; `all-new`
+/// is server-discovered and skips only this subset check.
+fn catalog_import_selected(ids: &[Value], payload: Option<&Map<String, Value>>) -> bool {
+    match payload.and_then(|payload| payload.get("models")) {
+        Some(Value::String(selection)) if selection.as_str() == "all-new" => true,
+        Some(Value::Array(selection)) => ids.iter().all(|id| {
+            id.as_str()
+                .is_some_and(|id| selection.iter().any(|want| want.as_str() == Some(id)))
+        }),
+        _ => false,
+    }
+}
+
+/// `catalog.refresh` names the provider it fetched: the native source string
+/// is fixed to `omp models <provider> --json --no-extensions`.
+fn catalog_source_matches(source: &str, provider: &str) -> bool {
+    source
+        .strip_prefix("omp models ")
+        .and_then(|rest| rest.strip_suffix(" --json --no-extensions"))
+        == Some(provider)
+}
+
+/// The native grant binds the subject it was minted for: an internally
+/// tagged `kind` plus the connection identity (`agent`) or hosted principal
+/// (`cli-agent`). A receipt without that binding cannot be used as a grant.
+fn grant_bound_subject(subject: &Value) -> bool {
+    match subject.get("kind").and_then(Value::as_str) {
+        Some("agent") => {
+            subject.get("alias").and_then(Value::as_str).is_some()
+                && subject.get("generation").and_then(Value::as_str).is_some()
+                && subject.get("uid").and_then(Value::as_u64).is_some()
+        }
+        Some("cli-agent") => {
+            subject.get("actor").and_then(Value::as_str).is_some()
+                && subject.get("sub").and_then(Value::as_str).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// `profile.sync` reports every selected profile's Pi and Claude exports: a
+/// named profile must exist in the snapshot and produce exactly the two
+/// harness rows; the all-profile form derives the selection from the snapshot
+/// profiles (empty is allowed when there are none). Statuses stay the native
+/// `unmanaged`/`in sync` pair.
+fn settings_sync_files_exact(
+    config: &Value,
+    reply: &Value,
+    payload: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(files) = reply.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(profiles) = settings_table(config, "profiles", "id") else {
+        return false;
+    };
+
+    if profiles.iter().enumerate().any(|(index, row)| {
+        row.get("id").and_then(Value::as_str).is_some_and(|id| {
+            profiles[..index]
+                .iter()
+                .any(|previous| previous.get("id").and_then(Value::as_str) == Some(id))
+        })
+    }) {
+        return false;
+    }
+    let named = settings_payload_text(payload, "profile");
+    if named.is_some_and(|id| {
+        !profiles
+            .iter()
+            .any(|row| row.get("id").and_then(Value::as_str) == Some(id))
+    }) {
+        return false;
+    }
+    let profile_count = if named.is_some() { 1 } else { profiles.len() };
+    let selected = |profile: &str| match named {
+        Some(id) => profile == id,
+        None => profiles
+            .iter()
+            .any(|row| row.get("id").and_then(Value::as_str) == Some(profile)),
+    };
+    let covered = |id: &str| {
+        ["pi", "claude"].iter().all(|harness| {
+            files.iter().any(|file| {
+                file.get("profile").and_then(Value::as_str) == Some(id)
+                    && file.get("harness").and_then(Value::as_str) == Some(*harness)
+            })
+        })
+    };
+    files.len() == profile_count * 2
+        && files.iter().enumerate().all(|(index, file)| {
+            let Some(profile) = file.get("profile").and_then(Value::as_str) else {
+                return false;
+            };
+            let Some(harness) = file.get("harness").and_then(Value::as_str) else {
+                return false;
+            };
+            selected(profile)
+                && matches!(harness, "pi" | "claude")
+                && matches!(
+                    file.get("status").and_then(Value::as_str),
+                    Some("unmanaged" | "in sync")
+                )
+                && file
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| !path.is_empty())
+                && !files[..index].iter().any(|previous| {
+                    previous.get("profile").and_then(Value::as_str) == Some(profile)
+                        && previous.get("harness").and_then(Value::as_str) == Some(harness)
+                })
+        })
+        && match named {
+            Some(id) => covered(id),
+            None => profiles
+                .iter()
+                .all(|row| row.get("id").and_then(Value::as_str).is_some_and(covered)),
+        }
+}
+
+/// A settings write answers its operation's own receipt family. The snapshot
+/// document covers the config writes; the nested shapes, the catalogue and
+/// the grant decisions answer their own bounded records. `fleet.check` is a
+/// read that changes nothing (its `settings.write` scope only satisfies the
+/// hosted contract), so its document is not a write receipt.
+fn settings_receipt_correlates(
+    operation: &str,
+    reply: &Value,
+    arguments: &Map<String, Value>,
+) -> bool {
+    let payload = arguments.get("payload").and_then(Value::as_object);
+    match operation {
+        "apply" | "harness.put" | "harness.remove" | "provider.put" | "provider.remove"
+        | "model.put" | "model.rename" | "model.remove" | "model.scope" | "role.set"
+        | "role.clear" | "profile.put" | "profile.rename" | "profile.remove" | "pin.put"
+        | "pin.remove" => {
+            settings_snapshot_document(reply)
+                && settings_target_applied(operation, &reply["config"], payload)
+        }
+        "catalog.import" => {
+            settings_snapshot_document(&reply["snapshot"]) && catalog_import_visible(reply, payload)
+        }
+        "profile.sync" => {
+            settings_snapshot_document(&reply["snapshot"])
+                && settings_sync_files_exact(&reply["snapshot"]["config"], reply, payload)
+        }
+        "catalog.refresh" => settings_payload_text(payload, "provider").is_some_and(|provider| {
+            reply
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| catalog_source_matches(source, provider))
+                && settings_text(reply, "fetchedAt").is_some()
+                && reply.get("models").and_then(Value::as_array).is_some()
+        }),
+        "grant.request" => settings_text(reply, "request_id").is_some(),
+        "grant.allow" => {
+            settings_text(reply, "grant_id").is_some()
+                && reply.get("expires_at").and_then(Value::as_i64).is_some()
+                && reply.get("bound").is_some_and(|bound| {
+                    settings_text(bound, "operation").is_some()
+                        && bound
+                            .get("payload_sha256")
+                            .and_then(Value::as_str)
+                            .is_some_and(|digest| {
+                                digest.len() == 64
+                                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                        && bound.get("expected_revision").is_some_and(|revision| {
+                            revision.is_null() || revision.as_str().is_some()
+                        })
+                        && bound.get("subject").is_some_and(grant_bound_subject)
+                        && settings_text(bound, "org").is_some()
+                })
+        }
+        "grant.reject" => settings_payload_text(payload, "request_id").is_some_and(|sent| {
+            reply.get("request_id").and_then(Value::as_str) == Some(sent)
+                && reply.get("status").and_then(Value::as_str) == Some("rejected")
+        }),
+        "grant.revoke" => settings_payload_text(payload, "grant_id").is_some_and(|sent| {
+            reply.get("grant_id").and_then(Value::as_str) == Some(sent)
+                && reply.get("status").and_then(Value::as_str) == Some("revoked")
+        }),
+        "master.resume" => {
+            reply.get("alias").and_then(Value::as_str) == Some("master")
+                && matches!(
+                    reply.get("state").and_then(Value::as_str),
+                    Some("starting" | "attention")
+                )
+        }
+        "fleet.check" => true,
+        _ => false,
+    }
+}
+
+/// Stable code for a board that refused `include_body` on the verdict read.
+pub const VERDICT_BODY_UNSUPPORTED: &str = "verdict_body_unsupported";
+
+/// Stable code for a board that predates `limit` on `issue_ls`.
+pub const ISSUE_LS_LIMIT_UNSUPPORTED: &str = "issue_ls_limit_unsupported";
+
+/// CAD-2286: stable code for a workspace whose document lifecycle cannot be
+/// used — the tenant predates it, the flag is off, or an older relay refuses
+/// the verb. Only `document_types` decides it ([`document_lifecycle_unavailable`]).
+pub const DOCUMENT_LIFECYCLE_UNAVAILABLE: &str = "document_lifecycle_unavailable";
+
+/// CAD-2286: the `document_types` answers that mean "this workspace has no
+/// document lifecycle", never "remote unavailable, retry later":
+///
+/// - `501` — a tenant without the verb (`not_implemented`);
+/// - `404 not_found` — the tenant's flag is off; it answers that before it
+///   reads any argument;
+/// - `400 invalid_request`/`unknown_verb` — a relay older than the verb.
+///   `document_types` takes no arguments, so the refusal can only be the
+///   name, as [`tenant_cannot_serve`] reasons.
+///
+/// Every other verb, `document_submit` included, keeps its own answer: a 404
+/// on submit is a missing file, not a missing lifecycle.
+fn document_lifecycle_unavailable(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
+    if verb != "document_types" {
+        return None;
+    }
+    let state = body.and_then(|b| b["state"].as_str()).unwrap_or_default();
+    if matches!(state, "waking" | "wake_failed") {
+        return None;
+    }
+    let code = refusal_fields(body).0;
+    let cause = match (status, code) {
+        (501, _) | (400, Some("invalid_request" | "unknown_verb")) => {
+            "the workspace's server is older than this command"
+        }
+        (404, Some("not_found")) => "document review is turned off on this workspace",
+        _ => return None,
+    };
+    Some(Error::invalid(
+        DOCUMENT_LIFECYCLE_UNAVAILABLE,
+        format!(
+            "document lifecycle is not available on this workspace (HTTP {status}{}): \
+             {cause}. Nothing was read",
+            code.map_or(String::new(), |c| format!(", {c}"))
+        ),
+    ))
+}
+
+/// CAD-2286: a `document_submit` 2xx is a receipt only in the shape of the
+/// tenant's `documentSubmitView` (`apps/api/src/tenant-board/document-store.ts`):
+/// a lifecycle stage (`DOCUMENT_STAGES` in `document-lifecycle.ts`), the type,
+/// whether that type is confirmed, and the baseline object for an unconfirmed
+/// one. The answer carries no id to correlate, so the shape is the proof; any
+/// other body may follow a recorded submit and is an unknown outcome.
+fn document_submit_receipt(reply: &Value) -> bool {
+    matches!(
+        reply.get("stage").and_then(Value::as_str),
+        Some("draft" | "in_review" | "approved" | "delivered" | "archived")
+    ) && reply.get("type").is_some_and(Value::is_string)
+        && reply.get("typeConfirmed").is_some_and(Value::is_boolean)
+        && reply.get("baseline").is_none_or(Value::is_object)
+}
+
+/// CAD-2286: the tenant's `document_submit` refusals
+/// (`DOCUMENT_SUBMIT_STATUS` in `apps/api/src/tenant-board/cli.ts`), each a
+/// typed error carrying its code. Without this, the generic decoder drops a
+/// 403 code as an access denial. A 501 is a server that predates the submit
+/// (the release order is named, as for the ticket-message verbs); no other
+/// 5xx is mapped: an unmapped store code answers 500 `internal`, after a
+/// possible write, so it stays unknown.
+fn document_submit_refusal(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
+    if verb != "document_submit" {
+        return None;
+    }
+    if status == 501 {
+        return Some(Error::invalid(
+            "not_implemented",
+            artifact_tenant_too_old("artifact submit", status, "submitted"),
+        ));
+    }
+    let (code, why): (&'static str, &str) = match (status, refusal_fields(body).0?) {
+        (404, "not_found") => (
+            "not_found",
+            "no such file that you can see on this workspace",
+        ),
+        (403, "not_creator") => ("not_creator", "only the file's creator can submit it"),
+        (400, "unlabelled") => (
+            "unlabelled",
+            "give the file a document type label before submitting it",
+        ),
+        (409, "already_shared") => (
+            "already_shared",
+            "this version is already shared; save a new version to submit it for review",
+        ),
+        (409, "document_archived") => ("document_archived", "this document is archived"),
+        _ => return None,
+    };
+    Some(Error::invalid(
+        code,
+        format!("{why} ({code}, HTTP {status}). Nothing was submitted"),
+    ))
+}
+
+/// CAD-2001: the project-scoped review-evidence verbs. Every one carries an
+/// explicit `project` — plus `issue` for the two approvals — so the answer is
+/// that project's evidence and no other's. They are newer than the tenant
+/// that must serve them, so a refusal meaning "this tenant does not know that
+/// verb" is reported as a release-order problem (see
+/// [`tenant_cannot_serve`]): never a pass, and never a fallback to the older
+/// repo-scoped verbs, which stay served for old clients only.
+pub const PROJECT_SCOPED_GATE_VERBS: &[&str] = &[
+    "audit_approval_project",
+    "audit_verdicts_project",
+    "audit_verdict_project",
+    "audit_approve_project",
+    "audit_reviewers_project",
+    "audit_reviewers_project_set",
+    "audit_identities",
+    "audit_identities_set",
+];
+
+/// CAD-1946: hosted merge gate evaluator, enqueue, scope/designate/digest/
+/// revoke and delegated-approval verbs. Unlike [`PROJECT_SCOPED_GATE_VERBS`],
+/// these can return real domain `409` refusals (`gate_refused`, `head_moved`,
+/// `already_revoked`, `approval_id_conflict`, `not_delegable`,
+/// `scope_approval_required`, `approval_revoked`, `project_archived`), so
+/// only `409 container_required` counts as "tenant cannot serve this verb".
+pub const HOSTED_MERGE_GATE_VERBS: &[&str] = &[
+    "delivery_check",
+    "delivery_enqueue",
+    "audit_revoke_project",
+    "audit_approve_scope_project",
+    "audit_scope_project",
+    "audit_designate_project",
+    "audit_designations_project",
+    "audit_digest_project",
+    "audit_approve_delegated_project",
+];
+
+/// Why a project-scoped verb could not be served, when the answer means "this
+/// tenant cannot serve that call". Two shapes say it:
+///
+/// - the verb is unknown — the tenant board answers `501 not_implemented`, an
+///   older relay rejects the name in its strict request schema
+///   (`400 invalid_request`), and `409 container_required` marks a verb the
+///   tenant routes to a runtime it does not have here;
+/// - the tenant's own store cannot answer (`503 capability_unavailable`).
+///
+/// The release order is the tenant server first, then this client. The
+/// message names that order and says what was not read or recorded; it never
+/// lets the caller read the refusal as "no evidence was filed" or as a reason
+/// to fall back to repo-scoped evidence.
+fn tenant_cannot_serve(verb: &str, status: u16, body: Option<&Value>) -> Option<String> {
+    let state = body.and_then(|b| b["state"].as_str()).unwrap_or_default();
+    if state == "waking" || state == "wake_failed" {
+        return None;
+    }
+    let code = body
+        .and_then(|b| b.pointer("/error/code"))
+        .and_then(Value::as_str);
+    let nothing = if mutating_cli_verb(verb) {
+        "Nothing was recorded"
+    } else {
+        "Nothing was read"
+    };
+    // A project the tenant has no proven policy for is a real refusal, not a
+    // version problem: name the remedy instead of the release order.
+    if status == 409 && code == Some("project_policy_unavailable") {
+        return Some(format!(
+            "the tenant stores no access policy for that project, so `{verb}` was refused \
+             before it ran — the owner records the project's policy first. {nothing}"
+        ));
+    }
+    let is_v2_gate = HOSTED_MERGE_GATE_VERBS.contains(&verb);
+    let cannot_serve = match status {
+        501 => true,
+        400 => matches!(code, Some("invalid_request" | "unknown_verb")),
+        404 => matches!(code, Some("unknown_verb" | "not_implemented")),
+        409 => {
+            if is_v2_gate {
+                code == Some("container_required")
+            } else {
+                true
+            }
+        }
+        // A tenant that predates the verb answers 503 for a capability it does
+        // not have. For a *mutation* the same code is not proof the verb never
+        // ran: the tenant wraps a hub RPC that threw *after* the write in
+        // `503 capability_unavailable` (`apps/api/src/tenant-board/cli.ts`,
+        // `setProjectAccess`/`setProjectEligibility` catches). A read keeps the
+        // release-order refusal; a write is left to the mutation classifier,
+        // which reports an unknown outcome.
+        503 => {
+            !mutating_cli_verb(verb)
+                && matches!(
+                    code,
+                    Some("capability_unavailable" | "not_implemented" | "unknown_verb")
+                )
+        }
+        _ => false,
+    };
+    if !cannot_serve {
+        return None;
+    }
+    Some(format!(
+        "the tenant could not serve `{verb}` (HTTP {status}{}) — CAD-2001 moved the merge \
+         gate's review evidence to the project scope, and the tenant must serve these verbs. \
+         Release order: update the tenant server first, then this Cadence client; a tenant \
+         that predates them refuses the name, and this client never falls back to the older \
+         repo-scoped evidence. {nothing}",
+        code.map_or(String::new(), |c| format!(", {c}"))
+    ))
 }
 
 /// Argument keys a platform team verb may carry. Other verbs keep their
@@ -231,6 +2722,10 @@ fn team_argument_shape(verb: &str, arguments: &Map<String, Value>) -> Result<()>
 /// instead of the broad cli.* pair the other verbs request.
 pub const REMOTE_SETTINGS_VERB: &str = "settings_agents";
 pub const REMOTE_MASTER_STATUS_VERB: &str = "master_status";
+
+/// A `401`: the bearer is not accepted. A managed caller may drop a cached
+/// agent credential and re-mint once; it must never fall back to the login.
+pub(super) const CREDENTIAL_REJECTED: &str = "credential_rejected";
 
 /// The hosted scope a `settings_agents` operation needs — the AOS-290
 /// operation table in `hosted-cadence-auth.ts` classifies the same names;
@@ -428,6 +2923,14 @@ const CAPABILITIES: &[&str] = &[
     // existing login without them stays valid for every other verb.
     "settings.read",
     "settings.write",
+    // CAD-1946: opt-in like settings — the operator's merge approval.
+    "audit.approve",
+    // CAD-1922: the first run's one sign-in/registration grant may carry the
+    // optional owner-only `billing.read`. Recognizing the scope here keeps
+    // renewal's exact-equality check working for a grant that includes it;
+    // it is never added to an ordinary login and `billing.cancel` is never
+    // recognized (it can only be minted by the separate owner action).
+    "billing.read",
 ];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
@@ -502,6 +3005,20 @@ fn private_directory(dir: &Path) -> Result<()> {
 
 /// Command use retains the legacy access-only expiry refusal. Offline status
 /// reads the same validated metadata without treating expiry as corrupt storage.
+/// The capabilities the saved credential for `target` carries (CAD-2213).
+///
+/// Read-only and best-effort: a caller uses this to explain a refusal it
+/// already has, never to authorize anything. An unreadable credential yields
+/// an empty set rather than an error that would replace the real one.
+pub fn saved_capabilities(target: &RemoteTarget) -> Vec<String> {
+    let Ok(dir) = crate::remote_auth::auth_dir(None) else {
+        return Vec::new();
+    };
+    load_credential(&dir, target)
+        .map(|cred| cred.capabilities)
+        .unwrap_or_default()
+}
+
 fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
     let cred = read_credential_metadata(dir, target)?;
     if cred.cli_session.is_none() && cred.expires_at <= now()? {
@@ -551,6 +3068,7 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
         "issuer",
         "subject_id",
         "capabilities",
+        "requested_capabilities",
         "access_token",
         "expires_at",
         "cli_session",
@@ -700,7 +3218,7 @@ fn save_credential(dir: &Path, slug: &str, cred: &Credential) -> Result<()> {
         _ => {
             return Err(reject(
                 "remote credential destination must be a private owned regular file",
-            ))
+            ));
         }
     }
     let mut random = [0u8; 16];
@@ -763,6 +3281,76 @@ fn renewed_credential_with(
         Instant,
     ) -> Result<crate::remote_enrollment::IssuerAnswer>,
 ) -> Result<Credential> {
+    renewed_credential_for(dir, target, deadline, CredentialPurpose::Cli, post)
+}
+
+/// CAD-1853: rotate a login that carries the cloud-agent scopes. A board
+/// login without those scopes is not cloud consent. An older grant of
+/// exactly the three cloud scopes still renews.
+fn renewed_cloud_credential_with(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+    post: impl FnOnce(
+        &Path,
+        &str,
+        &str,
+        &str,
+        Value,
+        Instant,
+    ) -> Result<crate::remote_enrollment::IssuerAnswer>,
+) -> Result<Credential> {
+    renewed_credential_for(dir, target, deadline, CredentialPurpose::CloudAgent, post)
+}
+
+/// The cloud transport boundary's custody: rotate the saved cloud-purpose
+/// login when it is due and return the credential whose token is actually
+/// sent. Not due means no wire call. The lock is taken here, so the frozen
+/// owner and the saved consent are re-read after any concurrent replacement.
+fn renewed_cloud_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
+    renewed_cloud_credential_with(
+        dir,
+        target,
+        Instant::now() + RENEWAL_WAIT,
+        crate::remote_enrollment::cli_session_post_detailed,
+    )
+}
+
+/// What a cloud send actually uses: the saved cloud-purpose login, rotated
+/// under its own purpose only when renewal is due. A login with no renewable
+/// session, or one whose access token is still fresh, is used as it is — a
+/// grant this purpose may not rotate (say, one saved without enrollment
+/// authority) can still serve the scope it carries until it expires. Once
+/// renewal is due the strict purpose rule decides, so an unrecognized grant
+/// is refused instead of being sent with an expired token.
+fn cloud_send_credential(
+    dir: &Path,
+    target: &RemoteTarget,
+    cred: Credential,
+) -> Result<Credential> {
+    let at = now()?;
+    if cred.cli_session.is_none()
+        || (cred.pending.is_none() && cred.expires_at > at.saturating_add(RENEW_BEFORE))
+    {
+        return Ok(cred);
+    }
+    renewed_cloud_credential(dir, target)
+}
+
+fn renewed_credential_for(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+    purpose: CredentialPurpose,
+    post: impl FnOnce(
+        &Path,
+        &str,
+        &str,
+        &str,
+        Value,
+        Instant,
+    ) -> Result<crate::remote_enrollment::IssuerAnswer>,
+) -> Result<Credential> {
     let _lock = private_lock(dir, &target.org, deadline)?;
     if Instant::now() >= deadline {
         return Err(Error::busy_coded(
@@ -771,7 +3359,7 @@ fn renewed_credential_with(
         ));
     }
     let cred = load_credential(dir, target)?;
-    renew_credential_locked(dir, target, deadline, cred, post)
+    renew_credential_locked(dir, target, deadline, cred, purpose, post)
 }
 
 /// Caller holds the source lock, including any frozen-identity check.
@@ -780,6 +3368,7 @@ fn renew_credential_locked(
     target: &RemoteTarget,
     deadline: Instant,
     mut cred: Credential,
+    purpose: CredentialPurpose,
     post: impl FnOnce(
         &Path,
         &str,
@@ -790,22 +3379,29 @@ fn renew_credential_locked(
     ) -> Result<crate::remote_enrollment::IssuerAnswer>,
 ) -> Result<Credential> {
     let at = now()?;
+    // Cloud renewal checks the saved scopes even while the access token is
+    // fresh, so a board login is never rotated as cloud consent. The CLI
+    // purpose keeps the legacy tolerance: a login without a renewable
+    // session is refused only once renewal is actually due.
+    if purpose == CredentialPurpose::CloudAgent && !purpose.admits(&cred.capabilities) {
+        return Err(purpose_refusal(purpose));
+    }
     let due = cred.pending.is_some() || cred.expires_at <= at.saturating_add(RENEW_BEFORE);
     if !due {
         return Ok(cred);
     }
     let Some(session) = cred.cli_session.clone() else {
-        return Err(reject(
-            "remote credential has no renewable session — run `cadence login` again",
-        ));
+        return Err(purpose_refusal(purpose));
     };
-    let issuer = cred
-        .issuer
-        .as_deref()
-        .ok_or_else(|| reject("renewable session issuer missing — run `cadence login` again"))?;
+    let issuer = cred.issuer.as_deref().ok_or_else(|| {
+        reject(format!(
+            "renewable session issuer missing — run `{}` again",
+            purpose.login_hint()
+        ))
+    })?;
     if cred.organization_slug.as_deref() != Some(target.org.as_str())
         || cred.subject_id.as_deref().is_none_or(|s| !valid_id(s))
-        || !valid_capabilities(&cred.capabilities)
+        || !purpose.admits(&cred.capabilities)
         || session.idle_expires_at <= at
         || session.absolute_expires_at <= at
         || session.idle_expires_at > session.absolute_expires_at
@@ -817,9 +3413,7 @@ fn renew_credential_locked(
         || session.device_label.len() > 120
         || session.generation == 0
     {
-        return Err(reject(
-            "renewable CLI session is invalid or expired — run `cadence login` again",
-        ));
+        return Err(purpose_refusal(purpose));
     }
     let pending = match cred.pending.clone() {
         Some(pending) => pending,
@@ -883,6 +3477,18 @@ fn renew_credential_locked(
     Ok(cred)
 }
 
+fn two_factor_refusal_code(status: u16, code: Option<&str>) -> Option<&'static str> {
+    if status != 403 {
+        return None;
+    }
+    match code {
+        Some("two_factor_enrollment_required") => Some("two_factor_enrollment_required"),
+        Some("two_factor_verification_required") => Some("two_factor_verification_required"),
+        Some("two_factor_required") => Some("two_factor_required"),
+        _ => None,
+    }
+}
+
 /// CAD-1434: renewal's separate adapter. The issuer's renewal route answers
 /// `{error:"<code>"}` (AOS `cli-session.ts`), not the gateway envelope, so it
 /// has its own reader. Only the issuer's terminal refresh-grant refusals ask
@@ -893,24 +3499,36 @@ fn renewal_refusal(
     body: &Value,
     correlation: Option<&crate::remote_enrollment::IssuerCorrelation>,
 ) -> Error {
-    let code = body
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     // The issuer's id is shown only when the header was valid (see
     // `issuer_correlation`). It is a support reference, never an authority.
     let request = correlation
         .map(|c| format!(" (issuer request {})", c.request_id))
         .unwrap_or_default();
-    match (status, code) {
-        (401, "invalid_token") | (400, "invalid_grant") => reject(format!(
+    let raw_code = body.get("error").and_then(Value::as_str);
+    if let Some(code) = two_factor_refusal_code(status, raw_code) {
+        reject(format!(
+            "the workspace requires two-factor authentication ({code}) — complete two-factor setup or verification in the browser and run `cadence login` again{request}"
+        ))
+    } else if renewal_session_ended(status, body) {
+        reject(format!(
             "the renewable CLI session was rejected by the issuer — run `cadence login` again{request}"
-        )),
-        _ => reject(format!(
+        ))
+    } else {
+        reject(format!(
             "remote CLI session renewal is not complete (HTTP {status}); your saved login \
              is kept, retry the command later{request}"
-        )),
+        ))
     }
+}
+
+/// The issuer's terminal refresh-grant refusals: the one proof a fresh login
+/// is the remedy for a renewal that did not complete.
+fn renewal_session_ended(status: u16, body: &Value) -> bool {
+    let code = body.get("error").and_then(Value::as_str);
+    matches!(
+        (status, code.unwrap_or_default()),
+        (401, "invalid_token") | (400, "invalid_grant")
+    ) || two_factor_refusal_code(status, code).is_some()
 }
 
 fn validate_renewal_response(
@@ -1027,17 +3645,104 @@ fn validate_renewal_response(
     Ok(())
 }
 
-/// Known, unique capabilities that include the CLI pair. Wiki scopes are
-/// optional, so a CLI-only login remains valid.
+/// CAD-1853: which saved consent a renewal may rotate. The purpose comes
+/// from the caller's boundary, never from the credential's contents, so a
+/// cloud-only grant is never rotated into CLI authority and a CLI login is
+/// never rotated as cloud consent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialPurpose {
+    /// The default CLI/wiki/settings login: the CLI pair is required.
+    Cli,
+    /// A login that carries [`crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES`].
+    /// That is the board login plus those scopes, or an older grant of
+    /// exactly those three.
+    CloudAgent,
+}
+
+impl CredentialPurpose {
+    fn login_hint(self) -> &'static str {
+        match self {
+            CredentialPurpose::Cli => "cadence login",
+            CredentialPurpose::CloudAgent => "cadence login --cloud-agent",
+        }
+    }
+
+    /// Known, unique capabilities this purpose may renew. The renewal
+    /// response must still match the saved set exactly; this predicate is
+    /// what refuses a saved consent that purpose may never rotate.
+    fn admits(self, values: &[String]) -> bool {
+        match self {
+            CredentialPurpose::Cli => valid_capabilities(values),
+            CredentialPurpose::CloudAgent => {
+                let scopes = crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES;
+                let once = |scope: &str| {
+                    values
+                        .iter()
+                        .filter(|value| value.as_str() == scope)
+                        .count()
+                        == 1
+                };
+                scopes.iter().all(|scope| once(scope))
+                    && (values.len() == scopes.len() || valid_capabilities(values))
+            }
+        }
+    }
+}
+
+fn purpose_refusal(purpose: CredentialPurpose) -> Error {
+    match purpose {
+        CredentialPurpose::Cli => {
+            reject("renewable CLI session is invalid or expired — run `cadence login` again")
+        }
+        CredentialPurpose::CloudAgent => reject(
+            "the saved login does not carry the cloud-agent scopes, or its renewable \
+             session is invalid or expired — run `cadence login <slug> --cloud-agent` again",
+        ),
+    }
+}
+
+/// The issuer's own text for a renewal that did not complete, so a terminal
+/// refusal stays actionable.
+fn renewal_message(error: &Error) -> String {
+    match error {
+        Error::Rejected(text) | Error::Internal(text) => text.clone(),
+        _ => "the saved cloud login could not be renewed, so nothing was sent".to_string(),
+    }
+}
+
+/// A READ whose saved cloud consent could not be renewed has proved no
+/// current read authority: the cloud rows are withheld and the rest of the
+/// page stays. Nothing was sent, so this is never an uncertain send outcome.
+fn cloud_renewal_withheld(error: Error) -> Error {
+    Error::gate_coded("cloud_agent_unavailable", renewal_message(&error))
+}
+
+/// A SEND (or an enrollment) whose saved cloud consent could not be renewed
+/// never reached the contract. It is a DEFINITE refusal — `cloud_agent_unavailable`
+/// would classify the operation as a possibly-accepted send and strand it as
+/// unknown, blocking the conversation until a readback of a turn that never
+/// existed settles it.
+fn cloud_renewal_refused(error: Error) -> Error {
+    Error::gate_coded("cloud_agent_authority_missing", renewal_message(&error))
+}
+
+/// Known, unique capabilities that include the CLI pair. Wiki, web,
+/// settings and the optional first-run `billing.read` are optional. The
+/// cloud-agent scopes are optional too, and only as the whole set: one or
+/// two of them is not a login this client rotates.
 fn valid_capabilities(values: &[String]) -> bool {
     let once = |c: &str| values.iter().filter(|v| v.as_str() == c).count() == 1;
-    values.iter().all(|v| CAPABILITIES.contains(&v.as_str()))
+    let cloud = crate::remote_enrollment::CLOUD_AGENT_LOGIN_SCOPES;
+    let cloud_present = cloud.iter().filter(|scope| once(scope)).count();
+    let known = |scope: &str| CAPABILITIES.contains(&scope) || cloud.contains(&scope);
+    values.iter().all(|v| known(v.as_str()))
         && values
             .iter()
             .enumerate()
             .all(|(i, v)| !values[..i].contains(v))
         && once("cli.read")
         && once("cli.write")
+        && (cloud_present == 0 || cloud_present == cloud.len())
 }
 fn same_capabilities_json(value: &Value, expected: &[String]) -> bool {
     value.as_array().is_some_and(|values| {
@@ -1143,11 +3848,64 @@ fn authorize(
     target: &RemoteTarget,
     cred: &Credential,
     surface: Surface,
+    verb: &str,
     scopes: &[&str],
     timeout: Duration,
 ) -> Result<String> {
+    let (status, _, body) = authorize_answer(target, cred, surface, scopes, MAX_TTL, timeout)?;
+    match status {
+        200 => envelope_of(surface, body),
+        s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
+        401 => {
+            // Only a 401 about the bearer itself may be answered by re-minting
+            // a cached agent credential. A policy 401 (for example
+            // `scope_not_granted`) is authorization and stays final.
+            let (refusal, _) = decode_refusal(status, body.as_ref());
+            match refusal {
+                Refusal::Authentication | Refusal::Uncertain => Err(Error::invalid(
+                    CREDENTIAL_REJECTED,
+                    refusal_error(status, body.as_ref()).to_string(),
+                )),
+                _ => Err(refusal_error(status, body.as_ref())),
+            }
+        }
+        403 if refusal_fields(body.as_ref()).0
+            == Some(agent_credential::HUMAN_SESSION_REQUIRED) =>
+        {
+            Err(Error::invalid(
+                agent_credential::HUMAN_SESSION_REQUIRED,
+                refusal_error(status, body.as_ref()).to_string(),
+            ))
+        }
+        403 if matches!(verb, "issue_message_send" | "issue_messages_read")
+            && body
+                .as_ref()
+                .and_then(|b| b.pointer("/error/code"))
+                .and_then(Value::as_str)
+                == Some("forbidden") =>
+        {
+            Err(Error::invalid(
+                "insufficient_scope",
+                "this login cannot write to this workspace (it lacks cli.write), and a new login \
+                 only helps if your role allows it. Nothing was sent (insufficient_scope, HTTP 403)",
+            ))
+        }
+        _ => Err(refusal_error(status, body.as_ref())),
+    }
+}
+
+/// The strict authorize request and its raw answer, before any refusal is
+/// decoded, so `doctor` can classify what `authorize` turns into an error.
+fn authorize_answer(
+    target: &RemoteTarget,
+    cred: &Credential,
+    surface: Surface,
+    scopes: &[&str],
+    ttl_seconds: u64,
+    timeout: Duration,
+) -> Result<(u16, Option<u64>, Option<Value>)> {
     let (relay, version) = surface.relay();
-    let (status, _, body) = post(
+    post(
         &target.endpoint,
         &format!("{relay}/authorize"),
         &cred.access_token,
@@ -1156,27 +3914,27 @@ fn authorize(
             "organization_id": target.org_id,
             "audience": target.endpoint,
             "requested_scopes": scopes,
-            "ttl_seconds": MAX_TTL,
+            "ttl_seconds": ttl_seconds,
         }),
         timeout,
-    )?;
-    match status {
-        200 => {
-            let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
-            let envelope = body["envelope"].as_str().unwrap_or_default();
-            let compact_jws = envelope.split('.').all(|p| {
-                !p.is_empty()
-                    && p.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-            }) && envelope.split('.').count() == 3;
-            if body["version"].as_str() != Some(version) || !compact_jws {
-                return Err(reject("remote authorize returned an invalid envelope"));
-            }
-            Ok(envelope.to_string())
-        }
-        s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
-        _ => Err(refusal_error(status, body.as_ref())),
+    )
+}
+
+/// The envelope in a 200 authorize answer: it must echo the version and carry
+/// a compact JWS.
+fn envelope_of(surface: Surface, body: Option<Value>) -> Result<String> {
+    let (_, version) = surface.relay();
+    let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
+    let envelope = body["envelope"].as_str().unwrap_or_default();
+    let compact_jws = envelope.split('.').all(|p| {
+        !p.is_empty()
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    }) && envelope.split('.').count() == 3;
+    if body["version"].as_str() != Some(version) || !compact_jws {
+        return Err(reject("remote authorize returned an invalid envelope"));
     }
+    Ok(envelope.to_string())
 }
 
 /// One `POST /__platform/{cli,wiki}/call` attempt: fresh envelope, strict
@@ -1212,6 +3970,7 @@ fn call_once(
         target,
         cred,
         surface,
+        verb,
         scopes,
         request_timeout(deadline, AUTH_TIMEOUT)?,
     )?;
@@ -1226,12 +3985,12 @@ fn call_once(
     if !arguments.is_empty() {
         body["arguments"] = Value::Object(arguments.clone());
     }
-    // CAD-1568: a mutating verb's transport failure after the call was
-    // attempted is outcome-unknown, not a rejection — the mutation may
-    // have landed, so the caller must reconcile by idempotency key, never
-    // assume nothing landed. `message_send` reconciles on `arguments.message`;
-    // the team mutations reconcile with a read (`team list` / `team invites`).
-    let mutating = matches!(surface, Surface::Cli) && mutating_cli_verb(verb);
+    // A mutation's transport failure after the call was attempted is
+    // outcome-unknown, not a rejection — the write may have landed, so the
+    // caller must reconcile with the verb's own read, never assume nothing
+    // landed. This covers the CLI writes and the wiki `write` action alike:
+    // the surface decides, not a CLI-only verb list.
+    let effect = call_effect(surface, verb, arguments);
     post(
         &target.endpoint,
         &format!("{relay}/call"),
@@ -1240,8 +3999,11 @@ fn call_once(
         request_timeout(deadline, CALL_TIMEOUT)?,
     )
     .map_err(|e| {
-        if mutating && e.kind() != "unknown" {
-            Error::unknown(format!("{e} — {}", lost_mutation_note(verb)))
+        if effect.is_mutation() && e.kind() != "unknown" {
+            Error::unknown(format!(
+                "{e} — {}",
+                effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+            ))
         } else {
             e
         }
@@ -1267,6 +4029,7 @@ fn upload_once(
         target,
         cred,
         Surface::Wiki,
+        "",
         &["wiki.write"],
         request_timeout(deadline, AUTH_TIMEOUT)?,
     )?;
@@ -1294,7 +4057,7 @@ fn upload_once(
             format!("multipart/form-data; boundary={boundary}"),
         )
         .send(&body[..])
-        .map_err(|_| reject("remote request failed"))?;
+        .map_err(|_| upload_outcome_unknown("remote request failed"))?;
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
@@ -1306,11 +4069,565 @@ fn upload_once(
         .into_body()
         .as_reader()
         .take(MAX_BODY + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(|_| upload_outcome_unknown("the upload answer could not be read"))?;
     if bytes.len() as u64 > MAX_BODY {
-        return Err(reject("remote response too large"));
+        return Err(upload_outcome_unknown("remote response too large"));
     }
     Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
+}
+
+/// What one `artifact put` asks for. The server's answer says what happened.
+pub struct ArtifactUpload<'a> {
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub id: Option<&'a str>,
+    pub issue: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub customer: Option<&'a str>,
+    pub file_name: &'a str,
+    pub bytes: &'a [u8],
+}
+
+/// AOS-346: one `POST /__platform/artifacts/upload`, the wiki upload's shape on
+/// the CLI surface: the bearer, a fresh `cli.write` envelope, then one multipart
+/// body. `request_id` is fixed for the command, so a wake retry cannot add a
+/// second version.
+fn artifact_upload_once(
+    target: &RemoteTarget,
+    cred: &Credential,
+    upload: &ArtifactUpload,
+    request_id: &str,
+    deadline: Instant,
+) -> Result<(u16, Option<u64>, Option<Value>)> {
+    let envelope = authorize(
+        target,
+        cred,
+        Surface::Cli,
+        "",
+        &["cli.write"],
+        request_timeout(deadline, AUTH_TIMEOUT)?,
+    )?;
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| reject("unable to create upload boundary"))?;
+    let boundary = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let mut fields = vec![
+        ("version", CLI_VERSION),
+        ("kind", upload.kind),
+        ("request_id", request_id),
+    ];
+    if !upload.title.is_empty() {
+        fields.push(("title", upload.title));
+    }
+    for (name, value) in [
+        ("id", upload.id),
+        ("issue", upload.issue),
+        ("label", upload.label),
+        ("customer", upload.customer),
+    ] {
+        if let Some(value) = value {
+            fields.push((name, value));
+        }
+    }
+    let body =
+        crate::wiki::upload::build_multipart(&boundary, &fields, upload.file_name, upload.bytes);
+    let builder = ureq::Agent::config_builder()
+        .timeout_global(Some(request_timeout(deadline, CALL_TIMEOUT)?))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None);
+    let response = crate::issuer_transport::agent(builder)
+        .post(format!("{}/__platform/artifacts/upload", target.endpoint))
+        .header("Authorization", format!("Bearer {}", cred.access_token))
+        .header("X-Cadence-Cli-Envelope", envelope.as_str())
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .send(&body[..])
+        .map_err(|_| artifact_outcome_unknown())?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| artifact_outcome_unknown())?;
+    if bytes.len() as u64 > MAX_BODY {
+        return Err(artifact_outcome_unknown());
+    }
+    Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
+}
+
+/// AOS-346 `artifact put`: hand one local file to a hosted workspace. A tenant
+/// that predates the route is named as such, never reported as an outage.
+pub fn upload_artifact(
+    target: &RemoteTarget,
+    upload: &ArtifactUpload,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let agent = agent_credential::bound_session();
+    upload_artifact_in(&dir, target, upload, wake_timeout, agent.as_deref(), note)
+}
+
+pub(crate) fn upload_artifact_for_slot(
+    dir: &Path,
+    target: &RemoteTarget,
+    upload: &ArtifactUpload,
+    wake_timeout: u64,
+    agent: &AgentSlot,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    upload_artifact_in(dir, target, upload, wake_timeout, Some(agent), note)
+}
+
+/// Upload with an explicit credential directory, as in `upload_file_in`.
+fn upload_artifact_in(
+    dir: &Path,
+    target: &RemoteTarget,
+    upload: &ArtifactUpload,
+    wake_timeout: u64,
+    agent: Option<&AgentSlot>,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    let waking = || {
+        Error::busy_coded(
+            "waking",
+            format!(
+                "org '{}' is still waking after {}s — retry, or pass a larger --wake-timeout",
+                target.org, wake_timeout
+            ),
+        )
+    };
+    // The tenant keys private ZIP custody to the same principal that requests
+    // its review. A human-staged ZIP is not readable by their agent.
+    let custody_agent = if upload.kind == "private-app-zip" && agent.is_some() {
+        Some(
+            agent_credential::applies(agent, target, Surface::Cli, "platform_call")
+                .ok_or_else(agent_credential::platform_agent_required)?,
+        )
+    } else {
+        None
+    };
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| reject("unable to create a request id"))?;
+    let request_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    loop {
+        request_timeout(deadline, AUTH_TIMEOUT).map_err(|_| waking())?;
+        let cred = match custody_agent {
+            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note, false)?
+                .map(|(credential, _)| credential)
+                .ok_or_else(agent_credential::platform_agent_required)?,
+            None => renewed_credential(dir, target, deadline)?,
+        };
+        if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
+            return Err(reject(
+                "artifact put needs the cli.write capability, which this remote login \
+                 lacks — nothing was sent",
+            ));
+        }
+        let (status, retry_after, body) =
+            artifact_upload_once(target, &cred, upload, &request_id, deadline)?;
+        if explicit_mutation_uncertainty(body.as_ref()).is_some() {
+            return Err(artifact_outcome_unknown());
+        }
+        if status == 501 || (status == 404 && body.is_none()) {
+            return Err(reject(artifact_tenant_too_old(
+                "artifact put",
+                status,
+                "stored",
+            )));
+        }
+        // A board gate or the documented waking response is pre-forward.
+        // Other 5xx replies may hide a committed upload; the native CLI
+        // tracker's refusal codes do not prove anything for this endpoint.
+        let pre_forward = board_gate_refused(body.as_ref()) || worker_waking(status, body.as_ref());
+        if status >= 500 && !pre_forward {
+            return Err(artifact_outcome_unknown());
+        }
+        if !(200..300).contains(&status) && status != 503 {
+            return Err(artifact_refusal(status, body.as_ref()));
+        }
+        match classify(status, retry_after, body) {
+            Verdict::Done(Ok(answer)) => {
+                // Reject a foreign receipt before hashing the uploaded bytes.
+                if upload
+                    .id
+                    .is_some_and(|id| answer["file"]["id"].as_str() != Some(id))
+                {
+                    return Err(artifact_outcome_unknown());
+                }
+                return artifact_receipt(answer, upload.bytes);
+            }
+            Verdict::Done(Err(_)) if (200..300).contains(&status) => {
+                return Err(artifact_outcome_unknown());
+            }
+            Verdict::Done(Err(error)) => return Err(error),
+            Verdict::Conflict(_) => return Err(reject("remote upload conflicted")),
+            Verdict::Waking(wait) => {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(waking)?;
+                if wait >= remaining {
+                    return Err(waking());
+                }
+                note(&format!("waking {}… ({}s)", target.org, wait.as_secs()));
+                std::thread::sleep(wait);
+            }
+        }
+    }
+}
+
+fn artifact_outcome_unknown() -> Error {
+    Error::unknown(
+        "the upload may or may not have been recorded — check `artifact find` before \
+         repeating it, because a repeat can add a version",
+    )
+}
+
+/// A success must name a usable version and the digest of the sent bytes.
+fn artifact_receipt(answer: Value, bytes: &[u8]) -> Result<Value> {
+    let file = &answer["file"];
+    if !file["id"].as_str().is_some_and(crate::store::artifact_id)
+        || !file["version"].as_u64().is_some_and(|version| version > 0)
+    {
+        return Err(artifact_outcome_unknown());
+    }
+    let digest = file["digest"]
+        .as_str()
+        .filter(|digest| digest.len() == 64)
+        .ok_or_else(artifact_outcome_unknown)?;
+    let hex = b"0123456789abcdef";
+    if !Sha256::digest(bytes)
+        .iter()
+        .zip(digest.as_bytes().as_chunks::<2>().0.iter())
+        .all(|(byte, pair)| {
+            pair[0] == hex[(byte >> 4) as usize] && pair[1] == hex[(byte & 0x0f) as usize]
+        })
+    {
+        return Err(artifact_outcome_unknown());
+    }
+    Ok(answer)
+}
+
+/// The store's refusals carry a safe code and message of its own; anything else
+/// goes through the shared decoder, which never echoes a raw body.
+fn artifact_refusal(status: u16, body: Option<&Value>) -> Error {
+    const STORE_CODES: &[&str] = &[
+        "invalid_request",
+        "not_found",
+        "conflict",
+        "payload_too_large",
+    ];
+    let error = body.and_then(|b| b.get("error"));
+    let code = error.and_then(|e| e["code"].as_str());
+    let message = error.and_then(|e| e["message"].as_str());
+    match (code, message) {
+        (Some(code), Some(message)) if STORE_CODES.contains(&code) => {
+            let message: String = message.chars().take(300).collect();
+            let message = message.trim_end_matches('.');
+            reject(format!(
+                "artifact put refused ({code}): {message}. Nothing was stored"
+            ))
+        }
+        _ => refusal_error(status, body),
+    }
+}
+
+/// Deploy order is the tenant first, then this client. The fallback is a named
+/// refusal, so a mismatch never reads as an outage or an empty result.
+pub fn artifact_tenant_too_old(verb: &str, status: u16, nothing: &str) -> String {
+    format!(
+        "this workspace's server does not serve `{verb}` yet (HTTP {status}): update the \
+         tenant server first, then this Cadence client. Nothing was {nothing}"
+    )
+}
+
+/// CAD-2316 / AOS-481: what one `POST /__platform/templates/upload` sends.
+pub struct TemplateUpload<'a> {
+    pub media_type: &'a str,
+    pub file_name: &'a str,
+    pub bytes: &'a [u8],
+}
+
+fn template_upload_once(
+    target: &RemoteTarget,
+    cred: &Credential,
+    upload: &TemplateUpload,
+    req_id: &str,
+    dl: Instant,
+) -> Result<(u16, Option<u64>, Option<Value>)> {
+    let to = request_timeout(dl, AUTH_TIMEOUT)?;
+    let env = authorize(target, cred, Surface::Cli, "", &["cli.write"], to)?;
+    let mut rand = [0u8; 16];
+    getrandom::fill(&mut rand).map_err(|_| reject("unable to create upload boundary"))?;
+    let bnd = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand);
+    let flds = [
+        ("version", CLI_VERSION),
+        ("media_type", upload.media_type),
+        ("request_id", req_id),
+    ];
+    let body = crate::wiki::upload::build_multipart(&bnd, &flds, upload.file_name, upload.bytes);
+    let cfg = ureq::Agent::config_builder()
+        .timeout_global(Some(request_timeout(dl, CALL_TIMEOUT)?))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None);
+    let resp = crate::issuer_transport::agent(cfg)
+        .post(format!("{}/__platform/templates/upload", target.endpoint))
+        .header("Authorization", format!("Bearer {}", cred.access_token))
+        .header("X-Cadence-Cli-Envelope", env.as_str())
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={bnd}"),
+        )
+        .send(&body[..])
+        .map_err(|_| template_upload_outcome_unknown())?;
+    let status = resp.status().as_u16();
+    let ra = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut bytes = Vec::new();
+    resp.into_body()
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| template_upload_outcome_unknown())?;
+    if bytes.len() as u64 > MAX_BODY {
+        return Err(template_upload_outcome_unknown());
+    }
+    Ok((status, ra, serde_json::from_slice(&bytes).ok()))
+}
+
+/// CAD-2316 / AOS-481: upload a local HTML template or intake DOCX to a hosted workspace.
+pub fn upload_template(
+    target: &RemoteTarget,
+    upload: &TemplateUpload,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let agent = agent_credential::bound_session();
+    upload_template_in(&dir, target, upload, wake_timeout, agent.as_deref(), note)
+}
+
+fn upload_template_in(
+    dir: &Path,
+    target: &RemoteTarget,
+    upload: &TemplateUpload,
+    wake_timeout: u64,
+    agent: Option<&AgentSlot>,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    let waking = || {
+        Error::busy_coded(
+            "waking",
+            format!(
+                "org '{}' is still waking after {}s — retry, or pass a larger --wake-timeout",
+                target.org, wake_timeout
+            ),
+        )
+    };
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| reject("unable to create a request id"))?;
+    let request_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let mut on_agent = agent_credential::applies(agent, target, Surface::Cli, "template_upload");
+    let mut reissued = false;
+    loop {
+        request_timeout(deadline, AUTH_TIMEOUT).map_err(|_| waking())?;
+        let agent_pair = match on_agent {
+            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note, true)?,
+            None => None,
+        };
+        let using_agent = agent_pair.is_some();
+        let from_cache = agent_pair
+            .as_ref()
+            .is_some_and(|(_, src)| matches!(src, agent_credential::Source::Cached));
+        let cred = match agent_pair {
+            Some((c, _)) => c,
+            None => renewed_credential(dir, target, deadline)?,
+        };
+        if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
+            return Err(reject(
+                "template upload needs the cli.write capability, which this remote login lacks — nothing was sent",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(waking());
+        }
+        let answered = template_upload_once(target, &cred, upload, &request_id, deadline);
+        let hr = agent_credential::HUMAN_SESSION_REQUIRED;
+        let refused_agent = using_agent
+            && on_agent.is_some()
+            && match &answered {
+                Err(e) => e.code() == Some(hr),
+                Ok((403, _, b)) => refusal_fields(b.as_ref()).0 == Some(hr),
+                _ => false,
+            };
+        if refused_agent {
+            if let Some(slot) = on_agent.take() {
+                slot.keep_login(&note, "this workspace has not been updated to accept it");
+            }
+            continue;
+        }
+        let rej_cache = using_agent
+            && from_cache
+            && !reissued
+            && match &answered {
+                Ok((401, ..)) => true,
+                Err(e) => e.code() == Some(CREDENTIAL_REJECTED),
+                _ => false,
+            };
+        if rej_cache {
+            if let Some(slot) = on_agent {
+                slot.invalidate();
+            }
+            reissued = true;
+            continue;
+        }
+        let (status, retry_after, body) = answered?;
+        if explicit_mutation_uncertainty(body.as_ref()).is_some() {
+            return Err(template_upload_outcome_unknown());
+        }
+        if status == 501 || (status == 404 && body.is_none()) {
+            let msg = template_tenant_too_old("template upload", status, "stored");
+            return Err(Error::invalid("not_implemented", msg));
+        }
+        if let Some(err) = template_store_refusal("template_upload", status, body.as_ref()) {
+            return Err(err);
+        }
+        let pre_fwd = board_gate_refused(body.as_ref()) || worker_waking(status, body.as_ref());
+        if status >= 500 && !pre_fwd {
+            return Err(template_upload_outcome_unknown());
+        }
+        if !(200..300).contains(&status) && status != 503 {
+            return Err(refusal_error(status, body.as_ref()));
+        }
+        match classify(status, retry_after, body) {
+            Verdict::Done(Ok(ans)) => {
+                return template_upload_receipt(ans, &request_id, upload.bytes);
+            }
+            Verdict::Done(Err(_)) if (200..300).contains(&status) => {
+                return Err(template_upload_outcome_unknown());
+            }
+            Verdict::Done(Err(e)) => return Err(e),
+            Verdict::Conflict(_) => return Err(reject("remote template upload conflicted")),
+            Verdict::Waking(wait) => {
+                let rem = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|r| !r.is_zero())
+                    .ok_or_else(waking)?;
+                if wait >= rem {
+                    return Err(waking());
+                }
+                note(&format!("waking {}… ({}s)", target.org, wait.as_secs()));
+                std::thread::sleep(wait);
+            }
+        }
+    }
+}
+
+fn template_upload_outcome_unknown() -> Error {
+    Error::unknown(
+        "the template source upload may or may not have been recorded — retry the command only after checking `template list` or `template show`",
+    )
+}
+
+fn template_upload_receipt(answer: Value, req_id: &str, bytes: &[u8]) -> Result<Value> {
+    let blob = &answer["blob"];
+    let dig = blob["sha256"].as_str().unwrap_or("");
+    let ok = answer.get("request_id").and_then(Value::as_str) == Some(req_id)
+        && blob["blob_key"].as_str().is_some_and(|k| !k.is_empty())
+        && blob["byte_length"].as_u64() == Some(bytes.len() as u64)
+        && dig.len() == 64
+        && crate::business_templates::sha256_hex(bytes).eq_ignore_ascii_case(dig);
+    if !ok {
+        return Err(template_upload_outcome_unknown());
+    }
+    Ok(answer)
+}
+
+pub fn template_tenant_too_old(verb: &str, status: u16, nothing: &str) -> String {
+    format!(
+        "this workspace's server does not serve `{verb}` yet (HTTP {status}; requires AOS-481): update the tenant server first, then use this Cadence client. Nothing was {nothing}"
+    )
+}
+
+fn is_template_or_document_verb(verb: &str) -> bool {
+    const VERBS: &str = "template_upload template_list template_show template_blob_read template_create template_revise template_sample template_intake template_approve document_create document_show document_export";
+    VERBS.split_ascii_whitespace().any(|v| v == verb)
+}
+
+fn template_store_refusal(verb: &str, status: u16, body: Option<&Value>) -> Option<Error> {
+    const CODES: &str = "invalid_request not_found conflict docx_executable_unsupported owner_required template_not_approved already_approved digest_mismatch export_required payload_too_large pdf_too_large pdf_renderer_unavailable pdf_render_failed";
+    if !is_template_or_document_verb(verb) {
+        return None;
+    }
+    let err = body?.get("error")?;
+    let (raw_code, msg) = (err.get("code")?.as_str()?, err.get("message")?.as_str()?);
+    let code = CODES.split_ascii_whitespace().find(|&c| c == raw_code)?;
+    let pdf_err = matches!(code, "pdf_renderer_unavailable" | "pdf_render_failed")
+        && matches!(verb, "template_sample" | "document_export")
+        && (500..=599).contains(&status);
+    if !(400..=422).contains(&status) && !pdf_err {
+        return None;
+    }
+    let bounded: String = msg.chars().take(300).collect();
+    Some(Error::invalid(
+        code,
+        format!("{verb} refused ({code}): {}", bounded.trim_end_matches('.')),
+    ))
+}
+
+fn jstr<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
+    v.get(k).and_then(Value::as_str)
+}
+
+fn template_receipt_correlates(verb: &str, reply: &Value, args: &Map<String, Value>) -> bool {
+    let name_arg = args.get("name").and_then(Value::as_str);
+    match verb {
+        "template_create" | "template_revise" => {
+            reply.pointer("/template/name").and_then(Value::as_str) == name_arg
+                && reply
+                    .pointer("/template/version")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|v| v > 0)
+        }
+        "template_approve" => {
+            reply.pointer("/template/name").and_then(Value::as_str) == name_arg
+                && reply.pointer("/template/version").and_then(Value::as_u64)
+                    == args.get("version").and_then(Value::as_u64)
+                && reply.pointer("/template/status").and_then(Value::as_str) == Some("approved")
+        }
+        "document_create" => {
+            jstr(reply, "id").is_some_and(|id| !id.is_empty())
+                && jstr(reply, "template_name").or_else(|| jstr(reply, "template"))
+                    == args.get("template").and_then(Value::as_str)
+        }
+        "document_export" => jstr(reply, "id") == args.get("id").and_then(Value::as_str),
+        _ => true,
+    }
 }
 
 /// CAD-913 `wiki upload`: send one local file (already read and size-checked
@@ -1377,6 +4694,10 @@ fn upload_file_in(
     wake_timeout: u64,
     note: impl Fn(&str),
 ) -> Result<Value> {
+    // The sent bytes are fixed for the whole command. The digest is computed
+    // lazily, once: a preflight, capability or deadline refusal before the
+    // first dispatched upload never hashes them, and a wake retry reuses it.
+    let mut expected = None;
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(wake_timeout))
         .ok_or_else(|| reject("invalid wake timeout"))?;
@@ -1435,17 +4756,58 @@ fn upload_file_in(
                 "remote command deadline elapsed during session renewal",
             ));
         }
+        // Digest the bytes immediately before the first dispatched upload —
+        // every refusal above returns without hashing — and reuse it on a wake
+        // retry.
+        let (expected_sha256, expected_size) =
+            expected.get_or_insert_with(|| (Sha256::digest(bytes), bytes.len() as u64));
         let (status, retry_after, body) =
             upload_once(target, &cred, logical_path, file_name, bytes, deadline)?;
+        if let Some(code) = explicit_mutation_uncertainty(body.as_ref()) {
+            return Err(upload_outcome_unknown(&format!(
+                "the relay reported {code}"
+            )));
+        }
         // A refusal names the status and the contract's error code only: the
         // raw body could carry anything, so it is never echoed.
         let conflict = status == 409 && body.as_ref().is_some_and(|b| b.get("conflict").is_some());
+        // The upload is a mutation: a 5xx with no pre-forward proof, or a 2xx
+        // without an object receipt, may follow a stored blob. Its outcome is
+        // unknown — the caller lists the parent path before uploading again.
+        let after_forward = post_forward_failure(status, body.as_ref(), false);
+        let unusable_success = (200..300).contains(&status) && !is_object_body(body.as_ref());
         if !(200..300).contains(&status) && status != 503 && !conflict {
             // CAD-1434: the gateway envelope is `{ok:false,error:{code}}`; the
             // decoder reads it (the old top-level read always fell through).
+            if after_forward {
+                return Err(upload_outcome_unknown(&format!(
+                    "the relay answered HTTP {status}"
+                )));
+            }
             return Err(refusal_error(status, body.as_ref()));
         }
+        if unusable_success {
+            return Err(upload_outcome_unknown(
+                "remote answer was not a usable receipt",
+            ));
+        }
+        // The receipt must name the bytes and path this call sent: the digest
+        // of the exact bytes, the tenant text variant's size plus rev, or the
+        // native committed write. A 2xx without one proves nothing.
+        if (200..300).contains(&status)
+            && !body.as_ref().is_some_and(|reply| {
+                upload_receipt_correlates(reply, logical_path, &expected_sha256[..], *expected_size)
+            })
+        {
+            return Err(upload_outcome_unknown(
+                "remote answer carried no receipt for the bytes and path sent",
+            ));
+        }
         match classify(status, retry_after, body) {
+            Verdict::Done(Err(error)) if after_forward => {
+                return Err(upload_outcome_unknown(&error.to_string()));
+            }
+            Verdict::Done(Err(error)) => return Err(error),
             Verdict::Done(result) => return result,
             Verdict::Conflict(_) => return Err(reject("remote upload conflicted")),
             Verdict::Waking(wait) => {
@@ -1557,6 +4919,13 @@ const TERMINAL_CODES: &[&str] = &[
     "lineage_terminal",
 ];
 
+/// HTTP 403 error codes emitted when workspace org-2FA policy blocks the session.
+const TWO_FACTOR_CODES: &[&str] = &[
+    "two_factor_enrollment_required",
+    "two_factor_verification_required",
+    "two_factor_required",
+];
+
 /// Read the safe `error.code` and `error.reason` (or legacy top-level `code`).
 /// Only lowercase, bounded tokens survive; anything else is dropped.
 fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
@@ -1570,6 +4939,75 @@ fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
         .and_then(Value::as_str);
     let reason = error.and_then(|e| e.get("reason")).and_then(Value::as_str);
     (safe(code), safe(reason))
+}
+
+/// Bounded diagnostic fields a failed `platform_call` may carry: the safe
+/// `error.code`, an allowlisted `error.stage`, and whether the server proved
+/// the request was not recorded (`error.recorded`). Never echoes free-text
+/// messages, keys, prompts, credentials or URLs.
+fn platform_error_details(body: Option<&Value>) -> String {
+    fn safe_token(v: Option<&str>) -> Option<&str> {
+        v.filter(|c| {
+            !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        })
+    }
+    let error = body.and_then(|b| b.get("error"));
+    let code = refusal_fields(body).0;
+    let stage = safe_token(error.and_then(|e| e.get("stage")).and_then(Value::as_str));
+    let recorded = error
+        .and_then(|e| e.get("recorded"))
+        .and_then(Value::as_bool);
+    let mut out = String::new();
+    if let Some(code) = code {
+        out.push_str(&format!(", code {code}"));
+    }
+    if let Some(stage) = stage {
+        out.push_str(&format!(", stage {stage}"));
+    }
+    if let Some(recorded) = recorded {
+        out.push_str(&format!(", recorded={recorded}"));
+    }
+    out
+}
+
+/// Only fixed app refusal codes cross this boundary; provider text stays private.
+fn app_action_refusal(status: u16, code: Option<&str>) -> Option<Error> {
+    let (code, message) = match (status, code) {
+        (400, Some("validation_failed")) => (
+            "validation_failed",
+            "The app action arguments were refused. Use `cadence --org <workspace> app describe <app>` to check the action's required fields.",
+        ),
+        (403, Some("owner_required")) => (
+            "owner_required",
+            "This app action requires the workspace owner. Ask the owner to perform it.",
+        ),
+        (403, Some("approval_required")) => (
+            "approval_required",
+            "This action is not available through app call. Use the app's own controls or ask the workspace owner.",
+        ),
+        (403, Some("conversation_required")) => (
+            "conversation_required",
+            "This action needs a board conversation. Open the app in the board.",
+        ),
+        (404, Some("app_unavailable")) => (
+            "app_unavailable",
+            "The app is unavailable in this workspace. Use `cadence --org <workspace> app describe` to list available apps.",
+        ),
+        (409, Some("stale_revision")) => (
+            "stale_revision",
+            "The record changed. Read it again and use its current revision for a new request.",
+        ),
+        (400, Some("request_id_reused")) => (
+            "request_id_reused",
+            "This request belongs to different action input. Use a new request only for a deliberate new action.",
+        ),
+        (409, Some("unsupported_verb")) => (
+            "unsupported_verb",
+            "This app does not offer that action. Use `cadence --org <workspace> app describe` to list its actions.",
+        ),
+        _ => return None,
+    };
+    Some(Error::invalid(code, message))
 }
 
 /// CAD-1434 / AOS-243: the correlation a refusal carries, read only when it is
@@ -1613,6 +5051,9 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
             (_, Some(r)) if POLICY_REASONS.contains(&r) => Refusal::Authorization,
             (_, Some(_)) => Refusal::Uncertain, // envelope_invalid: not terminal, not policy
             (Some(c), None) if TERMINAL_CODES.contains(&c) => Refusal::Authentication,
+            (Some(c), None) if status == 403 && TWO_FACTOR_CODES.contains(&c) => {
+                Refusal::Authentication
+            }
             (Some("forbidden"), None) => Refusal::Authorization,
             // The container's path/scope refusal: authorization on 403 only.
             (Some(CONTAINER_SCOPE_CODE), None) if status == 403 => Refusal::Authorization,
@@ -1624,12 +5065,17 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
         },
         _ => Refusal::Unknown,
     };
-    // The shown reason: an allowlisted policy/envelope reason on 401/403, or the
+    // The shown reason: an allowlisted policy/envelope/2FA reason on 401/403, or the
     // safe `error.code` on a non-auth refusal (a payload-size or validation code).
     // Auth-class codes are never shown as a free reason.
     let shown = match status {
         400 | 409 | 413 | 422 => code.map(str::to_owned),
         403 if code == Some(CONTAINER_SCOPE_CODE) => Some(CONTAINER_SCOPE_CODE.to_owned()),
+        403 if category == Refusal::Authentication
+            && code.is_some_and(|c| TWO_FACTOR_CODES.contains(&c)) =>
+        {
+            code.map(str::to_owned)
+        }
         _ => known_reason.map(str::to_owned),
     };
     (category, shown)
@@ -1641,6 +5087,12 @@ fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> Strin
     let code = reason.map_or(String::new(), |r| format!(", reason {r}"));
     let category = refusal.category();
     match refusal {
+        Refusal::Authentication if reason.is_some_and(|r| TWO_FACTOR_CODES.contains(&r)) => {
+            format!(
+                "workspace requires two-factor authentication ({category}, HTTP {status}{code}) — \
+                 complete two-factor setup or verification in the browser, then run `cadence login` again"
+            )
+        }
         Refusal::Authentication => format!(
             "the remote session ended ({category}, HTTP {status}{code}) — run `cadence login` again once"
         ),
@@ -1743,14 +5195,13 @@ fn refusal_error(status: u16, body: Option<&Value>) -> Error {
 
 /// The answer to a mutating verb whose reply was ambiguous: the write may
 /// already have committed, so the outcome is unknown and the caller
-/// reconciles with a read for the same explicit `--org` before repeating
-/// it. It never advises a bare retry, and it never claims the write failed.
-/// `correlation` is the bounded board correlation the refusal may carry.
-fn ambiguous_mutation_error(status: u16, correlation: Option<String>) -> Error {
+/// reconciles with the verb's own read before repeating it. It never advises
+/// a bare retry, and it never claims the write failed. `correlation` is the
+/// bounded board correlation the refusal may carry.
+fn ambiguous_mutation_error(status: u16, correlation: Option<String>, reconcile: &str) -> Error {
     let mut text = format!(
         "the remote action may already have committed (outcome_unknown, HTTP {status}); \
-         inspect `team list` or `team invites` with the same explicit --org before \
-         repeating the mutation. Nothing was retried; saved credentials are kept"
+         {reconcile}. Nothing was retried; saved credentials are kept"
     );
     if let Some(correlation) = correlation {
         text.push_str(&correlation);
@@ -1758,18 +5209,58 @@ fn ambiguous_mutation_error(status: u16, correlation: Option<String>) -> Error {
     Error::unknown(text)
 }
 
-/// CAD-1568: actionable text for the `cli_message_*` family's typed
-/// refusals, keyed on the container's bounded `error.code` — the raw
-/// `error.message` the route returns is never shown (a `cli_fail` body
-/// can carry arbitrary server text). Unknown or absent codes keep the
-/// generic decoded refusal unchanged.
+/// A 2xx that cannot be a receipt for the write it answered — no JSON body at
+/// all, or a body that is not an object. The call may have committed, so the
+/// outcome is unknown: the caller reconciles with the verb's own read rather
+/// than replaying the write or reading the empty answer as a success.
+fn unusable_success_error(status: u16, reconcile: &str) -> Error {
+    Error::unknown(format!(
+        "the remote answered HTTP {status} without a usable success body — the outcome is \
+         unknown; {reconcile}. Nothing was retried; saved credentials are kept"
+    ))
+}
+
+/// A wiki upload whose request was sent but whose answer was lost, oversized
+/// or unreadable: the blob may already be stored, so the outcome is unknown
+/// and the caller lists the parent path before uploading again.
+fn upload_outcome_unknown(detail: &str) -> Error {
+    Error::unknown(format!(
+        "{detail} — {RECONCILE_WIKI_UPLOAD}. Nothing was retried"
+    ))
+}
+
+const PROFILE_WRITE_NOT_PERMITTED: &str = "defining or editing a profile is a live human \
+    workspace owner's act, and this login is a member or not a user principal. If you are the \
+    owner and this login may have ended, run `cadence login` once. Nothing was written";
+
+/// CAD-1568: actionable text for a verb's typed refusals, keyed on the
+/// container's bounded `error.code` — the raw `error.message` the route
+/// returns is never shown (a `cli_fail` body can carry arbitrary server
+/// text). Today it covers the `cli_message_*` family, CAD-1999's
+/// `project_new` registry refusals and a wiki `read` of a missing path
+/// (CAD-2260). Unknown or absent codes keep the generic decoded refusal
+/// unchanged.
 fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Error) -> Error {
     let action: Option<(&'static str, &'static str)> = match (verb, code) {
         ("message_send", Some("recipient_class_unsupported")) => Some((
             "recipient_class_unsupported",
-            "remote send reaches `master` for a human workspace owner only; \
-             personal assistants require separate assistant authority, and local \
-             workers use the local-assignment plane",
+            "remote send reaches `master` (human workspace owner only) or an active \
+             workspace specialist alias; that recipient is not available in this workspace",
+        )),
+        ("message_send", Some("ambiguous_recipient")) => Some((
+            "ambiguous_recipient",
+            "more than one active specialist matches that alias in this workspace — \
+             address the unique profile alias; nothing was sent",
+        )),
+        ("message_send", Some("app_context_not_bound")) => Some((
+            "app_context_not_bound",
+            "that `--context-app` is not actively bound to the target specialist \
+             for this owner — check the specialist's app bindings; nothing was sent",
+        )),
+        ("message_send", Some("ambiguous_app_context")) => Some((
+            "ambiguous_app_context",
+            "that specialist is bound to multiple apps — pass `--context-app <app>` \
+             to select one; nothing was sent",
         )),
         ("message_send", Some("message_id_conflict")) => Some((
             "message_id_conflict",
@@ -1780,13 +5271,14 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
         ("message_send", Some("rejected")) => Some((
             "rejected",
             "the recipient or the --message id was refused — `sys-` ids are \
-             daemon-owned; inspect the selected workspace's master and use a \
+             daemon-owned; inspect the selected workspace's recipients and use a \
              non-reserved stable message id",
         )),
         ("message_send", Some("not_permitted")) => Some((
             "not_permitted",
-            "remote `send master` requires a verified human workspace owner; \
-             agent, service and ordinary-member credentials do not grant master chat",
+            "remote send requires a verified human workspace owner (or an owner's \
+             approved assistant for specialist aliases); agent and ordinary-member \
+             credentials are not permitted",
         )),
         ("message_send", Some("insufficient_scope")) => Some((
             "insufficient_scope",
@@ -1798,6 +5290,21 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "the send was refused at the request boundary — the remote call \
              needs a non-empty body and the stable --message id",
         )),
+        ("message_ack", Some("not_permitted")) => Some((
+            "not_permitted",
+            "remote inbox acknowledgement requires the human workspace owner or \
+             sending principal; nothing was acknowledged",
+        )),
+        ("message_ack", Some("insufficient_scope")) => Some((
+            "insufficient_scope",
+            "this remote login lacks the cli.write grant `inbox ack` needs — \
+             re-login with write scope, then retry",
+        )),
+        ("message_ack", Some("invalid_request")) => Some((
+            "invalid_request",
+            "remote `inbox ack` was refused at the request boundary — pass a \
+             valid alias and positive seq(s) or --through; nothing was acknowledged",
+        )),
         ("message_read", Some("not_permitted")) | ("message_inbox", Some("not_permitted")) => {
             Some((
                 "not_permitted",
@@ -1805,10 +5312,176 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
                  passive inbox inspection requires a human workspace owner",
             ))
         }
+        ("issue_message_send", Some("message_id_conflict")) => Some((
+            "message_id_conflict",
+            "that --message id was already used with different content, on another ticket, \
+             or by another member — pick a new id; nothing was stored",
+        )),
+        ("issue_message_send" | "issue_messages" | "issue_messages_read", Some("not_found")) => {
+            Some((
+                "not_found",
+                "this workspace has no ticket with that id; nothing was read or changed",
+            ))
+        }
+        // Not what today's relay sends, which refuses at mint (see `authorize`).
+        ("issue_message_send" | "issue_messages_read", Some("insufficient_scope")) => Some((
+            "insufficient_scope",
+            "this remote login lacks the cli.write grant this needs — nothing was sent",
+        )),
+        // An older relay refuses a verb it does not know the same way, so this
+        // cannot say which of the two happened.
+        (
+            "issue_message_send" | "issue_messages" | "issue_messages_read",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the call was refused at the request boundary: a value was invalid, or this \
+             workspace's hosted service predates ticket messages. Nothing was read or changed",
+        )),
         ("message_read", Some("not_found")) => Some((
             "not_found",
             "no CLI message with that id is visible to this human identity; \
              reconcile the original workspace and login before retrying the same id",
+        )),
+        // CAD-2063: the tenant has no runtime to serve these, so a retry or a
+        // new login cannot help.
+        (
+            "agent_show" | "message_inbox" | "master_status" | "settings_agents",
+            Some("container_required"),
+        ) => Some((
+            "container_required",
+            "a hosted workspace cannot serve this command. Retrying will not help, and \
+             nothing was changed",
+        )),
+        // CAD-2101: the profile verbs' typed refusals. The code stays in the
+        // text and the board's own message is not shown. (A stale revision is
+        // not here: it is a conflict answer, which prints the board's body.)
+        ("agent_profile_create" | "agent_profile_update", Some("not_permitted")) => {
+            Some(("not_permitted", PROFILE_WRITE_NOT_PERMITTED))
+        }
+        ("agent_profile_create" | "agent_profile_update", Some("unauthorized")) => {
+            Some(("unauthorized", PROFILE_WRITE_NOT_PERMITTED))
+        }
+        ("agent_profile_show", Some("not_permitted")) => Some((
+            "not_permitted",
+            "this login may not read that profile; nothing was read",
+        )),
+        ("agent_profile_show" | "agent_profile_update", Some("not_found")) => Some((
+            "not_found",
+            "this workspace has no profile with that id, or it is archived and only the \
+             owner can read it; nothing was read or changed",
+        )),
+        ("agent_profile_create", Some("alias_taken")) => Some((
+            "alias_taken",
+            "a profile or a runtime already holds that alias; pick another. Nothing was written",
+        )),
+        (
+            "agent_profile_show" | "agent_profile_create" | "agent_profile_update",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the board refused the request: a value or field was not accepted (the board \
+                 owns the field names and limits), or this workspace's board predates agent \
+                 profile commands — if the values are right, update the board first. Nothing \
+                 was written",
+        )),
+        // A write's 503 with no `state` is an unknown outcome (exit 1) before
+        // it gets here, so only the read reaches this arm.
+        ("agent_profile_show", Some("capability_unavailable")) => Some((
+            "capability_unavailable",
+            "the board could not reach its profile store; nothing was read. Try again later",
+        )),
+        // CAD-2396: workspace skills. A package refusal (`skill_refused`) is
+        // answered with its reason by `skill_refusal`, before this table.
+        (
+            "workspace_skill_approve" | "workspace_skill_revoke" | "workspace_skill_delete",
+            Some("not_permitted" | "unauthorized" | "owner_required"),
+        ) => Some((
+            "not_permitted",
+            "approving, revoking or deleting a workspace skill is a live human workspace \
+             owner's decision; this login is not one. Nothing was changed",
+        )),
+        (
+            "workspace_skill_show"
+            | "workspace_skill_approve"
+            | "workspace_skill_revoke"
+            | "workspace_skill_delete",
+            Some("not_found"),
+        ) => Some((
+            "not_found",
+            "this workspace has no such skill, or no such revision of it; nothing was read or \
+             changed",
+        )),
+        ("workspace_skill_approve" | "workspace_skill_revoke", Some("digest_mismatch")) => Some((
+            "digest_mismatch",
+            "the digest is not the one this decision needs — read `workspace-skill show` again \
+             and pass the digest it prints. Nothing was changed",
+        )),
+        ("workspace_skill_delete", Some("approved_skill")) => Some((
+            "approved_skill",
+            "that skill is approved, so agents may be reading it — revoke it first, then \
+             delete. Nothing was changed",
+        )),
+        ("workspace_skill_draft", Some("skill_limit")) => Some((
+            "skill_limit",
+            "this workspace holds the most skills it can; the owner deletes an unused one to \
+             make room, or draft a new revision of an existing skill. Nothing was written",
+        )),
+        ("workspace_skill_approve", Some("approved_limit")) => Some((
+            "approved_limit",
+            "this workspace already has the most approved skills an agent can list; revoke one \
+             first. Nothing was changed",
+        )),
+        (
+            "workspace_skill_list"
+            | "workspace_skill_show"
+            | "workspace_skill_check"
+            | "workspace_skill_draft"
+            | "workspace_skill_approve"
+            | "workspace_skill_revoke"
+            | "workspace_skill_delete",
+            Some("invalid_request"),
+        ) => Some((
+            "invalid_request",
+            "the board refused the request: a value was not accepted, or this workspace's \
+             board predates workspace skills — if the values are right, update the board \
+             first. Nothing was written",
+        )),
+        // CAD-1999: the hosted project registry's own typed refusals. A key
+        // that already exists as a ticket-only project conflicts exactly like
+        // a registered one; only the identical key+name+prefix is a reuse.
+        ("project_new", Some("project_exists")) => Some((
+            "project_exists",
+            "that project key is already registered, or already exists as its \
+             tickets' project with a different name or prefix — `issue project \
+             ls` shows the stored record; pick another key, or repeat the same \
+             key, name and prefix to reuse it. Nothing was written",
+        )),
+        ("project_new", Some("prefix_conflict")) => Some((
+            "prefix_conflict",
+            "that issue-id prefix already belongs to another project (registered, \
+             or spelled by existing ticket ids) — pass a different --prefix; \
+             nothing was written",
+        )),
+        ("project_new", Some("not_permitted")) => Some((
+            "not_permitted",
+            "remote `project new` requires a verified human workspace owner; an \
+             agent, service or ordinary-member credential cannot register \
+             workspace structure",
+        )),
+        ("project_new", Some("invalid_request")) => Some((
+            "invalid_request",
+            "the project was refused at the request boundary — the key must be \
+             1-32 lowercase letters, digits or hyphens, --name 1-200 bytes, and \
+             --prefix 1-16 letters/digits starting with a letter; nothing was written",
+        )),
+        // CAD-2260: the tenant board answers a wiki `read` with `404
+        // not_found` for a missing path, and for a blob whose stored bytes are
+        // gone. The code is what `wiki cp` reads as "the destination is new".
+        ("read", Some("not_found")) => Some((
+            "not_found",
+            "this workspace's wiki has no readable page at that path for this login; nothing \
+             was read",
         )),
         _ => None,
     };
@@ -1849,6 +5522,17 @@ pub fn local_status(target: &RemoteTarget) -> Value {
     }
 }
 
+/// CAD-1988: the documented `auth status` object for one hosted workspace and
+/// the exit code a status read should carry. Local only; no network call.
+pub fn status_report(dir: &Path, target: &RemoteTarget) -> (Value, i32) {
+    let report = local_status_at(dir, target);
+    let code = match report["state"].as_str() {
+        Some("renewable" | "access_valid_until_expiry") => 0,
+        _ => 1,
+    };
+    (report, code)
+}
+
 /// `local_status` with the credential dir injectable, so tests never touch the
 /// real config directory. Only a missing file is absence. A permission or I/O
 /// error is `unavailable`, never a claim that no credential exists.
@@ -1870,7 +5554,7 @@ fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
         // proof of absence or of server-side revocation.
         Err(_) => {
             return json!({"state": "invalid_local_credential", "live_verified": false,
-                "note": "the saved credential cannot be read; run `cadence login` again"})
+                "note": "the saved credential cannot be read; run `cadence login` again"});
         }
     };
     let at = now().unwrap_or(0);
@@ -1907,6 +5591,462 @@ fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
     out
 }
 
+/// The exact capability the published cloud-agent contract requires on the
+/// saved hosted login. Kept separate from `cli.write`: the default login
+/// never authorizes a paid model turn, and a login missing this scope is
+/// refused before a request is built.
+pub fn cloud_agent_credential(target: &RemoteTarget, scope: &str) -> Result<()> {
+    cloud_agent_credential_owned(target, scope, None)
+}
+
+/// Scope AND full-owner check against the saved login. `owner` is the source
+/// already admitted locally; the saved credential's verified issuer + subject
+/// must still be exactly that parent. This runs immediately before every
+/// transport call AND before serving any cached row, so a replaced human can
+/// neither spend a new turn nor read an earlier owner's reply.
+pub fn cloud_agent_credential_owned(
+    target: &RemoteTarget,
+    scope: &str,
+    owner: Option<&crate::store::cloud_agent::Owner>,
+) -> Result<()> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let cred = load_credential(&dir, target)?;
+    if !cred.capabilities.iter().any(|cap| cap == scope) {
+        return Err(Error::gate_coded(
+            "cloud_agent_scope_revoked",
+            format!(
+                "this remote login for org '{org}' does not carry the {scope} capability — \
+                 nothing was sent. Run `cadence login {org} --cloud-agent` to add it to \
+                 this login",
+                org = target.org,
+            ),
+        ));
+    }
+    if let Some(owner) = owner {
+        let pin = identity_of(&cred, target)?;
+        if pin.issuer != owner.issuer || pin.subject_id != owner.subject {
+            return Err(Error::gate_coded(
+                "cloud_agent_owner_changed",
+                "the saved cloud login now names a different verified owner (issuer/subject) \
+                 than this source was admitted under; no request or cached reply is served",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The saved login's verified logical owner for this exact target: the stable
+/// issuer + subject pair, never a credential/token/session generation. A
+/// legacy login without either half is refused rather than approximated.
+pub fn cloud_agent_identity(target: &RemoteTarget) -> Result<CliIdentityPin> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let cred = load_credential(&dir, target)?;
+    identity_of(&cred, target)
+}
+
+fn identity_of(cred: &Credential, target: &RemoteTarget) -> Result<CliIdentityPin> {
+    let issuer = cred
+        .issuer
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            reject(format!(
+                "the saved cloud login for org '{}' records no verified issuer — run \
+                 `cadence login --cloud-agent` again; nothing was sent",
+                target.org
+            ))
+        })?;
+    let subject_id = cred
+        .subject_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            reject(
+                "the saved cloud login records no verified subject id — run \
+                 `cadence login --cloud-agent` again; nothing was sent",
+            )
+        })?;
+    if cred.organization_id != target.org_id || cred.audience != target.endpoint {
+        return Err(reject(
+            "the saved credential does not name this exact workspace; nothing was sent",
+        ));
+    }
+    Ok(CliIdentityPin { subject_id, issuer })
+}
+
+/// CAD-1853: the owner-only record of one enrolled cloud-peer credential.
+/// The token is never returned to a child, prompt, argv or log; this module
+/// makes exactly one HTTP call with it and drops it.
+const PEER_RECORD_VERSION: &str = "hosted-cadence-cloud-agent-peer.v1";
+
+fn peer_dir(target: &RemoteTarget) -> Result<PathBuf> {
+    let base = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let dir = base.join("cloud-agent");
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let meta = fs::symlink_metadata(&dir)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(reject("cloud-agent credential directory is not private"));
+    }
+    let _ = target;
+    Ok(dir)
+}
+
+fn peer_path(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+) -> Result<PathBuf> {
+    // The key includes BOTH halves of the verified parent identity and the
+    // native sender uid/stamp: the same uid+stamp enrolled under another
+    // human is a different credential, never a replacement of this one.
+    let digest = Sha256::digest(
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            target.org_id, target.endpoint, owner.issuer, owner.subject, uid, epoch
+        )
+        .as_bytes(),
+    );
+    let name: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    Ok(peer_dir(target)?.join(format!("{name}.json")))
+}
+
+fn read_peer_record(path: &Path) -> Option<Value> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return None;
+    }
+    let mut raw = Vec::new();
+    file.take(16385).read_to_end(&mut raw).ok()?;
+    if raw.len() > 16384 {
+        return None;
+    }
+    serde_json::from_slice(&raw).ok()
+}
+
+fn peer_records(dir: &Path) -> Result<Vec<(PathBuf, Value)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)?.take(64) {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(record) = read_peer_record(&path) {
+            out.push((path, record));
+        }
+    }
+    Ok(out)
+}
+
+fn peer_matches(record: &Value, target: &RemoteTarget, uid: &str, epoch: i64) -> bool {
+    record["version"] == PEER_RECORD_VERSION
+        && record["purpose"] == "cloud_agent"
+        && record["organization_id"] == target.org_id
+        && record["audience"] == target.endpoint
+        && record["uid"] == uid
+        && record["registration_epoch"] == epoch
+}
+
+fn peer_parent(record: &Value) -> Result<CliIdentityPin> {
+    let issuer = record["issuer"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| reject("cloud-peer credential is missing its verified parent issuer"))?;
+    let subject_id = record["parent_subject"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| reject("cloud-peer credential is missing its verified parent subject"))?;
+    Ok(CliIdentityPin {
+        subject_id: subject_id.to_string(),
+        issuer: issuer.to_string(),
+    })
+}
+
+/// Persist the enrolled child credential for exactly this source. The caller
+/// has already validated the contract response; no secret is logged. Any
+/// other-owner record for the same native uid/stamp is removed first: one
+/// peer enrollment has exactly one verified parent, so resolution can never
+/// silently pick between two owners.
+pub fn cloud_agent_save_peer(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+    record: &Value,
+) -> Result<()> {
+    let path = peer_path(target, owner, uid, epoch)?;
+    for (other, existing) in peer_records(&peer_dir(target)?)? {
+        if other != path && peer_matches(&existing, target, uid, epoch) {
+            let _ = fs::remove_file(&other);
+        }
+    }
+    let body = serde_json::to_vec(&json!({
+        "version": PEER_RECORD_VERSION,
+        "purpose": "cloud_agent",
+        "organization_id": target.org_id,
+        "audience": target.endpoint,
+        "issuer": owner.issuer,
+        "parent_subject": owner.subject,
+        "uid": uid,
+        "registration_epoch": epoch,
+        "capabilities": ["cloud_agent.read", "cloud_agent.write"],
+        "record": record,
+    }))?;
+    let tmp = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    file.write_all(&body)?;
+    file.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Refuse a persisted cloud-peer child credential whose recorded
+/// `expires_at` has passed. The platform would refuse that token, so nothing
+/// is derived, sent or read from it; the operator must enroll the peer again.
+fn peer_unexpired(record: &Value) -> Result<()> {
+    let expires_at = record["record"]["expires_at"]
+        .as_u64()
+        .ok_or_else(|| reject("cloud-peer credential is missing its expiry"))?;
+    if expires_at <= now()? {
+        return Err(reject(
+            "the enrolled cloud-peer credential has expired — the operator must enroll this \
+             peer again",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the ONE verified parent recorded for this native source. Peers
+/// never fall back to the current human login: their custody is this record.
+pub fn cloud_agent_peer_owner(
+    target: &RemoteTarget,
+    uid: &str,
+    epoch: i64,
+) -> Result<CliIdentityPin> {
+    let mut found: Option<CliIdentityPin> = None;
+    for (_path, record) in peer_records(&peer_dir(target)?)? {
+        if !peer_matches(&record, target, uid, epoch) {
+            continue;
+        }
+        // The record IS this source's authority: once its recorded expiry has
+        // passed the stored token cannot be used, so no source is derived from
+        // it and nothing is traced upstream. Re-enrollment is the only exit.
+        peer_unexpired(&record)?;
+        let pin = peer_parent(&record)?;
+        if found.as_ref().is_some_and(|seen| seen != &pin) {
+            return Err(reject(
+                "ambiguous cloud-peer enrollment for this native source; re-enroll it \
+                 explicitly under the intended owner",
+            ));
+        }
+        found = Some(pin);
+    }
+    found.ok_or_else(|| {
+        // No record at all is MISSING authority for this source, and the
+        // projection withholds the row and names that reason rather than
+        // failing the page — a page failure would disclose the row's
+        // existence. A present-but-expired or mismatched record stays a
+        // plain refusal: it names a credential the operator must repair.
+        Error::gate_coded(
+            "cloud_agent_authority_missing",
+            "no enrolled cloud-peer credential for this source",
+        )
+    })
+}
+
+fn load_peer(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+    scope: Option<&str>,
+) -> Result<String> {
+    let path = peer_path(target, owner, uid, epoch)?;
+    let record = read_peer_record(&path)
+        .ok_or_else(|| reject("no enrolled cloud-peer credential for this source"))?;
+    if !peer_matches(&record, target, uid, epoch) {
+        return Err(reject("cloud-peer credential does not match this source"));
+    }
+    let parent = peer_parent(&record)?;
+    if parent.issuer != owner.issuer || parent.subject_id != owner.subject {
+        return Err(reject(
+            "cloud-peer credential belongs to a different verified parent owner",
+        ));
+    }
+    // A persisted child credential is only usable while it is unexpired: the
+    // platform would refuse an expired token, so this peer's cloud authority
+    // ends at its recorded `expires_at` instead of being traced upstream.
+    peer_unexpired(&record)?;
+    let scopes = record["capabilities"]
+        .as_array()
+        .ok_or_else(|| reject("cloud-peer credential is missing its granted scopes"))?;
+    if scopes.len() != 2
+        || !["cloud_agent.read", "cloud_agent.write"]
+            .iter()
+            .all(|scope| scopes.iter().any(|value| value.as_str() == Some(*scope)))
+    {
+        return Err(reject(
+            "cloud-peer credential does not carry exactly the cloud-agent scopes",
+        ));
+    }
+    if let Some(scope) = scope {
+        if !scopes.iter().any(|value| value.as_str() == Some(scope)) {
+            return Err(Error::gate_coded(
+                "cloud_agent_scope_revoked",
+                "the enrolled cloud-peer credential does not carry this action's scope",
+            ));
+        }
+    }
+    record["record"]["token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| reject("cloud-peer credential is missing its token"))
+}
+
+/// POST the bridge enrollment call with the saved bridge login (never a
+/// service token). Only the cloud-purpose body is built by the caller.
+pub fn cloud_agent_enroll_post(
+    target: &RemoteTarget,
+    body: &Value,
+) -> Result<(u16, Option<Value>, CliIdentityPin)> {
+    let dir = auth_dir(None).map_err(|_| reject("remote credential directory unavailable"))?;
+    // ONE credential snapshot: the same verified owner and token that prove
+    // the parent also perform the enrollment POST, so a login replaced in
+    // between cannot enroll a child under a different human. Renewal is
+    // cloud-purpose: a cloud-only grant refreshes under its own consent, and
+    // a refusal here is definite (nothing was sent), never `unknown`.
+    let cred = load_credential(&dir, target)?;
+    let cred = cloud_send_credential(&dir, target, cred).map_err(cloud_renewal_refused)?;
+    let pin = identity_of(&cred, target)?;
+    let issuer = pin.issuer.trim_end_matches('/').to_string();
+    post(
+        &issuer,
+        "/v1/hosted-cadence/enroll",
+        &cred.access_token,
+        body,
+        Duration::from_secs(20),
+    )
+    .map(|(status, _, body)| (status, body, pin))
+    .map_err(|_| Error::unknown("cloud-peer enrollment transport failed; outcome unknown"))
+}
+
+/// Whether this exact source has a private enrolled peer credential under
+/// this verified parent. The token is loaded only to validate the record and
+/// immediately dropped.
+pub fn cloud_agent_peer_ready(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+    scope: &str,
+) -> Result<()> {
+    load_peer(target, owner, uid, epoch, Some(scope)).map(|_| ())
+}
+
+/// One contract POST authenticated by an enrolled peer's own credential.
+/// There is no fallback to the current human login: a peer whose own custody
+/// is missing or was re-enrolled under another owner is refused here.
+pub fn cloud_agent_peer_post(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+    path: &str,
+    body: &Value,
+    scope: &str,
+) -> Result<(u16, Option<Value>)> {
+    if !path.starts_with("/__platform/") || path.contains(['\\', '#', '?']) {
+        return Err(reject("cloud-agent contract path is invalid"));
+    }
+    let token = load_peer(target, owner, uid, epoch, Some(scope))?;
+    let origin = target.endpoint.trim_end_matches('/');
+    post(origin, path, &token, body, Duration::from_secs(20))
+        .map(|(status, _, body)| (status, body))
+        .map_err(|_| Error::unknown("cloud-peer transport failed; outcome uncertain"))
+}
+
+/// One bounded POST for the published cloud-agent contract. The saved
+/// credential is loaded, checked against the exact stored org/audience and
+/// never returned; only the HTTP status and parsed JSON leave this function.
+/// The caller supplies the contract path (a single published constant) and
+/// the credential is never placed in a prompt, argument or response.
+pub fn cloud_agent_post(
+    target: &RemoteTarget,
+    path: &str,
+    body: &Value,
+    scope: &str,
+) -> Result<(u16, Option<Value>)> {
+    if !path.starts_with("/__platform/") || path.contains(['\\', '#', '?']) || path.len() > 200 {
+        return Err(reject("cloud-agent contract path is invalid"));
+    }
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    // The scope refusal is decided on the saved login before custody touches
+    // the issuer, so a narrowed grant is a revoked scope (nothing sent), not
+    // a failed renewal. The target pins the verified owner, so a login
+    // replaced between the daemon's early check and this request is refused
+    // here instead of being charged under the new human.
+    let cred = load_credential(&dir, target)?;
+    if !cred.capabilities.iter().any(|cap| cap == scope) {
+        return Err(Error::gate_coded(
+            "cloud_agent_scope_revoked",
+            "this saved login does not carry the action's cloud-agent scope",
+        ));
+    }
+    // CAD-1853: the access token lives 300 s, so custody rotates the saved
+    // cloud consent here, under its own purpose and the same source lock,
+    // whenever renewal is due. The action's scope was just proven on this
+    // login, and renewal can only return the identical capability set, so the
+    // token sent is admitted for the same action. A cloud-only grant never
+    // reaches the CLI purpose.
+    let cred = cloud_send_credential(&dir, target, cred).map_err(|error| {
+        if scope == crate::cloud_agent::SCOPE_READ {
+            cloud_renewal_withheld(error)
+        } else {
+            cloud_renewal_refused(error)
+        }
+    })?;
+    // The saved audience is an origin without a trailing slash; normalize so
+    // one slash joins it to the contract path (never `//__platform/...`).
+    let origin = target.endpoint.trim_end_matches('/');
+    post(
+        origin,
+        path,
+        &cred.access_token,
+        body,
+        Duration::from_secs(20),
+    )
+    .map(|(status, _, body)| (status, body))
+    .map_err(|error| match error {
+        // A transport failure may happen after the request reached the
+        // server (a queued turn). Never a rejection and never a retry.
+        Error::Internal(_) | Error::Rejected(_) => Error::unknown(
+            "cloud-agent transport failed before an answer — the remote outcome is unknown",
+        ),
+        other => other,
+    })
+}
+
 /// Revoke one remote device/workspace session before removing its protected
 /// local authority. A failed or offline issuer request leaves the record intact.
 pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
@@ -1920,6 +6060,13 @@ pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
         .issuer
         .as_deref()
         .ok_or_else(|| reject("renewable session issuer missing"))?;
+    let unknown = || {
+        Error::unknown(format!(
+            "remote revocation of session {} for org {} is unknown; local authority is retained. \
+             Reconcile by retrying `cadence auth logout --org {}` with this same saved session",
+            session.session_id, target.org, target.org
+        ))
+    };
     let (status, body) = crate::remote_enrollment::cli_session_post(
         dir,
         issuer,
@@ -1927,16 +6074,26 @@ pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
         &session.refresh_token,
         serde_json::json!({"version":SESSION_VERSION,"session_id":session.session_id}),
         deadline.min(Instant::now() + RENEWAL_WAIT),
-    )?;
+    )
+    .map_err(|error| {
+        if error.kind() == "unknown" {
+            unknown()
+        } else {
+            error
+        }
+    })?;
+    if matches!(status, 400 | 401 | 403) {
+        return Err(reject(
+            "remote device revocation was refused; local authority retained",
+        ));
+    }
     if status != 200
         || !exact_object(&body, &["version", "status", "session_id"])
         || body["version"] != SESSION_VERSION
         || body["status"] != "revoked"
         || body["session_id"] != session.session_id
     {
-        return Err(reject(
-            "remote device revocation was not confirmed; local authority retained",
-        ));
+        return Err(unknown());
     }
     let path = dir.join(format!("cli-{}.json", target.org));
     let meta = fs::symlink_metadata(&path)?;
@@ -1982,6 +6139,83 @@ pub fn cli_material_until(
     })
 }
 
+/// CAD-2286: `artifact submit <id>` on a hosted org. It asks `document_types`
+/// first, so an unavailable lifecycle is named as such
+/// ([`document_lifecycle_unavailable`]) and a 404 from the submit itself can
+/// only mean the file. Both calls ride a managed session's agent credential.
+///
+/// The probe and the submit are two calls, so the lifecycle can be turned off
+/// between them. The submit then answers 404 `not_found` and is reported as no
+/// such file; nothing was submitted, and running the command again names the
+/// unavailable lifecycle. The window is one round trip, so it is accepted
+/// rather than closed.
+pub fn submit_document(
+    target: &RemoteTarget,
+    id: &str,
+    deadline: Instant,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let session = agent_credential::bound_session();
+    submit_document_in(
+        target,
+        id,
+        deadline,
+        wake_timeout,
+        &dir,
+        session.as_deref(),
+        note,
+        std::thread::sleep,
+    )
+}
+
+/// [`submit_document`] with the credential dir, the managed session and the
+/// sleep injectable, so a test drives the real order.
+#[allow(clippy::too_many_arguments)]
+fn submit_document_in(
+    target: &RemoteTarget,
+    id: &str,
+    deadline: Instant,
+    wake_timeout: u64,
+    dir: &Path,
+    agent: Option<&AgentSlot>,
+    note: impl Fn(&str),
+    sleep: impl Fn(Duration),
+) -> Result<Value> {
+    let call = |verb: &str, arguments: Map<String, Value>| {
+        call_verb_until_retry(
+            target,
+            verb,
+            arguments,
+            deadline,
+            wake_timeout,
+            dir,
+            true,
+            agent,
+            &note,
+            &sleep,
+        )
+    };
+    // The probe decides availability only; its body is not read. What proves
+    // the submit is the submit's own receipt (`document_submit_receipt`).
+    if let RemoteAnswer::Conflict(_) = call("document_types", Map::new())? {
+        return Err(reject(
+            "remote read answered a conflict; nothing was submitted",
+        ));
+    }
+    let mut arguments = Map::new();
+    arguments.insert("id".into(), json!(id));
+    match call("document_submit", arguments)? {
+        RemoteAnswer::Ok(body) => Ok(body),
+        RemoteAnswer::Conflict(_) => Err(reject(
+            "remote submit answered a conflict; nothing was submitted",
+        )),
+    }
+}
+
 /// Execute within the command-owned deadline. Continuations reuse it rather
 /// than starting a fresh wake budget for each range.
 pub fn call_verb(
@@ -1995,13 +6229,41 @@ pub fn call_verb(
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
-    call_verb_until(
+    let session = agent_credential::bound_session();
+    call_verb_until_retry(
         target,
         verb,
         arguments,
         deadline,
         wake_timeout,
         &dir,
+        true,
+        session.as_deref(),
+        note,
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_verb_for_slot(
+    dir: &Path,
+    target: &RemoteTarget,
+    verb: &str,
+    arguments: Map<String, Value>,
+    deadline: Instant,
+    wake_timeout: u64,
+    agent: &AgentSlot,
+    note: impl Fn(&str),
+) -> Result<RemoteAnswer> {
+    call_verb_until_retry(
+        target,
+        verb,
+        arguments,
+        deadline,
+        wake_timeout,
+        dir,
+        true,
+        Some(agent),
         note,
         std::thread::sleep,
     )
@@ -2056,6 +6318,7 @@ fn call_verb_until(
         wake_timeout,
         dir,
         true,
+        None,
         note,
         sleep,
     )
@@ -2077,6 +6340,7 @@ pub(crate) fn call_bounded(
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
+    let session = agent_credential::bound_session();
     call_verb_until_retry(
         target,
         verb,
@@ -2085,9 +6349,371 @@ pub(crate) fn call_bounded(
         wake_timeout,
         &dir,
         retry_wake,
+        session.as_deref(),
         note,
         std::thread::sleep,
     )
+}
+
+/// CAD-2101: a profile write's 2xx must carry a `profile` object with a
+/// profile id (the named one, for an update) and a numeric revision.
+fn profile_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
+    let Some(profile) = receipt.get("profile") else {
+        return false;
+    };
+    let id = profile.get("id").and_then(Value::as_str);
+    let named = if verb == "agent_profile_update" {
+        id.is_some() && id == arguments.get("id").and_then(Value::as_str)
+    } else {
+        id.is_some_and(|id| !id.is_empty())
+    };
+    named && profile.get("revision").is_some_and(Value::is_u64)
+}
+
+/// CAD-2396: the board names why it refused a package, and the reason is the
+/// fix, so it is shown. `refusal_fields` keeps only a safe lowercase code; no
+/// package text is ever echoed.
+fn skill_refusal(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    reason: Option<&str>,
+) -> Option<Error> {
+    if !matches!(verb, "workspace_skill_check" | "workspace_skill_draft")
+        || code != Some("skill_refused")
+    {
+        return None;
+    }
+    let reason = reason.unwrap_or("unnamed");
+    Some(Error::invalid(
+        "skill_refused",
+        format!(
+            "the board refused the package: {reason} (skill_refused, HTTP {status}). Fix the \
+             package and run `workspace-skill check` again. Nothing was written"
+        ),
+    ))
+}
+
+/// CAD-2396: a workspace-skill write's 2xx names the skill it wrote. A draft
+/// carries the revision it saved; an approve carries exactly the approved
+/// revision and digest that were asked for; a revoke carries no approval.
+fn skill_receipt_correlates(verb: &str, reply: &Value, arguments: &Map<String, Value>) -> bool {
+    // A delete answers `{name, deleted: true}` for exactly the skill it removed.
+    if verb == "workspace_skill_delete" {
+        return arguments.get("name").and_then(Value::as_str).is_some()
+            && reply.get("name") == arguments.get("name")
+            && reply.get("deleted") == Some(&Value::Bool(true));
+    }
+    let Some(skill) = reply.get("skill") else {
+        return false;
+    };
+    let name = arguments.get("name").and_then(Value::as_str);
+    if name.is_none() || skill.get("name").and_then(Value::as_str) != name {
+        return false;
+    }
+    match verb {
+        "workspace_skill_draft" => reply.get("revision").is_some_and(Value::is_u64),
+        "workspace_skill_approve" => {
+            let approved = skill.get("approved");
+            approved.and_then(|a| a.get("revision")) == arguments.get("revision")
+                && approved.and_then(|a| a.get("digest")) == arguments.get("digest")
+                && arguments.contains_key("revision")
+        }
+        "workspace_skill_revoke" => skill.get("approved").is_some_and(Value::is_null),
+        _ => false,
+    }
+}
+
+/// CAD-2101: a tenant board that predates the profile verbs answers
+/// `501 not_implemented` before it reads anything. Say to update the board,
+/// never that coordination is unavailable. A newer tenant behind an older
+/// control answers a bare `400 invalid_request`, which a bad value gets too,
+/// so that case is left to the verb's own refusal text.
+fn profile_board_too_old(verb: &str, status: u16) -> Option<Error> {
+    if !(verb.starts_with("agent_profile_") || verb.starts_with("workspace_skill_"))
+        || status != 501
+    {
+        return None;
+    }
+    let nothing = if mutating_cli_verb(verb) {
+        "Nothing was written"
+    } else {
+        "Nothing was read"
+    };
+    Some(Error::invalid(
+        "not_implemented",
+        format!(
+            "this workspace's board predates `{verb}` (HTTP {status}, not_implemented) — update \
+             the board first, then use this client. {nothing}"
+        ),
+    ))
+}
+
+/// CAD-2240: a board that predates `project_timeline` answers `501
+/// not_implemented`; an older control relay rejects the unknown verb name as
+/// `400 invalid_request`/`unknown_verb`. Both are a release-order problem, not
+/// an outage. A current board also answers 400 to a bad cursor, so a 400 only
+/// counts when no `--before` was sent; the client validates the key, kinds
+/// and `--since` range locally, the inputs a current board answers 400 to.
+fn timeline_board_too_old(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<String> {
+    if verb != "project_timeline" {
+        return None;
+    }
+    let unknown_verb = status == 400
+        && matches!(code, Some("invalid_request" | "unknown_verb"))
+        && !arguments.contains_key("before");
+    if status != 501 && !unknown_verb {
+        return None;
+    }
+    Some(format!(
+        "this board cannot serve the project timeline yet (HTTP {status}{}) — update the board \
+         first, then use this client. Nothing was read",
+        code.map_or(String::new(), |c| format!(", {c}"))
+    ))
+}
+
+/// CAD-2260: a hosted tenant board serves the wiki's text `write`, `read` and
+/// `enumerate`, but not the `wiki cp` transfer operations (CAD-914). It answers
+/// `job_status` with `501 not_implemented`, and refuses a `write` that carries
+/// `transfer` at its argument check with `400 invalid_request`. Neither is an
+/// outage or a mistake in the command, so say the board does not serve the
+/// copy and name the verbs it does serve.
+///
+/// Matched by operation, and only the ones a copy opens with: `begin` (an
+/// import), an `export` that carries no `rev` (planning; the per-entry byte
+/// reads always pin one), and `status` (what `--resume` reads first). A board
+/// that serves transfers also answers 400 to a bad chunk or receipt, and a
+/// refusal after part of a copy moved is not proof that nothing did, so
+/// `chunk`, `apply`, `finish` and a pinned `export` keep the decoded refusal.
+/// A 400 counts on `begin` alone, whose manifest this client checked before
+/// sending it. `status` is also read after `begin` and by `--wait-index`, so
+/// it claims only that nothing was read.
+fn wiki_copy_unserved(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<Error> {
+    let transfer = arguments.get("transfer")?;
+    let op = transfer.get("op").and_then(Value::as_str)?;
+    let outcome = match (verb, op, status, code) {
+        ("write", "begin", 400, Some("invalid_request")) | ("write", "begin", 501, _) => "copied",
+        ("job_status", "export", 501, _) if transfer.get("rev").is_none() => "copied",
+        ("job_status", "status", 501, _) => "read",
+        _ => return None,
+    };
+    // Echo only a code this client names itself, never other board text.
+    let shown = match code {
+        Some(known @ ("invalid_request" | "not_implemented")) => format!(", {known}"),
+        _ => String::new(),
+    };
+    Some(Error::invalid(
+        "not_implemented",
+        format!(
+            "this workspace's board does not serve `wiki cp` (HTTP {status}{shown}): it predates \
+             transfer support, so the board has to be updated first. Until then copy one page at \
+             a time: `wiki put <path> --file <file>` writes a text page, `wiki upload` sends a \
+             binary file and `wiki cat` reads a page. Nothing was {outcome}"
+        ),
+    ))
+}
+
+/// One refusal a board that serves `wiki cp` (AOS-566) sends for a transfer
+/// operation, and the sentence this client prints for it.
+struct WikiCopyRefusal {
+    status: u16,
+    code: &'static str,
+    /// The transfer `op`s this row answers; empty answers every op.
+    ops: &'static [&'static str],
+    text: &'static str,
+}
+
+/// CAD-2261/CAD-2271: the one list of a hosted board's own transfer
+/// refusals. [`wiki_copy_refusal`] prints from it and
+/// [`is_wiki_copy_refusal`] trusts only its codes, so the two cannot drift.
+///
+/// CAD-2275: every row is a 4xx, a refusal the board gives before it acts.
+/// [`wiki_copy_refusal`] runs before the after-forward 5xx classification,
+/// so a 5xx row would be trusted as "nothing changed" when the write may
+/// have landed. A test holds this.
+const WIKI_COPY_REFUSALS: &[WikiCopyRefusal] = &[
+    WikiCopyRefusal {
+        status: 409,
+        code: "destination_changed",
+        ops: &[],
+        text: "a file this copy would write is already on the board with other content, changed \
+               after it was read, or has a folder in its place, so the board refused this copy \
+               and wrote nothing new. Copy again with `--update` to replace a changed file. \
+               `--update` cannot replace a folder: to copy a file into a folder, name the file \
+               inside it (`wiki:<folder>/<name>`)",
+    },
+    WikiCopyRefusal {
+        status: 413,
+        code: "payload_too_large",
+        ops: &[],
+        text: "a file in this copy, or the copy as a whole, is larger than this board accepts \
+               through `wiki cp`, so it refused this copy and wrote nothing new. Send a large \
+               binary file on its own with `wiki upload`, split a long page, or copy fewer files \
+               at a time",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "job_conflict",
+        ops: &[],
+        text: "the board already holds this job id for a different copy (another source, \
+               destination or member), so it refused the job and wrote nothing new. Copy again \
+               without `--resume` to start a new job",
+    },
+    WikiCopyRefusal {
+        status: 400,
+        code: "manifest_invalid",
+        ops: &[],
+        text: "the board does not accept this copy's file list: a name, path, kind or size is \
+               outside what it allows, for example a path longer than its limit. It wrote \
+               nothing new; rename or leave out that file and copy again",
+    },
+    WikiCopyRefusal {
+        status: 400,
+        code: "transfer_invalid",
+        ops: &[],
+        text: "the board refused this request as malformed or out of range and changed nothing. \
+               If it repeats, update this Cadence client; the board may need an update too",
+    },
+    WikiCopyRefusal {
+        status: 404,
+        code: "not_found",
+        ops: &["export"],
+        text: "the board has no readable page or folder at that path for this login",
+    },
+    WikiCopyRefusal {
+        status: 404,
+        code: "not_found",
+        ops: &["status"],
+        text: "the board has no such copy job for this login and destination: it may have been \
+               removed after being left idle, started for another destination, or belong to \
+               someone else. Copy again without `--resume`",
+    },
+    // Mid-job, the job wrapper adds the job id and what to try next.
+    WikiCopyRefusal {
+        status: 404,
+        code: "not_found",
+        ops: &["chunk", "apply", "finish"],
+        text: "the board no longer has this copy job for this login",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "stage_incomplete",
+        ops: &[],
+        text: "the board has not received all of this file's bytes yet, so the rest still has \
+               to be sent",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "entries_pending",
+        ops: &[],
+        text: "the board still has files in this job that were not applied",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "chunk_conflict",
+        ops: &[],
+        text: "the bytes sent for this file differ from what the board already holds for it, \
+               usually because two runs of the same job overlapped or the local file changed",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "job_closed",
+        ops: &[],
+        text: "this copy job is already finished",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "entry_decided",
+        ops: &[],
+        text: "the board already settled this file in this job",
+    },
+    WikiCopyRefusal {
+        status: 409,
+        code: "revision_changed",
+        ops: &[],
+        text: "the file changed on the board while it was being copied out; copy it out again \
+               with `--update` to replace what was already written",
+    },
+];
+
+/// CAD-2271: whether `code` is a hosted board's own transfer refusal, that
+/// is, one with a row in [`WIKI_COPY_REFUSALS`]. On the hosted path only
+/// [`wiki_copy_refusal`] gives a transfer error one of these codes, and the
+/// board answered it before it changed anything.
+pub(crate) fn is_wiki_copy_refusal(code: &str) -> bool {
+    WIKI_COPY_REFUSALS.iter().any(|row| row.code == code)
+}
+
+/// Every code with a row in [`WIKI_COPY_REFUSALS`], for the copy client's
+/// tests.
+#[cfg(test)]
+pub(crate) fn wiki_copy_refusal_codes() -> impl Iterator<Item = &'static str> {
+    WIKI_COPY_REFUSALS.iter().map(|row| row.code)
+}
+
+/// CAD-2261: a board that serves `wiki cp` (AOS-566) refuses a transfer
+/// operation with a code of its own. Say what happened and what to do, keep
+/// the board's code as the error's code, and never show the board's text.
+///
+/// Only a request that carries `transfer` is mapped: a text `wiki put` shares
+/// the `write` verb, and the board's request cap answers it with
+/// `413 payload_too_large` too. A transfer-serving board never answers a
+/// transfer operation with `invalid_request` or 501, so this never meets the
+/// "does not serve" answers of [`wiki_copy_unserved`], which runs first. The
+/// board's limits are its own: no number is named here.
+fn wiki_copy_refusal(
+    verb: &str,
+    status: u16,
+    code: Option<&str>,
+    arguments: &Map<String, Value>,
+) -> Option<Error> {
+    if !matches!(verb, "write" | "job_status") {
+        return None;
+    }
+    let op = arguments
+        .get("transfer")?
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let code = code?;
+    let row = WIKI_COPY_REFUSALS.iter().find(|row| {
+        row.status == status && row.code == code && (row.ops.is_empty() || row.ops.contains(&op))
+    })?;
+    Some(Error::invalid(
+        row.code,
+        format!("{} ({}, HTTP {status})", row.text, row.code),
+    ))
+}
+
+/// Whether a ticket message write's 2xx names the write that was asked for.
+/// The ticket id can come back in its stored case.
+fn ticket_receipt_correlates(verb: &str, receipt: &Value, arguments: &Map<String, Value>) -> bool {
+    let sent = |key: &str| arguments.get(key).and_then(Value::as_str);
+    let got = |key: &str| receipt.get(key).and_then(Value::as_str);
+    let same_ticket = sent("id")
+        .zip(got("id"))
+        .is_some_and(|(sent, got)| sent.eq_ignore_ascii_case(got));
+    same_ticket
+        && if verb == "issue_message_send" {
+            sent("message").is_some()
+                && got("message") == sent("message")
+                && got("to") == sent("to")
+                && got("state") == Some("stored")
+        } else {
+            sent("role").is_some()
+                && got("role") == sent("role")
+                && receipt.get("read_through").is_some_and(Value::is_u64)
+        }
 }
 
 /// CAD-1568 revision: a `message_send` 2xx is a usable receipt only when it
@@ -2096,8 +6722,8 @@ pub(crate) fn call_bounded(
 /// - `message` — the caller-chosen stable id echoed exactly (the
 ///   reconciliation key a lost reply is retried under);
 /// - `state` — a known lifecycle state and `duplicate` — a real bool;
-/// - `alias` — the requested canonical recipient echoed exactly (only
-///   `master` is ever requested);
+/// - `alias` — the requested recipient echoed (case-insensitive for
+///   specialist profile names alongside canonical `master`);
 /// - `workspace_id` — the immutable organization id for this destination
 ///   (the `org_id` pinned at login, never the registry slug);
 /// - `sender_subject` — the authenticated human's canonical subject; when
@@ -2115,7 +6741,7 @@ fn send_receipt_correlates(
     target: &RemoteTarget,
     cred: &Credential,
 ) -> bool {
-    let bound = |key: &str| {
+    let exact = |key: &str| {
         arguments
             .get(key)
             .and_then(Value::as_str)
@@ -2123,12 +6749,24 @@ fn send_receipt_correlates(
                 !expected.is_empty() && receipt.get(key).and_then(Value::as_str) == Some(expected)
             })
     };
-    bound("message")
-        && bound("alias")
+    let alias_matches = arguments
+        .get("alias")
+        .and_then(Value::as_str)
+        .is_some_and(|expected| {
+            !expected.is_empty()
+                && receipt
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .is_some_and(|got| !got.is_empty() && expected.eq_ignore_ascii_case(got))
+        });
+    exact("message")
+        && alias_matches
         && matches!(
             receipt.get("state").and_then(Value::as_str),
             Some(
                 "queued"
+                    | "delivered"
+                    | "answered"
                     | "submitting"
                     | "running"
                     | "completed"
@@ -2153,6 +6791,80 @@ fn send_receipt_correlates(
             .is_some_and(|s| !s.is_empty())
 }
 
+fn ack_receipt_correlates(
+    receipt: &Value,
+    arguments: &Map<String, Value>,
+    target: &RemoteTarget,
+) -> bool {
+    let alias_matches = arguments
+        .get("alias")
+        .and_then(Value::as_str)
+        .is_some_and(|expected| {
+            !expected.is_empty()
+                && receipt
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .is_some_and(|got| !got.is_empty() && expected.eq_ignore_ascii_case(got))
+        });
+    alias_matches
+        && receipt.get("workspace_id").and_then(Value::as_str) == Some(target.org_id.as_str())
+        && receipt.get("acked_count").and_then(Value::as_u64).is_some()
+        && receipt
+            .get("acked_seqs")
+            .and_then(Value::as_array)
+            .is_some_and(|seqs| {
+                seqs.iter()
+                    .all(|seq| seq.as_u64().is_some_and(|value| value > 0))
+            })
+}
+
+/// A hosted issue-id prefix as the registry stores it: 1-16 ASCII
+/// letters/digits starting with a letter (the board normalizes case, so the
+/// shape is what matters; the caller's own spelling is compared
+/// case-insensitively).
+fn valid_hosted_prefix(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16
+        && value.starts_with(|c: char| c.is_ascii_alphabetic())
+        && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// CAD-1999: a `project_new` 2xx is usable only when it carries the
+/// requested project back — a `project` object whose `key` and `name` are
+/// exactly the ones sent, and whose `prefix` is a valid stored issue-id
+/// prefix that matches the requested `--prefix` case-insensitively (when
+/// one was sent). Anything less (a `null` or `{ok:true}` body, a foreign
+/// project, a missing/invalid prefix or another project's prefix) cannot
+/// establish that THIS create landed under the intended namespace, so the
+/// outcome is unknown and is reconciled with `issue project ls`, never
+/// called a failure and never replayed blindly.
+fn project_receipt_correlates(receipt: &Value, arguments: &Map<String, Value>) -> bool {
+    let project = receipt.get("project").and_then(Value::as_object);
+    let bound = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|expected| {
+                !expected.is_empty()
+                    && project
+                        .and_then(|fields| fields.get(key))
+                        .and_then(Value::as_str)
+                        == Some(expected)
+            })
+    };
+    let prefix_ok = project
+        .and_then(|fields| fields.get("prefix"))
+        .and_then(Value::as_str)
+        .is_some_and(|actual| {
+            valid_hosted_prefix(actual)
+                && arguments
+                    .get("prefix")
+                    .and_then(Value::as_str)
+                    .is_none_or(|requested| actual.eq_ignore_ascii_case(requested))
+        });
+    project.is_some() && bound("key") && bound("name") && prefix_ok
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_verb_until_retry(
     target: &RemoteTarget,
@@ -2162,6 +6874,7 @@ fn call_verb_until_retry(
     wake_timeout: u64,
     dir: &Path,
     retry_wake: bool,
+    agent: Option<&AgentSlot>,
     note: impl Fn(&str),
     sleep: impl Fn(Duration),
 ) -> Result<RemoteAnswer> {
@@ -2185,6 +6898,11 @@ fn call_verb_until_retry(
         wiki_transfer_shape(verb, &arguments)?;
     }
     team_argument_shape(verb, &arguments)?;
+    // What this call can change, and the read that reconciles an answer which
+    // does not prove the effect. Fixed for the whole call (the wake retry only
+    // ever follows a pre-forward `waking` verdict), so a lost or unusable
+    // answer is classified once, the same way on every surface.
+    let effect = call_effect(surface, verb, &arguments);
     let budget_over = || -> Error {
         Error::busy_coded(
             "waking",
@@ -2198,9 +6916,57 @@ fn call_verb_until_retry(
     if wake_timeout == 0 {
         return Err(budget_over());
     }
+    // CAD-2149: a managed session's hosted verbs ride its own credential.
+    // `None` means the member's login, as for every human shell.
+    let mut on_agent = agent_credential::applies(agent, target, surface, verb);
+    let keyed_create = matches!(surface, Surface::Cli)
+        && verb == "issue_new"
+        && arguments.contains_key("request_id");
+    let identity_changed = || {
+        reject(
+            "retryable issue creation requires the same acting identity; this attempt was not \
+             run. If an earlier result is unknown, inspect the board before trying from a \
+             different agent or login",
+        )
+    };
+    if keyed_create && agent.is_some() && on_agent.is_none() {
+        return Err(identity_changed());
+    }
+    let require_agent = verb == "platform_call" && agent.is_some();
+    if require_agent && on_agent.is_none() {
+        return Err(agent_credential::platform_agent_required());
+    }
+    let mut reissued = false;
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
-        let cred = renewed_credential(dir, target, deadline)?;
+        let (agent_cred, from_cache) = match on_agent {
+            Some(slot) => {
+                match agent_credential::bearer(
+                    slot,
+                    target,
+                    dir,
+                    deadline,
+                    &note,
+                    !(keyed_create || require_agent),
+                )? {
+                    Some((credential, source)) => (
+                        Some(credential),
+                        matches!(source, agent_credential::Source::Cached),
+                    ),
+                    None if keyed_create => return Err(identity_changed()),
+                    None if require_agent => {
+                        return Err(agent_credential::platform_agent_required());
+                    }
+                    None => (None, false),
+                }
+            }
+            None => (None, false),
+        };
+        let using_agent = agent_cred.is_some();
+        let cred = match agent_cred {
+            Some(cred) => cred,
+            None => renewed_credential(dir, target, deadline)?,
+        };
         // A login that records its capabilities must hold the wiki scope the
         // action needs; a legacy login with none is left to the server's check.
         if matches!(surface, Surface::Wiki) && !cred.capabilities.is_empty() {
@@ -2222,6 +6988,11 @@ fn call_verb_until_retry(
         // settings.* scope; `master_status` needs settings.read. A login
         // without the needed scope is refused here, before a request is
         // built — never downgraded to another verb or the local org.
+        //
+        // CAD-2165: the managed refusal for these owner-class verbs lives in
+        // `cli::remote`, which runs before this call. It is not repeated here:
+        // duplicating it implied a second authority, and the scope checks
+        // below still refuse an agent credential that lacks the operation.
         if verb == REMOTE_SETTINGS_VERB && !cred.capabilities.is_empty() {
             let operation = arguments
                 .get("operation")
@@ -2254,8 +7025,198 @@ fn call_verb_until_retry(
                 "remote command deadline elapsed during session renewal",
             ));
         }
-        let (status, retry_after, body) =
-            call_once(target, &cred, surface, verb, &arguments, deadline)?;
+        let answered = call_once(target, &cred, surface, verb, &arguments, deadline);
+        // A tenant that predates the agent identity refuses the credential with
+        // exactly this code, before it forwards or runs anything. That one
+        // answer keeps the login; every other refusal is the agent's own.
+        let refused_agent = match (&answered, on_agent) {
+            (Err(error), Some(_)) if using_agent => {
+                error.code() == Some(agent_credential::HUMAN_SESSION_REQUIRED)
+            }
+            (Ok((403, _, body)), Some(_)) if using_agent => {
+                refusal_fields(body.as_ref()).0 == Some(agent_credential::HUMAN_SESSION_REQUIRED)
+            }
+            _ => false,
+        };
+        if refused_agent {
+            if keyed_create {
+                return Err(identity_changed());
+            }
+            if require_agent {
+                return Err(Error::invalid(
+                    agent_credential::HUMAN_SESSION_REQUIRED,
+                    "This platform action requires a person. The member login was not used for the action.",
+                ));
+            }
+            if let Some(slot) = on_agent.take() {
+                slot.keep_login(&note, "this workspace has not been updated to accept it");
+            }
+            continue;
+        }
+        // CAD-2165: a cached bearer the board no longer accepts (rotation or
+        // revocation) is dropped and re-minted once. A freshly minted bearer is
+        // the agent's own refusal and stays final, and a 401 is answered before
+        // the verb runs, so the retry cannot double-apply a write.
+        let rejected_cached = using_agent
+            && from_cache
+            && !reissued
+            && match &answered {
+                Ok((401, ..)) => true,
+                Err(error) => error.code() == Some(CREDENTIAL_REJECTED),
+                _ => false,
+            };
+        if rejected_cached {
+            if let Some(slot) = on_agent {
+                slot.invalidate();
+            }
+            reissued = true;
+            continue;
+        }
+        let (status, retry_after, mut body) = answered?;
+        if effect.is_mutation() {
+            if let Some(code) = explicit_mutation_uncertainty(body.as_ref()) {
+                return Err(Error::unknown(format!(
+                    "the remote action may already have committed \
+                     (outcome_unknown, HTTP {status}, reason {code}); {}. \
+                     Nothing was retried; saved credentials are kept",
+                    effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                )));
+            }
+        }
+        let platform_operation = (verb == "platform_call")
+            .then(|| arguments.get("operation").and_then(Value::as_str))
+            .flatten();
+        if (200..300).contains(&status) {
+            match platform_operation {
+                Some("call")
+                    if !body.as_ref().is_some_and(|answer| {
+                        answer.get("ok").and_then(Value::as_bool) == Some(true)
+                            && answer.get("data").is_some_and(Value::is_object)
+                    }) =>
+                {
+                    if let Some(reconcile) = effect.reconciliation() {
+                        return Err(Error::unknown(format!(
+                            "remote tool returned no usable receipt — {reconcile}"
+                        )));
+                    }
+                    return Err(reject("remote tool returned no usable response"));
+                }
+                Some("call") if body.as_ref().is_some_and(contains_qr_key) => {
+                    return Err(reject(
+                        "refused unsafe app response containing pairing QR material",
+                    ));
+                }
+                Some("connected_read")
+                    if !body.as_ref().is_some_and(|answer| {
+                        crate::platform::agenticos_provider::valid_connected_read_receipt(answer)
+                            && answer.pointer("/data/effect").and_then(Value::as_str)
+                                == Some("read")
+                            && answer.pointer("/data/price").is_some()
+                            && answer
+                                .pointer("/data/result")
+                                .is_some_and(|result| !result.is_null())
+                    }) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connected read returned no usable settled receipt — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
+                Some("connected_effect")
+                    if !body.as_ref().is_some_and(connected_effect_stage_answer) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connected-effect stage returned no usable answer — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
+                Some("status")
+                    if !body.as_ref().is_some_and(|answer| {
+                        answer.get("ok").and_then(Value::as_bool) == Some(true)
+                            && answer.get("data").is_some_and(Value::is_object)
+                            && matches!(
+                                answer.pointer("/data/outcome").and_then(Value::as_str),
+                                Some("recorded" | "unrecorded" | "unknown")
+                            )
+                            && arguments
+                                .get("key")
+                                .is_none_or(|key| answer.pointer("/data/key") == Some(key))
+                            && arguments
+                                .get("jobId")
+                                .is_none_or(|job| answer.pointer("/data/job/id") == Some(job))
+                    }) =>
+                {
+                    return Err(reject(
+                        "the remote platform status lookup returned no usable answer",
+                    ));
+                }
+                Some("artifact")
+                    if !body.as_ref().is_some_and(|answer| {
+                        answer.get("ok").and_then(Value::as_bool) == Some(true)
+                            && answer.get("data").is_some_and(Value::is_object)
+                    }) =>
+                {
+                    return Err(reject(
+                        "the remote platform artifact read returned no usable window",
+                    ));
+                }
+                Some("tools")
+                    if !body
+                        .as_ref()
+                        .and_then(|answer| answer.get("tools"))
+                        .is_some_and(Value::is_array) =>
+                {
+                    return Err(reject("the remote tool catalog is unavailable"));
+                }
+                Some("connection_providers")
+                    if !body.as_ref().is_some_and(connection_providers_answer) =>
+                {
+                    return Err(reject(
+                        "the hosted connection providers answer is incomplete — \
+                         nothing was listed; no empty catalog is reported",
+                    ));
+                }
+                Some("connection_list") if !body.as_ref().is_some_and(connection_list_answer) => {
+                    return Err(reject(
+                        "the hosted connection list answer is incomplete — \
+                         nothing was listed; no empty connection list is reported",
+                    ));
+                }
+                Some("connection_start")
+                    if !body
+                        .as_ref()
+                        .is_some_and(|answer| connection_authorization_url(answer).is_some()) =>
+                {
+                    return Err(Error::unknown(format!(
+                        "remote connection enrollment returned no usable authorization \
+                         link — {}",
+                        effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                    )));
+                }
+                Some(op) if op.starts_with("whatsapp_") => {
+                    if body.as_ref().is_some_and(contains_qr_key) {
+                        return Err(reject(
+                            "refused unsafe WhatsApp response containing pairing QR material",
+                        ));
+                    }
+                    let Some(projected) = body
+                        .as_ref()
+                        .and_then(|raw| project_whatsapp_connection_answer(op, raw))
+                    else {
+                        if let Some(reconcile) = effect.reconciliation() {
+                            return Err(Error::unknown(format!(
+                                "remote WhatsApp lifecycle call returned no usable allowlisted answer — {reconcile}"
+                            )));
+                        }
+                        return Err(reject(
+                            "the hosted WhatsApp response is incomplete — nothing was emitted",
+                        ));
+                    };
+                    body = Some(projected);
+                }
+                _ => {}
+            }
+        }
         // A successful status without the complete, correlated enqueue
         // receipt cannot establish whether — or as whose message, in which
         // workspace and conversation — the mutation landed. Unknown, never
@@ -2270,42 +7231,465 @@ fn call_verb_until_retry(
                 "remote send returned no usable correlated receipt — enqueue outcome is unknown",
             ));
         }
-        let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
-        // CAD-1568: a 5xx carrying a worker `state` is a pre-forward
-        // verdict (waking handled below, wake_failed/unavailable = nothing
-        // ran). A 5xx with no `state` may come from the container *after*
-        // the send was attempted — outcome unknown, reconcile by
-        // `arguments.message`, never a blind resubmission.
-        let send_outcome_unknown = verb == "message_send"
-            && status >= 500
-            && body.as_ref().and_then(|b| b["state"].as_str()).is_none();
-        // A team mutation is answered by the Worker itself, in the same D1
-        // batch that records the receipt. A 5xx with no `state` therefore
-        // follows a possible commit: the platform's own explicit
-        // uncertainty codes say so, and a bare one may hide a committed
-        // write behind an unanswerable reply. The board's gate refusal
-        // (`hop: board`) is decided before the verb ran, so it stays a
-        // definite refusal. The platform's explicit uncertainty codes keep
-        // their own decoded message, which names the code.
-        let team_mutation_unknown = team_mutation_verb(verb)
-            && status >= 500
-            && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
-            && !board_gate_refused(body.as_ref())
-            && !matches!(
-                refusal_code.as_deref(),
-                Some("mutation_outcome_uncertain" | "invite_email_uncertain")
-            );
-        let unknown_correlation = refusal_correlation(body.as_ref());
-        match classify(status, retry_after, body) {
-            Verdict::Done(Err(_e)) if team_mutation_unknown => {
-                return Err(ambiguous_mutation_error(status, unknown_correlation));
+        if verb == "message_ack"
+            && (200..300).contains(&status)
+            && !body
+                .as_ref()
+                .is_some_and(|receipt| ack_receipt_correlates(receipt, &arguments, target))
+        {
+            return Err(Error::unknown(format!(
+                "remote inbox ack returned no usable correlated receipt — {RECONCILE_MESSAGE_ACK}"
+            )));
+        }
+        // A 2xx that does not echo this write is not evidence it landed. Reading
+        // it as a refusal invites a new --message and a second stored copy, and
+        // reading it as success claims something nobody saw.
+        if matches!(verb, "issue_message_send" | "issue_messages_read")
+            && (200..300).contains(&status)
+            && !body
+                .as_ref()
+                .is_some_and(|receipt| ticket_receipt_correlates(verb, receipt, &arguments))
+        {
+            return Err(Error::unknown(format!(
+                "the remote answered without a matching receipt — {}",
+                mutation_reconcile(verb).unwrap_or(RECONCILE_UNKNOWN)
+            )));
+        }
+        if verb == "issue_attach" && (200..300).contains(&status) {
+            let expected_id = arguments.get("id").and_then(Value::as_str);
+            let expected_name = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| format!("hosted:{name}"));
+            let encoded = arguments.get("data").and_then(Value::as_str);
+            let expected_size = encoded.filter(|data| data.len() % 4 == 0).and_then(|data| {
+                (data.len() / 4 * 3)
+                    .checked_sub(data.bytes().rev().take_while(|byte| *byte == b'=').count())
+            });
+            let correlated = body.as_ref().is_some_and(|reply| {
+                reply
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .zip(expected_id)
+                    .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+                    && reply.get("artifact").and_then(Value::as_str) == expected_name.as_deref()
+                    && reply.get("size").and_then(Value::as_u64)
+                        == expected_size.map(|size| size as u64)
+                    && expected_id.is_some()
+                    && expected_name.is_some()
+                    && expected_size.is_some()
+            });
+            if !correlated {
+                return Err(Error::unknown(
+                    "remote attachment returned no correlated receipt — outcome is unknown",
+                ));
             }
-            Verdict::Done(Err(e)) if send_outcome_unknown => {
-                return Err(Error::unknown(format!(
-                    "{e} — the send may or may not have been recorded"
+        }
+        if verb == "issue_review" && (200..300).contains(&status) {
+            // The committed verdict must be the one this call asked for: same
+            // artifact, and the digest the tenant verified from storage. A
+            // reply that names anything else is not evidence this verdict
+            // landed, so the outcome stays unknown rather than becoming a
+            // refusal.
+            let correlated = arguments
+                .get("artifact")
+                .and_then(Value::as_str)
+                .zip(arguments.get("digest").and_then(Value::as_str))
+                .zip(arguments.get("decision").and_then(Value::as_str))
+                .is_some_and(|((artifact, digest), decision)| {
+                    body.as_ref()
+                        .and_then(|reply| reply.get("review"))
+                        .is_some_and(|review| {
+                            review.get("artifact").and_then(Value::as_str) == Some(artifact)
+                                && review.get("digest").and_then(Value::as_str) == Some(digest)
+                                && review.get("decision").and_then(Value::as_str) == Some(decision)
+                        })
+                });
+            if !correlated {
+                return Err(Error::unknown(
+                    "remote review returned no correlated receipt — outcome is unknown",
+                ));
+            }
+        }
+        // A 2xx is a success only when it carries a JSON object: an absent,
+        // null or non-object body cannot be a receipt for the write it
+        // answered. The call may have committed, so the outcome is unknown —
+        // never a false success, never a rejection, never a replay. (The
+        // verbs with a required correlated receipt check their own shape
+        // above, before this.)
+        if effect.is_mutation() && (200..300).contains(&status) && !is_object_body(body.as_ref()) {
+            return Err(unusable_success_error(
+                status,
+                effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN),
+            ));
+        }
+        // A 2xx object is a receipt only when it names what this call wrote —
+        // the tenant's own reply contract, mirrored by the native route. A
+        // malformed or foreign receipt cannot prove the write landed, so it is
+        // the same unknown outcome a lost answer is, never a false success.
+        let receipt_missing = effect.is_mutation()
+            && (200..300).contains(&status)
+            && body.as_ref().is_some_and(|reply| match verb {
+                "issue_new" | "issue_comment" | "issue_set" | "issue_link" | "issue_unlink" => {
+                    !issue_receipt_correlates(verb, reply, &arguments)
+                }
+                "project_policy" => !policy_receipt_correlates(reply, &arguments),
+                "project_new" => !project_receipt_correlates(reply, &arguments),
+                "agent_profile_create" | "agent_profile_update" => {
+                    !profile_receipt_correlates(verb, reply, &arguments)
+                }
+                "workspace_skill_draft"
+                | "workspace_skill_approve"
+                | "workspace_skill_revoke"
+                | "workspace_skill_delete" => !skill_receipt_correlates(verb, reply, &arguments),
+                "document_submit" => !document_submit_receipt(reply),
+                "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => {
+                    !team_receipt_correlates(verb, status, reply, &arguments)
+                }
+                REMOTE_SETTINGS_VERB => !settings_receipt_correlates(
+                    arguments
+                        .get("operation")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    reply,
+                    &arguments,
+                ),
+                "write" if matches!(surface, Surface::Wiki) && arguments.contains_key("text") => {
+                    !wiki_write_receipt_correlates(reply, &arguments)
+                }
+                "template_create" | "template_revise" | "template_approve" | "document_create"
+                | "document_export" => !template_receipt_correlates(verb, reply, &arguments),
+                _ => false,
+            });
+        if receipt_missing {
+            return Err(Error::unknown(format!(
+                "remote `{verb}` returned no correlated receipt — outcome is unknown; {}",
+                effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+            )));
+        }
+        let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
+        let refusal_reason = refusal_fields(body.as_ref()).1.map(str::to_owned);
+        // A 5xx with no pre-forward proof may come from the platform *after*
+        // the mutation was attempted: the write may have landed behind an
+        // unanswerable reply, so it is an unknown outcome, never availability
+        // ("retry later") and never a refusal. Only a documented waking
+        // response, the board's gate refusal, a CLI tracker refusal or a
+        // 501 not-implemented are treated as pre-effect.
+        let after_forward = effect.is_mutation()
+            && post_forward_failure(status, body.as_ref(), matches!(surface, Surface::Cli));
+        // A funded platform call may still be in progress or uncertain on
+        // a same-key replay; preserve its dedicated reconciliation guidance.
+        // CAD-2226: an uncertain `connection_start` is the same unresolved
+        // outcome — the one-time link may exist but cannot be read back.
+        let platform_outcome_unknown = effect.is_mutation()
+            && matches!(
+                platform_operation,
+                Some(
+                    "call"
+                        | "connected_read"
+                        | "connection_start"
+                        | "whatsapp_connect"
+                        | "whatsapp_start"
+                        | "whatsapp_stop"
+                        | "whatsapp_disconnect"
+                        | "whatsapp_link"
+                        | "whatsapp_rescope"
+                )
+            )
+            && !board_gate_refused(body.as_ref())
+            && !tracker_unavailable_before_verb(status, body.as_ref())
+            && ((status == 409
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("uncertain" | "idempotency_in_progress")
+                ))
+                || (status >= 500
+                    && status != 501
+                    && body.as_ref().and_then(|b| b["state"].as_str()).is_none()));
+        let unknown_correlation = refusal_correlation(body.as_ref());
+        // CAD-2101: a board without the profile verbs answers 501; say to
+        // update it, not that coordination is unavailable.
+        if let Some(error) = profile_board_too_old(verb, status) {
+            return Err(error);
+        }
+        if let Some(why) = timeline_board_too_old(verb, status, refusal_code.as_deref(), &arguments)
+        {
+            return Err(reject(why));
+        }
+        if let Some(error) = wiki_copy_unserved(verb, status, refusal_code.as_deref(), &arguments) {
+            return Err(error);
+        }
+        // A 409 that carries a `conflict` body stays a checked conflict.
+        let conflict_body = body.as_ref().is_some_and(|b| b.get("conflict").is_some());
+        if !conflict_body {
+            if let Some(error) =
+                wiki_copy_refusal(verb, status, refusal_code.as_deref(), &arguments)
+            {
+                return Err(error);
+            }
+        }
+        let platform_details = if platform_outcome_unknown {
+            platform_error_details(body.as_ref())
+        } else {
+            String::new()
+        };
+        // CAD-2001: a project-scoped gate verb the tenant cannot serve is a
+        // release-order problem, not an availability blip and not "no
+        // evidence". Report it before the generic decoder can call it
+        // retryable. A checked write conflict keeps its own verdict: the call
+        // ran and proved nothing was written.
+        if status == 501
+            && matches!(
+                verb,
+                "issue_message_send" | "issue_messages" | "issue_messages_read" | "message_ack"
+            )
+        {
+            let nothing = if verb == "issue_messages" {
+                "read"
+            } else {
+                "changed"
+            };
+            let command = match verb {
+                "issue_message_send" => "issue say",
+                "issue_messages_read" => "issue messages-read",
+                "message_ack" => "inbox ack",
+                _ => "issue messages",
+            };
+            return Err(Error::invalid(
+                "not_implemented",
+                artifact_tenant_too_old(command, status, nothing),
+            ));
+        }
+        if status == 501 && matches!(verb, "artifact_find" | "artifact_show" | "artifact_read") {
+            let verb = verb.replacen('_', " ", 1);
+            return Err(reject(artifact_tenant_too_old(&verb, status, "read")));
+        }
+        // CAD-2286: availability is decided by the type list alone, and a
+        // submit refusal keeps the store's code.
+        if let Some(error) = document_lifecycle_unavailable(verb, status, body.as_ref())
+            .or_else(|| document_submit_refusal(verb, status, body.as_ref()))
+        {
+            return Err(error);
+        }
+        if status == 501 && is_template_or_document_verb(verb) {
+            let nothing = if matches!(
+                verb,
+                "template_list" | "template_show" | "template_blob_read" | "document_show"
+            ) {
+                "read"
+            } else {
+                "changed"
+            };
+            let command = verb.replacen('_', " ", 1);
+            return Err(Error::invalid(
+                "not_implemented",
+                template_tenant_too_old(&command, status, nothing),
+            ));
+        }
+        if let Some(error) = template_store_refusal(verb, status, body.as_ref()) {
+            return Err(error);
+        }
+        // CAD-2150: a board that predates `include_body` refuses the field as an
+        // invalid request. That is not "the tenant cannot serve the verb": the
+        // plain read still works, so the caller gets a typed code and re-reads
+        // without the field instead of the release-order refusal.
+        if verb == "audit_verdicts_project"
+            && arguments.contains_key("include_body")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                VERDICT_BODY_UNSUPPORTED,
+                "the board does not know `include_body` for verdicts",
+            ));
+        }
+        // CAD-2277: a board that predates `limit` on `issue_ls` refuses the field
+        // as `invalid_request` (400). Surface a typed code so the CLI can retry
+        // once without `limit` and slice locally instead of failing outright.
+        if verb == "issue_ls"
+            && arguments.contains_key("limit")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                ISSUE_LS_LIMIT_UNSUPPORTED,
+                "the board does not know `limit` for `issue ls`",
+            ));
+        }
+        if PROJECT_SCOPED_GATE_VERBS.contains(&verb) || HOSTED_MERGE_GATE_VERBS.contains(&verb) {
+            let checked_conflict = body.as_ref().is_some_and(|b| {
+                b.get("conflict").is_some()
+                    || b.pointer("/error/code").and_then(Value::as_str) == Some("revision_conflict")
+            });
+            if !checked_conflict {
+                if let Some(why) = tenant_cannot_serve(verb, status, body.as_ref()) {
+                    return Err(reject(why));
+                }
+            }
+        }
+        if platform_operation == Some("connected_read")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                "invalid_request",
+                "the connected read was refused: check the input and connection, or update \
+                 the hosted tenant server if it predates connected-read support",
+            ));
+        }
+        // AOS-627: the stage's refusals are named by the board (`not_allowlisted`,
+        // `connection_access_denied`, `capability_unavailable`, ...). The generic
+        // classification drops the code of a 403, 404 or 503, so print it here.
+        // A board that predates the operation refuses it as `invalid_request`.
+        // Only the stage's own pre-effect refusals are definite: 400/403/404/409,
+        // and the two 503 codes the board returns before staging. A 401 keeps its
+        // login remedy, a waking answer keeps its wake path, and any other 5xx
+        // stays an unknown outcome (the row may exist), reconciled by replaying
+        // the same stage.
+        if platform_operation == Some("connected_effect")
+            && !board_gate_refused(body.as_ref())
+            && !tracker_unavailable_before_verb(status, body.as_ref())
+        {
+            let definite = match (status, refusal_code.as_deref()) {
+                (400 | 403 | 404 | 409, Some(code)) => Some(code),
+                (503, Some(code @ ("capability_unavailable" | "authority_unavailable"))) => {
+                    Some(code)
+                }
+                _ => None,
+            };
+            if let Some(code) = definite {
+                let hint = if code == "invalid_request" {
+                    " — check the input and connection, or update the hosted tenant server if \
+                     it predates connected-effect support"
+                } else {
+                    ""
+                };
+                return Err(reject(format!(
+                    "the stage was refused (HTTP {status}, {code}){hint}; nothing was staged \
+                     and nothing ran"
                 )));
             }
+        }
+        if matches!(platform_operation, Some("status" | "artifact"))
+            && (status == 501
+                || (status == 400
+                    && matches!(
+                        refusal_code.as_deref(),
+                        Some("invalid_request" | "unknown_verb")
+                    )
+                    && arguments.get("body").is_none()
+                    && arguments.get("query").is_none()))
+        {
+            let op_name = platform_operation.unwrap_or("status");
+            return Err(reject(format!(
+                "the tenant could not serve `platform {op_name}` (HTTP {status}{}) — update the \
+                 tenant server first, then this Cadence client; nothing was started or billed",
+                refusal_code
+                    .as_deref()
+                    .map_or(String::new(), |c| format!(", {c}"))
+            )));
+        }
+        // CAD-2226: a hosted server that predates the owner-enrollment
+        // operations answers the unknown operation with 501 or 400
+        // `invalid_request`/`unknown_verb`. That is a release-order problem:
+        // it is not an empty catalog, not an empty connection list and not a
+        // missing link, so nothing is invented and nothing falls back to the
+        // local daemon.
+        if matches!(
+            platform_operation,
+            Some("connection_providers" | "connection_list" | "connection_start")
+        ) && (status == 501
+            || (status == 400
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("invalid_request" | "unknown_verb")
+                )))
+        {
+            let operation = platform_operation.unwrap_or_default();
+            let consequence = if operation == "connection_start" {
+                "no authorization link exists and no account was linked"
+            } else {
+                "this is not an empty list"
+            };
+            return Err(reject(format!(
+                "the hosted tenant server does not serve `platform call` operation \
+                 `{operation}` (HTTP {status}{}) — update the hosted server first, then this \
+                 Cadence client; {consequence}",
+                refusal_code
+                    .as_deref()
+                    .map_or(String::new(), |c| format!(", {c}"))
+            )));
+        }
+        if matches!(
+            platform_operation,
+            Some(
+                "whatsapp_status"
+                    | "whatsapp_inspect"
+                    | "whatsapp_connect"
+                    | "whatsapp_start"
+                    | "whatsapp_stop"
+                    | "whatsapp_disconnect"
+                    | "whatsapp_link"
+                    | "whatsapp_rescope"
+            )
+        ) && (status == 501
+            || (status == 400
+                && matches!(
+                    refusal_code.as_deref(),
+                    Some("invalid_request" | "unknown_verb")
+                )))
+        {
+            let operation = platform_operation.unwrap_or_default();
+            return Err(reject(format!(
+                "the hosted tenant server does not serve `platform call` operation \
+                 `{operation}` (HTTP {status}{}) — update the hosted server first, then this \
+                 Cadence client",
+                refusal_code
+                    .as_deref()
+                    .map_or(String::new(), |c| format!(", {c}"))
+            )));
+        }
+        if platform_operation == Some("call")
+            && matches!(
+                arguments.get("tool").and_then(Value::as_str),
+                Some("app_call" | "app_describe" | "app_skill" | "board_pending_actions")
+            )
+        {
+            if let Some(error) = app_action_refusal(status, refusal_code.as_deref()) {
+                return Err(error);
+            }
+        }
+        match classify(status, retry_after, body) {
+            Verdict::Done(Err(_e)) if platform_outcome_unknown => {
+                return Err(Error::unknown(format!(
+                    "remote platform call returned HTTP {status}{platform_details} — {}",
+                    effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN)
+                )));
+            }
+            Verdict::Done(Err(_e)) if after_forward => {
+                return Err(ambiguous_mutation_error(
+                    status,
+                    unknown_correlation,
+                    effect.reconciliation().unwrap_or(RECONCILE_UNKNOWN),
+                ));
+            }
             Verdict::Done(Err(e)) => {
+                // Older tenant builds reject the new body field as invalid_request.
+                // Preserve that safe code so the CLI can explain the version boundary.
+                if verb == "issue_set"
+                    && status == 400
+                    && refusal_code.as_deref() == Some("invalid_request")
+                {
+                    return Err(Error::invalid("invalid_request", e.to_string()));
+                }
+                if let Some(error) = skill_refusal(
+                    verb,
+                    status,
+                    refusal_code.as_deref(),
+                    refusal_reason.as_deref(),
+                ) {
+                    return Err(error);
+                }
                 return Err(message_family_refusal(
                     verb,
                     status,
@@ -2445,7 +7829,7 @@ fn account_image_identity_from(
         None => {
             return Err(reject(
                 "saved account login expired — run `cadence login` again",
-            ))
+            ));
         }
     };
     Ok(AccountImageIdentity {
@@ -2577,6 +7961,7 @@ pub fn account_image_request(
             &target,
             deadline,
             cred,
+            CredentialPurpose::Cli,
             crate::remote_enrollment::cli_session_post_detailed,
         )?;
     }
@@ -2721,13 +8106,13 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
     )))
 }
 
+mod agent_credential;
+pub use agent_credential::{bind_managed_session, bound_session, AgentSlot};
+// The test seam is absent from a release or CI-profile build; only a debug
+// build or the explicit `test-seam` feature may reset the session binding.
+#[cfg(any(debug_assertions, feature = "test-seam"))]
+pub use agent_credential::unbind_managed_session;
+pub mod probe;
+
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "remote_cli_renewal_acceptance.rs"]
-mod renewal_acceptance;
-
-#[cfg(test)]
-#[path = "remote_cli/cad1459_account_image_acceptance.rs"]
-pub(crate) mod cad1459_account_image_acceptance;

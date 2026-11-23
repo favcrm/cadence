@@ -106,19 +106,24 @@ def contract_scripts(root):
 
 def focused_tests(root, changed):
     """CAD-1021: cheap invariant unit tests run when their input file
-    changes — a path → test-target map. Each entry is
-    (paths-it-watches, [cargo test filter args]). The test runs with
+    changes. Each entry is (paths-it-watches, [cargo test filter args]);
+    a test runs once however many of its paths changed. The test runs with
     the same --test-threads budget as every other step."""
-    MAP = {
+    MAP = [
         # CAD-1024: a new top-level verb in src/cli/commands.rs went red
         # on CI — the help-bucket invariant lives in cli::help tests.
-        "src/cli/commands.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
-        "src/cli/help.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
-    }
+        (("src/cli/commands.rs", "src/cli/help.rs"),
+         ["cargo", "test", "-p", "cadence-cli", "--bin", "cadence", "cli::help"]),
+        # CAD-2257: the delegation tests pin risk-classes.md to risk-paths.toml
+        # and read the context manifest; PR CI does not run them.
+        (("docs/roles/risk-classes.md", "docs/roles/risk-paths.toml",
+          "docs/cadence/project-context.yaml", "src/delegation.rs"),
+         ["cargo", "test", "-p", "cadence-agent", "--lib", "delegation::tests"]),
+    ]
     out = []
-    for path, argv in MAP.items():
-        if changed is None or path in changed:
-            out.append((f"focused {path}", argv))
+    for paths, argv in MAP:
+        if changed is None or any(p in changed for p in paths):
+            out.append((f"focused {argv[-1]}", argv))
     return out
 
 
@@ -146,6 +151,9 @@ def plan(root, changed, with_tests):
                   None if ui else "ui/ unchanged"))
     steps.append(("ui lint", ["bun", "run", "--cwd", "ui", "lint"],
                   None if ui else "ui/ unchanged"))
+    # CAD-1285: shipped migration blocks and their SCHEMA constants stay frozen.
+    steps.append(("migration ddl", ["python3", "scripts/check-migration-ddl"],
+                  None if touched(changed, "src/store/") else "src/store/ unchanged"))
     cs = contract_scripts(root)
     need = touched(changed, "scripts/", ".github/", "tests/scripts/")
     if not need:
@@ -172,6 +180,19 @@ def plan(root, changed, with_tests):
 
 
 def main(argv=None):
+    # CAD-2403: the lane hook runs a repository's own scripts/pre-push on the
+    # host only when the repository has no scripts/boat-build. This repository
+    # never compiles on the shared host by accident: without its Boat helper
+    # the push is refused unless CADENCE_PRE_PUSH_LOCAL=1 says so explicitly.
+    if (os.environ.get("CADENCE_PRE_PUSH_MODE") == "repo"
+            and os.environ.get("CADENCE_PRE_PUSH_LOCAL") != "1"):
+        print("pre-push: scripts/boat-build is missing or not executable; this "
+              "repository does not run its plan on the host (set "
+              "CADENCE_PRE_PUSH_LOCAL=1 for the explicit local path)",
+              file=sys.stderr)
+        return 1
+    if os.environ.pop("CADENCE_PRE_PUSH_MODE", None) == "repo":
+        argv = []  # git's remote and URL, not this script's options
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--tests", action="store_true",
                     help="also run every tests/*.rs target")
@@ -186,6 +207,8 @@ def main(argv=None):
     changed = changed_files(root, args.base or default_base(root))
     steps = plan(root, changed, args.tests)
     env = dict(os.environ)
+    # Boat sets CARGO_BUILD_JOBS=1 before this process. 4 is only the host
+    # default when the variable is unset (CADENCE_PRE_PUSH_LOCAL).
     env.setdefault("CARGO_BUILD_JOBS", "4")
     # CAD-1197: a step that runs `cargo test` gets only allowlisted CADENCE_*
     # variables, so a pane's production CADENCE_PM_DIR/CADENCE_STATE_DIR

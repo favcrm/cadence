@@ -1,0 +1,234 @@
+import { DurableObject } from "cloudflare:workers";
+import type { AppScope, AskResult, HostedSessionInspection, HostedSessionOptions, HostedState, OperationReply, OperationSettlement, PendingOperation, ThreadEntry } from "./contract.js";
+/**
+ * One agent conversation, one Durable Object.
+ *
+ * The engine owns the loop: transcript, inbox, model calls, tools, retries and
+ * crash recovery. It keeps all of it in this object's SQLite (`pi_*` tables)
+ * and a Lifecycle job, so an evicted or redeployed object restarts from the
+ * engine's last checkpoint and finishes the turn instead of losing it.
+ *
+ * The object name is the application's conversation key. The engine owns its
+ * own session ids (the root is "1"), so the name is never treated as one.
+ *
+ * The application supplies capabilities and the authority policy; this base
+ * supplies the prompt/skill profile, the model transport, the transcript
+ * projection, the board wire behavior and the execution guards. Only declared
+ * tools are installed, and every execution revalidates the live authority.
+ */
+export declare class HostedSession<Env extends object = Record<string, unknown>> extends DurableObject<Env> {
+    private readonly models;
+    private readonly registry;
+    private readonly options;
+    /**
+     * The session's insert-once operation envelopes. The engine deduplicates by
+     * request id alone, so this guard is what refuses a repeated id whose text
+     * or app scope changed.
+     */
+    private readonly operationScopes;
+    private readonly contextBudgetProofs;
+    private readonly modelTaskContext;
+    private readonly loopGuard;
+    /** The app scope of the operation that owns one tool call, read from the engine. */
+    private readonly toolAppScope;
+    private readonly harness;
+    /** The last model the gateway reported in this object's lifetime. */
+    private resolvedModel;
+    constructor(ctx: DurableObjectState, env: Env, options: HostedSessionOptions);
+    /**
+     * Board transcript SSE and owner-only diagnostic views. Diagnostic reconnects
+     * get a fresh full view; board reconnects resume from a transcript cursor.
+     */
+    fetch(request: Request): Promise<Response>;
+    /**
+     * Ask the session and wait for the answer.
+     *
+     * `app` is the host-verified scope of this turn; omit it for Home. The
+     * operation id is bound to the text and scope it was first admitted with, so
+     * a retry with the same id replays that operation and a retry that changes
+     * either is refused before the engine runs.
+     * Only a host-admitted user message may declare `transcriptRole`.
+     */
+    ask(prompt: string, operationId?: string, app?: AppScope, transcriptRole?: "operator"): Promise<AskResult>;
+    /** Map the engine's committed records, including durable input metadata, for the board. */
+    transcript(includeThinking: boolean): Promise<ThreadEntry[]>;
+    /**
+     * Inspect the current or a previously observed generation without opening
+     * the engine, submitting work or reading the transcript.
+     */
+    sessionSummary(sessionId?: string): HostedSessionInspection;
+    /** Read only the proven generation's committed, user-visible text. */
+    sessionTranscript(sessionId: string, after: number): {
+        messages: {
+            role: "operator" | "agent";
+            text: string;
+            created?: string;
+        }[];
+        nextCursor: number | null;
+    } | null;
+    /** Stored runtime records, not expanded presentation entries. Read-only. */
+    recordCount(): Promise<number>;
+    /** Abort this instance; durable state is retained when it is reconstructed. */
+    reload(): string;
+    /**
+     * Start a fresh context for this conversation. The model stops seeing what
+     * came before, while the board keeps showing it, with a marker where it
+     * happened. This also recovers a stale session a normal reload cannot. The
+     * callers are owner-only routes; this is deliberately not an automatic retry.
+     */
+    resetConversation(): Promise<void>;
+    /**
+     * Submit without waiting: the board's send is queued, not a blocking turn.
+     *
+     * `app` is the host-verified scope of this turn; omit it for Home. The
+     * operation id is bound to the text and scope it was first admitted with, so
+     * a retried send with the same id replays that operation and one that changes
+     * either is refused before the engine is asked.
+     * Only a host-admitted user message may declare `transcriptRole`.
+     */
+    submit(text: string, operationId: string, app?: AppScope, transcriptRole?: "operator"): Promise<boolean>;
+    /**
+     * Bind one operation to the exact text and app scope it was admitted with,
+     * and return the stored envelope. A changed text or scope throws here, before
+     * the engine sees the id, so a repeated id can never reuse another turn.
+     *
+     * An id this session never admitted may still be the engine's, from a build
+     * that predates the guard, so the engine's own records are read first and
+     * passed with the envelope: the guard adopts a legacy operation only as the
+     * Home envelope those records prove, and refuses anything else.
+     */
+    private admitOperation;
+    /**
+     * What the engine's own records prove about an operation id this guard has no
+     * envelope for: `null` when it holds nothing for it, otherwise the submission
+     * type, the exact text and the entry metadata the guard needs to recognise a
+     * legacy Home operation it may adopt.
+     *
+     * A placed input keeps its text and metadata in the entry it was placed as. A
+     * queued one has no entry yet, so its draft is read from the engine's own
+     * inbox document. That read awaits, and the engine may place the input and
+     * drop the draft while it does — one commit, so the draft is gone exactly
+     * when the submission has become placed. An absent draft is therefore re-read
+     * once from the submission itself, never in a loop, and recovered from the
+     * entry it now names; only a record that proves neither is left proving
+     * nothing, and the guard refuses it. A submission that is not an input, and a
+     * record the engine cannot produce, also yield evidence that proves nothing.
+     * Reading a record the engine cannot parse throws, so an unreadable id is
+     * refused rather than assumed free.
+     */
+    private engineEvidence;
+    /**
+     * The evidence one stored submission proves: its type, the exact text and the
+     * entry metadata, when the engine placed an entry for it. A submission with
+     * no entry proves no text here, which its caller refuses.
+     */
+    private placedEvidence;
+    /**
+     * The draft one queued input waits in the engine's inbox with, or `null` when
+     * the inbox does not hold it. `content` is the exact text it was submitted
+     * with and `entry` the metadata it will be placed as, so both are the
+     * engine's own record of the operation rather than anything a caller sent.
+     */
+    private queuedInput;
+    /**
+     * The durable input entry an operation is placed as. The recorded message id
+     * and the admitted app scope travel with the entry, so the transcript, a
+     * rebuilt object and a replayed retry all read the same envelope.
+     */
+    private inputEntry;
+    /**
+     * The app scope of the operation whose input root is this engine submission,
+     * read from the placed entry the engine stored. `null` is proven Home: a
+     * readable input entry that carries no scope. An entry that cannot be read
+     * throws, so the caller refuses rather than running an app turn as Home.
+     */
+    private operationAppScope;
+    /** The message ids of the run's own placed board inputs, never prompt text. */
+    private operationIds;
+    /** What the runtime has not settled yet, so the board can show queued/running/parked. */
+    pendingOperations(): Promise<PendingOperation[]>;
+    /**
+     * Resolve and render the host's committed identity before admitting new
+     * work. A refusal propagates unchanged, so an operation never starts when its
+     * canonical identity is unavailable; a host without the feature is unchanged.
+     */
+    private requireIdentity;
+    /**
+     * The committed identity text this conversation's operations see. It is
+     * resolved for admission and again for an operation's first request; only the
+     * immutable operation snapshot stores it, so a change committed mid-operation
+     * applies to the next one.
+     */
+    private identityContextText;
+    /**
+     * The one connection's public projection, checked before it is framed. A
+     * malformed projection fails the connection exactly like an unavailable one,
+     * so a partial header is never served.
+     */
+    private validatedThreadContext;
+    /**
+     * This connection's first `master` frame and the validated host projection it
+     * composes under, or `null` when either cannot be produced.
+     *
+     * The projection is re-read here, once per connection, so a reconnect never
+     * pins an older revision/avatar/name over a newer committed edit. This
+     * connection serves one conversation, so later frames compose under the same
+     * validated projection. The engine state is read only after the watch this
+     * connection has attached, so an already-running turn is reported truthfully
+     * and no run can begin between that read and the subscription. An
+     * unavailable or malformed projection, an unserializable frame and a failed
+     * state read all return `null` and refuse the connection with `503` rather
+     * than serve a stale or partial header; the caller stops the watch it opened.
+     * After `200`, a failing read rejects the event listener, which ends the
+     * stream exactly like a failed transcript read.
+     */
+    private connectionMaster;
+    /**
+     * One `master` frame: the engine's current turn and queue facts under the
+     * runtime's own fields, with the host projection this connection validated.
+     *
+     * The state is read for every frame, never derived from an event, so a frame
+     * reports only what the durable records prove. Metadata may contain non-JSON
+     * values, while reserved fields it cannot override retain runtime precedence;
+     * a callable root `toJSON` refuses the frame.
+     */
+    private composedMasterFrame;
+    /** Resolve a watch run's first input to the engine's admitted operation id. */
+    private previewOperation;
+    /**
+     * Resolve the engine invocation that made this exact model call. Generation
+     * retains its existing fail-closed uniqueness check; compaction must present
+     * the task id attested by its own phase before its checkpoint can fund a call.
+     */
+    private modelIdentity;
+    /** Whether a run is in flight. */
+    isBusy(): Promise<boolean>;
+    /**
+     * Cheap header state for `/api/master/state`: whether a turn is running, how
+     * many inputs are queued, and the model label. `parked` operations are
+     * neither running nor queued — the engine stopped them on its crash-loop
+     * guard, so counting them as queued would invent work. The label is the
+     * model the gateway actually served, or the configured alias until the first
+     * call resolves the platform default.
+     */
+    state(): Promise<HostedState>;
+    /**
+     * Inspect durable settlement without opening the engine or waking work.
+     * Absence is evidence only; the host must separately fence admission.
+     * Only interactive chat admission may opt in to overlapping a passive summary.
+     */
+    settledOperation(operationId: string, mode?: "chat"): Promise<OperationSettlement>;
+    /** Inspect one reply without resending, waking the engine, or reading a transcript. */
+    operationReply(operationId: string): Promise<OperationReply>;
+    /**
+     * Stop the turn with this id. The id is required: the engine reads a missing
+     * one as "abort this session" even when nothing has been asked to stop.
+     * Stopping a running turn aborts its conversation, and the engine withdraws
+     * the conversation's queued inputs with it: a caller reads `queuedMessages`
+     * first and hands those back to the person who sent them. False when nothing
+     * matched.
+     */
+    stopOperation(operationId: string): Promise<boolean>;
+    private recordResolvedModel;
+    private modelLabel;
+}

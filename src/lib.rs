@@ -7,6 +7,23 @@
 // (only `daemon run` does, and `reaper`'s own proof in a process of its
 // own), so the spawn registry need not see test spawns.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
+// CAD-1085: the protected runtime and its whole daemon surface exist only on
+// x86_64 Linux. Other targets compile the shared types so cross-platform code
+// keeps building, and the protected paths are dormant by design, so their
+// helpers read as dead code there. Keep the lint fully on where it matters.
+#![cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code, unused_imports)
+)]
+
+// Production console output must not interrupt a finite operation on EPIPE.
+// Tests retain libtest's normal output capture; CLI integration tests run the
+// production writers.
+#[cfg(not(test))]
+use crate::output as console_output;
+#[cfg(not(test))]
+#[macro_use]
+mod console_macros;
 
 pub mod adapter;
 pub mod agent_roles;
@@ -15,6 +32,7 @@ pub mod agent_uid;
 pub mod app_assistant;
 pub mod app_preview_export;
 pub mod assistant_actor;
+pub mod attachment_image;
 pub mod audit;
 pub mod backup;
 pub mod board_identity;
@@ -24,6 +42,7 @@ pub mod business_export;
 pub mod business_templates;
 pub mod cli_actor;
 pub mod client;
+pub mod cloud_agent;
 pub mod confine;
 pub mod context_pack;
 pub mod continuity;
@@ -43,19 +62,23 @@ pub mod device_login;
 pub mod devin_catalog;
 pub mod doctor;
 pub mod error;
+pub mod fd_fs;
 pub mod filter;
 pub mod gh_guard;
+pub mod github_connect;
 pub mod home;
-mod ident;
+#[doc(hidden)]
+pub mod ident;
 pub mod inbox;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;
 pub mod issue;
-#[cfg(test)]
-mod issuer_tls_fixture;
-pub(crate) mod issuer_transport;
+#[doc(hidden)]
+pub mod issuer_transport;
 pub mod lease;
 pub mod local_assignment;
+pub(crate) mod managed_section;
 pub mod master;
 pub mod master_perm;
 pub mod mcp;
@@ -69,8 +92,17 @@ pub mod overview;
 pub mod peer;
 pub mod pi_policy;
 pub mod platform;
+pub(crate) mod printed_command;
+pub mod private_app_update;
 pub mod proc;
+#[doc(hidden)]
+pub mod project_policy;
 pub(crate) mod protected_pi_profile;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod protected_runtime;
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[path = "protected_runtime_stub.rs"]
+pub mod protected_runtime;
 pub mod proto;
 pub mod reaper;
 pub mod releases;
@@ -94,6 +126,8 @@ pub mod tailnet_proof;
 pub(crate) mod test_ports;
 pub mod test_queue;
 pub mod test_seam;
+pub(crate) mod thread_budget;
+pub mod thread_search;
 pub mod ui;
 pub mod update;
 pub mod upgrade;
@@ -107,8 +141,9 @@ pub mod worktree;
 // from every non-test build.
 #[cfg(test)]
 extern crate self as cadence_agent;
-#[cfg(test)]
-mod test_web_issuer_tls;
+#[cfg(any(test, feature = "test-seam"))]
+#[doc(hidden)]
+pub mod test_web_issuer_tls;
 #[cfg(test)]
 mod web_cli_test_harness;
 

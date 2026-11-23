@@ -1,0 +1,31 @@
+{
+  "input": {
+    "v": 1,
+    "op": "agent.form.compile",
+    "input": {
+      "spec": {
+        "fields": [
+          {
+            "id": "name",
+            "label": "Name",
+            "type": "text",
+            "options": [
+              {
+                "value": "a",
+                "label": "A"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "agent.form.compile",
+    "value": {
+      "valid": false,
+      "message": "spec /fields/0/options: is only allowed for choice and multichoice fields"
+    }
+  }
+}

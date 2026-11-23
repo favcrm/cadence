@@ -15,7 +15,7 @@ use crate::issue::{
 
 mod epic;
 mod milestone;
-pub use epic::{run_epic, EpicAction};
+pub use epic::{decide_plan, propose_plan, run_epic, EpicAction};
 pub use milestone::{run_milestone, MilestoneAction};
 mod board_actions;
 mod checkout;
@@ -147,11 +147,15 @@ pub enum IssueAction {
         /// for the same result. The master cannot create any other.
         #[arg(long)]
         status: Option<String>,
+        /// Stable hosted retry ID. Repeat the same ID and arguments after a lost reply.
+        #[arg(long)]
+        request_id: Option<String>,
     },
     /// List issues — a compact table on a TTY, JSON when piped (or `--json`).
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND; `--tag` is the exception — all must be
     /// present. The grammar prints from `crate::filter::GRAMMAR`.
+    /// For hosted routing restrictions, inspect `cadence schema issue ls`.
     #[command(after_long_help = crate::filter::GRAMMAR)]
     #[command(visible_alias = "list")]
     Ls {
@@ -303,7 +307,8 @@ pub enum IssueAction {
         /// configured `base`, else the remote HEAD (`origin/HEAD`, else
         /// the remote's symbolic HEAD). A checkout with no `origin`
         /// uses its current branch. A resolved remote ref is never
-        /// replaced by the main checkout's current branch.
+        /// replaced by the main checkout's current branch. A branch
+        /// base that `origin` carries resolves to origin's current tip.
         #[arg(long)]
         base: Option<String>,
         /// Owner to record when the issue has none — default: the
@@ -339,6 +344,12 @@ pub enum IssueAction {
         /// owner and is recorded as a comment in its own commit.
         #[arg(long, value_name = "REASON")]
         take_over: Option<String>,
+        /// Hosted orgs only: claim this issue for the calling session under
+        /// a reusable profile id (`ap_…`). The caller is the actor, so no
+        /// local-agent alias is required and nothing is messaged to a
+        /// daemon. The profile supplies context, never authority.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
     },
     /// Record a claim on an issue (CAD-383) — for a PM whose lanes run
     /// outside cadence (Claude subagents, Codex, humans), so `dispatch`
@@ -474,6 +485,9 @@ pub enum IssueAction {
         /// Checklist file; every nonblank line must be a checkbox item.
         #[arg(long, value_name = "FILE")]
         from: PathBuf,
+        /// The current issue revision (required for a hosted org).
+        #[arg(long)]
+        if_rev: Option<String>,
     },
     /// Set writable fields: `status priority owner component title
     /// tags type milestone size` (`type`: epic|task|bug|spike; `size`:
@@ -557,6 +571,74 @@ pub enum IssueAction {
     /// Attach a file into `artifacts/` (basename only, size cap,
     /// create-only).
     Attach { id: String, file: PathBuf },
+    /// Read one named task artifact.
+    Artifact { id: String, name: String },
+    /// File one reviewer verdict on an exact artifact revision. Hosted only:
+    /// the digest must be the `sha256` this reviewer read back, so a verdict
+    /// cannot be written for a revision nobody read.
+    Review {
+        id: String,
+        /// The qualified artifact identifier from `issue show`.
+        #[arg(long)]
+        artifact: String,
+        /// Lowercase hex SHA-256 of the bytes this reviewer read.
+        #[arg(long)]
+        digest: String,
+        /// `pass`, `revise` or `blocked`.
+        #[arg(long)]
+        decision: String,
+        /// The findings.
+        #[arg(short = 'm', long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the findings from a file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Leave a message for a role on a ticket (hosted orgs). It is stored for
+    /// whoever holds that role to read: nothing wakes a session or proves a read.
+    Say {
+        id: String,
+        /// The role it is for, such as `developer`.
+        #[arg(long)]
+        to: String,
+        /// The role you are writing as. A label only: the verified sender is
+        /// your login.
+        #[arg(long)]
+        from: Option<String>,
+        /// A stable id you choose: 1-64 lowercase letters, digits or hyphens,
+        /// never `sys-*`. Reuse it to retry this exact message.
+        #[arg(long)]
+        message: String,
+        /// The message.
+        #[arg(short = 'm', long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the message from a file (`-` is stdin).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Read a ticket's messages, one page at a time (hosted orgs).
+    Messages {
+        id: String,
+        /// Only this role's messages and unread count. Use it for your own
+        /// role: without it the unread map stops at 100 roles.
+        #[arg(long)]
+        to: Option<String>,
+        /// Start after this `seq`. Repeat with the last `seq` while `more` is true.
+        #[arg(long)]
+        after: Option<u64>,
+    },
+    /// Move a role's read point forward (hosted orgs). It never moves back, and
+    /// stops at the role's last message.
+    MessagesRead {
+        id: String,
+        /// The role whose read point moves. It is shared by everyone in that role.
+        #[arg(long)]
+        role: String,
+        /// The last `seq` you actually received: a larger value marks messages
+        /// you have not seen.
+        #[arg(long)]
+        through: u64,
+    },
     /// Several updates to one issue as ONE tracker commit: set, tag,
     /// link, ref, attach, acceptance and a comment. Every part is
     /// validated first — one bad part refuses the whole edit and writes
@@ -592,6 +674,9 @@ pub enum IssueAction {
         /// Attach a file, as `issue attach`. Repeatable.
         #[arg(long = "attach", value_name = "FILE")]
         attach: Vec<PathBuf>,
+        /// Replace the Markdown description from FILE on a hosted org (`-` = stdin).
+        #[arg(long, value_name = "FILE|-", conflicts_with = "acceptance")]
+        body: Option<PathBuf>,
         /// Replace the Acceptance checklist from FILE (`-` = stdin).
         #[arg(long, value_name = "FILE|-")]
         acceptance: Option<PathBuf>,
@@ -604,6 +689,9 @@ pub enum IssueAction {
         /// Override the `status=done` evidence gate, as `issue set --force`.
         #[arg(long, value_name = "REASON")]
         force: Option<String>,
+        /// The current issue revision (required for a hosted org).
+        #[arg(long)]
+        if_rev: Option<String>,
     },
     /// Check the whole PM dir: schema, id/folder mismatch, dangling and
     /// cyclic links, depth > 2, oversize artifacts, unknown status/kind.
@@ -784,7 +872,9 @@ pub enum ProjectAction {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// List registered projects.
+    /// List registered projects. On a selected hosted org this reads the
+    /// org's own registry, including projects that exist only as their
+    /// tickets' key; `--sort`, `--limit` and `--fields` refuse there.
     #[command(after_long_help = crate::filter::GRAMMAR)]
     #[command(visible_alias = "list")]
     Ls {
@@ -811,44 +901,188 @@ pub enum ProjectAction {
         /// Project key.
         key: String,
     },
-    /// Record a project's access policy: visibility and the callers it
-    /// admits. `--grant` is the full member list and replaces whatever
-    /// was recorded; omitting it clears grants. It does not merge.
-    /// Private is unavailable until the isolation gate passes;
-    /// workspace-visible is the only visibility this build can write.
+    /// Update a registered repository remote after a GitHub transfer or
+    /// rename. Run this after the GitHub transfer; old-slug PR URLs then
+    /// stop matching. `--from` is the current recorded remote and `--to`
+    /// is the new `host/owner/repo` (a git URL is fine). Local tracker
+    /// write, same caller model as `project add`.
+    SetRemote {
+        /// Project key.
+        key: String,
+        /// Current recorded remote (`host/owner/repo` or a git URL).
+        #[arg(long)]
+        from: String,
+        /// New remote (`host/owner/repo` or a git URL).
+        #[arg(long)]
+        to: String,
+    },
+    /// Read or update a project's access policy: visibility and the callers
+    /// it admits.
+    ///
+    /// Running without `--visibility` reads the current recorded policy without
+    /// modifying anything. Passing `--visibility` replaces the recorded policy
+    /// (`--grant` is the full member list and replaces whatever was recorded;
+    /// omitting `--grant` with `--visibility private` requires `--clear-grants`).
     Policy {
         /// Project key.
         key: String,
-        /// Visibility to record.
-        #[arg(long, value_enum, default_value = "workspace-visible")]
-        visibility: PolicyVisibility,
-        /// Grant a caller access (`users/<handle>` or `operator`);
-        /// repeatable.
+        /// Visibility to record; omit to read the current policy without mutating.
+        #[arg(long, value_enum)]
+        visibility: Option<PolicyVisibility>,
+        /// Grant a caller access (`users/<handle>`, `agents/<profile_id>`, or `operator`);
+        /// repeatable (replaces recorded grants when `--visibility` is given).
         #[arg(long = "grant")]
         grants: Vec<String>,
+        /// Confirm clearing all grants when setting `--visibility private` with no `--grant`.
+        #[arg(long = "clear-grants")]
+        clear_grants: bool,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record a hosted org's delivery inputs for a project (CAD-1946): its
+    /// GitHub repos and, optionally, its `delivery:` policy section. A
+    /// hosted org stores no project.yaml or PROJECT.md, and the merge gate
+    /// refuses a project with no recorded repos. Replaces what was
+    /// recorded. The workspace owner only; locally, `project add --repo`
+    /// and PROJECT.md hold the same inputs.
+    Delivery {
+        /// Project key.
+        key: String,
+        /// A GitHub repo of the project, `owner/name` (repeatable).
+        #[arg(long = "repo", required = true)]
+        repos: Vec<String>,
+        /// A file holding the project's `delivery:` section: its YAML
+        /// value, the section under its own top-level `delivery:` key, or a
+        /// `---` frontmatter block holding that key. Comments, blank lines,
+        /// a BOM and CRLF line endings are accepted;
+        /// the file is checked with the native parser before anything is
+        /// sent. Omitted: no section, so the default policy applies.
+        #[arg(long)]
+        delivery_file: Option<std::path::PathBuf>,
+    },
+    /// A project's timeline on a hosted org (CAD-2240): ticket changes,
+    /// comments, role messages and reviews, newest first. Hosted only; a
+    /// native board records no such timeline.
+    Timeline {
+        /// Project key.
+        key: String,
+        /// Only entries at or after this time (30m, 24h, 7d, YYYY-MM-DD,
+        /// epoch).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only these kinds (created status owner claim comment message
+        /// review); comma-separated or repeated.
+        #[arg(long = "kind", value_delimiter = ',')]
+        kinds: Vec<String>,
+        /// Only role messages still open (not yet read by the addressed role).
+        #[arg(long)]
+        open: bool,
+        /// Entries per page, 1 to 100 (default 50).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// The `next_before` cursor of the previous page.
+        #[arg(long)]
+        before: Option<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
     },
 }
 
 /// `--visibility` for `project policy`: the recorded vocabulary, before it
 /// is mapped to the project policy type.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum PolicyVisibility {
     WorkspaceVisible,
     Private,
 }
 
 impl PolicyVisibility {
-    fn recorded(self) -> crate::issue::project::Visibility {
+    #[doc(hidden)]
+    pub fn recorded(self) -> crate::issue::project::Visibility {
         match self {
             Self::WorkspaceVisible => crate::issue::project::Visibility::WorkspaceVisible,
             Self::Private => crate::issue::project::Visibility::Private,
         }
     }
+
+    /// The spelling on the wire and in `project.yaml`, so the CLI flag, the
+    /// daemon payload and the recorded enum cannot drift apart. `pub` because
+    /// the `cadence` binary builds the `project new` payload from it.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::WorkspaceVisible => "workspace-visible",
+            Self::Private => "private",
+        }
+    }
+
+    /// Parse the wire spelling. `None` for anything else — the daemon then
+    /// refuses rather than guessing a visibility.
+    #[doc(hidden)]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "workspace-visible" => Some(Self::WorkspaceVisible),
+            "private" => Some(Self::Private),
+            _ => None,
+        }
+    }
 }
 
-pub(crate) fn print_json(value: &Value) {
-    println!("{}", crate::output::json_text(value).unwrap_or_default());
+/// Validate `issue project policy` key and flags cleanly before either local
+/// execution (`open_pm`) or remote RPC encoding (CAD-2650).
+///
+/// Returns `Ok(None)` when bare `issue project policy <KEY>` should perform a
+/// read-only lookup, `Ok(Some(visibility))` for a guarded write, and
+/// `Err(...)` for malformed keys, blank grants, or partial/ambiguous write flags.
+pub fn resolve_project_policy_request(
+    key: &str,
+    visibility: Option<PolicyVisibility>,
+    grants: &[String],
+    clear_grants: bool,
+) -> Result<Option<PolicyVisibility>> {
+    model::check_key(key)?;
+    match visibility {
+        None => {
+            if !grants.is_empty() || clear_grants {
+                return Err(Error::usage(
+                    "modifying a project's policy requires `--visibility <workspace-visible|private>`; \
+                     bare `cadence issue project policy <KEY>` is read-only",
+                ));
+            }
+            Ok(None)
+        }
+        Some(vis) => {
+            if grants.iter().any(|grant| grant.trim().is_empty()) {
+                return Err(Error::usage(
+                    "`--grant` values must be non-empty (`users/<handle>`, `agents/<profile_id>`, or `operator`)",
+                ));
+            }
+            if !grants.is_empty() && clear_grants {
+                return Err(Error::usage(
+                    "`--grant` and `--clear-grants` cannot be combined",
+                ));
+            }
+            if vis != PolicyVisibility::Private && clear_grants {
+                return Err(Error::usage(
+                    "`--clear-grants` applies only when setting `--visibility private`",
+                ));
+            }
+            if vis == PolicyVisibility::Private && grants.is_empty() && !clear_grants {
+                return Err(Error::usage(
+                    "setting `--visibility private` with no `--grant` clears all existing grants; \
+                     pass `--grant <caller>` or confirm with `--clear-grants`",
+                ));
+            }
+            Ok(Some(vis))
+        }
+    }
 }
+
+/// The library verbs print through the same closed-consumer rule and
+/// JSON policy as the binary: a closed stdout or stderr never turns a
+/// verb's own exit code into a panic.
+pub(crate) use crate::output::{eprint_line, print_json};
 
 fn open_pm() -> Result<Pm> {
     Pm::open_default()
@@ -883,7 +1117,12 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         | IssueAction::Ref { .. }
         | IssueAction::Comment { .. }
         | IssueAction::Edit { .. }
-        | IssueAction::Attach { .. } => links::run(action, state_dir),
+        | IssueAction::Attach { .. }
+        | IssueAction::Artifact { .. }
+        | IssueAction::Review { .. }
+        | IssueAction::Say { .. }
+        | IssueAction::Messages { .. }
+        | IssueAction::MessagesRead { .. } => links::run(action, state_dir),
         IssueAction::Lint { .. }
         | IssueAction::Reconcile { .. }
         | IssueAction::Sync { .. }
@@ -892,5 +1131,138 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         | IssueAction::Sprint { .. } => maintenance::run(action, state_dir),
         IssueAction::Epic { action } => run_epic(action, state_dir),
         IssueAction::Recover { action } => run_recover(action, state_dir),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CAD-1950: one spelling crosses the CLI/daemon boundary. The flag's
+    /// wire form and the daemon's parser are the same pair, so a change to
+    /// either that the other does not learn is a test failure, not a private
+    /// project silently created workspace-visible.
+    #[test]
+    fn the_visibility_wire_spelling_round_trips() {
+        for option in [
+            PolicyVisibility::WorkspaceVisible,
+            PolicyVisibility::Private,
+        ] {
+            assert_eq!(
+                PolicyVisibility::from_wire(option.wire()),
+                Some(option),
+                "{}",
+                option.wire()
+            );
+        }
+        assert_eq!(
+            PolicyVisibility::WorkspaceVisible.wire(),
+            "workspace-visible"
+        );
+        // Anything else is unknown, never a default.
+        for raw in ["", "workspace_visible", "Private", "public", "secret"] {
+            assert_eq!(PolicyVisibility::from_wire(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn project_policy_request_defaults_to_read_and_guards_writes() {
+        assert_eq!(
+            resolve_project_policy_request("atlas", None, &[], false).unwrap(),
+            None
+        );
+        assert!(resolve_project_policy_request("../escape", None, &[], false).is_err());
+        assert!(resolve_project_policy_request("ATLAS", None, &[], false).is_err());
+        assert!(
+            resolve_project_policy_request("atlas", None, &["users/alex".into()], false).is_err()
+        );
+        assert!(resolve_project_policy_request("atlas", None, &[], true).is_err());
+        assert!(
+            resolve_project_policy_request("atlas", None, &["users/alex".into()], true).is_err()
+        );
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::Private),
+            &[],
+            false
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::Private),
+            &["".into()],
+            false
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::Private),
+            &["   ".into()],
+            false
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::Private),
+            &["operator".into()],
+            true
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::WorkspaceVisible),
+            &[],
+            true
+        )
+        .is_err());
+        assert!(resolve_project_policy_request(
+            "atlas",
+            Some(PolicyVisibility::WorkspaceVisible),
+            &["users/alex".into()],
+            true
+        )
+        .is_err());
+        assert_eq!(
+            resolve_project_policy_request("atlas", Some(PolicyVisibility::Private), &[], true)
+                .unwrap(),
+            Some(PolicyVisibility::Private)
+        );
+        assert_eq!(
+            resolve_project_policy_request(
+                "atlas",
+                Some(PolicyVisibility::Private),
+                &["agents/ap_11111111-1111-4111-8111-111111111111".into()],
+                false
+            )
+            .unwrap(),
+            Some(PolicyVisibility::Private)
+        );
+        assert_eq!(
+            resolve_project_policy_request(
+                "atlas",
+                Some(PolicyVisibility::WorkspaceVisible),
+                &[],
+                false
+            )
+            .unwrap(),
+            Some(PolicyVisibility::WorkspaceVisible)
+        );
+
+        // Local CLI runner rejects invalid flags/keys before calling `open_pm()`.
+        let err = run(
+            &IssueAction::Project {
+                action: ProjectAction::Policy {
+                    key: "atlas".into(),
+                    visibility: Some(PolicyVisibility::WorkspaceVisible),
+                    grants: Vec::new(),
+                    clear_grants: true,
+                    json: false,
+                },
+            },
+            std::path::Path::new("/nonexistent-state-dir"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "usage");
+        assert!(err.to_string().contains("--clear-grants"), "{err}");
     }
 }

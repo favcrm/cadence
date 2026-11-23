@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod cloud;
+mod role_env;
 
 /// Environment names a spawned worker must not inherit. Devin cloud
 /// credentials stay on the daemon.
@@ -21,6 +22,29 @@ pub const CLOUD_SECRET_ENV: &[&str] = &[
     "CADENCE_DEVIN_RECOVER_BUDGET_MS",
 ];
 
+/// How a native harness reaches the daemon's agent lookups — lessons
+/// (CAD-2662) and its own thread (CAD-2663).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentToolRoute {
+    /// The `cadence-agent` MCP tools: Codex, whose command sandbox cannot
+    /// reach the daemon socket.
+    Mcp,
+    /// The `cadence` CLI from the agent's own shell.
+    Cli,
+}
+
+/// The route for `provider`, or `None` for a provider nobody has checked
+/// can reach these lookups (hosted, cloud, Devin, Cursor, or one added
+/// later). An allowlist, so a new provider is never told to call a lookup
+/// its guard refuses.
+pub fn agent_tool_route(provider: &str) -> Option<AgentToolRoute> {
+    match provider {
+        "codex" => Some(AgentToolRoute::Mcp),
+        "claude" | "pi" | "omp" => Some(AgentToolRoute::Cli),
+        _ => None,
+    }
+}
+
 /// `env -u` arguments that drop [`CLOUD_SECRET_ENV`] before a pane command.
 pub fn cloud_secret_env_prefix() -> String {
     CLOUD_SECRET_ENV
@@ -29,6 +53,19 @@ pub fn cloud_secret_env_prefix() -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// Create `dir` (recursive) at mode 0700, tightening an existing one.
+pub(super) fn ensure_private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+pub(crate) use role_env::{is_reviewer_role, reviewer_gh_env, RoleEnv};
 
 /// The daemon's own tracker and profile. Every agent it launches must
 /// share them, so a sandbox worker's `cadence issue …` reaches the
@@ -92,14 +129,15 @@ pub mod codex;
 pub mod fake;
 pub mod link;
 pub mod pi;
-// The protected managed-Pi launch seam is Linux-only (openat2 + fd-exec +
-// NSS account topology). On other targets the whole module is a stub whose
-// `protected_prereqs_satisfied` still fails closed — a non-Linux build never
+// The protected managed-Pi launch seam is Linux x86_64-only: it compiles the
+// installer_bundle constructor and helper_image_trust modules, which exist only
+// there. On other targets the whole module is a stub whose
+// `protected_prereqs_satisfied` still fails closed — such a build never
 // reaches a spawn through the split path.
-#[cfg(all(unix, target_os = "linux"))]
+#[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod pi_guest;
 
-#[cfg(not(all(unix, target_os = "linux")))]
+#[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
 pub(crate) mod pi_guest {
     use crate::error::{Error, Result};
     /// Non-Linux builds fail closed: the protected launch seam does not exist
@@ -118,9 +156,6 @@ pub mod stdio;
 pub mod ws;
 
 // CAD-1526: the message-window acceptance for the pi turn guard.
-#[cfg(test)]
-mod pi_turn_guard_acceptance;
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
@@ -554,9 +589,18 @@ pub trait ProviderAdapter: Send + Sync {
             Ok(())
         } else {
             Err(Error::pre_write(
-                "this runtime has no native image prompt, so the attached library image was not sent. Use an image-capable Pi session; the selected model was left unchanged.",
+                "this runtime has no native image prompt, so the attached image was not sent. Use an image-capable Pi session; the selected model was left unchanged.",
             ))
         }
+    }
+    /// Refuse a visual attachment before a send is accepted when this live
+    /// runtime cannot deliver it. The delivery path still re-checks, but a
+    /// queued message must not receive a successful receipt for an image the
+    /// selected runtime/model provably cannot take. Empty is a no-op.
+    fn preflight_turn_images(&self) -> Result<()> {
+        Err(Error::rejected(
+            "this runtime has no native image prompt, so the image attachment was refused before send. Use an image-capable Pi session; the selected model was left unchanged.",
+        ))
     }
     /// CAD-1009: [`Self::run_turn`] for a prompt that may carry a
     /// scoped-turn token `slot` (a unique marker the daemon left after
@@ -877,6 +921,10 @@ pub fn build(
     // produced inline. `fake` resolves for any provider via the
     // registry's provider-agnostic lookup, so no bypass is needed here.
     registry::spec(&agent.provider, &agent.endpoint_kind)?;
+    // CAD-2239: a reviewer is headless. Every open path (launch, resume,
+    // relaunch, restore, restart) builds here, so a stored reviewer pane row
+    // is refused too.
+    registry::refuse_reviewer_pane(&agent.provider, &agent.endpoint_kind, &agent.role)?;
     // Only the PTY layer and the managed-Pi seam consume the fixed agent-UID
     // launch context; every other provider/endpoint refuses a split launch
     // here rather than silently executing as the protected operator. The
@@ -1130,11 +1178,31 @@ mod split_launch_tests {
                 on_event: Box::new(|_, _| {}),
                 on_request: Box::new(|_| {}),
             };
+            // Bind a real settings store so open() reaches the protected
+            // prerequisite gate instead of refusing on an unbound adapter.
+            let dir = tempfile::tempdir().unwrap();
+            let tracker = dir.path().join("pm");
+            crate::issue::Pm::init(&tracker).unwrap();
+            let store = std::sync::Arc::new(
+                crate::store::Store::open(&dir.path().join("cadence.sqlite3")).unwrap(),
+            );
+            let mut settings = store.import_legacy_settings(&tracker).unwrap();
+            settings.doc.pi = Some(
+                serde_json::from_value(serde_json::json!({
+                    "models": { "allow": ["devin/swe-2-high"] }
+                }))
+                .unwrap(),
+            );
+            store
+                .save_settings(settings.revision, settings.doc, "cad-1159-fixture")
+                .unwrap();
+            let env = ProviderEnv::refusing_providers().with_settings_store(store);
+            env.set("CADENCE_PM_DIR", tracker.to_str().unwrap());
             let adapter = build(
                 &agent,
                 hooks,
                 std::path::Path::new("/nonexistent/fixture.log"),
-                &ProviderEnv::refusing_providers(),
+                &env,
                 Some(21001),
             )
             .unwrap_or_else(|e| panic!("managed/{provider} constructs under split: {e}"));
@@ -1143,7 +1211,22 @@ mod split_launch_tests {
                 Err(e) => e,
                 Ok(_) => panic!("{provider}: open succeeded with the prerequisites unavailable"),
             };
-            assert!(e.to_string().contains("UNKNOWN"), "{provider}: {e}");
+            // x86_64-linux reaches the fixed-supervisor gate; every other
+            // target stops at the unsupported-target stub. Both are
+            // fail-closed, and each asserts its own exact refusal rather than
+            // accepting any earlier error.
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+            assert!(
+                e.to_string()
+                    .contains("protected managed-Pi prerequisites unavailable"),
+                "{provider}: {e}"
+            );
+            #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
+            assert!(
+                e.to_string()
+                    .contains("protected managed-Pi launch is Linux-only"),
+                "{provider}: {e}"
+            );
         }
     }
     #[test]
@@ -1527,6 +1610,94 @@ mod tests {
         eprintln!(
             "scratch agents/ 4 logs: before={before} bytes, after={after} bytes, cap={}",
             PROVIDER_LOG_MAX_BYTES
+        );
+    }
+}
+
+#[cfg(test)]
+mod reviewer_env_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // CAD-844: a reviewer's `gh` must not read the operator's saved login. It
+    // gets a private empty config plus, only when provisioned, a token under
+    // its own name; other roles are unchanged.
+    #[test]
+    fn a_reviewer_gets_a_private_empty_gh_config() {
+        let state = tempfile::tempdir().unwrap();
+        let agent_dir = state.path().join("agents/rev-1");
+        let env = ProviderEnv::default();
+        let pairs = reviewer_gh_env(&env, "reviewer", &agent_dir)
+            .unwrap()
+            .pairs()
+            .to_vec();
+        let config = pairs
+            .iter()
+            .find(|(name, _)| name == "GH_CONFIG_DIR")
+            .expect("a reviewer is pinned");
+        let path = std::path::PathBuf::from(&config.1);
+        assert!(path.starts_with(&agent_dir), "{path:?}");
+        assert!(
+            std::fs::read_dir(&path).unwrap().next().is_none(),
+            "the reviewer gh config must start empty"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // Both token names are pinned empty: an inherited value would
+        // otherwise override the config pin and authenticate as the operator.
+        for name in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(key, value)| key == name && value.is_empty()),
+                "{name} is pinned empty when the operator provisioned nothing"
+            );
+        }
+        assert!(reviewer_gh_env(&env, "developer", &agent_dir)
+            .unwrap()
+            .pairs()
+            .is_empty());
+        assert!(reviewer_gh_env(&env, "pm", &agent_dir)
+            .unwrap()
+            .pairs()
+            .is_empty());
+        for role in ["Reviewer", "review", "code-reviewer"] {
+            assert!(
+                !reviewer_gh_env(&env, role, &agent_dir)
+                    .unwrap()
+                    .pairs()
+                    .is_empty(),
+                "a role that reads as a review is pinned whatever its spelling: {role}"
+            );
+        }
+
+        env.set("CADENCE_REVIEWER_GH_TOKEN", "ghp_read_only_synthetic");
+        let pairs = reviewer_gh_env(&env, "reviewer", &agent_dir)
+            .unwrap()
+            .pairs()
+            .to_vec();
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| name == "GH_TOKEN" && value == "ghp_read_only_synthetic"),
+            "the provisioned reviewer token is the only credential passed"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(name, value)| name == "GITHUB_TOKEN" && value.is_empty()),
+            "the generic token stays empty even when the reviewer token is set"
         );
     }
 }

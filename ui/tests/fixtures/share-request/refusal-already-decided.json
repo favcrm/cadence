@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "error": {
+    "code": "already_decided",
+    "message": "Chris already shared this request."
+  },
+  "status": "shared",
+  "decided_by": "Chris"
+}

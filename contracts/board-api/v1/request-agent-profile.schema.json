@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentProfileReq",
+  "description": "`POST /api/agent-profiles` (CAD-1989): hire a catalogue role as a profile.\n`job` is sent only when edited; `model` is absent or `inherit` unless picked.",
+  "type": "object",
+  "properties": {
+    "alias": {
+      "type": "string"
+    },
+    "catalogue": {
+      "type": "string"
+    },
+    "job": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "alias",
+    "catalogue"
+  ]
+}

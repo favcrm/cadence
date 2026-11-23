@@ -2,23 +2,37 @@
 
 use super::*;
 
+mod dev;
+mod dispatch;
+mod params;
+mod runs;
+
+pub(super) use dev::run_dev;
+#[cfg(test)]
+use dev::{parse_dev_command, run_package_dev, DevCommand};
+pub(super) use dispatch::{run, run_check, run_inspect};
+#[cfg(test)]
+use params::{record_params, works_params};
+#[cfg(test)]
+use runs::{derive_operation_id, parse_assistant_input, read_run_inputs, resolve_assistant_scope};
+
 /// `cadence app` verbs (CAD-547). `install`/`update`/`set`/`remove`
 /// write the tracker directly — one commit each, `Actor:` recorded —
 /// `ls`/`show` read it; `approve` is the operator's daemon gate, like
 /// `workflow approve`.
 #[derive(Subcommand)]
 pub(crate) enum AppAction {
-    /// Configure exact publication connections for an installation or context.
+    /// [native daemon only] Configure exact publication connections for an installation or context.
     Binding {
         #[command(subcommand)]
         action: BindingAction,
     },
-    /// Stage and explicitly approve release of an independently reviewed artifact.
+    /// [native daemon only] Stage and explicitly approve release of an independently reviewed artifact.
     Effect {
         #[command(subcommand)]
         action: EffectAction,
     },
-    /// Optional app-owned content settings; creates no worker or provider authority.
+    /// [native daemon only] Optional app-owned content settings; creates no worker or provider authority.
     Context {
         #[command(subcommand)]
         action: ContextAction,
@@ -41,42 +55,95 @@ pub(crate) enum AppAction {
         #[arg(long)]
         json: bool,
     },
-    /// Host-managed per-installation customer records with scoped revisions.
+    /// Inspect complete package integrity without claiming target compatibility.
+    /// Observes Native requirements; installs, approves and consents to nothing.
+    Inspect {
+        /// Package directory.
+        source: String,
+        /// Emit the machine-readable inspection receipt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// [native daemon only] Host-managed per-installation customer records with scoped revisions.
+    /// For a hosted workspace (`--org`), use `app describe <app>` and `app call <app> records.*`.
     Record {
         #[command(subcommand)]
         action: RecordAction,
     },
-    /// Saved segments, exclusion lists, suppressions and frozen
+    /// [native daemon only] Saved segments, exclusion lists, suppressions and frozen
     /// audiences over customer records (CAD-780). No mail is sent.
+    /// For a hosted workspace (`--org`), use `app call <app> segments.*` or `audience.preview`.
     Audience {
         #[command(subcommand)]
         action: AudienceAction,
     },
-    /// Campaign email content — the scoped-chat inert assistant draft
+    /// [native daemon only] Campaign email content — the scoped-chat inert assistant draft
     /// (CAD-1014): drafts a pending proposal the operator applies or
     /// discards. Never edits, approves or sends.
+    /// For a hosted workspace (`--org`), use `app call <app> content.*` or `proposals.*`.
     Content {
         #[command(subcommand)]
         action: ContentAction,
     },
-    /// Works content (CAD-1662): native operator docs, decks and sheets over
+    /// [native daemon only] Works content (CAD-1662): native operator docs, decks and sheets over
     /// the durable store. Explicit install and context; no actor flags. Review
     /// needs two verified humans, and the daemon derives the actor.
     Works {
         #[command(subcommand)]
         action: WorksAction,
     },
-    /// CRM app assistant discovery, consented action invocation, and durable receipt reads.
+    /// [native daemon only] CRM app assistant discovery, consented action invocation, and durable receipt reads.
+    /// For a hosted workspace (`--org`), use `app describe <app>` and `app call <app> <operation>`.
     Assistant {
         #[command(subcommand)]
         action: AssistantAction,
+    },
+    /// List installed apps, or describe the actions one hosted app offers.
+    Describe {
+        /// Installed app name; omit to list apps.
+        app: Option<String>,
+    },
+    /// Call a hosted app action using its declared arguments.
+    Call {
+        /// Installed app name.
+        app: String,
+        /// Action name from `app describe`.
+        operation: String,
+        /// Action arguments as one JSON object: inline, `@file`, a path, or `-` for stdin.
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Stable request handle; keep it and the same arguments if the outcome is uncertain.
+        #[arg(long)]
+        request: Option<String>,
+        /// Reason shown with an action held for an owner's decision.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Read one skill package shipped by an installed hosted app.
+    Skill {
+        /// Installed app name.
+        app: String,
+        /// Skill name from `app describe`.
+        skill: String,
+    },
+    /// List or inspect staged writes held in a hosted workspace conversation.
+    Pending {
+        /// Filter by decision status.
+        #[arg(long, value_enum)]
+        status: Option<PendingStatus>,
+        /// Inspect one staged action by id.
+        #[arg(long)]
+        id: Option<String>,
+        /// Conversation id (defaults to your Home conversation; people only).
+        #[arg(long)]
+        conversation: Option<String>,
     },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
         action: CatalogAction,
     },
-    /// App-owned local runs with separate execution approval.
+    /// [native daemon only] App-owned local runs with separate execution approval.
     Run {
         #[command(subcommand)]
         action: RunAction,
@@ -92,6 +159,9 @@ pub(crate) enum AppAction {
         /// Exact parent origin allowed by the frame bridge.
         #[arg(long, default_value = "http://127.0.0.1")]
         parent_origin: String,
+        /// Static preview only: inspect integrity without requiring Native support.
+        #[arg(long, requires = "bundle")]
+        integrity_only: bool,
     },
     /// Emit canonical screen PUSH fixtures from a local validated app bundle.
     Fixtures {
@@ -101,6 +171,9 @@ pub(crate) enum AppAction {
         /// Require the machine-readable fixture envelope.
         #[arg(long)]
         json: bool,
+        /// Synthetic fixtures only; does not prove target runtime compatibility.
+        #[arg(long)]
+        integrity_only: bool,
     },
     /// Run the app's declared local preview. In a detached app repository,
     /// `--package .` reads `package.json.cadence` and runs the app-owned
@@ -243,6 +316,59 @@ pub(crate) enum AppAction {
         /// Project key.
         #[arg(long)]
         project: String,
+    },
+    /// Explicit per-member read access to an installation's exact
+    /// conversations (CAD-2215). Operator only, through the daemon. The
+    /// local CLI lists and revokes; creating a grant needs the board's
+    /// authenticated session flow (a live owner plus the platform roster)
+    /// and is deliberately not offered as a CLI credential handoff.
+    Access {
+        #[command(subcommand)]
+        action: AccessAction,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PendingStatus {
+    Pending,
+    Approved,
+    Denied,
+}
+
+impl PendingStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+impl AppAction {
+    pub(crate) const fn is_hosted_action(&self) -> bool {
+        matches!(
+            self,
+            Self::Describe { .. } | Self::Call { .. } | Self::Skill { .. } | Self::Pending { .. }
+        )
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AccessAction {
+    /// List every grant (active and revoked) and the installation's live
+    /// conversations, so an operator can see the exact conversation ids.
+    #[command(visible_alias = "list")]
+    Ls { install_id: String },
+    /// Revoke one exact grant, or every grant this member holds for the
+    /// installation when `--conversation` is omitted. Works without the
+    /// member being present and needs no member session.
+    Revoke {
+        install_id: String,
+        #[arg(long)]
+        member: String,
+        #[arg(long)]
+        conversation: Option<String>,
     },
 }
 
@@ -989,691 +1115,6 @@ fn catalogue_params(
     Ok(())
 }
 
-fn read_record_csv(path: &Path) -> Result<String> {
-    use std::io::Read;
-    const MAX_CSV_BYTES: usize = 256 * 1024;
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::invalid("app_record_csv", format!("cannot open CSV: {e}")))?;
-    let mut bytes = Vec::new();
-    file.take((MAX_CSV_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Error::invalid("app_record_csv", format!("cannot read CSV: {e}")))?;
-    if bytes.len() > MAX_CSV_BYTES {
-        return Err(Error::invalid("app_record_csv", "CSV exceeds 256KiB"));
-    }
-    String::from_utf8(bytes).map_err(|_| Error::invalid("app_record_csv", "CSV must be UTF-8 text"))
-}
-
-fn read_csv_decisions(path: &Path) -> Result<serde_json::Value> {
-    use std::io::Read;
-    const MAX_DECISIONS_BYTES: usize = 64 * 1024;
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::invalid("app_record_csv", format!("cannot open decisions: {e}")))?;
-    let mut bytes = Vec::new();
-    file.take((MAX_DECISIONS_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Error::invalid("app_record_csv", format!("cannot read decisions: {e}")))?;
-    if bytes.len() > MAX_DECISIONS_BYTES {
-        return Err(Error::invalid(
-            "app_record_csv",
-            "decisions JSON exceeds 64KiB",
-        ));
-    }
-    let decisions: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| Error::invalid("app_record_csv", "decisions must be a JSON array"))?;
-    if !decisions.is_array() {
-        return Err(Error::invalid(
-            "app_record_csv",
-            "decisions must be a JSON array",
-        ));
-    }
-    Ok(decisions)
-}
-
-fn read_record_profile(path: &Path) -> Result<serde_json::Value> {
-    use std::io::Read;
-    const MAX_PROFILE_BYTES: usize = 16 * 1024;
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::invalid("app_record_profile", format!("cannot open profile: {e}")))?;
-    let mut bytes = Vec::new();
-    file.take((MAX_PROFILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Error::invalid("app_record_profile", format!("cannot read profile: {e}")))?;
-    if bytes.len() > MAX_PROFILE_BYTES {
-        return Err(Error::invalid(
-            "app_record_profile",
-            "profile JSON exceeds 16KiB",
-        ));
-    }
-    let profile: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| Error::invalid("app_record_profile", "profile must be a JSON object"))?;
-    if !profile.is_object() {
-        return Err(Error::invalid(
-            "app_record_profile",
-            "profile must be a JSON object",
-        ));
-    }
-    Ok(profile)
-}
-
-fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Value)> {
-    Ok(match action {
-        RecordAction::Create {
-            install_id,
-            context_id,
-            record_id,
-            profile,
-        } => (
-            "app_record_create",
-            json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "profile": read_record_profile(profile)?}),
-        ),
-        RecordAction::Ls {
-            install_id,
-            context_id,
-        } => (
-            "app_record_list",
-            json!({"install_id": install_id, "context_id": context_id}),
-        ),
-        RecordAction::Show {
-            install_id,
-            context_id,
-            record_id,
-        } => (
-            "app_record_show",
-            json!({"install_id": install_id, "context_id": context_id, "record_id": record_id}),
-        ),
-        RecordAction::Set {
-            install_id,
-            context_id,
-            record_id,
-            expected_revision,
-            profile,
-            consent_method,
-            consent_note,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "expected_revision": expected_revision, "profile": read_record_profile(profile)?});
-            if let Some(method) = consent_method {
-                params["consent_provenance"] = json!({"method": method, "note": consent_note});
-            }
-            ("app_record_update", params)
-        }
-        RecordAction::CsvPreview {
-            install_id,
-            context_id,
-            csv,
-        } => (
-            "app_record_csv_preview",
-            json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?}),
-        ),
-        RecordAction::CsvImport {
-            install_id,
-            context_id,
-            csv,
-            preview_token,
-            request_id,
-            decisions,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "preview_token": preview_token, "request_id": request_id});
-            if let Some(path) = decisions {
-                params["decisions"] = read_csv_decisions(path)?;
-            }
-            ("app_record_csv_import", params)
-        }
-        RecordAction::CsvAssistantImport {
-            install_id,
-            context_id,
-            request_id,
-            confirm_token,
-            message,
-            token,
-        } => {
-            // Handle-only: the daemon resolves the durable plan
-            // (csv_text + decisions + their digests) from request_id +
-            // confirm_token. No csv_text/preview_token/decisions params.
-            (
-                "app_record_csv_assistant_import",
-                json!({"install_id": install_id, "context_id": context_id, "request_id": request_id, "confirm_token": confirm_token, "message": message, "token": token}),
-            )
-        }
-        RecordAction::CsvConfirm {
-            install_id,
-            context_id,
-            csv,
-            preview_token,
-            request_id,
-            decisions,
-        } => {
-            // The confirm stores the durable plan: the exact csv_text +
-            // normalized decisions the daemon re-verifies against the
-            // preview_token + decisions_digest before minting. The agent
-            // later resolves the plan by request id + nonce.
-            let csv_text = read_record_csv(csv)?;
-            let decisions_value = match decisions {
-                Some(path) => read_csv_decisions(path)?,
-                None => json!([]),
-            };
-            let decisions_digest =
-                cadence_agent::store::app_records::csv_decisions_digest(&decisions_value)?;
-            (
-                "app_record_csv_confirm",
-                json!({"install_id": install_id, "context_id": context_id, "preview_token": preview_token, "request_id": request_id, "csv_text": csv_text, "decisions": decisions_value, "decisions_digest": decisions_digest}),
-            )
-        }
-        RecordAction::CsvAssistantPreview {
-            install_id,
-            context_id,
-            csv,
-            message,
-            token,
-        } => (
-            "app_record_csv_assistant_preview",
-            json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "message": message, "token": token}),
-        ),
-    })
-}
-
-/// CAD-1662: map each native Works verb to its `app_works_*` RPC. JSON
-/// files are bounded by `read_audience_json` (64 KiB) and forwarded as-is;
-/// the daemon's typed grammar validates every field. No actor is sent.
-fn works_params(action: &WorksAction) -> Result<(&'static str, serde_json::Value)> {
-    Ok(match action {
-        WorksAction::Query {
-            install_id,
-            context_id,
-            text,
-            kind,
-            review,
-            export,
-            tag,
-            owner,
-            sort,
-        } => (
-            "app_works_query",
-            json!({"install_id": install_id, "context_id": context_id, "text": text, "kind": kind, "review": review, "export": export, "tag": tag, "owner": owner, "sort": sort}),
-        ),
-        WorksAction::Get {
-            install_id,
-            context_id,
-            id,
-        } => (
-            "app_works_get",
-            json!({"install_id": install_id, "context_id": context_id, "id": id}),
-        ),
-        WorksAction::Create {
-            install_id,
-            context_id,
-            body,
-            idempotency_key,
-        } => {
-            let mut params = read_works_json(body, "works body")?;
-            let obj = params
-                .as_object_mut()
-                .ok_or_else(|| Error::invalid("app_works", "works body must be an object"))?;
-            obj.insert("install_id".into(), json!(install_id));
-            obj.insert("context_id".into(), json!(context_id));
-            obj.insert("idempotency_key".into(), json!(idempotency_key));
-            ("app_works_create", params)
-        }
-        WorksAction::Patch {
-            install_id,
-            context_id,
-            id,
-            if_revision,
-            body,
-            idempotency_key,
-        } => {
-            let mut params = read_works_json(body, "works patch")?;
-            let obj = params
-                .as_object_mut()
-                .ok_or_else(|| Error::invalid("app_works", "works patch must be an object"))?;
-            obj.insert("install_id".into(), json!(install_id));
-            obj.insert("context_id".into(), json!(context_id));
-            obj.insert("id".into(), json!(id));
-            obj.insert("if_revision".into(), json!(if_revision));
-            obj.insert("idempotency_key".into(), json!(idempotency_key));
-            ("app_works_patch", params)
-        }
-        WorksAction::Trash {
-            install_id,
-            context_id,
-            id,
-            if_revision,
-            idempotency_key,
-        } => (
-            "app_works_trash",
-            json!({"install_id": install_id, "context_id": context_id, "id": id, "if_revision": if_revision, "idempotency_key": idempotency_key}),
-        ),
-        WorksAction::Restore {
-            install_id,
-            context_id,
-            id,
-            if_revision,
-            idempotency_key,
-        } => (
-            "app_works_restore",
-            json!({"install_id": install_id, "context_id": context_id, "id": id, "if_revision": if_revision, "idempotency_key": idempotency_key}),
-        ),
-        WorksAction::RequestReview {
-            install_id,
-            context_id,
-            id,
-            revision,
-        } => (
-            "app_works_request_review",
-            json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision}),
-        ),
-        WorksAction::Review {
-            install_id,
-            context_id,
-            id,
-            revision,
-            decision,
-            note,
-        } => (
-            "app_works_review",
-            json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision, "decision": decision, "note": note}),
-        ),
-        WorksAction::Export {
-            install_id,
-            context_id,
-            id,
-            revision,
-            format,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision});
-            // Omit `format` when absent so the daemon applies its html default
-            // instead of receiving an explicit null (refused as invalid).
-            if let Some(format) = format {
-                params["format"] = json!(format);
-            }
-            ("app_works_export", params)
-        }
-    })
-}
-
-/// Works create/patch bodies: a near-64 KiB revision plus kind, title,
-/// tags or operations exceeds the 64 KiB audience bound, so Works verbs get
-/// their own 80 KiB reader. Other commands keep `read_audience_json`.
-fn read_works_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
-    read_bounded_json(path, kind, 80 * 1024)
-}
-
-fn read_audience_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
-    read_bounded_json(path, kind, 64 * 1024)
-}
-
-fn read_bounded_json(path: &Path, kind: &str, limit: usize) -> Result<serde_json::Value> {
-    use std::io::Read;
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::invalid("app_audience", format!("cannot open {kind}: {e}")))?;
-    let mut bytes = Vec::new();
-    file.take((limit + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Error::invalid("app_audience", format!("cannot read {kind}: {e}")))?;
-    if bytes.len() > limit {
-        return Err(Error::invalid(
-            "app_audience",
-            format!("{kind} JSON exceeds {}KiB", limit / 1024),
-        ));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| Error::invalid("app_audience", format!("{kind} must be JSON")))
-}
-
-fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::Value)> {
-    Ok(match action {
-        ContentAction::Draft {
-            install_id,
-            context_id,
-            campaign_id,
-            proposal_id,
-            draft,
-            message,
-            token,
-        } => {
-            // The draft JSON file holds {subject, preheader, blocks};
-            // the daemon's content grammar validates every field. The
-            // message+token are the live scoped turn's identity.
-            let body = read_audience_json(draft, "email draft")?;
-            let obj = body
-                .as_object()
-                .ok_or_else(|| Error::invalid("app_content", "email draft must be an object"))?;
-            let mut params = json!({
-                "install_id": install_id,
-                "context_id": context_id,
-                "campaign_id": campaign_id,
-                "proposal_id": proposal_id,
-                "message": message,
-                "token": token,
-            });
-            for key in ["subject", "preheader", "blocks"] {
-                if let Some(v) = obj.get(key) {
-                    params[key] = v.clone();
-                }
-            }
-            ("app_content_assistant_draft", params)
-        }
-        ContentAction::Proposals {
-            install_id,
-            context_id,
-            campaign_id,
-            message,
-            token,
-        } => {
-            let mut params = json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token});
-            if let Some(campaign) = campaign_id {
-                params["campaign_id"] = json!(campaign);
-            }
-            ("app_content_assistant_proposals", params)
-        }
-        ContentAction::ProposalShow {
-            install_id,
-            context_id,
-            proposal_id,
-            message,
-            token,
-        } => (
-            "app_content_assistant_proposal_show",
-            json!({"install_id":install_id,"context_id":context_id,"proposal_id":proposal_id,"message":message,"token":token}),
-        ),
-        ContentAction::AutonomySet { mode } => ("crm_autonomy_set", json!({"mode":mode})),
-        ContentAction::AutonomyShow => ("crm_autonomy_show", json!({})),
-    })
-}
-
-fn audience_params(action: &AudienceAction) -> Result<(&'static str, serde_json::Value)> {
-    Ok(match action {
-        AudienceAction::SegmentSave {
-            install_id,
-            context_id,
-            segment_id,
-            name,
-            predicates,
-            expected_revision,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id, "name": name, "predicates": read_audience_json(predicates, "predicates")?});
-            if let Some(revision) = expected_revision {
-                params["expected_revision"] = json!(revision);
-            }
-            ("app_segment_save", params)
-        }
-        AudienceAction::SegmentAssistantSave {
-            install_id,
-            context_id,
-            segment_id,
-            name,
-            predicates,
-            expected_revision,
-            message,
-            token,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id, "name": name, "predicates": read_audience_json(predicates, "predicates")?, "message": message, "token": token});
-            if let Some(revision) = expected_revision {
-                params["expected_revision"] = json!(revision);
-            }
-            ("app_segment_assistant_save", params)
-        }
-        AudienceAction::SegmentAssistantLs {
-            install_id,
-            context_id,
-            message,
-            token,
-        } => (
-            "app_segment_assistant_list",
-            json!({"install_id": install_id, "context_id": context_id, "message": message, "token": token}),
-        ),
-        AudienceAction::SegmentAssistantPreview {
-            install_id,
-            context_id,
-            segment_id,
-            message,
-            token,
-        } => (
-            "app_segment_assistant_preview",
-            json!({"install_id":install_id,"context_id":context_id,"segment_id":segment_id,"message":message,"token":token}),
-        ),
-        AudienceAction::SegmentAssistantShow {
-            install_id,
-            context_id,
-            segment_id,
-            message,
-            token,
-        } => (
-            "app_segment_assistant_show",
-            json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id, "message": message, "token": token}),
-        ),
-        AudienceAction::SegmentShow {
-            install_id,
-            context_id,
-            segment_id,
-        } => (
-            "app_segment_show",
-            json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id}),
-        ),
-        AudienceAction::SegmentLs {
-            install_id,
-            context_id,
-        } => (
-            "app_segment_list",
-            json!({"install_id": install_id, "context_id": context_id}),
-        ),
-        AudienceAction::ExclusionSave {
-            install_id,
-            context_id,
-            list_id,
-            name,
-            members,
-            expected_revision,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "list_id": list_id, "name": name, "member_ids": read_audience_json(members, "members")?});
-            if let Some(revision) = expected_revision {
-                params["expected_revision"] = json!(revision);
-            }
-            ("app_exclusion_save", params)
-        }
-        AudienceAction::ExclusionShow {
-            install_id,
-            context_id,
-            list_id,
-        } => (
-            "app_exclusion_show",
-            json!({"install_id": install_id, "context_id": context_id, "list_id": list_id}),
-        ),
-        AudienceAction::ExclusionLs {
-            install_id,
-            context_id,
-        } => (
-            "app_exclusion_list",
-            json!({"install_id": install_id, "context_id": context_id}),
-        ),
-        AudienceAction::SuppressionAdd {
-            install_id,
-            context_id,
-            email,
-            customer_id,
-            reason,
-        } => {
-            let mut params =
-                json!({"install_id": install_id, "context_id": context_id, "reason": reason});
-            if let Some(address) = email {
-                params["email"] = json!(address);
-            }
-            if let Some(id) = customer_id {
-                params["customer_id"] = json!(id);
-            }
-            ("app_suppression_add", params)
-        }
-        AudienceAction::SuppressionRemove {
-            install_id,
-            context_id,
-            email,
-            customer_id,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id});
-            if let Some(address) = email {
-                params["email"] = json!(address);
-            }
-            if let Some(id) = customer_id {
-                params["customer_id"] = json!(id);
-            }
-            ("app_suppression_remove", params)
-        }
-        AudienceAction::SuppressionLs {
-            install_id,
-            context_id,
-        } => (
-            "app_suppression_list",
-            json!({"install_id": install_id, "context_id": context_id}),
-        ),
-        AudienceAction::Preview {
-            install_id,
-            context_id,
-            base,
-            exclusion_list_id,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "base": read_audience_json(base, "base")?});
-            if let Some(list) = exclusion_list_id {
-                params["exclusion_list_id"] = json!(list);
-            }
-            ("app_audience_preview", params)
-        }
-        AudienceAction::Prepare {
-            install_id,
-            context_id,
-            freeze_id,
-            base,
-            exclusion_list_id,
-            max_recipients,
-        } => {
-            let mut params = json!({"install_id": install_id, "context_id": context_id, "freeze_id": freeze_id, "base": read_audience_json(base, "base")?, "max_recipients": max_recipients});
-            if let Some(list) = exclusion_list_id {
-                params["exclusion_list_id"] = json!(list);
-            }
-            ("app_audience_prepare", params)
-        }
-        AudienceAction::FreezeShow {
-            install_id,
-            context_id,
-            freeze_id,
-        } => (
-            "app_audience_show",
-            json!({"install_id": install_id, "context_id": context_id, "freeze_id": freeze_id}),
-        ),
-    })
-}
-
-fn release_scope(install: Option<&str>, context: Option<&str>) -> serde_json::Value {
-    let mut params = json!({});
-    if let Some(id) = install {
-        params["install_id"] = json!(id);
-    }
-    if let Some(id) = context {
-        params["context_id"] = json!(id);
-    }
-    params
-}
-fn binding_params(action: &BindingAction) -> (&'static str, serde_json::Value) {
-    match action {
-        BindingAction::Create {
-            install_id,
-            context_id,
-            slot,
-            connection_id,
-            request_id,
-        } => {
-            let mut params = release_scope(Some(install_id), context_id.as_deref());
-            params["slot"] = json!(slot);
-            params["connection_id"] = json!(connection_id);
-            params["request_id"] = json!(request_id);
-            ("app_binding_create", params)
-        }
-        BindingAction::Ls {
-            install_id,
-            context_id,
-        } => (
-            "app_binding_list",
-            release_scope(Some(install_id), context_id.as_deref()),
-        ),
-        BindingAction::Show {
-            install_id,
-            binding_id,
-        } => (
-            "app_binding_show",
-            json!({"install_id":install_id,"binding_id":binding_id}),
-        ),
-        BindingAction::Set {
-            install_id,
-            binding_id,
-            expected_revision,
-            connection_id,
-        } => (
-            "app_binding_update",
-            json!({"install_id":install_id,"binding_id":binding_id,"expected_revision":expected_revision,"connection_id":connection_id}),
-        ),
-        BindingAction::Publish {
-            install_id,
-            binding_id,
-            expected_revision,
-            destination_id,
-            destination_label,
-            toolkit,
-            timezone,
-            grant_id,
-        } => (
-            "app_binding_publish_set",
-            json!({"install_id":install_id,"binding_id":binding_id,"expected_revision":expected_revision,
-            "destination_id":destination_id,"destination_label":destination_label,"toolkit":toolkit,
-            "timezone":timezone,"grant_id":grant_id}),
-        ),
-        BindingAction::Revoke {
-            install_id,
-            binding_id,
-            expected_revision,
-        } => (
-            "app_binding_revoke",
-            json!({"install_id":install_id,"binding_id":binding_id,"expected_revision":expected_revision}),
-        ),
-    }
-}
-fn effect_params(action: &EffectAction) -> (&'static str, serde_json::Value) {
-    match action {
-        EffectAction::Resolve {
-            effect_id,
-            digest,
-            resolution,
-        } => (
-            "app_effect_resolve",
-            json!({"effect_id":effect_id,"digest":digest,"resolution":resolution.as_str()}),
-        ),
-        EffectAction::Stage {
-            run_id,
-            artifact_id,
-            slot,
-            request_id,
-            title,
-        } => (
-            "app_effect_stage",
-            json!({"run_id":run_id,"artifact_id":artifact_id,"slot":slot,"request_id":request_id,"title":title}),
-        ),
-        EffectAction::Show { effect_id } => ("app_effect_show", json!({"effect_id":effect_id})),
-        EffectAction::Ls {
-            install_id,
-            context_id,
-        } => (
-            "app_effect_list",
-            release_scope(install_id.as_deref(), context_id.as_deref()),
-        ),
-        EffectAction::Accept { effect_id, digest } => (
-            "app_effect_decide",
-            json!({"effect_id":effect_id,"digest":digest,"decision":"accept"}),
-        ),
-        EffectAction::Decline { effect_id, digest } => (
-            "app_effect_decide",
-            json!({"effect_id":effect_id,"digest":digest,"decision":"decline"}),
-        ),
-    }
-}
-
 #[derive(Subcommand)]
 pub(crate) enum AssistantAction {
     /// List the actions this installation declares for the current context.
@@ -1939,6 +1380,10 @@ pub(crate) enum RunAction {
     },
     /// Cancel a run and prevent further dispatch.
     Cancel { run_id: String },
+    /// Retire a terminal legacy run's unrecorded team-role provenance.
+    /// The run's state and history are unchanged; the app-team check
+    /// stops holding its input values.
+    RetireLegacy { run_id: String },
     /// Dispatch eligible steps of an explicitly approved run.
     Dispatch { run_id: String },
     /// Inspect an exact app-owned run and its output receipts.
@@ -1991,1236 +1436,50 @@ pub(crate) enum RunAction {
         #[arg(long, requires = "message")]
         token: Option<String>,
     },
+    /// Record accept or decline of one reviewed artifact. Does not publish.
+    /// One decision per run; the same request replays and a different
+    /// decision conflicts.
+    Disposition {
+        run_id: String,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        artifact_id: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, value_enum)]
+        decision: RunDisposition,
+    },
+    /// Write one host issue for one 1-based proposal. Requires an accepted
+    /// disposition of this artifact. The same request returns the same
+    /// issue; any other proposal on the run conflicts.
+    Ticket {
+        run_id: String,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        artifact_id: String,
+        #[arg(long)]
+        digest: String,
+        /// 1-based index into `## Proposed next steps`.
+        #[arg(long)]
+        index: u32,
+        #[arg(long)]
+        project: String,
+    },
 }
 
-fn read_run_inputs(path: &Path) -> Result<serde_json::Value> {
-    use std::io::Read;
-    const MAX_INPUT_BYTES: usize = 32 * 1024;
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::invalid("app_run_inputs", format!("cannot open inputs: {e}")))?;
-    let mut bytes = Vec::new();
-    file.take((MAX_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Error::invalid("app_run_inputs", format!("cannot read inputs: {e}")))?;
-    if bytes.len() > MAX_INPUT_BYTES {
-        return Err(Error::invalid(
-            "app_run_inputs",
-            "inputs JSON exceeds 32KiB",
-        ));
-    }
-    let inputs: std::collections::BTreeMap<String, String> = serde_json::from_slice(&bytes)
-        .map_err(|_| Error::invalid("app_run_inputs", "inputs must be a JSON object of strings"))?;
-    Ok(json!(inputs))
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum RunDisposition {
+    Accept,
+    Decline,
 }
 
-/// Bounded JSON object for `app assistant invoke`: inline, `@file`, a path,
-/// or `-` for stdin. The source never changes the 32 KiB bound.
-fn parse_assistant_input(state_dir: &Path, raw: &str) -> Result<serde_json::Value> {
-    use std::io::Read;
-    const MAX_INPUT_BYTES: usize = 32 * 1024;
-    let bytes = if raw == "-" {
-        let mut bytes = Vec::new();
-        std::io::stdin()
-            .lock()
-            .take((MAX_INPUT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| {
-                Error::invalid(
-                    "app_assistant_input",
-                    format!("cannot read assistant input from stdin: {e}"),
-                )
-            })?;
-        bytes
-    } else if raw.trim_start().starts_with('{') {
-        raw.as_bytes().to_vec()
-    } else {
-        let path = Path::new(raw.strip_prefix('@').unwrap_or(raw));
-        let file = cadence_agent::master::open_command_file(state_dir, path)?;
-        let mut bytes = Vec::new();
-        file.take((MAX_INPUT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| {
-                Error::invalid(
-                    "app_assistant_input",
-                    format!("cannot read assistant input: {e}"),
-                )
-            })?;
-        bytes
-    };
-    if bytes.len() > MAX_INPUT_BYTES {
-        return Err(Error::invalid(
-            "app_assistant_input",
-            "assistant input JSON exceeds 32KiB",
-        ));
-    }
-    let input: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|_| Error::invalid("app_assistant_input", "input must be a JSON object"))?;
-    if !input.is_object() {
-        return Err(Error::invalid(
-            "app_assistant_input",
-            "input must be a JSON object",
-        ));
-    }
-    Ok(input)
-}
-
-#[derive(Clone, Debug)]
-struct AssistantScope {
-    install_id: String,
-    context_id: String,
-    message: String,
-    token: String,
-}
-
-impl AssistantScope {
-    /// The daemon's identity fields plus one call's own fields.
-    fn params(&self, extra: serde_json::Value) -> serde_json::Value {
-        let mut params = json!({
-            "install_id": self.install_id,
-            "context_id": self.context_id,
-            "message": self.message,
-            "token": self.token,
-        });
-        if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
-            for (key, value) in extra {
-                params.insert(key.clone(), value.clone());
-            }
-        }
-        params
-    }
-}
-
-fn assistant_scope(
-    state_dir: &Path,
-    install_id: Option<&str>,
-    context_id: Option<&str>,
-    message: Option<&str>,
-    token: Option<&str>,
-) -> Result<AssistantScope> {
-    // `agent_identity` derives the caller from the connection, exactly as
-    // `cadence self` does. An operator outside a pane has no live turn and
-    // must pass every identity flag.
-    let live = client::rpc(state_dir, "agent_identity", json!({})).ok();
-    resolve_assistant_scope(live.as_ref(), install_id, context_id, message, token)
-}
-
-/// Explicit flags win; anything omitted comes from the caller's one live
-/// turn and its verified App stamp. Ambiguity refuses instead of guessing.
-fn resolve_assistant_scope(
-    live: Option<&serde_json::Value>,
-    install_id: Option<&str>,
-    context_id: Option<&str>,
-    message: Option<&str>,
-    token: Option<&str>,
-) -> Result<AssistantScope> {
-    let turns = live
-        .and_then(|value| value.get("running"))
-        .and_then(serde_json::Value::as_array);
-    let turn = match (message, token) {
-        (Some(id), Some(_)) => {
-            turns.and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(id)))
-        }
-        (None, None) => match turns.map(Vec::as_slice) {
-            Some([only]) => Some(only),
-            Some(rows) if !rows.is_empty() => {
-                return Err(Error::rejected(format!(
-                    "this agent holds {} running turns — pass --message and --token to choose one",
-                    rows.len()
-                )))
-            }
-            _ => None,
-        },
-        _ => {
-            return Err(Error::rejected(
-                "--message and --token are given together or not at all",
-            ))
-        }
-    };
-    let message =
-        match (message, turn.and_then(|row| row["id"].as_str())) {
-            (Some(id), _) => id.to_string(),
-            (None, Some(id)) => id.to_string(),
-            (None, None) if live.is_none() => return Err(Error::rejected(
-                "this process sees no live agent turn — pass --message, --token and the install id",
-            )),
-            (None, None) => {
-                return Err(Error::rejected(
-                    "no running turn to derive the app scope from — pass --message and --token",
-                ))
-            }
-        };
-    let token = match (token, turn.and_then(|row| row["turn_id"].as_str())) {
-        (Some(token), _) => token.to_string(),
-        (None, Some(token)) => token.to_string(),
-        (None, None) => {
-            return Err(Error::rejected(
-                "no live turn token — pass --token together with --message",
-            ))
-        }
-    };
-    let install_id = install_id
-        .map(str::to_string)
-        .or_else(|| {
-            turn.and_then(|row| row["app_install_id"].as_str())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            Error::rejected("this turn carries no App installation — pass the install id")
-        })?;
-    let context_id = context_id
-        .map(str::to_string)
-        .or_else(|| {
-            turn.and_then(|row| row["app_context_id"].as_str())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| Error::rejected("this turn carries no App context — pass --context-id"))?;
-    Ok(AssistantScope {
-        install_id,
-        context_id,
-        message,
-        token,
-    })
-}
-
-/// One idempotency key for one (turn, action, input), so re-running the
-/// same command replays the operation instead of creating a second effect.
-fn derive_operation_id(message: &str, action_id: &str, input: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
-    let mut digest = Sha256::new();
-    digest.update(message.as_bytes());
-    digest.update(b"\0");
-    digest.update(action_id.as_bytes());
-    digest.update(b"\0");
-    digest.update(serde_json::to_vec(input).expect("assistant input serializes"));
-    let hex = format!("{:x}", digest.finalize());
-    format!("op-{}", &hex[..24])
-}
-
-fn wait_assistant_operation(
-    state_dir: &Path,
-    scope: &AssistantScope,
-    operation_id: &str,
-    first: serde_json::Value,
-) -> Result<serde_json::Value> {
-    use std::time::{Duration, Instant};
-    let seconds = std::env::var("CADENCE_ASSISTANT_WAIT_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(120u64);
-    let deadline = Instant::now() + Duration::from_secs(seconds);
-    let mut current = first;
-    loop {
-        let status = current
-            .get("operation")
-            .and_then(|operation| operation.get("status"))
-            .or_else(|| current.get("status"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if status != "running" {
-            let mut value = current;
-            if status == "pending_permission" {
-                let revision = value
-                    .get("operation")
-                    .and_then(|operation| operation.get("revision"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or_default();
-                if let Some(object) = value.as_object_mut() {
-                    object.insert(
-                        "wait_note".into(),
-                        json!(format!(
-                            "operation {operation_id} waits for an operator decision: \
-                             `cadence app assistant decide {} --context-id {} \
-                             --operation-id {operation_id} --expected-revision {revision} \
-                             --decision allow_once` (or `allow_always` / `deny`)",
-                            scope.install_id, scope.context_id
-                        )),
-                    );
-                }
-            }
-            return Ok(value);
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::rejected(format!(
-                "operation {operation_id} is still running; read it again with \
-                 `cadence app assistant operation-show {} --operation-id {operation_id}`",
-                scope.install_id
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(500));
-        current = client::rpc(
-            state_dir,
-            "app_assistant_operation_show",
-            scope.params(json!({"operation_id": operation_id})),
-        )?;
-    }
-}
-
-fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
-    Ok(match action {
-        RunAction::Create {
-            install_id,
-            workflow,
-            inputs,
-            request_id,
-            owner_pm,
-            project_link,
-            context_id,
-            source_receipt_id,
-            selected_post_id,
-        } => {
-            let mut params = json!({
-                "install_id": install_id,
-                "workflow": workflow,
-                "inputs": read_run_inputs(inputs)?,
-                "request_id": request_id,
-            });
-            if let Some(owner) = owner_pm {
-                params["owner_pm"] = json!(owner);
-            }
-            if let Some(link) = project_link {
-                params["project_link"] = json!(link);
-            }
-            if let Some(context) = context_id {
-                params["context_id"] = json!(context);
-            }
-            if let (Some(receipt), Some(post)) = (source_receipt_id, selected_post_id) {
-                params["source_receipt_id"] = json!(receipt);
-                params["selected_post_id"] = json!(post);
-            }
-            ("app_run_create", params)
-        }
-        RunAction::Approve { run_id, digest } => {
-            ("app_run_approve", json!({"run_id":run_id,"digest":digest}))
-        }
-        RunAction::Cancel { run_id } => ("app_run_cancel", json!({"run_id":run_id})),
-        RunAction::Dispatch { run_id } => ("app_run_dispatch", json!({"run_id":run_id})),
-        RunAction::Show { run_id } => ("app_run_show", json!({"run_id":run_id})),
-        RunAction::Ls {
-            install_id,
-            context_id,
-        } => {
-            let mut params = match install_id {
-                Some(id) => json!({"install_id":id}),
-                None => json!({}),
-            };
-            if let Some(context) = context_id {
-                params["context_id"] = json!(context);
-            }
-            ("app_run_list", params)
-        }
-        RunAction::Artifact {
-            artifact_id,
-            message,
-            token,
-        } => {
-            let params = match (message, token) {
-                (None, None) => json!({"artifact_id":artifact_id}),
-                (Some(message), Some(token)) => {
-                    json!({"artifact_id":artifact_id,"message":message,"token":token})
-                }
-                _ => {
-                    return Err(Error::invalid(
-                        "app_run_artifact",
-                        "message and token must be supplied together",
-                    ));
-                }
-            };
-            ("app_run_artifact", params)
-        }
-        RunAction::CapabilityCall {
-            message,
-            token,
-            slot,
-            request_id,
-            input_json,
-        } => {
-            let input: Value = serde_json::from_str(input_json).map_err(|_| {
-                Error::invalid(
-                    "app_run_capability_call",
-                    "input-json must be a JSON object",
-                )
-            })?;
-            if !input.is_object() || serde_json::to_vec(&input)?.len() > 64 * 1024 {
-                return Err(Error::invalid(
-                    "app_run_capability_call",
-                    "input-json must be an object within 64 KiB",
-                ));
-            }
-            (
-                "app_run_capability_call",
-                json!({"message":message,"token":token,"slot":slot,
-                "request_id":request_id,"input":input}),
-            )
-        }
-        RunAction::CapabilityResults { run_id } => {
-            ("app_run_capability_results", json!({"run_id":run_id}))
-        }
-        RunAction::CapabilityResult {
-            receipt_id,
-            message,
-            token,
-        }
-        | RunAction::CapabilityAsset {
-            receipt_id,
-            message,
-            token,
-        } => {
-            let mut params = json!({"receipt_id":receipt_id});
-            if let (Some(message), Some(token)) = (message, token) {
-                params["message"] = json!(message);
-                params["token"] = json!(token);
-            }
-            (
-                if matches!(action, RunAction::CapabilityResult { .. }) {
-                    "app_run_capability_result"
-                } else {
-                    "app_run_capability_asset"
-                },
-                params,
-            )
-        }
-    })
-}
-
-/// `cadence app …` (CAD-547). `install`/`update`/`set`/`remove` write
-/// the tracker directly — one commit each, `Actor:` recorded, all
-/// unapproving-by-construction (a tracker write can only change the
-/// digest, never the approval record) — `ls`/`show` read; `approve`
-/// is the operator's daemon call, like `workflow approve`.
-pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
-    use cadence_agent::issue::app;
-    let result = match &action {
-        AppAction::Binding { action } => {
-            let (method, params) = binding_params(action);
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Effect { action } => {
-            let (method, params) = effect_params(action);
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Context { action } => {
-            let (method, params) = match action {
-                ContextAction::Create {
-                    install_id,
-                    label,
-                    defaults,
-                    request_id,
-                } => (
-                    "app_context_create",
-                    json!({"install_id":install_id,"label":label,"input_defaults":match defaults {Some(path)=>read_run_inputs(path)?,None=>json!({})},"request_id":request_id}),
-                ),
-                ContextAction::Ls { install_id } => {
-                    ("app_context_list", json!({"install_id":install_id}))
-                }
-                ContextAction::Show {
-                    install_id,
-                    context_id,
-                } => (
-                    "app_context_show",
-                    json!({"install_id":install_id,"context_id":context_id}),
-                ),
-                ContextAction::Set {
-                    install_id,
-                    context_id,
-                    expected_revision,
-                    label,
-                    defaults,
-                } => (
-                    "app_context_update",
-                    json!({"install_id":install_id,"context_id":context_id,"expected_revision":expected_revision,"label":label,"input_defaults":read_run_inputs(defaults)?}),
-                ),
-                ContextAction::Archive {
-                    install_id,
-                    context_id,
-                    expected_revision,
-                } => (
-                    "app_context_archive",
-                    json!({"install_id":install_id,"context_id":context_id,"expected_revision":expected_revision}),
-                ),
-            };
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Catalog { action } => {
-            let (method, params) = match action {
-                CatalogAction::ReleaseCheck { .. }
-                | CatalogAction::ReleaseInstall { .. }
-                | CatalogAction::ReleaseUpdate { .. }
-                | CatalogAction::ReleaseRevoke { .. }
-                | CatalogAction::Operation { .. }
-                | CatalogAction::Pending { .. }
-                | CatalogAction::Reconcile { .. } => {
-                    return Err(Error::usage("published-release lifecycle commands require a selected remote workspace (--org); local app/catalog commands are unchanged"));
-                }
-                CatalogAction::Approve { install_id, digest } => (
-                    "app_local_install_approve",
-                    json!({"install_id":install_id,"digest":digest}),
-                ),
-                CatalogAction::Revoke { install_id, digest } => (
-                    "app_local_install_revoke",
-                    json!({"install_id":install_id,"digest":digest}),
-                ),
-                CatalogAction::Install {
-                    source,
-                    expected_digest,
-                    catalogue_id,
-                    catalogue_version,
-                    catalogue_digest,
-                    catalogue_resolution,
-                } => {
-                    let source = install_source(source)?;
-                    let mut params = json!({"source":source});
-                    if let Some(digest) = expected_digest {
-                        params["expected_digest"] = json!(digest);
-                    }
-                    catalogue_params(
-                        &mut params,
-                        catalogue_id,
-                        catalogue_version,
-                        catalogue_digest,
-                        catalogue_resolution,
-                    )?;
-                    ("app_workspace_install", params)
-                }
-                CatalogAction::InstallCheck {
-                    source,
-                    catalogue_id,
-                    catalogue_version,
-                    catalogue_digest,
-                    catalogue_resolution,
-                } => {
-                    let source = install_source(source)?;
-                    let mut params = json!({"source":source});
-                    catalogue_params(
-                        &mut params,
-                        catalogue_id,
-                        catalogue_version,
-                        catalogue_digest,
-                        catalogue_resolution,
-                    )?;
-                    ("app_workspace_install_check", params)
-                }
-                CatalogAction::Upgrade {
-                    install_id,
-                    source,
-                    expected_digest,
-                    expected_generation,
-                    expected_new_digest,
-                    request_id,
-                    catalogue_id,
-                    catalogue_version,
-                    catalogue_digest,
-                    catalogue_resolution,
-                } => {
-                    let source = if source.contains("://")
-                        || source.starts_with("git@")
-                        || source.starts_with("builtin:")
-                    {
-                        source.clone()
-                    } else {
-                        // A committed request is replayable after its local
-                        // checkout is removed. The daemon verifies the exact
-                        // stored source and digest before returning that row.
-                        match std::fs::canonicalize(source) {
-                            Ok(path) => path,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                std::path::absolute(source).map_err(|e| {
-                                    Error::rejected(format!("workspace app source: {e}"))
-                                })?
-                            }
-                            Err(error) => {
-                                return Err(Error::rejected(format!(
-                                    "workspace app source: {error}"
-                                )))
-                            }
-                        }
-                        .to_string_lossy()
-                        .into_owned()
-                    };
-                    let mut params = json!({"install_id":install_id,"source":source,
-                        "expected_digest":expected_digest,"expected_generation":expected_generation,
-                        "expected_new_digest":expected_new_digest,"request_id":request_id});
-                    catalogue_params(
-                        &mut params,
-                        catalogue_id,
-                        catalogue_version,
-                        catalogue_digest,
-                        catalogue_resolution,
-                    )?;
-                    ("app_workspace_upgrade", params)
-                }
-                CatalogAction::UpgradeCheck {
-                    install_id,
-                    source,
-                    expected_digest,
-                    expected_generation,
-                    catalogue_id,
-                    catalogue_version,
-                    catalogue_digest,
-                    catalogue_resolution,
-                } => {
-                    let source = install_source(source)?;
-                    let mut params = json!({"install_id":install_id,"source":source,
-                        "expected_digest":expected_digest,"expected_generation":expected_generation});
-                    catalogue_params(
-                        &mut params,
-                        catalogue_id,
-                        catalogue_version,
-                        catalogue_digest,
-                        catalogue_resolution,
-                    )?;
-                    ("app_workspace_upgrade_check", params)
-                }
-                CatalogAction::UpgradeRecover {
-                    install_id,
-                    request_id,
-                } => (
-                    "app_workspace_upgrade_recover",
-                    json!({"install_id":install_id,"request_id":request_id}),
-                ),
-                CatalogAction::MigrationRecover {
-                    journal_id,
-                    rollback,
-                } => (
-                    "app_workspace_migration_recover",
-                    json!({"journal_id":journal_id,"rollback":rollback}),
-                ),
-                CatalogAction::Ls => ("app_workspace_list", json!({})),
-                CatalogAction::Show { install_id } => {
-                    ("app_workspace_show", json!({"install_id":install_id}))
-                }
-                CatalogAction::Migrate => ("app_workspace_migrate", json!({})),
-                CatalogAction::Recover { install_id } => {
-                    ("app_workspace_recover", json!({"install_id":install_id}))
-                }
-            };
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Run { action } => {
-            let (method, params) = run_params(action)?;
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Record { action } => {
-            let (method, params) = record_params(action)?;
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Audience { action } => {
-            let (method, params) = audience_params(action)?;
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Content { action } => {
-            let (method, params) = content_params(action)?;
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Works { action } => {
-            let (method, params) = works_params(action)?;
-            client::rpc(state_dir, method, params)?
-        }
-        AppAction::Assistant { action } => {
-            let (method, params, wait): (
-                &'static str,
-                serde_json::Value,
-                Option<(AssistantScope, String)>,
-            ) = match action {
-                AssistantAction::Actions {
-                    install_id,
-                    context_id,
-                    message,
-                    token,
-                } => {
-                    let scope = assistant_scope(
-                        state_dir,
-                        install_id.as_deref(),
-                        context_id.as_deref(),
-                        message.as_deref(),
-                        token.as_deref(),
-                    )?;
-                    ("app_assistant_actions", scope.params(json!({})), None)
-                }
-                AssistantAction::Invoke {
-                    install_id,
-                    context_id,
-                    message,
-                    token,
-                    action_id,
-                    operation_id,
-                    input,
-                    wait,
-                } => {
-                    // The ticket's refusal order: malformed or oversized
-                    // input never reaches the daemon, not even the read that
-                    // resolves the live turn.
-                    let input = parse_assistant_input(state_dir, input)?;
-                    let scope = assistant_scope(
-                        state_dir,
-                        install_id.as_deref(),
-                        context_id.as_deref(),
-                        message.as_deref(),
-                        token.as_deref(),
-                    )?;
-                    let operation_id = match operation_id {
-                        Some(id) => id.clone(),
-                        None => derive_operation_id(&scope.message, action_id, &input),
-                    };
-                    let params = scope.params(json!({
-                        "action_id": action_id,
-                        "operation_id": operation_id,
-                        "input": input,
-                    }));
-                    let waiting = wait.then(|| (scope.clone(), operation_id));
-                    ("app_assistant_invoke", params, waiting)
-                }
-                AssistantAction::OperationShow {
-                    install_id,
-                    context_id,
-                    message,
-                    token,
-                    operation_id,
-                } => {
-                    let scope = assistant_scope(
-                        state_dir,
-                        install_id.as_deref(),
-                        context_id.as_deref(),
-                        message.as_deref(),
-                        token.as_deref(),
-                    )?;
-                    (
-                        "app_assistant_operation_show",
-                        scope.params(json!({"operation_id":operation_id})),
-                        None,
-                    )
-                }
-                AssistantAction::Decide {
-                    install_id,
-                    context_id,
-                    operation_id,
-                    expected_revision,
-                    decision,
-                } => (
-                    "app_assistant_decision",
-                    json!({
-                        "install_id": install_id,
-                        "context_id": context_id,
-                        "operation_id": operation_id,
-                        "expected_revision": expected_revision,
-                        "decision": decision,
-                    }),
-                    None,
-                ),
-            };
-            let result = client::rpc(state_dir, method, params)?;
-            match wait {
-                Some((scope, operation_id)) => {
-                    wait_assistant_operation(state_dir, &scope, &operation_id, result)?
-                }
-                None => result,
-            }
-        }
-        AppAction::FrameKit {
-            out,
-            bundle,
-            parent_origin,
-        } => {
-            return cadence_agent::app_preview_export::write_frame_kit(
-                out,
-                bundle.as_deref(),
-                parent_origin,
-            );
-        }
-        AppAction::Fixtures { bundle, json } => {
-            return cadence_agent::app_preview_export::write_fixtures(bundle, *json);
-        }
-        AppAction::Dev {
-            name,
-            source,
-            package,
-            port,
-            host,
-            allow_host,
-        } => {
-            return run_dev(
-                name.as_deref(),
-                source.as_deref(),
-                package.as_deref(),
-                *port,
-                host,
-                allow_host,
-            );
-        }
-        // CAD-1270: `check` is dispatched before org/state-dir
-        // resolution — it never reaches the daemon path.
-        AppAction::Check { .. } => unreachable!("app check dispatches before state-dir resolution"),
-        AppAction::Install { source, project } => {
-            let pm = cadence_agent::issue::Pm::open_default()?;
-            app::install(&pm, project, source, state_dir, "")?
-        }
-        AppAction::Ls { project } => {
-            let pm = cadence_agent::issue::Pm::open_default()?;
-            app::ls(&pm, project.as_deref(), state_dir)?
-        }
-        AppAction::Show { name, project } => {
-            let pm = cadence_agent::issue::Pm::open_default()?;
-            app::show(&pm, project, name, state_dir)?
-        }
-        AppAction::Set {
-            name,
-            bindings,
-            project,
-        } => {
-            let pm = cadence_agent::issue::Pm::open_default()?;
-            app::set(&pm, project, name, bindings, state_dir, "")?
-        }
-        AppAction::Update {
-            name,
-            source,
-            project,
-        } => {
-            let pm = cadence_agent::issue::Pm::open_default()?;
-            app::update(&pm, project, name, source.as_deref(), state_dir, "")?
-        }
-        AppAction::Remove { name, project } => {
-            let pm = cadence_agent::issue::Pm::open_default()?;
-            app::remove(&pm, project, name, state_dir, "")?
-        }
-        AppAction::Approve { name, project } => client::rpc(
-            state_dir,
-            "app_approve",
-            json!({"project": project, "name": name}),
-        )?,
-        AppAction::Revoke { name, project } => client::rpc(
-            state_dir,
-            "app_revoke",
-            json!({"project": project, "name": name}),
-        )?,
-        AppAction::SetTeam {
-            name,
-            roles,
-            project,
-        } => client::rpc(
-            state_dir,
-            "app_set_team",
-            json!({"project": project, "name": name, "team": roles}),
-        )?,
-        AppAction::AddWorker {
-            name,
-            role,
-            project,
-        } => client::rpc(
-            state_dir,
-            "app_add_worker",
-            json!({"project": project, "name": name, "role": role}),
-        )?,
-    };
-    print_json(&result);
-    Ok(0)
-}
-
-pub(super) fn run(state_dir: PathBuf, action: AppAction) -> Result<i32> {
-    run_app(&state_dir, action)
-}
-
-/// CAD-1270 `cadence app check <dir>`: the offline bundle validator.
-/// Runs before org/state-dir resolution — it opens no state dir, daemon
-/// socket or PM; the only filesystem it reads is the named directory. A
-/// `builtin:` source gets the retired refusal (CAD-1422). The JSON
-/// report prints to stdout; the exit code is the verdict (0 pass, 3
-/// refusal — `rejected` in the kind table).
-pub(super) fn run_check(source: &str, _json: bool) -> Result<i32> {
-    let report = cadence_agent::issue::app_catalog::workspace::check_offline(source)?;
-    let ok = report["ok"].as_bool() == Some(true);
-    print_json(&report);
-    Ok(if ok { 0 } else { 3 })
-}
-
-/// No production state, PM, socket or app approval is accessed here.
-pub(super) fn run_dev(
-    name: Option<&str>,
-    source: Option<&Path>,
-    package: Option<&Path>,
-    port: u16,
-    host: &str,
-    allow_hosts: &[String],
-) -> Result<i32> {
-    if let Some(package) = package {
-        if !allow_hosts.is_empty() {
-            return Err(Error::invalid(
-                "app_dev_allow_host",
-                "--allow-host is only available in legacy --source mode",
-            ));
-        }
-        if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
-            return Err(Error::invalid(
-                "app_dev_host",
-                "package previews must bind loopback",
-            ));
-        }
-        return run_package_dev(package, port, host, true);
-    }
-    let name = name.ok_or_else(|| {
-        Error::invalid(
-            "app_dev_mode",
-            "pass a preview name with --source, or --package <dir>",
-        )
-    })?;
-    let source = source.ok_or_else(|| {
-        Error::invalid(
-            "app_dev_mode",
-            "pass a preview name with --source, or --package <dir>",
-        )
-    })?;
-    let source = source
-        .canonicalize()
-        .map_err(|e| Error::invalid("app_dev_source", format!("trusted source checkout: {e}")))?;
-    let harness = source.join("scripts/app-dev.mjs");
-    if !harness.is_file() || !source.join("ui/package.json").is_file() {
-        return Err(Error::invalid("app_dev_source", "source must be a trusted Cadence checkout with scripts/app-dev.mjs and UI dependencies"));
-    }
-    let mut command = std::process::Command::new("node");
-    command
-        .arg(&harness)
-        .arg(name)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--host")
-        .arg(host)
-        .current_dir(&source);
-    for host in allow_hosts {
-        command.arg("--allow-host").arg(host);
-    }
-    // The preview needs tools, not a native identity, state dir, provider
-    // keys, browser cookies or the operator's daemon/session environment.
-    command.env_clear();
-    copy_preview_env(&mut command);
-    let status = cadence_agent::reaper::status(&mut command)
-        .map_err(|e| Error::internal(format!("app development harness: {e}")))?;
-    Ok(status.code().unwrap_or(1))
-}
-
-struct AppPackageContract {
-    app: String,
-    dev: String,
-    check: Option<String>,
-}
-
-/// An app-owned preview: the package's `package.json` declares the app
-/// name and the commands; Cadence only validates the package and runs
-/// them. No daemon, state dir, PM, socket or approval is read.
-fn run_package_dev(root: &Path, port: u16, host: &str, exec_child: bool) -> Result<i32> {
-    let root = root
-        .canonicalize()
-        .map_err(|e| Error::invalid("app_dev_package", format!("package root: {e}")))?;
-    let contract = package_contract(&root)?;
-    if let Some(check) = contract.check.as_deref() {
-        let status = shell_status(check, &root, &contract.app, port, host)?;
-        if !status.success() {
-            return Ok(status.code().unwrap_or(1));
-        }
-    }
-    let mut child = dev_command(&contract.dev, &root, &contract.app, port, host)?;
-    if exec_child {
-        use std::os::unix::process::CommandExt;
-        let error = child.exec();
-        eprintln!("app dev: {error}");
-        return Ok(launch_error_code(&error));
-    }
-    match cadence_agent::reaper::status(&mut child) {
-        Ok(status) => Ok(status.code().unwrap_or(1)),
-        Err(error) => {
-            eprintln!("app dev: {error}");
-            Ok(launch_error_code(&error))
-        }
-    }
-}
-
-fn launch_error_code(error: &std::io::Error) -> i32 {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        127
-    } else {
-        126
-    }
-}
-
-fn package_contract(root: &Path) -> Result<AppPackageContract> {
-    let manifest = root.join("package.json");
-    let bytes = std::fs::read(&manifest).map_err(|e| {
-        Error::invalid(
-            "app_dev_package",
-            format!("read {}: {e}", manifest.display()),
-        )
-    })?;
-    let json: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::invalid("app_dev_package", format!("package.json: {e}")))?;
-    let cadence = json
-        .get("cadence")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            Error::invalid(
-                "app_dev_package",
-                "package.json needs a cadence object with app and dev",
-            )
-        })?;
-    let app = cadence
-        .get("app")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::invalid("app_dev_package", "cadence.app must be a string"))?;
-    cadence_agent::proto::identifier(app, "app name")?;
-    let dev = package_command(cadence.get("dev"), "cadence.dev", true)?;
-    let check = match cadence.get("check") {
-        Some(value) => Some(package_command(Some(value), "cadence.check", false)?),
-        None => None,
-    };
-    if !root.join("app/app.md").is_file() {
-        return Err(Error::invalid(
-            "app_dev_package",
-            "package needs app/app.md",
-        ));
-    }
-    Ok(AppPackageContract {
-        app: app.to_owned(),
-        dev,
-        check,
-    })
-}
-
-fn package_command(value: Option<&Value>, field: &str, one_command: bool) -> Result<String> {
-    let text = value
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::invalid("app_dev_package", format!("{field} must be a string")))?;
-    if text.trim().is_empty() || text.len() > 4096 {
-        return Err(Error::invalid(
-            "app_dev_package",
-            format!("{field} must be 1..=4096 bytes"),
-        ));
-    }
-    if one_command && parse_dev_command(text).is_err() {
-        return Err(Error::invalid(
-            "app_dev_package",
-            "cadence.dev must be one command; put multiple steps in a script",
-        ));
-    }
-    Ok(text.to_owned())
-}
-
-/// A command Cadence can prefix with `exec` without truncating a shell list.
-/// Quoted metacharacters are ordinary arguments; unquoted separators,
-/// redirects, subshells, command substitution and newlines are refused.
-struct DevCommand {
-    envs: Vec<(String, String)>,
-    argv: Vec<String>,
-}
-
-fn parse_dev_command(text: &str) -> Result<DevCommand> {
-    let words = split_shell_words(text)?;
-    let mut envs = Vec::new();
-    let mut index = 0;
-    while let Some((key, value)) = words.get(index).and_then(|word| assignment(word)) {
-        envs.push((key.to_owned(), value.to_owned()));
-        index += 1;
-    }
-    if index == words.len() {
-        return Err(Error::invalid(
-            "app_dev_package",
-            "cadence.dev needs a command after its assignments",
-        ));
-    }
-    Ok(DevCommand {
-        envs,
-        argv: words[index..].to_vec(),
-    })
-}
-
-fn assignment(word: &str) -> Option<(&str, &str)> {
-    let (key, value) = word.split_once('=')?;
-    let mut chars = key.chars();
-    let first = chars.next()?;
-    if !(first.is_ascii_alphabetic() || first == '_')
-        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return None;
-    }
-    Some((key, value))
-}
-
-/// Split one command into words without invoking a shell. Quoted separators
-/// stay in the argument; unquoted separators, redirects, subshells, command
-/// substitution and newlines refuse. Expansions are not performed; an app
-/// that needs a shell belongs in a script.
-fn split_shell_words(text: &str) -> Result<Vec<String>> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut started = false;
-    let mut quote: Option<char> = None;
-    let mut index = 0;
-    while index < chars.len() {
-        let ch = chars[index];
-        if ch == '\n' || ch == '\r' {
-            return Err(Error::invalid(
-                "app_dev_package",
-                "cadence.dev must be one command; newlines are refused",
-            ));
-        }
-        if let Some(active) = quote {
-            if ch == active {
-                quote = None;
-            } else if active == '"' && ch == '\\' {
-                let next = chars.get(index + 1).ok_or_else(|| {
-                    Error::invalid("app_dev_package", "cadence.dev ends with a backslash")
-                })?;
-                if *next == '\n' || *next == '\r' {
-                    return Err(Error::invalid(
-                        "app_dev_package",
-                        "cadence.dev must be one command; newlines are refused",
-                    ));
-                }
-                if matches!(*next, '$' | '`' | '"' | '\\') {
-                    current.push(*next);
-                    index += 1;
-                } else {
-                    current.push('\\');
-                }
-            } else if ch == '`' || (ch == '$' && chars.get(index + 1) == Some(&'(')) {
-                return Err(Error::invalid(
-                    "app_dev_package",
-                    "cadence.dev does not allow command substitution",
-                ));
-            } else {
-                current.push(ch);
-            }
-            started = true;
-            index += 1;
-            continue;
-        }
-        match ch {
-            '\'' | '"' => {
-                quote = Some(ch);
-                started = true;
-            }
-            '\\' => {
-                let next = chars.get(index + 1).ok_or_else(|| {
-                    Error::invalid("app_dev_package", "cadence.dev ends with a backslash")
-                })?;
-                current.push(*next);
-                started = true;
-                index += 1;
-            }
-            ' ' | '\t' => {
-                if started {
-                    words.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            ';' | '&' | '|' | '<' | '>' | '`' | '(' | ')' => {
-                return Err(Error::invalid(
-                    "app_dev_package",
-                    "cadence.dev must be one command; put multiple steps in a script",
-                ));
-            }
-            '$' if chars.get(index + 1) == Some(&'(') => {
-                return Err(Error::invalid(
-                    "app_dev_package",
-                    "cadence.dev does not allow command substitution",
-                ));
-            }
-            _ => {
-                current.push(ch);
-                started = true;
-            }
-        }
-        index += 1;
-    }
-    if quote.is_some() {
-        return Err(Error::invalid(
-            "app_dev_package",
-            "cadence.dev has an unterminated quote",
-        ));
-    }
-    if started {
-        words.push(current);
-    }
-    Ok(words)
-}
-
-fn configure_app_env(
-    child: &mut std::process::Command,
-    root: &Path,
-    app: &str,
-    port: u16,
-    host: &str,
-) {
-    child
-        .current_dir(root)
-        .env_clear()
-        .env("CADENCE_APP_ROOT", root)
-        .env("CADENCE_APP_NAME", app)
-        .env("CADENCE_APP_PORT", port.to_string())
-        .env("CADENCE_APP_HOST", host)
-        .env("CADENCE_APP_CONTRACT", "1");
-    copy_preview_env(child);
-}
-
-fn shell_base(root: &Path, app: &str, port: u16, host: &str) -> std::process::Command {
-    let mut child = std::process::Command::new("sh");
-    configure_app_env(&mut child, root, app, port, host);
-    child
-}
-
-/// Run the one parsed `dev` command directly, with leading `NAME=value`
-/// assignments applied to its environment. No shell means `exec` replaces
-/// Cadence cleanly and signals reach the app's own trap.
-fn dev_command(
-    command: &str,
-    root: &Path,
-    app: &str,
-    port: u16,
-    host: &str,
-) -> Result<std::process::Command> {
-    let DevCommand { envs, argv } = parse_dev_command(command)?;
-    let mut child = std::process::Command::new(&argv[0]);
-    child.args(&argv[1..]);
-    configure_app_env(&mut child, root, app, port, host);
-    for (key, value) in envs {
-        child.env(key, value);
-    }
-    Ok(child)
-}
-
-fn shell_command(
-    command: &str,
-    root: &Path,
-    app: &str,
-    port: u16,
-    host: &str,
-) -> std::process::Command {
-    let mut child = shell_base(root, app, port, host);
-    child.arg("-c").arg(command);
-    child
-}
-
-fn shell_status(
-    command: &str,
-    root: &Path,
-    app: &str,
-    port: u16,
-    host: &str,
-) -> Result<std::process::ExitStatus> {
-    let mut child = shell_command(command, root, app, port, host);
-    cadence_agent::reaper::status(&mut child)
-        .map_err(|e| Error::internal(format!("app dev command: {e}")))
-}
-
-fn copy_preview_env(command: &mut std::process::Command) {
-    for name in [
-        "PATH",
-        "HOME",
-        "LANG",
-        "TERM",
-        "PNPM_HOME",
-        "XDG_CACHE_HOME",
-        "TMPDIR",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
+impl RunDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Decline => "decline",
         }
     }
 }

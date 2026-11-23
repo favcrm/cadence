@@ -9,6 +9,13 @@ export interface WikiVersion {
   author?: string | null;
   at?: string | null;
   summary?: string | null;
+  /**
+   * Whether this revision's text can be opened, when the board says so per
+   * entry (hosted: a row whose text was never retained, or whose original
+   * scope this caller cannot read, is `false`). Absent when the host did not
+   * say, and the pane then falls back to the board's own rule.
+   */
+  can_open?: boolean;
 }
 
 export interface VersionRow extends WikiVersion {

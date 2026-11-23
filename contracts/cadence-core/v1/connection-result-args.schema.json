@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResultArgsV1",
+  "type": "object",
+  "properties": {
+    "dispatch_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "request_id": {
+      "$ref": "#/$defs/UuidV1"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "dispatch_id",
+    "request_id"
+  ],
+  "$defs": {
+    "UuidV1": {
+      "description": "Canonical lowercase UUID selector (`8-4-4-4-12`).",
+      "type": "string"
+    }
+  }
+}

@@ -34,12 +34,26 @@ validation, unsaved work, loading failures and the meaning of partial counts.
 
 ## Theme and typography
 
-Use semantic CSS variables from `src/theme.css`: ink levels for surfaces and
-text, `--color-edge` for boundaries, `--color-accent` for active/focus states,
-`--color-on-accent` for text on accent, and the status tokens for meaning.
-Use the scrim token for overlays. Do not hardcode a light-only background or
-use a status color as decorative branding. Theme selection supports explicit
-`data-theme="light"` / `"dark"` and a system fallback.
+Use `src/theme.css` for neutral white/graphite in light mode and charcoal/slate
+in dark mode. Use ink levels for surfaces, text and neutral primary button
+fills; `--color-edge` for boundaries; `--color-accent` for focus and active
+states; and `--color-on-accent` for text on accent. Use the scrim token for
+overlays. Reserve blue for ongoing work and green for completion in status
+badges; retain text labels so color is not the only cue. The brand mark does not
+set the control palette. Theme selection supports explicit `data-theme="light"` / `"dark"` and a system
+fallback.
+
+**Keep page canvases and tab bars transparent.** App screens sit directly on the
+host board's background (`cadence-kit` sets `html, body { background: transparent; }`).
+Do not paint an opaque background color on `html`, `body`, the root page
+container, or top tab bars — including re-applying `var(--color-ink-950)` or
+hardcoded hex values — because an opaque app canvas or filled tab-bar stripe
+clashes with the board whenever the host theme updates. Apply surface fills
+(`--color-ink-850`, `--color-ink-875`, `--color-ink-800`) only to discrete
+components (cards, tables, inputs, popovers, drawers). The host
+`.app-shell-outlet` also owns the outer page inset (`1.25rem 2rem` on desktop,
+`1rem` below `1024px`), matching native board pages — keep app roots at
+`padding: 0` instead of adding a second outer gutter.
 
 Use `--font-sans` (IBM Plex Sans with system fallbacks), and `.num` /
 `--font-mono` (IBM Plex Mono) for tabular numbers. Use the existing type scale:
@@ -175,3 +189,13 @@ in the source provenance and archive artifact inventory. A working-tree archive
 is development evidence, not a published SDK release or an installed consumer
 upgrade. See `docs/guides/app-toolchain.md` in the source repository for the
 separate bridge receiver and frame-kit delivery contracts.
+
+
+## v1.1 Screen Primitives and Canonical `.s-*` Selectors
+
+- **Canonical `.s-*` aliases:** `.s-toolbar`, `.s-field`, `.s-confirm-wrap`, `.s-confirm-scrim`, and `.s-confirm` alias the legacy `.crm-*` selectors so shared components stay backwards-compatible while screen apps target `.s-*`.
+- **New components:**
+  - `FilterBar` (`FilterBarProps`, `FilterChipOption`) renders a responsive search box (`.s-filter-bar-search`), toggleable facet buttons with `aria-pressed` (`.s-filter-bar-chips`), Clear trigger, and trailing action slots (`.s-filter-bar-actions`).
+  - `StatusPill` (`StatusPillProps`, `StatusTone`) renders status badges (`neutral`, `ok`, `warn`, `fail`, `info`, `accent`) against `--color-ok`, `--color-warn`, `--color-fail`, `--color-info`, and `--color-accent`.
+  - `StagedApprovalBanner` (`StagedApprovalBannerProps`, `StagedApprovalTone`) presents staged confirmation / refusal context (`warn`, `info`, `fail`) with accessible `region`/`alert` roles and Discard / Confirm actions.
+  - `LocaleBridgeProvider` and `useScreenLocale` bind `bridge.getState().snapshot?.presentationLocale` (falling back to `context?.locale` when provided, with optional `messages` catalog or `translate` callback) into `LocaleTextProvider` / `useTranslate` without importing board runtime locale bundles.

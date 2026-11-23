@@ -23,7 +23,91 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 
 use super::StoreConn;
-use super::{now, Store};
+use super::{now, Store, WriteTxn};
+
+/// CAD-1085: stamp the private protected-dispatch binding on a staged effect
+/// inside the caller's transaction. Idempotent for the same binding; a
+/// different binding is a conflict. It grants nothing.
+pub(crate) fn effect_bind_in(tx: &WriteTxn<'_>, effect_id: &str, binding: &str) -> Result<()> {
+    let changed = tx.execute_raw(
+        "UPDATE platform_effects SET connection_operation_binding=?2, updated_at=?3 \
+         WHERE effect_id=?1 AND (connection_operation_binding IS NULL \
+         OR connection_operation_binding=?2)",
+        params![effect_id, binding, now()],
+    )?;
+    if changed != 1 {
+        return Err(Error::invalid(
+            "effect_not_claimable",
+            "the effect is bound to a different protected operation",
+        ));
+    }
+    Ok(())
+}
+
+/// One staged effect by durable id, read inside a caller-owned transaction.
+pub(crate) fn effect_row_in(tx: &WriteTxn<'_>, effect_id: &str) -> Result<Option<EffectRow>> {
+    Ok(tx
+        .query_opt(
+            "SELECT * FROM platform_effects WHERE effect_id=?1",
+            params![effect_id],
+            EffectRow::from_row,
+        )?
+        .map(Some)
+        .unwrap_or_default())
+}
+
+/// CAD-1085: claim a human-decided effect INSIDE the caller's authoritative
+/// transaction, so the dispatch row, the approval CAS and this state change
+/// commit once. Every public field and the private protected binding must
+/// still match; an absent/mismatched binding refuses.
+pub(crate) fn effect_executing_in(
+    tx: &WriteTxn<'_>,
+    effect_id: &str,
+    expected: &EffectRow,
+    expected_binding: Option<&str>,
+) -> Result<EffectRow> {
+    let changed = tx.execute_raw(
+        "UPDATE platform_effects SET state='executing', updated_at=?2
+                 WHERE effect_id=?1 AND state='decided'",
+        params![effect_id, now()],
+    )?;
+    if changed != 1 {
+        return Err(Error::invalid(
+            "effect_not_claimable",
+            "effect is not claimable",
+        ));
+    }
+    let row = tx.query_row_raw(
+        "SELECT * FROM platform_effects WHERE effect_id=?1",
+        params![effect_id],
+        EffectRow::from_row,
+    )?;
+    let stored_binding: Option<String> = tx
+        .query_opt(
+            "SELECT connection_operation_binding FROM platform_effects WHERE effect_id=?1",
+            params![effect_id],
+            |sql_row| sql_row.get(0),
+        )?
+        .flatten();
+    if row.effect_id != expected.effect_id
+        || row.request != expected.request
+        || row.agent != expected.agent
+        || row.platform != expected.platform
+        || row.account != expected.account
+        || row.tool != expected.tool
+        || row.input != expected.input
+        || row.source_name != expected.source_name
+        || row.source_hash != expected.source_hash
+        || row.scopes != expected.scopes
+        || stored_binding.as_deref() != expected_binding
+    {
+        return Err(Error::invalid(
+            "effect_not_claimable",
+            "effect call identity changed",
+        ));
+    }
+    Ok(row)
+}
 
 /// §5.5 effect event names — all on [`super::platform::PLATFORM_STREAM`]
 /// (carrying fingerprints and handles, never secrets).
@@ -240,14 +324,31 @@ impl Store {
     /// whether it already existed (the dedupe), so the caller omits a
     /// second `request_opened` event.
     pub fn effect_stage(&self, row: &EffectRow) -> Result<(EffectRow, bool)> {
+        self.effect_stage_bound(row, None)
+    }
+
+    /// CAD-1085: stage with the private Connection operation binding. The
+    /// binding is a first-class durable column (hashed by the protected
+    /// authority journal) and is re-compared by [`Self::effect_executing_bound`]
+    /// so a private dispatch can never claim a row staged for other material.
+    pub(crate) fn effect_stage_bound(
+        &self,
+        row: &EffectRow,
+        connection_operation_binding: Option<&str>,
+    ) -> Result<(EffectRow, bool)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            let existing: Option<EffectRow> = tx.query_opt(
+            let existing: Option<(EffectRow, Option<String>)> = tx.query_opt(
                 "SELECT * FROM platform_effects WHERE request=?1",
                 params![row.request],
-                EffectRow::from_row,
+                |sql_row| {
+                    Ok((
+                        EffectRow::from_row(sql_row)?,
+                        sql_row.get("connection_operation_binding")?,
+                    ))
+                },
             )?;
-            if let Some(existing) = existing {
+            if let Some((existing, existing_binding)) = existing {
                 // The dedupe must be genuine: a same-named handle carrying a
                 // different call is a conflict, not a retry — refuse it so a
                 // caller cannot squat a handle and disguise a second effect.
@@ -255,7 +356,8 @@ impl Store {
                     && existing.platform == row.platform
                     && existing.account == row.account
                     && existing.tool == row.tool
-                    && existing.input == row.input;
+                    && existing.input == row.input
+                    && existing_binding.as_deref() == connection_operation_binding;
                 if !same {
                     return Err(Error::rejected(format!(
                         "effect request '{}' already names a different staged call",
@@ -268,8 +370,10 @@ impl Store {
                 "INSERT INTO platform_effects
                          (effect_id, request, agent, platform, account, tool, label,
                           input, input_summary, preview, source_name, source_hash,
-                          scopes, task, state, staged_at, updated_at)
-                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'waiting',?15,?15)",
+                          scopes, task, state, staged_at, updated_at,
+                          connection_operation_binding)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+                                'waiting',?15,?15,?16)",
                 params![
                     row.effect_id,
                     row.request,
@@ -286,6 +390,7 @@ impl Store {
                     serde_json::to_string(&row.scopes)?,
                     row.task,
                     now(),
+                    connection_operation_binding,
                 ],
             )?;
             Self::event(
@@ -458,41 +563,21 @@ impl Store {
     /// distinguishable from "executing" at restart — both reconcile,
     /// but the record says exactly where the run stopped.
     pub fn effect_executing(&self, effect_id: &str, expected: &EffectRow) -> Result<EffectRow> {
-        self.write_tx(|conn| {
-            let n = conn.execute(
-                "UPDATE platform_effects SET state='executing', updated_at=?2
-                         WHERE effect_id=?1 AND state='decided'",
-                params![effect_id, now()],
-            )?;
-            if n != 1 {
-                return Err(Error::invalid(
-                    "effect_not_claimable",
-                    "effect is not claimable",
-                ));
-            }
-            let row = conn.query_row(
-                "SELECT * FROM platform_effects WHERE effect_id=?1",
-                params![effect_id],
-                EffectRow::from_row,
-            )?;
-            if row.effect_id != expected.effect_id
-                || row.request != expected.request
-                || row.agent != expected.agent
-                || row.platform != expected.platform
-                || row.account != expected.account
-                || row.tool != expected.tool
-                || row.input != expected.input
-                || row.source_name != expected.source_name
-                || row.source_hash != expected.source_hash
-                || row.scopes != expected.scopes
-            {
-                return Err(Error::invalid(
-                    "effect_not_claimable",
-                    "effect call identity changed",
-                ));
-            }
-            Ok(row)
-        })
+        self.effect_executing_bound(effect_id, expected, None)
+    }
+
+    /// CAD-1085: the private-binding claim. The stored
+    /// `connection_operation_binding` must equal the caller's exact binding, so
+    /// an effect staged for one protected dispatch can never be executed under
+    /// another. The row still has to be `decided` and every public field still
+    /// has to match.
+    pub(crate) fn effect_executing_bound(
+        &self,
+        effect_id: &str,
+        expected: &EffectRow,
+        expected_binding: Option<&str>,
+    ) -> Result<EffectRow> {
+        self.write_tx(|tx| effect_executing_in(tx, effect_id, expected, expected_binding))
     }
 
     /// The platform outcome: `executing` → `done`|`failed` with the

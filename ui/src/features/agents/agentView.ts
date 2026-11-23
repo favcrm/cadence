@@ -1,6 +1,7 @@
 import { agentOn } from "../../lib/agentOn";
 import type { Agent } from "../../lib/types";
 import { agentIssueIds, type IssueIndex } from "../../lib/scope";
+import type { HiredProfile, IssueCard } from "../../lib/types";
 
 export const AGENT_FILTERS = [
   { value: "current", label: "Current" },
@@ -24,9 +25,10 @@ export function agentCategory(a: Agent): AgentCategory {
     a.fenced ||
     a.unknown > 0 ||
     a.stalled ||
-    ["attention", "error", "waiting_input", "blocked_by_quota"].includes(
-      a.state,
-    ) ||
+    (a.state != null &&
+      ["attention", "error", "waiting_input", "blocked_by_quota"].includes(
+        a.state,
+      )) ||
     a.quota?.state === "blocked" ||
     a.usage_limit?.state === "blocked"
   )
@@ -39,10 +41,13 @@ export function agentCategory(a: Agent): AgentCategory {
   if (
     a.running > 0 ||
     a.queued > 0 ||
-    ["busy", "running", "starting"].includes(a.state)
+    (a.state != null && ["busy", "running", "starting"].includes(a.state))
   )
     return "working";
-  if (a.state === "idle" || a.state === "stopped") return a.state;
+  // Only a reported state names a lifecycle bucket: a scoped row withholds
+  // it, and an absent state is not evidence of idling or stopping.
+  if (a.state === "idle") return "idle";
+  if (a.state === "stopped") return "stopped";
   return "other";
 }
 
@@ -69,11 +74,17 @@ export function agentMatchesFilter(a: Agent, filter: AgentFilter): boolean {
 export function agentHoldsWorkButDead(a: Agent): boolean {
   const holds =
     (a.tasks?.length ?? 0) > 0 || agentOn(a).length > 0 || a.queued > 0;
-  return !agentIsLive(a) && holds;
+  return agentLiveness(a) === false && holds;
 }
 
-function agentIsLive(a: Agent): boolean {
-  return !a.dead && !a.fenced && a.state !== "stopped" && a.state !== "dead";
+/** The daemon's own liveness verdict, when it gave one. A scoped row omits
+ * `dead`/`fenced` (they move on hidden work), so absence is `undefined` —
+ * unavailable, never "alive". */
+function agentLiveness(a: Agent): boolean | undefined {
+  if (a.dead === true || a.fenced === true) return false;
+  if (a.state === "stopped" || a.state === "dead") return false;
+  if (a.dead === false || a.fenced === false) return true;
+  return undefined;
 }
 
 export type AgentLifecycle =
@@ -91,7 +102,13 @@ export function lifecycleOf(a: Agent): AgentLifecycle {
   const category = agentCategory(a);
   if (category === "inbox") return a.queued > 0 ? "stale-inbox" : "normal";
   if (category === "working") return "active";
-  if ((a.tasks?.length ?? 0) > 0 || agentOn(a).length > 0) return "idle-holding";
+  // "Parked on a claim" is an idle verdict. A scoped row reports no state,
+  // and an unknown state is not evidence of idling.
+  if (
+    a.state != null &&
+    ((a.tasks?.length ?? 0) > 0 || agentOn(a).length > 0)
+  )
+    return "idle-holding";
   return "normal";
 }
 
@@ -139,9 +156,9 @@ export function lifecycleBadge(
 }
 
 /** Where an agent runs, derived from its endpoint kind - no stored column.
- * `sandbox` is a cloud sandbox agent; every other kind is local. */
+ * Native cloud conversations and the legacy sandbox kind run remotely. */
 export function agentLocation(a: Agent): "cloud" | "local" {
-  return a.endpoint_kind === "sandbox" ? "cloud" : "local";
+  return a.endpoint_kind === "cloud" || a.endpoint_kind === "sandbox" ? "cloud" : "local";
 }
 
 export function agentStatus(a: Agent): string {
@@ -178,10 +195,12 @@ export function agentMatchesSearch(
   a: Agent,
   query: string,
   index: IssueIndex,
+  displayName?: string | null,
 ): boolean {
   const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
   const text = [
     a.alias,
+    displayName,
     a.role,
     a.team_role,
     a.provider,
@@ -198,4 +217,84 @@ export function agentMatchesSearch(
     .join(" ")
     .toLowerCase();
   return terms.every((term) => text.includes(term));
+}
+
+/** CAD-1853: the AgenticOS cloud connection is conversational-only, so its
+ *  page shows the cloud projection instead of the local work panels. Another
+ *  provider can also report `endpoint_kind: "cloud"` (Devin does), and its
+ *  tabs, stats and settings must stay exactly as they were. */
+export function conversationalOnlyCloud(
+  a?: Pick<Agent, "provider" | "endpoint_kind"> | null,
+): boolean {
+  return a?.provider === "agenticos-cloud" && a?.endpoint_kind === "cloud";
+}
+
+/** A profile with no runtime is an idle seat unless it holds a live claim: the
+ *  filters then agree with what its card says. A profile with runtimes is carried
+ *  by their own rows. */
+export function profileMatchesFilter(p: HiredProfile, filter: AgentFilter): boolean {
+  if (p.runtimes.length > 0) return false;
+  if (filter === "all" || filter === "current") return true;
+  const live = liveClaimState(p);
+  if (live === "working") return filter === "working";
+  if (live === "blocked") return filter === "attention";
+  if (live === "waiting") return false;
+  return filter === "idle";
+}
+
+export function profileMatchesSearch(p: HiredProfile, query: string): boolean {
+  const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  const text = [p.alias, p.role, p.team_role, p.catalogue, usableClaim(p)?.issue_id].filter(Boolean).join(" ").toLowerCase();
+  return terms.every((term) => text.includes(term));
+}
+
+/** What a profile's card names: an issue and how the profile stands on it. */
+export interface ProfileWork {
+  id: string;
+  /** Absent when this viewer's issue list does not hold it. */
+  title?: string;
+  state: "working" | "blocked" | "waiting" | "open" | "last";
+}
+
+const CLOSED_STATUSES = new Set(["done", "dropped"]);
+const LIVE_CLAIMS = new Map<string, ProfileWork["state"]>([
+  ["running", "working"],
+  ["blocked", "blocked"],
+  ["queued", "waiting"],
+  ["waiting", "waiting"],
+]);
+
+const ENDED_CLAIMS = new Set(["failed", "result", "cancelled"]);
+
+/** The claim to show, or none. The payload isn't validated, and a card must never
+ *  say work started on nothing, or read a state it doesn't know as finished. */
+function usableClaim(p: HiredProfile): { issue_id: string; state: string } | null {
+  const claim = p.latest_claim;
+  if (!claim || typeof claim.issue_id !== "string" || !claim.issue_id || typeof claim.state !== "string") return null;
+  return LIVE_CLAIMS.has(claim.state) || ENDED_CLAIMS.has(claim.state) ? claim : null;
+}
+
+export function liveClaimState(p: HiredProfile): ProfileWork["state"] | undefined {
+  const claim = usableClaim(p);
+  return claim ? LIVE_CLAIMS.get(claim.state) : undefined;
+}
+
+/** In order: a live claim, the newest open issue the profile owns, then the last
+ *  it finished or stopped. `null` when the board records none, never an inferred
+ *  job. A failed read of the claim ledger leaves only the owned issues. */
+export function profileWork(p: HiredProfile, issues: IssueCard[]): ProfileWork | null {
+  const titled = (id: string, state: ProfileWork["state"]): ProfileWork => {
+    const title = issues.find((issue) => issue.id === id)?.title;
+    return title === undefined ? { id, state } : { id, title, state };
+  };
+  const claim = usableClaim(p);
+  const live = liveClaimState(p);
+  if (claim && live) return titled(claim.issue_id, live);
+  const owned = issues
+    .filter((issue) => issue.owner === p.alias && !issue.container)
+    .sort((a, b) => b.created.localeCompare(a.created) || b.id.localeCompare(a.id, undefined, { numeric: true }));
+  const open = owned.find((issue) => !CLOSED_STATUSES.has(issue.status));
+  if (open) return titled(open.id, "open");
+  if (claim) return titled(claim.issue_id, "last");
+  return owned[0] ? titled(owned[0].id, "last") : null;
 }

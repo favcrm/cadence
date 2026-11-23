@@ -17,7 +17,7 @@ interface Props {
   title: string;
   body: string;
   groups: string[];
-  seats: { alias: string; provider: string; state: string }[];
+  seats: { alias: string; provider: string; state: string | null }[];
   blocked: string | null;
   onClose: () => void;
   onWrite: (resp: WriteResp, verb: string) => void;
@@ -40,7 +40,9 @@ export default function KickoffDialog({ id, title, body, groups, seats, blocked,
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      // An open Select's Escape stops at the Select; this guards any other
+      // inner handler that cancels Escape (`defaultPrevented`).
+      if (e.key === "Escape" && !e.defaultPrevented) onClose();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -161,7 +163,7 @@ export default function KickoffDialog({ id, title, body, groups, seats, blocked,
                       options={seats.map((s) => ({
                         value: s.alias,
                         label: s.alias,
-                        badge: `${s.provider} · ${s.state}`,
+                        badge: [s.provider, s.state].filter(Boolean).join(" · "),
                       }))}
                       onChange={setSeat}
                     />

@@ -100,8 +100,13 @@ cmd_enable() {
     echo "::add-mask::$key_id"
     echo "::add-mask::$key_secret"
     echo "$dir" >> "$GITHUB_PATH"
+    # CAD-1967: the absolute path, not the bare name. `run-result-tests`
+    # deliberately cuts PATH down to the cargo shim, the compiler and
+    # system dirs, so a bare `sccache` wrapper is unreachable there and
+    # cargo fails with "could not execute process `sccache rustc -vV`".
+    # Naming the binary keeps that isolation exactly as it is.
     {
-        echo "RUSTC_WRAPPER=sccache"
+        echo "RUSTC_WRAPPER=$dir/sccache"
         echo "CARGO_INCREMENTAL=0"
         echo "SCCACHE_BUCKET=$BUCKET"
         echo "SCCACHE_REGION=auto"
@@ -118,12 +123,22 @@ cmd_enable() {
     [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "sccache enabled: mode $mode, prefix $prefix" >> "$GITHUB_STEP_SUMMARY"
 }
 
+# CAD-1967: the wrapper is an absolute path so a PATH-restricted cargo run
+# can still execute it; accept either form and prove it resolves.
+sccache_enabled() {
+    case "${RUSTC_WRAPPER:-}" in
+        sccache) command -v sccache >/dev/null 2>&1 ;;
+        /*) [ -x "$RUSTC_WRAPPER" ] ;;
+        *) return 1 ;;
+    esac
+}
+
 cmd_stats() {
-    if [ "${RUSTC_WRAPPER:-}" != sccache ] || ! command -v sccache >/dev/null 2>&1; then
+    if ! sccache_enabled; then
         note "stats: not enabled for this job"
         exit 0
     fi
-    out=$(sccache --show-stats 2>&1) || true
+    out=$("$RUSTC_WRAPPER" --show-stats 2>&1) || true
     printf '%s\n' "$out"
     if [ -s "${SCCACHE_ERROR_LOG:-}" ]; then
         echo "sccache error log (last 20 lines):"
@@ -140,7 +155,7 @@ cmd_stats() {
 # 2xx (the token can write) -- network trouble or an unexpected status is a
 # warning, so an R2 outage cannot redden CI.
 cmd_verify_ro() {
-    if [ "${RUSTC_WRAPPER:-}" != sccache ] || [ "${SCCACHE_S3_RW_MODE:-}" != READ_ONLY ]; then
+    if ! sccache_enabled || [ "${SCCACHE_S3_RW_MODE:-}" != READ_ONLY ]; then
         note "verify-ro: not in read-only mode; nothing to prove"
         exit 0
     fi

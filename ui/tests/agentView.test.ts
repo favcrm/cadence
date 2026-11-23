@@ -4,6 +4,7 @@ import {
   agentMatchesFilter,
   agentMatchesSearch,
   agentStatus,
+  conversationalOnlyCloud,
   lifecycleOf,
 } from "../src/features/agents/agentView";
 import { issueIndex } from "../src/lib/scope";
@@ -232,4 +233,21 @@ equal(
   true,
   "ad hoc work search",
 );
+equal(
+  conversationalOnlyCloud({ provider: "agenticos-cloud", endpoint_kind: "cloud" }),
+  true,
+  "the AgenticOS cloud connection is conversational-only",
+);
+// Devin also reports endpoint_kind "cloud"; it keeps its local work panels.
+equal(
+  conversationalOnlyCloud({ provider: "devin", endpoint_kind: "cloud" }),
+  false,
+  "another cloud provider keeps its tabs",
+);
+equal(
+  conversationalOnlyCloud({ provider: "agenticos-cloud", endpoint_kind: "managed" }),
+  false,
+  "the endpoint kind must still be cloud",
+);
+equal(conversationalOnlyCloud(undefined), false, "no profile is not cloud");
 console.log("agent view checks passed");

@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
-"""CAD-959: enqueue a PR only when the AGENTS.md review and merge rules hold.
+"""Evaluate or enqueue a PR using Cadence's delivery rules.
 
-    scripts/enqueue-reviewed <pr> --head <full-40-hex-sha> [--repo owner/name]
-                             [--notes-dir DIR] [--author ALIAS ...]
-                             [--dry-run] [--poll-secs N] [--poll-interval N]
+For a hosted org, select it with --org or CADENCE_ORG. --dry-run delegates to
+`cadence delivery check`; an enqueue delegates to `cadence delivery enqueue`.
+In this workspace the operator performs hosted enqueue. Use --project and
+--issue to identify the ticket and --head to pin the reviewed commit.
+`--exception --advisory` is refused for hosted orgs.
 
-Refuses (exit 1, one reason per line on stderr, every failing rule listed)
-unless ALL of these hold for the pinned head:
+When Browser QA is required, the hosted gate accepts a counted QA verdict, an
+unedited exact-head pass from a non-author repository member, or an eligible
+PR author's unedited exact-head pass with the operator's project-scoped
+per-head approval (CAD-2383). The gate cannot prove that QA actually ran.
+--browser-qa URL also validates that specific pass comment and requires QA;
+--require-browser-qa requires QA without naming a comment URL.
 
-  * the PR is OPEN, its head equals --head, mergeStateStatus is not DIRTY and
-    auto-merge is off;
-  * every required status check of the base branch (branch protection AND
-    rulesets) is PRESENT and SUCCESS at that head. Missing or pending fails,
-    and so does a base branch for which no required check can be read: an
-    invalid workflow yields zero checks, and "nothing failed" is not a pass;
-  * the verdict notes in the notes dir, parsed by `cadence audit verdicts`
-    (the audit's own note parser; reviewer = first token of `From:`), give the
-    required count of PASS verdicts pinned to this exact head from distinct
-    reviewers, none of them the PR author: two (Standards plus Spec/security),
-    or one (`Review (standards+spec)`) when every change is on the one-review
-    list (docs/roles/one-review-paths.toml, CAD-957, read at the PR's base
-    commit so a PR cannot widen its own list). A `ui/` change also needs a
-    Browser QA pass;
-  * a ticket comment for this head lists those verdict notes (created after
-    the other gates pass; dry-run only checks an existing comment);
-  * for a human-class diff (a path trigger, more than 1500 changed lines, or
-    any head-pinned note whose Risk is not exactly `auto`),
-    `cadence audit approval` reports an approval in
-    force for exactly this head. This script never records an approval.
+Without a hosted org selector, the native evaluator can run with --dry-run.
+Native local v1 signing is retired, so neither ordinary native enqueue nor the
+native --exception evaluator can land a PR. Do not treat either as a fallback
+for an unavailable hosted gate.
 
-Then it runs `gh pr merge --auto --squash --match-head-commit <sha>`, polls
-isInMergeQueue for up to --poll-secs (default 30), and when the PR is not
-queued runs --disable-auto and exits 1. --dry-run runs every check and
-enqueues nothing. Exit: 0 enqueued (or dry-run clean) / 1 refused / 2 usage.
+The wrapper compares its own and delivery-gate's bytes with origin/main before
+running: a real enqueue refuses a mismatch, while --dry-run warns. This check
+uses the local ref and does not fetch it; if origin/main is absent, it cannot
+compare. Every `cadence` call uses CADENCE_BIN when set, else `cadence` on PATH.
+See AGENTS.md "Review" and "Merging" and docs/guides/hosted-workspace.md for
+the applicable evidence and approval rules.
+
+Exit 0 means evaluation passed or enqueue was accepted, not that the PR
+merged. A refusal, invalid arguments or an upstream failure exits nonzero.
 """
 
 import argparse
@@ -40,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -50,7 +46,49 @@ from urllib.parse import quote
 
 ME = "enqueue-reviewed"
 DEFAULT_NOTES_DIR = "/var/www/agent-notes"
+GATE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delivery-gate")
+DEFAULT_GATE_KEY = "~/.config/cadence/delivery-gate/signing_key"  # CAD-1925
 ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
+# CAD-2081: the workflow principals whose rows count without a login, and the one
+# kind each may fill. Read at main's LIVE tip, not the PR's base (which can lag).
+WORKFLOW_PRINCIPALS_FILE = "docs/roles/review-workflow-principals.toml"
+WORKFLOW_KINDS = ("standards", "spec-security")
+# CAD-2192: the axis a review of each kind actually judges. A pass clears one
+# reviewer's earlier non-pass only when it covers every axis the non-pass named,
+# so a Browser QA failure survives a later Standards pass (and a Standards pass no
+# longer clears a Spec/security revise). `combined` exists to cover both code
+# axes at once. A pass of an unmapped kind (e.g. `other`) covers no axis, so a
+# non-pass of one is cleared only by a later pass of that same kind.
+KIND_AXES = {
+    "standards": frozenset({"standards"}),
+    "spec-security": frozenset({"spec-security"}),
+    "combined": frozenset({"standards", "spec-security"}),
+    "browser-qa": frozenset({"browser-qa"}),
+}
+# The review standard is a fresh-session review (AGENTS.md "Review", CAD-1946), which
+# this gate cannot yet enforce. Refusals for a missing or shared reviewer point at
+# the temporary exception and the standard.
+# A filed row by the author is refused even under --exception, and an advisory link does not clear it.
+AUTHOR_ROW_HINT = (" (a filed row under the author's identity still refuses under --exception, and an "
+                   "advisory link does not clear it. The author's own review can never be an advisory; "
+                   "only a fresh non-author session's review can. A hosted row has no retraction verb and "
+                   "is head-pinned. Agents file no hosted verdict: post findings as a PR comment, which is "
+                   "the advisory link; AGENTS.md \"Review\")")
+# The author has no attested principal: no row is filed yet by "the author", so no permanence claim.
+UNATTESTED_AUTHOR_HINT = (" (changing reviewer identities is the operator's decision alone, never a way to "
+                          "make a row count. Agents file no hosted verdict: post findings as a PR comment, "
+                          "which is the advisory link; AGENTS.md \"Review\")")
+# Local notes are not hosted rows: no permanence claim.
+LOCAL_AUTHOR_ROW_HINT = (" (a note under the author's identity still refuses under --exception, and an "
+                         "advisory link does not clear it. The author's own review can never be an advisory; "
+                         "only a fresh non-author session's review can)")
+REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
+                        "and this gate cannot yet tell one from the author under one login. On hosted, "
+                        "agents file no verdict: post findings as a PR comment, which is the advisory link "
+                        "(AGENTS.md \"Review\"). Routes: workflow-issued rows (dispatch review-standards.yml "
+                        "and review-spec.yml; a cheap first pass on gate, security, schema and release PRs, "
+                        "where fresh-session Opus reviews stay the real review; two rows satisfy other PRs), "
+                        "or --exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate)")
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
@@ -58,11 +96,24 @@ ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
 # check, so this list must catch every trigger 4/6/7 path mechanically rather
 # than rely on a single reviewer's `Risk:` line.
 HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/", ".config/", ".cargo/",
-                  "src/audit/", "src/delegation/", "tests/common/", "config/")
+                  "src/audit/", "src/delegation/", "src/delivery/", "tests/common/", "config/")
 # Every [schema]/[trigger4]/[trigger6]/[trigger7] glob in this file, read at the
-# PR's base, is human too (CAD-1104). Unreadable means human (fail closed).
+# diff's anchor (main's live tip for a main-based PR), is human too (CAD-1104).
+# Unreadable means human (fail closed).
 RISK_PATHS_FILE = "docs/roles/risk-paths.toml"
 RISK_HUMAN_TABLES = ("schema", "trigger4", "trigger6", "trigger7")
+# CAD-2081: a PR with a workflow-issued review needs the operator unless EVERY
+# changed path is on this allowlist, read at main's live tip. A workflow review can
+# write `risk: auto` (a prompt-injected model can), so no path is eligible by
+# default.
+WORKFLOW_AUTO_FILE = "docs/roles/workflow-auto-paths.toml"
+# Basename prefixes (compared casefolded, any directory) of files that can load as
+# agent instructions: never eligible, whatever the list says.
+WORKFLOW_NEVER_PREFIXES = ("agents.", "claude.", "gemini.", "agent.", "warp.", "qwen.",
+                           "crush.", "copilot-instructions.")
+# CAD-2254: whatever that list says, the trust-boundary, identity, secret and UI
+# trees keep the operator: every one-review exclude glob and these risk-paths tables.
+WORKFLOW_NEVER_TABLES = ("trigger1", "trigger3")
 HUMAN_LINES = 1500  # risk-classes trigger 5
 HUMAN_BASENAMES = {"Cargo.toml", "Cargo.lock", "package.json", "pnpm-lock.yaml",
                    "package-lock.json", ".npmrc", "yarn.lock", "bun.lockb",
@@ -78,6 +129,24 @@ HUMAN_EXACT = {
     # trigger 7: approval and delivery rules (CAD-1104)
     "src/delegation.rs", "src/issue/delivery_policy.rs",
     "src/issue/delivery_requirements.rs",
+    # CAD-2117: the classifier's own files (the one above is now a re-export
+    # shim). Keep in agreement with HUMAN_EXACT in cadence-core's
+    # delivery_requirements.rs.
+    "crates/cadence-core/src/delivery_requirements.rs",
+    "crates/cadence-core/src/delivery_rules.rs",
+    "src/daemon/delivery_requirements_rpc.rs",
+    # CAD-2117: what feeds or enforces the classification: the policy that
+    # picks the lean classes, the crate root (it can `#[path]` a module), the
+    # hosted evaluator entry, and the unattended-landing gate.
+    "crates/cadence-core/src/delivery.rs",
+    "crates/cadence-core/src/lib.rs",
+    "crates/cadence-core/src/evaluate.rs",
+    "src/daemon/unattended_landing.rs",
+    # Module roots that can redirect `delivery_requirements` (`#[path]` or an
+    # inline module), the hosted wrapper of `evaluate`, and the approve route.
+    # A floor, not a complete list.
+    "src/issue/mod.rs", "src/lib.rs",
+    "crates/cadence-core/src/wasm.rs", "src/daemon/delivery_rpc.rs",
     "docs/AUDIT.md", "tests/safety_floor.rs",
 }
 
@@ -88,6 +157,10 @@ NEVER_SCOPE_TRIGGERS = {1, 3}
 # work has started and the ticket is not closed. backlog, done, dropped: no.
 SCOPE_STATUSES = ("ready", "doing", "review")
 SCOPE_RECORDED_VIA = "operator-connection"  # the proof check_approval relies on
+# CAD-1946: a merge approval is the operator's when recorded over the local
+# operator connection or by a hosted org's owner login holding audit.approve.
+# Exactly these two; any other recorded_via refuses.
+APPROVAL_RECORDED_VIA = (SCOPE_RECORDED_VIA, "hosted-owner-login")
 # Rust's char::is_whitespace set: the daemon's scope_digest is sha256 of
 # body.trim(), and Python's str.strip() trims a different set.
 RUST_WS = "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
@@ -97,13 +170,34 @@ REGULAR_MODES = ("100644", "100755")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
-def run(argv, input_text=None):
-    """(returncode, stdout, stderr); a missing binary is rc 127."""
+def run(argv, input_text=None, exact=False):
+    """(returncode, stdout, stderr); a missing binary is rc 127. `exact` decodes the
+    output as UTF-8 without the newline translation of text mode, which would read
+    a `\r` inside a path name as `\n` (CAD-2257); it takes no input."""
+    # A host can carry several Cadence builds. `cadence` on PATH may predate the
+    # hosted verbs this gate needs, so let the caller name the build it means
+    # instead of making every refusal look like a gate failure.
+    if argv and argv[0] == "cadence":
+        argv = [os.environ.get("CADENCE_BIN", "cadence"), *argv[1:]]
     try:
-        r = subprocess.run(argv, input=input_text, capture_output=True, text=True)
+        r = subprocess.run(argv, input=input_text, capture_output=True, text=not exact)
+        out, err = (r.stdout.decode(), r.stderr.decode(errors="replace")) if exact else (r.stdout, r.stderr)
     except OSError as e:
         return 127, "", str(e)
-    return r.returncode, r.stdout, r.stderr
+    except UnicodeDecodeError:
+        # A path name that is not UTF-8 cannot be judged: fail closed with a reason.
+        return 1, "", f"{argv[0]} printed output that is not valid UTF-8 (a non-UTF-8 path name?)"
+    return r.returncode, out, err
+
+
+def stale_cli_hint(text):
+    """Name the real cause when the selected client predates a hosted verb."""
+    if "not available on a remote org" not in text and "not available on a remote" not in text:
+        return ""
+    return (
+        " — the selected cadence client does not support this hosted verb;"
+        " set CADENCE_BIN to a current build instead of retrying the same binary"
+    )
 
 
 def gh_json(argv):
@@ -186,25 +280,54 @@ def parse_raw_diff(raw):
     return out
 
 
-def pr_changes(pr, head, base, base_oid):
-    """(changes, changed_lines) of the PR, from git in the current checkout:
+def pr_changes(pr, head, base, base_oid, main_tip=None):
+    """(changes, changed_lines, merge_base) of the PR, from git in the current checkout:
     fetch the base and the PR head when either commit is absent, then diff the
     merge base to the pinned head with no rename detection (a rename is a
-    delete plus an add, so both ends are seen). Raises on any failure."""
+    delete plus an add, so both ends are seen). Raises on any failure.
+
+    CAD-2081: GitHub's `baseRefOid` can stay older than the real merge base after
+    main is merged into the branch, so a PR that merges main and restores an old
+    file diffs as docs-only against it. For a PR based on `main`, `main_tip` (main's
+    live tip, never empty) replaces `baseRefOid` as the merge-base anchor; an
+    unreadable tip raises. Any other base keeps the PR's base."""
+    anchor = base_oid
+    if base == "main":
+        if not main_tip:
+            raise RuntimeError("cannot read main's live tip, so the changed set cannot be anchored to it (fail closed)")
+        anchor = main_tip
     def have(sha):
         return run(["git", "cat-file", "-e", f"{sha}^{{commit}}"])[0] == 0
-    if not (have(head) and have(base_oid)):
+    if not (have(head) and have(base_oid) and have(anchor)):
         rc, _, err = run(["git", "fetch", "--quiet", "--no-tags", "origin", base, f"refs/pull/{pr}/head"])
         if rc != 0:
             raise RuntimeError(f"git fetch of {base} and refs/pull/{pr}/head failed: {err.strip()}")
-    for sha in (head, base_oid):
+        if not have(anchor):
+            run(["git", "fetch", "--quiet", "--no-tags", "origin", anchor])
+    for sha in (head, base_oid, anchor):
         if not have(sha):
             raise RuntimeError(f"commit {sha} is not in this checkout (run from a checkout of the repo)")
-    rc, mb, err = run(["git", "merge-base", base_oid, head])
-    if rc != 0 or not FULL_SHA.match(mb.strip()):
-        raise RuntimeError(f"no merge base of {base_oid} and {head}: {err.strip()}")
-    mb = mb.strip()
-    rc, out, err = run(["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", mb, head])
+    # CAD-2117: `git merge-base` alone picks one of several best common ancestors
+    # (a criss-cross merge), and the diff from the wrong one can hide a restored
+    # file. More than one is refused: nothing here can say which is the right base.
+    # CAD-2117: a shallow checkout can cut the history short, so `merge-base --all`
+    # may see one base where there are several. Refused, and so is an unreadable
+    # answer. A partial clone (blob:none, tree:0) keeps full history and passes.
+    rc, shallow, err = run(["git", "rev-parse", "--is-shallow-repository"])
+    if rc != 0 or shallow.strip() not in ("true", "false"):
+        raise RuntimeError(f"cannot tell whether this checkout is shallow: {err.strip() or shallow.strip()!r} (fail closed)")
+    if shallow.strip() == "true":
+        raise RuntimeError("this checkout is shallow, so the merge bases may be hidden and the changed set "
+                           "ambiguous; run `git fetch --unshallow` and retry (fail closed)")
+    rc, mbs, err = run(["git", "merge-base", "--all", anchor, head])
+    bases = mbs.split()
+    if rc != 0 or not bases or not all(FULL_SHA.fullmatch(b) for b in bases):
+        raise RuntimeError(f"no merge base of {anchor} and {head}: {err.strip()}")
+    if len(bases) > 1:
+        raise RuntimeError(f"{anchor} and {head} have {len(bases)} merge bases ({', '.join(b[:12] for b in bases)}), "
+                           "so the changed set is ambiguous (fail closed)")
+    mb = bases[0]
+    rc, out, err = run(["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev", mb, head], exact=True)
     if rc != 0:
         raise RuntimeError(f"git diff failed: {err.strip()}")
     rc, num, err = run(["git", "diff", "--numstat", "--no-renames", mb, head])
@@ -214,7 +337,7 @@ def pr_changes(pr, head, base, base_oid):
     for row in num.splitlines():
         added, deleted = row.split("\t")[:2]
         lines += (int(added) if added.isdigit() else 0) + (int(deleted) if deleted.isdigit() else 0)
-    return parse_raw_diff(out), lines
+    return parse_raw_diff(out), lines, mb
 
 
 def risk_globs(toml_text):
@@ -229,12 +352,127 @@ def risk_globs(toml_text):
     return globs if all(isinstance(g, str) for g in globs) else None
 
 
-def is_human_path(path, risk=()):
+def workflow_never_globs(one_text, risk_text):
+    """The globs neither a workflow review nor a ticket scope approval may carry to
+    merge (CAD-2254), or None if unreadable.
+
+    Every `one_review_exclude` glob of the one-review list plus risk-paths trigger 1
+    and trigger 3 (docs/roles/risk-classes.md trigger 7 states the rule). A list
+    missing, malformed, without its key or empty (CAD-2257: an empty one excludes
+    nothing) is unreadable, so the caller fails closed."""
+    lists = [glob_list(one_text, ("one_review_exclude",))]
+    lists += [glob_list(risk_text, (table, "paths")) for table in WORKFLOW_NEVER_TABLES]
+    if not all(lists):
+        return None
+    return [g for globs in lists for g in globs]
+
+
+def protected_ignoring_case(path, risk, never):
+    """Is `path`, compared without case, a human-class or never-eligible path (CAD-2254)?
+
+    Git treats `docs/Roles/x.md` and `docs/roles/x.md` as different paths, but a
+    case-insensitive checkout (the macOS build) puts them in one directory, so a
+    name that differs only by case from a protected path is not ordinary. `risk`
+    is risk_globs' list and `never` is workflow_never_globs' list."""
+    return is_human_path(path, list(risk) + list(never), fold=True)
+
+
+def unprintable(c):
+    """A control, format or line/paragraph separator character, or a space other than
+    U+0020: it can start a new output line, hide text or pass for another character
+    (CAD-2257)."""
+    cat = unicodedata.category(c)
+    return cat in ("Cc", "Cf", "Zl", "Zp") or (cat == "Zs" and c != " ")
+
+
+def shown(text):
+    """`text` with every unprintable character escaped, so a path name inside a line
+    the gate prints cannot start another line or hide text (CAD-2257)."""
+    return "".join(
+        {"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(c) or
+        (f"\\u{ord(c):04x}" if ord(c) < 0x10000 else f"\\U{ord(c):08x}")
+        if unprintable(c) else c
+        for c in text)
+
+
+def workflow_auto_reasons(changes, toml_text, never, risk):
+    """Why a PR with a workflow-issued review needs the operator's approval (CAD-2081).
+
+    A positive allowlist over `changes`, checked path by path against
+    WORKFLOW_AUTO_FILE's `[auto] paths`, `never` (workflow_never_globs' list, None
+    when unreadable: every path then needs the operator) and `risk` (risk_globs'
+    list, for the case check). docs/roles/risk-classes.md trigger 7 states the rule;
+    this function is its enforcement. Paths are returned raw; every line the gate
+    prints passes through `shown`."""
+    globs = glob_list(toml_text, ("auto", "paths"))
+    if globs is None:
+        return [f"cannot read {WORKFLOW_AUTO_FILE} at main's live tip, so a workflow review "
+                "cannot stand in for the operator (fail closed)"]
+    if never is None:
+        return [f"cannot read the one-review excludes of {ONE_REVIEW_FILE} or trigger 1 and 3 of "
+                f"{RISK_PATHS_FILE} at the diff's anchor, so a workflow review cannot stand in "
+                "for the operator (fail closed)"]
+    out = []
+    for status, old_mode, new_mode, path in changes:
+        segs = path.split("/")
+        if (not path or path.startswith("/") or "\\" in path or ".." in path
+                or any(seg in ("", ".") or seg.endswith((".", " ")) for seg in segs)
+                or any(unprintable(c) for c in path)):
+            why = "an odd path name"
+        elif any(seg.startswith(".") for seg in segs) or segs[-1].casefold().startswith(WORKFLOW_NEVER_PREFIXES):
+            why = "a hidden or agent-instruction file name"
+        elif any(glob_match(g, path) for g in never):
+            why = "a trust-boundary, identity, secret or UI path, never eligible"
+        elif not is_human_path(path, risk) and protected_ignoring_case(path, risk, never):
+            why = "a name that differs only by case from a protected path, never eligible"
+        elif not ((status == "A" and old_mode == "000000" and new_mode == "100644")
+                  or (status == "M" and old_mode == "100644" and new_mode == "100644")):
+            why = "not a plain add or modify of a 100644 file"
+        elif not any(glob_match(g, path) for g in globs):
+            why = f"not on the list in {WORKFLOW_AUTO_FILE}"
+        else:
+            continue
+        out.append(f"{path} ({why})")
+    return ([f"a workflow review cannot stand in for the operator: {'; '.join(out[:5])}"]
+            if out else [])
+
+
+ROUTINE_EXACT = ("README.md", "CONTRIBUTING.md")  # as in cadence-core's routine allowlist
+
+
+def lean_class_reasons(klass, changes, one, human_paths, lines):
+    """Why a routine or consequential class understates this script's own diff (CAD-2100).
+
+    `consequential` is checked as one combined review and `routine` as none, so a class
+    the evaluator gave from a different diff must not stand when this script's diff needs
+    more: not wholly on the one-review list (two reviews), human-class by path or size,
+    or, for routine, not plain regular-file markdown docs. Any other class is not lean."""
+    if klass not in ("routine", "consequential"):
+        return []
+    out = []
+    if not one:
+        out.append("this PR's own diff is not on the one-review list, so it needs two reviews")
+    if human_paths or lines > HUMAN_LINES:
+        out.append("this PR's own diff is human-class by path or size")
+    if klass == "routine" and not all(
+            s in ("A", "M") and new == "100644" and (old == new or s == "A") and path.endswith(".md")
+            and (path.startswith("docs/") or path in ROUTINE_EXACT)
+            for s, old, new, path in changes):
+        out.append("this PR's own diff is not plain ordinary markdown documentation")
+    return ([f"the evaluator's {klass} class does not hold for this script's diff against "
+             f"main's live tip: {'; '.join(out)} (an older classifier build can be stale; "
+             "refusing rather than merging on fewer reviews)"] if out else [])
+
+
+def is_human_path(path, risk=(), fold=False):
+    """Is `path` human-class by name or by a `risk` glob? `fold` compares casefolded."""
+    f = str.casefold if fold else str
+    path = f(path)
     base = path.rsplit("/", 1)[-1]
     segs = path.split("/")[:-1]
-    return (path in HUMAN_EXACT or path.startswith(HUMAN_PREFIXES)
-            or base in HUMAN_BASENAMES or ".github" in segs or ".cargo" in segs
-            or any(glob_match(g, path) for g in risk))
+    return (path in {f(p) for p in HUMAN_EXACT} or path.startswith(tuple(f(p) for p in HUMAN_PREFIXES))
+            or base in {f(b) for b in HUMAN_BASENAMES} or ".github" in segs or ".cargo" in segs
+            or any(glob_match(f(g), path) for g in risk))
 
 
 # ---- required checks --------------------------------------------------------
@@ -486,83 +724,585 @@ def required_check_reasons(repo, head, base_oid, required, rollup, runs):
 
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
 
-def read_verdicts(notes_dir, issue, pr, head):
-    """(verdicts, skipped) from the audit's own note parser. Raises on failure."""
-    rc, out, err = run(["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
-                        "--head", head, "--notes-dir", notes_dir])
+def read_verdicts(notes_dir, issue, pr, head, project=None):
+    """(verdicts, skipped, origin) from the audit's own verdict reader.
+
+    AOS-473: the document says where it came from. `hosted` is the org's own
+    record, whose rows carry the owner's reviewer attestation; `local` — and
+    an older client, which sends no marker — keeps the existing counting. Any
+    other value is a document this gate cannot classify, so it refuses rather
+    than guess.
+
+    CAD-2001: a hosted read is project-scoped. `project` is the ticket's own
+    project (from the requirements binding, never the repo's), and it is
+    passed as `--project`; the document must name that same project. A local
+    selection is never given a project — local notes carry none — so the
+    project argument is absent exactly when the org is local. Raises on
+    failure."""
+    argv = ["cadence", "audit", "verdicts", "--issue", issue, "--pr", str(pr),
+            "--head", head, "--notes-dir", notes_dir]
+    if project is not None:
+        argv += ["--project", project]
+    rc, out, err = run(argv)
     try:
         doc = json.loads(out)
         verdicts, skipped = doc["verdicts"], doc.get("skipped", [])
+        origin = doc.get("origin", "local")
         keys = ("name", "stamp", "reviewer", "kind", "outcome", "title_outcome", "section_outcome", "risk")
-        if rc != 0 or not all(isinstance(v, dict) and all(k in v for k in keys) for v in verdicts):
+        if rc != 0 or not isinstance(verdicts, list) or not all(isinstance(v, dict) and all(k in v for k in keys) for v in verdicts):
             raise ValueError("unexpected shape")
-        return verdicts, skipped
     except (ValueError, KeyError, TypeError, AttributeError):
-        raise RuntimeError(f"cannot read the verdict notes via `cadence audit verdicts` (rc {rc}): {(err or out).strip()[:200]}")
+        detail = (err or out).strip()[:400]
+        raise RuntimeError(
+            f"cannot read the verdict notes via `cadence audit verdicts` (rc {rc}): {detail}"
+            + stale_cli_hint(detail)
+        )
+    if origin not in ("local", "hosted"):
+        raise RuntimeError(
+            f"the verdict document names origin {origin!r}, which is neither local nor hosted; "
+            "refusing to guess which counting rule applies")
+    # The document must be the scope the gate asked for, in both directions: a
+    # hosted answer must name this project, and a local answer must not stand
+    # in for a project-scoped read.
+    if origin == "hosted":
+        if project is None:
+            raise RuntimeError(
+                "the hosted verdict document is project-scoped but the gate had no project "
+                "to ask for; refusing to count it")
+        if doc.get("project") != project:
+            raise RuntimeError(
+                f"the hosted verdict document names project {doc.get('project')!r}, not "
+                f"{project!r}; refusing to count another project's evidence")
+    elif project is not None:
+        raise RuntimeError(
+            f"the selected org answered a local verdict document for project {project!r}; "
+            "refusing to count it as that project's evidence")
+    return verdicts, skipped, origin
 
 
-def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
+def read_identities():
+    """`login -> subject_id` from the workspace's principal attestation map.
+
+    CAD-2049: the author exclusion has to resolve the PR author's login to a
+    principal before it can exclude that principal. `cadence audit identities`
+    is the owner's record of that join, and the read is admitted to the live
+    human owner only: a refusal is a refusal, never an empty map."""
+    rc, out, err = run(["cadence", "audit", "identities"])
+    try:
+        doc = json.loads(out)
+        rows = doc["identities"]
+        if rc != 0 or not isinstance(rows, list):
+            raise ValueError("unexpected shape")
+        mapping = {}
+        for row in rows:
+            login = (row.get("github_login") or "").strip().lower()
+            subject = (row.get("subject_id") or "").strip()
+            if login and subject:
+                mapping[login] = subject
+        return mapping
+    except (ValueError, KeyError, TypeError, AttributeError):
+        detail = (err or out).strip()[:200]
+        raise RuntimeError(
+            f"cannot read the workspace identity map via `cadence audit identities` (rc {rc}): "
+            f"{detail}" + stale_cli_hint(detail))
+
+
+def workflow_principals(toml_text):
+    """`principal -> {"kind", "workflow"}` from the allowlist text, or None when it
+    is missing or malformed. An entry for any kind but a Standards or Spec/security
+    review, without a workflow file path, or under a principal not named `svc_*`
+    (the reserved-principal guard relies on that prefix) is malformed, so one bad entry fails
+    the whole list closed."""
+    if toml_text is None:
+        return None
+    try:
+        table = tomllib.loads(toml_text)["principals"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(table, dict) or not all(
+            isinstance(k, str) and k.startswith("svc_") and isinstance(v, dict)
+            and v.get("kind") in WORKFLOW_KINDS
+            and isinstance(v.get("workflow"), str)
+            and re.fullmatch(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml", v["workflow"])
+            for k, v in table.items()):
+        return None
+    return {k: {"kind": v["kind"], "workflow": v["workflow"]} for k, v in table.items()}
+
+
+def workflow_file_reason(main_oid, sha, path):
+    """"" when `path` at `sha` is a regular file (mode 100644) byte-identical to
+    `path` at `main_oid`, main's live tip.
+
+    A GitHub re-run keeps the original commit's workflow for up to 30 days, so a
+    since-fixed workflow can still file a pass. A blob id equals byte equality, and
+    the mode is read too so a symlinked workflow cannot pass the blob compare. An
+    unreachable commit or a missing file refuses; it is never skipped."""
+    def have(rev):
+        return run(["git", "cat-file", "-e", f"{rev}^{{commit}}"])[0] == 0
+
+    def blob(rev):
+        rc, out, _ = run(["git", "ls-tree", rev, "--", path])
+        parts = out.rstrip("\n").split("\t", 1)[0].split(" ") if rc == 0 and out.strip() else []
+        if len(parts) != 3 or parts[0] != "100644" or parts[1] != "blob":
+            return ""
+        return parts[2]
+
+    if not FULL_SHA.fullmatch(sha or ""):
+        return f"its workflow_sha {sha!r} is not a full commit SHA"
+    for rev in (sha, main_oid):
+        if not have(rev):
+            run(["git", "fetch", "--quiet", "--no-tags", "origin", rev])
+        if not have(rev):
+            return f"commit {rev} is not in this checkout, so {path} there cannot be compared"
+    then, now = blob(sha), blob(main_oid)
+    if not then or not now:
+        return (f"{path} is not a regular file (100644) at workflow commit {sha[:12]} "
+                f"and at main's tip {main_oid[:12]}")
+    if then != now:
+        return (f"{path} at workflow commit {sha[:12]} differs from main's live tip: "
+                "a run of a superseded workflow does not count")
+    return ""
+
+
+def live_main_tip(repo):
+    """main's live tip commit, or "" when it cannot be read."""
+    rc, out, _ = run(["gh", "api", f"repos/{repo}/git/ref/heads/main", "--jq", ".object.sha"])
+    tip = out.strip()
+    return tip if rc == 0 and FULL_SHA.fullmatch(tip) else ""
+
+
+def is_workflow_row(n):
+    return n.get("identity_source") == "workflow-oidc"
+
+
+def workflow_reason(n, hosted):
+    """Why a workflow-issued row cannot count, or "" when it can (CAD-2081).
+
+    `identity_source` is only a claim. The row counts when its PRINCIPAL is in
+    the allowlist read from main's live tip and the kind is the one that
+    principal may fill. It has no login, so no login-based check applies."""
+    principal = (n.get("reviewer_id") or "").strip()
+    if not FULL_SHA.fullmatch(n.get("base_sha") or ""):
+        return f"workflow verdict {n['name']} cannot count: it records no base_sha"
+    # The tenant files only for a base of main. A PR retargeted since the filing no
+    # longer has the base the review ran against: judge the CURRENT base, not the row.
+    if hosted.get("pr_base") != "main":
+        return (f"workflow verdict {n['name']} cannot count: the PR's base is now "
+                f"{hosted.get('pr_base')!r}, not main")
+    allowed = hosted.get("workflow_principals")
+    if allowed is None:
+        return (f"workflow verdict {n['name']} cannot count: cannot read "
+                f"{WORKFLOW_PRINCIPALS_FILE} at main's live tip (fail closed)")
+    if (n.get("repo") or "").strip().lower() != hosted["repo"].lower():
+        return (f"workflow verdict {n['name']} cannot count: it names repo "
+                f"{n.get('repo')!r}, not the PR's repo {hosted['repo']}")
+    if principal not in allowed:
+        return (f"workflow verdict {n['name']} cannot count: principal {principal or '(none)'} is "
+                f"not in {WORKFLOW_PRINCIPALS_FILE} at main's live tip")
+    entry = allowed[principal]
+    if n["kind"] != entry["kind"]:
+        return (f"workflow verdict {n['name']} cannot count: principal {principal} may file only "
+                f"{entry['kind']}, not {n['kind']}")
+    why = hosted["workflow_file"](n.get("workflow_sha"), entry["workflow"])
+    if why:
+        return f"workflow verdict {n['name']} cannot count: {why}"
+    return ""
+
+
+def reviewer_key(v, hosted):
+    """The identity a verdict counts as. A hosted row counts the attested
+    principal (`reviewer_id`), never the login string: two logins for one
+    person are one reviewer, and one login for two people is two. A local
+    note counts its `From:` reviewer, as before (AOS-473)."""
+    if hosted is not None:
+        return (v.get("reviewer_id") or "").strip() or (v.get("reviewer") or "").strip()
+    return v.get("reviewer") or ""
+
+
+def unbound_reason(n, hosted):
+    """Why a hosted verdict cannot count, or "" when it can (AOS-473).
+
+    A hosted row is evidence only on the owner's attestation for this repo:
+    the row must name the PR's repo and carry both the principal and the
+    login the owner bound to it. An unproven row never falls back to local
+    counting, and the refusal names the remedy that actually applies."""
+    problems, remedy = [], []
+    row_repo = (n.get("repo") or "").strip()
+    if not row_repo:
+        problems.append("names no repo")
+        remedy.append("read the verdicts with --repo <owner/name>")
+    elif row_repo.lower() != hosted["repo"].lower():
+        problems.append(f"names repo {row_repo}, not the PR's repo {hosted['repo']}")
+        remedy.append("run the gate in the PR's checkout: the hosted read binds the "
+                      "cwd's github.com origin")
+    if not (n.get("reviewer_id") or "").strip():
+        problems.append("has no attested reviewer_id")
+        remedy.append("the workspace owner must attest the reviewer for this repo "
+                      "(`cadence audit reviewers set`)")
+    if not (n.get("github_login") or "").strip():
+        problems.append("has no attested github_login")
+        remedy.append("the workspace owner must attest the reviewer for this repo "
+                      "(`cadence audit reviewers set`)")
+    if not problems:
+        return ""
+    return (f"hosted verdict {n['name']} cannot count: it " + ", and it ".join(problems)
+            + " — " + "; ".join(dict.fromkeys(remedy)))
+
+
+def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
+                  exception=False, accepted=None, policy_kind=None):
     """(reasons, counted notes).
+
+    `exception` (CAD-1946) drops only the counts of missing verdicts. A filed
+    non-pass, an unorderable row or a non-independent row still refuses.
+
+    `accepted` (CAD-2197) is the operator's head-pinned acceptance row. It
+    lifts exactly one refusal: a WORKFLOW row that is not a pass. A person's
+    revise, an unorderable row, a non-independent row and every other gate
+    still refuse, because the acceptance is the operator reading a model's
+    finding, never a verdict of their own.
 
     Every head-pinned note counts toward a refusal, whatever its kind or file
     name: a non-pass note refuses unless the SAME reviewer has a later-stamped
-    pass of a recognised kind, and an unstamped non-pass note always refuses.
-    Notes are ordered by the file-name stamp, never mtime."""
+    pass that covers its own axes (CAD-2192: `combined` covers both code axes,
+    Browser QA only itself), and an unstamped non-pass note always refuses.
+    Notes are ordered by the file-name stamp, never mtime.
+
+    `hosted` is `{"repo": owner/name}` when the document came from the org.
+    Then a counted row must be attested for this repo and the author check
+    compares the attested login (AOS-473). Without it, the counting is the
+    local one, unchanged. CAD-2081: `hosted` also carries `workflow_principals`
+    (principal -> kind and workflow file, or None when unreadable), `pr_base`
+    and `workflow_file`; a workflow-issued row counts under `workflow_reason`
+    with no login check, and an owner row naming a listed principal counts for
+    nothing.
+
+    A hosted document appends corrections, so two of its rows for one reviewer
+    and one kind that share a stamp state no order: neither is the current
+    evidence, and a same-second pass filed next to a revise would otherwise
+    resolve to whichever row sorted first once a later pass of another kind
+    superseded the non-pass scan. Equal stamps are only harmless when the rows
+    carry the same evidence — outcome, title, section, and (hosted) the attested
+    login, because a principal re-bound from a non-author login to the author's
+    could otherwise file a second same-second pass and have the earlier
+    non-author row counted. The refusal stands independently of any newer row of
+    another kind. A local document keeps exactly the rule it had: its notes are
+    filed by hand, and only the newest-stamp tie below applies to them.
+
+    A hosted login fills at most one review slot: when one normalized login
+    carries two counted principals (serial rebinding), the set refuses and
+    those rows count for nothing."""
     reasons, counted = [], []
+    identity = lambda v: reviewer_key(v, hosted)
+
+    def evidence(n):
+        fields = (n["outcome"], n["title_outcome"], n["section_outcome"])
+        if hosted is None:
+            return fields
+        return fields + ((n.get("github_login") or "").strip().lower(),)
+
+    ambiguous = set()  # (identity, kind) whose latest stamp holds disagreeing rows
     by_reviewer = {}
     for v in verdicts:
-        by_reviewer.setdefault(v["reviewer"], []).append(v)
+        by_reviewer.setdefault(identity(v), []).append(v)
     for who, notes in sorted(by_reviewer.items()):
         stamped = [n for n in notes if n["stamp"]]
-        passes = [n for n in stamped if n["outcome"] == "pass" and n["kind"] != "other"]
+        passes = [n for n in stamped if n["outcome"] == "pass"]
         for n in notes:
             if n["outcome"] == "pass":
                 continue
-            if n["stamp"] and any(p["stamp"] > n["stamp"] for p in passes):
-                continue  # superseded by a later pass of this reviewer
+            # CAD-2192: a later pass supersedes only what it re-reviewed. A
+            # Browser QA failure is cleared by Browser QA, not by the same
+            # reviewer's Standards pass, and `combined` still covers both code
+            # axes. A row of an unmapped kind names no axis, so only a pass of
+            # that same kind can show it was re-reviewed: unknown never
+            # inherits another kind's clearance, and it is not stuck forever.
+            axes = KIND_AXES.get(n["kind"])
+            covered = any(
+                p["stamp"] > n["stamp"]
+                and (p["kind"] == n["kind"] if axes is None
+                     else axes <= KIND_AXES.get(p["kind"], frozenset()))
+                for p in passes)
+            if n["stamp"] and not is_workflow_row(n) and covered:
+                continue  # superseded by a later pass of this reviewer that covers the same axes; a workflow row is final
+            if accepted is not None and is_workflow_row(n) and n["stamp"]:
+                continue  # CAD-2197: the operator read this finding and accepted it at this head
             why = "" if n["stamp"] else "; the file name has no stamp, so it cannot be ordered"
             reasons.append(
                 f"verdict by {who or '(no reviewer)'} on this head is not a pass "
                 f"(outcome '{n['outcome']}', title '{n['title_outcome']}', section '{n['section_outcome']}'){why}: {n['name']}")
+        if hosted is not None:
+            by_kind = {}
+            for n in stamped:
+                by_kind.setdefault(n["kind"], []).append(n)
+            for kind, rows in sorted(by_kind.items()):
+                newest = max(r["stamp"] for r in rows)
+                top = [r for r in rows if r["stamp"] == newest]
+                if len(top) > 1 and len({evidence(r) for r in top}) > 1:
+                    ambiguous.add((who, kind))
+                    reasons.append(
+                        f"cannot order two {kind} verdicts by {who or '(no reviewer)'} with the same "
+                        f"stamp {newest}: {' and '.join(sorted(r['name'] for r in top))}")
         if stamped:
             newest = max(n["stamp"] for n in stamped)
             names = sorted({n["name"] for n in stamped if n["stamp"] == newest})
             if len(names) > 1:
                 reasons.append(f"cannot order two verdicts by one reviewer with the same file-name stamp: {' and '.join(names)}")
+    # CAD-2081 follow-up: the counted-kind filter below drops `other` rows before
+    # the workflow checks run, so a workflow row of that kind produced no refusal
+    # at all. Validate every workflow row here, whatever kind it names.
+    if hosted is not None:
+        reserved = hosted.get("workflow_principals")
+        for v in verdicts:
+            if v["outcome"] != "pass" or v["kind"] != "other":
+                continue
+            who = identity(v)
+            if is_workflow_row(v):
+                why = workflow_reason(v, hosted)
+                if why:
+                    reasons.append(why)
+            elif who in (reserved or {}):
+                reasons.append(
+                    f"verdict {v['name']} names workflow principal {who} but is not a "
+                    "workflow-issued row; it counts for nothing")
+            elif who.startswith("svc_") and reserved is None:
+                reasons.append(
+                    f"verdict {v['name']} names service principal {who}, and "
+                    f"{WORKFLOW_PRINCIPALS_FILE} cannot be read to tell whether it is reserved "
+                    "(fail closed)")
     # Counted: the latest recognised, stamped note per (reviewer, kind), when it passes.
     latest = {}
     for v in verdicts:
         if v["kind"] == "other" or not v["stamp"]:
             continue
-        cur = latest.get((v["reviewer"], v["kind"]))
+        key = (identity(v), v["kind"])
+        if key in ambiguous:
+            continue  # no order, so no current evidence
+        cur = latest.get(key)
         if cur is None or v["stamp"] > cur["stamp"]:
-            latest[(v["reviewer"], v["kind"])] = v
+            latest[key] = v
     for n in latest.values():
-        who = n["reviewer"]
+        who = identity(n)
         if n["outcome"] != "pass":
             continue  # already refused above unless superseded
         if not who:
-            reasons.append(f"verdict note has no 'From:' reviewer: {n['name']}")
+            reasons.append(
+                f"hosted verdict {n['name']} has no reviewer_id to count by" if hosted is not None
+                else f"verdict note has no 'From:' reviewer: {n['name']}")
+            continue
+        if hosted is not None and (is_workflow_row(n) or who in (hosted.get("workflow_principals") or {})):
+            # CAD-2081: a workflow row skips the login-based checks because it has no
+            # login. The allowlisted principal is the identity, so a row from it that
+            # does not say it came from the workflow is refused, not counted by login.
+            if not is_workflow_row(n):
+                reasons.append(f"verdict {n['name']} names workflow principal {who} but is not a "
+                               "workflow-issued row; it counts for nothing")
+                continue
+            why = workflow_reason(n, hosted)
+            if why:
+                reasons.append(why)
+            else:
+                counted.append(n)
+        elif hosted is not None and hosted.get("workflow_principals") is None and who.startswith("svc_"):
+            # The reserved-principal list could not be read, so a service principal
+            # cannot be told from a disguised workflow reviewer. Ordinary owner rows
+            # never need the list.
+            reasons.append(f"verdict {n['name']} names service principal {who}, and "
+                           f"{WORKFLOW_PRINCIPALS_FILE} cannot be read to tell whether it is reserved "
+                           "(fail closed)")
+        elif hosted is not None:
+            unbound = unbound_reason(n, hosted)
+            if unbound:
+                reasons.append(unbound)
+            elif (n.get("github_login") or "").strip().lower() in authors:
+                reasons.append(
+                    f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
+                    f"the owner attested that login as the PR author{AUTHOR_ROW_HINT}")
+            elif not hosted.get("author_principal"):
+                # CAD-2049: without the author's principal, no row can be proven
+                # not to be the author's — a second login is not a second person.
+                reasons.append(
+                    f"verdict {n['name']} cannot be proven independent: the PR author "
+                    f"{hosted.get('author_login') or '(unknown login)'} has no attested principal "
+                    f"(`cadence audit identities set --identity <subject>=<login>`){UNATTESTED_AUTHOR_HINT}")
+            elif (n.get("reviewer_id") or "").strip() == hosted["author_principal"]:
+                reasons.append(
+                    f"verdict by {n.get('github_login')} ({n['name']}) is not independent: "
+                    f"its principal is the PR author's ({hosted['author_principal']}){AUTHOR_ROW_HINT}")
+            else:
+                counted.append(n)
         elif who in authors:
-            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']})")
+            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']}){LOCAL_AUTHOR_ROW_HINT}")
         else:
             counted.append(n)
-    by = lambda kind: {n["reviewer"] for n in counted if n["kind"] == kind}
+    if hosted is not None:
+        # One attested login must not fill two review slots. Serial rebinding —
+        # alice->A files Standards, the owner replaces the map with alice->B and
+        # B files Spec/security — yields two principals behind one login, which
+        # is one person holding both slots. Refuse, and drop those rows so they
+        # satisfy no count at all.
+        by_login = {}
+        for n in counted:
+            if is_workflow_row(n):
+                continue  # no login, so no person to share a slot
+            by_login.setdefault((n.get("github_login") or "").strip().lower(), set()).add(identity(n))
+        shared = {login: ids for login, ids in by_login.items() if len(ids) > 1}
+        if shared:
+            for login, principals in sorted(shared.items()):
+                names = sorted(n["name"] for n in counted
+                               if (n.get("github_login") or "").strip().lower() == login)
+                reasons.append(
+                    f"login {login} is attested to {len(principals)} principals "
+                    f"({', '.join(sorted(principals))}) across this document, so one person "
+                    f"would fill more than one review slot: {' and '.join(names)} — the owner "
+                    f"must keep one login bound to one principal")
+            counted = [n for n in counted
+                       if (n.get("github_login") or "").strip().lower() not in shared]
+    by = lambda kind: {identity(n) for n in counted if n["kind"] == kind}
     std, spec, combined = by("standards"), by("spec-security"), by("combined")
+    if accepted is not None:
+        # CAD-2197: an accepted workflow revise answers ITS axis for the review
+        # count, and never for another. A sentinel keeps it out of the identity
+        # comparison below and out of `counted`, so nothing reports it as a pass
+        # and a forged same-reviewer pair cannot be manufactured by it.
+        for n in verdicts:
+            if not is_workflow_row(n) or n["outcome"] == "pass" or not n["stamp"]:
+                continue  # unorderable stays refused: an acceptance never orders a row
+            if hosted is not None and workflow_reason(n, hosted):
+                continue
+            if n["kind"] == "standards":
+                std.add("accepted-standards")
+            elif n["kind"] == "spec-security":
+                spec.add("accepted-spec-security")
     two = bool(std) and bool(spec) and any(a != b for a in std for b in spec)
-    if qualifies_one:
+    if exception:
+        return reasons, counted
+    if policy_kind in ("none", "standards", "spec_security"):
+        # CAD-2494: an approved policy asks one axis, or no code review. A combined
+        # verdict covers both axes.
+        if policy_kind == "standards" and not (std or combined):
+            reasons.append(f"no pass Standards verdict for {issue} pinned to this head{REVIEW_STANDARD_HINT}")
+        if policy_kind == "spec_security" and not (spec or combined):
+            reasons.append(f"no pass Spec/security verdict for {issue} pinned to this head{REVIEW_STANDARD_HINT}")
+    elif qualifies_one:
         if not (combined or two):
-            reasons.append(f"no pass verdict for {issue} pinned to this head (one review is required)")
+            reasons.append(f"no pass verdict for {issue} pinned to this head (one review is required){REVIEW_STANDARD_HINT}")
     else:
         if not std:
-            reasons.append(f"no pass Standards verdict for {issue} pinned to this head")
+            reasons.append(f"no pass Standards verdict for {issue} pinned to this head{REVIEW_STANDARD_HINT}")
         if not spec:
-            reasons.append(f"no pass Spec/security verdict for {issue} pinned to this head")
+            reasons.append(f"no pass Spec/security verdict for {issue} pinned to this head{REVIEW_STANDARD_HINT}")
         if std and spec and not two:
-            reasons.append("the Standards and Spec/security verdicts come from the same reviewer; two distinct reviewers are required")
+            reasons.append(f"the Standards and Spec/security verdicts come from the same reviewer; two distinct reviewers are required{REVIEW_STANDARD_HINT}")
     if need_qa and not by("browser-qa"):
-        reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author")
+        reasons.append(f"a ui/ change needs a pass Browser QA verdict for {issue} pinned to this head, from someone other than the author; "
+                       "the review workflows file only Standards and Spec/security, so they cannot supply it; "
+                       "on hosted, a non-author repository member posts a new comment whose whole body is the two "
+                       "lines `Browser QA: pass` and `Head: <this head>`, and the gate names that comment with "
+                       "--browser-qa <comment url> (the report goes in a different comment); the --exception "
+                       "browser-qa advisory link is the temporary route instead (AGENTS.md \"Review\")")
     return reasons, counted
+
+
+def exception_routine(klass, active, origin, readiness, ci_url):
+    """(refusals, waives readiness) for an exception on a routine PR (CAD-1946).
+
+    Hosted has no readiness record yet, and the exception names that waiver. A
+    present proof must still match the run, and a local org must still have one."""
+    if klass != "routine" or not active:
+        return [], False
+    if readiness is None:
+        if origin == "hosted":
+            return [], True
+        return ["active routine delivery has no fresh native readiness proof for this exact binding"], False
+    if ci_url is not None and ci_url != readiness["ci_run_url"]:
+        return ["native routine readiness CI run is not the actual successful ci.yml run at this head"], False
+    return [], False
+
+
+def two_workflow_reviews(counted, hosted):
+    """Standards plus Spec/security, counted, from distinct workflow principals."""
+    std = {reviewer_key(n, hosted) for n in counted
+           if is_workflow_row(n) and n["kind"] == "standards"}
+    spec = {reviewer_key(n, hosted) for n in counted
+            if is_workflow_row(n) and n["kind"] == "spec-security"}
+    return any(a != b for a in std for b in spec)
+
+
+REVIEW_WORKFLOWS = (("standards", "review-standards.yml"), ("spec-security", "review-spec.yml"))
+
+
+def hosted_routine_reasons(verdicts, counted, hosted, repo, pr, head):
+    """Why a hosted routine PR's reviews do not yet stand in for readiness (CAD-2135).
+
+    A hosted board has no delivery record, so it cannot prove what native readiness
+    proves. The two workflow reviews are the evidence this gate already trusts on
+    other classes; an owner row does not stand in for them. The refusal names what to
+    dispatch for a review not yet filed. The board keeps the first row per head, kind
+    and principal, so a filed review is not dispatched again at this head."""
+    if two_workflow_reviews(counted, hosted):
+        return []
+    filed = {v["kind"] for v in verdicts if is_workflow_row(v)}
+    commands = [f"gh workflow run {name} -R {shlex.quote(repo)} --ref main "
+                f"-f pr={shlex.quote(str(pr))} -f head_sha={shlex.quote(head)}"
+                for kind, name in REVIEW_WORKFLOWS if kind not in filed]
+    stuck = filed - {n["kind"] for n in counted if is_workflow_row(n)}
+    return ["active routine delivery on a hosted org has no readiness record and needs "
+            "a pass from both review workflows at this head"
+            + (": " + "; ".join(commands) if commands else "")
+            + (f"; filed but not counted: {', '.join(sorted(stuck))}. A filed review cannot be "
+               "filed again at this head; a new row takes a new commit" if stuck else "")]
+
+
+def browser_qa_comment_reasons(url, repo, pr, head):
+    """Why a `--browser-qa` comment does not bind a pass to this head (CAD-2173).
+
+    It proves who said what about which head, not that the QA ran, so the route also
+    takes the operator's approval. One edit could turn a fail into a pass after the
+    fact, so an edited comment does not count: post a new one."""
+    m = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/pull/{pr}#issuecomment-([0-9]+)",
+                     url, re.IGNORECASE | re.ASCII)
+    if not m:
+        return [f"--browser-qa must name a comment on this PR: {url!r}"]
+    rc, out, _ = run(["gh", "api", f"repos/{repo}/issues/comments/{m.group(1)}"])
+    try:
+        comment = json.loads(out) if rc == 0 else None
+    except ValueError:
+        comment = None
+    if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+        return [f"cannot read the --browser-qa comment {m.group(1)} (fail closed)"]
+    if (comment.get("issue_url") or "").lower() != f"https://api.github.com/repos/{repo}/issues/{pr}".lower():
+        return [f"the --browser-qa comment {m.group(1)} is not on this PR"]
+    if not comment.get("created_at") or comment.get("updated_at") != comment["created_at"]:
+        return [f"the --browser-qa comment {m.group(1)} was edited after posting: post a new one"]
+    if comment.get("author_association") not in QA_AUTHOR_ASSOCIATIONS:
+        return [f"the --browser-qa comment {m.group(1)} is not by a repository member"]
+    # The whole body, not a search of it: what a person reads and what this reads cannot
+    # differ when nothing else is there to render. The report goes in its own comment.
+    if comment["body"].replace("\r\n", "\n").rstrip("\n") != f"Browser QA: pass\nHead: {head}":
+        return [f"the --browser-qa comment {m.group(1)} must be exactly the two lines "
+                f"`Browser QA: pass` and `Head: {head}`; put the report in another comment"]
+    return []
+
+
+# The repository is public, so anyone can comment. GitHub states this per comment.
+QA_AUTHOR_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+
+
+ADVISORY_KINDS = ("standards", "spec-security", "browser-qa")
+
+
+def advisory_reasons(advisory, need_qa):
+    """Refusals for the exception's advisory links (CAD-1946)."""
+    kinds = ["standards", "spec-security"] + (["browser-qa"] if need_qa else [])
+    reasons = [f"the exception needs --advisory {k}=<https url>" for k in kinds if k not in advisory]
+    reasons += [f"unknown advisory kind {k!r}" for k in sorted(advisory) if k not in ADVISORY_KINDS]
+    reasons += [f"advisory {k} is not an https url: {v!r}" for k, v in sorted(advisory.items())
+                if not re.fullmatch(r"https://\S+", v)]
+    picked = [advisory[k] for k in kinds if k in advisory]
+    if len(set(picked)) != len(picked):
+        reasons.append("the advisory links must be separate records, one per review")
+    return reasons
 
 
 def check_comment(comments, head, counted, base_ref, required=()):
@@ -578,6 +1318,140 @@ def check_comment(comments, head, counted, base_ref, required=()):
             + (f" ({', '.join(names)})" if names else "")]
 
 
+# An approved custom delivery policy's answer (CAD-2494, CAD-2424): the answer
+# lists the reviews and GitHub App checks the policy names. Anything this gate
+# does not recognise in it refuses instead of being ignored.
+REQUIREMENT_KEYS = frozenset((
+    "class", "reviews", "review_kind", "security_capable", "browser_qa", "operator_approval",
+    "full_checks", "reasons", "policy_digest", "activation", "required_reviews", "required_checks"))
+BASE_REVIEW_KINDS = ("none", "combined", "standards_and_spec")
+POLICY_REVIEW_KINDS = BASE_REVIEW_KINDS + ("standards", "spec_security")
+POLICY_REVIEW_COUNT = {"none": 0, "combined": 1, "standards": 1, "spec_security": 1,
+                       "standards_and_spec": 2}
+AGENT_FOCI = ("standards", "spec-security", "browser-qa", "general")
+REVIEW_ENTRY_KEYS = frozenset(("name", "kind", "focus", "app", "mode"))
+
+
+def review_join(a, b):
+    """The review satisfying both kinds. A single axis never stands in for combined."""
+    if a == "none":
+        return b
+    return a if b == "none" or a == b else "standards_and_spec"
+
+
+def policy_evidence(req):
+    """None for an answer with no policy evidence, else the parsed policy.
+
+    The answer carries `required_reviews` and `required_checks` only for an
+    approved custom policy. Either one alone, an unknown field, an unknown
+    review shape or checks that do not match the reviews refuse."""
+    reviews, checks = req.get("required_reviews"), req.get("required_checks")
+    if reviews is None and checks is None:
+        return None
+    if not isinstance(reviews, list) or not isinstance(checks, list):
+        raise ValueError("policy evidence needs both required_reviews and required_checks as lists")
+    unknown = sorted(set(req) - REQUIREMENT_KEYS)
+    if unknown:
+        raise ValueError(f"policy answer carries unrecognized fields {unknown}")
+
+    def text(value):
+        return isinstance(value, str) and value != "" and not any(
+            unicodedata.category(char) == "Cc" for char in value)
+
+    names, required, axes = set(), [], {"standards": False, "spec-security": False, "general": False}
+    qa = operator = False
+    for r in reviews:
+        if not isinstance(r, dict) or set(r) - REVIEW_ENTRY_KEYS or not text(r.get("name")):
+            raise ValueError("policy review entry is malformed or carries unrecognized fields")
+        if r["name"] in names:
+            raise ValueError(f"policy review '{r['name']}' is listed twice")
+        names.add(r["name"])
+        kind, focus, app, mode = (r.get("kind"), r.get("focus"), r.get("app"), r.get("mode"))
+        if kind == "agent" and focus in AGENT_FOCI and app is None and mode is None:
+            if focus == "browser-qa":
+                qa = True
+            else:
+                axes[focus] = True
+        elif kind == "check" and text(app) and mode in ("required", "advisory") and focus is None:
+            if mode == "required":
+                required.append((r["name"], app))
+        elif kind == "operator" and focus is None and app is None and mode is None:
+            operator = True
+        else:
+            raise ValueError(f"policy review '{r['name']}' has an unrecognized shape")
+    listed = []
+    for c in checks:
+        if not isinstance(c, dict) or set(c) != {"name", "app"} or not text(c["name"]) or not text(c["app"]):
+            raise ValueError("policy required check is malformed or names no GitHub App")
+        listed.append((c["name"], c["app"]))
+    if len({name for name, _ in listed}) != len(listed) or sorted(listed) != sorted(required):
+        raise ValueError("policy required checks do not match the required check reviews")
+    if axes["standards"] and axes["spec-security"]:
+        kind = "standards_and_spec"
+    elif axes["standards"]:
+        kind = "standards"
+    elif axes["spec-security"]:
+        kind = "spec_security"
+    else:
+        kind = "combined" if axes["general"] else "none"
+    return {"names": sorted(names), "checks": sorted(listed), "kind": kind,
+            "browser_qa": qa, "operator": operator}
+
+
+def policy_floor_reasons(changes, lines, risk, never):
+    """Why a policy `consequential` answer understates this script's own diff.
+
+    The approved policy may lower the reviews only on ordinary paths: a change
+    that is not a plain add or modify, a human-class or trust-boundary path, a
+    path the one-review list excludes, or a diff over the size limit keeps the
+    strict floor, and an unreadable list cannot show it does not apply."""
+    out = []
+    if risk is None or never is None:
+        out.append("the trusted path lists cannot be read at the diff's anchor")
+        risk, never = (), ()
+    if any(not (s in ("A", "M") and new in ("100644", "100755") and (old == new or s == "A"))
+           for s, old, new, _ in changes):
+        out.append("a change is not a plain add or modify of a regular file")
+    if any(is_human_path(path, risk) or any(glob_match(g, path) for g in never)
+           for _, _, _, path in changes):
+        out.append("a path is human-class, a trust boundary or excluded from one review")
+    if lines > HUMAN_LINES:
+        out.append(f"{lines} changed lines is over {HUMAN_LINES}")
+    return ([f"the approved policy's consequential class does not hold for this script's diff: "
+             f"{'; '.join(out)} (the trusted-list floor applies; refusing rather than merging "
+             "on the policy's reviews alone)"] if out else [])
+
+
+def policy_check_reasons(repo, head, checks):
+    """Refusals for each required policy check: the latest run of that name from
+    that GitHub App (matched by slug) on the exact head must have succeeded. A
+    run from another App never counts."""
+    reasons = []
+    for name, app in checks:
+        try:
+            runs = check_runs_at(repo, head, name)
+        except RuntimeError as e:
+            reasons.append(str(e))
+            continue
+        mine = [r for r in runs if r["app"]["slug"] == app]
+        if not mine:
+            others = sorted({r["app"]["slug"] for r in runs})
+            reasons.append(f"policy check '{name}' from app '{app}' has no run at head {head[:12]}"
+                           + (f" (only from {', '.join(others)})" if others else ""))
+            continue
+        newest = max(r["started_at"] for r in mine)
+        latest = [r for r in mine if r["started_at"] == newest]
+        if len({(r["status"], r.get("conclusion")) for r in latest}) > 1:
+            reasons.append(f"policy check '{name}' from app '{app}' has ambiguous newest runs at head {head[:12]}")
+            continue
+        check = max(latest, key=lambda r: r["id"])
+        if check["status"] != "completed":
+            reasons.append(f"policy check '{name}' from app '{app}' is pending ({check['status']}) at head {head[:12]}")
+        elif check.get("conclusion") != "success":
+            reasons.append(f"policy check '{name}' from app '{app}' is not successful ({check.get('conclusion')}) at head {head[:12]}")
+    return reasons
+
+
 def requirements_inspection(issue, repo, pr, head):
     """Read the daemon's trusted, policy-aware requirements decision."""
     pr_url = f"https://github.com/{repo}/pull/{pr}"
@@ -588,6 +1462,7 @@ def requirements_inspection(issue, repo, pr, head):
         req = result["requirements"]
         if rc != 0 or not isinstance(result, dict) or not isinstance(req, dict):
             raise ValueError("unexpected response shape")
+        policy = policy_evidence(req)
         if (result.get("issue") != issue or result.get("repo") != repo.lower()
                 or result.get("pr") != pr or result.get("head") != head
                 or not isinstance(result.get("base_ref"), str) or not result["base_ref"]
@@ -599,7 +1474,7 @@ def requirements_inspection(issue, repo, pr, head):
                 or req.get("class") not in ("routine", "consequential", "sensitive", "strict")
                 or req.get("activation") not in ("active", "no_profile", "not_approved", "malformed")
                 or type(req.get("reviews")) is not int or req["reviews"] not in (0, 1, 2)
-                or req.get("review_kind") not in ("none", "combined", "standards_and_spec")
+                or req.get("review_kind") not in (POLICY_REVIEW_KINDS if policy else BASE_REVIEW_KINDS)
                 or type(req.get("security_capable")) is not bool
                 or type(req.get("operator_approval")) is not bool
                 or type(req.get("browser_qa")) is not bool
@@ -611,7 +1486,18 @@ def requirements_inspection(issue, repo, pr, head):
             "routine": (0, "none", False, False, False),
             "consequential": (1, "combined", False, False, True),
         }
-        if req["class"] in expected and req["activation"] == "active":
+        if policy is not None:
+            # An approved custom policy: only consequential (the policy decides) or strict
+            # (the trusted-list floor), never lean, with every floor intact.
+            if (req["activation"] != "no_profile" or req["class"] not in ("consequential", "strict")
+                    or not req["full_checks"] or req["security_capable"]
+                    or req["reviews"] != POLICY_REVIEW_COUNT[req["review_kind"]]
+                    or review_join(req["review_kind"], policy["kind"]) != req["review_kind"]
+                    or (policy["browser_qa"] and not req["browser_qa"])
+                    or (policy["operator"] and not req["operator_approval"])
+                    or (req["class"] == "strict" and req["review_kind"] not in ("combined", "standards_and_spec"))):
+                raise ValueError("policy answer does not match its named reviews or the trusted floor")
+        elif req["class"] in expected and req["activation"] == "active":
             reviews, kind, security, approval, full = expected[req["class"]]
             if (req["reviews"], req["review_kind"], req["security_capable"],
                     req["operator_approval"], req["full_checks"]) != (
@@ -631,6 +1517,13 @@ def requirements_inspection(issue, repo, pr, head):
                    ("issue", "project", "repo", "pr", "head", "base", "base_ref", "merge_base", "policy_digest")}
         if not isinstance(binding["project"], str) or not binding["project"]:
             raise ValueError("requirements response has no project binding")
+        # CAD-2001: where the answer came from decides which evidence scope the
+        # later reads must carry. A hosted answer marks itself; the daemon's own
+        # answer carries no marker. Anything else is a document this gate cannot
+        # classify, so it refuses instead of guessing a scope.
+        origin = result.get("origin")
+        if origin is not None and origin != "hosted":
+            raise ValueError(f"requirements response names origin {origin!r}, not hosted")
         readiness = result.get("readiness")
         if readiness is not None:
             if not isinstance(readiness, dict):
@@ -647,19 +1540,31 @@ def requirements_inspection(issue, repo, pr, head):
                     or readiness["outcome_report"].split("/")[-1] in ("", ".", "..")
                     or any(unicodedata.category(char) == "Cc" for char in readiness["outcome_report"])):
                 raise ValueError("routine readiness does not bind to this issue, PR, head, base and policy")
-        return {"binding": binding, "requirements": req, "readiness": readiness}
+        return {"binding": binding, "requirements": req, "readiness": readiness,
+                "origin": origin, "policy": policy}
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise RuntimeError(f"cannot use authoritative `cadence delivery requirements` result: {e}; {(err or out).strip()[:200]}")
 
 
-def check_approval(repo, pr, head, report, evidence=None):
-    rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo])
+def check_approval(repo, pr, head, report, evidence=None, project=None, issue=None):
+    """Is an operator approval in force for exactly this head?
+
+    CAD-2001: a hosted approval is project-scoped and names the ticket it
+    authorizes, so `project` and `issue` are passed whenever the org is hosted
+    (they come from the ticket's own requirements binding). A local approval is
+    repo-scoped and takes neither. The client refuses a hosted call that cannot
+    name them, so a missing project can never be answered from repo-scoped
+    evidence; that refusal is reported as the refusal it is."""
+    argv = ["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo]
+    if project is not None:
+        argv += ["--project", project, "--issue", issue]
+    rc, out, err = run(argv)
     try:
         state = json.loads(out)
     except ValueError:
-        return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"]
+        return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:400]}"]
     if (rc == 0 and state.get("state") == "in-force"
-            and state.get("recorded_via") == SCOPE_RECORDED_VIA
+            and state.get("recorded_via") in APPROVAL_RECORDED_VIA
             and isinstance(state.get("approval_id"), str) and state["approval_id"]):
         if evidence is not None:
             evidence["approval"] = state["approval_id"]
@@ -668,6 +1573,41 @@ def check_approval(repo, pr, head, report, evidence=None):
         return []
     why = state.get("reason") or state.get("state") or "unknown"
     return [f"human-class diff has no operator approval recorded for exactly head {head} ({why}); the operator records it with `cadence audit approve`"]
+
+def read_acceptance(repo, pr, head, project, issue):
+    """(row, why) for the operator's acceptance of a workflow revise (CAD-2197).
+
+    The row is the board's `accepts_revise` on the approval read: recorded by
+    the operator's hosted login, for this project, issue, PR and exactly this
+    head. Anything else is no acceptance — a failed read refuses nothing by
+    itself, it only withholds the lift, so a board that predates the field
+    keeps every existing refusal."""
+    argv = ["cadence", "audit", "approval", "--pr", str(pr), "--head", head,
+            "--repo", repo, "--project", project, "--issue", issue]
+    rc, out, err = run(argv)
+    try:
+        state = json.loads(out)
+    except ValueError:
+        return None, f"cannot read an acceptance via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"
+    row = state.get("accepts_revise")
+    if row is None:
+        return None, None
+    if not isinstance(row, dict):
+        return None, "`accepts_revise` is not a row"
+    if (row.get("head_sha") or "").lower() != head.lower():
+        return None, f"the acceptance names head {row.get('head_sha')}"
+    if row.get("action") != "accept-revise":
+        return None, f"the acceptance names action {row.get('action')!r}"
+    if row.get("recorded_via") != "hosted-owner-login":
+        # An acceptance is the hosted owner's own write; the native
+        # `operator-connection` recorder is a different surface this board
+        # does not have, so it is not evidence here.
+        return None, f"the acceptance was recorded via {row.get('recorded_via')!r}"
+    if not isinstance(row.get("approval_id"), str) or not row["approval_id"]:
+        return None, "the acceptance has no id"
+    if row.get("project") not in (None, project) or row.get("issue") not in (None, issue):
+        return None, "the acceptance names another project or issue"
+    return row, None
 
 
 # ---- ticket scope approval (CAD-1106) --------------------------------------
@@ -758,13 +1698,13 @@ PATH_TRIGGER_TABLES = (("schema", 2), ("trigger4", 4), ("trigger6", 6), ("trigge
 
 def path_triggers(paths, risk_text):
     """(triggers hit, [unmapped human paths]) from the risk-paths tables read
-    at the base, or (None, reason) when a table is unreadable. A human-class
+    at the diff's anchor, or (None, reason) when a table is unreadable. A human-class
     path (is_human_path) in no table is unmapped: it needs a per-head approval."""
     tables = []
     for t, n in PATH_TRIGGER_TABLES:
         g = glob_list(risk_text, (t, "paths"))
         if g is None:
-            return None, f"cannot read the [{t}] list of {RISK_PATHS_FILE} at the base"
+            return None, f"cannot read the [{t}] list of {RISK_PATHS_FILE} at the diff's anchor"
         tables.append((n, g))
     hit, unmapped = set(), []
     for p in paths:
@@ -786,12 +1726,11 @@ def scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verd
     if not isinstance(body, str) or str(ticket.get("id", "")).lower() != issue.lower():
         why.append(f"cannot read the body of ticket {issue}")
     # Paths: never trigger 1 or 3, never a two-review (exclude) path.
-    t13 = [g for t in ("trigger1", "trigger3") for g in (glob_list(risk_text, (t, "paths")) or [None])]
-    exc = glob_list(one_text, ("one_review_exclude",))
-    if None in t13 or exc is None:
-        why.append(f"cannot read the trigger 1/3 lists ({RISK_PATHS_FILE}, {ONE_REVIEW_FILE}) at the base")
+    never = workflow_never_globs(one_text, risk_text)
+    if never is None:
+        why.append(f"cannot read the trigger 1/3 lists ({RISK_PATHS_FILE}, {ONE_REVIEW_FILE}) at the diff's anchor")
     else:
-        hit = [p for p in paths if any(glob_match(g, p) for g in t13 + exc)]
+        hit = [p for p in paths if any(glob_match(g, p) for g in never)]
         if hit:
             why.append(f"trigger 1/3 or two-review path needs a per-head approval: {', '.join(hit[:5])}")
     if not paths:
@@ -938,21 +1877,31 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             except RuntimeError as e:
                 reasons.append(str(e))
 
-    # Changed paths (modes included) and size, straight from git.
+    # Changed paths (modes included) and size, straight from git. CAD-2100: for a PR
+    # based on main, main's tip is resolved once here; the diff and both path lists
+    # below are read with it, so they cannot disagree within one evaluation.
+    live_tip = live_main_tip(repo) if base == "main" else ""
     try:
-        changes, lines = pr_changes(pr, head, base, base_oid)
+        changes, lines, merge_base = pr_changes(pr, head, base, base_oid, live_tip)
     except RuntimeError as e:
         reasons.append(f"cannot list the changed files of PR #{pr}: {e}")
-        changes, lines = [], 0
+        changes, lines, merge_base = [], 0, ""
+    # The commit the path lists are read at: main's live tip for a main-based PR (a PR
+    # cannot edit the lists it is judged by: the tip holds no unmerged PR), else the
+    # PR's base commit. Empty when that commit could not be read (main's tip or
+    # `baseRefOid`); the reads below then return nothing (an empty ref would read the
+    # default branch), and a failed diff has already refused.
+    lists_ref = live_tip if base == "main" else base_oid
     paths = sorted({c[3] for c in changes})
     if not changes and not any("cannot list the changed files" in r for r in reasons):
         reasons.append(f"PR #{pr} has an empty diff against {base}")
 
-    # One-review list, read at the PR's base commit.
-    rc, toml_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                            f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={base_oid}"])
-    one_text = toml_text if rc == 0 and base_oid else None
-    one = rc == 0 and bool(base_oid) and one_review_qualifies(changes, toml_text)
+    # One-review list, read with the diff's anchor.
+    rc, toml_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                             f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={lists_ref}"])
+                        if lists_ref else (1, "", ""))
+    one_text = toml_text if rc == 0 else None
+    one = rc == 0 and one_review_qualifies(changes, toml_text)
     report.append("reviews required: " + ("one (diff is on the one-review list)" if one else "two (Standards and Spec/security)"))
     need_qa = any(p.startswith("ui/") for p in paths)
 
@@ -982,10 +1931,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         authors.add(str(ticket["claim"]["by"]).lower())
 
     authority = None
+    policy = None
     required_comment_evidence = []
     if issue:
         try:
             authority = requirements_inspection(issue, repo, pr, head)
+            policy = authority["policy"]
             if (authority["binding"]["base"] != base_oid
                     or authority["binding"]["base_ref"] != base
                     or authority["binding"]["repo"] != repo.lower()
@@ -995,6 +1946,11 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             need_qa = need_qa or req["browser_qa"]
             report.append(f"delivery requirements: {req['class']} ({req['activation']}); policy {authority['binding']['policy_digest']}")
             report.extend(f"delivery reason: {reason}" for reason in req["reasons"])
+            if policy is not None:
+                report.append("approved policy reviews: " + (", ".join(policy["names"]) or "none")
+                              + "; required checks: "
+                              + (", ".join(f"{n} ({a})" for n, a in policy["checks"]) or "none"))
+                reasons += policy_check_reasons(repo, head, policy["checks"])
             if req["activation"] == "active":
                 required_comment_evidence.extend((f"Delivery class: {req['class']}",
                                                   f"Policy digest: {authority['binding']['policy_digest']}"))
@@ -1015,58 +1971,235 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         except RuntimeError as e:
             reasons.append(str(e))
 
+    # CAD-2001: a hosted org's evidence is project-scoped, and the project is
+    # the ticket's own — the one `delivery requirements` just bound and this
+    # script already compared with the ticket above. It is never the repo's
+    # project and never a cwd default. A local org passes nothing: its notes
+    # carry no project attribution.
+    hosted_project = None
+    if authority is not None and authority["origin"] == "hosted":
+        hosted_project = authority["binding"]["project"]
+
+    # CAD-2197: the operator's acceptance of a workflow revise at exactly this
+    # head. Read before the review checks because it lifts one of their
+    # refusals. A failed read or a board that predates the field withholds the
+    # lift and changes nothing else, so every existing refusal stays.
+    accepted_revise, acceptance_why = None, None
+    if hosted_project is not None and issue:
+        accepted_revise, acceptance_why = read_acceptance(
+            repo, pr, head, hosted_project, issue)
+        if acceptance_why:
+            report.append(f"acceptance not used: {acceptance_why}")
+
     verdicts, counted = [], []
+    accepted_findings = []
+    origin = "local"
+    main_tip, has_workflow = "", False
     if issue:
         try:
-            verdicts, skipped = read_verdicts(args.notes_dir, issue, pr, head)
+            verdicts, skipped, origin = read_verdicts(args.notes_dir, issue, pr, head,
+                                                      hosted_project)
             for sk in skipped:
-                report.append(f"skipped note {sk['name']}: {sk['reason']}")
+                report.append(f"skipped note {sk.get('name', '?')}: {sk.get('reason', sk)}")
             for v in verdicts:
                 if v["kind"] == "other":
                     report.append(f"ignored note {v['name']}: its title names no known review kind")
         except RuntimeError as e:
             reasons.append(str(e))
+        has_workflow = any(is_workflow_row(v) for v in verdicts)
+        # AOS-473: the origin the document names decides the counting rule. A
+        # hosted document is the org's attested record for this repo; anything
+        # else keeps the local rule. A failed read leaves no verdicts to count.
+        # CAD-2001: a hosted document also had to name the ticket's project —
+        # `read_verdicts` refuses one that does not.
+        hosted = None
+        if origin == "hosted":
+            author_login = ((view.get("author") or {}).get("login") or "").strip()
+            # CAD-2049: read the map only when there is a row to count. The read
+            # is the owner's, and the CAD-1946 exception needs no verdicts, so a
+            # caller with nothing to count is never refused over it.
+            identities = {}
+            # CAD-2081: workflow rows have no login to resolve, so a document of
+            # only those needs no read of the owner's map.
+            if any(not is_workflow_row(v) for v in verdicts):
+                try:
+                    identities = read_identities()
+                except RuntimeError as e:
+                    reasons.append(str(e))
+            # CAD-2081: the workflow allowlist and workflow files are read at main's
+            # LIVE tip, not the PR's base, which can sit hundreds of commits behind: a
+            # revocation or fix on main must reach an open PR. The tip never contains
+            # an unmerged PR, so a PR still cannot add its own reviewer.
+            # The allowlist loads whenever the document has any row, so whether an
+            # owner-attested row naming a reserved principal counts never depends on
+            # its neighbours. A failed read refuses a workflow row, and an owner row
+            # only when its principal is a service principal (svc_*) that the list
+            # might reserve; ordinary owner rows never need the list.
+            wf_principals = None
+            if verdicts:
+                main_tip = live_tip or live_main_tip(repo)
+                if main_tip:
+                    rc, wf_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                                          f"repos/{repo}/contents/{WORKFLOW_PRINCIPALS_FILE}?ref={main_tip}"])
+                    wf_principals = workflow_principals(wf_text if rc == 0 else None)
+            hosted = {"repo": repo, "project": hosted_project,
+                      "author_login": author_login,
+                      "author_principal": identities.get(author_login.lower(), ""),
+                      "workflow_principals": wf_principals, "pr_base": base,
+                      "workflow_file": lambda sha, path: workflow_file_reason(main_tip, sha, path)}
+            report.append(f"verdict origin: hosted ({repo}, project {hosted_project}); "
+                          "counting attested principals")
+            if any(not is_workflow_row(v) for v in verdicts):
+                report.append("PR author principal: "
+                              + (hosted["author_principal"]
+                                 or f"unattested ({author_login or 'no login'})"))
         active = authority is not None and authority["requirements"]["activation"] == "active"
         klass = authority["requirements"]["class"] if authority else None
         counted = []
-        if not active or klass == "strict":
+        qa_by_comment = False
+        if args.browser_qa:
+            if hosted is None:
+                reasons.append("--browser-qa is for a hosted org")
+            elif not any(p.startswith("ui/") for p in paths):
+                reasons.append("--browser-qa is for a ui/ change, and this PR has none")
+            else:
+                rs = browser_qa_comment_reasons(args.browser_qa, repo, pr, head)
+                reasons += rs
+                qa_by_comment = not rs
+        row_qa = need_qa and not qa_by_comment
+        # A workflow row the operator accepted is settled for the routes that ask
+        # whether both review axes answered; it is never counted as a pass.
+        settled = ([v for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"
+                    and (hosted is None or not workflow_reason(v, hosted))]
+                   if accepted_revise is not None else [])
+        if args.exception:
+            rc, ends, err = run([sys.executable, GATE_SCRIPT, "exception-open"])
+            if rc != 0:
+                reasons.append((err or ends).strip()[:200] or "the review exception is closed")
+            ends = ends.strip()
+            reasons += advisory_reasons(args.advisory, need_qa)
+            routine_reasons, waives_readiness = exception_routine(
+                klass, active, origin, authority["readiness"] if authority else None, ci_url)
+            reasons += routine_reasons
+            rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted,
+                                        exception=True, accepted=accepted_revise)
+            reasons += rs
+            report.append(f"review EXCEPTION until {ends}: reviewer attestation waived")
+            required_comment_evidence.append(f"Review exception until: {ends}")
+            required_comment_evidence.extend(f"Advisory review: {k} = {v}"
+                                             for k, v in sorted(args.advisory.items()))
+        elif policy is not None and klass == "consequential":
+            # CAD-2494: the approved policy names the reviews. Its kind is the answer's.
+            policy_kind = authority["requirements"]["review_kind"]
+            rs, counted = check_reviews(verdicts, policy_kind == "combined", row_qa, authors, issue,
+                                        hosted, accepted=accepted_revise, policy_kind=policy_kind)
+            reasons += rs
+        elif not active or klass == "strict":
             native_one = bool(authority and authority["requirements"]["reviews"] == 1)
             effective_one = one and native_one
-            rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue)
+            rs, counted = check_reviews(verdicts, effective_one, row_qa, authors, issue, hosted,
+                                         accepted=accepted_revise)
             reasons += rs
         elif klass == "routine":
-            if authority["readiness"] is None:
+            if authority["readiness"] is None and origin == "hosted":
+                rs, counted = check_reviews(verdicts, False, need_qa, authors, issue, hosted,
+                                          accepted=accepted_revise)
+                reasons += rs
+                reasons += hosted_routine_reasons(verdicts, counted + settled, hosted, repo, pr, head)
+            elif authority["readiness"] is None:
                 reasons.append("active routine delivery has no fresh native readiness proof for this exact binding")
             else:
                 ready = authority["readiness"]
                 if ci_url is not None and ci_url != ready["ci_run_url"]:
                     reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
             if need_qa:
-                reasons += check_reviews(verdicts, True, True, authors, issue)[0]
+                reasons += check_reviews(verdicts, True, True, authors, issue, hosted,
+                                                     accepted=accepted_revise)[0]
+            # A workflow row that is not a pass refuses whatever the class, so it
+            # stays true when hosted readiness ships. Without readiness on hosted,
+            # check_reviews above also reads owner rows.
+            if accepted_revise is None:
+                reasons += [f"workflow verdict {v['name']} is not a pass (outcome '{v['outcome']}'): "
+                            "a workflow review that is not a pass always refuses"
+                            for v in verdicts if is_workflow_row(v) and v["outcome"] != "pass"]
         elif klass == "consequential":
-            rs, counted = check_reviews(verdicts, True, need_qa, authors, issue)
+            rs, counted = check_reviews(verdicts, True, row_qa, authors, issue, hosted,
+                                     accepted=accepted_revise)
             reasons += rs
             combined = [n for n in counted if n.get("kind") == "combined"]
-            if len({n.get("reviewer") for n in combined}) != 1:
+            # Two counted workflow reviews, Standards plus Spec/security from distinct
+            # principals, are stricter than one combined review and satisfy it.
+            if (len({reviewer_key(n, hosted) for n in combined}) != 1
+                    and not two_workflow_reviews(counted + settled, hosted)):
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
+        if qa_by_comment:
+            required_comment_evidence.append(f"Browser QA comment: {args.browser_qa}")
+            if not two_workflow_reviews(counted, hosted):
+                reasons.append("--browser-qa also needs a pass from both review workflows at this head")
+        accepted_findings = sorted(
+            {v["name"] for v in verdicts
+             if is_workflow_row(v) and v["outcome"] != "pass"})
+        if accepted_revise is not None:
+            report.append("accepted workflow revise: "
+                          + str(accepted_revise.get("approval_id"))
+                          + f" at {head[:12]} (source {accepted_revise.get('source')!r})"
+                          + (f"; findings {', '.join(accepted_findings)}"
+                             if accepted_findings else ""))
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
 
-    # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
-    rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
-                            f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={base_oid}"])
-    risk_text = risk_text if rc == 0 and base_oid else None
+    # CAD-2197: a workflow revise that was not accepted is final, and the operator
+    # needs the exact head and command to accept or supersede it. This is the
+    # "missing or malformed acceptance names the head it would need" rule: a
+    # failed or absent read answers with the same sentence, never with a lift.
+    if (accepted_revise is None and hosted_project is not None
+            and any(is_workflow_row(v) and v["outcome"] != "pass" for v in verdicts)):
+        reasons.append(
+            f"a workflow review at head {head} is not a pass and no acceptance is recorded for "
+            f"that head; the operator accepts it with `cadence audit accept-revise --pr {pr} "
+            f"--head {head} --issue {issue} --project {hosted_project} --source ...` after "
+            "reading the findings, or a new commit is reviewed again")
+
+    # Human class: paths, size, any head-pinned note whose Risk is not exactly `auto`,
+    # or (CAD-2081) a workflow-issued review on any change outside the workflow
+    # auto-paths allowlist or on a path it can never make eligible (CAD-2254).
+    # `cadence delivery requirements` does not report that last rule; this script
+    # adds it.
+    rc, risk_text, _ = (run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                             f"repos/{repo}/contents/{RISK_PATHS_FILE}?ref={lists_ref}"])
+                        if lists_ref else (1, "", ""))
+    risk_text = risk_text if rc == 0 else None
     risk = risk_globs(risk_text)
-    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the base (fail closed)"]
+    why = [] if risk is not None else [f"cannot read {RISK_PATHS_FILE} at the diff's anchor (fail closed)"]
     why += [p for p in paths if is_human_path(p, risk or ())][:5]
     if lines > HUMAN_LINES:
         why.append(f"{lines} changed lines")
+    # CAD-2100: a lean class (routine, consequential) cannot hide what this script's
+    # own diff found. The classifier may be an older build than this script.
+    if authority is not None and authority["requirements"]["activation"] == "active":
+        reasons += lean_class_reasons(authority["requirements"]["class"], changes, one,
+                                      [p for p in paths if is_human_path(p, risk or ())], lines)
+    if policy is not None and authority["requirements"]["class"] == "consequential":
+        reasons += policy_floor_reasons(changes, lines, risk, workflow_never_globs(one_text, risk_text))
+    if has_workflow:
+        auto_text = None
+        if main_tip:
+            rc, auto_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                                    f"repos/{repo}/contents/{WORKFLOW_AUTO_FILE}?ref={main_tip}"])
+            auto_text = auto_text if rc == 0 else None
+        why += workflow_auto_reasons(changes, auto_text,
+                                     workflow_never_globs(one_text, risk_text), risk or ())
     not_auto = [v for v in verdicts if v["risk"] != "auto"]
     if not_auto:
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
+    if args.browser_qa:
+        # The comment cannot prove the QA ran. The operator accepts that per head, so no
+        # auto-paths entry and no scope approval stands in here.
+        why.append("Browser QA by PR comment")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        rs = check_approval(repo, pr, head, report, approval_evidence)
-        if rs:  # legacy CAD-1106 scope fallback only
+        rs = check_approval(repo, pr, head, report, approval_evidence,
+                            hosted_project, issue)
+        if rs and not args.exception and not args.browser_qa:  # legacy CAD-1106 scope fallback only
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
@@ -1077,9 +2210,10 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     else:
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
     authoritative_operator = bool(authority and authority["requirements"]["operator_approval"])
-    if authoritative_operator and not why:
-        rs = check_approval(repo, pr, head, report, approval_evidence)
-        if rs:
+    if (authoritative_operator or args.exception) and not why:
+        rs = check_approval(repo, pr, head, report, approval_evidence,
+                            hosted_project, issue)
+        if rs and not args.exception:
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
                              risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
@@ -1087,6 +2221,13 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             else:
                 rs = []
         reasons += rs
+    if accepted_revise is not None:
+        # CAD-2201: the comment names the finding that was accepted, not only the
+        # id, so a reader of the evidence can tell what the operator read.
+        required_comment_evidence.append(
+            "Accepted workflow revise: " + str(accepted_revise.get("approval_id"))
+            + f" at {head[:12]}"
+            + (f"; findings {', '.join(accepted_findings)}" if accepted_findings else ""))
     if require_comment:
         if approval_evidence.get("approval"):
             required_comment_evidence.append("Operator approval id: " + approval_evidence["approval"])
@@ -1095,9 +2236,18 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         evidence.update(issue=issue, repo=repo, pr=pr, head=head, base=base_oid, base_ref=base,
                         notes=sorted({n["name"] for n in counted}),
                         checks=sorted(names), comments=ticket.get("comments") or [],
+                        merge_base=merge_base, main_tip=live_tip,
                         binding=authority["binding"] if authority else None,
                         requirements=authority["requirements"] if authority else None,
                         readiness=authority["readiness"] if authority else None)
+        if args.browser_qa:
+            evidence["browser_qa"] = args.browser_qa
+        if accepted_revise is not None:
+            evidence["accepted_revise"] = dict(accepted_revise,
+                                               findings=accepted_findings)
+        if args.exception:
+            evidence["exception"] = {"ends": ends, "advisory": dict(args.advisory),
+                                     "waives_readiness": waives_readiness}
         evidence["ci_run"] = ci_url
         evidence["ci_proofs"] = proofs
     return reasons, report
@@ -1124,6 +2274,13 @@ def evidence_body(evidence):
              f"Base branch: {evidence['base_ref']}",
              f"Green CI run: {evidence['ci_run']}",
              "Required checks: " + ", ".join(evidence["checks"])]
+    # CAD-2100: `Base:` is the PR's recorded base commit, which the final head check
+    # compares with GitHub's. These record what the classification judged. Not required
+    # by check_comment, so an evidence comment without them still counts.
+    if evidence.get("merge_base"):
+        lines.append(f"Merge base judged: {evidence['merge_base']}")
+    if evidence.get("main_tip"):
+        lines.append(f"Main tip: {evidence['main_tip']}")
     for name in sorted(evidence.get("ci_proofs") or {}):
         url = evidence["ci_proofs"][name]
         if url != evidence["ci_run"]:
@@ -1139,6 +2296,16 @@ def evidence_body(evidence):
                       f"Native CI run: {readiness['ci_run_id']} {readiness['ci_run_url']}"))
     if evidence.get("approval"):
         lines.append("Operator approval id: " + evidence["approval"])
+    if evidence.get("browser_qa"):
+        lines.append(f"Browser QA comment: {evidence['browser_qa']}")
+    exception = evidence.get("exception")
+    if exception:
+        waived = "authenticated reviewer attestation"
+        if exception.get("waives_readiness"):
+            waived += ", routine readiness (hosted has none)"
+        lines.append(f"EXCEPTION, not a normal gate pass. Waived: {waived}.")
+        lines.append(f"Review exception until: {exception['ends']}")
+        lines.extend(f"Advisory review: {k} = {v}" for k, v in sorted(exception["advisory"].items()))
     return "\n".join(lines)
 
 
@@ -1184,11 +2351,27 @@ def queued(repo, pr):
     return p.get("isInMergeQueue") is True or p.get("state") == "MERGED"
 
 
+def post_gate_signature(args, repo):
+    """Sign (repo, pr, head) and post it on the PR; the merge queue's
+    delivery-gate job verifies it (CAD-1925). Reasons on failure."""
+    key = os.path.expanduser(args.gate_key)
+    rc, out, err = run([sys.executable, GATE_SCRIPT, "sign", "--repo", repo, "--pr", str(args.pr),
+                        "--head", args.head, "--key", key]
+                       + (["--exception"] if args.exception else []))
+    if rc != 0 or not out.strip():
+        return [f"delivery-gate signature failed: {(err or out).strip()[:200]}"]
+    rc, out, err = run(["gh", "pr", "comment", str(args.pr), "-R", repo, "--body-file", "-"],
+                       input_text=out)
+    if rc != 0:
+        return [f"posting the delivery-gate signature failed: {(err or out).strip()[:200]}"]
+    return []
+
+
 def enqueue(args, repo):
     rc, out, err = run(["gh", "pr", "merge", str(args.pr), "-R", repo, "--auto", "--squash",
                         "--match-head-commit", args.head])
     if rc != 0:
-        print(f"{ME}: gh pr merge failed: {(err or out).strip()}", file=sys.stderr)
+        print(f"{ME}: gh pr merge failed: {shown((err or out).strip())}", file=sys.stderr)
     else:
         deadline = time.monotonic() + args.poll_secs
         while True:
@@ -1204,26 +2387,490 @@ def enqueue(args, repo):
         if rc == 0:
             break
     if rc != 0:
-        print(f"{ME}: DANGER: --disable-auto failed; auto-merge may still be on: {(err or out).strip()}", file=sys.stderr)
+        print(f"{ME}: DANGER: --disable-auto failed; auto-merge may still be on: {shown((err or out).strip())}", file=sys.stderr)
     else:
         print(f"{ME}: auto-merge disabled again", file=sys.stderr)
     return 1
 
 
+def self_test():
+    """CAD-2049, CAD-2081, CAD-2254: the gate's rules over fixed documents. No network, no files.
+
+    The gate cannot approve its own change, so this is the reproducible check
+    those tickets ask for: it runs the functions the gate runs, over the shapes
+    that decide the independence rule, the workflow-row rules and the
+    workflow-only route's path rules."""
+    def row(name, reviewer_id, login, kind="combined", outcome="pass"):
+        return {"name": name, "stamp": "20261103-000000", "reviewer": login,
+                "reviewer_id": reviewer_id, "github_login": login, "repo": "o/r",
+                "kind": kind, "outcome": outcome, "title_outcome": outcome,
+                "section_outcome": outcome, "risk": "auto"}
+
+    def hosted(author_login, author_principal):
+        return {"repo": "o/r", "project": "p", "author_login": author_login,
+                "author_principal": author_principal}
+
+    cases = [
+        ("same principal under another login refuses",
+         hosted("author", "usr_author"), row("a.md", "usr_author", "author2"),
+         "not independent"),
+        ("an unattested author proves nothing",
+         hosted("author", ""), row("b.md", "usr_other", "reviewer"),
+         "no attested principal"),
+        ("a distinct attested principal counts",
+         hosted("author", "usr_author"), row("c.md", "usr_other", "reviewer"),
+         None),
+    ]
+    failures = 0
+    for label, h, verdict, expected in cases:
+        reasons, counted = check_reviews([verdict], True, False, {"author"}, "CAD-1", h)
+        if expected is None:
+            ok = not reasons and len(counted) == 1
+            detail = "; ".join(reasons) or f"counted {len(counted)}"
+        else:
+            ok = bool(reasons) and not counted and any(expected in r for r in reasons)
+            detail = "; ".join(reasons) or "no refusal"
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {detail}")
+        failures += 0 if ok else 1
+
+    def workflow_hosted():
+        return {"repo": "o/r", "project": "p", "author_login": "author",
+                "author_principal": "usr_author", "pr_base": "main",
+                "workflow_principals": {
+                    "svc_std": {"kind": "standards",
+                                "workflow": ".github/workflows/review-standards.yml"}},
+                "workflow_file": lambda sha, path: ""}
+
+    def workflow_row(name, principal, kind):
+        return {"name": name, "stamp": "20261103-000000", "reviewer": "",
+                "reviewer_id": principal, "github_login": "", "repo": "o/r",
+                "kind": kind, "outcome": "pass", "title_outcome": "pass",
+                "section_outcome": "pass", "risk": "auto",
+                "identity_source": "workflow-oidc",
+                "base_sha": "a" * 40, "workflow_sha": "b" * 40}
+
+    # CAD-2081 follow-up: an uncounted kind used to drop the row before the
+    # workflow checks, so these produced no refusal.
+    workflow_cases = [
+        ("a workflow row of an uncounted kind refuses",
+         workflow_row("d.md", "svc_std", "other"), "may file only standards, not other"),
+        ("an unlisted workflow principal refuses",
+         workflow_row("e.md", "svc_ghost", "other"), "not in docs/roles/review-workflow-principals.toml"),
+    ]
+    for label, verdict, expected in workflow_cases:
+        reasons, counted = check_reviews(
+            [verdict], True, False, set(), "CAD-1", workflow_hosted())
+        ok = not counted and any(expected in r for r in reasons)
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {'; '.join(reasons) or 'no refusal'}")
+        failures += 0 if ok else 1
+
+    # CAD-2254: the workflow-only route's path rules over fixed lists. The size
+    # trigger and a non-`auto` Risk are decided inline in evaluate; the suite's
+    # cad2254 block covers those two.
+    auto = '[auto]\npaths = ["docs/**/*.md", "src/**"]\n'
+    risk = ["docs/roles/**", "scripts/**", "docs/design/**"]
+    never = workflow_never_globs(
+        'one_review_exclude = ["src/daemon/**", "ui/**"]\n',
+        '[trigger1]\npaths = ["src/peer.rs"]\n[trigger3]\npaths = ["src/secret/**"]\n')
+
+    def plain(path):
+        return [("M", "100644", "100644", path)]
+
+    auto_cases = [
+        ("an ordinary listed path is eligible", plain("docs/guides/x.md"), never, None),
+        ("a one-review excluded tree keeps the operator", plain("src/daemon/x.rs"), never, "never eligible"),
+        ("a UI path keeps the operator", plain("ui/src/x.tsx"), never, "never eligible"),
+        ("a trigger 1 path keeps the operator", plain("src/peer.rs"), never, "never eligible"),
+        ("a trigger 3 path keeps the operator", plain("src/secret/x.rs"), never, "never eligible"),
+        ("an excluded path beside an ordinary one keeps the operator",
+         plain("docs/x.md") + plain("src/daemon/x.rs"), never, "never eligible"),
+        ("a case alias of a protected path keeps the operator",
+         plain("docs/Roles/x.md"), never, "differs only by case"),
+        ("a case alias of an exact human-class name keeps the operator",
+         plain("docs/team.md"), never, "differs only by case"),
+        ("a case alias under a risk glob keeps the operator",
+         plain("docs/Design/x.md"), never, "differs only by case"),
+        ("an emptied never-eligible list keeps the operator", plain("docs/x.md"),
+         workflow_never_globs('one_review_exclude = []\n', '[trigger1]\npaths = ["a"]\n[trigger3]\npaths = ["b"]\n'),
+         "fail closed"),
+        ("a zero-width character makes an odd path name", plain("docs/x\u200b.md"), never,
+         "an odd path name"),
+        ("a trailing-dot directory makes an odd path name", plain("docs/dir./x.md"), never,
+         "an odd path name"),
+        ("a newline prints escaped, not as a new line", plain("docs/a\nb.md"), never, "a\\nb.md (an odd path name)"),
+        ("a no-break space makes an odd path name, printed escaped", plain("docs/a\u00a0b.md"), never,
+         "a\\u00a0b.md (an odd path name)"),
+        ("a further agent-instruction name keeps the operator", plain("docs/AGENT.md"), never,
+         "agent-instruction file name"),
+        ("a lookalike of an agent-instruction name stays eligible", plain("docs/agenda.md"), never, None),
+        ("an agent-instruction name spelled with a folding character keeps the operator",
+         plain("docs/agent\u017f.md"), never, "agent-instruction file name"),
+        ("an unlisted path keeps the operator", plain("contracts/x.json"), never, "not on the list"),
+        ("a delete keeps the operator", [("D", "100644", "000000", "docs/x.md")], never,
+         "not a plain add or modify"),
+        ("a mode change keeps the operator", [("M", "100644", "100755", "docs/x.md")], never,
+         "not a plain add or modify"),
+        ("unreadable never-eligible lists keep the operator", plain("docs/x.md"),
+         workflow_never_globs(None, None), "fail closed"),
+    ]
+    for label, changes, never_globs, expected in auto_cases:
+        reasons = [shown(r) for r in workflow_auto_reasons(changes, auto, never_globs, risk)]
+        ok = (not reasons) if expected is None else any(expected in r for r in reasons)
+        print(f"{'ok  ' if ok else 'FAIL'} {label}: {'; '.join(reasons) or 'eligible'}")
+        failures += 0 if ok else 1
+    ok = (is_human_path("tests/x.rs", ["tests/**"]) and is_human_path("docs/design/x.md", ["docs/design/**"])
+          and not is_human_path("docs/guides/x.md", ["tests/**", "docs/design/**"]))
+    print(f"{'ok  ' if ok else 'FAIL'} a risk-paths trigger glob makes a path human-class")
+    failures += 0 if ok else 1
+
+    # CAD-1946: hosted thin-client delegation when `cadence org inspect` reports remote.
+    import stat
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="enqueue-hosted-test.") as tmp:
+        fake_cadence = os.path.join(tmp, "cadence")
+        calls_log = os.path.join(tmp, "calls.log")
+        with open(fake_cadence, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                f"log = {calls_log!r}\n"
+                "argv = sys.argv[1:]\n"
+                "with open(log, 'a', encoding='utf-8') as lf:\n"
+                "    lf.write(json.dumps(argv) + '\\n')\n"
+                "mode = os.environ.get('TEST_ORG_MODE', 'remote')\n"
+                "if argv[-2:] == ['org', 'inspect']:\n"
+                "    if mode == 'broken':\n"
+                "        sys.stderr.write('unknown org\\n')\n"
+                "        sys.exit(1)\n"
+                "    print(json.dumps({'org': 'fav-limited', 'selected': True, 'destination': {'mode': mode}}))\n"
+                "    sys.exit(0)\n"
+                "if 'delivery' in argv and 'check' in argv:\n"
+                "    if os.environ.get('TEST_GATE') == 'refused':\n"
+                "        print(json.dumps({'state': 'refused', 'ok': False, 'repo': 'favcrm/cadence', 'pr': 7, 'head': 'a'*40, 'reasons': ['need 2 reviews']}))\n"
+                "        sys.exit(1)\n"
+                "    print(json.dumps({'state': 'pass', 'ok': True, 'repo': 'favcrm/cadence', 'pr': 7, 'head': 'a'*40, 'delivery_class': 'human', 'approval_kind': 'per-head', 'reasons': []}))\n"
+                "    sys.exit(0)\n"
+                "if 'delivery' in argv and 'enqueue' in argv:\n"
+                "    if os.environ.get('TEST_ENQUEUE') == '409':\n"
+                "        sys.stderr.write('head_moved: PR head changed\\n')\n"
+                "        sys.exit(1)\n"
+                "    print(json.dumps({'state': 'enqueued', 'ok': True, 'repo': 'favcrm/cadence', 'pr': 7, 'head': 'a'*40, 'evidence_id': 'ev_99', 'queued': True, 'auto_merge_enabled': True, 'comment_url': 'https://example/c/1'}))\n"
+                "    sys.exit(0)\n"
+                "sys.exit(2)\n"
+            )
+        os.chmod(fake_cadence, os.stat(fake_cadence).st_mode | stat.S_IXUSR)
+        old_cwd = os.getcwd()
+        old_bin = os.environ.get("CADENCE_BIN")
+        old_org = os.environ.get("CADENCE_ORG")
+        old_mode = os.environ.get("TEST_ORG_MODE")
+        old_gate = os.environ.get("TEST_GATE")
+        old_enq = os.environ.get("TEST_ENQUEUE")
+        try:
+            os.chdir(tmp)
+            os.environ["CADENCE_BIN"] = fake_cadence
+            os.environ.pop("CADENCE_ORG", None)
+            os.environ["TEST_ORG_MODE"] = "remote"
+            os.environ["TEST_GATE"] = "pass"
+            os.environ["TEST_ENQUEUE"] = "ok"
+            rc_dry = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--dry-run"])
+            rc_enq = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--head", "a" * 40])
+            rc_exc = main([
+                "7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--head", "a" * 40,
+                "--exception", "--advisory", "standards=https://example/1",
+                "--advisory", "spec-security=https://example/2", "--dry-run",
+            ])
+            os.environ["CADENCE_ORG"] = "fav-limited"
+            open(calls_log, "w", encoding="utf-8").close()
+            rc_env_qa = main(["7", "--repo", "favcrm/cadence", "--require-browser-qa", "--dry-run"])
+            env_calls = [json.loads(line) for line in open(calls_log, encoding="utf-8") if line.strip()]
+            saw_env_qa = any("--org" in c and "fav-limited" in c and "--browser-qa" in c for c in env_calls)
+            os.environ.pop("CADENCE_ORG", None)
+            os.environ["TEST_GATE"] = "refused"
+            rc_ref = main(["7", "--org", "fav-limited", "--repo", "favcrm/cadence", "--dry-run"])
+            os.environ["TEST_ORG_MODE"] = "broken"
+            rc_brk = main(["7", "--org", "bad-org", "--repo", "favcrm/cadence", "--dry-run"])
+            ok_hosted = (
+                rc_dry == 0 and rc_enq == 0 and rc_exc == 1
+                and rc_env_qa == 0 and saw_env_qa and rc_ref == 1 and rc_brk == 1
+            )
+        finally:
+            os.chdir(old_cwd)
+            for k, v in [("CADENCE_BIN", old_bin), ("CADENCE_ORG", old_org),
+                         ("TEST_ORG_MODE", old_mode), ("TEST_GATE", old_gate),
+                         ("TEST_ENQUEUE", old_enq)]:
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        print(f"{'ok  ' if ok_hosted else 'FAIL'} hosted org thin client delegates check/enqueue and fails closed")
+        failures += 0 if ok_hosted else 1
+    return 0 if not failures else 1
+
+
+MAIN_REF = "refs/remotes/origin/main"  # fully qualified: a local branch or tag named origin/main cannot shadow it
+
+
+def main_ref_present():
+    """True when MAIN_REF resolves here (False: not a repo, no such ref, no git)."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", MAIN_REF + "^{commit}"],
+                           capture_output=True)
+    except OSError:
+        return False
+    return r.returncode == 0
+
+
+def git_main_blob(name):
+    """origin/main's scripts/<name> bytes, or None when git cannot read it."""
+    try:
+        blob = subprocess.run(["git", "show", f"{MAIN_REF}:scripts/{name}"], capture_output=True)
+    except OSError:
+        return None
+    return blob.stdout if blob.returncode == 0 else None
+
+
+def check_gate_copy(dry_run):
+    """CAD-2108: a gate that differs from main's must not sign. Returns refusal lines.
+
+    Compares this script and its sibling delivery-gate, byte for byte, with
+    origin/main's, read by local git from the CURRENT directory (not the script's:
+    a copy of main's gate run from a scratch directory inside the repo must pass).
+    No network. A stale local origin/main is not detected. No origin/main here means
+    no opinion; origin/main present but the file unreadable cannot prove equality."""
+    files = {}
+    for path in (os.path.abspath(__file__), GATE_SCRIPT):
+        try:
+            with open(path, "rb") as fh:
+                files[os.path.basename(path)] = fh.read()
+        except OSError:
+            files[os.path.basename(path)] = None
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        digest.update(name.encode() + b"\0" + (files[name] or b"") + b"\0")
+    short = digest.hexdigest()[:12]
+    problems = []
+    if not main_ref_present():
+        print(f"{ME}: gate {short} (unchecked)", flush=True)
+        print(f"{ME}: gate not compared with origin/main (no origin/main in the current directory)",
+              file=sys.stderr)
+        return []
+    for name in sorted(files):
+        main_bytes = git_main_blob(name)
+        if files[name] is None:
+            problems.append(f"{name} cannot be read here, so it cannot be compared with origin/main")
+        elif main_bytes is None:
+            problems.append(f"scripts/{name} cannot be read from origin/main, so equality is unproven")
+        elif files[name] != main_bytes:
+            problems.append(f"{name} differs from origin/main:scripts/{name}")
+    if not problems:
+        print(f"{ME}: gate {short} (same as origin/main)", flush=True)
+        return []
+    how = ("run main's copy from inside the repo: d=$(mktemp -d) && for f in enqueue-reviewed delivery-gate; do "
+           "git show refs/remotes/origin/main:scripts/$f > $d/$f; done && chmod +x $d/enqueue-reviewed && "
+           "$d/enqueue-reviewed <args> (git fetch origin main first if your origin/main is old)")
+    if dry_run:
+        print(f"{ME}: gate {short} (differs from origin/main; dry run continues)", flush=True)
+        for p in problems:
+            print(f"{ME}: warning: {shown(p)}; a real enqueue refuses; {how}", file=sys.stderr)
+        return []
+    print(f"{ME}: gate {short} (differs from origin/main)", flush=True)
+    return [f"{p}; this gate would sign with rules main does not have; {how}" for p in problems]
+
+
+def hosted_org_mode(org_arg):
+    """Detect whether an explicitly selected Cadence org (`--org` or `CADENCE_ORG`)
+    is remote via `cadence --org <org> org inspect`, failing closed on any error."""
+    explicit_org = (org_arg or os.environ.get("CADENCE_ORG") or "").strip() or None
+    if not explicit_org:
+        return "local", None, None
+    rc, out, err = run(["cadence", "--org", explicit_org, "org", "inspect"])
+    if rc != 0:
+        detail = err.strip() or out.strip() or f"exit {rc}"
+        return "error", None, f"cannot inspect hosted org {explicit_org}: {detail}"
+    try:
+        doc = json.loads(out)
+    except ValueError as e:
+        return "error", None, f"cadence org inspect returned invalid JSON: {e}"
+    if not isinstance(doc, dict):
+        return "error", None, "cadence org inspect returned non-object JSON"
+    dest = doc.get("destination")
+    mode = dest.get("mode") if isinstance(dest, dict) else doc.get("mode")
+    if mode in ("remote", "local"):
+        return mode, doc, None
+    return "error", None, f"cadence org inspect reported unknown mode {mode!r}"
+
+
+def _run_hosted_check(args, repo):
+    explicit_org = (args.org or os.environ.get("CADENCE_ORG") or "").strip() or None
+    cmd = ["cadence"]
+    if explicit_org:
+        cmd += ["--org", explicit_org]
+    cmd += ["delivery", "check", "--repo", repo, "--pr", str(args.pr)]
+    if args.head:
+        cmd += ["--head", args.head]
+    if args.issue:
+        cmd += ["--issue", args.issue]
+    if args.project:
+        cmd += ["--project", args.project]
+    if args.browser_qa or args.require_browser_qa:
+        cmd.append("--browser-qa")
+    rc, out, err = run(cmd)
+    try:
+        doc = json.loads(out) if out.strip() else None
+    except ValueError:
+        doc = None
+    return rc, out, err, doc
+
+
+def run_hosted_gate(args, repo):
+    """Thin hosted client: evaluate or approve+enqueue on the remote Cadence board."""
+    head = args.head
+    explicit_org = (args.org or os.environ.get("CADENCE_ORG") or "").strip() or None
+    if args.dry_run or not head:
+        rc, out, err, doc = _run_hosted_check(args, repo)
+        if args.dry_run:
+            if isinstance(doc, dict):
+                checked_head = str(doc.get("head") or head or "").lower()
+                cls = doc.get("delivery_class")
+                kind = doc.get("approval_kind")
+                reasons = list(doc.get("reasons")) if isinstance(doc.get("reasons"), list) else []
+                if args.browser_qa:
+                    if not FULL_SHA.match(checked_head):
+                        reasons.append("cannot verify --browser-qa without a resolved 40-hex PR head")
+                    else:
+                        reasons.extend(browser_qa_comment_reasons(args.browser_qa, repo, args.pr, checked_head))
+                if rc == 0 and doc.get("ok") is True and not reasons:
+                    print(f"{ME}: dry run: every rule holds for PR #{args.pr} at {checked_head}"
+                          f" (class={cls}, approval={kind}); nothing enqueued")
+                    return 0
+                for r in reasons:
+                    print(f"{ME}: refused: {shown(str(r))}", file=sys.stderr)
+                if not reasons:
+                    msg = err.strip() or out.strip() or f"delivery check exited {rc}"
+                    print(f"{ME}: refused: {shown(msg)}", file=sys.stderr)
+                return 1
+            msg = err.strip() or out.strip() or f"delivery check exited {rc}"
+            print(f"{ME}: refused: {shown(msg)}", file=sys.stderr)
+            return rc if rc != 0 else 1
+        if rc != 0 or not isinstance(doc, dict) or not FULL_SHA.match(str(doc.get("head", ""))):
+            reasons = doc.get("reasons", []) if isinstance(doc, dict) else []
+            for r in reasons:
+                print(f"{ME}: refused: {shown(str(r))}", file=sys.stderr)
+            if not reasons:
+                msg = err.strip() or out.strip() or f"delivery check could not resolve PR #{args.pr} head"
+                print(f"{ME}: refused: {shown(msg)}", file=sys.stderr)
+            return 1
+        head = doc["head"].lower()
+
+    if args.browser_qa:
+        qa_reasons = browser_qa_comment_reasons(args.browser_qa, repo, args.pr, head)
+        if qa_reasons:
+            for r in qa_reasons:
+                print(f"{ME}: refused: {shown(str(r))}", file=sys.stderr)
+            return 1
+
+    cmd = ["cadence"]
+    if explicit_org:
+        cmd += ["--org", explicit_org]
+    cmd += ["delivery", "enqueue", "--repo", repo, "--pr", str(args.pr), "--head", head]
+    if args.issue:
+        cmd += ["--issue", args.issue]
+    if args.project:
+        cmd += ["--project", args.project]
+    if args.browser_qa or args.require_browser_qa:
+        cmd.append("--browser-qa")
+    rc, out, err = run(cmd)
+    if rc == 0:
+        try:
+            doc = json.loads(out)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and doc.get("ok") is True:
+            ev = doc.get("evidence_id") or "?"
+            url = doc.get("comment_url") or doc.get("comment_id") or "?"
+            print(f"{ME}: enqueued PR #{args.pr} at {head} (evidence {ev}, comment {url})")
+            return 0
+        print(f"{ME}: refused: delivery enqueue returned an invalid receipt", file=sys.stderr)
+        return 1
+    msg = err.strip() or out.strip() or f"delivery enqueue exited {rc}"
+    print(f"{ME}: refused: {shown(msg)}", file=sys.stderr)
+    return rc
+
+
 def main(argv):
-    ap = argparse.ArgumentParser(prog=ME, description="Enqueue a PR only when review, checks and approval hold.")
+    if "--self-test" in argv:
+        return self_test()
+    ap = argparse.ArgumentParser(
+        prog=ME,
+        description="Check or enqueue through Cadence; this workspace's hosted enqueue is operator-only.",
+    )
     ap.add_argument("pr", type=int)
-    ap.add_argument("--head", required=True, help="the full 40-hex head SHA the review covered")
+    ap.add_argument("--head", help="the full 40-hex head SHA the review covered")
     ap.add_argument("--repo")
+    ap.add_argument("--org", help="hosted Cadence org selector (delegates to cadence delivery check/enqueue)")
+    ap.add_argument("--project", help="explicit project key for hosted delivery check/enqueue")
+    ap.add_argument("--issue", help="explicit tracker issue id for hosted delivery check/enqueue")
     ap.add_argument("--notes-dir", default=os.environ.get("CADENCE_NOTES_DIR", DEFAULT_NOTES_DIR))
     ap.add_argument("--author", action="append", default=[], help="an extra alias that authored the PR")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--gate-key", default=os.environ.get("CADENCE_DELIVERY_GATE_KEY", DEFAULT_GATE_KEY),
+                    help="legacy native signing key (local v1 signing is retired)")
+    ap.add_argument("--exception", action="store_true",
+                    help="native evaluation only; refused on hosted orgs and cannot enqueue with retired v1 signing")
+    ap.add_argument("--advisory", action="append", default=[], metavar="KIND=URL",
+                    help="advisory review for native exception evaluation; refused on hosted orgs")
+    ap.add_argument("--browser-qa", metavar="URL",
+                    help="hosted: validate this exact-head pass comment and require Browser QA")
+    ap.add_argument("--require-browser-qa", action="store_true",
+                    help="force hosted delivery check/enqueue to require Browser QA")
     ap.add_argument("--poll-secs", type=float, default=30)
     ap.add_argument("--poll-interval", type=float, default=2)
     args = ap.parse_args(argv)
-    args.head = args.head.lower()
-    if args.pr < 1 or not FULL_SHA.match(args.head):
+    if args.head is not None:
+        args.head = args.head.lower()
+    pairs = [a.partition("=") for a in args.advisory]
+    args.advisory = {k: v for k, _, v in pairs}
+    if len(args.advisory) != len(pairs) or (pairs and not args.exception):
+        print(f"{ME}: --advisory takes one KIND=URL per kind, with --exception", file=sys.stderr)
+        return 2
+    if (args.browser_qa or args.require_browser_qa) and args.exception:
+        print(f"{ME}: --browser-qa and --exception are separate routes", file=sys.stderr)
+        return 2
+    if args.pr < 1 or (args.head is not None and not FULL_SHA.match(args.head)):
         print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
+        return 2
+
+    gate_refusals = check_gate_copy(args.dry_run)
+    if gate_refusals:
+        for r in gate_refusals:
+            print(f"{ME}: refused: {shown(r)}", file=sys.stderr)
+        return 1
+
+    org_mode, _, org_err = hosted_org_mode(args.org)
+    if org_err:
+        print(f"{ME}: refused: {shown(org_err)}", file=sys.stderr)
+        return 1
+    if org_mode == "remote":
+        if args.exception:
+            print(f"{ME}: refused: --exception is not supported on hosted orgs", file=sys.stderr)
+            return 1
+        repo = args.repo
+        try:
+            if not repo:
+                repo = gh_json(["repo", "view", "--json", "nameWithOwner"])["nameWithOwner"]
+            if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", repo):
+                print(f"{ME}: bad repo {repo!r}", file=sys.stderr)
+                return 2
+            return run_hosted_gate(args, repo)
+        except (RuntimeError, KeyError, TypeError) as e:
+            print(f"{ME}: refused: cannot read the PR: {shown(str(e))}", file=sys.stderr)
+            return 1
+
+    if args.require_browser_qa:
+        print(f"{ME}: --require-browser-qa applies only on a hosted org", file=sys.stderr)
+        return 2
+    if not args.head:
+        print(f"{ME}: --head is required (unless --org <hosted-org> or CADENCE_ORG selects a remote org)", file=sys.stderr)
         return 2
     repo = args.repo
     try:
@@ -1251,13 +2898,17 @@ def main(argv):
                                      or final_evidence.get("ci_run") != evidence.get("ci_run")
                                      or final_evidence.get("ci_proofs") != evidence.get("ci_proofs"))):
                     reasons.append("delivery policy/base/readiness/CI binding changed after evidence collection; revalidate before enqueue")
+                if not reasons:
+                    reasons += post_gate_signature(args, repo)
     except (RuntimeError, KeyError, TypeError) as e:
         reasons, report = [f"cannot read the PR: {e}"], []
+    # Every report and refusal line is escaped: a path name in it cannot print a line
+    # of its own (CAD-2257).
     for line in report:
-        print(f"{ME}: {line}")
+        print(f"{ME}: {shown(line)}")
     if reasons:
         for r in reasons:
-            print(f"{ME}: refused: {r}", file=sys.stderr)
+            print(f"{ME}: refused: {shown(r)}", file=sys.stderr)
         return 1
     if args.dry_run:
         print(f"{ME}: dry run: every rule holds for PR #{args.pr} at {args.head}; nothing enqueued")

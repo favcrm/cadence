@@ -123,19 +123,6 @@ fn peek_kid(env: &str) -> Result<String, HttpResp> {
 /// Process-wide JWKS cache (shared shape with `cli_route`).
 static CLI_JWKS: std::sync::Mutex<board_identity::JwksCache> =
     std::sync::Mutex::new(board_identity::JwksCache::new());
-
-/// CAD-1434 / AOS-243 test seam: prime the process-wide JWKS cache through the
-/// SAME `JwksCache::key` that `grant_of` calls, so the production `fetch_keys`
-/// fetch and parser populate it. There is no key setter: the only way a key
-/// enters the cache is the real issuer fetch. The native request thread does
-/// not inherit a thread-local TLS fixture, so the controller primes here on its
-/// own thread before any native call. Test builds only.
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) fn prime_jwks_for_test(issuer: &str, kid: &str, now: i64) -> crate::Result<()> {
-    let mut cache = CLI_JWKS.lock().unwrap_or_else(|e| e.into_inner());
-    cache.key(issuer, kid, now).map(|_| ())
-}
-
 /// `wikienv_` requests on `/api/wiki/<tail>`. Only the translated routes
 /// are served; a verified envelope whose scope or prefix does not cover
 /// the action is refused before the daemon sees it.
@@ -169,6 +156,8 @@ pub(crate) fn handle(
             "the envelope's granted wiki scopes do not cover this action",
         );
     }
+    let unresolved_user = grant.actor.starts_with("users/")
+        && grant.actor != crate::project_policy::policy_user_actor(&grant.sub);
     // Single-use: consume the jti like the CLI route, so a captured
     // wiki bearer cannot be replayed at this route either.
     if !consume_jti(state_dir, &grant) {
@@ -178,15 +167,19 @@ pub(crate) fn handle(
             "the envelope's jti was already consumed",
         );
     }
-    // Only a verified `users/` or the owner `operator` maps to a daemon
-    // identity. A service or agent envelope has no `wiki_as` claim the
-    // daemon accepts, so it is refused rather than relayed as an agent.
-    let Some(attribution) = relay_claim(&grant.actor) else {
-        return refuse(
-            403,
-            "insufficient_scope",
-            "this envelope's actor has no wiki identity on this board",
-        );
+    // Only an unambiguous verified user or owner maps to a daemon identity.
+    // A lossy user handle keeps only the public read ceiling, never writes.
+    let attribution = if unresolved_user {
+        "public".to_string()
+    } else {
+        let Some(attribution) = relay_claim(&grant.actor) else {
+            return refuse(
+                403,
+                "insufficient_scope",
+                "this envelope's actor has no wiki identity on this board",
+            );
+        };
+        attribution
     };
     // The board's configured `--read-only` refuses every write route, as
     // `operator::admit` does for browser writes. Checked before the daemon

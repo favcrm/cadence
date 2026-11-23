@@ -1,9 +1,16 @@
 # `@cadence/app-kit`
 
-The app side of the Cadence screen bridge, implemented once. Transport and
-lifecycle only: boot, `init`, `ready`, the closed PUSH union,
-`call`/`slot`/`tool`, assets, bounded `state`, teardown. What a PUSH *means*
-stays in the app.
+The app side of the Cadence screen bridge, implemented once with zero runtime
+dependencies and zero domain-specific assumptions:
+
+1. **`createScreenBridge(options)`** — reactive `screen.v2` store (`subscribe` +
+   `getState`), closed `ScreenPush` validation, host drawer verb separation,
+   per-verb argument allowlists and byte caps, concurrency limits, reply size
+   and secret-key guards, write vs read retirement, route patching, and scoped
+   unsaved-edit leave state.
+2. **`createScreenReceiver(options)`** — low-level transport and lifecycle:
+   boot, `init`, `ready`, the closed PUSH union, `call`/`slot`/`tool`, assets,
+   drawer surfaces + context, `ownLeaveState`, bounded `state`, teardown.
 
 The wire protocol is owned by
 `ui/src/features/workspace-apps/screen/screenProtocol.ts`; this package
@@ -26,9 +33,116 @@ This package is the one piece those do not provide: a receiver an app screen
 runs in the browser. It ships inside the toolchain rather than as a parallel
 CLI.
 
-## Usage
+## Usage (`createScreenBridge`)
+
+```js
+import { createScreenBridge } from "@cadence/app-kit";
+
+export const CALL_FIELDS = {
+  "records.list": ["query", "limit", "cursor"],
+  "records.show": ["record_id"],
+  "records.create": ["record_id", "profile"],
+  "records.update": ["record_id", "expected_revision", "profile"],
+  "screen.route.patch": ["section", "view", "record_id", "replace"],
+};
+
+export const bridge = createScreenBridge({
+  tag: "notes",
+  appName: "notes",
+  records: true,
+  surfaces: true,
+  locale: true,
+  calls: CALL_FIELDS,
+  argBytes: { "records.create": 49152, "records.update": 49152 },
+  writeVerbs: ["records.create", "records.update"],
+  observations: ["records.list", "records.show"],
+  route: { sections: ["all", "open"], defaultSection: "all" },
+});
+```
+
+### Private apps and platform tools
+
+An authorized CLI or MCP caller can request a hosted private-app review using
+`private_app_review_request` with a public release ZIP URL and a request ID.
+The returned review URL opens Apps for a signed-in workspace owner. The owner
+reviews the package, requested access, source URL and ZIP fingerprint, then
+explicitly checks the acknowledgement and approves installation or rejects
+the request. Opening the link does not install anything. A closed, expired,
+missing or stale request cannot be approved; reopen the link to check its
+current status if a decision's outcome is uncertain. Callers can track the
+request with `private_app_review_status`. Approval does not grant platform
+tools; the separate owner grant described below is still required. Owners can
+also continue to upload a ZIP or choose a GitHub release in Apps directly.
+
+The hosted workspace can grant a private app a catalogue **read** or **draft**
+tool. Declare the slot in `app.md`:
+
+```yaml
+needs:
+  capabilities:
+    lookup: { schema: 1, capability: catalog.tool, version: 1, action: invoke, resource_kind: connection_account, effect: read }
+```
+
+In the app toolchain's `package.json`, add `catalog.call`, `catalog.status` and
+`catalog.confirm` to `cadence.screen.operations`, and both `records.call` and
+`records.slot` to `cadence.screen.may`; keep the screen's
+`host_contract: "screen-records.v1"` and `tools: {}`. Document which catalogue
+tool and, for a connected read, an eligible account under Apps → Manage →
+Platform tool. A grant never gives the app a provider credential or an
+unrestricted tool slug.
+
+```js
+const bridge = createScreenBridge({ tag: "main", records: true, catalog: true });
+
+async function search(scope, requestId, query) {
+  const receipt = await bridge.catalog(scope, "lookup", { body: { query } }, requestId);
+  return receipt.result;
+}
+```
+
+Use the current `bridge.getSnapshot().scope`. Give each logical action a unique
+`requestId` and retain it across retries and sign-ins for the same workspace
+member. The workspace checks the live session and grant each time; another
+member cannot read the original result. Free reads can run for members, while
+draft calls and paid confirmations require an owner. A free call can run
+directly; a paid call opens a host-owned confirmation showing the tool, input,
+account where applicable, and current price. If the price changes, the owner must
+review again. A lost or uncertain outcome is **not** retried automatically.
+Call `bridge.catalogStatus(scope, "lookup", input, requestId)` with the same
+input and request ID before starting a new action. It returns `uncertain` or
+`settled`. An absent or previously refused claim is still uncertain: an earlier
+request may be preparing and could yet run. Keep the same request ID for that
+logical action; do not use a new ID to retry an unresolved outcome. A settled
+outcome can have `result_available: false` when the platform recorded settlement
+but the original result was lost. An unrecorded platform lookup stays uncertain;
+it does not prove the provider did nothing. An app update or removal revokes its
+grants; status then refuses rather than exposing the prior app's result. Sends
+and publishing remain on their existing approval paths.
+
+Connected reads put the provider's reviewed arguments in `input.body`; the
+host supplies the bound `connection_id`. Do not put connection IDs, secrets,
+or charge ceilings in app input. Availability and compatible input schemas
+depend on the workspace's enabled catalogue. First-party text generation and
+audio transcription are not supported by this bridge; each needs a separate
+integration with its funded pricing and settlement path. This hosted contract
+also requires an updated host and app-inspection CLI. The native host refuses
+execution rather than pretending to run the tool.
 
 ## Presentation and the board-wide drawer
+
+### Transparent canvas (avoid page and tab-bar background colors)
+
+Keep the app screen's document (`html`, `body`), root page wrapper, and top tab
+bars transparent (`background: transparent`). The host board owns the page
+backdrop and `cadence-kit` sets `html, body { background: transparent; }`. Do
+not paint an opaque page background color (such as `--color-ink-950` or a
+hardcoded dark/light hex) or a solid-filled top tab bar strip — doing so
+creates a mismatched inset box whenever the host theme changes. Reserve surface
+background tokens (`--color-ink-850`, `--color-ink-875`, `--color-ink-800`) for
+discrete elevated components such as cards, tables, inputs, popovers, and
+drawers. Similarly, the host `.app-shell-outlet` owns the outer page padding
+(`1.25rem 2rem` on desktop, `1rem` below `1024px`), matching native board pages;
+keep the app root's own outer margin/padding at `0` to avoid double gutters.
 
 A screen opts into the host's `screen-presentation.v1` contract by naming it in
 `accepts` (with `screen.v2`). The host then tells the frame which surface it is
@@ -45,14 +159,115 @@ const receiver = createScreenReceiver({
 
 receiver.presentation();          // current surface, defaults to "outlet"
 await receiver.openDrawer("settings"); // host opens the board-wide drawer
+await receiver.openDrawer("draft", { size: "wide" }); // a wider panel
 await receiver.closeDrawer();          // host returns the frame to the outlet
 ```
+
+`openDrawer(surface, { size, context })` takes an optional `size` of `"narrow"`
+(the default panel) or `"wide"` (about 736px at desktop widths; the panel is the
+full viewport at the board's narrow breakpoint either way), plus an optional
+bounded plain-JSON `context` (`<= 1024` bytes) on `screen-surfaces.v1` read by
+the drawer child via `drawerContext()`. Any other size or invalid context
+rejects with a `TypeError` before it is sent, and a host refuses it in place.
 
 `openDrawer`/`closeDrawer` send the host UI verbs `screen.drawer.open` and
 `screen.drawer.close`. They are shell verbs, not app capabilities, so they are
 not required in the PUSH's `actions`. A host that never opts in — or opts in
 but never sends a presentation — leaves the app in its own drawer; the helpers
 reject with `ScreenClosedError`, which is the intended fallback.
+
+`screen-surfaces.v1` is the independent-overlay variant: the host names each
+mount's role (`"primary"` or `"drawer"`), and the optional `onSurface` callback
+receives `(role, surface, modal)`. `receiver.surfaceRole()` and
+`receiver.surface()` expose the same values after the host message. The drawer
+helpers work under either opt-in; a drawer mount never opens another drawer.
+
+### In the chat canvas
+
+An app can also be shown in the chat canvas. Add `screen-canvas.v1` to
+`accepts` (it needs `screen-surfaces.v1`, or `canvas: true` with `surfaces: true`
+on a bridge). The host then tells the frame `receiver.surfaceRole() ===
+"canvas"` and `receiver.readOnly() === true` (also the 4th `onSurface`
+argument and the bridge's `surface.readOnly`). A frame that did not opt in is
+told `primary` with `readOnly()` false, as before; the host narrows a canvas
+mount's operations either way.
+
+In the canvas an app should hide edit controls, drop member-only wording such
+as "Edits are disabled on this board", and use compact padding. The host shows
+"Open in <App> to edit" itself. `openDrawer` is unchanged: only a `drawer`
+mount refuses it.
+
+The host's header already shows the view's title (and the app's mark), so an app
+should also hide its own page title (the in-body heading such as "Customers")
+when `surfaceRole()` is `"canvas"`.
+
+### Declaring views
+
+An app that wants chat to open one of its places ("show me Q3's P&L") declares
+it as a view in `screens.json`, next to `navigation` (records contract only).
+A view names a navigation section, optionally a record, and the params it takes:
+
+```jsonc
+"views": [
+  { "id": "pnl", "label": { "en": "Profit and loss", "zh-TW": "損益表" },
+    "section": "reports", "record_id": "pnl",
+    "params": { "from": { "type": "date" }, "to": { "type": "date" } } },
+  { "id": "balance_sheet", "label": { "en": "Balance sheet" },
+    "section": "reports", "record_id": "balance_sheet",
+    "params": { "as_at": { "type": "date", "required": true } } }
+]
+```
+
+- `id` is `[a-z0-9_-]{1,32}` and unique; at most 20 views. `label` has 1 to 8
+  locales, each up to 60 characters. `section` must be a declared navigation
+  section; `record_id` is optional (`[a-z0-9_-]{1,64}`).
+- `params` holds at most 6 entries, named `[a-z_]{1,24}`. A param is `{ "type":
+  "date" }` (`YYYY-MM-DD`), `{ "type": "string" }` (plain text, up to 200
+  characters) or `{ "type": "enum", "values": [...] }` (up to 20 strings). Add
+  `"required": true` to refuse a call without it; every param is optional
+  otherwise.
+- An `enum` param may add `labels`, the words the canvas header and the view card
+  show for a value instead of the humanized id:
+  `"labels": { "prior_year": { "en": "vs prior year", "zh-TW": "對比去年" } }`.
+  Keys must be listed `values`; each value takes 1 to 8 locales, each up to 40
+  characters with no control characters; `labels` on a non-enum param is refused.
+  The board picks its own locale, then its language (`zh` for `zh-TW`), then `en`,
+  and a value without a usable label keeps the humanized id. Values are never
+  renamed, so routes and chat cards are unchanged. A daemon older than the one
+  that adds `labels` refuses a manifest that carries it: ship it only after
+  the daemon and the packager's `CADENCE_TARGET_VERSION` include it.
+- Unknown keys, an undeclared section, a repeated id or param, or a value over
+  a limit refuse the whole declaration at install.
+
+Declaring a view grants nothing. The host that opens one checks the params
+against it before it writes the chat card.
+
+### Route params (`screen-route-params.v1`)
+
+A view's params reach the app on the route. Add `screen-route-params.v1` to
+`accepts` (it needs `screen-records.v1`), or `routeParams: true` on a bridge
+that also has `records: true` and a `route`. Then:
+
+- the route the host pushes carries `params` (a frozen name-to-string object,
+  `{}` when none): `bridge.getSnapshot().route.params`;
+- `patchRoute({ params })` may send params. A patch with `params` replaces the
+  whole set (`{ params: {} }` clears it); a patch without it leaves them as
+  they were, so send `params` on every patch that should change them. Add
+  nothing to `calls`: `params` is allowed for `screen.route.patch` by the opt-in;
+- the full-page board URL carries them as `p.<name>=<value>` (for example
+  `?crm=reports&p.from=2026-07-01&p.to=2026-09-30`), so a reload or a shared
+  link opens the same place; the canvas tab keeps them in its own route. The host
+  drops `p.*` when the section changes through the app's own navigation.
+
+A frame that did not opt in is pushed the route exactly as before, and a
+`screen.route.patch` with `params` from it closes the mount. Values are plain
+text (1 to 200 characters, no control characters); the app validates dates and
+enums itself, as the host only keeps the set bounded.
+
+To adopt: bump `@cadence/app-kit` to 0.8.0, declare the views, pass
+`routeParams: true` (or add the capability to `accepts`), read
+`route.params` where the app reads `route.section`, and write `params` in the
+patches that follow a filter change. An app that does none of this is unchanged.
 
 ```js
 import { createScreenReceiver } from "@cadence/app-kit";
@@ -72,12 +287,61 @@ const asset = await receiver.asset("draft-image:d1:0");
 receiver.state(JSON.stringify(localDraft)); // ≤ 32 KiB
 ```
 
+### Generic locale, audio capture, leave guard, and records screens
+
+Any `screen.v2` screen may opt into `screen-locale.v1` to receive the
+host-selected UI locale (`push.presentation_locale`: `"en" | "zh-TW"`), and may
+call `ownLeaveState()` after an accepted `screen.v2` PUSH to publish
+`{ v: 2, op: "leave", unsaved }` with symbol-fenced handle ownership.
+
+Any `screen.v2` screen may opt into `screen-audio.v1` (`audio: true` on
+`createScreenBridge`, or `accepts: ["screen.v2", "screen-audio.v1"]` on
+`createScreenReceiver`) for host-modal audio capture (`bridge.audioCapture`), or
+into `screen-audio.v2` (`audio: "v2"` on `createScreenBridge`, or
+`accepts: ["screen.v2", "screen-audio.v2"]` on `createScreenReceiver`) for
+headless inline audio sessions (`bridge.audioSession` + `bridge.onAudioSession`).
+When the host projects `audio_capture: 1` for the live mount
+(`bridge.canAudioCapture()`), `screen-audio.v1` opens the host modal and resolves
+`{ transcript, duration_seconds, held_at, source }`, while `screen-audio.v2`
+keeps the UI inside the app's own screen and streams bounded
+`ScreenAudioSessionSnapshot` events (`phase`, `elapsed_seconds`, `level` 0..100,
+`peak` 0..100, segment counts, `transcript`, `error`) for `start`, `pause`,
+`resume`, `stop`, `upload` (bounded `ArrayBuffer` <= 50 MiB), `retry`, and
+`cancel` without opening any host modal. Interactive audio commands wait without
+a wall-clock RPC timeout unless `timeoutMs` is passed explicitly, and refusals
+(`cancelled`, `owner_required`, `conflict`, `unavailable`, `mic_unavailable`)
+leave the open screen bridge intact.
+
+A records screen names `screen-records.v1` (with `screen.v2`) in `accepts`; the
+host then sends the records projection, which the app validates in `onPush` (or
+delegates to `createScreenBridge`). Records CSV calls are larger than the
+default action budget, so the receiver takes a `maxArgsBytes` limit (the host
+allows 320 KiB for `records.csv.*`; keep the app's own per-verb bounds too).
+
+```js
+const receiver = createScreenReceiver({
+  accepts: ["screen.v2", "screen-records.v1", "screen-locale.v1"],
+  maxArgsBytes: 327680,
+  onPush(push) { validateAndRender(push); },
+});
+await receiver.call("records.csv.preview", { csv_text });
+```
+
 Wire guarantees the receiver enforces (mirroring the Social Content
 reference receiver and `screenProtocol.ts`):
 
 - `call`/`slot`/`tool` and `asset` open only after a `screen.v2` PUSH; before
   that, and on a v1-only mount, they reject with `ScreenClosedError`
   (`code: "gone"`) instead of posting a request the host cannot answer.
+- A host that cannot serve an asset ref sends nothing. `asset(ref, { timeoutMs })`
+  rejects with `ScreenTimeoutError` when the host has not answered in time and
+  frees the ref for a re-request; the host's one late answer is dropped, not a
+  teardown. Without `timeoutMs` the request waits as before.
+- A call reply may name the asset refs it made servable (`asset_refs`, a host
+  field older hosts never send); `assetAdmitted(ref)` is then true, so an app
+  can request a just-returned draft image at once instead of waiting for the
+  next PUSH. Without it, keep waiting for the PUSH. It stays true once set, so
+  still check the latest reply's data (a draft whose image was removed).
 - `tool` additionally requires `accepts` to include `screen-actions.v1`; the
   host closes a port that sends a tool call without the negotiation. One tool
   call is outstanding at a time — a second is refused locally with
@@ -94,9 +358,10 @@ reference receiver and `screenProtocol.ts`):
   `slot`→`slot-state`, `tool`→`tool-reply`); anything else tears the port down.
 - Asset replies carry `data:image/(jpeg|png|webp);base64,…` within the 96 KiB
   image's encoded allowance (`MAX_ASSET_BYTES`).
-- `args`/`input` are plain objects within 16 KiB; `anchor` is exactly
-  `{x,y,w,h}` in frame coordinates (or `"footer"`); ids follow
-  `ACTION_ID`, tool aliases `TOOL_ALIAS`, `request_id` `TOOL_REQUEST_ID`.
+- `args`/`input` are plain objects within 16 KiB by default; `maxArgsBytes`
+  raises that for a host verb with a larger allowance (records CSV is 320 KiB).
+  `anchor` is exactly `{x,y,w,h}` in frame coordinates (or `"footer"`); ids
+  follow `ACTION_ID`, tool aliases `TOOL_ALIAS`, `request_id` `TOOL_REQUEST_ID`.
 - `tool` takes an optional fourth argument, `generation_scope`
   (`{draft_id, operation: "caption"|"image", revision}`), carried on the wire
   so the host binds the generation to that draft revision.
@@ -111,10 +376,6 @@ reference receiver and `screenProtocol.ts`):
   the promise stays open until `done`/`refused` (which resolve the host's
   event, receipt included). The optional anchor defaults to `"footer"`.
 
-What stays app-owned: the closed verb set and per-verb arg shapes (the PUSH
-`actions` advertisement), payload validation in `onPush`, and which asset refs
-are legitimate.
-
 Defaults: `accepts: ["screen.v2"]`, `timeoutMs: 15000`, boot read from
 `#cadence-screen-boot`. A reply that is neither `ok` nor a well-formed
 `{code, text}` refusal rejects with `ScreenRefusalError` (status from
@@ -123,13 +384,40 @@ protocol violation calls `onError` and closes the port.
 
 ## Migrating a repo
 
-1. Replace the hand-written receiver/bridge with `createScreenReceiver`; keep
-   the app's projection and payload validation in `onPush`.
+1. Replace the hand-written receiver/bridge with `createScreenBridge` (or
+   `createScreenReceiver` for custom projections).
 2. Keep `cadence app check` (not a local copy) in CI.
 3. Keep the app's build and bundler: this package does not build screens.
+
+## Forms in Sandboxed Screens
+
+`installSandboxFormActions(doc)` is idempotent per `Document` (reference-counted across installers) and handles actionless `<form>` submissions inside `<iframe sandbox="allow-scripts">` (where `allow-forms` is omitted and Chromium otherwise aborts `<button type="submit">` / `Enter` submissions before firing `"submit"`). It intercepts actionless submit-button clicks and single-line `<input>` `Enter` keydowns (respecting `disabled`, `<fieldset disabled>`, `form="..."`, `action`, `formaction`, and constraint validation), calls `preventDefault()`, and dispatches a cancelable `"submit"` event so React `onSubmit` handlers run normally, while also calling `preventDefault()` during capture-phase `"submit"` to block accidental iframe navigation in permissive hosts. Passing `sandboxForms: true` to `createScreenBridge(...)` installs it automatically and cleans it up on `retire()` or `reset()`.
+
+## React 19 Bindings (`@cadence/app-kit/react`)
+
+- `useScreenBridge(bridge)` subscribes with `useSyncExternalStore` and returns
+  the current `ScreenBridgeState`.
+- `useScreenSelector(bridge, selector, isEqual?)` memoizes selected slices per
+  `(state, selector)` and preserves reference identity when `isEqual` holds.
+- `useScreenStatus(bridge)` returns `{ status, error, ready, isLoading, isError }`
+  with shallow equality stability.
+- `createFrameNavigationAdapter(bridge, options?)` adapts `NavigationProvider`
+  link activations into `bridge.patchRoute(...)` calls.
+
+## Non-Fatal Host 403 Refusals
+
+Only mount revocation refusals (`"This app's access is no longer available."`
+or post-mount `403` refusals that are not a `slot` call, declared `writeVerbs`
+operation, `code === "owner_required"`, or opted-in `keepAliveOnForbidden`)
+transition the bridge to `"error"`. Host `403` refusals for declared
+`writeVerbs`, confirmation `slot` actions, `owner_required` gates, or
+`keepAliveOnForbidden` calls reject the returned promise (`ScreenRefusalError`
+with `.status === 403`) while keeping the bridge mounted and interactive.
 
 ## Tests
 
 ```sh
-pnpm test:app-kit
+bun run test:app-kit
 ```
+
+Run it from `ui/`, where the `test:app-kit` script lives.

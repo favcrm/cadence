@@ -5,10 +5,11 @@ import { wiki } from "./api";
 import { filterHits, groupHits, snippetParts, TYPE_FILTERS, type SearchHit, type TypeFilter } from "./search";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { EmptyCard, Failure, Loading, useWikiScope, WikiToolbar } from "./shared";
+import { EmptyCard, Failure, Loading, Note, useWikiScope, WikiToolbar } from "./shared";
 import type { WikiRoute } from "./Wiki";
 import { withinScope } from "./scope";
 import { useTranslate } from "../../lib/locale";
+import { ManagedFileResults, useManagedFiles } from "./ManagedFileViews";
 
 const FILTER_LABELS: Record<TypeFilter, string> = { all: "All", pages: "Pages", images: "Images", video: "Video", pdf: "PDF" };
 
@@ -21,33 +22,45 @@ const FILTER_LABELS: Record<TypeFilter, string> = { all: "All", pages: "Pages", 
 export default function SearchPane({
   route,
   navHref,
+  managedFiles,
 }: {
   route: WikiRoute;
   navHref: (route: Route) => string;
+  managedFiles?: boolean;
 }) {
   const t = useTranslate();
   const scope = useWikiScope();
   const query = route.query ?? "";
   const [value, setValue] = useState(query);
   const [hits, setHits] = useState<SearchHit[] | null>(null);
+  const [partial, setPartial] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<TypeFilter>("all");
+  const includeFiles = !!managedFiles && !!query && filter !== "pages" && filter !== "video";
+  const files = useManagedFiles({ path: scope?.root ?? "", query }, !!managedFiles && !!query);
+  const shownFiles = !includeFiles ? [] : files.rows?.filter(({ file }) =>
+    filter === "all" || (filter === "images" && file.kind === "image") || (filter === "pdf" && file.kind === "pdf"),
+  );
 
   useEffect(() => setValue(query), [query]);
 
   useEffect(() => {
     if (!query) {
       setHits(null);
+      setPartial(false);
       setError(null);
       return;
     }
     let cancelled = false;
     setHits(null);
+    setPartial(false);
     setError(null);
     wiki
       .search(query, undefined, scope?.root)
       .then((resp) => {
-        if (!cancelled) setHits((resp.hits ?? resp.results ?? []).filter((hit) => !scope || withinScope(hit.path, scope.root)));
+        if (cancelled) return;
+        setHits((resp.hits ?? resp.results ?? []).filter((hit) => !scope || withinScope(hit.path, scope.root)));
+        setPartial(resp.partial === true);
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -94,6 +107,8 @@ export default function SearchPane({
           <Button type="submit">{t("Search")}</Button>
         </form>
       </WikiToolbar>
+      {files.error !== null && includeFiles && <Failure what="file search failed" error={files.error} />}
+      {!!shownFiles?.length && <ManagedFileResults rows={shownFiles} navHref={navHref} />}
 
       {error !== null ? (
         <Failure what="search failed" error={error} />
@@ -103,39 +118,50 @@ export default function SearchPane({
         </EmptyCard>
       ) : shown === null ? (
         <Loading what={`searching for “${query}”…`} />
+      ) : includeFiles && !shownFiles && files.error === null && shown.length === 0 ? (
+        <Loading what={`searching files for “${query}”…`} />
       ) : shown.length === 0 ? (
-        <EmptyCard title={t("No matches")}>
-          {t("No page matches")} <span className="num">{query}</span>
-          {filter !== "all" ? ` ${t("among")} ${filter}` : ""}.
-        </EmptyCard>
+        !shownFiles?.length && (!includeFiles || files.error === null) && (
+          <EmptyCard title={t("No matches")}>
+            {t("No matches for")} <span className="num">{query}</span>
+            {filter !== "all" ? ` ${t("among")} ${filter}` : ""}.
+          </EmptyCard>
+        )
       ) : (
-        <div className="wk-sres">
-          {shown.map((file) => (
-            <div key={file.path} className="card wk-srow">
-              <div className="wk-spath num">{scope ? file.path.slice(scope.root.length + 1) : file.path}</div>
-              <div className="wk-sheading">
-                <Link
-                  className="wk-sname lnk"
-                  href={navHref({ screen: "wiki", mode: "browse", path: file.path, query: null })}
-                >
-                  {file.name}
-                </Link>
-                <span className="wk-smatches">{file.matches.length} {file.matches.length === 1 ? "match" : "matches"}</span>
+        <>
+          {partial && (
+            <Note>
+              {t("No page matched every word — these results match some of them.")}
+            </Note>
+          )}
+          <div className="wk-sres">
+            {shown.map((file) => (
+              <div key={file.path} className="card wk-srow">
+                <div className="wk-spath num">{scope ? file.path.slice(scope.root.length + 1) : file.path}</div>
+                <div className="wk-sheading">
+                  <Link
+                    className="wk-sname lnk"
+                    href={navHref({ screen: "wiki", mode: "browse", path: file.path, query: null })}
+                  >
+                    {file.name}
+                  </Link>
+                  <span className="wk-smatches">{file.matches.length} {file.matches.length === 1 ? "match" : "matches"}</span>
+                </div>
+                <div className="wk-sexcerpts">
+                  {file.matches.slice(0, 3).map((hit, index) => (
+                    <div key={index} className="wk-snip">
+                      {hit.line != null && <span className="wk-sline num">{t("Line")} {hit.line}</span>}
+                      <span>{snippetParts(hit.snippet, query).map((part, i) =>
+                        part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,
+                      )}</span>
+                    </div>
+                  ))}
+                </div>
+                {file.matches.length > 3 && <div className="wk-smatches wk-smore">{file.matches.length - 3} {file.matches.length === 4 ? t("more match") : t("more matches")} {t("in this file")}</div>}
               </div>
-              <div className="wk-sexcerpts">
-                {file.matches.slice(0, 3).map((hit, index) => (
-                  <div key={index} className="wk-snip">
-                    {hit.line != null && <span className="wk-sline num">{t("Line")} {hit.line}</span>}
-                    <span>{snippetParts(hit.snippet, query).map((part, i) =>
-                      part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,
-                    )}</span>
-                  </div>
-                ))}
-              </div>
-              {file.matches.length > 3 && <div className="wk-smatches wk-smore">{file.matches.length - 3} {file.matches.length === 4 ? t("more match") : t("more matches")} {t("in this file")}</div>}
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        </>
       )}
     </>
   );

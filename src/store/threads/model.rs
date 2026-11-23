@@ -22,12 +22,17 @@ pub const KIND_ARTIFACT: &str = "artifact";
 /// CAD-1752: the master's inert proposal to hire a catalogue role - the
 /// card the operator reviews. It registers nothing.
 pub const KIND_HIRE_PROPOSAL: &str = "hire_proposal";
+/// CAD-2285: the master's A2UI form for the operator - one validated
+/// `createSurface` envelope. Inert: an answer is an ordinary operator
+/// message. Its `text` is the daemon-written fallback.
+pub const KIND_SURFACE: &str = "surface";
 
-/// CAD-1767: thread entry kinds only the operator reads - artifact cards
-/// and hire proposals. The one list every member-facing thread path
-/// (`member_assist_history`, the board's member thread reads) filters by.
+/// CAD-1767: thread entry kinds only the operator reads - artifact cards,
+/// hire proposals and (CAD-2285) forms. The one list every member-facing
+/// thread path (`member_assist_history`, the board's member thread reads)
+/// filters by.
 pub fn operator_only_kind(kind: &str) -> bool {
-    matches!(kind, KIND_ARTIFACT | KIND_HIRE_PROPOSAL)
+    matches!(kind, KIND_ARTIFACT | KIND_HIRE_PROPOSAL | KIND_SURFACE)
 }
 
 pub(super) const ROLES: &[&str] = &[ROLE_OPERATOR, ROLE_AGENT, ROLE_SYSTEM, ROLE_MEMBER];
@@ -39,11 +44,12 @@ pub(super) const KINDS: &[&str] = &[
     KIND_TURN_RESULT,
     KIND_ARTIFACT,
     KIND_HIRE_PROPOSAL,
+    KIND_SURFACE,
 ];
 
 // ECMAScript String.trim whitespace: the Home notifier applies that same
 // visible-text rule. SQLite's default trim removes only ordinary spaces.
-pub(super) const REPLY_WHITESPACE: &str = concat!(
+pub(in crate::store) const REPLY_WHITESPACE: &str = concat!(
     "\t\n\u{b}\u{c}\r \u{a0}\u{1680}",
     "\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}",
     "\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}"

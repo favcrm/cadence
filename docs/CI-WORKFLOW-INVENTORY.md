@@ -1,15 +1,19 @@
 # Workflow inventory after #738 (CAD-1088)
 
 This inventory was taken during the reduced-gate window; CAD-1102 ended that
-window and made the current gate permanent. Required branch checks observed at the start of CAD-1088 are **fmt,
-clippy, test, build, ui**; neither `test-shard` nor `test-once` is required.
+window and made the current gate permanent. Required branch checks observed at the start of CAD-1088 were **fmt,
+clippy, test, build, ui**; neither `test-shard` nor `test-once` was required.
+Since CAD-1970 `ci.yml` has no `test` job: live branch protection requires
+**fmt, clippy, build, ui and delivery-gate** (`enqueue-reviewed` reads the live
+set), `cross-build (required)` always runs but is not yet a required context
+(operator step), and the suite runs in `tests.yml` on a schedule and on demand.
 No branch/ruleset settings are changed by this cleanup. The last three rows
 were added when those workflows landed (CAD-1455, CAD-1506, CAD-1475); the
 rest of the table records the CAD-1088 snapshot.
 
 | Workflow | Triggers | Current role |
 | --- | --- | --- |
-| `ci.yml` | PR, merge group, main push, v tags, dispatch | Five required gates; exact-SHA queue reuse; isolated cache writer; guarded release chain |
+| `ci.yml` | PR, merge group, main push, v tags, dispatch (`native_fixture`) | Gates fmt, clippy, build, ui and `cross-build (required)` (live protection requires the first four plus `delivery-gate`); exact-SHA queue reuse; isolated cache writer; guarded release chain; the C1 proof is opt-in per dispatch (CAD-1970) |
 | `staging.yml` | Filtered PR, dispatch, 15-minute schedule, main CI completion | PR migration rehearsal active; select/stage/promote refuse reduced source trees |
 | `e2e.yml` | Nightly, v tags, dispatch | MVP journey retired; cargo-only seam-exclusion probe, not E2E coverage |
 | `clean-install.yml` | Filtered PR, dispatch | Installer fixtures retired; native installation dispatch scaffolding remains |
@@ -19,6 +23,7 @@ rest of the table records the CAD-1088 snapshot.
 | `mutation.yml` | Dispatch | Manual guard-removal proof; takes a live cargo test target and test name |
 | `ci-selection-benchmark.yml` | Dispatch | Manual full-versus-selected integration benchmark |
 | `nextest-shard-benchmark.yml` | Dispatch | Manual shard/inventory benchmark |
+| `instabox-measure.yml` | Dispatch, filtered PR | Manual compile-time benchmark; since CAD-1970 also times one full unpartitioned suite on `instabox-large` |
 | `promotion-completion.yml` | `staging` run completion on main | Binds a promoted candidate's signed receipt to the finished upstream run and attests a small completion receipt; it never approves, rebuilds or deploys (CAD-1455) |
 | `release-mirror.yml` | Dispatch | Manual retry that copies an already published release into the owned release store; no build, retag or byte replacement (CAD-1506) |
 | `release-visibility.yml` | Dispatch on main | Operator-owned private→public flip of one published catalogue record after the `production` environment approval; never writes artifacts, deletes or withdraws (CAD-1475) |
@@ -51,7 +56,7 @@ manifests as retired rather than deleted.
   not applicable. Edits confined to pre-existing independent top-level
   `tests/<name>.rs` targets narrow the `test-shards` matrix's integration
   selection only (lib/bins suites and every zero-target guard unchanged).
-  The required `test` check is the aggregate: it merges every shard's
+  Historical (CAD-1970 removed the `test` job): the `test` check was the aggregate: it merges every shard's
   junit and re-runs the coverage guard (CAD-1480). All
   shared/config/workflow/script/mixed/unknown changes: full validation.
   Classifier missing or failing: full validation. Required contexts remain
@@ -73,6 +78,70 @@ manifests as retired rather than deleted.
   Preserve every release guard and its ordering. Stage frontend setup remains
   as restoration scaffolding in this increment; it was behind the freeze, which CAD-1102 lifted.
 - Align local/documented commands with the reduced-window state.
+
+## CAD-1970: the coverage contract, and what is deliberately not asserted
+
+The shard matrix is unchanged. What changed is what a green shard *means*.
+
+- **Coverage is judged against the binaries, not against the reports.** Each
+  shard writes `target/nextest/cadence/inventory.json` — its own nextest
+  `list --message-format json` for the same selection and features — and
+  `scripts/check-test-junit.py --inventory` requires every selected
+  `(binary id, test name)` to appear exactly once, green and unskipped. The
+  `test` aggregate (removed from `ci.yml` by CAD-1970; this records the contract it enforced) passes `--complete-partition` over all six
+  inventories and refuses a test no shard owns (a partition gap) or one two
+  shards own (an overlap). A case dropped from all six reports therefore
+  fails; before CAD-1970 it passed, because the guard only asked whether each
+  target still had one runnable case. Agreement among shards was never
+  coverage.
+- **An `#[ignore]` is a reviewed line, not a silent exclusion.**
+  `.config/nextest-ignored.txt` declares the fourteen ignored cases. The guard
+  refuses an ignored case that is not declared, and a declaration whose case
+  now runs. A binary absent from a narrowed selection does not make its lines
+  stale.
+- **`scripts/test_check_test_junit.py`** drives the real CLI over synthetic
+  report/inventory sets for each refusal above; it runs from `fmt` like the
+  other gate contracts. That is the author's change detection, not the
+  independent negative acceptance the ticket requires, which still has to
+  come from a reviewer.
+- **The C1 native-fixture proof is a dispatch input.** `native-fixture-release-exclusion`
+  now runs only with `workflow_dispatch` + `native_fixture=true`. Its script,
+  its isolated runner and its assertions are untouched; what changed is that a
+  plain manual dispatch on main no longer fails on an artifact from another
+  lane.
+- **`ci-selection-benchmark.yml` lost a step that could not run.** It invoked
+  `--test test_seam`, a target CAD-1727 removed with `autotests = false`. The
+  seam guard is `scripts/check-release-test-seam` in `build`; the benchmark was
+  not that guard.
+- **`instabox-measure.yml` gained a `full-suite` leg** that times one
+  unpartitioned `scripts/run-result-tests` on `instabox-large`. It is
+  measurement, not policy: it changes no required check and no runner label.
+
+Deliberately not asserted: that one runner is faster. The six shards exist
+because CAD-1480 measured the suite past a single runner's wall-time budget on
+the runner available then. The first same-content comparison is now in:
+
+| `f7915b475` (PR #1469), both cold | six shards | one `instabox-large` |
+| --- | --- | --- |
+| workers | 6 × `--jobs 4` | 1 × `--jobs 8` (8 vCPU, 16 GB) |
+| summed runner-seconds | 2696 | 568 |
+| created → last shard | 717 s | — |
+| created → required `test` green | ≈735 s | 568 s |
+| summed queue delay | 843 s | ≈7 s |
+
+One run each, so no distribution. The single runner was 149 s faster on the
+critical path and 4.75× cheaper in runner-seconds, and the shards spent 843 s
+queued. That is still not the whole decision: both legs were cold, and the
+unmeasured dimension is **throughput**, not latency — six shard jobs let six
+runs share a pool, one large job per run shares a pool observed at ≥2
+concurrent slots. Changing the matrix is its own PR with a warm-cache run and
+a two-PR overlap measurement. Until then the matrix stays as it is.
+
+Also deliberately unchanged: `test-shards` still compiles the workspace once
+per shard. Reusing one archive across shards was measured only as cold
+compilation (`instabox-measure` on `a9951a20`), which is not the end-to-end
+question, and a `--archive-file` consumer needs the same absolute
+workspace/target layout the producer used. That is a separate measured change.
 
 ## Deliberately not changed
 

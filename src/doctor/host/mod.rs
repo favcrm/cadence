@@ -693,8 +693,8 @@ pub(crate) use util::WalScan;
 pub(crate) use util::SECRET_PREFIXES;
 #[allow(unused_imports)]
 use util::{
-    census_of, comm_family, dir_size_limited, file_locked, file_size, group_line, kill_lines,
-    kill_remedy, pid_age_secs, proc_census, proc_stat, proc_uptime, read_u64_file,
+    census_of, comm_family, dir_size_limited, file_locked, file_size, group_line, kill_line,
+    kill_lines, kill_remedy, pid_age_secs, proc_census, proc_stat, proc_uptime, read_u64_file,
     redact_argv_parts, repo_root, shell_quote, stale_worktrees, top_groups, GroupAgg, OldestProc,
     ProcStat, REDACTED,
 };

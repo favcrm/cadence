@@ -130,6 +130,9 @@ const SHA_TRAILER: &str = " Report when done: end your final answer with a one-l
 followed by a last line `SHA: <40-hex>` naming the commit you produced — the daemon reads \
 that line as the reported revision. Do not report a SHA you have not committed.";
 
+const REMOTE_TASK_GUIDANCE: &str = " Read required SOPs from the supplied brief or an \
+    authorized source you can open. Report a missing SOP before the step that needs it.";
+
 /// Cloud sessions cannot read the host spec path or run `cadence self`.
 /// The spec text is inlined and the `SHA:` trailer stays the report contract.
 /// The operator exit for a held Devin cloud turn. The held message
@@ -181,7 +184,7 @@ pub(super) fn cloud_kickoff_body(
         .unwrap_or_default();
     let head = format!(
         "Cadence task {} (job {}, revision {}). You are a cloud session and cannot \
-         read host paths or invoke the cadence CLI. For company questions, use wiki/guide \
+         read host paths or invoke the cadence CLI.{REMOTE_TASK_GUIDANCE} For company questions, use wiki/guide \
          access only if this session has it; otherwise report knowledge not consulted and \
          ask for authorized source material, inventing no policy. Spec text follows. ",
         task.id, job.id, revision
@@ -294,20 +297,17 @@ pub(super) fn kickoff_body(
         message_id,
         &assignee.provider,
         &assignee.endpoint_kind,
+        false,
     )
 }
-
-/// CAD-1373: one short discovery pointer shared by the full and compact
-/// job envelopes, so the compact form keeps it. It names the document's
-/// installed path and section — `cadence skill status` prints the path
-/// for the session's own `$HOME`, so the pointer needs no install.
-const KNOWLEDGE_POINTER: &str = " Company questions: read the \"Business knowledge\" section of \
-    $HOME/.agents/skills/cadence/SKILL.md.";
 
 /// The `job dispatch` kickoff for an assignee on `provider`/
 /// `endpoint_kind`. Public so `cadence dispatch --job` can build the
 /// same text before `issue start` and refuse a list that will not fit
 /// (CAD-160) instead of leaving a worktree and job behind.
+/// When `contract_in_context` is true, the complete captured spec and
+/// acceptance are already mandatory context; the envelope keeps scope and the
+/// report obligation without copying those source bodies.
 pub fn job_kickoff(
     job: &Job,
     task: &Task,
@@ -315,8 +315,10 @@ pub fn job_kickoff(
     message_id: &str,
     provider: &str,
     endpoint_kind: &str,
+    contract_in_context: bool,
 ) -> Result<String> {
-    if cloud_session(provider, endpoint_kind) {
+    let cloud = cloud_session(provider, endpoint_kind);
+    if !contract_in_context && cloud {
         let ceiling = if provider == "sandbox" && endpoint_kind == "sandbox" {
             crate::adapter::sandbox::SANDBOX_SPEC_BYTES
         } else {
@@ -348,11 +350,14 @@ pub fn job_kickoff(
             scope += " Do the work inside that worktree (cd there first).";
         }
     }
-    let acceptance = task
-        .acceptance
-        .as_deref()
-        .map(|a| format!(" Acceptance: {}.", clean(a)))
-        .unwrap_or_default();
+    let acceptance = if contract_in_context {
+        String::new()
+    } else {
+        task.acceptance
+            .as_deref()
+            .map(|a| format!(" Acceptance: {}.", clean(a)))
+            .unwrap_or_default()
+    };
     let issue = job
         .issue_id
         .as_deref()
@@ -382,13 +387,20 @@ pub fn job_kickoff(
              HEAD)\"` — `cadence self` shows the turn_id."
         )
     };
-    let head = format!(
-        "Cadence task {} (job {}, revision {}): implement per spec at {}.",
-        task.id,
-        job.id,
-        revision,
-        clean(spec)
-    );
+    let head = if contract_in_context {
+        format!(
+            "Cadence task {} (job {}, revision {}): implement the complete task contract supplied in context.",
+            task.id, job.id, revision
+        )
+    } else {
+        format!(
+            "Cadence task {} (job {}, revision {}): implement per spec at {}.",
+            task.id,
+            job.id,
+            revision,
+            clean(spec)
+        )
+    };
     // Explicit envelopes end with the per-message correlation: the
     // screen probe slices the body's tail, and without it every
     // kickoff shares the same boilerplate ending. Managed envelopes
@@ -402,7 +414,11 @@ pub fn job_kickoff(
     // in both envelopes, so the managed full form still ends on the
     // reminder, the managed compact form on the report contract, and
     // the explicit form on the correlation tail.
-    let discovery = KNOWLEDGE_POINTER;
+    let discovery = if cloud {
+        REMOTE_TASK_GUIDANCE
+    } else {
+        crate::briefing::TASK_GUIDANCE
+    };
     let full = format!(
         "{head}{scope}{acceptance}{discovery}{issue}{report} Do not report a SHA you have not \
          committed.{correlation}"
@@ -491,6 +507,7 @@ mod cad1373_kickoff_pointer_tests {
             "m1",
             "sandbox",
             "sandbox",
+            false,
         )
         .unwrap();
         assert!(body.contains("Do the sandbox task."), "{body}");
@@ -514,6 +531,11 @@ mod cad1373_kickoff_pointer_tests {
             "{body}"
         );
         assert!(body.contains("report knowledge not consulted"), "{body}");
+        assert!(
+            body.contains("Report a missing SOP before the step"),
+            "{body}"
+        );
+        assert!(!body.contains(".agents/skills"), "{body}");
         assert!(body.contains(" Acceptance: the task is done."), "{body}");
         assert!(body.contains("`SHA: <40-hex>`"), "{body}");
     }

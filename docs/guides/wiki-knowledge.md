@@ -45,6 +45,48 @@ contradictions and open questions. Periodically check broken source links,
 orphan pages, and claims whose source has changed. Do not automatically turn
 an uploaded document into accepted operational guidance.
 
+### Board navigation and recovery
+
+The Wiki root lists the fixed namespaces; it is not itself a place to create
+pages. Open a writable folder such as `global/`, a project folder, or your
+personal folder. Native boards identify that folder by handle; hosted boards
+use the verified member subject. A read-only message on one folder does not
+mean every folder is read-only.
+
+On a Wiki-managed hosted board, Wiki browse and filename search also show
+durable workspace files that the viewer may read. A linked Evidence item
+opens the recorded version, not the latest version. **Restricted files** at
+the Wiki root lists private files only for people who can already read them,
+with its own search and Archived filter. Shared folders and search do not
+include those files. Personal review reminders live in **Home → To do**, not
+in Wiki.
+
+An empty project Context offers to create its wiki folder. Search filters use
+the available file type, and a hosted result that matched only some search
+terms says so. Hosted attachment filenames remain searchable even when their
+text cannot be extracted. An upload's extraction status is a receipt, not a
+live progress feed; an unconfirmed result does not establish that extraction
+has finished. Hosted history identifies your edits as yours and uses a neutral
+contributor label for other, unresolved subjects.
+
+Removing an item returns its exact `.trash/...` landing. An operator can open
+Trash in the board, inspect the recorded entries, and restore to the original
+path or another available destination. Trash is not visible to members or
+agents. The browser does not guess a restore source when a native landing's
+original path cannot be proved from its tracker history; it reports when its
+bounded history search stops before finding proof. Keep the original receipt:
+an operator can restore that exact source with
+`cadence wiki mv <landing> <destination>` after the server's safety checks.
+Older servers may not support the trash browser.
+
+Hosted restores with more than 200 distinct stored attachments are refused
+until an enforceable storage-custody policy exists. Smaller hosted restores
+check that the referenced objects exist immediately before the move; an
+independent, privileged deletion after that check can still race the restore.
+The check is not a backup or proof of a tenant bucket lock. An older revision
+whose original text was not retained cannot be reconstructed from its history
+entry.
+
 ## Upload and update
 
 The board Wiki Upload pane sends a complete destination path for every file.
@@ -52,6 +94,9 @@ Markdown and TXT uploads create or update a text page. Other uploads use the
 blob store; PDF text extraction runs after the blob commits and the response
 includes an `extraction` status. The board warns when a PDF was saved but its
 text could not be indexed.
+
+On hosted boards, editable Markdown and TXT uploads are limited to 256 KiB;
+larger text uploads are refused before storage rather than becoming attachments.
 
 An operator can use the CLI:
 
@@ -130,16 +175,64 @@ the same transfer operations (`begin`, `chunk`, `apply`, `finish`, `status`,
 empty files are kept. `.md`, `.markdown`, and `.txt` are text pages; other
 regular files are attachments.
 
+A hosted workspace board serves these transfer operations since its 2026-11-12
+release (AOS-566). On a hosted board:
+
+- Every operation is two requests (authorize, then call), and the whole command
+  has one deadline, `--wake-timeout` (120 seconds by default). Each file costs
+  at least two operations, so a copy of more than a few dozen files can run out
+  of time: pass a longer `--wake-timeout`, or let it stop and continue the same
+  job with `--resume <job>`. A resume checks every entry again, so a very large
+  copy is better split into several smaller ones.
+- The board sets its own size limits for `wiki cp`, which are lower than this
+  client's. A file over the limit refuses the whole copy before anything is
+  staged; send a large binary file on its own with `wiki upload`.
+- A refusal names the board's code and what to do, for example
+  `destination_changed` (copy again with `--update`) or `payload_too_large`.
+  An export reports a file the board refused in its JSON failure list (exit 1)
+  and stops there; the board's code is in that entry's text.
+- A board released before then answers `not_implemented` and copies nothing;
+  there, write each text page with `wiki put` and send each binary file with
+  `wiki upload`.
+
 The command hashes the source and refuses symlinks, special files, and
 internal paths before it mutates the wiki. It prints the job id and digest
 before entry writes. Repeat the same source and `--resume JOB_ID` after an
 interruption. Resume reuses the admitted manifest and its destination revisions;
-it does not read those revisions again. An empty directory is admitted with no
-entries, and finish creates that root. `--update` pins the destination's
-current revisions and replaces changed bytes. Without it, identical content
-can be skipped, but changed existing pages are create-only. A partial job
-exits nonzero and names the job id. `--wait-index` polls that job's own
-status until the index is covered, the job fails, or the command deadline
+it does not read those revisions again. The client chooses the job id before
+`begin`; if its response is lost or unusable, the error names that same id.
+Inspect or resume that job rather than starting a fresh copy blindly.
+An empty directory is admitted with no entries, and finish creates that root.
+`--update` pins the destination's current revisions and replaces changed
+bytes. Without it, identical content can be skipped, but changed existing
+pages are create-only. A partial job exits nonzero and names the job id.
+When a chunk, apply or finish stops partway, the exit code says what is known
+about that one request. Entries applied earlier in the same job stay applied
+in every case.
+
+- **3** — a hosted board refused the request with one of its own transfer
+  codes, and the error keeps that code. That request changed nothing. Follow
+  the message: resume with `--resume <job>`, or copy again without `--resume`
+  when the job is gone.
+- **75** — the command deadline passed before the request was sent, or the
+  board's gateway answered that the board was still waking and did not forward
+  it. That request changed nothing. Run the same copy again with
+  `--resume <job>`, with a larger `--wake-timeout` if the board was still
+  waking; a plain rerun starts a new job instead.
+- **1** — the outcome is not confirmed: a reply was lost, a local daemon refused
+  (its refusal can follow a publish), or the client cannot prove the request
+  was never sent. It may have landed. Run the same copy with `--resume <job>`
+  before repeating anything; the job shows what was recorded.
+
+A local source problem found while sending a chunk, such as a file that changed
+or shrank after the manifest was pinned or could not be read, exits 3: that run
+did not apply the file and did not finish the job; copy again without
+`--resume`. The same holds when the board's job holds more bytes for a file than
+its pinned size, which resuming cannot fix. A chunk answer the client cannot
+read exits 1.
+
+`--wait-index` polls that job's own status until the index is covered, the job
+fails, or the command deadline
 passes. It does not refresh the global index.
 
 Matching working-tree bytes alone are not proof of publication. If the desired
@@ -242,3 +335,19 @@ exploration. Its inferred edges should carry provenance and must not replace
 the canonical text or the direct source fetch. Reviewed project memory remains
 a separate, short lesson workflow: use `cadence memory propose`, independent
 reviews, and acceptance when a fact should be injected into future dispatches.
+
+Every native agent can look up and propose lessons during a task through one
+daemon call. A managed Codex agent uses the `memory_match` and
+`memory_propose` tools on its Cadence MCP server, because its command sandbox
+cannot reach the daemon socket. Claude, Pi and OMP agents use the CLI from
+their shell: `cadence memory match --turn`, and `cadence memory propose`
+without `--project`. Their briefing says when to run them: at the start of a
+task, when the scope changes, and before repeating an approach that already
+failed. A lookup repeats dispatch's lesson selection for the issue the agent's
+running turn is bound to, with the same 12-entry and 4 KiB caps. It can add the
+paths, components or tags the agent is now working on. The project, role and
+provider come from that turn and cannot be passed. A stale or withheld lesson
+comes back as its slug and reason only. Each lookup records a
+`lessons_supplied` event on the agent. That row is separate from the dispatch
+`context_supplied` row and does not affect context restore. A proposal with no
+project goes into the turn's project, through the same review as any other.

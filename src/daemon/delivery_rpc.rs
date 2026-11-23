@@ -23,17 +23,21 @@
 //! Every refusal happens before anything is written — the tracker, the
 //! record and the message queue alike.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::delivery_requirements_rpc::{self, RoutineReadiness};
+use super::identity::scope_allows_delivery;
 use super::{
     check_values, optional_str, optional_strs, request_actor, required_str, Shared,
     APPROVAL_RECORDED_VIA, DAEMON_ALIAS,
 };
-use crate::delivery::{self, Candidate, Observed, Record, State, TicketDone, VerdictRec};
+use crate::delivery::{
+    self, private, publication, Candidate, Observed, Record, State, TicketDone, VerdictRec,
+};
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report, Pm};
 use crate::master;
@@ -45,6 +49,14 @@ const REASON_MAX: usize = 2_000;
 
 fn now() -> i64 {
     crate::issue::time::now_epoch()
+}
+
+/// CAD-622: the verdict on one proposed PR/head — the refusal that keeps
+/// it out of the loop, or the tentative app evidence that the accepted
+/// head may commit. Nothing is written to the record for a refusal.
+enum PrAdmission {
+    Refused(String),
+    Admitted(Option<delivery::AppEvidence>),
 }
 
 fn apply_routine_ready_observation(
@@ -96,13 +108,6 @@ fn apply_routine_ready_observation(
     }
 }
 
-#[cfg(test)]
-#[path = "cad1298_observer_acceptance.rs"]
-mod observer_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-#[path = "cad1298_security_acceptance.rs"]
-mod security_acceptance;
-
 fn hash(text: &str) -> String {
     Sha256::digest(text.as_bytes())
         .iter()
@@ -118,15 +123,357 @@ fn not_in_loop(id: &str) -> Error {
     ))
 }
 
+/// CAD-2215: strict local payload for the private/legacy verbs. Only the
+/// documented fields are accepted; any other key — a public session, a
+/// relay envelope, an asserted actor or read-as identity — is refused so
+/// it cannot ride along with the local socket operator's authority.
+fn reject_delivery_fields(params: &Value, allowed: &[&str], verb: &str) -> Result<()> {
+    let Some(map) = params.as_object() else {
+        return Err(Error::rejected(format!(
+            "{verb}: payload must be an object"
+        )));
+    };
+    for key in map.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(Error::rejected(format!(
+                "{verb}: unknown field '{key}' is not accepted"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// CAD-2215: a done report is the worker's only if the record's exact
+/// native dispatch receipt completed with a stored result that names that
+/// same report and the same head. Alias, ticket and file time are never
+/// enough to establish provenance.
+fn report_follows_receipt(receipt: &store::Message, report_path: &str, sha: Option<&str>) -> bool {
+    if receipt.state != "completed" {
+        return false;
+    }
+    let Some(result) = receipt.result.as_ref() else {
+        return false;
+    };
+    let Some(text) = result.get("text").and_then(Value::as_str) else {
+        return false;
+    };
+    let want = format!("Report: {report_path}");
+    if !text.lines().any(|line| line.trim() == want) {
+        return false;
+    }
+    let recorded = result
+        .get("sha")
+        .and_then(Value::as_str)
+        .filter(|sha| !sha.is_empty())
+        .or_else(|| {
+            text.lines().rev().find_map(|line| {
+                line.trim()
+                    .strip_prefix("SHA:")
+                    .map(str::trim)
+                    .filter(|sha| !sha.is_empty())
+            })
+        });
+    recorded.is_some_and(|recorded| Some(recorded) == sha)
+}
+
 impl Shared {
-    /// Open the loop's record for a ticket `master_dispatch` just sent
-    /// to `worker`. A finished record is replaced; a live one is kept.
-    pub(super) fn delivery_start(&self, id: &str, project: &str, worker: &str) -> Result<()> {
-        let dispatched_at = self
-            .store
-            .worker_issue_turn(id, worker)?
-            .map_or_else(now, |turn| turn.created.floor() as i64);
-        self.delivery_adopt(id, project, worker, dispatched_at)
+    /// CAD-2215: a dispatch row is not ordinary merely because it has the
+    /// dispatch shape. The actual invariants:
+    ///
+    /// - Job mode (`task_id` present): the task and its job must be
+    ///   readable and the job bound to this ticket; then
+    ///   [`store::Store::assist_job_has_request`] must be false — it is an
+    ///   exact `EXISTS` over any `assist_requests` ledger row (including
+    ///   duplicate/ambiguous owners) plus the durable planned-queue id —
+    ///   and `job.pm_alias` must have no member-assistant binding in any
+    ///   state (tombstoned rows are durable; the store never deletes
+    ///   them). A read error refuses.
+    /// - Taskless mode: the recorded sender must be the proven local
+    ///   operator or an exact registered agent identity with a
+    ///   `sender_uid` and no assistant binding. Member, `cli:`/remote-CLI
+    ///   principal, unattributed and unknown senders are ambiguous or
+    ///   member-private and refuse.
+    ///
+    /// Anything unprovable stays operator-only. Names and id prefixes are
+    /// never authority.
+    fn ordinary_job_binding(&self, message: &store::Message) -> Result<()> {
+        let issue = message.issue.as_deref().unwrap_or("?");
+        if let Some(task_id) = message.task_id.as_deref() {
+            let task = self.store.task(task_id).map_err(|e| {
+                Error::rejected(format!(
+                    "{issue}'s dispatch task {task_id} cannot be read ({e}) — operator \
+                     recovery only"
+                ))
+            })?;
+            let job = self.store.job(&task.job_id).map_err(|e| {
+                Error::rejected(format!(
+                    "{issue}'s dispatch job {} cannot be read ({e}) — operator recovery only",
+                    task.job_id
+                ))
+            })?;
+            if job.issue_id.as_deref() != message.issue.as_deref() {
+                return Err(Error::rejected(format!(
+                    "dispatch task {task_id} belongs to a job not bound to this ticket — \
+                     operator recovery only"
+                )));
+            }
+            // Any ledger or durable-acceptance request row means the job
+            // is member-private, including duplicate/ambiguous owners and
+            // a queued promotion that never bound its ledger row.
+            return match self.store.assist_job_has_request(&job.id) {
+                Ok(true) => Err(Error::rejected(format!(
+                    "dispatch task {task_id} belongs to member-private job {} — never ordinary",
+                    job.id
+                ))),
+                Ok(false) => {
+                    // Bindings are never deleted (only archived/revoked),
+                    // so any row for the job's PM — active or tombstoned —
+                    // is durable evidence of a member/assistant origin.
+                    match self.store.assistant_for_alias(&job.pm_alias) {
+                        Ok(Some(_)) => Err(Error::rejected(format!(
+                            "dispatch task {task_id}'s job PM {} has a member-assistant binding \
+                             (including tombstoned) — ambiguous provenance; operator recovery \
+                             only",
+                            job.pm_alias
+                        ))),
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(Error::rejected(format!(
+                            "cannot prove dispatch job {}'s PM {} is not a member assistant \
+                             ({e}) — operator recovery only",
+                            job.id, job.pm_alias
+                        ))),
+                    }
+                }
+                Err(e) => Err(Error::rejected(format!(
+                    "cannot prove dispatch job {} is not member-private ({e}) — operator \
+                     recovery only",
+                    job.id
+                ))),
+            };
+        }
+        // A taskless dispatch is not ordinary by absence of a task. Its
+        // recorded sender must prove a non-member origin.
+        let Some(label) = message.sender.as_deref().filter(|s| !s.is_empty()) else {
+            return Err(Error::rejected(format!(
+                "{issue}'s dispatch has no recorded sender — provenance unproven; operator \
+                 recovery only"
+            )));
+        };
+        if label == "member" {
+            return Err(Error::rejected(format!(
+                "{issue}'s dispatch was sent by a member/assistant principal — never ordinary"
+            )));
+        }
+        // Only the proven local operator is ordinary without an agent
+        // identity.
+        if label == "operator" {
+            return Ok(());
+        }
+        // `cli:<canonical>` is a remote CLI *principal* in the member
+        // role, not the operator. Without an authoritative recorded
+        // operator entitlement it is ambiguous/private and must never
+        // mint ordinary provenance.
+        if label.starts_with("cli:") {
+            return Err(Error::rejected(format!(
+                "{issue}'s dispatch was sent by the remote CLI principal {label} (member role) \
+                 — no operator entitlement is recorded; operator recovery only"
+            )));
+        }
+        if message.sender_uid.is_none() {
+            return Err(Error::rejected(format!(
+                "{issue}'s dispatch names sender {label} without an agent uid — provenance \
+                 unproven; operator recovery only"
+            )));
+        }
+        match self.store.assistant_for_alias(label) {
+            Ok(Some(_)) => Err(Error::rejected(format!(
+                "{issue}'s dispatch was sent by member assistant {label} — never ordinary"
+            ))),
+            Ok(None) => Ok(()),
+            Err(e) => Err(Error::rejected(format!(
+                "cannot prove {issue}'s dispatch sender {label} is not a member assistant \
+                 ({e}) — operator recovery only"
+            ))),
+        }
+    }
+
+    /// CAD-2215: the exact native dispatch row a provenance reference
+    /// must name. The store is the authority; the reference string is
+    /// never trusted on its own.
+    fn dispatch_row(
+        &self,
+        issue: &str,
+        project: &str,
+        worker: &str,
+        dispatch: &str,
+    ) -> Result<store::Message> {
+        let message = self.store.message(dispatch)?.ok_or_else(|| {
+            Error::rejected(format!(
+                "{issue}'s delivery receipt {dispatch} is not a native message — operator \
+                 recovery only"
+            ))
+        })?;
+        // The authoritative ordinary shapes: a plain issue dispatch has
+        // `source=dispatch` and no task; a real task dispatch has
+        // `source=job_dispatch` and a task. Any other pairing (including
+        // a task on a plain dispatch) is not ordinary.
+        let shape_ok = matches!(
+            (message.source.as_str(), message.task_id.as_deref()),
+            ("dispatch", None) | ("job_dispatch", Some(_))
+        );
+        if !shape_ok
+            || message.issue.as_deref() != Some(issue)
+            || message.alias != worker
+            || message
+                .worktree
+                .as_deref()
+                .is_none_or(|lane| lane.trim().is_empty())
+        {
+            return Err(Error::rejected(format!(
+                "{issue}'s delivery receipt {dispatch} is not one of the two ordinary dispatch \
+                 shapes binding this ticket, worker and lane — operator recovery only"
+            )));
+        }
+        if matches!(message.state.as_str(), "unknown" | "failed") {
+            return Err(Error::rejected(format!(
+                "{issue}'s delivery receipt {dispatch} is {} — its outcome must be reconciled \
+                 by the operator before any ordinary effect",
+                message.state
+            )));
+        }
+        // The stored project must be the exact project that holds this
+        // ticket — a matching issue id with a different project is not
+        // ordinary either.
+        let pm = self.pm()?;
+        let ticket = crate::issue::board::find_issue(&pm.dir, issue).map_err(|_| {
+            Error::rejected(format!(
+                "{issue}'s delivery receipt {dispatch} names no ticket the tracker holds — \
+                 operator recovery only"
+            ))
+        })?;
+        if ticket.project != project {
+            return Err(Error::rejected(format!(
+                "{issue}'s delivery receipt {dispatch} names project {project}, but the \
+                 ticket belongs to {} — operator recovery only",
+                ticket.project
+            )));
+        }
+        // A dispatch row is not ordinary by shape: a promoted member-private
+        // job can produce one too.
+        self.ordinary_job_binding(&message)?;
+        Ok(message)
+    }
+
+    /// The native receipt behind a record's origin.
+    fn dispatch_receipt(&self, rec: &Record) -> Result<store::Message> {
+        let Some(dispatch) = rec.origin.verified_ordinary() else {
+            return Err(Error::rejected(format!(
+                "{}'s delivery record has no exact native dispatch receipt — operator \
+                 recovery only",
+                rec.issue
+            )));
+        };
+        self.dispatch_row(&rec.issue, &rec.project, &rec.worker, dispatch)
+    }
+
+    /// Revalidate the exact receipt before an ordinary transition.
+    /// Unknown or unverifiable is refused, never treated as ordinary.
+    pub(super) fn require_ordinary(&self, rec: &Record, verb: &str) -> Result<store::Message> {
+        self.dispatch_receipt(rec)
+            .map_err(|error| Error::rejected(format!("{verb} refused: {error}")))
+    }
+
+    /// Open the loop's record for a ticket the daemon's own dispatch just
+    /// sent to `worker`. `dispatch` is the accepted kickoff message id —
+    /// the exact native receipt the record stands on; this constructor is
+    /// the only way ordinary work enters the loop.
+    ///
+    /// A live verified record is kept (a duplicate dispatch is not a new
+    /// loop). A finished one is replaced. A pre-provenance record that
+    /// happens to sit on the ticket key is moved to its own legacy key
+    /// first, so the upgrade never destroys recovery evidence.
+    pub(super) fn delivery_start(
+        &self,
+        id: &str,
+        project: &str,
+        worker: &str,
+        dispatch: &str,
+    ) -> Result<()> {
+        if dispatch.trim().is_empty() {
+            return Err(Error::rejected(
+                "a delivery record needs the accepted dispatch receipt it follows",
+            ));
+        }
+        // The reference must resolve to the exact native dispatch row for
+        // this ticket, project, worker and lane — an arbitrary string is
+        // never provenance.
+        let receipt = self.dispatch_row(id, project, worker, dispatch)?;
+        // The recorded clock is this receipt's own `created`, never the
+        // latest issue/worker turn (which may be unrelated private work).
+        let dispatched_at = if receipt.created > 0.0 {
+            receipt.created.floor() as i64
+        } else {
+            now()
+        };
+        let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = delivery::load(&self.state_dir)?;
+        if all
+            .get(id)
+            .is_some_and(|r| !r.state.terminal() && r.origin.is_verified_ordinary())
+        {
+            return Ok(());
+        }
+        if let Some(prior) = all.get(id).filter(|r| !r.origin.is_verified_ordinary()) {
+            let legacy = delivery::legacy_key(id, "pre-2215");
+            let candidate = prior.clone();
+            all.insert(legacy, candidate);
+        }
+        let mut rec = Record::new_ordinary(id, project, worker, now(), dispatch);
+        rec.dispatched_at = dispatched_at;
+        all.insert(id.to_string(), rec);
+        delivery::save(&self.state_dir, &all)
+    }
+
+    /// CAD-484: admit a report's ticket for operator recovery when no
+    /// exact native dispatch receipt proves it ordinary. The record is
+    /// stored under its own legacy key — it never takes the ticket key an
+    /// ordinary loop owns, and the router never routes it. `report` names
+    /// the file purely to make the legacy key stable, never as evidence.
+    pub(super) fn delivery_adopt(
+        &self,
+        id: &str,
+        project: &str,
+        worker: &str,
+        dispatched_at: i64,
+        report: &str,
+    ) -> Result<()> {
+        let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = delivery::load(&self.state_dir)?;
+        if all
+            .get(id)
+            .is_some_and(|r| r.origin.is_verified_ordinary() && !r.state.terminal())
+        {
+            return Ok(());
+        }
+        let key = delivery::legacy_key(id, report);
+        if all.contains_key(&key) {
+            return Ok(());
+        }
+        let mut rec = Record::new(id, project, worker, now());
+        rec.dispatched_at = dispatched_at;
+        rec.note = Some(
+            "delivery candidate with no exact native dispatch receipt — operator recovery \
+             only; nothing was routed, published or merged"
+                .to_string(),
+        );
+        // Operator recovery reference only: the report this candidate was
+        // adopted from, never provenance.
+        rec.legacy_recovery = Some(delivery::LegacyRecovery {
+            report: report.to_string(),
+            unverified: true,
+        });
+        all.insert(key, rec);
+        delivery::save(&self.state_dir, &all)
     }
 
     pub(super) fn unattended_worker_complete(
@@ -182,28 +529,11 @@ impl Shared {
         }
     }
 
-    /// CAD-484: open the record for a lane the checkup adopted — the
-    /// worker's done report predates the loop, so the dispatch bound is
-    /// the report's own `at`, letting the router take it rather than
-    /// filter it as filed before the record existed.
-    pub(super) fn delivery_adopt(
-        &self,
-        id: &str,
-        project: &str,
-        worker: &str,
-        dispatched_at: i64,
-    ) -> Result<()> {
-        let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all = delivery::load(&self.state_dir)?;
-        if all.get(id).is_some_and(|r| !r.state.terminal()) {
-            return Ok(());
-        }
-        let mut rec = Record::new(id, project, worker, now());
-        rec.dispatched_at = dispatched_at;
-        all.insert(id.to_string(), rec);
-        delivery::save(&self.state_dir, &all)
-    }
-
+    /// CAD-484/CAD-2215: the checkup no longer promotes a lane's done
+    /// report into the loop. A report's `agent` front matter and file
+    /// name are not provenance, so adoption lands in
+    /// [`Self::delivery_adopt`] as an operator-recovery record instead.
+    ///
     /// One router pass over the loop (CAD-431): the worker's newest
     /// unconsumed `done` report goes to review; an unstaffed review is
     /// retried. Returns how many records moved.
@@ -222,13 +552,19 @@ impl Shared {
         }
         let pm = self.pm()?;
         // CAD-362: pair-precision history, snapshot before the mutable
-        // pass — `pick_reviewer` reads every record for the pair.
-        let history: Vec<delivery::Record> = all.values().cloned().collect();
+        // pass — `pick_reviewer` reads every record for the pair. Only
+        // verified ordinary records count as history (CAD-2215).
+        let history: Vec<delivery::Record> = all
+            .values()
+            .filter(|r| r.origin.is_verified_ordinary())
+            .cloned()
+            .collect();
         let hist: Vec<&delivery::Record> = history.iter().collect();
-        // The PRs live records hold — one PR belongs to one ticket.
+        // The PRs live ordinary records hold — one PR belongs to one
+        // ticket. A legacy candidate owns nothing.
         let held: Vec<(String, String)> = all
             .values()
-            .filter(|r| !r.state.terminal())
+            .filter(|r| !r.state.terminal() && r.origin.is_verified_ordinary())
             .filter_map(|r| Some((r.issue.clone(), delivery::pr_ref(r.pr.as_deref()?)?)))
             .collect();
         let mut moved = 0;
@@ -260,6 +596,16 @@ impl Shared {
         if rec.state.terminal() {
             return Ok(false);
         }
+        // CAD-2215: only a record whose exact native dispatch receipt is
+        // still a real dispatch for this ticket, worker and lane may
+        // route. Unknown or unverifiable is refused, never inferred.
+        let receipt = match self.require_ordinary(rec, "routing") {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::warn!("delivery router, {}: {error}", rec.issue);
+                return Ok(false);
+            }
+        };
         if rec.state == State::Escalated
             && (!rec.unattended_hold
                 || !matches!(
@@ -355,6 +701,19 @@ impl Shared {
             if rec.state == State::Unstaffed
                 || (rec.state == State::Working && rec.outcome_report.is_some())
             {
+                // A retained outcome report is only usable while the
+                // exact receipt still names it and its head.
+                if let Some(report) = rec.outcome_report.as_deref() {
+                    if !report_follows_receipt(&receipt, report, rec.head.as_deref()) {
+                        tracing::warn!(
+                            "delivery router, {}: retained outcome report {report} is not \
+                             named by its exact dispatch receipt {} — left for operator recovery",
+                            rec.issue,
+                            receipt.id
+                        );
+                        return Ok(false);
+                    }
+                }
                 let before = rec.state;
                 self.start_review(pm, rec, hist)?;
                 return Ok(rec.state != before || rec.ready_evidence.is_some());
@@ -362,9 +721,26 @@ impl Shared {
             return Ok(false);
         };
         let name = latest["name"].as_str().unwrap_or_default();
+        // The report must be the one the exact dispatch receipt completed
+        // with: the store's stored result names this report path and the
+        // same head. A file that merely sits in the folder (or names the
+        // alias) is not the worker's result.
+        if !report_follows_receipt(
+            &receipt,
+            latest["path"].as_str().unwrap_or_default(),
+            latest["sha"].as_str(),
+        ) {
+            tracing::warn!(
+                "delivery router, {}: done report {name} is not named by its exact dispatch \
+                 receipt {} — left for operator recovery",
+                rec.issue,
+                receipt.id
+            );
+            return Ok(false);
+        }
         let refusal = match (latest["sha"].as_str(), latest["pr"].as_str()) {
-            (Some(sha), Some(pr)) => match self.pr_refusal(pm, rec, pr, held)? {
-                None => {
+            (Some(sha), Some(pr)) => match self.pr_admission(pm, rec, pr, sha, held)? {
+                PrAdmission::Admitted(evidence) => {
                     self.on_done(
                         pm,
                         rec,
@@ -372,10 +748,11 @@ impl Shared {
                         pr,
                         latest["path"].as_str().unwrap_or(""),
                         hist,
+                        evidence,
                     )?;
                     None
                 }
-                why => why,
+                PrAdmission::Refused(why) => Some(why),
             },
             _ => Some(
                 "has no `sha:` and `pr:` — the review loop needs both. File a new done \
@@ -416,27 +793,151 @@ impl Shared {
     /// must be in one of the ticket's project repos (`repos[].remote`,
     /// compared normalized), and no other live ticket may hold it —
     /// otherwise the operator's `gh` would enqueue a PR nobody
-    /// dispatched.
-    fn pr_refusal(
+    /// dispatched. CAD-622: and an app's own team agent never authors a
+    /// change to that app's source — the PR's own changed files (or its
+    /// repository, when an installation pinned it as the app's git
+    /// source) name the app.
+    ///
+    /// The app evidence is resolved as a *tentative* local value: a
+    /// refused report leaves the record's accepted PR/head and their
+    /// evidence untouched, and only an admitted report hands its evidence
+    /// to `on_done` to commit against that exact PR and head.
+    fn pr_admission(
         &self,
         pm: &Pm,
         rec: &Record,
         pr: &str,
+        sha: &str,
         held: &[(String, String)],
-    ) -> Result<Option<String>> {
+    ) -> Result<PrAdmission> {
         if let Some(why) = delivery::project_pr_refusal(&pm.dir, &rec.project, pr)? {
-            return Ok(Some(why));
+            return Ok(PrAdmission::Refused(why));
         }
         let key = delivery::pr_ref(pr).unwrap_or_default();
         if let Some((other, _)) = held.iter().find(|(i, k)| *k == key && *i != rec.issue) {
-            return Ok(Some(format!(
+            return Ok(PrAdmission::Refused(format!(
                 "names {key}, which ticket {other} already holds in the review loop"
             )));
         }
-        Ok(None)
+        // CAD-622: the apps this PR touches, and whether their teams name
+        // the worker. Unreadable evidence holds the report — it never
+        // admits an own-team author, and a known git source counts even
+        // when the diff cannot be read.
+        let evidence = self.resolve_apps(pm, &rec.issue, pr, sha, &[rec.worker.as_str()])?;
+        let evidence = match evidence {
+            crate::issue::app_guard::Evidence::Unavailable(why) => {
+                return Ok(PrAdmission::Refused(format!(
+                    "could not be checked against its app's team: {why} — the report is \
+                     held until the PR's own changed files can be read; re-file it once \
+                     GitHub answers"
+                )));
+            }
+            crate::issue::app_guard::Evidence::NotApplicable => None,
+            crate::issue::app_guard::Evidence::Known { apps, from_git } => {
+                for app in &apps {
+                    let touched = if from_git.contains(app) {
+                        "its pinned git source".to_string()
+                    } else {
+                        format!("{}/{app}/", crate::issue::app::DIR)
+                    };
+                    if let Some(why) = crate::issue::app_guard::refusal(
+                        crate::issue::app_guard::Ctx {
+                            pm_dir: &pm.dir,
+                            state_dir: Some(&self.state_dir),
+                            store: Some(&self.store),
+                        },
+                        app,
+                        &touched,
+                        &rec.worker,
+                    )? {
+                        return Ok(PrAdmission::Refused(why));
+                    }
+                }
+                Some(delivery::AppEvidence {
+                    pr: pr.to_string(),
+                    head: sha.to_string(),
+                    apps: apps.into_iter().collect(),
+                    from_git: from_git.into_iter().collect(),
+                })
+            }
+        };
+        Ok(PrAdmission::Admitted(evidence))
     }
 
-    /// The worker reported `sha` done on `pr`.
+    /// CAD-622: what this PR's head touches — its changed files under
+    /// `apps/<name>/`, plus every app whose install record pins this
+    /// PR's repository as its git source. `NotApplicable` when nobody in
+    /// `aliases` is on any app's team and no app takes its source from
+    /// this repository (nothing was read); `Unavailable` when the app
+    /// question was asked and the diff could not answer — the caller
+    /// holds, never admits.
+    fn resolve_apps(
+        &self,
+        pm: &Pm,
+        issue: &str,
+        pr: &str,
+        sha: &str,
+        aliases: &[&str],
+    ) -> Result<crate::issue::app_guard::Evidence> {
+        use crate::issue::app_guard::{
+            apps_from_git_source, apps_in_paths, teams, unproven_teams, Evidence,
+        };
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        let (slug, _) = crate::issue::task_report::parse_pr_url(pr)?;
+        let from_git = apps_from_git_source(guard, &slug)?;
+        // A legacy snapshot that leaves one of these aliases possibly on
+        // an app's team makes the app question real too: the PR's own
+        // files decide whether that app is touched, and the per-app
+        // check then holds instead of reading the alias as independent.
+        let unproven = unproven_teams(guard)?;
+        let interested = !from_git.is_empty()
+            || aliases
+                .iter()
+                .any(|alias| unproven.values().any(|set| set.contains(*alias)))
+            || aliases.iter().any(|alias| {
+                teams(guard).is_ok_and(|t| t.values().any(|team| team.contains(*alias)))
+            });
+        if !interested {
+            return Ok(Evidence::NotApplicable);
+        }
+        let unavailable = |why: &str| {
+            let _ = self.store.event_public(
+                DAEMON_ALIAS,
+                "review_app_guard_unavailable",
+                json!({"issue": issue, "pr": pr, "head": sha, "why": why}),
+            );
+            Evidence::Unavailable(why.to_string())
+        };
+        let Ok(text) = delivery::gh(
+            &self.delivery_gh.to_string_lossy(),
+            &["pr", "view", pr, "--json", "files,headRefOid"],
+        ) else {
+            return Ok(unavailable("the PR's changed files could not be read"));
+        };
+        let view: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))?;
+        if view["headRefOid"].as_str() != Some(sha) {
+            return Ok(unavailable("the PR tip moved while its files were read"));
+        }
+        let Some(files) = view["files"].as_array() else {
+            return Ok(unavailable("the PR read returned no file list"));
+        };
+        let mut apps = from_git.clone();
+        apps.extend(apps_in_paths(
+            files.iter().filter_map(|f| f["path"].as_str()),
+        ));
+        Ok(Evidence::Known { apps, from_git })
+    }
+
+    /// The worker reported `sha` done on `pr`. `evidence` is the app
+    /// evidence `pr_admission` resolved for exactly this PR/head; it is
+    /// committed here, with the head, so a later reader can never pair a
+    /// list with a different diff.
+    #[allow(clippy::too_many_arguments)]
     fn on_done(
         self: &Arc<Self>,
         pm: &Pm,
@@ -445,6 +946,7 @@ impl Shared {
         pr: &str,
         outcome_report: &str,
         hist: &[&Record],
+        evidence: Option<delivery::AppEvidence>,
     ) -> Result<()> {
         let same_head = rec.head.as_deref() == Some(sha) && rec.pr.as_deref() == Some(pr);
         if same_head
@@ -463,6 +965,7 @@ impl Shared {
             rec.disable_auto = true;
         }
         rec.pr = Some(pr.to_string());
+        rec.app_evidence = evidence;
         rec.ready_evidence = None;
         rec.ready_binding = None;
         rec.outcome_report = (!outcome_report.is_empty()).then(|| outcome_report.to_string());
@@ -473,6 +976,83 @@ impl Shared {
         rec.head = Some(sha.to_string());
         rec.head_at = now();
         self.start_review(pm, rec, hist)
+    }
+
+    /// CAD-622: the app evidence for the record's current `pr`/`head` —
+    /// the one the accepted head committed, or a fresh resolution when
+    /// the cached list is not bound to exactly this PR and head (a moved
+    /// head, a retry, a recovery). `None` is unavailable evidence: the
+    /// caller holds the review rather than routing it unchecked.
+    fn head_app_evidence(
+        &self,
+        pm: &Pm,
+        rec: &mut Record,
+        aliases: &[&str],
+    ) -> Result<Option<delivery::AppEvidence>> {
+        let (Some(pr), Some(head)) = (rec.pr.clone(), rec.head.clone()) else {
+            return Ok(Some(delivery::AppEvidence::default()));
+        };
+        if let Some(cached) = rec
+            .app_evidence
+            .as_ref()
+            .filter(|ev| ev.pr == pr && ev.head == head)
+        {
+            return Ok(Some(cached.clone()));
+        }
+        match self.resolve_apps(pm, &rec.issue, &pr, &head, aliases)? {
+            crate::issue::app_guard::Evidence::Unavailable(_) => Ok(None),
+            crate::issue::app_guard::Evidence::NotApplicable => {
+                Ok(Some(delivery::AppEvidence::default()))
+            }
+            crate::issue::app_guard::Evidence::Known { apps, from_git } => {
+                let evidence = delivery::AppEvidence {
+                    pr,
+                    head,
+                    apps: apps.into_iter().collect(),
+                    from_git: from_git.into_iter().collect(),
+                };
+                // Committed only with the head it describes: every reader
+                // re-checks the binding before trusting it.
+                rec.app_evidence = Some(evidence.clone());
+                Ok(Some(evidence))
+            }
+        }
+    }
+
+    /// The candidates that are on the team of an app this head's PR
+    /// touches — they never review a change to that app.
+    fn app_barred(
+        &self,
+        pm: &Pm,
+        evidence: &delivery::AppEvidence,
+        candidates: &[Candidate],
+    ) -> Result<std::collections::BTreeSet<String>> {
+        use crate::issue::app_guard::{teams, unproven_teams};
+        let guard = crate::issue::app_guard::Ctx {
+            pm_dir: &pm.dir,
+            state_dir: Some(&self.state_dir),
+            store: Some(&self.store),
+        };
+        let teams = teams(guard)?;
+        // A legacy snapshot that leaves a candidate possibly on an app's
+        // team excludes that candidate too: an unproven member never
+        // reviews the app it might belong to.
+        let unproven = unproven_teams(guard)?;
+        let mut barred = std::collections::BTreeSet::new();
+        for app in &evidence.apps {
+            for candidate in candidates {
+                let member = teams
+                    .get(app)
+                    .is_some_and(|team| team.contains(&candidate.alias));
+                let maybe = unproven
+                    .get(app)
+                    .is_some_and(|set| set.contains(&candidate.alias));
+                if member || maybe {
+                    barred.insert(candidate.alias.clone());
+                }
+            }
+        }
+        Ok(barred)
     }
 
     /// The head moved without a done report from the worker: whoever
@@ -494,6 +1074,8 @@ impl Shared {
         rec.ready_evidence = None;
         rec.ready_binding = None;
         rec.outcome_report = None;
+        // CAD-622: the old head's changed files say nothing about this one.
+        rec.app_evidence = None;
         self.start_review(pm, rec, hist)
     }
 
@@ -542,6 +1124,63 @@ impl Shared {
         let (Some(sha), Some(pr)) = (rec.head.clone(), rec.pr.clone()) else {
             return Ok(());
         };
+        // CAD-622: every entry into review or readiness — a done report,
+        // an observed head change, a retry, a recovery — re-authorizes
+        // the worker against exactly this head. A head the worker pushed
+        // after admission is a new diff: if it touches an app the worker
+        // is on, the review is refused (the operator decides), and
+        // unreadable evidence holds the record instead of routing it.
+        // The roster is read first: a candidate that is on an app's team
+        // makes the app question real even when the worker is not.
+        let agents = self.store.agents()?;
+        let roster: Vec<&str> = agents.iter().map(|a| a.alias.as_str()).collect();
+        let Some(evidence) = self.head_app_evidence(pm, rec, &roster)? else {
+            if rec.state != State::Unstaffed {
+                rec.enter(State::Unstaffed, now());
+                rec.note = Some(format!(
+                    "{sha} held from review: the PR's changed files could not be read, so \
+                     the app-team check cannot be made"
+                ));
+                let _ = self.store.event_public(
+                    DAEMON_ALIAS,
+                    "review_app_guard_held",
+                    json!({"issue": rec.issue, "sha": sha, "pr": pr}),
+                );
+            }
+            return Ok(());
+        };
+        for app in &evidence.apps {
+            let touched = if evidence.from_git.contains(app) {
+                "its pinned git source".to_string()
+            } else {
+                format!("{}/{app}/", crate::issue::app::DIR)
+            };
+            let refusal = crate::issue::app_guard::refusal(
+                crate::issue::app_guard::Ctx {
+                    pm_dir: &pm.dir,
+                    state_dir: Some(&self.state_dir),
+                    store: Some(&self.store),
+                },
+                app,
+                &touched,
+                &rec.worker,
+            )?;
+            let Some(why) = refusal else { continue };
+            // An own-team author cannot be repaired by routing the review
+            // elsewhere: the head itself must change. The record is held
+            // for the operator rather than entering review or readiness.
+            if rec.state != State::Escalated || rec.note.as_deref() != Some(why.as_str()) {
+                let _ = self.store.event_public(
+                    DAEMON_ALIAS,
+                    "review_app_author_refused",
+                    json!({"issue": rec.issue, "sha": sha, "pr": pr, "app": app, "why": why}),
+                );
+            }
+            rec.enter(State::Escalated, now());
+            rec.unattended_hold = true;
+            rec.note = Some(why);
+            return Ok(());
+        }
         rec.unattended_turn = None;
         let unattended = match self.unattended_authorization_for_issue(&rec.issue) {
             Ok(run) => run.is_some(),
@@ -658,7 +1297,6 @@ impl Shared {
         let requirement = classification.as_ref().map(|v| &v["requirements"]);
         let profile_review = requirement
             .is_some_and(|r| r["activation"] == "active" && r["class"] == "consequential");
-        let agents = self.store.agents()?;
         let worker_vendor = agents
             .iter()
             .find(|a| a.alias == rec.worker)
@@ -675,22 +1313,35 @@ impl Shared {
                 role: a.role.clone(),
             })
             .collect();
+        // CAD-622: an app's own team agent never reviews a change to that
+        // app. The evidence is the one `head_app_evidence` already bound
+        // to this exact PR/head above (or a fresh read of the same head).
+        let barred = self.app_barred(pm, &evidence, &candidates)?;
+        let mut excluded = rec.excluded.clone();
+        excluded.extend(barred.iter().cloned());
         let Some(pick) = delivery::pick_reviewer(
             &rec.worker,
             worker_vendor.as_deref(),
             rec.reviewer.as_deref(),
-            &rec.excluded,
+            &excluded,
             &candidates,
             &pm.config.review,
             hist,
         ) else {
             if rec.state != State::Unstaffed {
                 rec.enter(State::Unstaffed, now());
-                rec.note = Some(format!(
+                let mut note = format!(
                     "no idle reviewer can take {sha}: a fresh review goes only to an idle \
                      agent registered with --role reviewer, never to a busy reviewer, an \
-                     implementer, the author, or another PM's group",
-                ));
+                     implementer, the author, or another PM's group"
+                );
+                if !barred.is_empty() {
+                    note.push_str(&format!(
+                        "; excluded as members of the app's own team: {}",
+                        barred.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                rec.note = Some(note);
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
                     "review_unstaffed",
@@ -830,6 +1481,7 @@ impl Shared {
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
+        self.require_ordinary(rec, "a verdict")?;
         if rec.worker == who {
             return Err(Error::rejected(format!(
                 "{who} is {id}'s worker — a worker never judges its own work"
@@ -846,6 +1498,54 @@ impl Shared {
                 "{id}'s review is assigned to {}, not {who}",
                 rec.reviewer.as_deref().unwrap_or("nobody")
             )));
+        }
+        // CAD-622: an app's own team agent never reviews a change to that
+        // app. The head's app set is resolved now when routing did not
+        // persist one, membership is read fresh (an alias can join a team
+        // while a review is outstanding), and unavailable evidence holds
+        // the verdict rather than admitting it.
+        {
+            use crate::issue::app_guard::{review_refusal, Evidence};
+            let guard = crate::issue::app_guard::Ctx {
+                pm_dir: &pm.dir,
+                state_dir: Some(&self.state_dir),
+                store: Some(&self.store),
+            };
+            // The cached apps count only when they are bound to the very
+            // PR and head under review; anything else is re-resolved, so
+            // a list left by another PR can never admit this head.
+            let evidence = match rec.app_evidence.as_ref().filter(|ev| {
+                Some(ev.pr.as_str()) == rec.pr.as_deref()
+                    && Some(ev.head.as_str()) == rec.head.as_deref()
+            }) {
+                Some(ev) => Evidence::Known {
+                    apps: ev.apps.iter().cloned().collect(),
+                    from_git: ev.from_git.iter().cloned().collect(),
+                },
+                None => match (rec.pr.as_deref(), rec.head.as_deref()) {
+                    (Some(pr), Some(head)) => {
+                        self.resolve_apps(&pm, id, pr, head, &[who.as_str(), rec.worker.as_str()])?
+                    }
+                    _ => Evidence::NotApplicable,
+                },
+            };
+            match evidence {
+                Evidence::Unavailable(why) => {
+                    return Err(Error::rejected(format!(
+                        "{id}'s verdict is held: the PR's changed files could not be read \
+                         ({why}) — the app-team check is never skipped; file it again when \
+                         GitHub answers"
+                    )));
+                }
+                Evidence::Known { apps, .. } => {
+                    for app in apps {
+                        if let Some(why) = review_refusal(guard, &app, &who)? {
+                            return Err(Error::rejected(why));
+                        }
+                    }
+                }
+                Evidence::NotApplicable => {}
+            }
         }
         let head = rec.head.clone().unwrap_or_default();
         if sha != head {
@@ -963,10 +1663,52 @@ impl Shared {
         Ok(filed)
     }
 
-    /// `delivery_list` — every record, oldest dispatch first. A read.
-    /// CAD-437: `issues`/`states`/`projects` are repeatable any-of
-    /// filters; `open` keeps the loop's live rows (non-terminal).
-    pub(super) fn rpc_delivery_list(&self, params: &Value) -> Result<Value> {
+    /// `delivery_list` — the ordinary records this native caller may
+    /// read, oldest dispatch first.
+    ///
+    /// Strict native inputs only: a board/hosted relay proof is refused
+    /// here (this method has no acknowledged relay contract). The
+    /// caller's current project scope and private-job denials are applied
+    /// before any filter or valid-value decision, and re-proved before the
+    /// answer is returned. A proven operator keeps full ordinary access.
+    pub(super) fn rpc_delivery_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        reject_delivery_fields(
+            params,
+            &["issues", "issue", "states", "projects", "open"],
+            "delivery_list",
+        )?;
+        let scope = self.project_scope(peer_pid, "delivery list")?;
+        let denials = if scope.is_some() {
+            Some(self.private_job_denials_for_read(params, None, None, peer_pid)?)
+        } else {
+            None
+        };
+        let answer = self.delivery_list_answer(params, false, &scope, denials.as_ref())?;
+        if self.project_scope(peer_pid, "delivery list")? != scope {
+            return Err(Error::rejected(
+                "delivery list refused: reader access changed",
+            ));
+        }
+        if let Some(previous) = denials.as_ref() {
+            if self.private_job_denials_for_read(params, None, None, peer_pid)? != *previous {
+                return Err(Error::rejected(
+                    "delivery list refused: reader access changed",
+                ));
+            }
+        }
+        Ok(answer)
+    }
+
+    /// The projection shared by the native list and operator recovery.
+    /// Scope is applied to the loaded records before any user filter, so
+    /// a filter cannot probe a project the reader may not see.
+    fn delivery_list_answer(
+        &self,
+        params: &Value,
+        include_legacy: bool,
+        scope: &Option<super::identity::ProjectScope>,
+        denials: Option<&store::PrivateJobDenials>,
+    ) -> Result<Value> {
         let mut issues = optional_strs(params, "issues")?;
         if let Some(one) = optional_str(params, "issue") {
             issues.push(one.to_string());
@@ -977,6 +1719,12 @@ impl Shared {
         let open = params.get("open").and_then(Value::as_bool) == Some(true);
         let mut rows: Vec<Record> = delivery::load(&self.state_dir)?
             .into_values()
+            .filter(|r| include_legacy || r.origin.is_verified_ordinary())
+            // A record names the project it belongs to, so that exact
+            // project must be readable: an issue id alone is not enough when
+            // the tracker holds the id in more than one project.
+            .filter(|r| scope_allows_delivery(scope, &r.issue, &r.project))
+            .filter(|r| denials.is_none_or(|denied| !denied.issues.contains(&r.issue)))
             .filter(|r| issues.is_empty() || issues.contains(&r.issue))
             .collect();
         if !projects.is_empty() {
@@ -984,11 +1732,15 @@ impl Shared {
             // projects live records carry — a project deleted from the
             // tracker still names its rows, and a name in neither is
             // an unknown value (the grammar's error), not an empty page.
+            // A scoped reader sees only the projects of rows it may read,
+            // so the refusal cannot list a hidden project.
             let mut valid: std::collections::BTreeSet<String> =
                 rows.iter().map(|r| r.project.clone()).collect();
-            if let Ok(dir) = self.pm_dir() {
-                if let Ok(list) = issue::project::list(&dir) {
-                    valid.extend(list.into_iter().map(|p| p.key));
+            if scope.is_none() {
+                if let Ok(dir) = self.pm_dir() {
+                    if let Ok(list) = issue::project::list(&dir) {
+                        valid.extend(list.into_iter().map(|p| p.key));
+                    }
                 }
             }
             let refs: Vec<&str> = valid.iter().map(String::as_str).collect();
@@ -1004,6 +1756,253 @@ impl Shared {
             "records": rows.iter().map(Record::to_json).collect::<Vec<_>>(),
             "pm_dir": self.pm_dir().ok(),
         }))
+    }
+    /// Compare completed native dispatches with their exact private ledger
+    /// results. This is read-only: an absent or stale sidecar must not be
+    /// mistaken for a running delivery, and a read never retries publication.
+    pub(super) fn unavailable_private_completions<'a>(
+        &self,
+        jobs: impl IntoIterator<Item = &'a str>,
+        all: &BTreeMap<String, private::PrivateDelivery>,
+    ) -> Result<BTreeSet<String>> {
+        let mut unavailable = BTreeSet::new();
+        for job in jobs {
+            for task in self.store.tasks_for_job(job)? {
+                for message in self.store.task_dispatch_messages(&task.id)? {
+                    if message.state != "completed" {
+                        continue;
+                    }
+                    let verified = self
+                        .expected_private_dispatch_result(job, &task, &message)
+                        .ok()
+                        .and_then(|(origin, expected)| {
+                            all.get(&origin.delivery_id()).map(|delivery| {
+                                let recorded = &delivery.origin;
+                                let same_origin = recorded.job == origin.job
+                                    && recorded.task == origin.task
+                                    && recorded.revision == origin.revision
+                                    && recorded.dispatch == origin.dispatch
+                                    && recorded.issue == origin.issue
+                                    && recorded.project == origin.project
+                                    && recorded.owner_org == origin.owner_org
+                                    && recorded.owner_sub == origin.owner_sub;
+                                same_origin
+                                    && delivery.state == private::PrivateState::Completed
+                                    && delivery.results.len() == 1
+                                    && delivery.result(&message.id).is_some_and(|result| {
+                                        result.message == expected.message
+                                            && result.revision == expected.revision
+                                            && result.sha == expected.sha
+                                            && result.body == expected.body
+                                            && result.digest == expected.digest
+                                    })
+                            })
+                        })
+                        .unwrap_or(false);
+                    if !verified {
+                        unavailable.insert(message.id);
+                    }
+                }
+            }
+        }
+        Ok(unavailable)
+    }
+
+    /// `delivery_private_list` — the private job deliveries the proven
+    /// operator may see. An agent connection sees nothing. A member reads
+    /// their own private deliveries through the additive
+    /// `member_job_list.private_deliveries` projection after its signed
+    /// envelope, live authority and project proofs; there is no owner
+    /// delivery RPC over a board relay.
+    pub(super) fn rpc_delivery_private_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        reject_delivery_fields(params, &["issue"], "delivery_private_list")?;
+        let reader = match self.agent_caller(peer_pid, "private delivery list")? {
+            AgentCaller::Operator => private::Reader::Operator,
+            AgentCaller::Agent(_) => private::Reader::Other,
+        };
+        self.private_delivery_list(params, reader)
+    }
+
+    /// The scoped private projection. A reader that is neither the exact
+    /// owner nor the operator receives an empty list — no row, count or
+    /// id.
+    pub(super) fn private_delivery_list(
+        &self,
+        params: &Value,
+        reader: private::Reader<'_>,
+    ) -> Result<Value> {
+        if reader == private::Reader::Other {
+            // Nonowners cannot observe whether the private sidecar exists,
+            // parses, or is writable.
+            return Ok(json!({"deliveries": []}));
+        }
+        let issue = optional_str(params, "issue");
+        let all = private::load(&self.state_dir)?;
+        let mut jobs = Vec::new();
+        for job in self.store.job_task_summary(Some(false))?.lists.into_keys() {
+            if !self.store.assist_job_has_request(&job)? {
+                continue;
+            }
+            if let private::Reader::Owner { org, sub } = reader {
+                if !self
+                    .store
+                    .assist_job_owner(&job)?
+                    .is_some_and(|owner| owner.0 == org && owner.1 == sub)
+                {
+                    continue;
+                }
+            }
+            if let Some(wanted) = issue {
+                if self.store.job(&job)?.issue_id.as_deref() != Some(wanted) {
+                    continue;
+                }
+            }
+            jobs.push(job);
+        }
+        let mut unavailable =
+            self.unavailable_private_completions(jobs.iter().map(String::as_str), &all)?;
+        let readable = private::readable(&all, reader);
+        for delivery in &readable {
+            if issue.is_some_and(|i| delivery.origin.issue != i) {
+                continue;
+            }
+            let unproved = match delivery.state {
+                private::PrivateState::Completed => {
+                    self.verify_private_delivery_origin(delivery).is_err()
+                }
+                private::PrivateState::Running => {
+                    self.verify_private_running_origin(delivery).is_err()
+                }
+                _ => false,
+            };
+            if unproved {
+                unavailable.insert(delivery.origin.dispatch.clone());
+            }
+        }
+        let rows: Vec<Value> = readable
+            .into_iter()
+            .filter(|d| issue.is_none_or(|i| d.origin.issue == i))
+            // An operator may inspect an unproved completed record for
+            // recovery; a stale running row must not masquerade as progress.
+            .filter(|d| {
+                !unavailable.contains(&d.origin.dispatch)
+                    || (reader == private::Reader::Operator
+                        && d.state == private::PrivateState::Completed)
+            })
+            .map(|d| d.to_json())
+            .collect();
+        Ok(json!({
+            "deliveries": rows,
+            "private_deliveries_state": if unavailable.is_empty() { "available" } else { "unavailable" },
+        }))
+    }
+
+    /// `delivery_legacy_list` — the proven local operator's recovery view
+    /// of records whose provenance is not verified. Strict local payload;
+    /// a board process cannot reach it, and the shared `delivery_list`
+    /// never serves legacy rows.
+    pub(super) fn rpc_delivery_legacy_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        reject_delivery_fields(
+            params,
+            &["issues", "issue", "states", "projects", "open"],
+            "delivery_legacy_list",
+        )?;
+        self.operator_connection("delivery legacy list", params, peer_pid)?;
+        // A proven operator has full scope (`None`) and needs no private
+        // denials; legacy recovery is its own strictly local read.
+        self.delivery_list_answer(params, true, &None, None)
+    }
+
+    /// `delivery_private_reconcile` — retry private-ledger recovery from
+    /// native rows only. Proven local operator; strict payload. Re-opens
+    /// a missing entry and appends the exact completed result; never
+    /// reruns a task or writes a shared effect.
+    pub(super) fn rpc_delivery_private_reconcile(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_delivery_fields(params, &["job"], "delivery_private_reconcile")?;
+        self.operator_connection("delivery private reconcile", params, peer_pid)?;
+        self.reconcile_private_deliveries(optional_str(params, "job"))
+    }
+
+    /// `delivery_publish_reconcile` — operator recovery for one pending
+    /// publication attempt. Strict payload; proven local operator only.
+    pub(super) fn rpc_delivery_publish_reconcile(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_delivery_fields(
+            params,
+            &["delivery", "attempt"],
+            "delivery_publish_reconcile",
+        )?;
+        self.operator_connection("delivery publish reconcile", params, peer_pid)?;
+        // Serialize the native ownership proof with supported request
+        // promotion/binding changes until the shared tracker effect settles.
+        let _provenance = self
+            .member_job_lock
+            .read()
+            .map_err(|_| Error::internal("publication provenance lock poisoned"))?;
+        let delivery_id = required_str(params, "delivery")?;
+        let all = private::load(&self.state_dir)?;
+        let delivery = all.get(delivery_id).ok_or_else(|| {
+            Error::rejected("publication reconcile refused: private delivery is not recorded")
+        })?;
+        self.verify_private_delivery_origin(delivery)?;
+        let pm = self.pm()?;
+        publication::reconcile(
+            &pm,
+            &self.state_dir,
+            delivery_id,
+            required_str(params, "attempt")?,
+        )
+    }
+
+    /// `delivery_publish` — the proven local operator publishes selected
+    /// results of one private job delivery to its bound shared ticket as
+    /// one board comment. No board relay or member path inherits this
+    /// identity: they have no typed publication principal and are
+    /// refused, and a PR target is not representable.
+    pub(super) fn rpc_delivery_publish(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        reject_delivery_fields(
+            params,
+            &["delivery", "issue", "project", "results"],
+            "delivery_publish",
+        )?;
+        self.operator_connection("delivery publish", params, peer_pid)?;
+        // Keep the settled owner/request binding stable from reproof through
+        // the shared write; promotion takes the same lock before its effects.
+        let _provenance = self
+            .member_job_lock
+            .read()
+            .map_err(|_| Error::internal("publication provenance lock poisoned"))?;
+        let delivery_id = required_str(params, "delivery")?;
+        let issue = required_str(params, "issue")?;
+        let project = required_str(params, "project")?;
+        let results = optional_strs(params, "results")?;
+        let all = private::load(&self.state_dir)?;
+        let delivery = all.get(delivery_id).ok_or_else(|| {
+            Error::rejected("publication refused: private delivery is not recorded")
+        })?;
+        self.verify_private_delivery_origin(delivery)?;
+        let pm = self.pm()?;
+        let request = publication::PublicationRequest {
+            delivery_id: delivery_id.to_string(),
+            issue: issue.to_string(),
+            project: project.to_string(),
+            results,
+        };
+        let grant = publication::authorize(
+            &pm,
+            delivery,
+            &request,
+            &publication::VerifiedPublisher::operator(),
+        )?;
+        let receipt = publication::publish(&pm, &self.state_dir, &grant)?;
+        Ok(json!({"delivery": grant.delivery_id, "published": receipt}))
     }
 
     /// `delivery_observe` — the operator's process reports what GitHub
@@ -1048,10 +2047,16 @@ impl Shared {
             .unwrap_or_else(|e| e.into_inner());
         let guard = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
-        // CAD-362: pair-precision history for any re-route below.
-        let history: Vec<Record> = all.values().cloned().collect();
+        // CAD-362: pair-precision history for any re-route below — only
+        // verified ordinary records (CAD-2215).
+        let history: Vec<Record> = all
+            .values()
+            .filter(|r| r.origin.is_verified_ordinary())
+            .cloned()
+            .collect();
         let hist: Vec<&Record> = history.iter().collect();
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
+        self.require_ordinary(rec, "an observation")?;
         let before = rec.state;
         // CAD-776: readiness before this observation — the wake fires
         // on the transition into merge-ready, never on merely being
@@ -1257,6 +2262,10 @@ impl Shared {
                 let Some(rec) = all.get_mut(&id) else {
                     continue;
                 };
+                if let Err(error) = self.require_ordinary(rec, "a merged-ticket settlement") {
+                    tracing::warn!("delivery settlement, {id}: {error}");
+                    continue;
+                }
                 let next = match rec.ticket_done.clone() {
                     Some(TicketDone::Pending {
                         why,
@@ -1623,8 +2632,9 @@ impl Shared {
         let Some(pr) = rec.pr.as_deref() else {
             return Ok(Some("the loop records no PR".to_string()));
         };
-        if let Some(why) = self.pr_refusal(pm, rec, pr, &[])? {
-            return Ok(Some(format!("the PR {why}")));
+        match self.pr_admission(pm, rec, pr, head, &[])? {
+            PrAdmission::Refused(why) => return Ok(Some(format!("the PR {why}"))),
+            PrAdmission::Admitted(_) => {}
         }
         if !self
             .store
@@ -1653,6 +2663,7 @@ impl Shared {
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
+        self.require_ordinary(rec, "a merge decision")?;
         if !matches!(rec.state, State::Passed | State::Ready) {
             return Err(Error::rejected(format!(
                 "{id} has no standing PASS or routine readiness to merge (it is {})",
@@ -1793,6 +2804,7 @@ impl Shared {
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
+        self.require_ordinary(rec, "an approval")?;
         if !matches!(rec.state, State::Passed | State::Ready) {
             return Err(Error::rejected(format!(
                 "{id} has no standing PASS or fresh routine readiness to approve (it is {})",
@@ -2045,6 +3057,7 @@ impl Shared {
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
+        self.require_ordinary(rec, "a decline")?;
         if rec.state.terminal() {
             return Err(Error::rejected(format!(
                 "{id} is already {}",

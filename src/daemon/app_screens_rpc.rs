@@ -32,7 +32,7 @@
 //!
 //! CAD-1777: an optional host `parent_action_token` on mint pairs a
 //! DRAWER child with a live, consumed, non-read-only PRIMARY action
-//! context of the same records screen, install, digest, approval epoch
+//! context of the same screen (any contract, CAD-1932), install, digest, approval epoch
 //! and context — proven natively and re-proved at consume under the
 //! action-context lock. A child consume retires only a prior child of the
 //! same parent (one childslot) and never the parent; consuming or
@@ -373,24 +373,17 @@ impl Shared {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         let (digest, approval_epoch, pkg) = self.screen_package_checked(&pm, install_id, tag)?;
-        // CAD-1777: a drawer child is admitted ONLY as a paired
-        // `screen-records.v1` screen over the same live, non-read-only
+        // CAD-1777 / CAD-1932: a drawer child of any screen contract is
+        // admitted ONLY as a paired mount over the same live, non-read-only
         // primary action context. The host's token is a lookup key; every
-        // proof field below is native. Every other contract and every
-        // token-less mint keeps its existing primary behavior.
+        // proof field below is native. Every token-less mint keeps its
+        // existing primary behavior.
         let parent = match parent_action_token {
             None => None,
             Some(parent_token) => {
                 if read_only {
                     return Err(Error::rejected(
                         "a read-only mount cannot host a drawer child",
-                    ));
-                }
-                if pkg.host_contract.as_deref()
-                    != Some(crate::issue::app_screen_decl::HOST_CONTRACT_RECORDS)
-                {
-                    return Err(Error::rejected(
-                        "only a records screen admits a drawer child",
                     ));
                 }
                 let Some(context) = context_id.as_deref() else {
@@ -530,6 +523,7 @@ impl Shared {
             .filter(|m| {
                 m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_READ
                     || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH
+                    || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_IMPORT
                     || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_CHAT_ATTACH
             })
             .collect();
@@ -697,6 +691,7 @@ impl Shared {
             && pkg.may.iter().any(|m| {
                 m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_READ
                     || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH
+                    || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_IMPORT
                     || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_CHAT_ATTACH
             });
         if pkg.tools.is_empty() && pkg.operations.is_empty() && !media_only {
@@ -797,6 +792,14 @@ pub const SCREEN_KIT_CSS: &str = concat!(
     include_str!("../../design/kit.css"),
     "\n",
     include_str!("screen_kit.css"),
+    "\n",
+    // CAD-1622: the shared drawer shell's rules, so any app screen can render
+    // the shell the CRM app uses without shipping host CSS. The package the
+    // CRM app consumes builds from these same files, so the two copies cannot
+    // drift.
+    include_str!("../../ui/screen-ui/src/drawer-base.css"),
+    "\n",
+    include_str!("../../ui/screen-ui/src/drawer.css"),
 );
 /// The kit contract version a package can feature-detect.
 pub const SCREEN_KIT_VERSION: &str = "cadence-kit/1";
@@ -804,7 +807,7 @@ pub const SCREEN_KIT_VERSION: &str = "cadence-kit/1";
 /// Rendered-frame HTML: the static wrapper document carrying the CSP
 /// nonce, the bootstrap JSON block, the approved CSS and the approved
 /// IIFE — every byte host-verified so the package's own text can never
-/// break out of its script/style context. Capped post-escape (768 KiB).
+/// break out of its script/style context. Assets share the app package bound.
 ///
 /// `csp_nonce` admits the two stamped blocks only; `bridge_nonce` is the
 /// non-authorizing init token the child echoes (distinct from the
@@ -835,20 +838,20 @@ pub fn render_frame_html(
     )
 }
 
-/// Revalidate public, caller-constructible package bytes before selecting
-/// scripts. The declaration alone supplies explicit order; absent startup
-/// retains entry-only execution, regardless of the map's file order.
-pub fn render_package_frame_html(
+/// Render an already-validated package without repeating declaration
+/// validation or script/style end-token scans (CAD-2534).
+#[doc(hidden)]
+pub fn render_checked_package_frame_html(
     csp_nonce: &str,
     tag: &str,
     bridge_nonce: &str,
     generation: u64,
-    package: &crate::issue::app_screen_pkg::ScreenPackage,
+    checked: &crate::issue::app_screen_decl::IntegrityCheckedScreen,
+    assets: &std::collections::BTreeMap<String, String>,
     parent_origin: &str,
 ) -> Result<String> {
-    let checked = crate::issue::app_screen_decl::validate_map(&package.manifest, &package.assets)?;
     let mut styles = Vec::new();
-    for (name, body) in &package.assets {
+    for (name, body) in assets {
         if name.ends_with(".js") {
             check_script_text(body)?;
         } else if name.ends_with(".css") {
@@ -863,16 +866,48 @@ pub fn render_package_frame_html(
     let scripts: Vec<&str> = match checked.startup() {
         Some(order) => order
             .iter()
-            .map(|name| package.assets[name].as_str())
-            .collect(),
-        None => vec![package.assets[checked.entry()].as_str()],
+            .map(|name| {
+                assets
+                    .get(name)
+                    .map(String::as_str)
+                    .ok_or_else(|| Error::rejected("screen script asset missing"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => vec![assets
+            .get(checked.entry())
+            .map(String::as_str)
+            .ok_or_else(|| Error::rejected("screen entry asset missing"))?],
     };
-    render_frame_document(
+    assemble_frame_document(
         csp_nonce,
         tag,
         bridge_nonce,
         generation,
         (&styles, &scripts),
+        parent_origin,
+    )
+}
+
+/// Revalidate public, caller-constructible package bytes before selecting
+/// scripts. The declaration alone supplies explicit order; absent startup
+/// retains entry-only execution, regardless of the map's file order.
+#[cfg(test)]
+pub fn render_package_frame_html(
+    csp_nonce: &str,
+    tag: &str,
+    bridge_nonce: &str,
+    generation: u64,
+    package: &crate::issue::app_screen_pkg::ScreenPackage,
+    parent_origin: &str,
+) -> Result<String> {
+    let checked = crate::issue::app_screen_decl::validate_map(&package.manifest, &package.assets)?;
+    render_checked_package_frame_html(
+        csp_nonce,
+        tag,
+        bridge_nonce,
+        generation,
+        &checked,
+        &package.assets,
         parent_origin,
     )
 }
@@ -886,6 +921,53 @@ fn render_frame_document(
     parent_origin: &str,
 ) -> Result<String> {
     let (styles, scripts) = assets;
+    for css in styles {
+        check_style_text(css)?;
+    }
+    for js in scripts {
+        check_script_text(js)?;
+    }
+    assemble_frame_document(
+        csp_nonce,
+        tag,
+        bridge_nonce,
+        generation,
+        (styles, scripts),
+        parent_origin,
+    )
+}
+
+/// Assemble the static frame document; callers must have verified `styles` and
+/// `scripts` with [`check_style_text`] and [`check_script_text`] first.
+fn assemble_frame_document(
+    csp_nonce: &str,
+    tag: &str,
+    bridge_nonce: &str,
+    generation: u64,
+    assets: (&[&str], &[&str]),
+    parent_origin: &str,
+) -> Result<String> {
+    let (styles, scripts) = assets;
+    let asset_bytes = styles
+        .iter()
+        .chain(scripts.iter())
+        .try_fold(0usize, |total, text| total.checked_add(text.len()))
+        .ok_or_else(|| Error::rejected("screen frame assets exceed the app package byte limit"))?;
+    if asset_bytes > crate::issue::app::MAX_APP_BYTES as usize {
+        return Err(Error::rejected(
+            "screen frame assets exceed the app package byte limit",
+        ));
+    }
+    let bootstrap_bytes = csp_nonce
+        .len()
+        .saturating_add(tag.len())
+        .saturating_add(bridge_nonce.len())
+        .saturating_add(parent_origin.len());
+    if bootstrap_bytes > 4 * 1024 {
+        return Err(Error::rejected(
+            "screen frame bootstrap exceeds its byte limit",
+        ));
+    }
     let boot = json!({
         "tag": tag,
         "bridge_nonce": bridge_nonce,
@@ -902,40 +984,41 @@ fn render_frame_document(
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
-    let mut style_blocks = String::new();
+    let capacity = asset_bytes
+        + SCREEN_KIT_CSS.len()
+        + boot.len()
+        + kit_boot.len()
+        + csp_nonce.len() * (2 + scripts.len())
+        + (styles.len() + scripts.len()) * 32
+        + 512;
+    let mut html = String::with_capacity(capacity);
+    html.push_str("<!doctype html><html data-cadence-kit=\"");
+    html.push_str(SCREEN_KIT_VERSION);
+    html.push_str("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><script nonce=\"");
+    html.push_str(&csp_nonce);
+    html.push_str("\" type=\"application/json\" id=\"cadence-screen-boot\">");
+    html.push_str(&boot);
+    html.push_str("</script><script nonce=\"");
+    html.push_str(&csp_nonce);
+    html.push_str("\" type=\"application/json\" id=\"cadence-screen-kit\">");
+    html.push_str(&kit_boot);
+    html.push_str("</script><style id=\"cadence-kit\">");
+    html.push_str(SCREEN_KIT_CSS);
+    html.push_str("</style>");
     for css in styles {
-        style_blocks.push_str(&format!("<style>{}</style>", check_style_text(css)?));
+        html.push_str("<style>");
+        html.push_str(css);
+        html.push_str("</style>");
     }
-    let mut script_blocks = String::new();
+    html.push_str("</head><body><div id=\"root\"></div>");
     for js in scripts {
-        script_blocks.push_str(&format!(
-            "<script nonce=\"{csp_nonce}\">{}</script>",
-            check_script_text(js)?
-        ));
+        html.push_str("<script nonce=\"");
+        html.push_str(&csp_nonce);
+        html.push_str("\">");
+        html.push_str(js);
+        html.push_str("</script>");
     }
-    let html = format!(
-        "<!doctype html><html data-cadence-kit=\"{kit}\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<script nonce=\"{csp}\" type=\"application/json\" id=\"cadence-screen-boot\">{boot}</script>\
-<script nonce=\"{csp}\" type=\"application/json\" id=\"cadence-screen-kit\">{kit_boot}</script>\
-<style id=\"cadence-kit\">{kit_css}</style>\
-{style_blocks}\
-</head><body><div id=\"root\"></div>\
-{script_blocks}\
-</body></html>",
-        csp = csp_nonce,
-        boot = boot,
-        kit = SCREEN_KIT_VERSION,
-        kit_boot = kit_boot,
-        kit_css = SCREEN_KIT_CSS,
-        style_blocks = style_blocks,
-        script_blocks = script_blocks,
-    );
-    if html.len() > 768 * 1024 {
-        return Err(Error::rejected(
-            "rendered screen document exceeds its bound",
-        ));
-    }
+    html.push_str("</body></html>");
     Ok(html)
 }
 
@@ -969,8 +1052,12 @@ fn escape_json_script(text: &str) -> String {
 /// Preserving the exact approved source is what makes the approved
 /// bytes' sha256 the executed bytes.
 fn check_script_text(text: &str) -> Result<&str> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("</script") || lower.contains("<!--") || lower.contains("-->") {
+    let script_end = text.match_indices('<').any(|(index, _)| {
+        text.as_bytes()
+            .get(index..index + 8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"</script"))
+    });
+    if script_end || text.contains("<!--") || text.contains("-->") {
         return Err(Error::rejected(
             "screen entry contains a forbidden HTML-script end token",
         ));
@@ -982,7 +1069,12 @@ fn check_script_text(text: &str) -> Result<&str> {
 /// contain a case-insensitive `</style` end token; fail closed instead
 /// of rewriting (a rewritten stylesheet is not the approved bytes).
 fn check_style_text(text: &str) -> Result<&str> {
-    if text.to_ascii_lowercase().contains("</style") {
+    let style_end = text.match_indices('<').any(|(index, _)| {
+        text.as_bytes()
+            .get(index..index + 7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"</style"))
+    });
+    if style_end {
         return Err(Error::rejected(
             "screen stylesheet contains a forbidden </style end token",
         ));
@@ -1058,6 +1150,22 @@ mod tests {
         let kit = &h[kit_start..kit_start + h[kit_start..].find("</style>").unwrap()];
         assert!(kit.contains(include_str!("../../design/tokens.css")));
         assert!(kit.contains(include_str!("../../design/kit.css")));
+        // CAD-1622: the shared drawer shell's rules travel with the kit.
+        assert!(kit.contains(include_str!("../../ui/screen-ui/src/drawer-base.css")));
+        assert!(kit.contains(include_str!("../../ui/screen-ui/src/drawer.css")));
+        for class in [
+            ".crm-drawer {",
+            ".crm-drawer-scrim",
+            ".crm-drawer-shell",
+            ".crm-drawer-top",
+            ".crm-drawer-body",
+            ".crm-drawer-foot",
+        ] {
+            assert!(
+                kit.contains(class),
+                "kit lacks the shared drawer shell rule {class}"
+            );
+        }
         for class in [
             ".btn {",
             ".field {",
@@ -1088,5 +1196,97 @@ mod tests {
         let mut keys: Vec<_> = boot.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, ["bridge_nonce", "generation", "parent_origin", "tag"]);
+    }
+
+    #[test]
+    fn cad2534_checked_frame_render_matches_package_render_and_blocks_breakout() {
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+
+        let digest = |text: &str| format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+        let js = "console.log('ok');";
+        let css = ".ok{color:inherit}";
+        let manifest = json!({
+            "contract": "app-screens/v2",
+            "app": "demo",
+            "entry": "client.js",
+            "assets": [
+                {"name": "client.js", "media_type": "text/javascript", "size": js.len(), "sha256": digest(js)},
+                {"name": "styles.css", "media_type": "text/css", "size": css.len(), "sha256": digest(css)},
+            ],
+            "provenance": {
+                "source_digest": digest("src"),
+                "sdk_digest": digest("sdk"),
+                "toolchain_digest": digest("tc"),
+            },
+            "host_contract": "screen-records.v1",
+            "may": [],
+            "operations": [],
+        })
+        .to_string();
+        let assets = BTreeMap::from([
+            ("client.js".to_string(), js.to_string()),
+            ("styles.css".to_string(), css.to_string()),
+        ]);
+        let checked = crate::issue::app_screen_decl::validate_map(&manifest, &assets).unwrap();
+        let pkg = crate::issue::app_screen_pkg::ScreenPackage {
+            tag: "main".to_string(),
+            manifest,
+            assets: assets.clone(),
+            app: checked.app().to_string(),
+            remote_images: checked.remote_images().to_vec(),
+            contract: checked.contract().to_string(),
+            may: checked.may().to_vec(),
+            tools: checked.tools().clone(),
+            host_contract: checked.host_contract().map(str::to_string),
+            operations: checked.operations().to_vec(),
+            navigation: checked.navigation().cloned(),
+            views: checked.views().map(<[_]>::to_vec),
+        };
+        let from_checked = render_checked_package_frame_html(
+            "cspnonce",
+            "main",
+            &"b".repeat(64),
+            7,
+            &checked,
+            &assets,
+            "http://h",
+        )
+        .unwrap();
+        let from_package =
+            render_package_frame_html("cspnonce", "main", &"b".repeat(64), 7, &pkg, "http://h")
+                .unwrap();
+        assert_eq!(from_checked, from_package);
+
+        let bad_js = "var x='</script>';";
+        let bad_css = "body{content:'</style>'}";
+        for (bad_assets, why) in [
+            (
+                BTreeMap::from([
+                    ("client.js".to_string(), bad_js.to_string()),
+                    ("styles.css".to_string(), css.to_string()),
+                ]),
+                "forbidden HTML-script end token",
+            ),
+            (
+                BTreeMap::from([
+                    ("client.js".to_string(), js.to_string()),
+                    ("styles.css".to_string(), bad_css.to_string()),
+                ]),
+                "forbidden </style end token",
+            ),
+        ] {
+            let err = render_checked_package_frame_html(
+                "cspnonce",
+                "main",
+                &"b".repeat(64),
+                7,
+                &checked,
+                &bad_assets,
+                "http://h",
+            )
+            .expect_err("breakout asset must still be rejected");
+            assert!(err.to_string().contains(why), "unexpected error: {err}");
+        }
     }
 }

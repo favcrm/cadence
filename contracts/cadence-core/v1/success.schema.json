@@ -27,6 +27,57 @@
       ]
     },
     {
+      "description": "The native receipt [`Compat::report`] produced; its published shape is\n[`RequirementsValue`], and the value is emitted as produced rather than\nre-decoded, so a shape drift is a test failure, never a runtime trap.",
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "app.requirements.evaluate"
+        },
+        "value": {
+          "$ref": "#/$defs/RequirementsValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
+      "description": "The declared app tag of a screen declaration whose assets matched the\nsupplied facts (CAD-2008).",
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "app.screen.integrity"
+        },
+        "value": {
+          "$ref": "#/$defs/ScreenIntegrityValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
+      "description": "The same app tag under the host-owned operation admission\n(CAD-2118/AOS-479); no operation membership is implied.",
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "app.screen.asset-integrity"
+        },
+        "value": {
+          "$ref": "#/$defs/ScreenIntegrityValue"
+        }
+      },
+      "required": [
+        "op",
+        "value"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "op": {
@@ -59,14 +110,15 @@
       ]
     },
     {
+      "description": "The delivery-requirements document: the class, the reviews it needs and\nthe policy it was decided under (CAD-1946).",
       "type": "object",
       "properties": {
         "op": {
           "type": "string",
-          "const": "works.draft.validate"
+          "const": "delivery.requirements.evaluate"
         },
         "value": {
-          "$ref": "#/$defs/DraftValue"
+          "$ref": "#/$defs/DeliveryRequirementsValue"
         }
       },
       "required": [
@@ -79,10 +131,10 @@
       "properties": {
         "op": {
           "type": "string",
-          "const": "works.review.check"
+          "const": "agent.form.check"
         },
         "value": {
-          "$ref": "#/$defs/ReviewValue"
+          "$ref": "#/$defs/FormCheckValue"
         }
       },
       "required": [
@@ -95,10 +147,10 @@
       "properties": {
         "op": {
           "type": "string",
-          "const": "works.export.check"
+          "const": "agent.form.compile"
         },
         "value": {
-          "$ref": "#/$defs/ExportValue"
+          "$ref": "#/$defs/FormCompileValue"
         }
       },
       "required": [
@@ -111,93 +163,158 @@
     "ok"
   ],
   "$defs": {
-    "DraftValue": {
-      "description": "Success value of `works.draft.validate`. The two material fields are the\nexact bytes a host hashes: a revision's `contentDigest` is `sha256:` plus\nthe hex SHA-256 of the UTF-8 `content_material` bytes, and\n`payload_material` also covers tags.",
-      "type": "object",
-      "properties": {
-        "content_material": {
-          "type": [
-            "string",
-            "null"
-          ]
+    "Activation": {
+      "description": "Whether default lean classification applies, and if not, why strict\nrequirements are retained.",
+      "oneOf": [
+        {
+          "description": "A valid default-equivalent policy is in force.",
+          "type": "string",
+          "const": "active"
         },
-        "kind": {
-          "description": "The normalized kind, present only when the draft is valid.",
-          "type": [
-            "string",
-            "null"
-          ]
+        {
+          "description": "The policy is custom or its provenance is unknown. The serialized\nname is retained for compatibility with existing requirements readers.",
+          "type": "string",
+          "const": "no_profile"
         },
-        "payload_material": {
-          "type": [
-            "string",
-            "null"
-          ]
+        {
+          "description": "A `delivery:` section exists but is not the approved one\n(`delivery_unapproved`) — the legacy requirements stay.",
+          "type": "string",
+          "const": "not_approved"
         },
-        "refusals": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/WorksRefusal"
-          }
-        },
-        "tags": {
-          "description": "Tags after trimming and de-duplication, present only when valid.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          }
-        },
-        "title": {
-          "description": "The trimmed title, present only when the draft is valid.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "valid": {
-          "type": "boolean"
+        {
+          "description": "The section is malformed with no approved policy\n(`delivery_error`) — the defaults apply, legacy requirements.",
+          "type": "string",
+          "const": "malformed"
         }
-      },
-      "required": [
-        "valid",
-        "refusals"
       ]
     },
-    "ExportValue": {
-      "description": "Success value of `works.export.check`.",
+    "CheckMode": {
+      "type": "string",
+      "enum": [
+        "advisory",
+        "required"
+      ]
+    },
+    "DeliveryClass": {
+      "description": "What class the evidence places the delivery in.",
+      "oneOf": [
+        {
+          "description": "Activated profile, allowlisted ordinary documentation only.",
+          "type": "string",
+          "const": "routine"
+        },
+        {
+          "description": "Activated profile, ordinary listed paths.",
+          "type": "string",
+          "const": "consequential"
+        },
+        {
+          "description": "Reserved: `classify` resolves sensitive conditions to `Strict` and\ndoes not currently return this variant.",
+          "type": "string",
+          "const": "sensitive"
+        },
+        {
+          "description": "No relaxation applies: the profile is not in force, the trusted\nlists are unavailable, or the diff evidence is incomplete. The\nrequirements are the legacy ones (see the module header).",
+          "type": "string",
+          "const": "strict"
+        }
+      ]
+    },
+    "DeliveryPolicy": {
+      "description": "A project's delivery policy — `PROJECT.md` `delivery:` or the\ndefaults. [`parse`] builds it through the strict raw types and\n[`DeliveryPolicy::validate`]; `serde` round-trips the validated\nform (the approval payload's `delivery` key).",
       "type": "object",
       "properties": {
-        "allowed": {
-          "type": "boolean"
+        "heavy": {
+          "description": "Over this a delivery is \"heavy\".",
+          "$ref": "#/$defs/SizeLimit"
         },
-        "export_state": {
-          "description": "`ready` | `blocked`.",
-          "type": "string"
+        "integration_branch": {
+          "description": "CAD-1561: one extra PR target beyond the repository default\nbranch. `None` is omitted from the canonical JSON so existing\ndigests and approvals are unchanged. A non-default target is\nadmitted only while the exact current approved policy names it —\nlast-approved fallbacks (`delivery_unapproved` notes) do not.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "reason": {
-          "description": "The card's export explanation for this state.",
-          "type": "string"
+        "max_revise": {
+          "description": "REVISE verdicts a ticket takes before the operator decides.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
         },
-        "refusals": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/WorksRefusal"
+        "merge": {
+          "description": "How an approved PR merges.",
+          "$ref": "#/$defs/MergePolicy"
+        },
+        "oversized": {
+          "description": "Over this a delivery cannot merge through the loop.",
+          "$ref": "#/$defs/SizeLimit"
+        },
+        "reviews": {
+          "description": "The named reviews a `risk` rule may require.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Review"
           }
         },
-        "review_state": {
-          "description": "`draft` | `edited` | `reviewed`.",
+        "risk": {
+          "description": "Risk rules: a delivery must satisfy every review `require`d by\nevery rule whose `when` holds. A rule with no `when` always\napplies.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RiskRule"
+          }
+        },
+        "solo_operator": {
+          "description": "Optional legacy CAD-1298 profile, retained for compatible reads.\nCAD-1314 needs no profile for default lean classification. Keeping\n`None` omitted preserves existing canonical digests and approvals;\nrequirements always use [`Resolved`], never the raw file.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SoloOperatorProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "merge",
+        "max_revise",
+        "reviews",
+        "risk",
+        "heavy",
+        "oversized"
+      ]
+    },
+    "DeliveryRequirementsValue": {
+      "description": "Success value of `delivery.requirements.evaluate`: the requirements the\nevaluator produced, beside the policy they were computed under. The value is\nemitted as produced; this type publishes its shape.",
+      "type": "object",
+      "properties": {
+        "policy": {
+          "$ref": "#/$defs/DeliveryPolicy"
+        },
+        "policy_digest": {
           "type": "string"
+        },
+        "policy_note": {
+          "description": "`delivery_unapproved:`/`delivery_error:` when the file's section is not\nthe one in force.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_source": {
+          "description": "`default`, `file` or `approved`.",
+          "type": "string"
+        },
+        "requirements": {
+          "$ref": "#/$defs/Requirements"
         }
       },
       "required": [
-        "allowed",
-        "review_state",
-        "export_state",
-        "reason",
-        "refusals"
+        "policy",
+        "policy_source",
+        "policy_digest",
+        "requirements"
       ]
     },
     "FieldRefusal": {
@@ -216,9 +333,98 @@
         "message"
       ]
     },
+    "FormCheckValue": {
+      "description": "Success value of `agent.form.check`. When `valid`, `fallback` and\n`digest` are set; otherwise `message` names the refused path and rule,\nexactly as the native daemon words it.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "description": "Lowercase sha256 hex of the envelope's compact JSON; a replay of the\nsame form compares equal.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fallback": {
+          "description": "The text every surface that does not render the form shows.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "valid"
+      ]
+    },
+    "FormCompileValue": {
+      "description": "Success value of `agent.form.compile`. When `valid`, `form`, `fallback`\nand `digest` are set; otherwise `message` names the refused spec or form\npath and rule.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fallback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "form": {
+          "description": "The compiled `{\"version\":\"1.0\",\"createSurface\":{...}}` envelope."
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "valid"
+      ]
+    },
     "ManifestPreflightValue": {
       "description": "Success value of `app.manifest.preflight`.",
       "type": "object"
+    },
+    "MergeMethod": {
+      "type": "string",
+      "enum": [
+        "squash",
+        "merge",
+        "rebase"
+      ]
+    },
+    "MergePolicy": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/MergeMethod"
+        },
+        "queue": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "queue"
+      ]
     },
     "ReadinessValue": {
       "description": "Success value of `issue.readiness`.",
@@ -243,38 +449,538 @@
         "blocked"
       ]
     },
-    "ReviewValue": {
-      "description": "Success value of `works.review.check`: the state the host must write.",
+    "RequiredCheck": {
+      "description": "CAD-2413: a GitHub App check an approved policy requires on the head.",
       "type": "object",
       "properties": {
-        "allowed": {
-          "type": "boolean"
+        "app": {
+          "type": "string"
         },
-        "refusals": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/WorksRefusal"
-          }
-        },
-        "review_status": {
-          "description": "`approved` or `changes_requested`; absent when refused.",
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "app"
+      ]
+    },
+    "RequiredReview": {
+      "description": "CAD-2413: one review an approved policy's applying rules require, so a\ngate can count it by kind.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "A `check` review's GitHub App.",
           "type": [
             "string",
             "null"
           ]
         },
-        "reviewed_revision": {
-          "description": "The revision an approval records; absent when refused, or for\n`changes`, which leaves the stored reviewed revision unchanged.",
+        "focus": {
+          "description": "An `agent` review's focus.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "`agent`, `check` or `operator`.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "A `check` review's mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The review's name in the policy's `reviews` map.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ]
+    },
+    "RequirementCheck": {
+      "description": "One requirement and whether the target met it.",
+      "oneOf": [
+        {
+          "description": "The manifest's `requires.core` range against the target's version.",
+          "type": "object",
+          "properties": {
+            "host": {
+              "description": "The target's version.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "core"
+            },
+            "ok": {
+              "description": "Whether the target's version falls inside the range.",
+              "type": "boolean"
+            },
+            "required": {
+              "description": "The declared range text.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "host",
+            "ok"
+          ]
+        },
+        {
+          "description": "One declared contract major list against the target's profile.",
+          "type": "object",
+          "properties": {
+            "contract": {
+              "description": "The contract the manifest requires.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "contract"
+            },
+            "ok": {
+              "description": "Whether every required major is supported.",
+              "type": "boolean"
+            },
+            "required": {
+              "description": "The majors the manifest requires.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            },
+            "stage": {
+              "description": "The target's stage for `contract`; `null` when it does not\nprovide it.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TargetStage"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "supported": {
+              "description": "The majors the target declares for `contract`; empty when the\ntarget does not provide it.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "contract",
+            "required",
+            "supported",
+            "ok"
+          ]
+        }
+      ]
+    },
+    "Requirements": {
+      "description": "What a delivery needs to merge, derived from the class.",
+      "type": "object",
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/Activation"
+        },
+        "browser_qa": {
+          "description": "A change to a path in the repository's `browser_qa` table needs a\nBrowser QA pass (never when the lists are unreadable).",
+          "type": "boolean"
+        },
+        "class": {
+          "$ref": "#/$defs/DeliveryClass"
+        },
+        "full_checks": {
+          "description": "The full PR check floor applies. `false` only for routine —\nwhere the required base-branch checks are still all required.",
+          "type": "boolean"
+        },
+        "operator_approval": {
+          "description": "An exact-head operator-connection approval is required.",
+          "type": "boolean"
+        },
+        "policy_digest": {
+          "description": "Digest of the policy the requirements were computed under —\nevidence binds to it and a policy change invalidates them.",
+          "type": "string"
+        },
+        "reasons": {
+          "description": "Machine-readable reasons: why this class, what evidence decided.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_checks": {
+          "description": "CAD-2413: the GitHub App checks those rules require; absent likewise.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RequiredCheck"
+          }
+        },
+        "required_reviews": {
+          "description": "CAD-2413: the reviews an approved custom policy's applying rules\nrequire, in rule order. Absent when no approved policy was evaluated,\nso a gate can tell \"the policy requires none\" from \"no policy\".",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RequiredReview"
+          }
+        },
+        "review_kind": {
+          "$ref": "#/$defs/ReviewKind"
+        },
+        "reviews": {
+          "description": "Independent verdict count on the exact head: `0` for routine under a\nvalid default-equivalent policy, or when an approved policy's applying\nrules name no code review (CAD-2413).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "security_capable": {
+          "description": "The combined review must be filed by a security-capable\nreviewer (sensitive class).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "class",
+        "reviews",
+        "review_kind",
+        "security_capable",
+        "browser_qa",
+        "operator_approval",
+        "full_checks",
+        "reasons",
+        "policy_digest",
+        "activation"
+      ]
+    },
+    "RequirementsHost": {
+      "description": "The version and contracts of the target that produced a receipt.",
+      "type": "object",
+      "properties": {
+        "contracts": {
+          "description": "The target's declared contracts, name → sorted majors.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          }
+        },
+        "core": {
+          "description": "The target's version, as it participated in precedence.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "core",
+        "contracts"
+      ]
+    },
+    "RequirementsValue": {
+      "description": "Success value of `app.requirements.evaluate`: the native compatibility\nreceipt, typed. It is the value [`Compat::report`] produced for the\nsupplied target, so native and non-native hosts quote one receipt shape.\n\nThis type is the *published shape* of the receipt (the op emits the\nreceipt itself); `receipt_matches_the_published_shape` pins it.\n\n**Authority**: the profile is caller data, not authenticated by this\nfunction. `compatible: true` means \"every declared requirement is met by\nthe exact profile supplied\", never \"this tenant is authorized to install\".\nA consumer that admits must first establish that the profile it sends is\nits own current, authentic host profile, and must bind the answer to the\nexact manifest bytes and profile it supplied.\n\n`ok` here is the receipt's compatibility verdict (as in the native\nreceipt), not the envelope's `ok`, which only says the op ran.",
+      "type": "object",
+      "properties": {
+        "checks": {
+          "description": "One entry per checked requirement, in declaration order (core first,\nthen contracts by name).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RequirementCheck"
+          }
+        },
+        "compatible": {
+          "description": "Whether every declared requirement is met by the target.",
+          "type": "boolean"
+        },
+        "contracts": {
+          "description": "The declared contract requirements, name → sorted majors.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          }
+        },
+        "core": {
+          "description": "The declared `requires.core` range text; `null` when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "declared": {
+          "description": "Whether the manifest declared any `needs.requires` at all.",
+          "type": "boolean"
+        },
+        "host": {
+          "description": "The target that was evaluated.",
+          "$ref": "#/$defs/RequirementsHost"
+        },
+        "ok": {
+          "description": "Compatibility verdict, always equal to `compatible`.",
+          "type": "boolean"
+        },
+        "schema": {
+          "description": "Receipt schema; `1` is the only version.",
+          "type": "integer",
+          "format": "uint32",
+          "const": 1,
+          "minimum": 0
+        },
+        "unmet": {
+          "description": "The first unmet requirement in the native wording; `null` when\ncompatible. The full set is in `checks`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "ok",
+        "compatible",
+        "declared",
+        "contracts",
+        "host",
+        "checks"
+      ]
+    },
+    "Review": {
+      "description": "One named review a rule may require. `kind` picks the variant.",
+      "oneOf": [
+        {
+          "description": "An independent agent review; `focus` is one of [`FOCI`].",
+          "type": "object",
+          "properties": {
+            "focus": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent"
+            }
+          },
+          "required": [
+            "kind",
+            "focus"
+          ]
+        },
+        {
+          "description": "A GitHub App check (a bot). `mode: advisory` never blocks;\n`required` blocks like an agent review.",
+          "type": "object",
+          "properties": {
+            "app": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "check"
+            },
+            "mode": {
+              "$ref": "#/$defs/CheckMode"
+            }
+          },
+          "required": [
+            "kind",
+            "app",
+            "mode"
+          ]
+        },
+        {
+          "description": "The operator decides.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "operator"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ReviewKind": {
+      "description": "The kind of independent review `reviews` counts toward.",
+      "oneOf": [
+        {
+          "description": "No review required (routine under a valid default-equivalent policy).",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "One combined `Review (standards+spec)` verdict.",
+          "type": "string",
+          "const": "combined"
+        },
+        {
+          "description": "Two verdicts — Standards and Spec/security — by distinct\nreviewers.",
+          "type": "string",
+          "const": "standards_and_spec"
+        },
+        {
+          "description": "CAD-2413: an approved policy requires only the Standards review.",
+          "type": "string",
+          "const": "standards"
+        },
+        {
+          "description": "CAD-2413: an approved policy requires only the Spec/security review.",
+          "type": "string",
+          "const": "spec_security"
+        }
+      ]
+    },
+    "RiskRule": {
+      "type": "object",
+      "properties": {
+        "require": {
+          "description": "Names in `reviews` the delivery must satisfy.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "when": {
+          "description": "The conditions under which the rule applies — ANY of them.\nAbsent: the rule always applies.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RiskWhen"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "require"
+      ]
+    },
+    "RiskWhen": {
+      "type": "object",
+      "properties": {
+        "files_over": {
           "type": [
             "integer",
             "null"
           ],
-          "format": "int64"
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "lines_over": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "paths": {
+          "description": "Repo-relative, file-level globs — the same grammar as the\n`areas:` reader and `paths=` ([`crate::delivery_rules::check_path`]):\n`*` and `?` match inside one segment, a `**` segment any number,\na trailing `/` everything under it, and a glob without wildcards\nis a file or a directory covering everything under it. Matched with\n[`crate::delivery_rules::area_match`], the same function as `areas:`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         }
       },
+      "additionalProperties": false
+    },
+    "ScreenIntegrityValue": {
+      "description": "Success value of `app.screen.integrity` and\n`app.screen.asset-integrity`: the declared app tag of the one declaration\nthat passed.\n\n`ok: true` on the envelope only says the check ran; this value says the\ndeclaration and the supplied facts agreed under the shared screen\ncontract. It is integrity evidence, not install, mount, execution or\neffect authority, and it covers the facts the caller supplied — the caller\nmust have hashed the exact bytes it installed. Under\n`app.screen.asset-integrity` it likewise says nothing about operation\nmembership or CALL/SLOT permission: the caller checks those itself.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "The declared app tag (`valid_tag` grammar).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
       "required": [
-        "allowed",
-        "refusals"
+        "app"
+      ]
+    },
+    "SizeLimit": {
+      "type": "object",
+      "properties": {
+        "files_over": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lines_over": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lines_over",
+        "files_over"
+      ]
+    },
+    "SoloOperatorProfile": {
+      "description": "The legacy solo-operator delivery profile (CAD-1298), still readable\nafter CAD-1314 made the tiers default for valid default-equivalent policies.\nCustom, malformed and unapproved policies retain strict requirements.\n`version` is forward-proofing:\n`1` is the only accepted value, an unknown one refuses the whole\nsection, so an older binary never silently accepts a profile shape it\ndoes not understand.",
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version"
+      ]
+    },
+    "TargetStage": {
+      "description": "The stage a target declares for a contract. Closed set: an unknown stage\nis a profile this core cannot evaluate and refuses.",
+      "oneOf": [
+        {
+          "description": "A strict validator exists; nothing executes the declaration.",
+          "type": "string",
+          "const": "validator"
+        },
+        {
+          "description": "A consumer renders or runs the descriptor in a sandbox.",
+          "type": "string",
+          "const": "sandboxed"
+        }
       ]
     },
     "ValidateValue": {
@@ -304,28 +1010,6 @@
       "required": [
         "valid",
         "refusals"
-      ]
-    },
-    "WorksRefusal": {
-      "description": "One refused Works domain step, in the native wire shape.",
-      "type": "object",
-      "properties": {
-        "code": {
-          "description": "`invalid` | `conflict` | `forbidden` | `not_found` | `needs_review`.",
-          "type": "string"
-        },
-        "kind": {
-          "description": "`rejected` or `conflict`.",
-          "type": "string"
-        },
-        "message": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind",
-        "code",
-        "message"
       ]
     }
   }

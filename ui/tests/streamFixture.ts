@@ -1,6 +1,6 @@
 import type { MasterState } from "../src/lib/types";
 
-const IDLE: MasterState = { alias: "master", provider: "fixture", endpoint_kind: "fixture", live: false, turn: null, queue: [] };
+const IDLE: MasterState = { alias: "master", provider: "fixture", endpoint_kind: "fixture", live: false, turn: null, queue: [], identity: { name: null, tone: null, look: "robot", revision: "fixture" } };
 
 /** Only the master transcript carries a turn snapshot. The board and member
  * streams retain their own protocols; an empty fixture keeps them open. */

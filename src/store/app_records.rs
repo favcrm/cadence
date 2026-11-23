@@ -316,7 +316,7 @@ CREATE TABLE IF NOT EXISTS app_assistant_permissions(
  resource_id TEXT NOT NULL, effect TEXT NOT NULL CHECK(effect IN ('allow','deny')),
  semantics_digest TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
  state TEXT NOT NULL CHECK(state IN ('active','revoked')), scope_label TEXT NOT NULL,
- created REAL NOT NULL, updated REAL NOT NULL,
+ created REAL NOT NULL, updated REAL NOT NULL, sealed_human TEXT,
  UNIQUE(context_id, action_id, resource_id, effect));
 CREATE TABLE IF NOT EXISTS app_csv_confirms(
  context_id TEXT NOT NULL, request_id TEXT NOT NULL,
@@ -422,6 +422,9 @@ pub(crate) struct AssistantPermissionWrite<'a> {
     pub effect: &'a str,
     pub semantics_digest: &'a str,
     pub scope_label: &'a str,
+    /// CAD-1868: the human a refine grant is sealed to (canonical JSON);
+    /// `None` for every other grant.
+    pub sealed_human: Option<&'a str>,
 }
 
 type AssistantPermissionRow = (String, String, String, String, String, i64, String, String);
@@ -701,6 +704,33 @@ impl RecordStore {
                     }
                     Err(_) => true,
                 };
+            // CAD-1868: the human a refine standing grant is sealed to. A
+            // nullable column, version stays 1: an older binary names its
+            // columns explicitly and never reads it, and a NULL always
+            // refuses a refine grant. A file without the table is left as is.
+            let has_permissions = match conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='app_assistant_permissions'",
+                [],
+                |r| r.get::<_, i64>(0),
+            ) {
+                Ok(count) => count > 0,
+                Err(error) => return Err(busy_or(&error, Error::rejected(CORRUPT_RECORD_FILE))),
+            };
+            let needs_sealed_human = has_permissions
+                && match conn.prepare("SELECT sealed_human FROM app_assistant_permissions LIMIT 0")
+                {
+                    Ok(_) => false,
+                    Err(error) if is_contention(&error) => {
+                        return Err(Error::internal("record file is busy"));
+                    }
+                    Err(_) => true,
+                };
+            if needs_sealed_human {
+                conn.execute_batch(
+                    "ALTER TABLE app_assistant_permissions ADD COLUMN sealed_human TEXT",
+                )
+                .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            }
             if needs_decisions_digest {
                 conn.execute_batch(
                     "ALTER TABLE app_record_csv_imports ADD COLUMN decisions_digest TEXT NOT NULL DEFAULT ''",
@@ -2917,6 +2947,7 @@ impl RecordStore {
             effect,
             semantics_digest,
             scope_label,
+            sealed_human,
         } = permission;
         crate::proto::identifier(permission_id, "permission ID")?;
         crate::proto::identifier(context, "context ID")?;
@@ -2925,12 +2956,13 @@ impl RecordStore {
             || !semantics_digest.starts_with("sha256:")
             || semantics_digest.len() != 71
             || scope_label.len() > 200
+            || sealed_human.is_some_and(|human| human.len() > 1024)
         {
             return Err(Error::rejected("assistant permission is malformed"));
         }
         let conn = self.conn();
-        conn.execute("INSERT INTO app_assistant_permissions(permission_id,context_id,action_id,resource_id,effect,semantics_digest,revision,state,scope_label,created,updated) VALUES(?,?,?,?,?,?,1,'active',?,?,?) ON CONFLICT(context_id,action_id,resource_id,effect) DO UPDATE SET permission_id=excluded.permission_id,semantics_digest=excluded.semantics_digest,revision=app_assistant_permissions.revision+1,state='active',scope_label=excluded.scope_label,updated=excluded.updated",
-            params![permission_id, context, action_id, resource_id, effect, semantics_digest, scope_label, now(), now()]).map_err(|e| Error::internal(e.to_string()))?;
+        conn.execute("INSERT INTO app_assistant_permissions(permission_id,context_id,action_id,resource_id,effect,semantics_digest,revision,state,scope_label,created,updated,sealed_human) VALUES(?,?,?,?,?,?,1,'active',?,?,?,?) ON CONFLICT(context_id,action_id,resource_id,effect) DO UPDATE SET permission_id=excluded.permission_id,semantics_digest=excluded.semantics_digest,revision=app_assistant_permissions.revision+1,state='active',scope_label=excluded.scope_label,updated=excluded.updated,sealed_human=excluded.sealed_human",
+            params![permission_id, context, action_id, resource_id, effect, semantics_digest, scope_label, now(), now(), sealed_human]).map_err(|e| Error::internal(e.to_string()))?;
         drop(conn);
         self.app_assistant_permission_find(context, action_id, resource_id, effect)?
             .ok_or_else(|| Error::internal("assistant permission save did not persist"))
@@ -2946,6 +2978,24 @@ impl RecordStore {
         let conn = self.conn();
         let row: Option<AssistantPermissionRow> = conn.query_row("SELECT permission_id,action_id,resource_id,effect,semantics_digest,revision,state,scope_label FROM app_assistant_permissions WHERE context_id=? AND action_id=? AND resource_id=? AND effect=?", params![context,action_id,resource_id,effect], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().map_err(|e| Error::internal(e.to_string()))?;
         Ok(row.map(|(id,action,resource,effect,digest,revision,state,label)| json!({"id":id,"action_id":action,"resource_id":resource,"effect":effect,"semantics_digest":digest,"revision":revision,"state":state,"scope_label":label})))
+    }
+
+    /// CAD-1868: the stored sealed human of one grant row, read only by the
+    /// refine grant path; never part of a permission listing.
+    pub fn app_assistant_permission_sealed_human(
+        &self,
+        context: &str,
+        permission_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT sealed_human FROM app_assistant_permissions WHERE context_id=? AND permission_id=?",
+            params![context, permission_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(|e| Error::internal(e.to_string()))
     }
 
     pub fn app_assistant_permissions_list(&self, context: &str) -> Result<Vec<Value>> {

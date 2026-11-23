@@ -32,6 +32,7 @@
 import { api, ApiError, type ChatFileDestination, type ChatFileRow } from "../../../lib/api";
 import { beginPrivateOperation, onPrivateSessionReset, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
 import type { ThreadRef } from "../../../lib/types";
+import type { PendingAttachment } from "../../home/thread";
 import {
   attachFits,
   attachRefusal,
@@ -127,6 +128,18 @@ let nextSlotId = 0;
 const controllers = new Map<string, AbortController>();
 const appliedSeeds = new Map<string, object>();
 const savedListeners = new Set<() => void>();
+const focusListeners = new Set<(key: string) => void>();
+
+/** Focus is an explicit UI intent, never a draft edit or a send. */
+export function requestComposerFocus(key: string): void {
+  for (const listener of focusListeners) listener(key);
+}
+
+/** Mounted composers reveal their owner before focusing their own input. */
+export function onComposerFocusRequest(listener: (key: string) => void): () => void {
+  focusListeners.add(listener);
+  return () => { focusListeners.delete(listener); };
+}
 
 /** A parent-held seed object is a one-shot intent, not a reset on every
  *  remount. A new explicit seed object can still replace this draft. */
@@ -260,6 +273,11 @@ export function composerHasIntent(key: string): boolean {
 export function composerDraftState(key: string): ComposerDraft {
   const family = families.get(key);
   return family ? activeOf(family).snapshot : EMPTY_DRAFT;
+}
+
+/** Identity of the visible draft, for asynchronous actions that must not cross a slot change. */
+export function activeComposerSlot(key: string): number | undefined {
+  return families.get(key)?.activeId;
 }
 
 /** The slot a read addresses: the family's visible slot, or one parked
@@ -411,11 +429,11 @@ export function attachHold(key: string): AttachItem[] {
 }
 
 /** The ready rows one submit is about to carry, frozen by row identity:
- *  the `{id}` array for the send plus each row's key and upload
+ *  the attachment list for the send plus each row's key and upload
  *  generation. File ids are not row identity — two distinct rows can
  *  legitimately hold the same dedup id. */
 export interface ReadyCapture {
-  ids: { id: string }[];
+  ids: PendingAttachment[];
   rows: { key: string; generation: number }[];
 }
 
@@ -426,7 +444,12 @@ export function captureReady(key: string, expectedDestination?: AttachDestinatio
   }
   const rows = ready;
   return {
-    ids: rows.map((i) => ({ id: i.id! })),
+    ids: rows.map((i) => ({
+      id: i.id!,
+      name: i.name,
+      size: i.size,
+      mime: i.mime || i.file.type || "application/octet-stream",
+    })),
     rows: rows.map((i) => ({ key: i.key, generation: i.generation })),
   };
 }
@@ -665,7 +688,7 @@ export function addFiles(key: string, files: Iterable<File>, destination?: Attac
   const added: AttachItem[] = [];
   for (const file of files) {
     const itemKey = `a${++nextItemKey}`;
-    const problem = attachRefusal(file.name, file.size) ?? attachFits(have, 1);
+    const problem = attachRefusal(file.size, file.name) ?? attachFits(have, 1);
     have += 1;
     if (problem !== null) {
       added.push({
@@ -720,8 +743,8 @@ export function retryAttach(key: string, itemKey: string): void {
   const item = q.items.find((a) => a.key === itemKey);
   if (!item || item.status !== "failed" || item.permanent) return;
   // The same pre-flight checks as a fresh pick: a retry never admits a
-  // file addition would have refused (kind, size, count).
-  const problem = attachRefusal(item.name, item.size) ?? attachFits(q.items.length - 1, 1);
+  // file addition would have refused (size, count).
+  const problem = attachRefusal(item.size, item.name) ?? attachFits(q.items.length - 1, 1);
   if (problem !== null) {
     q.items = q.items.map((a) => (a.key === itemKey ? { ...a, error: problem, permanent: true } : a));
     publish(cell);

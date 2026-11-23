@@ -11,19 +11,27 @@
 //! Sandbox startup never writes to the shared home. File match and provider
 //! links are not evidence that a running agent session has reloaded them.
 
+use std::io::Read;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
+mod sync;
+
+pub use sync::{
+    activated_guidance, invoke_activated_sync, show, status, sync, unmanaged_snapshots,
+    ActivatedGuidance, ShowOutput,
+};
+
 /// The vendored skill document — single source of truth.
 pub const SKILL_MD: &str = include_str!("../skills/cadence/SKILL.md");
 
-struct BundledSkill {
-    name: &'static str,
-    files: &'static [(&'static str, &'static str)],
+pub(super) struct BundledSkill {
+    pub(super) name: &'static str,
+    pub(super) files: &'static [(&'static str, &'static str)],
 }
 
 const CADENCE: BundledSkill = BundledSkill {
@@ -74,18 +82,300 @@ const COMPANY_OUTPUTS: BundledSkill = BundledSkill {
     ],
 };
 
-pub const SKILL_NAMES: [&str; 3] = [CADENCE.name, BUSINESS_DOCUMENTS.name, COMPANY_OUTPUTS.name];
+const WEBSITE_BUILDER: BundledSkill = BundledSkill {
+    name: "website-builder",
+    files: &[
+        (
+            "playbook.md",
+            include_str!("../skills/website-builder/playbook.md"),
+        ),
+        (
+            "state.schema.json",
+            include_str!("../skills/website-builder/state.schema.json"),
+        ),
+        (
+            "references/site-spec.md",
+            include_str!("../skills/website-builder/references/site-spec.md"),
+        ),
+        (
+            "scripts/build.py",
+            include_str!("../skills/website-builder/scripts/build.py"),
+        ),
+        (
+            "scripts/check.py",
+            include_str!("../skills/website-builder/scripts/check.py"),
+        ),
+        (
+            "scripts/common.py",
+            include_str!("../skills/website-builder/scripts/common.py"),
+        ),
+        (
+            "scripts/next.py",
+            include_str!("../skills/website-builder/scripts/next.py"),
+        ),
+        (
+            "scripts/selftest.py",
+            include_str!("../skills/website-builder/scripts/selftest.py"),
+        ),
+        (
+            "scripts/submit.py",
+            include_str!("../skills/website-builder/scripts/submit.py"),
+        ),
+        (
+            "SKILL.md",
+            include_str!("../skills/website-builder/SKILL.md"),
+        ),
+    ],
+};
+
+const INCIDENT_RESPONSE: BundledSkill = BundledSkill {
+    name: "incident-response",
+    // Publish the entry point after its references, not before them.
+    files: &[
+        (
+            "references/postmortem-template.html",
+            include_str!("../skills/incident-response/references/postmortem-template.html"),
+        ),
+        (
+            "SKILL.md",
+            include_str!("../skills/incident-response/SKILL.md"),
+        ),
+    ],
+};
+
+const DELIVERABLE_QA: BundledSkill = BundledSkill {
+    name: "deliverable-qa",
+    files: &[(
+        "SKILL.md",
+        include_str!("../skills/deliverable-qa/SKILL.md"),
+    )],
+};
+
+const CADENCE_APP_DEV: BundledSkill = BundledSkill {
+    name: "cadence-app-dev",
+    files: &[
+        (
+            "references/contracts-and-storage.md",
+            include_str!("../skills/cadence-app-dev/references/contracts-and-storage.md"),
+        ),
+        (
+            "references/bridge-and-ui.md",
+            include_str!("../skills/cadence-app-dev/references/bridge-and-ui.md"),
+        ),
+        (
+            "references/release-and-catalog.md",
+            include_str!("../skills/cadence-app-dev/references/release-and-catalog.md"),
+        ),
+        (
+            "SKILL.md",
+            include_str!("../skills/cadence-app-dev/SKILL.md"),
+        ),
+    ],
+};
+
+pub const REQUIRED_SKILL: &str = CADENCE.name;
+
+pub const SKILL_NAMES: [&str; 7] = [
+    CADENCE.name,
+    BUSINESS_DOCUMENTS.name,
+    COMPANY_OUTPUTS.name,
+    WEBSITE_BUILDER.name,
+    INCIDENT_RESPONSE.name,
+    DELIVERABLE_QA.name,
+    CADENCE_APP_DEV.name,
+];
+
+/// Short one-line description for each bundled skill, matching the agent page UI.
+pub fn bundled_line(name: &str) -> &'static str {
+    match name {
+        "cadence" => "Tickets, threads and reports",
+        "business-documents" => "Document intake, templates and pricing checks",
+        "company-outputs" => "Quotes, invoices, proposals and reports",
+        "website-builder" => "Build and publish a static website",
+        "incident-response" => "Contain and close out incidents across teams",
+        "deliverable-qa" => "Independent browser and visual QA before release",
+        "cadence-app-dev" => "Build, audit and package sandboxed Cadence apps",
+        _ => "Bundled skill",
+    }
+}
+
+fn bundle_by_name(name: &str) -> Option<&'static BundledSkill> {
+    match name {
+        "cadence" => Some(&CADENCE),
+        "business-documents" => Some(&BUSINESS_DOCUMENTS),
+        "company-outputs" => Some(&COMPANY_OUTPUTS),
+        "website-builder" => Some(&WEBSITE_BUILDER),
+        "incident-response" => Some(&INCIDENT_RESPONSE),
+        "deliverable-qa" => Some(&DELIVERABLE_QA),
+        "cadence-app-dev" => Some(&CADENCE_APP_DEV),
+        _ => None,
+    }
+}
+
+/// CAD-2092: validate a per-agent `params.skills` allowlist.
+/// Every entry must be a known bundled skill, and the required `cadence`
+/// skill cannot be turned off.
+pub fn validate_skill_selection(names: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if bundle_by_name(name).is_none() {
+            return Err(Error::rejected(format!(
+                "unknown bundled skill {name:?}; expected {}",
+                SKILL_NAMES.join(", ")
+            )));
+        }
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    if !out.iter().any(|n| n == REQUIRED_SKILL) {
+        return Err(Error::rejected(format!(
+            "required skill '{REQUIRED_SKILL}' cannot be turned off"
+        )));
+    }
+    Ok(out)
+}
+
+/// CAD-2092: parse a JSON `params.skills` value into a validated skill list.
+pub fn validate_skills_param(value: &Value) -> Result<Vec<String>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| Error::rejected("'skills' must be an array of bundled skill names"))?;
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(name) = item.as_str() else {
+            return Err(Error::rejected("'skills' entries must be strings"));
+        };
+        names.push(name.to_string());
+    }
+    validate_skill_selection(&names)
+}
+
+/// CAD-2092: bundled skill catalog including exact `SKILL.md` bytes and file list
+/// so the agent page drawer shows what the agent sees.
+pub fn bundled_catalog() -> Vec<Value> {
+    SKILL_NAMES
+        .iter()
+        .filter_map(|&name| {
+            let bundle = bundle_by_name(name)?;
+            let skill_md = bundle
+                .files
+                .iter()
+                .find(|(rel, _)| *rel == "SKILL.md")
+                .map(|(_, body)| *body)
+                .unwrap_or("");
+            let files: Vec<&str> = bundle.files.iter().map(|(rel, _)| *rel).collect();
+            Some(json!({
+                "name": bundle.name,
+                "line": bundled_line(bundle.name),
+                "source": "bundled",
+                "bundled": true,
+                "required": bundle.name == REQUIRED_SKILL,
+                "skill_md": skill_md,
+                "files": files,
+            }))
+        })
+        .collect()
+}
+
+/// CAD-2092: stage ONLY the selected bundled skills into an agent's private
+/// directory (`<state_dir>/agents/<alias>/skills/<name>`), removing any
+/// previously staged unselected skill directories. Never touches `$HOME`.
+pub fn stage_agent_skills(
+    state_dir: &Path,
+    alias: &str,
+    selected: &[String],
+) -> Result<Vec<(String, PathBuf)>> {
+    crate::proto::identifier(alias, "agent alias")?;
+    let validated = validate_skill_selection(selected)?;
+    let agent_dir = state_dir.join("agents").join(alias);
+    let root = agent_dir.join("skills");
+    if root
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(Error::rejected(format!(
+            "refusing to stage skills into symlink {}",
+            root.display()
+        )));
+    }
+    std::fs::create_dir_all(&root)
+        .map_err(|e| Error::provider(format!("create {}: {e}", root.display())))?;
+    let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let keep = name
+                .to_str()
+                .is_some_and(|s| validated.iter().any(|want| want == s));
+            if !keep {
+                let path = entry.path();
+                if path
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_dir())
+                {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    let mut staged = Vec::with_capacity(validated.len());
+    for name in validated {
+        let bundle = bundle_by_name(&name).expect("validated skill exists");
+        let dir = root.join(&name);
+        if dir
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(Error::rejected(format!(
+                "refusing to write staged skill symlink {}",
+                dir.display()
+            )));
+        }
+        for (relative, content) in bundle.files {
+            let file = dir.join(relative);
+            if file
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err(Error::rejected(format!(
+                    "refusing to write staged skill file symlink {}",
+                    file.display()
+                )));
+            }
+            let stale = std::fs::read(&file)
+                .map(|bytes| bytes != content.as_bytes())
+                .unwrap_or(true);
+            if stale {
+                let parent = file.parent().expect("bundled file has a parent");
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| Error::provider(format!("create {}: {e}", parent.display())))?;
+                std::fs::write(&file, content)
+                    .map_err(|e| Error::provider(format!("write {}: {e}", file.display())))?;
+            }
+        }
+        staged.push((name, dir));
+    }
+    Ok(staged)
+}
 
 /// Provider skill directories that receive links to each selected bundle.
-const LINK_PARENTS: [&str; 3] = [".claude/skills", ".cursor/skills", ".copilot/skills"];
+pub(super) const LINK_PARENTS: [&str; 4] = [
+    ".claude/skills",
+    ".cursor/skills",
+    ".copilot/skills",
+    ".gemini/skills",
+];
 
-fn canonical_root(home: &Path) -> PathBuf {
+pub(super) fn canonical_root(home: &Path) -> PathBuf {
     home.join(".agents").join("skills")
 }
 
 /// Real provider dirs/files are never touched. Only missing or symlink
 /// entries are managed.
-fn link_state(link: &Path, target: &Path) -> &'static str {
+pub(super) fn link_state(link: &Path, target: &Path) -> &'static str {
     match std::fs::symlink_metadata(link) {
         Err(_) => "missing",
         Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(link) {
@@ -96,449 +386,114 @@ fn link_state(link: &Path, target: &Path) -> &'static str {
     }
 }
 
-fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
+pub(super) fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
     match target {
-        None => Ok(&[CADENCE, BUSINESS_DOCUMENTS, COMPANY_OUTPUTS]),
+        None => Ok(&[
+            CADENCE,
+            BUSINESS_DOCUMENTS,
+            COMPANY_OUTPUTS,
+            WEBSITE_BUILDER,
+            INCIDENT_RESPONSE,
+            DELIVERABLE_QA,
+            CADENCE_APP_DEV,
+        ]),
         Some("cadence") => Ok(&[CADENCE]),
         Some("business-documents") => Ok(&[BUSINESS_DOCUMENTS]),
         Some("company-outputs") => Ok(&[BUSINESS_DOCUMENTS, COMPANY_OUTPUTS]),
+        Some("website-builder") => Ok(&[WEBSITE_BUILDER]),
+        Some("incident-response") => Ok(&[INCIDENT_RESPONSE]),
+        Some("deliverable-qa") => Ok(&[DELIVERABLE_QA]),
+        Some("cadence-app-dev") => Ok(&[CADENCE_APP_DEV]),
         Some(name) => Err(Error::rejected(format!(
             "unknown bundled skill {name:?}; expected {}",
             SKILL_NAMES.join(", ")
         ))),
     }
 }
-
-/// Refresh selected public guidance, including company-outputs' guidance
-/// dependency. Validate the fixed name before any filesystem writes.
-pub fn sync(home: &Path, force: bool, target: Option<&str>) -> Result<Value> {
-    let selected = selected(target)?;
-    let root = canonical_root(home);
-    let mut reports = Vec::with_capacity(selected.len());
-    let mut wrote = false;
-    for skill in selected {
-        let (report, bundle_wrote) =
-            write_bundle(home, &root, skill.name, skill.files.iter().copied(), force)?;
-        wrote |= bundle_wrote;
-        reports.push(report);
-    }
-    Ok(json!({"root": root, "wrote": wrote, "skills": reports}))
-}
-
-/// Write one bundle's `files` into `home` and repair its provider links.
-/// Non-force unless `force`: a file whose bytes already match is left
-/// untouched, so a second run writes nothing and keeps its timestamp.
-/// Returns that bundle's report and whether any file was written — a
-/// repaired link alone is reported in `linked` and is not a file write,
-/// which is the rule `sync` has always had.
-fn write_bundle<'a, I>(
-    home: &Path,
-    root: &Path,
-    name: &str,
-    files: I,
-    force: bool,
-) -> Result<(Value, bool)>
-where
-    I: IntoIterator<Item = (&'a str, &'a str)>,
-{
-    let dir = root.join(name);
-    let mut written = Vec::new();
-    for (relative, content) in files {
-        let file = dir.join(relative);
-        if file
-            .symlink_metadata()
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-        {
-            return Err(Error::rejected(format!(
-                "refusing to write canonical skill-file symlink {}",
-                file.display()
-            )));
-        }
-        let stale = force
-            || std::fs::read(&file)
-                .map(|bytes| bytes != content.as_bytes())
-                .unwrap_or(true);
-        if stale {
-            std::fs::create_dir_all(file.parent().expect("bundled file has a parent"))
-                .map_err(|e| Error::provider(format!("create {}: {e}", dir.display())))?;
-            std::fs::write(&file, content)
-                .map_err(|e| Error::provider(format!("write {}: {e}", file.display())))?;
-            written.push(file);
-        }
-    }
-    let mut linked = Vec::new();
-    let mut skipped = Vec::new();
-    for parent in LINK_PARENTS {
-        let skills = home.join(parent);
-        let link = skills.join(name);
-        match link_state(&link, &dir) {
-            "ok" => continue,
-            "foreign" => {
-                skipped.push(json!({
-                    "path": link, "reason": "real entry exists — left alone"}));
-                continue;
+/// Compare the fixed bundle under `root/.agents/skills`, without returning files.
+pub fn guidance_copy(root: Option<&Path>, name: &str) -> Result<&'static str> {
+    let bundle = selected(Some(name))?
+        .iter()
+        .find(|skill| skill.name == name)
+        .expect("selected skill includes its requested bundle");
+    let Some(root) = root else {
+        return Ok("unknown");
+    };
+    let root = canonical_root(root).join(name);
+    let mut state = "current";
+    for (relative, expected) in bundle.files {
+        let actual = (|| -> std::io::Result<bool> {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(root.join(relative))?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(std::io::ErrorKind::InvalidData.into());
             }
-            _ => {}
-        }
-        std::fs::create_dir_all(&skills)
-            .map_err(|e| Error::provider(format!("create {}: {e}", skills.display())))?;
-        if link.symlink_metadata().is_ok() {
-            std::fs::remove_file(&link)
-                .map_err(|e| Error::provider(format!("replace {}: {e}", link.display())))?;
-        }
-        std::os::unix::fs::symlink(&dir, &link)
-            .map_err(|e| Error::provider(format!("link {}: {e}", link.display())))?;
-        linked.push(link);
-    }
-    let wrote = !written.is_empty();
-    Ok((
-        json!({
-            "name": name, "path": dir, "written": written,
-            "linked": linked, "skipped": skipped,
-        }),
-        wrote,
-    ))
-}
-
-/// Inspect every expected file and provider link without changing anything.
-/// `has_files` distinguishes an empty home from an existing partial install.
-pub fn status(home: &Path) -> Value {
-    let root = canonical_root(home);
-    let mut reports = Vec::with_capacity(SKILL_NAMES.len());
-    let mut installed = true;
-    let mut content_match = true;
-    let mut has_files = false;
-    let mut repairable = false;
-    let mut link_needs_attention = false;
-    let mut foreign = false;
-    for skill in selected(None).expect("the complete bundled set is valid") {
-        let dir = root.join(skill.name);
-        let mut files = Vec::with_capacity(skill.files.len());
-        let mut skill_installed = true;
-        let mut skill_match = true;
-        for &(relative, content) in skill.files {
-            let file = dir.join(relative);
-            let exists = file.is_file();
-            let matches = std::fs::read(&file)
-                .map(|bytes| bytes == content.as_bytes())
-                .unwrap_or(false);
-            has_files |= exists;
-            skill_installed &= exists;
-            skill_match &= matches;
-            files.push(json!({
-                "path": file, "installed": exists, "content_match": matches,
-            }));
-        }
-        installed &= skill_installed;
-        content_match &= skill_match;
-        if !skill_installed || !skill_match {
-            repairable = true;
-        }
-        let links: serde_json::Map<String, Value> = LINK_PARENTS
-            .iter()
-            .map(|parent| {
-                let name = parent
-                    .split('/')
-                    .next()
-                    .unwrap_or(parent)
-                    .trim_start_matches('.');
-                (
-                    name.to_string(),
-                    json!(link_state(&home.join(parent).join(skill.name), &dir)),
-                )
-            })
-            .collect();
-        for state in links.values() {
-            match state.as_str() {
-                Some("ok") => {}
-                Some("foreign") => foreign = true,
-                _ => {
-                    repairable = true;
-                    link_needs_attention = true;
+            if metadata.len() != expected.len() as u64 {
+                return Ok(false);
+            }
+            let mut buffer = [0; 4096];
+            for bytes in expected.as_bytes().chunks(buffer.len()) {
+                let chunk = &mut buffer[..bytes.len()];
+                file.read_exact(chunk)?;
+                if bytes != &*chunk {
+                    return Ok(false);
                 }
             }
-        }
-        reports.push(json!({
-            "name": skill.name, "path": dir, "installed": skill_installed,
-            "content_match": skill_match, "files": files, "links": links,
-        }));
-    }
-    let current = installed && content_match && !repairable && !foreign;
-    let guidance = if current {
-        "current"
-    } else {
-        "needs-attention"
-    };
-    let repair = if repairable {
-        Value::String("cadence skill install".to_string())
-    } else {
-        Value::Null
-    };
-    let attention = if foreign {
-        Value::String(
-            "a foreign provider entry was left alone; remove it by hand if this install should own the link"
-                .to_string(),
-        )
-    } else {
-        Value::Null
-    };
-    json!({
-        "root": root, "installed": installed, "has_files": has_files,
-        "content_match": content_match, "skills": reports,
-        "home": home,
-        "build": crate::overview::BUILD_COMMIT,
-        "guidance": guidance,
-        "repair": repair,
-        "attention": attention,
-        "file_match": if content_match { "current" } else { "needs-attention" },
-        "provider_discovery": if link_needs_attention || foreign {
-            "needs-attention"
-        } else {
-            "current"
-        },
-        "live_session": "not-checked",
-        "live_session_note": "File match and provider links do not show that an agent loaded this guidance. An existing session keeps what it already read; start a fresh session or reread the skill at a task boundary.",
-    })
-}
-
-/// Which build's embedded guidance an update may write.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActivatedGuidance {
-    /// No switch happened: this process is the active build.
-    CurrentProcess,
-    /// Execute `releases/<sha>/cadence` so the write uses that build's bytes.
-    Release(String),
-    /// The active build is not identified. Do not write.
-    Unavailable,
-}
-
-/// `health` and `restart` are the update report's JSON fields.
-/// A rollback prefers `rolled_back_to` over the failed candidate's `build`.
-pub fn activated_guidance(rolled_back: bool, health: &Value, restart: &Value) -> ActivatedGuidance {
-    if !rolled_back && health.is_null() && restart.is_null() {
-        return ActivatedGuidance::CurrentProcess;
-    }
-    let sha = if rolled_back {
-        health["rolled_back_to"]
-            .as_str()
-            .or_else(|| health["build"].as_str())
-            .or_else(|| restart["sha"].as_str())
-    } else {
-        health["build"].as_str().or_else(|| restart["sha"].as_str())
-    };
-    match sha.map(str::trim).filter(|sha| !sha.is_empty()) {
-        Some(sha) => ActivatedGuidance::Release(sha.to_string()),
-        None => ActivatedGuidance::Unavailable,
-    }
-}
-
-/// `cwd/skills/<bundled-name>` is an unmanaged snapshot. This only
-/// reports paths that are already there; it does not search, read
-/// bodies, or change them.
-pub fn unmanaged_snapshots(cwd: &Path) -> Vec<Value> {
-    let mut found = Vec::new();
-    for name in SKILL_NAMES {
-        let path = cwd.join("skills").join(name);
-        if path.symlink_metadata().is_ok() {
-            found.push(json!({
-                "name": name,
-                "path": path,
-                "role": "unmanaged",
-                "active": false,
-                "note": "workspace snapshot only; not an agent install and not modified",
-            }));
+            Ok(file.read(&mut buffer[..1])? == 0)
+        })();
+        match actual {
+            Ok(false) if state == "current" => state = "stale",
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => state = "missing",
+            Err(_) => return Ok("unknown"),
+            _ => {}
         }
     }
-    found
+    Ok(state)
 }
 
-/// Synchronize guidance for the activated build. A build that has
-/// `skill sync` runs it there — that build's own non-force sync over its
-/// own bytes.
-///
-/// A build from before `skill sync` existed offers only its forced manual
-/// install, which rewrites every file it ships. It is asked for its bytes
-/// in a private staging home, and this process then applies those bytes
-/// here with the non-force policy every other path uses: only a missing or
-/// differing file is written, so a second unchanged run writes nothing.
-/// The bytes are always the activated build's, never this process's, and
-/// nothing the child writes in the staging home reaches this home.
-pub fn invoke_activated_sync(binary: &Path, home: &Path, state_dir: &Path) -> Value {
-    if !binary.is_file() {
-        return json!({
-            "guidance": "not-checked",
-            "wrote": false,
-            "reason": format!("activated binary {} is not a file; guidance was not written", binary.display()),
-            "live_session": "not-checked",
-        });
-    }
-    if let Some(report) = run_skill_json(binary, home, state_dir, &["skill", "sync"]) {
-        return normalize_sync_report(report, binary);
-    }
-    legacy_activated_sync(binary, home)
-}
-
-/// The compatibility path for an activated build that predates
-/// `skill sync`. The child runs against a staging home and a staging state
-/// dir, so nothing it does can reach this home or this runtime state.
-fn legacy_activated_sync(binary: &Path, home: &Path) -> Value {
-    let not_checked = |reason: String| {
-        json!({
-            "guidance": "not-checked",
-            "wrote": false,
-            "reason": reason,
-            "repair": "cadence skill install",
-            "live_session": "not-checked",
-            "activated_binary": binary,
-        })
-    };
-    let staged = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(e) => return not_checked(format!("staging home was not created: {e}")),
-    };
-    let staged_home = staged.path().join("home");
-    let staged_state = staged.path().join("state");
-    if let Err(e) =
-        std::fs::create_dir_all(&staged_home).and_then(|()| std::fs::create_dir_all(&staged_state))
-    {
-        return not_checked(format!("staging home was not created: {e}"));
-    }
-    let Some(sync) = run_skill_json(binary, &staged_home, &staged_state, &["skill", "install"])
-    else {
-        return not_checked(
-            "activated binary did not report guidance; this process did not write it".into(),
-        );
-    };
-    let applied = apply_staged_bundle(&staged_home, home);
-    let foreign = applied["skills"].as_array().is_some_and(|skills| {
-        skills.iter().any(|skill| {
-            skill["skipped"]
-                .as_array()
-                .is_some_and(|skipped| !skipped.is_empty())
-        })
-    });
-    let error = applied["error"].clone();
-    let clean = !foreign && error.is_null();
-    json!({
-        "guidance": if clean { "current" } else { "needs-attention" },
-        "wrote": applied["wrote"],
-        "repair": if clean { Value::Null } else { json!("cadence skill install") },
-        "attention": if foreign {
-            json!("a foreign provider entry was left alone; remove it by hand if this install should own the link")
-        } else {
-            Value::Null
-        },
-        "error": error,
-        "applied": applied,
-        "sync": sync,
-        "source_command": "skill install",
-        "staged": true,
-        "live_session": "not-checked",
-        "live_session_note": "File match and provider links do not show that an agent loaded this guidance. An existing session keeps what it already read; start a fresh session or reread the skill at a task boundary.",
-        "activated_binary": binary,
-    })
-}
-
-fn run_skill_json(binary: &Path, home: &Path, state_dir: &Path, args: &[&str]) -> Option<Value> {
-    let mut command = Command::new(binary);
-    command
-        .args(["--state-dir"])
-        .arg(state_dir)
-        .args(args)
-        .env("HOME", home)
-        .env("CADENCE_JSON", "compact")
-        .env_remove("CADENCE_ORG")
-        .env_remove("CADENCE_ALIAS");
-    let output = crate::reaper::output(&mut command).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_json_stdout(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_json_stdout(stdout: &str) -> Option<Value> {
-    let trimmed = stdout.trim();
-    serde_json::from_str(trimmed).ok().or_else(|| {
-        trimmed
-            .lines()
-            .rev()
-            .find_map(|line| serde_json::from_str(line).ok())
-    })
-}
-
-fn normalize_sync_report(mut parsed: Value, binary: &Path) -> Value {
-    if parsed.get("guidance").is_none() {
-        if let Some(status) = parsed.get("status").cloned() {
-            if parsed.get("wrote").is_none() {
-                parsed["wrote"] = status.get("wrote").cloned().unwrap_or(Value::Bool(false));
-            }
-            parsed["guidance"] = status
-                .get("guidance")
-                .cloned()
-                .unwrap_or(Value::String("not-checked".into()));
-            parsed["repair"] = status.get("repair").cloned().unwrap_or(Value::Null);
-            parsed["live_session"] = json!("not-checked");
-            parsed["live_session_note"] = status
-                .get("live_session_note")
-                .cloned()
-                .unwrap_or(Value::Null);
-        }
-    }
-    parsed["activated_binary"] = json!(binary);
-    parsed
-}
-
-/// Apply a staged activated build's bytes to `home` with the non-force
-/// policy: only a missing or differing file is written, and only a missing
-/// or ours-wrong provider link is repaired. The managed path list is this
-/// build's, so no path the activated build never shipped is invented here,
-/// and a file this build no longer ships is never deleted. A write or link
-/// failure is reported, not hidden, and stops the remaining bundles.
-fn apply_staged_bundle(staged_home: &Path, home: &Path) -> Value {
-    let root = canonical_root(home);
-    let staged_root = canonical_root(staged_home);
-    let mut reports = Vec::new();
-    let mut wrote = false;
-    let mut error = Value::Null;
-    for skill in selected(None).expect("the complete bundled set is valid") {
-        let staged_dir = staged_root.join(skill.name);
-        let files: Vec<(&str, String)> = skill
-            .files
-            .iter()
-            .filter_map(|&(relative, _)| {
-                std::fs::read_to_string(staged_dir.join(relative))
-                    .ok()
-                    .map(|content| (relative, content))
-            })
-            .collect();
-        if files.is_empty() {
-            continue;
-        }
-        match write_bundle(
-            home,
-            &root,
-            skill.name,
-            files
-                .iter()
-                .map(|(relative, content)| (*relative, content.as_str())),
-            false,
-        ) {
-            Ok((report, bundle_wrote)) => {
-                wrote |= bundle_wrote;
-                reports.push(report);
-            }
-            Err(e) => {
-                error = json!(e.to_string());
-                break;
-            }
-        }
-    }
-    json!({"root": root, "wrote": wrote, "skills": reports, "error": error})
+/// Compare one bundled skill in this caller's home, without exposing its contents.
+pub fn guidance(home: Option<&Path>, name: &str) -> Result<Value> {
+    let state = guidance_copy(home, name)?;
+    Ok(json!({
+        "skill": name,
+        "status": state,
+        "scope": "caller HOME",
+        "remedy": (state != "current").then(|| format!("cadence skill install {name} (review local changes first)")),
+        "live_session": "not checked"
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guidance_checks_only_the_requested_bundle_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        sync(home.path(), false, Some("deliverable-qa")).unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "missing"
+        );
+        sync(home.path(), false, Some("cadence")).unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "current"
+        );
+        std::fs::write(
+            canonical_root(home.path()).join("cadence/SKILL.md"),
+            b"different",
+        )
+        .unwrap();
+        assert_eq!(
+            guidance(Some(home.path()), "cadence").unwrap()["status"],
+            "stale"
+        );
+        assert_eq!(guidance(None, "cadence").unwrap()["status"], "unknown");
+    }
 
     #[test]
     fn already_current_update_uses_this_process_and_rollback_uses_the_restored_sha() {
@@ -627,5 +582,227 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("foreign"));
+    }
+
+    #[test]
+    fn website_builder_selects_only_its_own_bundle() {
+        let only = selected(Some("website-builder")).unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].name, "website-builder");
+        assert!(SKILL_NAMES.contains(&"website-builder"));
+    }
+
+    #[test]
+    fn website_builder_install_writes_all_ten_files_then_second_sync_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("website-builder")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("website-builder");
+        for (path, _) in WEBSITE_BUILDER.files {
+            assert!(root.join(path).is_file(), "missing {path}");
+        }
+        assert_eq!(WEBSITE_BUILDER.files.len(), 10);
+
+        let second = sync(dir.path(), false, Some("website-builder")).unwrap();
+        assert_eq!(second["wrote"], false);
+    }
+
+    #[test]
+    fn skill_show_lists_manifest_with_byte_counts_and_refuses_unknown_file() {
+        let manifest = match show("website-builder", None).unwrap() {
+            ShowOutput::Manifest(value) => value,
+            ShowOutput::File(_) => panic!("manifest expected"),
+        };
+        assert_eq!(manifest["name"], "website-builder");
+        let files = manifest["files"].as_array().unwrap();
+        assert_eq!(files.len(), 10);
+        for row in files {
+            assert!(row["bytes"].as_u64().unwrap() > 0);
+        }
+        match show("website-builder", Some("scripts/next.py")).unwrap() {
+            ShowOutput::File(text) => assert_eq!(
+                text,
+                include_str!("../skills/website-builder/scripts/next.py")
+            ),
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+        let refused = show("website-builder", Some("../../etc/passwd"));
+        assert!(refused.is_err());
+        assert!(show("no-such-skill", None).is_err());
+    }
+
+    /// company-outputs installs business-documents with it; `show` must name
+    /// the bundle the caller asked for, not the first entry of that selection.
+    #[test]
+    fn skill_show_names_the_requested_bundle_not_its_dependency() {
+        let paths = |value: &Value| -> Vec<String> {
+            value["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let company = match show("company-outputs", None).unwrap() {
+            ShowOutput::Manifest(value) => value,
+            ShowOutput::File(_) => panic!("manifest expected"),
+        };
+        assert_eq!(company["name"], "company-outputs");
+        assert!(paths(&company).contains(&"references/proposal.md".to_string()));
+        let business = match show("business-documents", None).unwrap() {
+            ShowOutput::Manifest(value) => value,
+            ShowOutput::File(_) => panic!("manifest expected"),
+        };
+        assert_eq!(business["name"], "business-documents");
+        assert!(!paths(&business).contains(&"references/proposal.md".to_string()));
+    }
+
+    #[test]
+    fn incident_response_bundle_installs_skill_and_generic_postmortem_template() {
+        assert!(SKILL_NAMES.contains(&"incident-response"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("incident-response")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("incident-response");
+        assert!(root.join("SKILL.md").is_file());
+        assert!(root.join("references/postmortem-template.html").is_file());
+
+        let second = sync(dir.path(), false, Some("incident-response")).unwrap();
+        assert_eq!(second["wrote"], false);
+
+        match show(
+            "incident-response",
+            Some("references/postmortem-template.html"),
+        )
+        .unwrap()
+        {
+            ShowOutput::File(html) => {
+                assert!(html.contains("--doc-accent"));
+                assert!(html.contains("@page"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+    }
+
+    #[test]
+    fn deliverable_qa_bundle_installs_one_procedure_with_the_gate_pass_lines() {
+        assert!(SKILL_NAMES.contains(&"deliverable-qa"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("deliverable-qa")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("deliverable-qa");
+        assert!(root.join("SKILL.md").is_file());
+        let second = sync(dir.path(), false, Some("deliverable-qa")).unwrap();
+        assert_eq!(second["wrote"], false);
+        match show("deliverable-qa", Some("SKILL.md")).unwrap() {
+            ShowOutput::File(text) => {
+                // The exact two lines the merge gate counts (scripts/enqueue-reviewed).
+                assert!(text.contains("Browser QA: pass\n   Head: <full 40-hex sha>"));
+                assert!(text.contains("never approves on a person's behalf"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+    }
+
+    #[test]
+    fn cadence_app_dev_bundle_installs_skill_references_and_gemini_provider_link() {
+        assert!(SKILL_NAMES.contains(&"cadence-app-dev"));
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("cadence-app-dev")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("cadence-app-dev");
+        for relative in [
+            "SKILL.md",
+            "references/contracts-and-storage.md",
+            "references/bridge-and-ui.md",
+            "references/release-and-catalog.md",
+        ] {
+            assert!(root.join(relative).is_file(), "missing {relative}");
+        }
+        for parent in [
+            ".claude/skills",
+            ".cursor/skills",
+            ".copilot/skills",
+            ".gemini/skills",
+        ] {
+            let link = dir.path().join(parent).join("cadence-app-dev");
+            assert!(
+                link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "expected symlink at {}",
+                link.display()
+            );
+            assert_eq!(std::fs::read_link(&link).unwrap(), root);
+        }
+        let second = sync(dir.path(), false, Some("cadence-app-dev")).unwrap();
+        assert_eq!(second["wrote"], false);
+        let report = status(dir.path());
+        let entry = report["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "cadence-app-dev")
+            .expect("cadence-app-dev status entry");
+        assert_eq!(entry["installed"], true);
+        assert_eq!(entry["content_match"], true);
+        for provider in ["claude", "cursor", "copilot", "gemini"] {
+            assert_eq!(entry["links"][provider], "ok", "provider {provider}");
+        }
+        match show("cadence-app-dev", Some("SKILL.md")).unwrap() {
+            ShowOutput::File(text) => {
+                assert!(text.contains("createScreenBridge"));
+                assert!(text.contains("preventDefault"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+        match show(
+            "cadence-app-dev",
+            Some("references/contracts-and-storage.md"),
+        )
+        .unwrap()
+        {
+            ShowOutput::File(text) => {
+                assert!(text.contains("app-storage/v1"));
+                assert!(text.contains("capability_slots"));
+                assert!(text.contains("agent-side and unattested"));
+            }
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+    }
+
+    #[test]
+    fn cad2092_stage_agent_skills_exposes_only_selected_and_enforces_required() {
+        let state = tempfile::tempdir().unwrap();
+        // Turning off required `cadence` is refused.
+        let err = stage_agent_skills(state.path(), "worker-1", &["deliverable-qa".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("required skill 'cadence'"));
+
+        // Unknown / path-traversal names are refused.
+        assert!(stage_agent_skills(
+            state.path(),
+            "worker-1",
+            &["cadence".to_string(), "../escape".to_string()],
+        )
+        .is_err());
+
+        // Stage two skills: only those two exist under agents/worker-1/skills.
+        let first = stage_agent_skills(
+            state.path(),
+            "worker-1",
+            &["cadence".to_string(), "deliverable-qa".to_string()],
+        )
+        .unwrap();
+        assert_eq!(first.len(), 2);
+        let root = state.path().join("agents/worker-1/skills");
+        assert!(root.join("cadence/SKILL.md").is_file());
+        assert!(root.join("deliverable-qa/SKILL.md").is_file());
+        assert!(!root.join("website-builder").exists());
+
+        // Narrowing selection prunes previously staged unselected skills.
+        let second =
+            stage_agent_skills(state.path(), "worker-1", &["cadence".to_string()]).unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(root.join("cadence/SKILL.md").is_file());
+        assert!(!root.join("deliverable-qa").exists());
     }
 }

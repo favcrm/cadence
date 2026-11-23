@@ -45,14 +45,34 @@ function onPopState(): void {
   notify();
 }
 
+/** Fired after every in-app `navigate`, for readers of `location.hash`. */
+export const NAVIGATED = "cadence:navigated";
+
 const snapshot = () => location.pathname + location.search;
 
 export function navigate(href: string, opts: { replace?: boolean } = {}): void {
+  // A trusted credential-entry URL is a DIFFERENT origin; history.pushState
+  // cannot cross origins (SecurityError). Follow it as a real top-level
+  // navigation, which is also what the entry boundary requires.
+  try {
+    const target = new URL(href, location.href);
+    if (
+      (target.protocol === "http:" || target.protocol === "https:") &&
+      target.origin !== location.origin
+    ) {
+      window.location.assign(target.href);
+      return;
+    }
+  } catch {
+    // A relative or malformed href falls through to the router's own rules.
+  }
   if (href === snapshot()) return;
   if (navigationGuard && !navigationGuard()) return;
   if (opts.replace) history.replaceState(null, "", href);
   else history.pushState(null, "", href);
   notify();
+  // pushState is silent and the route snapshot ignores the hash; a page showing `#heading` listens for this.
+  window.dispatchEvent(new Event(NAVIGATED));
 }
 
 /** The current path plus query; re-renders on every navigation. */

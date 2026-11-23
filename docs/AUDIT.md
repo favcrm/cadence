@@ -6,8 +6,8 @@ the verdict, the reviewer and merger identities, the risk class and
 what triggered it, the operator approval for human-class merges, the
 gate summary, and the post-merge outcome. It exists because review
 evidence already lives in six places — merge commits, the
-`qa-verdict` commit status, verdict and ops notes under
-`/var/www/agent-notes/`, tracker folders, the daemon's own event and
+`qa-verdict` commit status, verdict and ops notes in the notes
+directory (`notes_dir`), tracker folders, the daemon's own event and
 verdict tables, and the daemon's operator approval records — and
 nobody should have to re-derive a merge's provenance by hand.
 
@@ -31,39 +31,112 @@ cadence audit --json --limit 50        # machine form for digests/tiles
 `--since` accepts `24h`, `7d`, `2w`, `YYYY-MM-DD` or a unix epoch.
 `--limit 0` means no cap (default 200).
 
-Three read-only verbs serve `scripts/enqueue-reviewed` (CAD-959), which
+Three read-only verbs serve `scripts/enqueue-reviewed`, which
 decides before a merge what the audit reports after it:
 
 ```bash
-cadence audit approval --pr 84 --head <full-sha>   # JSON; exit 0 only when an approval is in force for exactly that head
-cadence audit verdicts --issue CAD-92 --pr 84 --head <full-sha>   # head-pinned verdict notes, plus why others were skipped
-cadence audit scope --issue CAD-92   # CAD-1106: ticket scope pre-approvals (id, body digest, recorded_via, revoked); exit 0 when the store answered
+cadence audit approval --project cadence --issue CAD-92 --pr 84 --head <full-sha>   # JSON; exit 0 only when an approval is in force for exactly that head
+cadence audit verdicts --project cadence --issue CAD-92 --pr 84 --head <full-sha>   # head-pinned verdicts for the selected org, plus why others were skipped
+cadence audit scope --issue CAD-92   # ticket scope pre-approvals (id, body digest, recorded_via, revoked); exit 0 when the store answered
 ```
+
+On a hosted org, `audit verdicts --body` also prints each note's findings for a
+person or agent to read a `REVISE`. The gate does not read that text and it
+never decides a count; see `docs/guides/hosted-workspace.md`.
+
+On a hosted org the approval and verdict reads are project-scoped.
+`--project` is required and is the issue's own project — never inferred from
+`--repo` or the cwd, and never a repo's first project — and `audit approval`
+also requires `--issue`, because an approval is unique per project, issue,
+repo, PR and head. The tenant re-checks the live issue→project relation and the
+project's declared repo on every read, so a moved or removed issue is refused
+rather than answered as countable. A local selection refuses `--project` and
+`--issue`: the local store and the notes folder carry no project attribution,
+and claiming one would be a scope nothing checked.
 
 `audit scope` only lists records; `scripts/enqueue-reviewed` decides which one
 counts (digest equals the sha256 of the trimmed current ticket body,
 `recorded_via` `operator-connection`, not revoked).
 
-`audit verdicts` uses the same note parser as the audit. A reviewer is the
-first whitespace token of `From:`, lower-cased (the rest is prose). Its kind
-comes from the exact title (`Standards`, `Spec/security`, `Browser QA`,
+`audit verdicts` answers for the org this invocation selects: `--org` and
+`CADENCE_ORG` route it exactly as they route every other verb, so an unknown,
+conflicting or unreadable selection refuses — it never reads the notes folder
+instead — and a hosted org reads its own record (and refuses when it cannot)
+rather than this machine's notes. A local selection parses the notes directory
+offline, with the same note parser as the audit; a reviewer is the first
+whitespace token of `From:`, lower-cased (the rest is prose). Its kind comes
+from the exact title (`Standards`, `Spec/security`, `Browser QA`,
 `Review (standards+spec)`); anything else is `other`. Symlinked notes are
-skipped, never followed. Neither verb writes anything or talks to the daemon.
+skipped, never followed. Neither `approval` nor `verdicts` writes anything —
+the verdict read does not even take the registry lock — and the local read
+needs no daemon, state dir or `HOME`.
+
+The review standard is a fresh-session review (AGENTS.md "Review"): a non-author
+session with no inherited context, including a subagent. These verbs do not
+enforce it. The gate counts hosted verdicts by attested principal and refuses the
+author's principal, while local notes count by their self-declared `From:` alias,
+which is not attested. The review workflows and why agents file no hosted verdict
+are described in AGENTS.md "Review" and what a workflow row proves in
+AGENTS.md "What a workflow row proves". Local `v1` and `exception v1` signing in
+`scripts/delivery-gate` is retired; `delivery-gate sign` refuses it.
+
+Workflow row shape: a hosted row with `identity_source: "workflow-oidc"` has no
+`github_login` and carries `run_id`, `run_attempt`, `workflow_sha`, `jti` and
+`base_sha`, all strings. The tenant writes it (`projectVerdictEntry`) and
+`verdict_entry` in `src/delivery/hosted_gate.rs` is the one reader. What the gate
+counts is in AGENTS.md "Review"; what a workflow row proves and does not is
+in AGENTS.md "What a workflow row proves".
+
+The document says where it came from: `origin` is `local` for the
+note parse and `hosted` for the org's record, and the merge gate applies the
+attested rule only to `hosted`. A hosted read takes `--project` and `--repo`
+(the default repo is the cwd checkout's github.com origin), sends both, and
+refuses an answer naming another project or repository; each hosted entry
+carries `repo`, `reviewer_id` and `github_login`, except a workflow-issued row,
+which has no `github_login`. A local read refuses
+`--repo` and `--project`, because notes are neither repo- nor project-scoped.
+The binding itself is the workspace owner's record — the GitHub login once for
+the workspace, and the project's review set as principals:
+
+```bash
+cadence audit identities   # JSON: the workspace's principal→GitHub-login attestation map
+cadence audit identities set --identity user_a=alice --identity user_b=bob   # owner only, `audit.approve`; replaces the whole map
+cadence audit reviewers --project cadence   # JSON: that project's eligible principals, joined to the attested logins
+cadence audit reviewers set --project cadence --reviewer user_a --reviewer user_b   # owner only, `audit.approve`; replaces the project's whole set
+```
+
+Both writes require the same opt-in `audit.approve` login as `audit approve`.
+Eligibility is a project fact and the login is a workspace attestation, so a
+project set names principals only: a `--reviewer login=subject` row is refused
+with the two-step remedy. A principal with no attested login reads back as
+`github_login: null` and its verdicts cannot count yet. Leaving a reviewer out
+of the project's set stops new verdicts for that project only: rows already
+filed keep their stored principal and login and stay countable for their head,
+because evidence must never be erasable — an owner must not be able to hide a
+`revise` by unbinding.
 
 Two operator verbs write the approval evidence the report reads (see
 [Operator approval evidence](#operator-approval-evidence-the-human-class-gate)):
 
 ```bash
-cadence audit approve --pr 84 --head 011d212bb5314e5c2dee959e7156732728a31018 \
-    --source "chris in chat 2026-09-20T22:33Z"   # --repo defaults to the cwd's origin
-cadence audit revoke merge-pr84-011d212bb531 --source "chris" --reason "head moved"
+cadence audit approve --project cadence --issue CAD-92 --pr 84 \
+    --head 011d212bb5314e5c2dee959e7156732728a31018 \
+    --source "<who approved, where>"   # --repo defaults to the cwd's origin
+cadence audit revoke merge-pr84-011d212bb531 --source "<who revoked, where>" --reason "head moved"
 ```
+
+On a hosted org the merge approval names its project and the ticket it
+authorizes as well as the exact head: the tenant records it uniquely per
+project, issue, repo, PR and head, so an approval for another ticket never
+answers this one, and the receipt must echo exactly what was sent. A local
+approval is repo-scoped and refuses `--project`; `--issue` there remains the
+scope pre-approval (`--action scope`) and never mixes with `--pr`.
 
 ## Each row
 
 ```
 #63 session start|end: one-verb session gate and teardown (CAD-92)
-    merge 33a6a82 · merged_at 2026-09-20T10:53:00Z · merger cc-syntax
+    merge 33a6a82 · merged_at 2026-09-20T10:53:00Z · merger acme-bot
     reviewed_head 7896dd27 · landed_head 7896dd273 · contains_head yes (patch-id match)
     verdict pass · qa-verdict SUCCESS · reviewer qa-1 · reviewer@gh qa-bot
     class notify · trigger deletion and lifecycle paths; fourth review round
@@ -71,7 +144,7 @@ cadence audit revoke merge-pr84-011d212bb531 --source "chris" --reason "head mov
     auditor_check What an auditor should check after the merge: …
     residue CAD-147
     outcome tree_match=yes (patch-id match) smoke=unknown (no smoke record) daemon_restart=… revert=no
-    approval operator-claimed · id merge-pr63-7896dd273503 · source "chris in chat" · head 7896dd273 · recorded 2026-09-20T10:50:02Z (before merge) · unverified until CAD-280
+    approval operator-claimed · id merge-pr63-7896dd273503 · source "operator in chat" · head 7896dd273 · recorded 2026-09-20T10:50:02Z (before merge) · unverified until CAD-280
 ```
 
 - **merge** — the squash commit on the default branch (from `git log`;
@@ -140,7 +213,7 @@ is true of this merge and not of the fleet as a whole.
   different identity namespace. When every identity is one account,
   the match is structural — see the digest below.
 
-## The digest: structural facts are reported once (CAD-207)
+## The digest: structural facts are reported once
 
 When every GitHub login the fleet names — every `mergedBy` of every
 merged PR the run fetched, and the `qa-verdict` status creator on
@@ -155,7 +228,7 @@ and buries the real findings, so in that case the match is:
 - reported **once**, as a summary line:
 
   ```
-  structural: 34 merge(s) share GitHub identity cc-syntax — the qa-verdict status and the merge were made by the same GitHub account on every row that has both — …; reported once, not flagged (docs/AUDIT.md)
+  structural: 34 merge(s) share GitHub identity acme-bot — the qa-verdict status and the merge were made by the same GitHub account on every row that has both — …; reported once, not flagged (docs/AUDIT.md)
   summary: 36 row(s), 2 flagged — no-passing-verdict, no-passing-verdict
   ```
 
@@ -169,7 +242,7 @@ determination is made over the whole fetch, not the rendered window:
 a narrow `--since`/`--class`/`--project`/`--limit` cannot turn a real
 self-review into a structural one. Mergers cover every merged PR
 `gh pr list` returned, and the fact is decided only once the status
-of every one of those PRs is in hand (CAD-287). A `--merge-report`
+of every one of those PRs is in hand. A `--merge-report`
 fixture holds them all. A live run fetches statuses only for the
 rendered rows (fetching the rest would cost one API call per PR), so
 when any fetched PR is outside the window — or its status fetch
@@ -188,7 +261,7 @@ Class `human` merges wait for the operator
 can only verify that gate if the approval exists as durable evidence
 bound to the exact head that landed — PR #84's approval lived only in
 a queue message that was later cancelled, invisible to every
-after-the-fact reconstruction (CAD-217).
+after-the-fact reconstruction.
 
 **Records.** `cadence audit approve` writes one `approval_recorded`
 event; `cadence audit revoke` writes one `approval_revoked` event.
@@ -217,7 +290,7 @@ no `--id` the daemon counts the default up (`<base>-2`, …), so
 `approve → revoke → approve` records a fresh approval.
 
 **Who may record.** Only an operator connection, by exactly the rule
-`slot_reconcile` applies (CAD-230, CAD-276). The daemon derives the
+`slot_reconcile` applies. The daemon derives the
 caller from the socket's `SO_PEERCRED` pid and its `/proc` ancestry: a
 caller that descends from a registered pane or an enrolled managed
 endpoint is an agent and is refused, and so is one that is not
@@ -227,25 +300,41 @@ and no `CADENCE_ALIAS`, no pane's pty on its stdio, and a session
 leader on its own ancestry). Identity-shaped request fields (`by`,
 `operator`, `actor`, `alias`, `lane`, `pid`, `pane`, `recorded_via`)
 are refused rather than read. Worker output, worker messages and queue
-messages are never authority. Accepted residual, inherited from
-CAD-276: a same-uid process that leaves every agent's ancestry without
+messages are never authority. Accepted residual: a same-uid process that leaves every agent's ancestry without
 orphaning its session (`setsid -f`) and scrubs its env and stdio still
-passes. Operator-by-positive-proof as a design decision
-(tracker issue **CAD-280**, "operator by positive proof") will replace this rule for
-board writes, `slot_reconcile` and these verbs alike.
+passes.
 
-Board writes moved first (CAD-313, ADR 0004 phase 1): the board's
+On the default store, daemon operator verbs, rollout verbs and the board's
+peer proof also refuse a caller with a known coding-agent runtime variable on
+its ancestry. This is a guardrail against accidents, not a boundary:
+an agent that scrubs its environment and leaves the marked ancestry (`setsid -f
+env -i`), or starts through `systemd-run`, cron or `ssh localhost`, still passes.
+Other stores are not covered. The check compares the store with the default in
+the environment of the process that runs it. For daemon verbs and the board that
+is the service, as set when it started: a service pinned to the real store but
+started with `HOME` or `CADENCE_HOME` moved (`XDG_STATE_HOME` on the legacy
+layout) is unguarded on those paths until it restarts from the normal
+environment. For rollout verbs and `cadence update` it is the caller: moving
+those variables on the call while pinning the real store skips the guard.
+`cadence daemon
+start` and `cadence ui start` strip these variables from the service they start,
+because a service started from an agent's shell is not that agent, so a board
+started that way still passes. A direct `cadence ui run` from an agent's shell is
+not stripped, and neither is a marked board that outlives a daemon restart.
+
+Board writes moved first (ADR 0004 phase 1): the board's
 operator is the holder of a session opened with a `cadence ui login`
 link, and minting that link needs this same proof **plus** the
 operator secret file. The residual carries over: a same-uid process
 that reads `<state>/operator/secret` and passes the proof can mint a
 link. A process cadence launched (a pane, a managed endpoint, a runner,
 anything the daemon started) must evade the proof — `setsid -f` with a
-scrubbed env and stdio (`operator_secret_theft_residual_pinned` pins
-it). **A same-uid process cadence never launched needs no evasion at
-all**: an agent CLI the operator started by hand, outside every
-registered pane, passes the proof as it is (the PR #249 reviewer minted
-a link from its own Claude Code shell), and can read the file. A board
+scrubbed env and stdio. No test pins this.
+**A same-uid process cadence never launched needs little or no
+evasion**: an agent CLI the operator started by hand, outside every
+registered pane, passes the proof as it is when it carries no known
+marker or runs on another store, and otherwise has to scrub its
+environment and leave the marked ancestry. Either way it can read the file. A board
 session is two credentials: the HttpOnly cookie and a key the signed-in
 tab keeps in its `sessionStorage` and sends as `X-Cadence-Session`.
 Phase 1 therefore refuses cadence-launched agents, relays, forged
@@ -268,7 +357,7 @@ to this machine in agent-written markdown are never clickable, and
 there is no failed-login rate limit (a shared budget let an agent lock
 the operator out). These audit verbs do not take the secret yet (ADR 0004 §12, Q7).
 
-**Delegated approvals (CAD-918).** `cadence audit designate` and
+**Delegated approvals.** `cadence audit designate` and
 `cadence audit approve --issue <ID> --action scope` are operator-connection
 verbs with the proof above, and the master can never request either. A
 designated agent records `cadence audit approve --delegated` from its own
@@ -294,7 +383,7 @@ is the operator's alone. No reader counts it as an operator approval:
 delegated approval does not satisfy `enqueue-reviewed` yet — consistent
 with evidence only until CAD-814 slice 2.
 
-**Bounded workflow authority (CAD-225).** Operator-issued unattended workflow
+**Bounded workflow authority.** Operator-issued unattended workflow
 grants have separate native admission, enqueue-intent and enqueue observations.
 Audit output attributes that scoped authority to its grant, worker, independent
 reviewer, exact report and delivery policy. It does not mint a per-head operator
@@ -417,6 +506,28 @@ passes, and any same-uid process can write the SQLite file directly —
 hence `operator-claimed`, never verified, until CAD-280. The record's
 `source` is the operator's own statement of who approved and where.
 
+**Hosted delivery-gate evidence.** On a hosted org, approvals,
+scope/delegated approvals, and `delivery enqueue` do not write local SQLite
+or git notes and need no local daemon. Instead, the tenant Durable Object evaluates
+the gate server-side, requires a fresh 15-minute (`900`s) 6-digit Email-OTP
+step-up for board `Approve & merge`, appends an immutable row to
+`tenant_delivery_evidence`, and signs the PR comment with the hosted Ed25519
+delivery-gate key (`cadence-delivery-gate/v2`). `docs/roles/delivery-gate.allowed_signers`
+trusts only `cadence-hosted-delivery-gate` (`v2`), and `scripts/delivery-gate sign`
+refuses all local `v1` and `--exception` signing. During `merge_group` CI,
+`scripts/delivery-gate verify` accepts only `<!-- cadence-delivery-gate v2 -->`
+SSHSIG comments and confirms the live unrevoked `tenant_delivery_evidence` row
+with GitHub Actions OIDC (`id-token: write`) at
+`POST https://<host>/__platform/delivery-gate/verify`. When a workflow review
+(`identity_source: "workflow-oidc"`) records a verdict on an open hosted ticket,
+the tenant DO atomically binds the canonical
+`https://github.com/<owner>/<repo>/pull/<n>` `pr` ref onto that ticket. The CLI
+verbs (`delivery check`, `delivery enqueue`, `audit scope`, `audit approve`
+`--action scope`/`--delegated`, `audit designate`, `audit designations`,
+`audit digest`, `audit revoke`) and `scripts/enqueue-reviewed --org <org>`
+all fail closed when a hosted org is unreachable or returns a refusal. The gate's
+mechanics for a hosted org are in [guides/delivery.md](guides/delivery.md).
+
 What the audit **cannot** detect:
 
 - Whether the GitHub login that posted `qa-verdict` is the same human
@@ -451,7 +562,7 @@ was down".
       "qa_verdict_status": "SUCCESS", "qa_verdict_creator": "qa-bot",
       "status_post_hoc": false,
       "verdict": "pass", "verdict_post_hoc": false,
-      "reviewer": "qa-1", "merger": "cc-syntax",
+      "reviewer": "qa-1", "merger": "acme-bot",
       "class": "notify", "trigger": "…",
       "gates": ["…raw lines…"],
       "gate_summary": {"suite": "256/256", "stress": null, "flakes": null},
@@ -492,7 +603,7 @@ fleet-level fact:
 `{code: "shared-github-identity", match: "reviewer==merger",
 identity, rows, explanation}`.
 
-Stability contract for CAD-87's digest and the Overview tile: field
+Stability contract for the digest and the Overview tile: field
 names, nesting and the `schema` tag do not change; new fields may be
 added. Every field that a source could not prove is `null` in JSON and
 `unknown` in text, with the reason in `unknowns[]` — the audit never
@@ -506,7 +617,7 @@ and `--merge-report <path>` substitute the notes directory and every
 fixture is a hard error — a fixture can never fall back to a live
 scan, and in fixture mode `gh` is never invoked.
 
-## Platform custody events (ADR 0006 §5.5, CAD-366)
+## Platform custody events (ADR 0006 §5.5)
 
 Connected-platform custody verbs write their audit to a dedicated
 stream, `audit:platforms` — like `audit:approvals` the name is no

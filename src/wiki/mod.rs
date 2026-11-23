@@ -38,7 +38,6 @@
 //! layer additionally refuses any symlinked component.
 
 use std::collections::BTreeSet;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,16 +48,27 @@ use unicode_normalization::UnicodeNormalization;
 use crate::error::{Error, Result};
 use crate::issue::Pm;
 
+mod blob;
 pub mod cli;
 pub mod collection;
 pub mod correction;
 pub mod envelope;
 pub mod index;
 pub mod ingest;
+mod read;
 pub mod revision;
 pub mod transfer;
 pub mod transfer_client;
+pub mod trash;
 pub mod upload;
+
+#[cfg(test)]
+use blob::sha256_file;
+pub(crate) use blob::sniff_mime;
+use blob::{blob_view, read_blob_slice};
+pub use blob::{put_blob, UPLOAD_DIR};
+use read::{json_string_len, oversize};
+pub use read::{json_u64, read, read_range, read_revision, read_revision_for_evidence, BodyRange};
 
 /// `if_rev` value meaning "the page does not exist yet" — a
 /// create-only write. Any real content rev is `fnv1a:<16 hex>`.
@@ -84,6 +94,76 @@ const VIEW_CAP: u64 = 1_048_576;
 /// its stdout newline stays strictly under this. It is not a new cap:
 /// an unbounded `read` still returns the whole page.
 pub const NATIVE_TOOL_LINE_BOUND: usize = 50_000;
+
+/// CAD-2187: the project a wiki path names, when it names one.
+///
+/// Both `projects/<key>/…` and the virtual
+/// `agents/<alias>/memory/<key>/…` view carry the project's policy.
+/// `global/` names no project.
+fn project_of_path(path: &str) -> Option<&str> {
+    let rest = if let Some(rest) = path.strip_prefix("projects/") {
+        rest
+    } else {
+        let (_, rest) = path.strip_prefix("agents/")?.split_once('/')?;
+        rest.strip_prefix("memory/")?
+    };
+    let (key, _) = rest.split_once('/').unwrap_or((rest, ""));
+    (!key.is_empty()).then_some(key)
+}
+
+/// This caller's spelling in a project policy — the one the board writes.
+pub(super) fn policy_spelling(caller: &Caller) -> String {
+    match caller {
+        Caller::Operator => "operator".to_string(),
+        Caller::Agent { alias, .. } => format!("agents/{alias}"),
+        Caller::User(handle) => format!("users/{handle}"),
+        // The policy knows `operator`, `users/`, `agents/` and `service/`.
+        // A public caller is none of those, but a project with no policy or a
+        // workspace-visible one admits everyone — `service/public` carries that
+        // meaning, where the unknown spelling `public` would deny every project.
+        Caller::Public => "service/public".to_string(),
+    }
+}
+
+/// CAD-2187: a project's pages answer only to callers its policy admits.
+///
+/// This lives in the store rather than in a route because every read
+/// arrives here — file, listing, history, transfer export, the board's
+/// envelope relay, the CLI — so a new surface cannot forget it, which is the
+/// way a per-route check fails. The refusal is worded exactly as a missing
+/// page, so it cannot be used to ask whether a project exists; an unreadable
+/// tracker yields an empty set and therefore refuses every project page,
+/// while `global` is untouched.
+fn admitted(pm: &Pm, caller: &Caller, path: &str) -> bool {
+    let Some(project) = project_of_path(path) else {
+        return true;
+    };
+    admitted_project(pm, caller, project)
+}
+
+fn admitted_project(pm: &Pm, caller: &Caller, project: &str) -> bool {
+    crate::project_policy::readable(pm, &policy_spelling(caller)).contains(project)
+}
+
+/// The refusal a page read gives, worded as the store's own missing-file one.
+fn no_such_page(path: &str) -> Error {
+    Error::rejected(format!("wiki read '{path}': no such file"))
+}
+
+/// The refusal a listing gives, worded as the store's own missing-directory one.
+fn no_such_directory(path: &str) -> Error {
+    Error::rejected(format!("wiki ls '{path}': no such directory"))
+}
+
+/// The export path's name for [`admitted`]: `transfer` is a child module, so
+/// it reaches the store's project gate through this instead of re-deriving it.
+pub(crate) fn admitted_for_export(pm: &Pm, caller: &Caller, path: &str) -> Result<()> {
+    if admitted(pm, caller, path) {
+        Ok(())
+    } else {
+        Err(no_such_page(path))
+    }
+}
 
 /// Who the daemon derived from the connection — never a request
 /// field. `wiki_as` on an operator connection produces the same
@@ -146,7 +226,29 @@ impl Op {
 /// policy is a change to the table.
 ///
 /// `segs` are normalized segments (empty = the root, for `ls`).
-pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
+pub fn allowed(pm: &Pm, caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
+    // CAD-2187: a project the caller's policy does not admit is not a place
+    // they can see or change. This check sits in `allowed` — the one function
+    // every operation already calls, read and write alike — because a check
+    // per route is a list that the next route forgets, and the reviews found
+    // five such doors before the gate moved here.
+    let project = match segs {
+        ["projects", key, ..] | ["agents", _, "memory", key, ..] => Some(*key),
+        _ => None,
+    };
+    if let Some(key) = project {
+        if !admitted_project(pm, caller, key) {
+            return Err(no_such_page(&segs.join("/")));
+        }
+    }
+    allowed_by_table(caller, op, segs)
+}
+
+/// The coarse ACL alone — what every caller was checked against before the
+/// project policy existed. Kept separate because a caller that is not reading
+/// or writing as itself (the trash scan asking whether the operator *could*
+/// write an origin) has no `Pm`-bearing request to consult.
+pub(crate) fn allowed_by_table(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     let verb = || format!("wiki {} '/{}' refused", op.as_str(), segs.join("/"));
     let no = |why: &str| -> Result<()> { Err(Error::rejected(format!("{}: {why}", verb()))) };
     // CAD-615: the operator's permission rules. Not a knowledge page,
@@ -335,9 +437,10 @@ pub fn normalize_dir(path: &str) -> Result<String> {
 }
 
 /// The vault this tracker serves — [`crate::home::vault_for`]:
-/// `<home>/vault` under `CADENCE_HOME`, the served tracker's `wiki/`
-/// under the legacy layout (the daemon's tracker is instance-bound,
-/// so the vault follows `pm.dir`, not the process env).
+/// `<home>/vault` under `CADENCE_HOME` or when the served tracker sits
+/// inside the home, the tracker's own `wiki/` otherwise (the daemon's
+/// tracker is instance-bound, so the vault follows `pm.dir`, not the
+/// process env).
 pub fn vault_dir(pm: &Pm) -> Result<PathBuf> {
     crate::home::vault_for(&pm.dir)
 }
@@ -437,6 +540,61 @@ fn rev_of(abs: &Path) -> Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ABSENT.to_string()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// What a logical wiki name currently is on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    None,
+    Text,
+    Dir,
+    Blob,
+}
+
+/// The logical entry at `abs`: a text page `x`, a directory `x/` or a
+/// blob pointer `x.blob`. Call it only while holding `pm.lock()`.
+/// Two spellings present at once is ambiguous and refused.
+fn entry_kind(abs: &Path, norm: &str) -> Result<Kind> {
+    let mut ptr = abs.as_os_str().to_owned();
+    ptr.push(".blob");
+    let text = match abs.symlink_metadata() {
+        Ok(m) if m.is_dir() => Some(Kind::Dir),
+        Ok(_) => Some(Kind::Text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let blob = match Path::new(&ptr).symlink_metadata() {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    match (text, blob) {
+        (Some(_), true) => Err(Error::rejected(format!(
+            "wiki '{norm}' refused: ambiguous — both '{norm}' and '{norm}.blob' exist"
+        ))),
+        (Some(k), false) => Ok(k),
+        (None, true) => Ok(Kind::Blob),
+        (None, false) => Ok(Kind::None),
+    }
+}
+
+/// The logical entry kind at `norm`, after refusing a parent that is a
+/// page: creating a missing parent directory beside `p.blob` (or over a
+/// text page `p`) would hide it. Call it only while holding `pm.lock()`.
+fn logical_kind(vault: &Path, norm: &str) -> Result<Kind> {
+    let segs: Vec<&str> = norm.split('/').collect();
+    for i in 1..segs.len() {
+        let parent = segs[..i].join("/");
+        match entry_kind(&resolve(vault, &parent)?, &parent)? {
+            Kind::Dir | Kind::None => {}
+            Kind::Text | Kind::Blob => {
+                return Err(Error::rejected(format!(
+                    "wiki '{norm}' refused: '{parent}' is a page, not a directory"
+                )))
+            }
+        }
+    }
+    entry_kind(&resolve(vault, norm)?, norm)
 }
 
 pub(crate) fn rev_bytes(bytes: &[u8]) -> String {
@@ -604,12 +762,17 @@ fn blob_meta(pointer: &Path) -> Result<Value> {
 /// logical name.
 pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     let norm = normalize_dir(path)?;
+    // Normalized first, and the check reads the same spelling: a project
+    // recorded in NFC must not be refused because the caller typed NFD.
+    if !admitted(pm, caller, &norm) {
+        return Err(no_such_directory(&norm));
+    }
     let segs: Vec<&str> = if norm.is_empty() {
         Vec::new()
     } else {
         norm.split('/').collect()
     };
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     let vault = vault_dir(pm)?;
 
     // The root: the fixed top-level folders.
@@ -676,7 +839,11 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             if segs.len() == 3 {
                 // Project dirs holding lessons this agent authored.
                 let mut out = Vec::new();
+                let readable = crate::project_policy::readable(pm, &policy_spelling(caller));
                 for p in memory_projects(pm, &alias)? {
+                    if !readable.contains(&p) {
+                        continue;
+                    }
                     out.push(
                         Entry {
                             path: format!("{base}/{p}"),
@@ -789,10 +956,15 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     let abs = resolve(&vault, &norm)?;
     match abs.symlink_metadata() {
         Ok(m) if m.is_dir() => {
-            let entries = read_dir_entries(&abs, &norm)?
-                .iter()
-                .map(Entry::json)
-                .collect::<Vec<_>>();
+            let mut entries = read_dir_entries(&abs, &norm)?;
+            // `projects/` names no single project, so the gate above admits it
+            // — but listing it would name every project, including the ones
+            // this caller cannot read. A child they cannot read is dropped, not
+            // marked: a listing must not enumerate what a page cannot show.
+            if norm == "projects" {
+                entries.retain(|entry| admitted(pm, caller, &entry.path));
+            }
+            let entries = entries.iter().map(Entry::json).collect::<Vec<_>>();
             Ok(json!({"path": norm, "entries": entries}))
         }
         Ok(m) if m.is_file() => Err(Error::rejected(format!(
@@ -886,666 +1058,6 @@ fn profile_file(pm: &Pm, alias: &str, name: &str) -> Result<PathBuf> {
     }
 }
 
-/// One bounded read of an original text page. `offset` is a UTF-8 byte
-/// index. `bytes` is the maximum length; `None` returns the longest
-/// slice from `offset` that fits [`NATIVE_TOOL_LINE_BOUND`]. `rev`,
-/// when set, must be the original page revision — a mismatch returns
-/// no body.
-pub struct BodyRange<'a> {
-    pub offset: u64,
-    pub bytes: Option<u64>,
-    pub rev: Option<&'a str>,
-}
-
-struct TextPage {
-    path: String,
-    text: String,
-    /// Revision of the whole original, not of the returned slice.
-    rev: String,
-}
-
-enum Opened {
-    Dir { path: String },
-    Blob(Value),
-    Text(TextPage),
-}
-
-/// `wiki read` — text as `{kind:"text",text,rev}`; a blob page as
-/// `{kind:"blob",sha256,size,mime,name,rev}` (rev = the pointer's);
-/// a directory as `{kind:"dir"}`. View paths read their source.
-/// The text `rev` is the original body's revision.
-pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
-    match open_page(pm, caller, path)? {
-        Opened::Dir { path } => Ok(json!({"path": path, "kind": "dir"})),
-        Opened::Blob(value) => Ok(value),
-        Opened::Text(page) => Ok(json!({
-            "path": page.path,
-            "kind": "text",
-            "text": page.text,
-            "rev": page.rev,
-            "sha256": transfer::sha256_bytes(page.text.as_bytes()),
-        })),
-    }
-}
-
-/// Read `path` at `at`. This does not call [`read`] when the selector
-/// misses: an unknown, ambiguous, or non-commit name is an error.
-pub fn read_revision(
-    pm: &Pm,
-    caller: &Caller,
-    path: &str,
-    at: &str,
-    range: Option<BodyRange<'_>>,
-) -> Result<Value> {
-    let pinned = revision::pin(pm, caller, path, at)?;
-    let mut value = match (&pinned.body, range) {
-        (revision::Body::Dir, Some(_)) => {
-            return Err(Error::rejected(format!(
-                "wiki revision '{path}' refused: a range read needs a text page or blob"
-            )))
-        }
-        (revision::Body::Dir, None) => json!({
-            "path": pinned.path,
-            "kind": "dir",
-            "rev": Value::Null,
-            "sha256": Value::Null,
-        }),
-        (revision::Body::Text(text), None) => json!({
-            "path": pinned.path,
-            "kind": "text",
-            "text": text,
-            "rev": pinned.rev,
-            "sha256": pinned.sha256,
-        }),
-        (revision::Body::Text(text), Some(range)) => {
-            let page = TextPage {
-                path: pinned.path.clone(),
-                text: text.clone(),
-                rev: pinned.rev.clone(),
-            };
-            text_read_range(page, range)?
-        }
-        (revision::Body::Blob(blob), None) => json!({
-            "path": pinned.path,
-            "kind": "blob",
-            "sha256": blob.sha256,
-            "size": blob.size,
-            "mime": blob.mime,
-            "name": blob.name,
-            "rev": pinned.rev,
-        }),
-        (revision::Body::Blob(blob), Some(range)) => {
-            let meta = json!({
-                "path": pinned.path,
-                "kind": "blob",
-                "sha256": blob.sha256,
-                "size": blob.size,
-                "mime": blob.mime,
-                "name": blob.name,
-                "rev": pinned.rev,
-            });
-            blob_read_range(pm, &meta, range)?
-        }
-    };
-    if let Some(obj) = value.as_object_mut() {
-        // `rev` is the selector the caller asked for. A commit name is not
-        // rewritten to the live FNV token, or the board cannot tell this
-        // page from latest. `git` stays the resolved commit.
-        obj.insert("rev".to_string(), json!(at));
-        obj.insert("at".to_string(), json!(at));
-        obj.insert("git".to_string(), json!(pinned.git));
-        if obj.get("sha256").is_none() {
-            obj.insert("sha256".to_string(), json!(pinned.sha256));
-        }
-    }
-    if value.get("range").is_some() || value.get("data_base64").is_some() {
-        let len = serde_json::to_vec(&value)
-            .map(|body| body.len())
-            .unwrap_or(usize::MAX);
-        if len.saturating_add(1) >= NATIVE_TOOL_LINE_BOUND {
-            return Err(Error::rejected(
-                "wiki revision refused: the historical range does not fit the native tool line bound",
-            ));
-        }
-    }
-    Ok(value)
-}
-
-/// Bounded original-body read. Same authorization and sandbox path as
-/// [`read`]. A text page adds `text` and `range`. A blob page keeps the
-/// pointer metadata and adds `range` plus `data_base64` (standard
-/// base64 of that byte slice). A directory is refused. The reply does
-/// not copy the page or raise [`TEXT_CAP`].
-pub fn read_range(pm: &Pm, caller: &Caller, path: &str, range: BodyRange<'_>) -> Result<Value> {
-    match open_page(pm, caller, path)? {
-        Opened::Text(page) => text_read_range(page, range),
-        Opened::Blob(meta) => blob_read_range(pm, &meta, range),
-        Opened::Dir { .. } => Err(Error::rejected(format!(
-            "wiki read '{path}' refused: a range read needs a text page or blob — \
-             directories have no original text range"
-        ))),
-    }
-}
-
-fn text_read_range(page: TextPage, range: BodyRange<'_>) -> Result<Value> {
-    if let Some(want) = range.rev {
-        if want != page.rev {
-            return Err(Error::rejected(format!(
-                "wiki read '{}' refused: revision '{want}' is not the original \
-                 revision '{}' — ranges are not combined across revisions",
-                page.path, page.rev
-            )));
-        }
-    }
-    let total = page.text.len() as u64;
-    if range.offset > total {
-        return Err(Error::rejected(format!(
-            "wiki read '{}' refused: offset {} is past the original {total} bytes",
-            page.path, range.offset
-        )));
-    }
-    let start = range.offset as usize;
-    if !page.text.is_char_boundary(start) {
-        return Err(Error::rejected(format!(
-            "wiki read '{}' refused: offset {start} is inside a UTF-8 character",
-            page.path
-        )));
-    }
-    let end = match range.bytes {
-        Some(n) => explicit_end(&page, start, n)?,
-        None => fitting_end(&page, start)?,
-    };
-    Ok(ranged_value(&page, start, end))
-}
-
-struct BlobView<'a> {
-    path: &'a str,
-    sha256: &'a str,
-    size: u64,
-    mime: &'a str,
-    name: &'a str,
-    rev: &'a str,
-}
-
-fn blob_str<'a>(meta: &'a Value, key: &str, path: &str) -> Result<&'a str> {
-    meta.get(key).and_then(Value::as_str).ok_or_else(|| {
-        Error::rejected(format!(
-            "wiki read '{path}' refused: blob pointer '{key}' is not a string"
-        ))
-    })
-}
-
-fn blob_view(meta: &Value) -> Result<BlobView<'_>> {
-    let path = blob_str(meta, "path", "")?;
-    let sha256 = blob_str(meta, "sha256", path)?;
-    if sha256.len() != 64
-        || !sha256
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err(Error::rejected(format!(
-            "wiki read '{path}' refused: blob pointer sha256 is not 64 lowercase hex digits"
-        )));
-    }
-    let size = meta.get("size").and_then(Value::as_u64).ok_or_else(|| {
-        Error::rejected(format!(
-            "wiki read '{path}' refused: blob pointer size is not a non-negative integer"
-        ))
-    })?;
-    Ok(BlobView {
-        mime: blob_str(meta, "mime", path)?,
-        name: blob_str(meta, "name", path)?,
-        rev: blob_str(meta, "rev", path)?,
-        path,
-        sha256,
-        size,
-    })
-}
-
-fn blob_ranged_value(view: &BlobView<'_>, start: u64, end: u64, data_base64: String) -> Value {
-    let mut value = json!({
-        "path": view.path,
-        "kind": "blob",
-        "sha256": view.sha256,
-        "size": view.size,
-        "mime": view.mime,
-        "name": view.name,
-        "rev": view.rev,
-        "range": {"start": start, "end": end, "total": view.size},
-    });
-    value["data_base64"] = Value::String(data_base64);
-    value
-}
-
-fn b64_len(n: usize) -> usize {
-    n.div_ceil(3).saturating_mul(4)
-}
-
-fn decimal_len_u64(n: u64) -> usize {
-    if n == 0 {
-        1
-    } else {
-        (n.ilog10() as usize) + 1
-    }
-}
-
-/// Compact length of [`blob_ranged_value`]. Base64 uses the standard
-/// alphabet, which needs no JSON escape. Key order matches `json!`.
-fn blob_line_len(view: &BlobView<'_>, start: u64, end: u64) -> usize {
-    let Ok(n) = usize::try_from(end.saturating_sub(start)) else {
-        return usize::MAX;
-    };
-    if n >= NATIVE_TOOL_LINE_BOUND {
-        return usize::MAX;
-    }
-    "{\"data_base64\":".len()
-        + 2
-        + b64_len(n)
-        + ",\"kind\":\"blob\",\"mime\":".len()
-        + json_string_len(view.mime)
-        + ",\"name\":".len()
-        + json_string_len(view.name)
-        + ",\"path\":".len()
-        + json_string_len(view.path)
-        + ",\"range\":{\"end\":".len()
-        + decimal_len_u64(end)
-        + ",\"start\":".len()
-        + decimal_len_u64(start)
-        + ",\"total\":".len()
-        + decimal_len_u64(view.size)
-        + "},\"rev\":".len()
-        + json_string_len(view.rev)
-        + ",\"sha256\":".len()
-        + json_string_len(view.sha256)
-        + ",\"size\":".len()
-        + decimal_len_u64(view.size)
-        + "}".len()
-}
-
-fn blob_fits(view: &BlobView<'_>, start: u64, end: u64) -> bool {
-    if end < start {
-        return false;
-    }
-    let len = blob_line_len(view, start, end);
-    len.checked_add(1)
-        .is_some_and(|n| n < NATIVE_TOOL_LINE_BOUND)
-}
-
-fn blob_end(view: &BlobView<'_>, start: u64, bytes: Option<u64>) -> Result<u64> {
-    let total = view.size;
-    let end = match bytes {
-        Some(n) => start.saturating_add(n).min(total),
-        None => {
-            let mut lo = start;
-            let mut hi = total;
-            let mut best = None;
-            while lo <= hi {
-                let mid = lo + (hi - lo) / 2;
-                if blob_fits(view, start, mid) {
-                    best = Some(mid);
-                    if mid == total {
-                        break;
-                    }
-                    lo = mid + 1;
-                } else if mid == start {
-                    break;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            best.ok_or_else(|| oversize(view.path))?
-        }
-    };
-    if !blob_fits(view, start, end) {
-        return Err(oversize(view.path));
-    }
-    Ok(end)
-}
-
-fn blob_read_range(pm: &Pm, meta: &Value, range: BodyRange<'_>) -> Result<Value> {
-    let view = blob_view(meta)?;
-    if let Some(want) = range.rev {
-        if want != view.rev {
-            return Err(Error::rejected(format!(
-                "wiki read '{}' refused: revision '{want}' is not the original \
-                 revision '{}' — ranges are not combined across revisions",
-                view.path, view.rev
-            )));
-        }
-    }
-    if range.offset > view.size {
-        return Err(Error::rejected(format!(
-            "wiki read '{}' refused: offset {} is past the original {} bytes",
-            view.path, range.offset, view.size
-        )));
-    }
-    let start = range.offset;
-    let end = blob_end(&view, start, range.bytes)?;
-    let bytes = read_blob_slice(pm, &view, start, end)?;
-    use base64::Engine;
-    let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let value = blob_ranged_value(&view, start, end, data_base64);
-    debug_assert_eq!(
-        blob_line_len(&view, start, end),
-        serde_json::to_string(&value)
-            .map(|encoded| encoded.len())
-            .unwrap_or(usize::MAX)
-    );
-    Ok(value)
-}
-
-/// Read only the requested slice of an immutable, content-addressed object.
-/// Upload verifies its digest; remote cat verifies the assembled bytes once.
-fn read_blob_slice(pm: &Pm, view: &BlobView<'_>, start: u64, end: u64) -> Result<Vec<u8>> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let vault = vault_dir(pm)?;
-    let blobs = blobs_dir(&vault);
-    match blobs.symlink_metadata() {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
-        Ok(_) => {
-            return Err(Error::rejected(format!(
-                "wiki read '{}' refused: blob store is not a real directory",
-                view.path
-            )))
-        }
-        Err(e) => {
-            return Err(Error::rejected(format!(
-                "wiki read '{}' refused: blob store is unavailable: {e}",
-                view.path
-            )))
-        }
-    }
-    let object = blobs.join(view.sha256);
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&object)
-        .map_err(|_| {
-            Error::rejected(format!(
-                "wiki read '{}' refused: blob object is not a regular file",
-                view.path
-            ))
-        })?;
-    let meta = file.metadata().map_err(|e| {
-        Error::rejected(format!(
-            "wiki read '{}' refused: blob object is unreadable: {e}",
-            view.path
-        ))
-    })?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
-        return Err(Error::rejected(format!(
-            "wiki read '{}' refused: blob object is not a regular file",
-            view.path
-        )));
-    }
-    if meta.len() != view.size {
-        return Err(Error::rejected(format!(
-            "wiki read '{}' refused: blob object is {} bytes, pointer size is {}",
-            view.path,
-            meta.len(),
-            view.size
-        )));
-    }
-    let len = usize::try_from(end - start).unwrap_or(usize::MAX);
-    let mut buf = vec![0u8; len];
-    if len > 0 {
-        file.seek(SeekFrom::Start(start)).map_err(|e| {
-            Error::rejected(format!(
-                "wiki read '{}' refused: blob object is unreadable: {e}",
-                view.path
-            ))
-        })?;
-        file.read_exact(&mut buf).map_err(|_| {
-            Error::rejected(format!(
-                "wiki read '{}' refused: blob object is shorter than its pointer",
-                view.path
-            ))
-        })?;
-    }
-    Ok(buf)
-}
-
-/// Optional JSON integer field. Absent is `None`. A float, a negative,
-/// or a non-number is refused — never coerced.
-pub fn json_u64(params: &Value, key: &str) -> Result<Option<u64>> {
-    match params.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| {
-                Error::rejected(format!(
-                    "wiki read refused: '{key}' must be a non-negative integer"
-                ))
-            })
-            .map(Some),
-        Some(_) => Err(Error::rejected(format!(
-            "wiki read refused: '{key}' must be a non-negative integer"
-        ))),
-    }
-}
-
-fn open_page(pm: &Pm, caller: &Caller, path: &str) -> Result<Opened> {
-    let norm = normalize(path)?;
-    if norm.is_empty() {
-        return Err(Error::rejected(
-            "wiki read '' refused: the root is a directory",
-        ));
-    }
-    let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
-    let vault = vault_dir(pm)?;
-
-    match classify(&segs) {
-        View::Profile { alias } => {
-            if segs.len() != 4 {
-                return Err(Error::rejected(format!(
-                    "wiki read '{norm}' refused: profile/ reads are profile/<file>"
-                )));
-            }
-            let file = profile_file(pm, &alias, segs[3])?;
-            let meta = std::fs::metadata(&file)?;
-            if meta.len() > VIEW_CAP {
-                return Err(Error::rejected(format!(
-                    "wiki read '{norm}' refused: file over the {VIEW_CAP}-byte cap"
-                )));
-            }
-            let text = std::fs::read_to_string(&file)
-                .map_err(|e| Error::rejected(format!("wiki read '{norm}': {e}")))?;
-            return Ok(text_page(norm, text));
-        }
-        View::Memory { alias } => {
-            if segs.len() != 5 {
-                return Err(Error::rejected(format!(
-                    "wiki read '{norm}' refused: memory/ reads are \
-                     memory/<project>/<lesson>.md"
-                )));
-            }
-            let file = memory_file(pm, &alias, segs[3], segs[4])?;
-            let text = std::fs::read_to_string(&file)
-                .map_err(|e| Error::rejected(format!("wiki read '{norm}': {e}")))?;
-            return Ok(text_page(norm, text));
-        }
-        View::Real => {}
-    }
-
-    let abs = resolve(&vault, &norm)?;
-    match abs.symlink_metadata() {
-        Ok(m) if m.is_dir() => Ok(Opened::Dir { path: norm }),
-        Ok(m) if m.is_file() => {
-            if m.len() > TEXT_CAP {
-                return Err(Error::rejected(format!(
-                    "wiki read '{norm}' refused: file over the {TEXT_CAP}-byte cap"
-                )));
-            }
-            let text = std::fs::read_to_string(&abs).map_err(|_| {
-                Error::rejected(format!(
-                    "wiki read '{norm}' refused: not UTF-8 text (is it a blob?)"
-                ))
-            })?;
-            Ok(text_page(norm, text))
-        }
-        Ok(_) => Err(Error::rejected(format!("wiki read '{norm}': not a file"))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // A blob page: <path>.blob holds the pointer.
-            let pointer = vault.join(format!("{norm}.blob"));
-            match pointer.symlink_metadata() {
-                Ok(m) if m.is_file() && !m.file_type().is_symlink() => {
-                    let meta = blob_meta(&pointer)?;
-                    Ok(Opened::Blob(json!({
-                        "path": norm,
-                        "kind": "blob",
-                        "sha256": meta.get("sha256").cloned().unwrap_or(Value::Null),
-                        "size": meta.get("size").cloned().unwrap_or(Value::Null),
-                        "mime": meta.get("mime").cloned().unwrap_or(Value::Null),
-                        "name": meta.get("name").cloned().unwrap_or(Value::Null),
-                        "rev": rev_of(&pointer)?,
-                    })))
-                }
-                _ => Err(Error::rejected(format!("wiki read '{norm}': no such file"))),
-            }
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn text_page(path: String, text: String) -> Opened {
-    let rev = rev_bytes(text.as_bytes());
-    Opened::Text(TextPage { path, text, rev })
-}
-
-fn ranged_value(page: &TextPage, start: usize, end: usize) -> Value {
-    json!({
-        "path": page.path,
-        "kind": "text",
-        "rev": page.rev,
-        "text": &page.text[start..end],
-        "range": {
-            "start": start,
-            "end": end,
-            "total": page.text.len(),
-        }
-    })
-}
-
-fn oversize(path: &str) -> Error {
-    Error::rejected(format!(
-        "wiki read '{path}' refused: the range exceeds the \
-         {NATIVE_TOOL_LINE_BOUND}-byte native tool line bound"
-    ))
-}
-
-/// Bytes one UTF-8 byte contributes inside a `serde_json` string.
-/// Controls use the short escapes (`\n`, `\r`, `\t`, `\b`, `\f`); every
-/// other byte below 0x20 is `\u00XX`.
-fn json_byte_escape_len(b: u8) -> usize {
-    match b {
-        b'"' | b'\\' | 0x08 | b'\t' | b'\n' | 0x0c | b'\r' => 2,
-        0x00..=0x1F => 6,
-        _ => 1,
-    }
-}
-
-fn json_string_len(s: &str) -> usize {
-    let mut n = 2;
-    for &b in s.as_bytes() {
-        n += json_byte_escape_len(b);
-    }
-    n
-}
-
-fn decimal_len(n: usize) -> usize {
-    if n == 0 {
-        1
-    } else {
-        (n.ilog10() as usize) + 1
-    }
-}
-
-/// Compact length of [`ranged_value`], matching `serde_json::to_string`.
-/// `json!` maps sort keys, so the line is
-/// `{"kind":"text","path":…,"range":{"end":…,"start":…,"total":…},"rev":…,"text":…}`.
-fn compact_line_len(page: &TextPage, start: usize, end: usize) -> usize {
-    "{\"kind\":\"text\",\"path\":".len()
-        + json_string_len(&page.path)
-        + ",\"range\":{\"end\":".len()
-        + decimal_len(end)
-        + ",\"start\":".len()
-        + decimal_len(start)
-        + ",\"total\":".len()
-        + decimal_len(page.text.len())
-        + "},\"rev\":".len()
-        + json_string_len(&page.rev)
-        + ",\"text\":".len()
-        + json_string_len(&page.text[start..end])
-        + "}".len()
-}
-
-fn line_fits(len: usize) -> bool {
-    len + 1 < NATIVE_TOOL_LINE_BOUND
-}
-
-fn explicit_end(page: &TextPage, start: usize, bytes: u64) -> Result<usize> {
-    let mut end = start.saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
-    if end > page.text.len() {
-        end = page.text.len();
-    }
-    if !page.text.is_char_boundary(end) {
-        return Err(Error::rejected(format!(
-            "wiki read '{}' refused: range end {end} is inside a UTF-8 character",
-            page.path
-        )));
-    }
-    // The JSON line is longer than the raw slice, so a slice that already
-    // meets the line bound cannot fit.
-    if end - start + 1 >= NATIVE_TOOL_LINE_BOUND || !line_fits(compact_line_len(page, start, end)) {
-        return Err(oversize(&page.path));
-    }
-    Ok(end)
-}
-
-/// Largest char-boundary end at or after `start` whose compact JSON
-/// line fits the native tool bound. One forward pass; escaped length
-/// is accumulated, not recomputed, and no JSON string is built.
-fn fitting_end(page: &TextPage, start: usize) -> Result<usize> {
-    let text = page.text.as_str();
-    let limit = start
-        .saturating_add(NATIVE_TOOL_LINE_BOUND.saturating_sub(1))
-        .min(text.len());
-    let base = compact_line_len(page, start, start) - decimal_len(start);
-    let mut end = start;
-    let mut escaped = 0usize;
-    let mut i = start;
-    while i < limit {
-        let ch_end = i + text[i..].chars().next().map(char::len_utf8).unwrap_or(0);
-        if ch_end > limit {
-            break;
-        }
-        let mut add = 0;
-        for &b in &text.as_bytes()[i..ch_end] {
-            add += json_byte_escape_len(b);
-        }
-        let line = base + decimal_len(ch_end) + escaped + add;
-        if !line_fits(line) {
-            break;
-        }
-        escaped += add;
-        end = ch_end;
-        i = ch_end;
-    }
-    let line = base + decimal_len(end) + escaped;
-    if !line_fits(line) {
-        return Err(oversize(&page.path));
-    }
-    debug_assert_eq!(
-        line,
-        serde_json::to_string(&ranged_value(page, start, end))
-            .map(|encoded| encoded.len())
-            .unwrap_or(usize::MAX)
-    );
-    Ok(end)
-}
-
 /// `wiki write` — a text page. `if_rev` is the optimistic-concurrency
 /// token: `ABSENT` ("none") requires a missing page, a `fnv1a:` rev
 /// must equal the current content's. Returns `{rev}` on success, or
@@ -1565,7 +1077,7 @@ pub fn write(
         ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
+    allowed(pm, caller, Op::Write, &segs)?;
     if let View::Real = classify(&segs) {
     } else {
         unreachable!("allowed() refused the views before here")
@@ -1581,16 +1093,24 @@ pub fn write(
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
 
+    match logical_kind(&vault, &norm)? {
+        Kind::Dir => {
+            return Err(Error::rejected(format!(
+                "wiki write '{norm}' refused: a directory exists there"
+            )))
+        }
+        Kind::Blob => {
+            return Err(Error::rejected(format!(
+                "wiki write '{norm}' refused: a blob page exists there — rm it first"
+            )))
+        }
+        Kind::None | Kind::Text => {}
+    }
     let cur = rev_of(&abs)?;
     if let Some(want) = if_rev {
         if want != cur {
             return Ok(json!({"conflict": "if_rev", "current_rev": cur, "path": norm}));
         }
-    }
-    if abs.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        return Err(Error::rejected(format!(
-            "wiki write '{norm}' refused: a directory exists there"
-        )));
     }
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1644,7 +1164,7 @@ pub fn mkdir(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         return Err(Error::rejected("wiki mkdir '' refused: the root exists"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
+    allowed(pm, caller, Op::Write, &segs)?;
     if classify(&segs) != View::Real {
         unreachable!()
     }
@@ -1652,39 +1172,85 @@ pub fn mkdir(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     let abs = resolve(&vault, &norm)?;
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
-    match abs.symlink_metadata() {
-        Ok(m) if m.is_dir() => return Ok(json!({"path": norm, "created": false})),
-        Ok(_) => {
+    match logical_kind(&vault, &norm)? {
+        Kind::Dir => return Ok(json!({"path": norm, "created": false})),
+        Kind::Text | Kind::Blob => {
             return Err(Error::rejected(format!(
                 "wiki mkdir '{norm}' refused: a file exists there"
             )))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        Kind::None => {}
     }
-    std::fs::create_dir_all(&abs)?;
+    // Directories this call creates, deepest first, for rollback.
+    let mut made: Vec<PathBuf> = Vec::new();
+    for a in abs.ancestors() {
+        if a.symlink_metadata().is_ok() {
+            break;
+        }
+        made.push(a.to_path_buf());
+    }
     let keep = abs.join(".gitkeep");
-    std::fs::write(&keep, "")?;
-    let mut paths = vec![keep];
-    if let Some(g) = gitignore {
-        paths.push(g);
+    let created = std::fs::create_dir_all(&abs)
+        .and_then(|()| std::fs::write(&keep, ""))
+        .map_err(Error::from)
+        .and_then(|()| {
+            let mut paths = vec![keep.clone()];
+            if let Some(g) = gitignore {
+                paths.push(g);
+            }
+            let actor = caller.actor();
+            crate::issue::write::commit_who(
+                pm,
+                &paths,
+                &format!("wiki: mkdir {norm}"),
+                &[],
+                &actor,
+                None,
+            )
+        });
+    if let Err(e) = created {
+        // Remove only what this call made; `remove_dir` leaves a
+        // non-empty directory alone.
+        let _ = std::fs::remove_file(&keep);
+        for d in &made {
+            let _ = std::fs::remove_dir(d);
+        }
+        return Err(e);
     }
-    let actor = caller.actor();
-    crate::issue::write::commit_who(
-        pm,
-        &paths,
-        &format!("wiki: mkdir {norm}"),
-        &[],
-        &actor,
-        None,
-    )?;
     Ok(json!({"path": norm, "created": true}))
+}
+
+/// `rm`'s landing-directory grammar — `<millis>-<8 lowercase hex>`, the
+/// exact shape [`rm`] mints (and `trash`'s own selector parser accepts).
+/// `mv` validates the key on its own, never as the first segment of the
+/// logical path: the synthetic landing id must not spend the original
+/// path's [`DEPTH_CAP`]/[`PATH_CAP`] budget.
+const LANDING_STAMP_MAX: usize = 20;
+const LANDING_NONCE: usize = 8;
+
+fn valid_landing_key(key: &str) -> bool {
+    let Some((stamp, nonce)) = key.split_once('-') else {
+        return false;
+    };
+    !stamp.is_empty()
+        && stamp.len() <= LANDING_STAMP_MAX
+        && stamp.bytes().all(|b| b.is_ascii_digit())
+        && nonce.len() == LANDING_NONCE
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `wiki mv` — rename a page, dir or blob page. Both endpoints pass
 /// the write ACL; the destination must not exist. A `from` under
 /// `.trash/` restores — operator only (trash is operator-managed).
 pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
+    // The source is read as it moves, and the destination may be a place the
+    // project gate does not cover (`global/`). Gating the source is what stops
+    // a move from laundering a private page out of its project.
+    if !admitted(pm, caller, from) {
+        return Err(no_such_page(from));
+    }
     let norm_to = normalize(to)?;
     if norm_to.is_empty() {
         return Err(Error::rejected("wiki mv refused: destination is the root"));
@@ -1692,46 +1258,74 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
     let segs_to: Vec<&str> = norm_to.split('/').collect();
     let vault = vault_dir(pm)?;
 
-    // A `.trash/<stamp>/<orig>` source is a restore: operator only.
+    // A `.trash/<key>/<orig>` source is a restore: operator only.
     // A trashed blob page keeps its `<orig>.blob` pointer name — the
     // logical name is what normalizes (the pointer suffix is the
     // store's own, never API-addressable elsewhere).
-    let restoring = from.starts_with(".trash/");
-    let (src_abs, from_label, src_is_pointer) = if restoring {
-        if !matches!(caller, Caller::Operator) {
-            return Err(Error::rejected(
-                "wiki mv refused: restoring from .trash/ is the operator's",
-            ));
-        }
-        let rel = from.trim_start_matches(".trash/");
-        let (src_rel, is_pointer) = match rel.strip_suffix(".blob") {
-            Some(base) => {
-                let n = normalize(base)?;
-                (format!("{n}.blob"), true)
+    let (src_abs, from_label, src_is_pointer) = match from.strip_prefix(".trash/") {
+        Some(rel) => {
+            if !matches!(caller, Caller::Operator) {
+                return Err(Error::rejected(
+                    "wiki mv refused: restoring from .trash/ is the operator's",
+                ));
             }
-            None => (normalize(rel)?, false),
-        };
-        if src_rel.trim_end_matches(".blob").is_empty() {
-            return Err(Error::rejected("wiki mv refused: empty trash path"));
+            // The landing id is validated on its own; the optional tail is
+            // the original logical path. Without a tail the legacy
+            // whole-landing form (`cadence wiki mv .trash/<key> <to>`)
+            // restores the landing root itself.
+            let (key, orig) = match rel.split_once('/') {
+                Some((key, orig)) => (key, Some(orig)),
+                None => (rel, None),
+            };
+            if !valid_landing_key(key) {
+                return Err(Error::rejected(format!(
+                    "wiki mv refused: '{key}' is not a trash landing id"
+                )));
+            }
+            // Only the ORIGINAL path is a logical path, so it keeps the
+            // full 32-segment / 2048-byte budget it had before `rm`.
+            let (src_rel, is_pointer) = match orig {
+                Some(orig) => {
+                    let (norm_orig, is_pointer) = match orig.strip_suffix(".blob") {
+                        Some(base) => (normalize(base)?, true),
+                        None => (normalize(orig)?, false),
+                    };
+                    if norm_orig.is_empty() {
+                        return Err(Error::rejected("wiki mv refused: empty trash path"));
+                    }
+                    if is_pointer {
+                        (format!("{norm_orig}.blob"), true)
+                    } else {
+                        (norm_orig, false)
+                    }
+                }
+                None => (String::new(), false),
+            };
+            let label = if src_rel.is_empty() {
+                format!(".trash/{key}")
+            } else {
+                format!(".trash/{key}/{src_rel}")
+            };
+            // CAD-2018: resolve the landing component by component with
+            // symlinks refused — a planted `.trash/<key>/x -> /etc` must
+            // never turn an ancestor into a source outside the vault. The
+            // same walk runs again under the write lock in `mv_real`.
+            (resolve(&vault, &label)?, label, is_pointer)
         }
-        (
-            trash_dir(&vault).join(&src_rel),
-            format!(".trash/{src_rel}"),
-            is_pointer,
-        )
-    } else {
-        let norm_from = normalize(from)?;
-        if norm_from.is_empty() {
-            return Err(Error::rejected("wiki mv refused: source is the root"));
+        None => {
+            let norm_from = normalize(from)?;
+            if norm_from.is_empty() {
+                return Err(Error::rejected("wiki mv refused: source is the root"));
+            }
+            let segs_from: Vec<&str> = norm_from.split('/').collect();
+            allowed(pm, caller, Op::Remove, &segs_from)?;
+            if classify(&segs_from) != View::Real {
+                unreachable!()
+            }
+            (resolve(&vault, &norm_from)?, norm_from, false)
         }
-        let segs_from: Vec<&str> = norm_from.split('/').collect();
-        allowed(caller, Op::Remove, &segs_from)?;
-        if classify(&segs_from) != View::Real {
-            unreachable!()
-        }
-        (resolve(&vault, &norm_from)?, norm_from, false)
     };
-    allowed(caller, Op::Write, &segs_to)?;
+    allowed(pm, caller, Op::Write, &segs_to)?;
     if classify(&segs_to) != View::Real {
         unreachable!()
     }
@@ -1781,6 +1375,23 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
     mv_real(pm, caller, &src_abs, &dst_abs, &from_label, &norm_to)
 }
 
+#[cfg(test)]
+mod before_mv_lock {
+    use std::cell::RefCell;
+    type Hook = Box<dyn FnOnce()>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub(super) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+    pub(super) fn run() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 fn mv_real(
     pm: &Pm,
     caller: &Caller,
@@ -1789,14 +1400,52 @@ fn mv_real(
     from_label: &str,
     to: &str,
 ) -> Result<Value> {
+    // CAD-912 test seam (cfg(test) only): runs once between the
+    // pre-lock look and the writer lock, to publish a destination there.
+    #[cfg(test)]
+    before_mv_lock::run();
+    let _lock = pm.lock()?;
+    // Check the logical destination, not `dst`: a blob page moves to
+    // `<to>.blob`, and a text page or dir at `<to>` must refuse too.
     let vault = vault_dir(pm)?;
-    let dst_pointer = vault.join(format!("{to}.blob"));
-    if dst.symlink_metadata().is_ok() || dst_pointer.symlink_metadata().is_ok() {
+    if logical_kind(&vault, to)? != Kind::None {
         return Err(Error::rejected(format!(
             "wiki mv '{from_label}' → '{to}' refused: destination exists"
         )));
     }
-    let _lock = pm.lock()?;
+    if from_label.starts_with(".trash/") {
+        // CAD-2018: a restore is proved under THIS lock, so no wiki
+        // writer can swap the landing between the proof and the move.
+        // Every component from the vault down is a real entry (a
+        // symlinked ancestor could otherwise move a file outside the
+        // vault), and the landing itself holds no symlink, no
+        // non-logical name, and only blob pointers whose stored bytes
+        // are present at the recorded size. It does not claim custody
+        // against a privileged process changing the tree afterwards.
+        //
+        // The destination `to` is part of the proof: a directory's
+        // descendants inherit its depth and byte budget, so restoring to
+        // a root already at DEPTH_CAP or PATH_CAP would land children
+        // that `normalize` refuses — pages no read could ever address.
+        // A refusal here leaves the landing untouched.
+        let rel = src
+            .strip_prefix(&vault)
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "wiki mv restore source {} is outside the vault",
+                    src.display()
+                ))
+            })?;
+        if resolve(&vault, rel)?.as_path() != src {
+            return Err(Error::internal(format!(
+                "wiki mv restore source {} did not resolve to itself",
+                src.display()
+            )));
+        }
+        trash::check_restore_destination(&vault, src, to)?;
+    }
     let gitignore = ensure_layout(pm)?;
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1831,7 +1480,7 @@ pub fn rm(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         return Err(Error::rejected("wiki rm '' refused: the root stays"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Remove, &segs)?;
+    allowed(pm, caller, Op::Remove, &segs)?;
     if classify(&segs) != View::Real {
         unreachable!()
     }
@@ -1883,328 +1532,6 @@ pub fn rm(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
 }
 
 /// The daemon's name for an accepted upload's staging dir —
-/// `<state>/wiki-uploads/`. `put_blob` accepts a `tmp` only under it.
-pub const UPLOAD_DIR: &str = "wiki-uploads";
-
-/// sha256 of a file, lowercase hex.
-fn sha256_file(path: &Path) -> Result<String> {
-    use sha2::Digest;
-    let mut f = std::fs::File::open(path)?;
-    let mut h = sha2::Sha256::new();
-    std::io::copy(&mut f, &mut h)?;
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// A first-block MIME guess: magic bytes for the kinds the board
-/// streams; UTF-8 → text/plain; else octet-stream. The pointer file
-/// records it; the board's serve rules decide inline vs attachment.
-pub(crate) fn sniff_mime(head: &[u8]) -> &'static str {
-    match head {
-        [0x89, b'P', b'N', b'G', ..] => "image/png",
-        [0xff, 0xd8, 0xff, ..] => "image/jpeg",
-        [b'G', b'I', b'F', b'8', ..] => "image/gif",
-        [b'R', b'I', b'F', b'F', ..] if head.len() >= 12 && &head[8..12] == b"WEBP" => "image/webp",
-        [b'%', b'P', b'D', b'F', ..] => "application/pdf",
-        [b'P', b'K', 0x03, 0x04, ..] => "application/zip",
-        [0x00, 0x00, 0x00, ..] if head.len() >= 12 && &head[4..8] == b"ftyp" => "video/mp4",
-        [0x1a, 0x45, 0xdf, 0xa3, ..] => "video/webm",
-        _ => {
-            if std::str::from_utf8(head).is_ok() {
-                let text = std::str::from_utf8(head).unwrap_or_default();
-                let lower = text.trim_start().to_lowercase();
-                if lower.starts_with("<?xml") && lower.contains("<svg") || lower.starts_with("<svg")
-                {
-                    "image/svg+xml"
-                } else if lower.starts_with("<!doctype html") || lower.starts_with("<html") {
-                    "text/html"
-                } else {
-                    "text/plain"
-                }
-            } else {
-                "application/octet-stream"
-            }
-        }
-    }
-}
-
-/// `wiki_put_blob` — verify a staged upload and land it: re-hash the
-/// tmp file (the caller's `sha256` is advisory and must match),
-/// enforce the cap BEFORE the move, sniff MIME, secret-scan text
-/// content, then publish the bytes at `.blobs/<sha256>` and commit the
-/// `<path>.blob` pointer. The tracker write lock is taken only for
-/// the pointer's commit — never while the upload is being checked.
-///
-/// Blob bytes are immutable and content-addressed: publication stages
-/// the verified tmp to a unique sibling on the blob filesystem and
-/// then links it in under the hash name without ever overwriting or
-/// partially exposing an existing object. A name collision is not
-/// trusted — the existing entry must prove it is a confined regular
-/// file holding exactly the upload's sha256 bytes before the upload
-/// dedupes to it, else the call refuses. Once staged this call NEVER
-/// unlinks `.blobs/<sha256>` — another pointer, history or a trash
-/// entry may already reference it; a refusal removes only this call's
-/// own unpublished staging file (unreferenced blob cleanup is GC
-/// work, not this op's).
-///
-/// `tmp` must sit under `<state_dir>/wiki-uploads/` — a tmp anywhere
-/// else is refused (the daemon never renames an arbitrary caller
-/// path into the vault). `if_rev` is the pointer's
-/// optimistic-concurrency token (`none` = the page must not exist).
-pub fn put_blob(
-    pm: &Pm,
-    state_dir: &Path,
-    caller: &Caller,
-    path: &str,
-    tmp: &Path,
-    sha256: Option<&str>,
-    if_rev: Option<&str>,
-) -> Result<Value> {
-    let norm = normalize(path)?;
-    if norm.is_empty() {
-        return Err(Error::rejected(
-            "wiki put_blob '' refused: the root is a directory",
-        ));
-    }
-    let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
-    if classify(&segs) != View::Real {
-        unreachable!()
-    }
-    let vault = vault_dir(pm)?;
-
-    // The tmp must live under <state>/wiki-uploads/ — canonicalized
-    // so `..` and symlink tricks cannot escape the check.
-    let uploads = state_dir.join(UPLOAD_DIR);
-    let uploads_canon = uploads.canonicalize().unwrap_or_else(|_| uploads.clone());
-    let tmp_canon = tmp
-        .canonicalize()
-        .map_err(|e| Error::rejected(format!("wiki put_blob tmp {}: {e}", tmp.display())))?;
-    if tmp_canon.parent() != Some(uploads_canon.as_path()) {
-        return Err(Error::rejected(format!(
-            "wiki put_blob refused: tmp must be a file directly under {}",
-            uploads.display()
-        )));
-    }
-    let meta = tmp_canon.symlink_metadata()?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
-        return Err(Error::rejected(
-            "wiki put_blob refused: tmp is not a regular file",
-        ));
-    }
-    let cap = pm.config.wiki.max_upload_bytes;
-    if meta.len() > cap {
-        let _ = std::fs::remove_file(&tmp_canon);
-        return Err(Error::rejected(format!(
-            "wiki put_blob '{norm}' refused: {} bytes over the {cap}-byte cap",
-            meta.len()
-        )));
-    }
-    let actual = sha256_file(&tmp_canon)?;
-    if let Some(want) = sha256 {
-        if !want.eq_ignore_ascii_case(&actual) {
-            let _ = std::fs::remove_file(&tmp_canon);
-            return Err(Error::rejected(format!(
-                "wiki put_blob '{norm}' refused: sha256 mismatch (got {actual})"
-            )));
-        }
-    }
-    // MIME sniff + secret scan on text content. Read a bounded head
-    // for sniffing; the scan runs on the full text when it is one.
-    let mut head = vec![0u8; 8192.min(meta.len() as usize)];
-    std::fs::File::open(&tmp_canon)?.read_exact(&mut head)?;
-    let mime = sniff_mime(&head);
-    let mut secret_warnings = Vec::new();
-    if mime == "text/plain" && meta.len() <= TEXT_CAP {
-        if let Ok(text) = std::fs::read_to_string(&tmp_canon) {
-            secret_warnings = crate::secret::guard(&format!("wiki/{norm}"), &text)?;
-        }
-    }
-
-    // Land the blob: stage the verified tmp to a unique sibling name
-    // on `.blobs/`'s own filesystem, then publish it at `<sha256>`
-    // atomically and without overwrite. A partial copy never appears
-    // under the hash name; an already-published object is verified
-    // byte-for-byte before it is deduped — never blindly trusted by
-    // name and never rewritten. From here on this call may only
-    // unlink `stage` — `dest` is shared content another pointer may
-    // already reference.
-    ensure_layout(pm)?;
-    let blobs = blobs_dir(&vault);
-    let stage = blobs.join(format!(
-        ".{actual}.upload-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    match std::fs::hard_link(&tmp_canon, &stage) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&tmp_canon);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            // The state dir and the vault may live on different
-            // mounts: copy bytes onto the blob filesystem. A failed
-            // copy leaves the tmp in place and `dest` untouched — but
-            // the private `stage` it may have partially written is
-            // ours alone, so it is always removed.
-            if let Err(e) = std::fs::copy(&tmp_canon, &stage) {
-                let _ = std::fs::remove_file(&stage);
-                return Err(e.into());
-            }
-            let _ = std::fs::remove_file(&tmp_canon);
-        }
-        Err(e) => return Err(e.into()),
-    }
-    let dest = blobs.join(&actual);
-    publish_blob(&stage, &dest)?;
-    // CAD-911 test seam — compiled ONLY into test builds (`cfg(test)`;
-    // shipped daemons and libraries never carry it): a unit test that
-    // armed this thread parks HERE — blob published, pointer lock not
-    // yet taken, no lock held while parked — to interleave a second
-    // real put_blob deterministically. Unarmed it is a no-op.
-    #[cfg(test)]
-    test_pause::at_publish_seam();
-
-    // The pointer file — a normal tracker text write under the lock.
-    let pointer = vault.join(format!("{norm}.blob"));
-    let _lock = pm.lock()?;
-    let gitignore = ensure_layout(pm)?;
-    if let Some(parent) = pointer.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let cur = rev_of(&pointer)?;
-    if let Some(want) = if_rev {
-        if want != cur {
-            // Conflict. `publish_blob` already consumed this call's
-            // private stage; `dest` is shared custody another pointer
-            // may already reference — nothing here unlinks it.
-            return Ok(json!({"conflict": "if_rev", "current_rev": cur, "path": norm}));
-        }
-    }
-    if resolve(&vault, &norm)?.symlink_metadata().is_ok() {
-        // A text page already sits at the logical name.
-        return Err(Error::rejected(format!(
-            "wiki put_blob '{norm}' refused: a text page exists there — rm it first"
-        )));
-    }
-    let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
-    let pointer_text = serde_json::to_string_pretty(&json!({
-        "sha256": actual,
-        "size": meta.len(),
-        "mime": mime,
-        "name": name,
-    }))?;
-    let before = std::fs::read(&pointer).ok();
-    std::fs::write(&pointer, &pointer_text)?;
-    let mut paths = vec![pointer.clone()];
-    if let Some(g) = gitignore {
-        paths.push(g);
-    }
-    let actor = caller.actor();
-    if let Err(e) = crate::issue::write::commit_who(
-        pm,
-        &paths,
-        &format!("wiki: put_blob {norm}"),
-        &[],
-        &actor,
-        None,
-    ) {
-        restore(&pointer, before);
-        return Err(e);
-    }
-    let mut out = json!({
-        "path": norm,
-        "kind": "blob",
-        "sha256": actual,
-        "size": meta.len(),
-        "mime": mime,
-        "name": name,
-        "rev": rev_of(&pointer)?,
-    });
-    if !secret_warnings.is_empty() {
-        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
-    }
-    Ok(out)
-}
-
-/// Publish staged blob bytes at `dest` — atomically, never over an
-/// existing object, and never trusting a name as proof of content.
-/// `stage` already sits on `dest`'s filesystem (it is the unique
-/// sibling name `put_blob` staged onto `.blobs/` itself), so a
-/// `hard_link` lands the complete bytes at the hash name in one
-/// atomic, no-overwrite step.
-///
-/// `AlreadyExists` is a collision claim, not a byte proof: the
-/// existing entry is verified to be a confined regular non-symlink
-/// file whose size and sha256 match the hash name exactly before the
-/// upload is deduped to it. Foreign bytes, a directory, a symlink or
-/// any size/hash mismatch refuse the upload — the existing object is
-/// left byte-for-byte as found, no pointer is committed by this
-/// caller, and only the private `stage` name is removed. A
-/// `hard_link` that lands means `stage`'s own verified bytes now own
-/// the name, so no re-check is needed.
-///
-/// Publication is link-based on purpose: it makes the no-overwrite
-/// guarantee atomic on every filesystem the vault deploys to here
-/// (Linux ext4/tmpfs). A filesystem without hard links cannot promise
-/// that, so `publish_blob` surfaces the link error rather than
-/// falling back to a copy or a rename that could overwrite or expose
-/// partial bytes at the hash name.
-fn publish_blob(stage: &Path, dest: &Path) -> Result<()> {
-    match std::fs::hard_link(stage, dest) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_existing_blob(stage, dest)?;
-        }
-        Err(e) => {
-            // The staging name is ours alone — never leave it behind.
-            let _ = std::fs::remove_file(stage);
-            return Err(e.into());
-        }
-    }
-    // Whether the link landed or the existing object verified as the
-    // same content, our private staging name is ours alone — removed.
-    let _ = std::fs::remove_file(stage);
-    Ok(())
-}
-
-/// The `AlreadyExists` half of [`publish_blob`]: prove the entry at
-/// `dest` is a regular, non-symlink file holding exactly `stage`'s
-/// bytes — the same sha256 the name claims — before the upload
-/// dedupes to it. Any other shape or content refuses. `stage` is
-/// removed on EVERY failing exit — refusal or I/O error alike —
-/// because it is this call's private name, while `dest` is shared
-/// custody a failure must never touch.
-fn verify_existing_blob(stage: &Path, dest: &Path) -> Result<()> {
-    let out = verify_existing_blob_inner(stage, dest);
-    if out.is_err() {
-        let _ = std::fs::remove_file(stage);
-    }
-    out
-}
-
-fn verify_existing_blob_inner(stage: &Path, dest: &Path) -> Result<()> {
-    let refuse = |why: String| -> Error {
-        Error::rejected(format!(
-            "wiki put_blob refused: existing blob object {} {why}",
-            dest.display()
-        ))
-    };
-    let meta = dest.symlink_metadata()?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(refuse("is not a regular file".to_string()));
-    }
-    let staged = stage.symlink_metadata()?;
-    if meta.len() != staged.len() {
-        return Err(refuse(format!(
-            "holds {} bytes, expected {}",
-            meta.len(),
-            staged.len()
-        )));
-    }
-    if sha256_file(dest)? != sha256_file(stage)? {
-        return Err(refuse("content does not match its hash name".to_string()));
-    }
-    Ok(())
-}
-
 /// CAD-911 — TEST-ONLY synchronization hooks for the `put_blob`
 /// unit tests; `cfg(test)` keeps every byte of this module out of
 /// shipped binaries and libraries. It is NOT a production hook: no
@@ -2365,7 +1692,21 @@ mod test_pause {
 /// Search the derived index. The caller and path checks remain the wiki's
 /// existing allowlist; the index is only a candidate finder.
 pub fn search(pm: &Pm, state_dir: &Path, caller: &Caller, q: &str, base: &str) -> Result<Value> {
-    index::search(pm, state_dir, caller, q, base)
+    if !admitted(pm, caller, base) {
+        return Err(no_such_page(base));
+    }
+    let mut found = index::search(pm, state_dir, caller, q, base)?;
+    // A base inside the caller's tree is not enough: an index search can return
+    // a hit from anywhere, so every hit is asked the same question the page
+    // itself would be.
+    if let Some(hits) = found.get_mut("matches").and_then(|m| m.as_array_mut()) {
+        hits.retain(|hit| {
+            hit["path"]
+                .as_str()
+                .is_some_and(|path| admitted(pm, caller, path))
+        });
+    }
+    Ok(found)
 }
 
 /// `wiki history` — `git log` for a page, mapped to its tracker
@@ -2373,13 +1714,18 @@ pub fn search(pm: &Pm, state_dir: &Path, caller: &Caller, q: &str, base: &str) -
 /// views `agents/<a>/<file>`, memory views `<proj>/memory/<slug>.md`.
 pub fn history(pm: &Pm, caller: &Caller, path: &str, limit: usize) -> Result<Value> {
     let norm = normalize(path)?;
+    // A page that does not exist has an empty history, not an error, so a page
+    // the caller may not see answers exactly that.
+    if !admitted(pm, caller, path) {
+        return Ok(json!({"path": norm, "commits": []}));
+    }
     if norm.is_empty() {
         return Err(Error::rejected(
             "wiki history '' refused: the root has no file log",
         ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     let vault = vault_dir(pm)?;
     let rels: Vec<PathBuf> = match classify(&segs) {
         View::Profile { alias } => {
@@ -2461,7 +1807,115 @@ pub fn history(pm: &Pm, caller: &Caller, path: &str, limit: usize) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issue::Pm;
     use serde_json::json;
+
+    /// CAD-2187, the acceptance check: a page under a project answers only to
+    /// a caller that project's policy admits, and says the same thing to
+    /// everyone else that it says about a page that does not exist.
+    #[test]
+    fn a_project_page_is_refused_unless_its_policy_admits_the_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pm_dir = dir.path().join("pm");
+        std::fs::create_dir_all(&pm_dir).unwrap();
+        std::fs::write(
+            pm_dir.join("pm.yaml"),
+            "schema: 1\nnotes_dir: /var/www/agent-notes\n",
+        )
+        .unwrap();
+        let project = pm_dir.join("secret");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("project.yaml"),
+            "key: secret\nprefix: SEC\npolicy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+        )
+        .unwrap();
+        let pm = Pm::at(&pm_dir).unwrap();
+
+        let page = "projects/secret/notes.md";
+        // The grant and the owner read it.
+        assert!(admitted(&pm, &Caller::Operator, page));
+        assert!(admitted(&pm, &Caller::User("mia".to_string()), page));
+        // Everyone else is refused, in the words of a missing page — so the
+        // refusal cannot be read as "this project exists".
+        assert!(!admitted(&pm, &Caller::User("rob".to_string()), page));
+        assert!(no_such_page(page).to_string().contains("no such file"));
+        assert!(no_such_directory("projects/secret")
+            .to_string()
+            .contains("no such directory"));
+        // The shallowest spelling of the project is gated too — it is a page.
+        assert!(!admitted(
+            &pm,
+            &Caller::User("rob".to_string()),
+            "projects/secret"
+        ));
+        // `global` names no project, so no policy can empty it.
+        assert!(admitted(
+            &pm,
+            &Caller::User("rob".to_string()),
+            "global/x/y.md"
+        ));
+
+        // An empty tracker admits no project page, which is the fail-closed
+        // direction; `global` is still served.
+        let empty_dir = dir.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        std::fs::write(
+            empty_dir.join("pm.yaml"),
+            "schema: 1\nnotes_dir: /var/www/agent-notes\n",
+        )
+        .unwrap();
+        let empty = Pm::at(&empty_dir).unwrap();
+        assert!(!admitted(&empty, &Caller::Operator, page));
+        assert!(admitted(&empty, &Caller::Operator, "global/x.md"));
+    }
+
+    #[test]
+    fn evidence_distinguishes_an_unreadable_project_from_a_proven_missing_page() {
+        let root = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&root.path().join("private")).unwrap();
+        let project = pm.dir.join("secret");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("project.yaml"),
+            "key: secret\nprefix: SEC\npolicy:\n  version: 3\n  visibility: private\n  members:\n  - users/mia\n",
+        )
+        .unwrap();
+
+        let page = "projects/secret/notes.md";
+        write(&pm, &Caller::Operator, page, "private original", None).unwrap();
+        let revision = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let member = Caller::User("mia".into());
+        let outsider = Caller::User("rob".into());
+
+        let original = read_revision_for_evidence(&pm, &member, page, &revision, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original["text"], "private original");
+        assert!(read_revision_for_evidence(
+            &pm,
+            &member,
+            "projects/secret/missing.md",
+            &revision,
+            1024,
+        )
+        .unwrap()
+        .is_none());
+        assert!(read_revision_for_evidence(&pm, &member, page, &"0".repeat(40), 1024).is_err());
+
+        let denied = read_revision_for_evidence(&pm, &outsider, page, &revision, 1024)
+            .unwrap_err()
+            .to_string();
+        let empty = Pm::init(&root.path().join("empty")).unwrap();
+        let unknown = read_revision_for_evidence(&empty, &outsider, page, &revision, 1024)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(denied, unknown, "refusal must not reveal project existence");
+        assert!(!denied.contains("private original"));
+    }
 
     fn segs(path: &str) -> Vec<&str> {
         if path.is_empty() {
@@ -2599,7 +2053,7 @@ mod tests {
             (&public, Op::Read, "wiki/x", false),
         ];
         for (caller, op, path, want) in table {
-            let got = allowed(caller, *op, &segs(path));
+            let got = allowed_by_table(caller, *op, &segs(path));
             assert_eq!(
                 got.is_ok(),
                 *want,
@@ -3782,5 +3236,149 @@ mod tests {
         test_pause::at_publish_seam();
         // The pause was consumed: a second unarmed call is a no-op.
         test_pause::at_publish_seam();
+    }
+
+    // ---- CAD-912: logical entry kinds under the writer lock ----
+
+    #[test]
+    fn cad912_nested_mkdir_and_write_beside_blob_page_are_refused() {
+        let (_root, pm) = range_pm();
+        let ptr = cad912_blob_page(&pm, "global/x");
+        let vault = vault_dir(&pm).unwrap();
+        let m = mkdir(&pm, &Caller::Operator, "global/x/y");
+        assert!(m.is_err(), "mkdir under a blob page must be refused: {m:?}");
+        let w = write(&pm, &Caller::Operator, "global/x/y", "hi", Some(ABSENT));
+        assert!(w.is_err(), "write under a blob page must be refused: {w:?}");
+        assert!(ptr.exists(), "blob pointer intact");
+        assert!(
+            vault.join("global/x").symlink_metadata().is_err(),
+            "no directory beside the blob page"
+        );
+    }
+
+    #[test]
+    fn cad912_mv_blob_page_onto_text_page_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let tmp = cad911_stage_tmp(&uploads, "b.bin", b"blob page bytes");
+        put_blob(&pm, &state, &Caller::Operator, "global/b", &tmp, None, None).unwrap();
+        write(&pm, &Caller::Operator, "global/t", "text", None).unwrap();
+        let r = mv(&pm, &Caller::Operator, "global/b", "global/t");
+        assert!(
+            matches!(&r, Err(e) if e.to_string().contains("destination exists")),
+            "a blob page must not land beside a text page: {r:?}"
+        );
+        let vault = vault_dir(&pm).unwrap();
+        assert!(vault.join("global/b.blob").exists(), "source pointer stays");
+        assert!(
+            vault.join("global/t.blob").symlink_metadata().is_err(),
+            "no ambiguous pair"
+        );
+    }
+
+    fn cad912_blob_page(pm: &Pm, logical: &str) -> PathBuf {
+        let vault = vault_dir(pm).unwrap();
+        let p = vault.join(format!("{logical}.blob"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"sha256":"00","size":1,"mime":"text/plain","name":"x"}"#,
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn cad912_create_only_text_over_blob_page_is_refused() {
+        let (_root, pm) = range_pm();
+        let ptr = cad912_blob_page(&pm, "global/x");
+        let before = std::fs::read(&ptr).unwrap();
+        let r = write(&pm, &Caller::Operator, "global/x", "hi", Some(ABSENT));
+        assert!(r.is_err(), "text over a blob page must be refused: {r:?}");
+        assert_eq!(std::fs::read(&ptr).unwrap(), before, "blob pointer intact");
+        let vault = vault_dir(&pm).unwrap();
+        assert!(
+            vault.join("global/x").symlink_metadata().is_err(),
+            "no shadow text page"
+        );
+    }
+
+    #[test]
+    fn cad912_mkdir_over_blob_page_is_refused() {
+        let (_root, pm) = range_pm();
+        let ptr = cad912_blob_page(&pm, "global/x");
+        let r = mkdir(&pm, &Caller::Operator, "global/x");
+        assert!(r.is_err(), "mkdir over a blob page must be refused: {r:?}");
+        assert!(ptr.exists());
+        let vault = vault_dir(&pm).unwrap();
+        assert!(
+            vault.join("global/x").symlink_metadata().is_err(),
+            "no dir created"
+        );
+    }
+
+    #[test]
+    fn cad912_put_blob_over_directory_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let tmp = cad911_stage_tmp(&uploads, "d.bin", b"dir collision bytes");
+        mkdir(&pm, &Caller::Operator, "global/x").unwrap();
+        let r = put_blob(&pm, &state, &Caller::Operator, "global/x", &tmp, None, None);
+        assert!(r.is_err(), "blob over a directory must be refused: {r:?}");
+        let vault = vault_dir(&pm).unwrap();
+        assert!(vault.join("global/x/.gitkeep").exists(), "dir intact");
+        assert!(
+            vault.join("global/x.blob").symlink_metadata().is_err(),
+            "no pointer"
+        );
+    }
+
+    #[test]
+    fn cad912_failed_mkdir_commit_leaves_only_preexisting_entries() {
+        let (_root, pm) = range_pm();
+        write(&pm, &Caller::Operator, "global/keep/page", "stay", None).unwrap();
+        let hooks = pm.dir.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let r = mkdir(&pm, &Caller::Operator, "global/keep/a/b");
+        assert!(r.is_err(), "the injected commit failure must surface");
+        let vault = vault_dir(&pm).unwrap();
+        assert!(
+            vault.join("global/keep/a").symlink_metadata().is_err(),
+            "created dirs removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join("global/keep/page")).unwrap(),
+            "stay"
+        );
+    }
+
+    #[test]
+    fn cad912_mv_rechecks_destination_under_the_lock() {
+        let (_root, pm) = range_pm();
+        write(&pm, &Caller::Operator, "global/src", "moving", None).unwrap();
+        let vault = vault_dir(&pm).unwrap();
+        let dst = vault.join("global/dst");
+        let dst_hook = dst.clone();
+        before_mv_lock::set(move || std::fs::write(&dst_hook, "newly published").unwrap());
+        let r = mv(&pm, &Caller::Operator, "global/src", "global/dst");
+        assert!(
+            r.is_err(),
+            "a destination published before the lock must refuse: {r:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "newly published");
+        assert_eq!(
+            std::fs::read_to_string(vault.join("global/src")).unwrap(),
+            "moving"
+        );
     }
 }

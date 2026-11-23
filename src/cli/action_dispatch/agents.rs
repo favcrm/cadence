@@ -215,6 +215,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             exec_max_failures,
         ),
         Commands::Skill { action } => skill::run(state_dir, action),
+        Commands::WorkspaceSkill { action } => workspace_skill::run_native(&action),
         Commands::Events {
             alias,
             job,
@@ -226,6 +227,8 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Thread { action } => thread::run(state_dir, action),
         Commands::Topic { action } => topic::run(state_dir, action),
         Commands::Monitor { action } => monitor::run(state_dir, action),
+        Commands::Endpoint { action } => crate::cli::endpoint::run(state_dir, action),
+        Commands::Routine { action } => crate::cli::routine::run(state_dir, action),
         Commands::Status {
             group,
             all,
@@ -240,9 +243,6 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             watch,
             placement.map(PlacementArg::placement),
         ),
-        Commands::LocalAgent { .. } => Err(Error::usage(
-            "local-agent coordinates a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
-        )),
         Commands::Team { .. } => Err(Error::usage(
             "team requires a hosted org: pass --org <org> for a logged-in workspace, or switch back from `--org local`. Nothing was sent",
         )),

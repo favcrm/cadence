@@ -81,55 +81,55 @@ async function main() {
       })),
     ));
     await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-    const buttons = () => Array.from(host.querySelectorAll("button")) as HTMLButtonElement[];
+    const buttons = () => Array.from(document.querySelectorAll("button")) as HTMLButtonElement[];
     const tab = (label: string) => buttons().find((b) => b.textContent?.trim() === label);
     const done = async () => { await React.act(async () => { root.unmount(); }); host.remove(); };
-    return { host, tab, done };
+    return { host, body: document.body, tab, done };
   }
 
-  const uploads = (host: ParentNode) =>
-    host.querySelectorAll('input[type="file"]').length > 0 ||
-    Array.from(host.querySelectorAll("button")).some((b) => b.textContent?.trim() === "Attach");
+  const uploads = (rootNode: ParentNode) =>
+    rootNode.querySelectorAll('input[type="file"]').length > 0 ||
+    Array.from(rootNode.querySelectorAll("button")).some((b) => b.textContent?.trim() === "Attach");
 
   const staleState: ResourceState<IssueDetail> = { data: detail, status: "stale", error: "offline", asOf: Date.now(), inFlight: false };
 
   for (const origin of ["home", "threads", "issue"] as const) {
     const view = await render({ origin });
-    assert(!view.host.querySelector("textarea"), `${origin}: no comment box without the My work opt-in`);
+    assert(!view.body.querySelector("textarea"), `${origin}: no comment box without the My work opt-in`);
     await React.act(() => view.tab("Evidence")?.click());
-    assert(!uploads(view.host), `${origin}: the shared Evidence tab offers no upload`);
-    assert(view.host.textContent?.includes("evidence.txt"), `${origin}: recorded evidence is still listed`);
+    assert(!uploads(view.body), `${origin}: the shared Evidence tab offers no upload`);
+    assert(view.body.textContent?.includes("evidence.txt"), `${origin}: recorded evidence is still listed`);
     await view.done();
   }
 
   {
     const view = await render({ origin: "myWork", myWork: myWork("unassigned") });
-    assert(!view.host.querySelector("textarea"), "myWork/unassigned: quick actions are off");
+    assert(!view.body.querySelector("textarea"), "myWork/unassigned: quick actions are off");
     await React.act(() => view.tab("Evidence")?.click());
-    assert(!uploads(view.host), "myWork/unassigned: no upload");
+    assert(!uploads(view.body), "myWork/unassigned: no upload");
     await view.done();
   }
   {
     const view = await render({ origin: "myWork", myWork: myWork("checking") });
-    assert(view.host.textContent?.includes("Confirming this is still assigned to you"), "myWork/checking: actions are paused with a reason");
+    assert(view.body.textContent?.includes("Confirming this is still assigned to you"), "myWork/checking: actions are paused with a reason");
     await React.act(() => view.tab("Evidence")?.click());
-    assert(!uploads(view.host), "myWork/checking: no upload");
+    assert(!uploads(view.body), "myWork/checking: no upload");
     await view.done();
   }
   {
     const view = await render({ origin: "myWork", myWork: myWork("assigned"), readState: staleState });
-    const textarea = view.host.querySelector("textarea") as HTMLTextAreaElement | null;
+    const textarea = view.body.querySelector("textarea") as HTMLTextAreaElement | null;
     assert(textarea?.disabled, "myWork/stale: the bounded comment write is disabled");
     await React.act(() => view.tab("Evidence")?.click());
-    assert(!uploads(view.host), "myWork/stale: no upload");
+    assert(!uploads(view.body), "myWork/stale: no upload");
     await view.done();
   }
   {
     const view = await render({ origin: "myWork", myWork: myWork("assigned") });
-    const textarea = view.host.querySelector("textarea") as HTMLTextAreaElement | null;
+    const textarea = view.body.querySelector("textarea") as HTMLTextAreaElement | null;
     assert(textarea && !textarea.disabled, "myWork/assigned: the bounded comment write stays available");
     await React.act(() => view.tab("Evidence")?.click());
-    assert(!uploads(view.host), "myWork/assigned: Evidence still offers no upload");
+    assert(!uploads(view.body), "myWork/assigned: Evidence still offers no upload");
     await view.done();
   }
 

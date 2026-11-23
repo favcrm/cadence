@@ -90,57 +90,21 @@ pub(super) fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
             workflow,
             inputs,
         } => {
-            let mut params = json!({"project": project});
-            match (file, workflow) {
-                (Some(file), None) => {
-                    let cap = cadence_agent::issue::plan::MAX_PLAN_BYTES as u64;
-                    let text = match read_master_command_file(state_dir, Some(&file), cap) {
-                        Err(e) if e.to_string().contains(cadence_agent::master::NO_STDIN) => {
-                            return Err(e);
-                        }
-                        res => res.map_err(|e| {
-                            Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
-                        })?,
-                    };
-                    params["text"] = json!(text);
-                }
-                (None, Some(name)) => {
-                    params["workflow"] = json!(name);
-                    if !inputs.is_empty() {
-                        let mut map = serde_json::Map::new();
-                        for pair in &inputs {
-                            let Some((k, v)) = pair.split_once('=') else {
-                                return Err(Error::rejected(format!(
-                                    "--input '{pair}' — expected k=v"
-                                )));
-                            };
-                            if k.is_empty() {
-                                return Err(Error::rejected("--input needs a name: k=v"));
-                            }
-                            map.insert(k.to_string(), json!(v));
-                        }
-                        params["inputs"] = Value::Object(map);
-                    }
-                }
-                _ => {
-                    if cadence_agent::master::caller_is_master() {
-                        return Err(Error::rejected(cadence_agent::master::NO_STDIN));
-                    }
-                    return Err(Error::rejected(
-                        "plan propose needs --file <plan.md> or --workflow <name>",
-                    ));
-                }
-            }
-            client::rpc(state_dir, "plan_propose", params)?
+            return cadence_agent::issue::cli::propose_plan(
+                state_dir,
+                &project,
+                file.as_deref(),
+                workflow.as_deref(),
+                &inputs,
+                "plan",
+            );
         }
         PlanAction::Approve { epic } => {
-            client::rpc(state_dir, "plan_approve", json!({"epic": epic}))?
+            return cadence_agent::issue::cli::decide_plan(state_dir, &epic, None);
         }
-        PlanAction::Reject { epic, reason } => client::rpc(
-            state_dir,
-            "plan_reject",
-            json!({"epic": epic, "reason": reason}),
-        )?,
+        PlanAction::Reject { epic, reason } => {
+            return cadence_agent::issue::cli::decide_plan(state_dir, &epic, Some(&reason));
+        }
         PlanAction::Show { epic } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
             cadence_agent::issue::plan::show(&pm, &epic)?

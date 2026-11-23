@@ -1,12 +1,15 @@
 # Cadence board
 
-An internal project tracker: one folder per issue in a private directory,
-one writer implementation (`src/issue/write.rs`) shared by the
-`cadence issue` CLI and the board's HTTP write API, and `cadence ui`
-serving a board + JSON API on loopback.
+The native project tracker keeps one folder per issue in a private directory.
+Its CLI and loopback board HTTP API share the native writer implementation
+(`src/issue/write.rs`). Hosted workspaces use their own storage and supported
+operations; see [hosted workspaces](guides/hosted-workspace.md).
 
-- **Tracker dir:** `~/pm` (or `CADENCE_PM_DIR`). A private git repo —
-  never pushed anywhere public.
+- **Tracker dir:** `~/pm` (or `CADENCE_PM_DIR`) for an existing
+  installation; `<home>/tracker` (`~/.cadence/tracker`) for a first run
+  that has no earlier tracker, state dir or hosted config — see
+  [CLI.md](CLI.md#cadence-home-overrides-and-isolation-cad-1922). A
+  private git repo — never pushed anywhere public.
 - **Notes dir:** `/var/www/agent-notes` (`notes_dir` in `pm.yaml`) —
   kickoff/QA/verdict chains, read-only.
 - **Runtime:** the cadence daemon socket, read-only. The board and CLI
@@ -15,17 +18,19 @@ serving a board + JSON API on loopback.
 - **Board:** `http://cadence.localhost:18000` through the dev gateway
   (nginx → `127.0.0.1:3010`).
 
-An AgenticOS-hosted board can opt into `cadence ui start --board-public-only`
-or set `CADENCE_BOARD_PUBLIC_ONLY=1` for `cadence setup`. The mode requires
+A board with a configured public identity can opt into
+`cadence ui start --board-public-only` or set
+`CADENCE_BOARD_PUBLIC_ONLY=1` for `cadence setup`. The mode requires
 the complete `AGENTICOS_BOARD_HOST`, `AGENTICOS_BOARD_ISSUER`, and
 `AGENTICOS_BOARD_COMPANY` identity configuration and persists in `ui.json`
 across ordinary UI restarts. It is off for local development unless explicitly
-enabled. In this mode, every protected request must name the public board
-Host and pass its session/role gate. A local-Host `/api/health` remains only
-for setup and update probes and returns `ok` and `build`; other local-Host
-requests are refused. This closes a direct loopback read path inside the
-hosted container. The image's `:3011` relay and agent/daemon process isolation
-have separate release gates; enabling this option alone does not establish
+enabled. In this mode, ordinary board requests must name the public board
+Host and protected routes still pass their session and role gates.
+A local-Host `/api/health` remains for setup and update probes only and
+returns `ok` and `build`; other local-Host requests are refused. This closes
+a direct loopback read path inside the hosted container. The image's
+`:3011` relay and agent/daemon process isolation have separate release
+gates; enabling this option alone does not establish
 their security.
 The persisted mode has no `--no-board-public-only` shortcut: a hosted board
 that cannot enforce it should stay unavailable. A running UI refuses a
@@ -35,6 +40,16 @@ before overwriting `ui.json`, but it is not a production rollback by itself.
 Activation needs an operator-reviewed image/configuration backup and restore
 runbook; a failed guard must not automatically fall back to the sessionless
 local surface.
+
+A protected deployment can also serve credential entry on a separate HTTPS
+origin pinned by its runtime profile. A signed-in public board owner manages
+custody and authorizes one pending request at a time from the board. The
+handoff opens the form only at the pinned origin and only for that request.
+The originating public owner session must still be authorized by a live
+membership authority; standalone signed login alone is not sufficient.
+The ordinary board and loopback never collect the credential. The entry
+host does not serve ordinary workspace APIs or offer device or local login
+in public-only mode.
 
 ## My work
 
@@ -119,7 +134,7 @@ and does not activate Private projects or qualify assistant/filesystem isolation
 through the existing `cli.read` actor-envelope protocol. The native server derives
 the owner from the verified user actor and accepts no arguments. A local-org CLI
 invocation explains that a hosted org is required. Existing project, issue, setup,
-membership and local-agent commands remain their current interfaces; this feature
+membership and `agent connect` commands remain their current interfaces; this feature
 adds no setup/access screens, work-proof format or agent-execution dashboard.
 
 
@@ -182,9 +197,15 @@ created: 2026-09-17T16:01:23Z
 |---|---|
 | `status` | A container's status rolls up from its children; else a bound job's task states (`dispatched`/`running`/`revising` → `doing`, `review` and `verified` → `review`, `done` → `done`, `blocked` only flags `blocked_reason`); else a terminal file status (`done`/`dropped` — merge evidence or an explicit set, which no note can reopen); else the latest note carrying `Issue: <id>` (`-kickoff` → `doing`, `-qa` → `review`, `-verdict` → `review` — a verdict is a review outcome, pass or not; notes never derive `done` — on that side the file field carries it, set by reconcile/`mark_done_on_merge` on merge evidence or by hand); else the file. `verified` stays `review` until `job accept`. `status_source` says which: `rollup` \| `job` \| `notes` \| `file`. Draft tasks are unstarted templates and never drive the board. |
 | `blocks` / `duplicates` | Inverses of `blocked_by` / `duplicate_of`, computed at read time. |
-| `ready` | Leaf issue, status `ready`, nothing unfinished in `blocked_by`. |
-| `blocked` | Any `blocked_by` target not `done`. |
+| `ready` | Leaf issue with status `backlog` or `ready` that is not blocked. |
+| `blocked` | A `blocked_by` target is absent or is neither `done` nor `dropped`, or a task in the selected job is blocked. |
 | counts, activity, sessions | Comments/artifacts/refs lengths; merged notes+comments+git log; agents bound through `agent.tasks` × `jobs.issue_id` — exact, never a text scan. |
+
+When several jobs bind to an issue, the newest nonterminal job wins by numeric
+creation time; equal times use the job ID in descending order. If every job is
+terminal, the newest terminal job wins. If any job in the group has a
+nonnumeric creation time, the selector retains its previous string-and-ID
+ordering; this fallback does not establish that the job state is safe or current.
 
 Statuses: `backlog ready doing review done dropped`. Issues are never
 deleted — `dropped` is the end state. `dropped` issues don't render on
@@ -315,9 +336,10 @@ pi:
   pick its own extensions. The installed `package.json` `version` must
   equal the pin and its `pi.extensions` files must exist; they become
   operator-pinned `-e` argv entries (`--no-extensions` stays on), and the
-  package dir joins the confined master's read set, read-only. A
-  missing package, a drifted version or an entry escaping the package
-  dir refuses the launch.
+  package and its validated installed runtime dependency closure join the
+  confined master and worker read sets, read-only. This does not grant the
+  whole npm tree. A missing package, invalid dependency closure, drifted
+  version or an entry escaping the package dir refuses the launch.
 - A hosted AgenticOS image may set
   `CADENCE_PI_AGENTICOS_READ_EXTENSION=/opt/executor/cadence-read.mjs`.
   This is an operator environment opt-in for the **master only**, separate
@@ -366,6 +388,309 @@ The OpenRouter worker/reviewer prohibition and existing master exception
 remain unchanged. A catalog entry or this documentation does not authorize
 an unlisted model or a production configuration change.
 
+## Project access policy
+
+A project's access policy is stored in `<pm>/<project>/project.yaml`.
+Projects without a recorded policy retain their existing access, and new
+projects default to `workspace_visible`.
+
+`private` is a defined policy value, but this build refuses to record it:
+`private_available()` remains `false` while the isolation paths and their
+acceptance checks are incomplete. Do not rely on project policy as a
+completed isolation boundary.
+
+Hosted boards keep the policy in the workspace rather than `project.yaml`.
+Project settings show the recorded hosted visibility and resolve grants to
+workspace member IDs; only a workspace owner can change them. A project with no
+stored policy is shown as unrecorded, not as a newly recorded policy. Hosted
+boards also refuse new private policies until isolation is qualified. Selecting
+Private in the editor is only a draft while that gate is closed; it cannot be
+saved.
+
+`POST /api/assist/job_request` requires a JSON `issue` field (the hosted
+platform call uses `arguments.issue`): an existing issue in a project the
+member can read. Every valid request is accepted durably, whether the issue
+is free or already held by another nonterminal job. The immediate response
+is exactly `{request_id, status:"accepted"}` and is identical for a replay;
+it names no job and no occupancy state. A request whose issue is held waits
+as a pending accepted request and is promoted autonomously by the daemon
+watch to at most one draft job when the issue becomes free. Every promotion,
+including the first, re-proves the request's ORIGINAL issuing credential
+(never the member's latest) and the member's current project/issue grant
+before its effects. It needs the operator-enrolled `hosted-board`
+`assist.revalidate` service credential; a revoked credential, removed member,
+inaccessible issue or unavailable service fails closed. The request does not
+approve or dispatch work. One issue can have only one nonterminal job.
+Replaying a request key cannot retarget it to a different issue, and a replay
+refuses once the job that request created is bound to an issue the member can
+no longer read. The replay does not depend on the ownership ledger, so a
+request whose promotion was interrupted still replays.
+
+`member_job_list` adds owner-only `requests` rows
+`{request_id, issue, status, job, reason}`, filtered by the issues the member
+can read now. `pending` never exposes a job id, even if a crash left an
+internal job or ownership binding; `created` exposes the canonical job only
+after its ledger, subscription and notice are durable and its provenance is
+unambiguous. The list reports `promotion_worker` (`running` or `unavailable`).
+A pending row's `reason` is `null` while waiting,
+`promotion_worker_unavailable` when no joined worker runs,
+`promotion_unavailable` when the original credential or service cannot be
+re-proven, or `promotion_attempt_failed` when an effect or recorded binding
+cannot be proven. No reason names another job or its occupancy. An unprovable
+completed binding needs operator recovery; it is not silently rebound.
+
+Member-assistant job lists, evidence, events, sharing, subscription and
+reconciliation require a readable issue binding. A subscriber can read only
+while the owner shares the job; disabling sharing retains the subscription
+record but withholds its reads until sharing resumes.
+
+Member-private job deliveries are recorded separately from the shared delivery
+loop. Each result binds the exact job, task, revision, dispatch message,
+recorded report SHA (including an explicit null) and result bytes. Only the
+current owner with the required project access can receive them in
+`member_job_list.private_deliveries`; a subscriber cannot. A proven operator
+can inspect them with `cadence delivery private-ls`. The projection's
+`private_deliveries_state` is `unavailable` when a native completion cannot be
+matched to the ledger; stale running entries are withheld. This is a
+point-in-time consistency check, not a claim about the cause of the mismatch.
+`cadence delivery private-reconcile` replays provable native evidence without
+rerunning work or publishing it.
+
+For this delivery ledger, sharing requires an explicit, proven local operator
+action: `cadence delivery publish` names the delivery, its bound issue and
+project, and the selected result messages. It writes an issue comment, not a
+PR; there is no member publication operation or PR publication target. A
+pending attempt can be resolved with `cadence delivery publish-reconcile`.
+Ambiguous legacy records remain available only for operator inspection and
+recovery. Other tracker report writers are not yet covered by this gate; do
+not rely on it as a publication boundary for all private work.
+
+The cloud-sandbox dispatch preflight refuses jobs whose ownership is private
+or ambiguous before its entitlement probe and dispatch effects. That runner
+records shared issue references and pushes a Git ref; the preflight is not yet
+fenced against a later provenance change, so it is not a complete privacy
+boundary. A previously attempted remote create has an unknown outcome and is
+left for operator inspection; the refusal does not assert that the remote job
+stopped.
+
+An issue-only message is withheld from a reader who cannot access a private
+job on that issue: without task provenance it cannot be distinguished from the
+job's work. This may also hide unrelated issue activity. Scoped message pages
+withhold cloud-origin and cloud-derived rows rather than borrowing the board's
+operator cloud proof; other cloud paths are not yet qualified.
+For a scoped `cadence message ls`, rows omit the table-global message sequence;
+use a returned message ID with `--since` to continue terminal history. Live
+messages remain in the list regardless of that anchor. A proven operator keeps
+the numeric sequence in the management view.
+Scoped agent and task details also omit message sequence positions; scoped task
+verdicts and member job evidence omit verdict sequence positions. Authorized
+content remains available, and the operator retains numeric management views.
+
+Scoped agent status is `busy` only when the reader can see running work for
+that agent; otherwise it is unavailable, not an idle or live verdict. Scoped
+fleet `live` is `null`, and a state filter other than `busy` is refused.
+Operators retain the runtime state, liveness count and full state filters.
+
+Scoped `cadence job events <job>` and `cadence events --job <job>` use
+encrypted continuation cursors and stable keyed event IDs instead of global
+event positions. Continue with an event's returned `cursor` via `--after`;
+an empty continuation returns the same cursor. Scoped readers cannot use legacy
+numeric event checkpoints, and missing key material refuses the read rather
+than resetting it or returning numeric positions. A proven operator retains
+the numeric view. Relayed member job-event pages must acknowledge the opaque
+format on every response; an older daemon cannot serve that scoped feed.
+
+Scoped `cadence events <agent>` uses the same opaque format. Its tail contains
+only visible rows; continue with the returned cursor via `--after`. A cursor
+is bound to the reader, agent registration, workspace and readable project
+set, so a change of access refuses an old cursor instead of resetting it.
+The board requires the daemon to acknowledge the scoped format before it
+shows member event history. Agent event watermarks remain operator-only.
+
+Scoped `cadence topic read <topic>` returns post IDs without global positions.
+Use the page's opaque `before` value with `--before` to read older posts. A
+native topic reader must request the opaque format; missing keys, numeric
+checkpoints and older daemons refuse rather than silently restarting. Private
+room cursors are also bound to the member's current join cutoff.
+For project topics, a subscription alone does not grant project read access;
+job and peer topics also require access to the associated job. Fleet topics
+remain explicitly subscriber-shared. Topic fan-out and retained mailbox
+copies are not yet covered by this read guard and must not be treated as a
+private-data boundary.
+
+Scoped `cadence monitor alerts <monitor>` returns stable alert IDs, opaque
+continuation cursors and per-alert acknowledgement tokens. Continue with
+`--after <cursor>` and acknowledge an authorized native-agent alert with
+`cadence monitor ack <monitor> --ack <token>`; numeric positions remain
+operator-only. The board's numeric acknowledgement route is operator-only,
+and member alert rows are read-only. The CLI requires the daemon to confirm
+either a scoped page or a proven operator's numeric page; an older daemon that
+does neither is refused. Native scoped acknowledgement holds the tracker and
+slot guards while rechecking identity, project access, monitor
+coverage and private-job denials in the same transaction as the alert write.
+This serializes supported authority changes; it does not isolate an agent that
+can modify the same user's files or database directly.
+
+Native inbox reads and acknowledgements require a proven operator or a
+connection attributed to the named inbox alias. A passive inbox has no actor
+of its own, so the latter is not a usable native consumer identity. Explicit
+agent and service consumer grants are not yet implemented. Scoped inbox
+cursors and topic-notice filtering are also not yet migrated; this does not
+establish project isolation for a non-operator mailbox.
+
+The synthetic unread-recovery preview at
+`/20261108-004316/cad2215-unread-recovery/` was owner-accepted on 2026-11-08;
+its source is `design-plans/cad2215-unread-recovery/`. It demonstrates an
+explicit per-conversation start without deleting older markers. The product
+flow and server-side watermark are not implemented yet.
+
+Signed `member_assist_history` reads require `cursor_format: "opaque-v1"`.
+They return stable keyed entry IDs and randomized, direction-bound continuation
+tokens instead of global thread positions. Tokens are bound to the verified
+member, assistant conversation and workspace; numeric, foreign or invalid
+tokens refuse rather than restarting. Operator-only entries are filtered before
+the page limit, and conversation metadata excludes the shared update timestamp.
+The board requires the per-page opaque acknowledgement and refuses an older
+daemon's numeric or unexpected metadata.
+
+Human-room history and post/Ask receipts omit global topic positions. History
+returns opaque backward cursors, a stable keyed identity for the current
+human/room/join scope, and a separate opaque read token for each visible post.
+Read markers remain numeric inside the store and are not reset by the cutover.
+The board checks capability and executes each scoped call on the same daemon
+connection, then requires that response's opaque-format acknowledgement.
+Invalid, stale or foreign cursors are refused; the UI blocks automatic
+continuation and offers an explicit room reload without resetting its marker.
+An unavailable write receipt can mean the post already committed; retries use
+the same client ID.
+
+Direct-agent `thread_read` requires `cursor_format: "opaque-v1"` and returns
+stable keyed row IDs and randomized, principal-, direction-, thread- and
+workspace-bound cursors instead of global positions. Project/private and cloud
+source filtering precede pagination. A proven operator retains numeric thread
+positions. `cadence thread show` requires the corresponding per-response
+acknowledgement and refuses an older or malformed daemon page.
+
+`thread_search` (CAD-2663) lets a native agent (Claude, Codex, Pi or OMP) find
+an exact fact in its own conversation after a compaction. It runs as
+`cadence thread search "<phrase>"` from the agent's shell, and as the
+`thread_search` MCP tool on Codex. The daemon searches only the conversation
+the caller's running turn belongs to, and the request cannot name an agent,
+thread or conversation. A row qualifies only when its message reached the
+agent: delivered, and not the running turn. An issue-bound message is
+included only while the caller's project scope and private-job denials admit
+it. A message with no issue or task is included, as the continuity pack
+carries it.
+
+A query is an exact phrase or up to 6 words. Entries holding the whole phrase
+rank first, then entries ranked by how many of the words they hold, newest
+first. One search reads the newest 4,000 such entries and returns at most 10
+hits and 4 KiB of snippets. Each hit has an opaque handle, bound to the
+caller, thread, turn and read scope. `--around <handle>` reads up to 6 entries
+either side, with each entry clipped to 1.5 KiB and the window capped at
+8 KiB. Text is returned as stored, which is already secret-redacted, and turn
+tokens are redacted on the way out. No global position or payload is
+returned. A continuity pack names the route in one line of its header.
+
+This is not yet a complete private-activity boundary. Relayed member and
+`read_as` thread pages still expose global positions. On an ordinary thread, a
+cloud row whose owner has **no** enrolled credential for the target is
+withheld (`cloud_agent_authority_missing`) instead of failing the page, so its
+presence is not disclosed. A record that exists but has expired, is
+ambiguous, or names another verified owner still refuses the page, and that
+refusal remains an existence signal; proving the owner identity independently
+of the hidden row would close it.
+
+For scoped job-event, agent-event, topic, monitor-alert, human-room,
+member-assistant history and direct-agent thread reads, an operator provisions
+the fixed
+`<state-dir>/scoped-cursors.json` record and raw key files, then runs
+`cadence daemon cursor-key-init` from a proven operator connection:
+
+```json
+{
+  "version": 1,
+  "identity_key_file": "/secure/cadence-cursors/identity.key",
+  "active_key_id": "0123456789abcdef0123456789abcdef",
+  "keys": [{
+    "id": "0123456789abcdef0123456789abcdef",
+    "key_file": "/secure/cadence-cursors/cursor.key"
+  }]
+}
+```
+
+Replace these example paths with owner-controlled absolute paths. Each
+distinct key file contains exactly 32 raw bytes, is a single-link regular file
+with mode `0600` under a `0700` owner-only directory, and is outside the state,
+tracker and backup trees. The state directory is `0700`; the record is `0600`.
+Symlinked or unsafe paths are refused. Initialization is idempotent for the
+same key set; changing that set or its bytes fails closed. The active ID may
+switch among keys already in the bound set. Retain the key set for restarts.
+A portable import creates a new workspace namespace, so source-workspace
+cursors do not resume there.
+
+The board projects live updates per signed member, including after project
+access changes. This is not yet a completed privacy boundary: global sequence
+numbers can reveal intervening activity, and same-UID processes and files are
+not isolated.
+
+Relayed member job-list, agent-list/detail/event, thread and master-state reads
+require the daemon's matching per-response scope acknowledgement. A daemon
+that does not confirm the projection is unavailable to that reader; the board
+must not use its global response. In particular, a missing or older member-job
+ack makes the whole list unavailable, not just its private-delivery rows. An
+older board does not enforce this boundary, even against a newer daemon. Keep
+private projects unavailable until both components are upgraded, old board
+processes are gone, and the remaining checks pass.
+
+Member agent detail rechecks the current agent and job scopes before returning
+the row. If the scoped event read fails or either scope changes, it returns an
+unavailable response instead of an earlier row or a raw daemon error. Concurrent
+visible job or agent changes can require a retry. Operator detail rechecks the
+live role before returning and retains event-error reporting for recovery.
+
+For a relayed member, master-state turn and queue metadata are withheld. A
+non-Home master app conversation requires an explicit grant for that exact
+member, installation and conversation, pinned to its approved bundle and
+context. A later read rechecks revocation, installation drift and membership;
+project and private-job checks still apply to its bound messages. Anonymous
+and other relays without a member grant cannot read it. The owner manages those
+grants on one exact installation: `GET /api/app-installations/{id}/member-access`
+lists the installation's conversations, its grants (active and revoked) and the
+live roster a grant may name; `POST` on the same path grants one conversation to
+one `member_sub` with the approved `expected_digest`; `POST
+/api/app-installations/{id}/member-access/revoke` withdraws that one exact pair.
+All three are operator-only, take the installation from the path, ignore any
+body field that claims the caller's identity or tenancy, and relay the board's
+verified public session so the daemon re-reads the live roster itself. A local
+operator with no public session may list and revoke but cannot grant, because
+no live roster can prove the member; an unprovable roster fails the read
+rather than returning an empty one. There is no installation-wide or
+conversation-less revoke on this surface.
+
+Each explicit app-conversation grant has an authorization epoch, and an
+in-flight member thread or master-state read rechecks it. Schema v67 assigns
+epochs to existing grants without changing their access or recreating history.
+The final recheck can still race a revocation, and daemon and board socket
+writes are not fenced across revocation. Do not rely on the epoch as a strict
+in-flight revocation boundary. Opaque thread watermarks and the accepted
+unread-recovery flow are also not implemented.
+
+Project authorization uses the exact verified user subject, not its lossy
+display handle. Subjects that do not fit the existing 64-character handle
+grammar have no private-project or personal-wiki identity; public wiki reads
+remain subject to their ordinary public policy. This does not establish the
+remaining project or local-process isolation boundary.
+
+Agent-memory wiki paths are scoped to the lesson's project; personal wiki
+search uses separate per-user corpora so another user's private pages do not
+change a member's search ranking.
+
+The intended boundary includes local agents and MCP. The tracker is stored in
+ordinary files: board and daemon checks do not isolate a process that can read
+them. Existing same-UID agent and local CLI/MCP paths are not yet isolated;
+CAD-2216 tracks the implementation and independent verification.
+
 ## `cadence issue` — the only writer
 
 ```bash
@@ -395,6 +720,34 @@ cadence project new reminders --repo ~/code/reminders [--prefix REM] \
                                             # different repo, key `agents`, a bad
                                             # key, a non-git path, the tracker or
                                             # the daemon state dir writes nothing
+cadence --org <slug> project new fav-bd --name "Fav BD" [--prefix FBD]
+                                            # CAD-1999, hosted org only: register
+                                            # an empty project in the org's own
+                                            # registry — no repo, no PROJECT.md.
+                                            # --name is the human label and is
+                                            # required; the same key, name and
+                                            # prefix is the same project. A key
+                                            # already registered (or already
+                                            # present only as its tickets'
+                                            # project) with a different name or
+                                            # prefix, or a prefix another project
+                                            # uses, refuses without writing. The
+                                            # live human workspace owner is the
+                                            # only caller the board admits.
+cadence --org <slug> issue project ls       # CAD-1999: the org's projects —
+                                            # registered ones plus the projects
+                                            # that exist only as their tickets'
+                                            # key (name = key for those).
+                                            # --sort/--limit/--fields are local
+                                            # transforms and refuse remotely
+cadence --org <slug> issue project timeline <key> [--since 7d] [--kind status,review] [--open] [--limit 50] [--before <cursor>]
+                                            # CAD-2240: the project's timeline,
+                                            # newest first (hosted only); page
+                                            # on with the `next_before` cursor
+cadence --org <slug> issue ls --project fav-bd
+                                            # CAD-1999: one project's tickets; an
+                                            # empty registered project reads as an
+                                            # empty list. One key per call.
 cadence issue new "title"                   # --project wins, else CADENCE_PROJECT,
                                             # else the cwd repo's remote/path; no
                                             # match fails closed. --parent, --priority,
@@ -524,9 +877,10 @@ existing global checks counter remains for compatibility. `dispatch` reads the
 same section-scoped items: an issue with none is warned about, not refused
 (CAD-159 — see Dispatch and finish).
 
-Every write is exactly one git commit in the PM repo, made under a lock
-file (`~/pm/.lock`) with atomic `issue.md` replacement. Field values are
-validated inside `issue::write` itself — on `new`, `set` and the HTTP
+A native tracker write is recorded in the PM Git repository under the
+tracker write lock, with atomic `issue.md` replacement where applicable.
+Hosted workspace writes use their own storage and supported operations.
+The native `issue::write` validates field values — on `new`, `set` and the HTTP
 PATCH alike — so a bad value can never be committed and lint stays the
 safety net: `status` is one of the six, `priority` is P0–P3, `component`
 must be declared by the issue's project (`""` clears it), `tags` are
@@ -543,7 +897,11 @@ Symlinks inside the tracker are never followed — a linked folder or
 `issue.md` is invisible to reads, an error in lint, and refused by
 writes.
 
-### PROJECT.md `delivery:` — the per-project delivery policy (CAD-826)
+### PROJECT.md `delivery:` — the per-project delivery policy
+
+The lifecycle, the trusted path lists, the evidence each review takes and the
+human approval are in [Delivery](guides/delivery.md). This section is the
+`delivery:` schema.
 
 A project may declare the delivery policy the loop will run under in
 `<pm>/<key>/PROJECT.md` frontmatter. Like the work gates it lives in
@@ -551,7 +909,8 @@ PROJECT.md and not `project.yaml` (strict `deny_unknown_fields` — an
 older binary would refuse the whole file), and it takes effect only
 once the operator approves it: `cadence issue project approve-work
 <key>` records the resolved policy and its `sha256:` digest beside the
-stage-gate digest. A malformed `delivery:` refuses the whole approval;
+stage-gate digest. On a hosted org the owner's save with
+`issue project delivery` is the approval. A malformed `delivery:` refuses the whole approval;
 the daemon computes both fields from the file it read — a
 `delivery`/`delivery_digest` param is ignored. With no section the
 recorded policy is `null` and the digest is the default policy's. The
@@ -560,7 +919,7 @@ left implicit — but `risk` rule order is significant, so reordering
 rules changes it and needs re-approval.
 
 `integration_branch` optionally permits one additional PR target beside the
-repository default branch (CAD-1561). It must be a canonical branch name, not
+repository default branch. It must be a canonical branch name, not
 a `refs/` path or revision expression, and match the current, exactly approved
 policy. An unapproved, removed or malformed section cannot enable it through
 the last-approved fallback. Re-approve through the operator connection after
@@ -597,9 +956,8 @@ delivery:
   oversized: {lines_over: 3000, files_over: 40}   # optional
 ```
 
-`merge`, `max_revise`, `heavy` and `oversized` fall back to today's
-loop constants: `squash` through the merge queue, `max_revise`
-`MAX_REVISE`, `HEAVY_*`/`OVERSIZED_*` — and the default policy is one
+`merge`, `max_revise`, `heavy` and `oversized` fall back to built-in
+defaults (`squash` through the merge queue), and the default policy is one
 `review` agent review (`focus: general`) required unconditionally.
 Unknown keys are refused at every level. Validation: review names are
 tags; an `agent` needs a `focus` from the allowlist above and takes no
@@ -614,12 +972,13 @@ file-level glob grammar the `areas:` reader and an issue's `paths=`
 field use (`*` and `?` match inside one path segment, a `**` segment
 any number of segments, a trailing `/` everything under it — no
 leading `/` or `~`, no empty/`.`/`..` segment, `#`, `\`, `,` or
-control characters; validated by `areas::check_path` and, in slice 3,
-matched by `areas::matches`, so the two grammars can't diverge). `heavy` sits strictly
-under `oversized`. And the safety floor: at least one unconditional
-rule must require an `agent` or `operator` review — a `check` is a bot
-and never satisfies the floor, even `required` (it still blocks where
-a rule names it) — so a merge can never need no review at all.
+control characters; validated by the same path check and
+matched by the same matcher, so the two grammars can't diverge). `heavy` sits strictly
+under `oversized`. The policy schema requires at least one unconditional
+`agent` or `operator` review rule; a `check` cannot satisfy that schema
+floor. The shared requirements evaluator can nevertheless classify an
+eligible routine change with zero mandatory reviews. Required checks, outcome
+evidence and any additional downstream gate still apply.
 
 While the file's section is not the approved one, every reader falls
 back — to the approved policy, else the defaults — and reports the
@@ -632,8 +991,14 @@ agent cannot swap a stricter policy for the defaults silently. The
 notes: `delivery_unapproved: …` when the section changed, was removed
 or is malformed since approval (the approved policy stays in force),
 and `delivery_error: …` when it is malformed with none; `issue lint`
-warns the same. Nothing in the delivery loop consumes the policy until
-CAD-814 slices 2–5.
+warns the same. The shared requirements evaluator consumes the effective
+policy and trusted change evidence; the final enqueue gate can impose further
+requirements. Inspect the actual result for the target and exact head.
+
+The merge gate counts the `standards` and `spec-security` review axes itself.
+Counting reviews by a rule's `agent`, `check` or `operator` kind is not applied
+yet: the section is validated and approved, and the gate does not count against
+its `reviews` names. Read the gate with `delivery check`.
 
 ## Multi-host trackers — `issue sync`
 
@@ -660,9 +1025,9 @@ lints but leaves the push for a later sync. `issue doctor` reports the
 same ahead/behind counts against `origin/<branch>` and points at
 `issue sync` whenever the local side is behind.
 
-## History — from git alone
+## Native tracker history — from git
 
-Every write is one commit whose subject carries the verb
+A native tracker write is recorded as a commit whose subject carries the verb
 (`CAD-16: set status=review (operator (ui))`), so the tracker's own
 log is the audit trail. Each commit also carries trailers after a
 blank line: `Issue: <ID>` once per issue the write touches (link and
@@ -948,10 +1313,17 @@ business: no `--ready`, no forced claims; the output prints the queued
 message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
 
-**Task context delivery (CAD-1822).** A plain dispatch to a managed
-endpoint also pins the task contract and the assigned project's tracked
+**Task context delivery (CAD-1822, CAD-1846, CAD-2001).** Plain dispatch,
+explicit `dispatch --job --spec`, and native issue-linked job task dispatch use the
+same project-source and current-policy lesson selection for the actual
+worker's role. They pin the task contract and the assigned project's tracked
 sources, but only when that project's tracked
-`docs/cadence/project-context.yaml` at HEAD sets `agent_delivery: true`.
+`docs/cadence/projects/<key>/project-context.yaml` — or, when that is not
+tracked, `docs/cadence/project-context.yaml` — at HEAD sets
+`agent_delivery: true`. One checkout can serve several projects, so the
+per-project path is preferred and lets each project keep its own opt-in;
+the shared default serves only the project its `project:` names, and a
+manifest naming another project is refused, never read as this project's.
 Absent or false leaves every existing dispatch path unchanged. A
 tracked manifest the daemon cannot read or parse cannot prove the
 opt-in, so delivery stays off and dispatch is unchanged; once
@@ -961,9 +1333,15 @@ is daemon-side: the issue's registered project's declared local
 repository and the manifest at HEAD. Required documents are
 selected regardless of role; optional ones by the worker's runtime
 role (`dev` by default, `qa` for reviewer/QA, `pm`/`devops` exact).
-The pin records the task revision (SHA-256 of `issue.md`), the complete
-acceptance, the project revision and each source's `id`/`path`/
-`revision`/`sha256`/bytes as a `context_pin` event bound to that
+The schema-2 pin includes canonical issue prose (without tracker frontmatter
+or duplicated acceptance lines), complete acceptance, the project revision
+and each source's `id`/`path`/`revision`/`sha256`/bytes. Plain task revisions
+are SHA-256 of the captured `issue.md`. A job task retains its distinct task
+and parent issue identities; its composite revision also covers the complete
+effective spec, stored task criteria, native revision and exact execution/report
+contract, so a spec-only change cannot masquerade as retained context. The
+kickoff carries scope and the native report/SHA contract without duplicating
+the spec or criteria. These persist in a `context_pin` event bound to that
 message id — a retried send keeps its first pin, and two queued
 dispatches cannot share one. Before the first managed turn the daemon
 appends the full contract and sources, quoted as data inside its own
@@ -1018,9 +1396,11 @@ material is reserved conservatively in the same cap — currently the
 44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
 provider, even while its guard is off. This is a local byte reservation, not provider-window
 accounting; the receipt records it as `adapter_reserved_bytes`, never as
-appended source. Only an opted-in project's changed
-kickoff body supersedes a reported duplicate. A
-missing
+appended source. An opted-in plain issue's changed actionable contract or
+kickoff body supersedes a reported plain duplicate. The completed-contract
+comparison excludes tracker bookkeeping, not narrative/title/criteria;
+live retries still return before recapture.
+A missing
 required source, an unusable manifest, a combined payload over 48 000
 bytes, a pinned project context on an endpoint that cannot receive
 prompt content, or a pin naming another task refuses before the turn
@@ -1037,6 +1417,47 @@ rather than have it silently truncated. A revised task dispatched again
 keeps the earlier message and ref as history: a different kickoff body
 for the same completed worker/lane is an explicit revision, not a
 duplicate.
+
+For opted-in job tasks, spec files must resolve within the canonical issue
+directory, that issue's actual task worktree, or a tracked regular-file path
+at HEAD in the declared project repository. Descriptor-relative reads reject
+symlink escapes and hardlinks; arbitrary external paths are refused. Tracked
+spec paths supply their current bounded UTF-8 working bytes with an exact
+content digest, **not** a claim that those bytes were verified at a Git SHA.
+Opt-out does not read the spec through this context pipeline. Old incomplete
+pins are not silently upgraded to complete contracts; dispatch a new revision.
+For a new opted-in job whose default spec is exactly its canonical `issue.md`,
+the daemon pins `spec_sha256` over the complete Markdown body, including every
+criterion, rather than tracker frontmatter. Claim/lane/message-ref bookkeeping
+therefore cannot invalidate the job's own spec. Material body changes still
+refuse; the accepted job digest is never refreshed. The context manifest
+separately retains the exact raw captured issue/source revision. Other spec
+files retain their raw-byte job hash. A task-specific checklist does not replace
+requirements in the effective canonical spec: only criteria already represented
+verbatim are deduplicated. Older canonical jobs with raw-source hashes are not
+silently converted; recreate/reconcile their binding when that hash no longer
+matches the effective spec.
+
+Eligible lessons reuse the existing accepted-memory matching/rendering policy;
+no approval or verification rule is relaxed. One optional `native:lessons`
+source carries the bounded rendered lessons and selected IDs. Stale/withheld,
+load-failure and whole-source budget omissions remain explicit gaps.
+`--no-lessons` suppresses this source. The opted-in path does not also append
+the legacy lessons sidecar. Supply receipts record lesson IDs, not proof of
+model use or source verification.
+
+CLI retry identity is checked before source capture or `issue start`.
+A live plain kickoff cannot suppress an explicit job kickoff, nor can a
+completed kickoff for a sibling task. A matching open job's canonical
+`<job>-t1` task returns its accepted live/completed message without recapturing
+sources or creating another job. An unaccepted draft is reused only after
+its assignee, issue/lane, branch/base, criteria and spec locator match.
+Ambiguous open jobs, conflicting live modes or an unprovable/ceased accepted
+binding refuse for reconciliation; native task redispatch remains explicit.
+Material task/job/worker identity is rechecked in the admission transaction
+before the pin, message and task revision become visible together.
+An explicit task-bound follow-up cannot borrow another task's active pack;
+a passive report remains ambient rather than activating its reported task.
 
 ### Claims — who may start or dispatch an issue in flight (CAD-383)
 
@@ -1144,12 +1565,19 @@ checkout is not guessed at. It refuses, naming what it found, while:
   an abandoned lane and reports `not_started: true` (CAD-275), or
 - the branch's work survives nowhere: not merged into the repo's
   default branch (`origin/HEAD`, else the checkout's current branch)
-  and not pushed to a remote-tracking ref. "Merged" recognizes
-  however the work landed — ancestry, `git cherry` patch-equivalence
-  (rebase/cherry-pick), the branch's combined diff reverse-applying
-  onto the default tree (a squash merge, checked in a temporary index
-  so no worktree is touched), or a merged GitHub PR naming the head
-  branch. The output's `merged_by` reports which rule matched.
+  and not pushed to a remote-tracking ref. "Merged" means the exact
+  tip survives somewhere durable: ancestry of the default ref, or a
+  merged GitHub PR on origin's own repository whose head is exactly
+  the tip (CAD-2181). Content inference (`git cherry`, a diff that
+  reverse-applies) is never evidence — it is forgeable by content
+  shape. A squash-merged lane still releases when it has nothing of
+  its own left to lose: its tip is on origin, or its tree is identical
+  to the default ref's — every file and mode already there, so the
+  delete drops history only. One whose content survives nowhere (no
+  PR, no push, a different tree, a non-GitHub origin) is kept, and the
+  refusal says to push it or `--force`. The tree comparison decomposes
+  no patches, so the shapes that fooled `git cherry` refuse. The
+  output's `merged_by` reports which merge rule matched, if any.
 
 Then it runs `git worktree remove`, deletes the local branch (with
 `--remote` the remote one too), and lands one tracker commit
@@ -1171,144 +1599,216 @@ or activity enumeration; an unknown check is not evidence of no live use.
 
 ## Project memory — `cadence memory`
 
-One reviewed fact per file at `<pm>/<project>/memory/<slug>.md`:
-YAML frontmatter (`id`, `type`, `status`, `confidence`, `scope`,
-`author`, authenticated `author_proof`, `source`, `created`,
-`verified_at`, optional `stale`, review cycle/receipts and optional
-`supersedes`)
-plus a body contract — a fact, then `**Why:**` and `**How to apply:**`
-sections. Types are `rule | gotcha | decision | recipe`; statuses are
-`proposed | accepted | rejected | superseded`.
+One claim per canonical file at `<pm>/<project>/memory/<slug>.md`; Wiki
+continues to project those files. There is no second vault or memory database.
+The body remains a fact, `**Why:**` and `**How to apply:**`. Existing types
+`rule | gotcha | decision | recipe` describe the claim's purpose, not its trust.
+
+### Versioned schema and rollout
+
+`src/memory/mod.rs::Front` and `src/memory/policy.rs::PolicyV2` are the
+authoritative serialized schema. New proposals are always server-stamped
+policy revision 2, including proposals read from a file. Imported author,
+approval, verification or usage fields cannot create authority. There is no
+caller-selectable v1 mode and no per-project activation switch.
+
+The optional `policy` distinguishes the existing v1 representation from v2.
+V2 records retain:
+
+- claim nature (`mechanical | judgement`), source provenance, project-local
+  approval audience and optional native team-role restrictions;
+- immutable typed evidence references and an optional declarative check
+  identifier/source revision/target revision — never an executable command;
+- native authorship/contributors, confirmed model evidence where available,
+  operator source attestations, digest/cycle-bound reviews and decisions;
+- bounded latest usage-report receipts and report counts. Full audit history
+  stays in the canonical record, not the default agent context.
+
+For a Wiki citation, refusal or an unreadable revision is a skipped check, not
+proof that the page is absent. Absence requires an admitted, successfully read
+pinned commit. Neither result is a pass.
+
+Existing v1 records are neither rewritten nor silently adopted. Their native
+two-reviewer/PM lifecycle remains in `memory::submit_review`,
+`memory::finalize_native` and the legacy retrieval evaluator. Incomplete
+historical receipts remain readable but cannot authorize retrieval. Explicit
+legacy adoption belongs to CAD-382.
+
+This is a source rollout, not an installation instruction. After an approved
+installation, every new proposal uses v2; existing files retain their version.
+Mechanical promotion is intentionally blocked until CAD-348 supplies genuine
+native logic-check evidence. A hash, command string, review or operator source
+attestation cannot stand in for a check result. Curator scheduling is CAD-349;
+this change launches no curator or provider.
+
+### Native commands
+
+Example candidate, not pre-approved guidance:
 
 ```bash
-cadence memory propose --project demo --type gotcha \
-    --scope-path 'src/adapter/**' -m "$(cat <<'EOF'
-Retrying a wedged adapter needs daemon restart first.
+cadence memory propose --project demo --type gotcha --nature judgement \
+    --scope-path 'src/adapter/**' --source CAD-1 -m 'Review a context pack against its recorded revision.
 
-**Why:** the adapter holds the socket.
+**Why:** an unpinned source can change after review.
 
-**How to apply:** `cadence daemon stop` before the retry.
-EOF
-)"
-cadence memory review <slug> --operation accept --verdict pass \
+**How to apply:** inspect the recorded revision before applying this claim.'
+
+cadence memory show <slug> --project demo --json
+cadence memory review <slug> --project demo --operation accept --verdict pass \
     --digest <sha256> --evidence 'source and applicability checks'
-cadence memory accept pipe-drain [--project demo]   # PM finalization only
-cadence memory reject <slug>                       # PM only
-cadence memory supersede <old> <new>               # currently refused
-cadence memory verify <slug>                       # fresh review cycle + PM
-cadence memory ls [--project k]... [--status s]... [--type t]...
-                  [--component c]... [--path f]... [--stale [--days 30]]
-                  [--sort k] [--limit n] [--fields f,…] [--json]
-                                            # value flags repeat/comma-join
-                                            # (any-of); flags AND
-cadence memory show <slug> [--json]
-cadence memory match --issue <ID> [--provider p] [--json]
+cadence memory accept <slug> --project demo --digest <sha256> \
+    --evidence 'decision on this exact judgement'
+cadence memory classify <slug> --project demo --digest <sha256> \
+    --evidence 'operator source-provenance attestation'
+cadence memory revalidate <slug> --project demo --digest <sha256> \
+    --evidence 'why the existing claim must be withheld'
+cadence memory verify <slug> --project demo --digest <sha256> \
+    --evidence 'current-cycle policy decision'
+cadence memory invalidate <slug> --project demo --digest <sha256> \
+    --evidence 'why the claim is no longer valid'
+cadence memory reject <slug> --project demo --digest <sha256> \
+    --evidence 'why the candidate is refused'
+cadence memory supersede <old> <new> --project demo  # refused pending CAD-464
+
+cadence memory feedback <slug> --project demo --digest <sha256> \
+    --message <own-running-message> --token <current-turn> --kind used
+cadence memory ls [--project k]... [--status s]... [--type t]... [--json]
+cadence memory match --issue <ID> [--provider p] [--role dev] [--json]
+cadence memory match --turn [--path p]... [--component c]... [--tag t]... [--json]
 cadence memory lint [--project k]
 ```
 
-Every authority-bearing proposal/review/finalization is a daemon RPC.
-The daemon derives exactly one live agent endpoint from the Unix socket
-peer through its one caller-identity verifier (CAD-381): a pty pane by
-current adapter ownership, endpoint generation and process start, or a
-managed (headless claude/codex) endpoint by its daemon-minted CAD-230
-enrollment (provider pid + start time + uid + owner generation), plus the
-registration incarnation. A caller outside every agent tree has no agent
-identity and is refused — which is not operator proof: operator authority
-needs its own positive proof (CAD-276, CAD-313). Two endpoints on one
-ancestry are ambiguous and refused. Request aliases, `CADENCE_ALIAS`,
-operator UI labels and external identities cannot create proof.
-Two distinct non-author PM/worker endpoint identities, displayed with
-unique aliases, must pass the same semantic SHA-256 revision (claim/body,
-trusted author/contributors, type, source, confidence, scope and supersede
-target); an authenticated PM endpoint then finalizes. Body edits, stale
-digests, duplicate aliases, missing evidence, disagreement and reused
-endpoint identities fail closed.
-Legacy accepted records remain visible with a review-blocked reason and
-are excluded from matching until a corrected native proposal is reviewed.
-`verify` opens a fresh receipt cycle; a timestamp alone cannot revalidate.
-Worker receipts do not make a record retrievable: acceptance and each
-verify cycle need a durable PM finalization receipt bound to the same
-semantic digest. A finalized cycle is consumed; a later verify starts the
-next cycle and cannot reuse its receipts.
-Supersede is refused until crash-atomic pair recovery exists. Every write
-is one tracker commit carrying `Memory: <slug>` and `Actor:` trailers —
-never `Issue:`. `issue lint`
-validates memory files with everything else (the pre-commit hook
-covers them); `memory lint` runs the same checks alone. Lint bounds a
-fact block to 5 lines and 512 bytes and a path glob to 200 chars and
-two `**` segments; a file that cannot be parsed at all is a warning —
-every read path already reports it, and an error there would let one
-stray file brick every tracker commit.
+`memory match --turn` is a native agent's own-task lookup (CAD-2662). The daemon
+reruns dispatch's lesson selection for the issue the caller's running turn is
+bound to, adds any `--path`, `--component` and `--tag`, and records a
+`lessons_supplied` event. The project, issue, provider and role come from that
+turn, so `--turn` refuses `--issue`, `--project`, `--provider` and `--role`.
+Codex agents get the same lookup as the `memory_match` and `memory_propose` MCP
+tools. A native agent may omit `--project` on `propose`; the proposal then goes
+into its turn's project. Anyone else must pass it.
 
-Matching is a union: a memory applies when ANY scope axis intersects
-the dispatch context — `--scope-project` (every dispatch in the
-project), `--scope-component`, `--scope-path` (repo-relative globs
-matched against the issue's recorded-commit paths), `--scope-tag`
-(issue `tags:`), `--scope-provider` (the target worker's provider).
-`match --issue` prints the ranked list: `rule` > `gotcha` > `recipe` >
-`decision`, then confidence, then most recently verified (unverified
-and decayed last), each with its evidence label, followed by withheld
-entries and their reasons (`--json`: `matched[].evidence`,
-`withheld[]`).
+`propose` refuses a blank or omitted `--source`, and it refuses a scope
+with no retrieval axis. `--scope-project`, `--scope-component`,
+`--scope-path`, `--scope-tag`, and `--scope-provider` are axes.
+`--scope-role` selects an audience; it is not an axis. An empty scope
+matches nothing, so the write is refused rather than stored invisible.
+`propose` also accepts `--audience project|role|company`, repeated
+`--scope-role`, typed JSON `--evidence-ref` and typed JSON
+`--verification-condition`. Role audience requires explicit selectors.
+Wiki evidence references use the full lowercase 40-hex commit of the Wiki
+tracker, not a live `fnv1a:` token or a content SHA-256. Existing references
+with unsupported selectors remain readable but cannot produce a complete
+evidence analysis. A condition's optional `wiki_target_revision` pins a Wiki
+tracker commit independently of the project-repository `target_revision`.
+When a project target is present without a Wiki target, Wiki applicability is
+reported as skipped rather than compared across repositories.
 
-Evidence freshness (CAD-203) is separate from review status. Accepting
-a lesson records the review; it does not re-check the evidence, so only
-a PM-finalized `verify` cycle stamps `verified_at` and clears `stale`.
-Retrieval reads the verify finalization receipt itself, and every
-injected lesson carries an evidence label:
+Company audience changes approval requirements, **not** cross-project
+visibility. `accept`, `verify`, `reject`, `classify`, `revalidate` and
+`invalidate` bind the caller's explicit digest; the CLI does not silently
+approve whichever revision happens to be current.
 
-- `verified <date>` — last finalized verify is inside the project's
-  freshness window: `memory: {stale_days: N}` in `project.yaml`,
-  default 30 days;
-- `unverified (last verified <date>)` — the verify has aged past the
-  window. Age alone never withholds: the lesson decays and is still
-  injected;
-- `unverified` — never verified. Older records whose `verified_at` was
-  stamped at accept time read the same way; the files are not rewritten.
+### Authority and decisions
 
-A lesson is **withheld** only when its evidence is explicitly stale —
-`stale: <why>` in its frontmatter (set by a curator today, by CAD-111's
-citation re-check later; the next finalized verify clears it). The
-withholding is recorded with its reason so "why did I not get this?" is
-answerable: in the lessons file (`## Withheld` section), the dispatch
-comment (`Lessons withheld: <slug> (<reason>)`), the dispatch JSON
-(`lessons_withheld`), `memory match` and the `issue context` memory
-manifest. Contradiction is not a withholding reason here.
+`src/daemon/memory_rpc.rs` uses the shared native caller verifier: current
+owned pane proof or managed-root enrollment, including native UID, registration,
+generation and process identity. A missing agent identity is not operator
+proof; operator actions require `Shared::proven_operator`. Request labels,
+provider transport names and configured/requested models are not evidence.
+Ready events must match the native endpoint model/generation; managed owner
+generation remains a separate native proof binding.
 
-Injection happens in two places:
+`memory::policy::qualify` is the approval-matrix evaluator. Read its computed
+requirements and current refusal reason with `memory show --json`
+(`policy.requirements`, `quorum`, `evidence`); the Memory screen reads the same
+projection. Do not substitute a fixed vote count. Unknown underlying model
+vendors do not qualify as independent curators. An operator cannot replace the
+required first curator.
 
-- `dispatch` renders the matched accepted set to
-  `<state>/dispatch/<message-id>-lessons.md` (≤ 12 entries, ≤ 4 KiB),
-  appends `Lessons: <file>.` to the kickoff body, records the slugs in
-  the dispatch comment (`Lessons injected: …`) and returns `lessons`,
-  `lessons_withheld` and `lessons_file` in the JSON. `--no-lessons` skips it; `--job`
-  kickoffs are daemon-templated and never carry the file. Memory
-  failures degrade, never sink the dispatch (the worktree already
-  exists): a memory file that fails to load is excluded and named
-  while valid lessons still inject, and an unwritable lessons file or
-  a suffix that would push the kickoff body over the pty cap drops the
-  file — every case carries a `lessons_error` string naming the
-  reason. The lessons file is written via tmp + rename, so a failed
-  write never leaves a partial artifact.
-- `agent bootstrap`/`join` briefings gain a
-  `## Project memory — accepted rules (<project>)` section listing the
-  project's accepted `rule`s not marked stale (each with its evidence
-  label) for the worker's cwd — ≤ 8 entries and ≤ 4 KiB, same bound
-  as the dispatch lessons file. An over-budget rule is skipped, not a
-  stop; omitted rules are counted.
+Native operator proposals have operator origin, but origin alone is not a
+decision. `classify` is operator-only source attestation on a current
+agent-claimed v2 record; it rotates the semantic digest/cycle and retains
+history. It neither proves a passing check nor approves the company-level
+extra requirement. External-derived candidates remain quarantined until an
+actual operator release; agents cannot assert their own provenance.
 
-Memory readers skip files that fail to load and report them: `ls`,
-`ls --stale` and `match` warn once on stderr and include `load_errors`
-in `--json`; the API returns `memory_errors`. An absent `memory/` dir
-is a valid empty store; a directory that exists but cannot be
-enumerated is a load error. Write-time glob bounds are re-applied at
-load — a hand-edited over-complex path scope is quarantined with an
-error before it can reach matching.
+Review and decision receipts bind the semantic claim digest and cycle.
+Claim/body, applicability, provenance or verification-condition changes
+invalidate old receipts. Review/feedback timestamps and counters do not
+rewrite the claim digest. Writes use the record-scoped PM lock, locked reread
+and scoped commit; stale revisions and refused actors leave no partial record.
+Supersede remains refused until crash-atomic pair recovery exists.
 
-Staleness: `ls --stale` flags an accepted memory not verified within
-the `--days` window (30 default), or whose path globs match files
-changed in a project repo after `verified_at` — informational only;
-`verify` is the refresh. Retrieval labels by its own window as above.
+HTTP memory curation stays closed. Browser authentication and Origin checks
+do not turn a browser request into native reviewer or operator proof.
+
+### Validity, age and authenticated reports
+
+V2 statuses are `proposed | quarantined | accepted | pending-revalidation |
+invalidated | rejected | superseded`. Pending records are withheld; native
+revalidation decisions can restore accepted state. Rejection and invalidation
+are terminal in place and retain the claim and prior decisions.
+
+`memory::matching::withhold_reason` combines explicit staleness with v2
+inactivity expiry. An accepted v2 claim expires from supply after 28 days
+without an authenticated reported use, initially measured from acceptance.
+Expiry does not delete or rewrite it. A current owned-turn `used` report can
+renew inactivity after manual reading, including an expired accepted claim.
+Reviews, decisions, `wrong` and `reread` reports do not count as use.
+Source classification may rotate the digest, but classification/revalidation
+retain the original acceptance inactivity anchor; neither starts a new lifetime.
+
+`memory_feedback` derives the reporter and trusted issue/job-task project
+from the live native assignment. Foreign recipients, retired/completed turns,
+wrong tokens, stale claim digests and caller-supplied receipts/counters/times
+are refused. Only report aggregates and the latest receipt per kind are kept;
+raw turn tokens are not copied into canonical memory. Counts mean reports,
+not unique uses, observed consumption or proven benefit.
+Do not paste the current token into `--evidence`: feedback containing its raw
+token there is refused before persistence, without echoing or silently redacting it.
+
+Feedback takes the record-scoped tracker lock and rereads/CAS-checks the claim
+before `Store::with_memory_feedback` rechecks current native ownership and
+assignment inside the fenced writer. The writer covers the atomic canonical
+file save, not Git hooks. A native transaction error restores the original
+bytes before any Git commit; the tracker lock remains held through the later
+audit commit. This prevents a turn retired during lock contention from renewing
+guidance and avoids re-entering Store from a Git hook while its mutex is held.
+
+Policy review age, source provenance, inactivity and mechanical verification
+are distinct. V2 policy decisions never stamp `verified_at` or claim
+verification at a SHA. Existing v1 verification labels continue to read their
+native verify receipt; verification age alone decays that label, while an
+explicit stale mark withholds. `ls --stale` remains evidence-age inspection,
+not a synonym for all validity/role refusals; `match --json` lists applicable
+withholding reasons.
+
+### Applicability and efficient context
+
+Existing scope axes retain their union semantics: project-wide, component,
+repo-relative path glob, issue tag or target provider. Native team-role
+restrictions are an additional gate. Dispatch and briefing pass the assigned
+team role, never an authorization-role fallback; an unknown role withholds
+role-restricted guidance. All matching stays within the canonical project.
+
+Revisioned kickoffs select one optional lessons source, bounded by
+`memory::render_lessons` to 12 entries / 4 KiB and omitted whole when the pack
+cannot fit it. Its revision hashes rendered claim/application text and evidence
+labels, not audit receipts or usage counters. Feedback does not cause repeated
+history injection or a counter-only pack revision. `--no-lessons` selects none.
+Legacy non-pack dispatch retains its bounded lessons sidecar; a pack kickoff
+does not inject that same guidance twice.
+
+Briefings supply eligible project-wide rules under their separate 8-entry /
+4-KiB cap. Withheld items disclose identity/reason, never claim/application
+instructions. List/detail JSON and the read-only screen expose bounded policy
+summaries; v2 decision summaries show the latest eight entries plus full counts.
+Canonical/Wiki history remains available for deliberate inspection.
+
+Unreadable files are excluded and reported, not treated as accepted empty
+records. `memory lint` and `issue lint` share `memory::check_front`; readers
+report malformed files and unsafe scope globs as load errors. The existing
+five-line / 512-byte fact and 200-character / two-`**` glob limits are unchanged.
 
 ## `cadence ui` — the reader
 
@@ -1690,23 +2190,36 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/issues/:id/activity` | the merged activity stream only |
 | `GET /api/issues/:id/history?limit=N` | parsed git history for the issue — same entries as `issue log` (default limit 50, `400` on a bad limit); an epic's stage move is a `stage` entry with `from`, `to` and `note`, a plan decision a `plan` entry (CAD-432) |
 | `GET /api/issues/:id/artifacts/:name` | one artifact file — inline for a small safe list (`text/plain` for md/txt/logs/code, images), **`Content-Disposition: attachment` for everything else, always for html/svg/xml/js/pdf**. Every artifact response carries `Content-Security-Policy: sandbox; default-src 'none'` and `Cache-Control: no-store`; names must satisfy the write grammar (no `/`, no leading dot); symlinks → `404` |
-| `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
+| `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down; `profiles` (CAD-1989) lists the Settings > Agents profiles as `{id, alias, role, team_role, catalogue, look, job, model, runtimes}` (`job` is the operator's: the board's shared payload always carries `null`, and the daemon returns it only to a proven operator), `runtimes` being the aliases registered with `--profile <id>` (empty means "Idle · no runtime") |
+| `POST /api/agent-profiles` | `{alias, catalogue, job?, model?}` — CAD-1989: a hire saves a Settings > Agents profile from the catalogue role and nothing else: no runtime row, no home directory, no launch. `job` is sent only when edited (else the role's instructions); `model` is `inherit` unless one registered model is chosen (an explicit model stays strict). Operator only over the daemon's `agent_profile_create`; `409 alias_taken` when a profile or a runtime has the alias. A runtime attaches later with `cadence join <group> <provider> --profile <id>` and `cadence agent context <id>` reads the profile (the operator, or the agent whose own runtime is registered against it; anyone else is refused). The alias grammar is lowercase letters, digits and dashes, starting with a letter or digit; a runtime cannot take an alias a profile holds. The job is readable by the operator and a runtime registered against the profile; a group-root agent that registers a member against a profile also reads it (its `join` needs it for the briefing) | `201 {profile}` |
 | `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
-| `GET /api/memories?project=&status=&type=&component=&path=` | memory cards across projects — same filters as `memory ls`; `memory_errors` lists files that failed to load |
-| `GET /api/memories/:project/:slug` | one memory: frontmatter + body; `404` on unknown slug, `400` on grammar |
-| `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
+| `GET /api/memories?project=&status=&type=&component=&path=` | memory cards from projects readable by the caller — same filters as `memory ls`; `memory_errors` includes load failures only for readable projects |
+| `GET /api/memories/:project/:slug` | one readable memory: frontmatter, body and evidence analysis; Wiki citations use the proven board caller's access. An unattributed or refused caller is refused rather than treated as anonymous; inaccessible and unknown memories share a generic `404`, `400` on grammar |
+| `GET /api/overview` | the Home rail and Apps payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
 | `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Any admitted board reader can read agent threads, as with `/api/agents/<alias>`; private local/hosted admission happens first. A live turn token quoted in thread prose is only redacted at `export` |
 | `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each idle poll; closes when a daemon poll fails or session admission is lost; the authenticated UI reconnects from the last event ID; `405` on HEAD |
 | `GET /api/master/summary?since=<epoch secs>` | "since you left" (CAD-328) over the daemon's `master_summary` (CAD-339), never posted to the thread: plans proposed and decided, tickets moved, reports, open questions, `routing_backlog`; `400` without a numeric `since`, `501 unsupported_daemon` on a daemon without the master, `503` daemon down |
 
+Memory evidence receipts include two deliberately bounded fixtures. A body line
+`contradicts: <slug>` marks a same-project, same-scope contradiction. The
+overfit fixture flags a fact line shaped `<environment> cron = <comma-separated
+minutes> was broken` as an incident-specific answer; citations and the Why/How
+sections are not searched for this pattern. It does not detect other overfit or
+establish semantic truth. Citation-derived receipt text and errors redact
+credential-shaped values, including warn-only and operator-allowlisted matches.
+If analysis fails, the `unknown` receipt retains the candidate and condition
+identifiers and reports the checks as incomplete with a sanitized error.
+A `pass` means only the receipt's listed mechanical checks passed; it is not a
+review, verification authorization, or finalization.
+
 ### API — writes
 
-Every issue write goes through `issue::write` — the same functions the
-CLI runs — so the API is a second front door, not a second writer. Memory
-authority is separate: browser HTTP has no native socket/PTY identity and
-is refused after the normal write guards. Each successful issue call is
-exactly one git commit whose subject carries the actor:
+Native board issue writes go through `issue::write` — the same functions
+the native CLI runs — so its API is a second front door, not a second writer.
+Memory authority is separate: browser HTTP has no native socket/PTY identity
+and is refused after the normal write guards. A successful native issue call
+records a Git commit whose subject carries the actor:
 `CAD-16: set status=review (operator (ui))`.
 
 | Route | Body | Returns |
@@ -1731,6 +2244,7 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/epics/:epic/stage` | `{stage, note?}` — CAD-432: move an epic's stage over the daemon's `epic_stage` (CAD-405); the board never writes the tracker for it. The relay runs on the board's own connection, which the daemon attributes to the operator, so **every** board move needs the operator, not only moves into an `operator_stages` stage: read-only, the write guards, `403 operator_only` for an agent-attributed caller and `403 operator_proof` for a peer without the positive proof — the plan routes' path — before anything is written; no identity field is read (`deny_unknown_fields`). The relay sets `operator_decision: true`, and the daemon then requires the operator on the board's connection for any target, so a board an agent started is refused too (`403 operator_proof`) instead of landing the move as that agent's. Agents move stages with `cadence issue epic stage` over their own connection. The daemon's rules still apply: one step forward, any step back to the floor | `200` `{epic, from, to, forward, needs_operator, by, at, …}`; `400` a skip or unknown stage; `409` already there; `404` unknown epic |
 | `POST /api/issues/:id/answers` | `{question, text}` — the operator's answer (CAD-328) to the open question report `question` on `:id`: an `answer` task report (CAD-341) authored `operator`, never from the request or the board's environment; `403 operator_only` for an agent caller and `403 operator_proof` for a peer that is not provably the operator (same proof as the plan routes); `400` when `question` is not a question report on the ticket or `text` is blank. Then the daemon's `answer_route` (CAD-447) queues one message to the question's author with the answer and the report path — the reply's `route` says whether it was sent (`undeliverable` when the asker is gone; the answer stands either way) — and a best-effort `reports_changed` so the master's report router (CAD-339) picks it up at once | `201` `{issue, card, warnings, route}` |
 | `POST /api/threads/:alias/messages` | `{text, message?, expected_recipient_uid?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. `expected_recipient_uid` (CAD-1591) is an optional identity constraint, never authority: a nonempty uid the daemon's enqueue transaction compares to the recipient's current uid — a mismatch refuses before any message or thread side effect, and an omitted field keeps the ordinary path. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
+| `POST /api/master/identity` | `{expected_revision, name?, tone?, look?}` — at least one of name/tone/look; operator session and positive native operator proof, no actor/alias selectors. The opaque revision covers the protected identity files and effective avatar; a stale editor is refused before mutation. `look` uses the existing eleven-slug avatar catalogue | `{identity: {name, tone, look, revision}, applies: "next_turn"}`; the actor includes committed identity in its next model turn, including after a provider session reset |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`
@@ -1790,7 +2304,7 @@ operator secret can mint its own link. A process cadence did not
 launch — an agent CLI the operator started by hand, outside every
 pane cadence registered — passes the proof with no evasion at all; an
 agent's `setsid -f` child with a scrubbed env and stdio passes by
-evasion. `operator_secret_theft_residual_pinned` pins the second.
+evasion. No test pins the second.
 
 Agent attribution — which agent a request without a session writes
 as — is unchanged:
@@ -1956,11 +2470,10 @@ to I3+.
 
 ## Overview — needs-me + deploy drift
 
-The landing screen answers two questions at a glance: *what is waiting
-on a human or the PM right now, and with which command*, and *is what
-we merged actually running*. `GET /api/overview` derives the whole
-payload at read time — nothing is stored; `cadence overview [--json]
-[--watch <secs>]` renders the same data as an aligned terminal list.
+Home's rail answers what is waiting for the viewer. The former `/overview`
+page is retired; Home and Apps still use `GET /api/overview`, which derives
+its payload at read time. `cadence overview [--json] [--watch <secs>]` renders
+the same data as a terminal list.
 
 **Needs me** — one row per subject, ranked by urgency then age, each with
 `{kind, title, age, project, link, command, audience, audience_reason}`.
@@ -2159,9 +2672,84 @@ inside a disclosure. An unproven viewer sees the sign-in explanation and makes
 no protected Outbox request. This view adds no publication or file-management
 actions.
 
-`ui/`: Vite + React 19 + TypeScript + Tailwind 4, Bun 1.4.4 with Node 22 for scripts and tests. Design tokens
-per `~/Project/agentic-alpha/DESIGN.md` — graphite ink ramp, IBM Plex
-Sans/Mono, teal `#2dd4bf` on interactive elements only.
+Hosted quotation and invoice templates live in **Home → To do → Template
+approvals**, including on workspaces without the Wiki file lifecycle. From a
+saved Canvas draft, **Review template** opens the same review at that exact
+version. The drawer leads with a short or continuation SAMPLE PDF in a new tab
+and the calculation rules. **Fields and version details** shows the fill-in
+fields, version history, full digest and any recorded approval source. Samples
+contain synthetic values only. Authoring packs still use the agent and CLI.
+
+Only the workspace owner can approve a version for reuse. That decision binds
+the version's content digest; it does not approve any future document. **Use
+template** adds a request for the approved version to the Home composer without
+sending it or overwriting the existing draft. This does not issue, number, or
+send an invoice. **Settings → Templates** is available only on native boards.
+
+On a hosted board advertising `wiki_managed_files` (CAD-2477), **Wiki** is
+the shared library for durable files and knowledge. An assigned approver
+opens **Home → To do → Review** to read the submitted version in Wiki.
+Opening a file does not clear the follow-up; approval does. Recent recorded
+approval and delivery outcomes appear in **Updates** for the people involved
+who still have access. The private-assistant Home shows these document
+follow-ups without mounting the Master's queues or activity. On the owner's
+workspace Home they appear alongside the existing actions. The two kinds
+of Home keep their existing access rules.
+
+The file's Wiki link and linked ticket Evidence point to the exact version.
+Approval and archive/restore are file actions; approval does not deliver the
+file. The owner edits **Document policy** in **Settings → Workspace → General**.
+Old Documents links open Wiki (Archived links keep that view); the old policy
+link opens General or a permitted Settings default. Hosted boards that do
+not advertise the capability still use the two older destinations below.
+
+Documents (`/documents`, CAD-2286) is hosted only: the review side of the
+document lifecycle that `artifact submit` starts
+(`docs/guides/hosted-workspace.md`). One shared probe,
+`GET /api/document-types`, decides whether it exists. The nav item shows on a hosted
+board only once the probe answers the `cad2286.document-lifecycle.v1`
+capability. A `404`, a `501 not_implemented` or another capability hides it,
+and that answer holds until the private session changes. A failed probe is an
+error with Retry, and a failed re-read keeps the last good answer. The screen
+has Active and Archived tabs (`?archived=1`); Active has stage chips (All, In
+review, Approved, Delivered, Draft; `?stage=`) that filter the server's list in
+the browser. The server lists recent files only, so an empty Active tab says
+older documents may not appear. A title opens the file in the canvas: its
+approver gets the version under review, everyone else the newest version they
+can see. Every control only hides, and the hosted workspace decides each
+action. Approve shows on an in-review row to the approver in force: a confirmed
+type's named member, otherwise the workspace owner. It sends the version it
+showed, so an approval never covers a version the approver did not open. A
+member approving their own version is refused by the server (`self_approval`),
+because the wire carries no author. An owner who is the approver may approve
+their own, and this session's row then says "Approved by you (self)". Archive
+and Restore are the owner's; Restore returns the stage the document had before
+it was archived. A platform operator session changes nothing. Each write asks
+for confirmation and reports a refusal in that code's own words. A list that
+answers `404` after the probe said available means review was turned off: the
+screen says so and asks the probe again once.
+
+Settings → Documents (`/settings/documents`) is mounted when the hosted board
+names `documents` in `settings_sections`, which it does while the lifecycle is
+on. It lists each type's approval rule, approver, archive delay and recipient
+note, and the baseline that a type follows until it is confirmed. The rows are
+the probe's answer, not a second read. Approver names come from
+`/api/team/members`; an unreadable roster shows ids and never says an approver
+has left. Only the workspace owner (operator proof, not read-only, not a
+platform operator session) adds, edits and confirms a type. Everyone else sees
+the page without controls. A member's answer for a type, for example through
+the assistant, is pending: the owner sees "Needs your confirmation" and
+Confirm, which sends the row's `rev`. The owner's own save is confirmed at
+once. The form checks what the server checks: a name of 1–40 characters, a
+note of at most 200, no control characters and 1–3650 days. It also refuses a
+name of "." or "..", and a new name that an existing type already has in any
+case, so adding never replaces a type. A confirmed approver who is no longer a
+member is flagged to the owner, because nobody can approve that type until it
+is edited.
+
+`ui/`: Vite + React 19 + TypeScript + Tailwind 4, Bun 1.4.4 with Node 22 for scripts and tests.
+See the [Screen UI design guidance](../ui/screen-ui/DESIGN.md) for the shared
+palette, IBM Plex Sans/Mono typography and control styles.
 
 ```bash
 cd ui
@@ -2184,6 +2772,93 @@ Start an isolated sandbox board and use the Rust restart loop in
 [CONTRIBUTING.md](../CONTRIBUTING.md#isolated-board-development) before running
 the Vite server. The configured dev port must match that sandbox board.
 
+### Assistant identity
+
+The chat header, answer sender, composer and About panel use the committed
+identity of that conversation's actor. A custom name is literal in English and
+Traditional Chinese; the localized role label is only the unset-name fallback.
+An unavailable profile is not reported as an unnamed or successfully saved one.
+
+Member-assistant setup is optional and request-first. The assistant may ask
+"What would you like to call me?" and "How would you like me to communicate?",
+one question per turn; skip/later do not block work. On Native, the existing
+fenced ACK accepts `name` (the assistant), `tone`, `user_name` (how to address the
+user), `preferences` and `look`. Later edits preserve the existing bootstrap
+state and conversation. Name/tone remain in the managed IDENTITY.md/SOUL.md
+sections; user address/preferences stay in private USER.md. Subsequent valid turns read
+the committed profile. A personal avatar selection is an ordinary chat request,
+not a browser-side profile write, and remains pending until state confirms it.
+The profile patch is bounded by UTF-8 value bytes: 4096 per field and 16384
+across supplied values (including a supplied look), not JSON encoding or the
+merged stored profile. Avatar params are validated before profile-file effects.
+
+The avatar renderer and eleven looks are the existing `AgentAvatar` catalogue.
+A new personal assistant pins its immutable alias-derived look once in
+`params.look`; renaming, setup deferral, reload and login never reroll it.
+Existing pins win, and an unpinned Master keeps the robot.
+
+On hosted boards with scoped assistants, **Agents** shows your own assistant
+first and the company Master only to workspace owners. **Teammate assistants**
+lists other current members with their workspace display name and a default
+assistant avatar. The cards are informational: they do not show setup or activity
+and do not let anyone, including an owner, open a teammate’s assistant.
+**My assistant** opens your own profile at `/agents/assistant`, and its Home
+link opens your private chat even when you own the workspace. Hired profiles
+on these boards open by ID at `/agents/profile/<id>`, so a legacy profile
+named `assistant` remains separate and accessible.
+
+Native Master-backed Home/app conversations are still workspace-owned. Their
+headers keep that scope visible at narrow widths too. The About panel offers
+proven operators a bounded name/personality/avatar editor through
+`POST /api/master/identity` (`master_identity_set` natively). IDENTITY.md and
+SOUL.md use the protected writer and digest record, never agent self-edit.
+Identity reads check the protected source digests before per-turn use. A
+coordinator identity save refuses existing drift in any protected source before
+writing; it records only the fields changed and verifies the post-save briefing
+sources rather than blessing unrelated edits.
+`MASTER_IDENTITY_LOCK` serializes verified reads with protected file/digest/params
+publication, including direct Master file edits and installation. A legitimate
+save cannot be mistaken for external drift while its digest is being published.
+`Shared::prompt_with_profile` includes committed name/personality in the initial
+prompt and any permitted fresh-session retry, including Pi `/new` and pre-tool
+history recovery. The UI reports next-turn application, not a change to an
+already-running turn. An editor retains its draft and base revision on a
+concurrent update; explicitly reload the saved identity to edit the newer base.
+The About panel preserves Escape dismissal and returns focus after a save.
+A rename does not change the `master` routing alias, ownership, permissions or
+retained history. Personal-assistant Home/app routing
+and scoped assistant-to-Master queries remain the separate CAD-1818 phase.
+
+The tenant Worker port (AOS-378) uses the same shared UI without changing its
+existing recipients: subject-owned Home/app conversations are personal, while
+the reserved owner-only Recruit conversation uses the workspace coordinator.
+The server adds `actor_identity: {scope, conversation_id, identity}` to the
+selected conversation's master state and initial streamed snapshot; the UI
+reads `/api/master/state?conversation=<id>` and refuses mismatched projections.
+Only an absent projection retains Native's coordinator contract. A present
+malformed projection or failed/stale canonical read is unavailable, with no
+borrowed profile, ownership claim or edit control.
+Before the first hosted Home message, the thread may still be null. Home binds
+the valid personal projection from its default master-state response, whose
+server-issued conversation ID already exists; the first streamed entries do
+not need a reload to acquire the name or scope. That validated binding is also
+adopted by the empty thread before its hosted stream opens, so initial turn
+snapshots and Stop/Cancel use the same ID without relaxing stream admission.
+App/Recruit panes still require their selected conversation ID and never borrow
+that default Home projection.
+Hosted app turn indicators and Stop/Cancel reconciliation use the selected
+conversation's state too; an idle Home snapshot cannot hide its running turn.
+
+Worker personal profiles are canonical actor-private Workspace-DO rows, not
+Native Markdown files. The actor-bound `assistant_profile` tool uses the same
+fields and bootstrap states, while protected workspace edits remain owner-only
+HTTP actions. Initial personal avatars are pinned from the immutable
+tenant-scoped subject; a rename never rerolls them. User address/preferences
+never enter UI identity projections or workspace context. Recruit's About panel
+is the workspace editor; editing it does not rename the user's assistant.
+Both source repositories and the matching UI release must pass their normal
+promotion/release gates before this behavior is available in a hosted tenant.
+
 ### App routing QA handovers
 
 Use `/apps/<app-key>` (for example `/apps/social-content`) for installed-app
@@ -2200,6 +2875,30 @@ list or a later reinstall cannot transfer the link to a replacement with the
 same app key. An existing conflicting pin refuses before redirect or app
 mount; it is never overwritten. The redirect replaces history and preserves
 the original query and fragment, adding only a missing installation pin.
+
+Installed apps use the board header for `Apps / App name / Section`; the
+version is secondary metadata, and a default section adds no duplicate leaf.
+Sections come only from the active app's declared `section_query`, using the
+verified installation declaration before screen readiness and in native outlets.
+Section labels use the same app-provided locale resolver as sidebar navigation.
+Parent navigation retains installation/context pins and unrelated query
+parameters while clearing record and segment selection. The aligned
+**Assistant** button controls the right-hand chat pane without remounting the
+conversation or app frame. A collapsed chat leaves no rail; on narrow screens
+the workspace and assistant share one pane. App-content navigation temporarily
+selects the narrow workspace; a conversation link reveals the assistant. Neither
+changes the saved Assistant preference. Context-only URL writes do not select a pane.
+Workflow launchers and developer
+tools live in the header's **More actions** menu. Narrow layouts keep account,
+board status, update, language and theme controls in the existing mobile navigation.
+App actions remain unavailable until the current installation receipt is verified.
+Pending approvals stay installation-scoped across cached app switches and
+override the untouched collapsed default; an explicit choice
+still wins. Canvas edit requests reveal the current composer; editable inputs
+receive focus without sending or replacing the draft.
+App-to-chat requests also clear a temporary narrow workspace selection.
+Non-modal app canvases start below the board header and end before the assistant.
+Expansion is disabled when it cannot add width.
 
 Every setup or Browser QA handover states these separately:
 
@@ -2218,6 +2917,133 @@ claiming a real board acceptance run. At desktop and narrow widths, exercise
 canonical navigation and a representative old contextual deep link; verify
 that the installation/context is retained and missing access fails safely.
 This procedure grants no permission to refresh staging or production.
+
+### QA board for hosted surfaces (CAD-2291)
+
+Member chat, the Browser panel, member app screens, Documents and Settings →
+Documents exist only on a hosted board, and an agent session cannot sign in to
+one. The QA board serves a checkout's UI with those routes answered from
+fixtures as a synthetic hosted member (or owner), so a Browser QA run needs no
+hand-written stub:
+
+```bash
+node ui/scripts/qa-board.mjs up --checkout <path> [--name <n>] [--cadence <bin>]
+node ui/scripts/qa-board.mjs status [--name <n>]
+node ui/scripts/qa-board.mjs down [--name <n>]
+```
+
+`up` needs `<checkout>/ui/node_modules` (hard-link the shared one when
+`ui/bun.lock` matches; never `bun install` there) and `openssl`. It starts,
+on free ports in 3110-3199:
+
+- a `cadence dev` sandbox board for native routes, under
+  `/tmp/qa-board-<name>` (mode 700, short for the socket path limit);
+- Vite from `<checkout>/ui`, with `/api` sent to the fixture proxy;
+- the fixture proxy. It answers `/api/meta` (a signed-in hosted member with the
+  sandbox's build identity), `/api/locale`, `member-assistant/*`,
+  `/api/browser` with `/view` and `/stop`, and one member app screen: the
+  repo's starter app (`app-toolchain/template/app`) through the binary's own
+  frame (`cadence app frame-kit`), with an installation, context and run shaped
+  like `ui/scripts/app-fixtures/producer.ts`. It also answers the document
+  routes (`/api/document-types[/<label>[/confirm]]`, `/api/documents` and
+  `/api/documents/<id>/approve|archive|restore`) as the hosted board answers
+  the preset viewer, with writes kept in its own copy of the rows, and
+  `/api/team/members` under the `hosted` settings or the `owner` viewer.
+  Every other route goes to the sandbox; a sandbox 401 is answered as a 404, so
+  it cannot sign the member out, and is counted;
+- a stand-in HTTPS live view with a self-signed certificate made at start
+  (browse with `--ignore-https-errors`). Its Done button ends a takeover.
+
+The fixtures are in `ui/scripts/qa-board/fixtures/`. Before serving them, `up`
+compiles `ui/scripts/qa-board/validate.ts` against the checkout's `ui/src`
+with the ui tests' compiler options and runs every payload through the UI's
+own client code (`parseBrowserRead`, `readBrowser`, `viewBrowser`,
+`stopBrowser`, `readPersonalIdentity`, `mutatePersonalProfile`, the member
+thread store, `sendToAssistant`, `screenTag`, `screenProjection`, `shapeFor`,
+`parseMount`, `readTeamMembers`, `settingsRedirect`, `sessionAdmissible`, and
+the documents client and access rules, which it drives through every write for
+each viewer preset). A refused payload is named and `up` stops: the board is
+proved by running it, so there is no separate unit test. `/api/meta` and
+`/api/locale` have no exported parser: meta is checked by `writeBlock` and
+`kickoffBlock`, and both by the live render.
+
+`up` prints its provenance as JSON: the checkout's sha and whether it is clean,
+the sandbox build from `/api/version`, the fixtures' revision, the ports and
+the URLs. Open the UI at the printed `http://localhost:<port>/`: the app frame
+accepts an http parent only on a `localhost` name. `down` stops exactly the
+recorded processes, runs `cadence dev reset`, removes the state directory and
+reports any process, port or file left. If its record (`state.json`) cannot be
+read, `down` stops and removes nothing, reports `unreadable` and exits 1:
+inspect by hand.
+
+The control endpoint is on the fixture proxy's port:
+
+- `POST /__qa/state` takes `{"browser": "handoff" | "handoff-signed-in" |
+  "active" | "ended", "state", "signedIn", "url", "instructions", "locale":
+  "en" | "zh-TW" | null}`, every field optional: a preset, then overrides. A
+  browser state `parseBrowserRead` refuses is answered 400. The UI polls the
+  session while it is live; a locale change shows after a reload.
+- The same body takes the document presets, also optional:
+  - `documents`: `available` (the default) or `not-served`, where every
+    document route answers `404 not_found`. The fixture meta is hosted, so the
+    Documents nav shows from the start. Any `documents` value rebuilds the rows
+    and types from the fixtures and clears `document_refusals`.
+  - `document_refusals`: a list of `approve`, `archive`, `restore`, `set-type`
+    and `confirm-type`; each listed route answers its refusal from
+    `fixtures/document-refusals.json` ahead of its normal answer.
+  - `settings`: `native` (the default) sends no `settings_sections`, so every
+    native Settings page stays. `hosted` sends the list the hosted board sends
+    the viewer (`HOSTED_SECTIONS` in `validate.ts`), with `documents` while the
+    documents preset is `available`.
+  - `viewer`: `member` (the default) or `owner`. `owner` serves meta as the
+    hosted board serves the roster's owner (`operator: true`, session role
+    `operator`), so Archive and Restore show, and with `settings: hosted` the
+    type form too. The member view answers the owner's writes with
+    `403 owner_only`, and its `set-type` on a new or pending type answers
+    pending; a confirmed type is `owner_only`. The member sees every fixture
+    row, where a real member sees only what `artifact find` would show them
+    plus what they review.
+  - Changing `viewer` resets no rows. Start clean as the member with
+    `{"documents":"available","document_refusals":[],"settings":"native","viewer":"member"}`,
+    or as the owner with
+    `{"viewer":"owner","settings":"hosted","documents":"available"}`.
+- CAD-2471, the canvas app view. The proxy answers the app's assistant routes
+  (`assistant/actions|operations|permissions`) with one finished operation
+  whose resource links include customers, so "Open in canvas" can be driven.
+  The control body takes `app_access`: `member` (the default) or `none`, which
+  answers the app's detail, contexts and mount `403`, as for a viewer without
+  access to the app.
+- CAD-2419, the workspace skill library on the Skills tab of the hosted
+  profile `qa-writer` (`/agents/qa-writer?tab=skills`). The proxy adds that
+  profile to the sandbox's `GET /api/agents` roster. It answers
+  `/api/agent-profiles/ap_qa_writer` (GET, and POST at the stored revision)
+  and `/api/workspace-skills[/<name>[/approve|revoke|delete]]` from
+  `fixtures/workspace-skills.json` and `fixtures/skills-profile.json`.
+  Writes go to its own copy. The member is answered `403 owner_required`.
+  `weekly-report` is used by 12 active and 2 archived agents, each with a
+  profile of its own, and a profile save keeps every skill's `used_by` in step,
+  so "Turn off for this agent" can be exercised. The QA board refuses an approval past `approved_max` (3) with
+  `approved_limit`. The same body takes:
+  - `skills`: `available` (the default), `not-served` (every library route
+    answers 404, so the section is hidden) or `failing` (the list answers
+    503). Any `skills` value restores the library and the profile from the
+    fixtures.
+  - `profile_changed: true`: another writer saved the profile. Its revision
+    moves on, so the page's next Assigned toggle is stale.
+- `GET /__qa/state` returns the current state, including `viewer`, `settings`,
+  `documents` (`probe`, `refusals`, and in `changed` the documents
+  approved, archived or restored and the types written since the last
+  `documents` preset) and `skills` (`probe`, and the profile's `revision` and
+  `skills`). `GET /__qa/counts` returns the requests per fixture
+  route, the live-view requests and the sandbox routes whose 401 was masked.
+  Document writes count under templated keys
+  (`POST /api/documents/:id/approve`, likewise `archive` and `restore`;
+  `POST /api/document-types/:label` and `POST /api/document-types/:label/confirm`),
+  and the Archived tab's list counts apart as `GET /api/documents?archived=1`.
+
+Every result from the QA board is **fixture evidence**, not a real hosted
+board run, and the report says so. A check on a real hosted board stays an
+operator canary.
 
 The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
 between columns (derived/container cards don't — the reason shows on
@@ -2381,10 +3207,13 @@ installation and permission refusals, including host Pi-confinement defaults,
 without starting an agent session.
 
 The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
-`/overview` (the team overview: needs, drift, monitors, projects),
 `/projects[/:slug[/epics|/milestones|/context]]`, `/agents[/:alias]`, `/setup` and
-`/settings[/memory]`; the nav shows Home, Projects, Agents and Settings,
-and Home's rail links to the overview.
+`/settings[/memory]`; the nav shows Home, Projects, Agents and Settings.
+Home's desktop rail always shows To do and Updates; on narrow screens it opens
+as a dismissible drawer. Home About links to the active assistant's Instructions
+tab: the Master profile for a confirmed workspace actor with access, or My
+assistant when a signed-in personal actor has its own roster row. A missing
+personal row never falls back to Master.
 
 Threads notifications (CAD-1423) group received messages by authorized conversation
 in the header inbox. Unread respects both actually viewed thread messages and the
@@ -2393,6 +3222,9 @@ either cursor advances. Mark all read dismisses notifications without marking
 unviewed transcript messages read.
 All includes every eligible conversation, not a truncated first page. The bell's
 unread total covers that complete authorized history.
+Use Notification settings in the inbox to manage browser alerts.
+A successful preference save or browser-alert sync clears that operation's
+warning without hiding a failure in the other.
 
 Agent-pair Threads stay read-only (CAD-1591): a message whose recorded
 sender is a still-registered agent carries a "Reply as you" action that
@@ -2454,6 +3286,15 @@ chips above the composer (one status/remove icon slot each, +N more
 past three), and a sent message's files render as read-only chips under
 its bubble (CAD-1419/CAD-1462).
 
+Below 640px, Home uses a one-row toolbar without a breadcrumb. A
+signed-out reader can still sign in from the toolbar and find language
+and theme choices in the navigation drawer. The master assistant header
+shows Latest when activity arrives while a reader is
+away from the end, without covering or fading the thread.
+The floating dock puts attach, draft and send in one row. Longer drafts
+expand, and the thread keeps enough room below its last message to clear
+the dock and the Needs-you button.
+
 The shared turn bar (CAD-1700) names the conversation actually ahead of a
 queued message, including Home's server-issued thread id. The master queue
 projection includes every queued message, so a position beyond twenty still
@@ -2467,9 +3308,10 @@ original content/app binding. An unrelated transport failure keeps its own
 same-id row Retry; neither action uses a later draft.
 An unresolved conversation id never claims an unthreaded running turn;
 the surface can still identify its own pending or stored operator message.
-The Conversations dropdown belongs to the positioned pane header, so it opens
-below the header rather than the page and keyboard focus does not scroll the
-workspace down to reach it.
+The installed-app chat header shows the assistant and active conversation,
+with Copy last answer when available and Collapse. Use `/new` or `/clear` to
+start a fresh app conversation. Existing conversation links still open their
+scoped conversation.
 
 The shell loads conversation replies on mount and observes them while their
 pane is offscreen: an app reply opens its exact conversation, and a Home

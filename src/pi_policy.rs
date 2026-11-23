@@ -50,6 +50,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use cadence_core::connection_dispatch::{
+    Ident, ModelId, PiModelRefusalV1 as PiModelRefusal, RoleModelPolicyV1, RoleV1,
+};
 
 /// `[pi]` in pm.yaml — everything optional individually; the table's
 /// absence means "no pi policy", which the model gate treats as an
@@ -276,54 +279,109 @@ pub fn resolve_model_with_source(
     }
 }
 
+/// `[pi.models]` → the shared policy shape. A value the shared grammar
+/// refuses (or any unrepresentable list) yields `None`, which the decision
+/// treats as an absent policy: nothing is allowed.
+fn shared_role_policy(policy: &PiPolicy) -> Option<RoleModelPolicyV1> {
+    let models = |values: &[String]| -> Option<Vec<ModelId>> {
+        values
+            .iter()
+            .map(|value| ModelId::try_from(value.clone()).ok())
+            .collect()
+    };
+    let agentic = policy
+        .agentic_providers
+        .iter()
+        .map(|value| Ident::try_from(value.clone()).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(RoleModelPolicyV1 {
+        allow: models(&policy.models.allow)?,
+        master_allow: match &policy.models.master_allow {
+            Some(values) => Some(models(values)?),
+            None => None,
+        },
+        worker_allow: match &policy.models.worker_allow {
+            Some(values) => Some(models(values)?),
+            None => None,
+        },
+        agentic_providers: agentic,
+    })
+}
+
 /// `model` must be on the allowlist `role` launches under — the role's
 /// own `master_allow`/`worker_allow` when pm.yaml carries one, else
 /// `allow` (CAD-575). The refusal lists the pinned ids and names the
 /// key so a rejected request names its fix; an absent `[pi]` (or an
 /// empty applicable list) allows nothing.
+///
+/// The single Pi allowlist gate: resolve, open, `/model` and agent set all
+/// use it, and callers derive the master role from its identity. The
+/// allow/deny decision is the shared `cadence-core` rule
+/// ([`cadence_core::connection_dispatch::pi_model_decision`]); this wrapper
+/// keeps Cadence's operator-facing refusal text.
+///
+/// Pi's tool allowlist and pi-guard only govern tools executed by Pi itself,
+/// so an agentic provider (Cursor always) must never be accepted for the
+/// master even when the model is allowlisted, and the Cursor argv check
+/// ([`require_safe_transport`]) stays here because it is about how this
+/// process launches the provider, not about the shared policy vocabulary.
 pub fn require_allowed(policy: Option<&PiPolicy>, role: &str, model: &str) -> Result<()> {
-    // Pi's tool allowlist and pi-guard only govern tools executed by
-    // Pi itself. The Cursor extension runs its own `agent --trust`
-    // child; an allowlisted model must never bypass a guarded role.
-    // Keep this in the shared gate: resolve, open, /model and agent set
-    // all use it, and callers derive the master role from its identity.
-    if role == "master" && !model.contains('/') {
-        return Err(Error::rejected(format!(
+    let role_v1 = if role == "master" {
+        RoleV1::Master
+    } else {
+        RoleV1::Worker
+    };
+    let model_id = ModelId::try_from(model.to_string()).map_err(|_| {
+        Error::rejected(format!("pi {role} model '{model}' is not a valid model id"))
+    })?;
+    let shared = policy.and_then(shared_role_policy);
+    match cadence_core::connection_dispatch::pi_model_decision(role_v1, &model_id, shared.as_ref())
+    {
+        Ok(()) => {
+            require_safe_transport(model)?;
+            Ok(())
+        }
+        // The two shape refusals keep the exact operator-facing text this
+        // gate has always produced.
+        Err(PiModelRefusal::MasterNeedsProvider) => Err(Error::rejected(format!(
             "pi master model '{model}' must name provider/id so its tool execution \
              classification can be checked before launch (CAD-602)"
-        )));
+        ))),
+        Err(PiModelRefusal::AgenticProviderForMaster) => {
+            let provider = model.split_once('/').map(|(p, _)| p).unwrap_or(model);
+            let guidance = if provider == "cursor" {
+                "the native cursor provider (CAD-603) or a completion-only Pi provider"
+            } else {
+                "a completion-only provider"
+            };
+            Err(Error::rejected(format!(
+                "pi master model '{model}' uses an agentic provider whose own tools \
+                 bypass Pi's tool allowlist and pi-guard — use {guidance} \
+                 even when this model is on master_allow (CAD-602)"
+            )))
+        }
+        Err(
+            PiModelRefusal::AbsentPolicy
+            | PiModelRefusal::EmptyAllowList
+            | PiModelRefusal::NotAllowed,
+        ) => {
+            // The transport check runs before the allowlist message so a
+            // Cursor argv refusal is never masked by an allowlist refusal.
+            require_safe_transport(model)?;
+            let key = policy.map(|p| p.models.allow_key(role)).unwrap_or("allow");
+            let allow: &[String] = policy.map(|p| p.models.allow_for(role)).unwrap_or(&[]);
+            let listed = if allow.is_empty() {
+                format!("nothing — Settings > Agents has no Pi {key} entries")
+            } else {
+                allow.join(", ")
+            };
+            Err(Error::rejected(format!(
+                "pi {role} model '{model}' is not on the operator's allowlist (allowed: \
+                 {listed}) — set it in Settings > Agents ({key}); pm.yaml is not the \
+                 launch authority (CAD-559, CAD-575)"
+            )))
+        }
     }
-    let provider = model.split_once('/').map(|(p, _)| p).unwrap_or(model);
-    let agentic = provider == "cursor"
-        || policy.is_some_and(|p| p.agentic_providers.iter().any(|p| p == provider));
-    if role == "master" && agentic {
-        let guidance = if provider == "cursor" {
-            "the native cursor provider (CAD-603) or a completion-only Pi provider"
-        } else {
-            "a completion-only provider"
-        };
-        return Err(Error::rejected(format!(
-            "pi master model '{model}' uses an agentic provider whose own tools \
-             bypass Pi's tool allowlist and pi-guard — use {guidance} \
-             even when this model is on master_allow (CAD-602)"
-        )));
-    }
-    let key = policy.map(|p| p.models.allow_key(role)).unwrap_or("allow");
-    require_safe_transport(model)?;
-    let allow: &[String] = policy.map(|p| p.models.allow_for(role)).unwrap_or(&[]);
-    if allow.iter().any(|m| m == model) {
-        return Ok(());
-    }
-    let listed = if allow.is_empty() {
-        format!("nothing — Settings > Agents has no Pi {key} entries")
-    } else {
-        allow.join(", ")
-    };
-    Err(Error::rejected(format!(
-        "pi {role} model '{model}' is not on the operator's allowlist (allowed: \
-         {listed}) — set it in Settings > Agents ({key}); pm.yaml is not the \
-         launch authority (CAD-559, CAD-575)"
-    )))
 }
 
 /// CAD-603: allowlisting does not fix the Cursor extension's argv

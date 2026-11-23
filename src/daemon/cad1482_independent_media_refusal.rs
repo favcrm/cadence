@@ -532,16 +532,55 @@ impl Drop for Fx {
 }
 
 fn assign_turn(fx: &Fx, message: &str, text: &str, media_refs: Option<Value>) -> String {
-    let mut params = json!({
-        "alias": AGENT,
-        "text": text,
-        "message": message,
-    });
-    if let Some(refs) = media_refs {
-        params["media_refs"] = refs;
+    match media_refs {
+        None => {
+            let sent = fx
+                .op(
+                    "thread_send",
+                    json!({"alias": AGENT, "text": text, "message": message}),
+                )
+                .expect("operator send");
+            assert_eq!(sent["state"], "queued", "{sent}");
+        }
+        // CAD-2162: a fresh send carrying a library image first proves the
+        // live adapter's image support, and this fixture runs no adapter.
+        // Seed the operator-chat row that send stores instead; the inspect
+        // guard under test reads only that row and its pinned reference.
+        Some(refs) => {
+            let (_, state) = fx
+                .shared
+                .store
+                .enqueue_steered_for_with_conversation(
+                    AGENT,
+                    None,
+                    text,
+                    None,
+                    message,
+                    "user",
+                    None,
+                    None,
+                    None,
+                    &crate::store::Sender::OperatorChat,
+                    &crate::store::Steer::NONE,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&refs),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("seed the pinned operator-chat row");
+            assert_eq!(state, "queued");
+            assert_eq!(
+                fx.shared.store.message_media_refs(message).unwrap(),
+                Some(refs),
+                "the seeded row lost its pinned library image"
+            );
+        }
     }
-    let sent = fx.op("thread_send", params).expect("operator send");
-    assert_eq!(sent["state"], "queued", "{sent}");
     let db = rusqlite::Connection::open(fx.state.join("cadence.sqlite3")).unwrap();
     db.execute(
         "UPDATE messages SET state='submitting', started=1.0 WHERE id=?1",
@@ -913,3 +952,6 @@ fn cad1482_unattached_library_image_inspect_refuses_without_bytes_or_provider_su
         "HTTP inspect fetched a provider artifact"
     );
 }
+
+#[path = "cad1962_media_import_acceptance.rs"]
+mod cad1962_media_import_acceptance;

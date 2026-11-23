@@ -607,14 +607,18 @@ pub fn pi_worker_confinement(
             write.push(cache);
         }
     }
-    // CAD-559: the pinned `[pi].providers` package dirs the `-e`
-    // entries point into — read-only, the same grant the master gets.
-    // `build_command` refuses the launch on an unresolvable pin, so a
-    // missed grant here can never load anything else instead.
+    // Pinned provider packages and their validated runtime dependencies are
+    // read-only, as in the master policy. `build_command` refuses a bad pin
+    // or dependency closure before this policy can be used.
     if let Ok(packages) = provider_packages(env) {
         for pkg in packages {
             if !read.contains(&pkg.dir) {
                 read.push(pkg.dir);
+            }
+            for dep in pkg.deps {
+                if !read.contains(&dep) {
+                    read.push(dep);
+                }
             }
         }
     }

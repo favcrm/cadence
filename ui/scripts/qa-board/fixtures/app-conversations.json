@@ -1,0 +1,9 @@
+{
+  "alias": "app-template",
+  "install_id": "qa-template",
+  "general": "conv_qa_general",
+  "conversations": [
+    { "id": "conv_qa_general", "title": null, "subject": null, "context_id": "qa-context", "is_general": true, "archived": false, "created": 1794600000, "updated": 1794600000, "reply_seq": 0 },
+    { "id": "conv_qa_second", "title": "Second conversation", "subject": null, "context_id": "qa-context", "is_general": false, "archived": false, "created": 1794600100, "updated": 1794600100, "reply_seq": 0 }
+  ]
+}

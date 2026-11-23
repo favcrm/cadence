@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslate } from "../../lib/locale";
-import Md from "../../ui/Md";
+import Md, { CodeSurface } from "../../ui/Md";
 import { artifactBytes } from "./artifactClient";
 import { CSV_MAX_COLS, CSV_MAX_ROWS, parseCsv } from "./csv";
 import type { ArtifactKind } from "./canvasStore";
+import ImageOverlay from "./ImageOverlay";
 
 export interface Loaded {
   bytes: ArrayBuffer;
   mime: string;
 }
+
+/** How an HTML artifact is shown: in its sandboxed frame, or its source. */
+export type HtmlView = "rendered" | "source";
 
 /** The sandboxed document an HTML artifact renders in: an opaque origin
  *  (`sandbox=""` on the frame — never allow-same-origin), plus a policy
@@ -25,6 +29,18 @@ export function downloadName(title: string, kind: ArtifactKind, mime: string): s
   const base = title.replace(/[^\w.\- ]+/g, "_").trim().slice(0, 80) || "artifact";
   const ext = kind === "image" ? (mime.split("/")[1]?.split("+")[0] ?? "png") : EXT[kind];
   return `${base}.${ext}`;
+}
+
+/** Hand bytes to the browser as a file. */
+export function saveBytes(bytes: ArrayBuffer, mime: string, filename: string): void {
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime.split(";")[0] }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /** Fetch one version's bytes through the board (operator session), aborting
@@ -50,11 +66,29 @@ export function useArtifactBytes(conversation: string, id: string, version: numb
 
 /** A `data:` URL for an image: the board CSP allows `data:` images and not
  *  `blob:` ones. SVG only ever shows as an `<img>` source, never as a URL. */
-function imageDataUrl(data: Loaded): string {
+export function imageDataUrl(data: Loaded): string {
   let bin = "";
   const bytes = new Uint8Array(data.bytes);
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return `data:${data.mime.split(";")[0]};base64,${btoa(bin)}`;
+}
+
+/** Open already-loaded PDF bytes in the browser's own top-level PDF viewer.
+ *  Inline `<embed>`/`<iframe>` PDFs are blocked by the board's `object-src`,
+ *  while a top-level `blob:` navigation opened from a click succeeds. */
+export function openPdfInTab(bytes: ArrayBuffer): void {
+  const tab = window.open("about:blank", "_blank");
+  if (tab === null) return;
+  let href: string | null = null;
+  try {
+    href = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+    tab.location.replace(href);
+    const created = href;
+    window.setTimeout(() => URL.revokeObjectURL(created), 30_000);
+  } catch {
+    if (href !== null) URL.revokeObjectURL(href);
+    tab.close();
+  }
 }
 
 function sizeLabel(bytes: number): string {
@@ -73,13 +107,14 @@ function CsvView({ text, contentRef }: { text: string; contentRef: React.RefObje
   if (!table) {
     return (
       <div ref={contentRef} className="canvas-doc min-w-0" data-artifact-view="csv">
-        <pre className="num text-micro text-ink-200 whitespace-pre overflow-auto">{text}</pre>
+        <pre className="num text-micro text-ink-200 whitespace-pre overflow-auto"
+          role="region" aria-label={t("CSV text")} tabIndex={0}>{text}</pre>
       </div>
     );
   }
   return (
     <div ref={contentRef} className="canvas-doc cv-csv" data-artifact-view="csv" data-csv-table>
-      <div className="cv-csv-scroll">
+      <div className="cv-csv-scroll" role="region" aria-label={t("CSV table")} tabIndex={0}>
         <table>
           <thead>
             <tr>
@@ -121,47 +156,86 @@ export default function ArtifactView({
   title,
   data,
   contentRef,
+  htmlView = "rendered",
+  focusablePreview = false,
+  aspect,
 }: {
   kind: ArtifactKind;
   title: string;
   data: Loaded;
   contentRef: React.RefObject<HTMLDivElement | null>;
+  htmlView?: HtmlView;
+  /** Include the rendered document in an enclosing drawer's explicit tab order. */
+  focusablePreview?: boolean;
+  /** A generated image's shape, for its overlay. */
+  aspect?: string;
 }) {
   const t = useTranslate();
   switch (kind) {
     case "md":
       return (
         <div ref={contentRef} className="canvas-doc issue-reader text-secondary text-ink-200 break-words min-w-0" data-artifact-view="md">
-          <Md text={decode(data)} />
+          <Md text={decode(data)} focusableTables={focusablePreview} />
         </div>
       );
     case "csv":
       return <CsvView text={decode(data)} contentRef={contentRef} />;
-    case "html":
+    case "html": {
+      if (htmlView === "source") {
+        // ignoreBOM: the source shows every stored character, a leading BOM included.
+        const source = new TextDecoder("utf-8", { ignoreBOM: true }).decode(data.bytes);
+        return (
+          <div ref={contentRef} className="canvas-doc cv-source" data-artifact-view="html-source">
+            <CodeSurface label="html" code={source}>
+              <code>{source}</code>
+            </CodeSurface>
+          </div>
+        );
+      }
       return (
         <iframe
           className="canvas-frame"
           data-artifact-view="html"
           title={title}
+          tabIndex={focusablePreview ? 0 : undefined}
           sandbox=""
           referrerPolicy="no-referrer"
           srcDoc={htmlFrameDocument(decode(data))}
         />
       );
+    }
     case "image":
       return (
         <div className="canvas-doc" data-artifact-view="image">
-          <img className="canvas-image" src={imageDataUrl(data)} alt={title} />
+          <div className="imgshot" data-canvas-image>
+            <img className="canvas-image" src={imageDataUrl(data)} alt={title} />
+            <ImageOverlay
+              title={title}
+              aspect={aspect}
+              mime={data.mime}
+              bytes={data.bytes.byteLength}
+              onDownload={() => saveBytes(data.bytes, data.mime, downloadName(title, kind, data.mime))}
+            />
+          </div>
         </div>
       );
     case "pdf":
       // No inline PDF: the board CSP allows no blob/object source, so the
-      // drawer offers Download (in the footer) and says so.
+      // drawer offers Open in new tab (top-level blob navigation) and Download.
       return (
         <div className="canvas-doc canvas-pdf" data-artifact-view="pdf">
           <p className="text-body text-ink-100">{title}</p>
           <p className="num text-micro text-ink-500">PDF · {sizeLabel(data.bytes.byteLength)}</p>
-          <p className="text-micro text-ink-400">{t("A preview is not available yet. Use Download.")}</p>
+          <p className="text-micro text-ink-400">{t("A preview is not available yet. Open in a new tab or use Download.")}</p>
+          <div className="flex flex-wrap items-center gap-3 pt-1">
+            <button
+              type="button"
+              className="lnk text-micro"
+              onClick={() => openPdfInTab(data.bytes)}
+            >
+              {t("Open in new tab")}
+            </button>
+          </div>
         </div>
       );
   }

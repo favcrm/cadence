@@ -69,14 +69,8 @@ use crate::issue::board::Issue;
 use crate::issue::model::{self, Front};
 use crate::issue::parse;
 
-/// Longest glob accepted, in bytes.
-pub const PATH_MAX: usize = 256;
 /// Most planned paths one issue may declare.
 pub const PATHS_MAX: usize = 64;
-/// Most wildcard characters (`*`/`?`) one glob may carry — a cap on
-/// top of [`PATH_MAX`], since wildcards are what makes matching cost
-/// anything at all.
-pub const WILD_MAX: usize = 16;
 /// Changed files per lane kept for matching, sorted. A lane past the
 /// cap warns on the prefix only — advisory, not exhaustive.
 const CHANGED_MAX: usize = 8192;
@@ -257,6 +251,10 @@ fn parse_owner(owner: &str) -> std::result::Result<(Option<String>, Option<Strin
     Ok((epic, pm))
 }
 
+pub use cadence_core::delivery_rules::{check_path, PATH_MAX, WILD_MAX};
+
+/*
+
 /// One planned path or area glob: repo-relative, file-level. `*` and
 /// `?` match inside one path segment, a `**` segment any number of
 /// segments, and a trailing `/` (or a plain directory path) everything
@@ -296,36 +294,9 @@ pub fn check_path(p: &str) -> Result<()> {
     }
     Ok(())
 }
+*/
 
-/// Agent-controlled strings (refs, aliases, planted frontmatter,
-/// filenames, a `changed_error`'s git stderr) reach terminals, tracker
-/// comments and the overview JSON through warnings. Strip anything
-/// that moves a cursor or mirrors text: control characters and bidi or
-/// other invisible format marks. Matching fields stay raw — this is
-/// for display only.
-pub(crate) fn scrub(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !is_format(*c))
-        .collect()
-}
-
-/// Invisible or direction-overriding marks — the bidi controls,
-/// joiners, soft hyphen, BOM, word joiners, interlinear anchors and
-/// hangul fillers — none of which a path, ref or alias legitimately
-/// carries.
-fn is_format(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'              // soft hyphen
-        | '\u{061C}'            // arabic letter mark
-        | '\u{115F}' | '\u{1160}' | '\u{FFA0}'  // hangul fillers
-        | '\u{200B}'..='\u{200F}' // ZWSP ZWNJ ZWJ LRM RLM
-        | '\u{202A}'..='\u{202E}' // LRE RLE PDF RLO LRO
-        | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-        | '\u{2066}'..='\u{2069}' // LRI RLI FSI PDI
-        | '\u{FEFF}'            // BOM / ZWNBSP
-        | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation anchors
-    )
-}
+pub(crate) use cadence_core::delivery_rules::scrub;
 
 /// `issue set <ID> paths=a,b` — validated, sorted, de-duplicated; an
 /// empty value clears.
@@ -362,73 +333,12 @@ fn segments(glob: &str) -> Vec<&str> {
     }
 }
 
-/// One pattern segment against one path segment. `*` is the only
-/// pattern that consumes a variable run, so a single backtracking
-/// point — the last `*` seen — suffices: retry means that `*` takes
-/// one more byte. O(|pat| × |s|) worst case, no exponential retry, so
-/// `src/******************z` against sixty `a`s returns in
-/// microseconds instead of hanging a render.
-fn seg_match(pat: &[u8], s: &[u8]) -> bool {
-    let (mut p, mut c) = (0usize, 0usize);
-    // (pattern index just past the last `*`, string index it resumes at).
-    let mut star: Option<(usize, usize)> = None;
-    while c < s.len() {
-        match pat.get(p) {
-            Some(b'*') => {
-                star = Some((p + 1, c));
-                p += 1;
-            }
-            Some(&pc) if pc == b'?' || pc == s[c] => {
-                p += 1;
-                c += 1;
-            }
-            // Mismatch or pattern exhausted mid-string: the last `*`
-            // absorbs one more byte, or there is no match.
-            _ => match star {
-                Some((sp, sc)) => {
-                    p = sp;
-                    c = sc + 1;
-                    star = Some((sp, c));
-                }
-                None => return false,
-            },
-        }
-    }
-    while pat.get(p) == Some(&b'*') {
-        p += 1;
-    }
-    p == pat.len()
-}
-
-/// Pattern segments against path segments — `**` matches any run of
-/// segments, everything else is one [`seg_match`]. A dynamic program
-/// over (pattern × path): `dp[i][j]` is "`pat[i..]` matches
-/// `path[j..]`", filled back to front in O(|pat| × |path|) cells, so
-/// stacked `**`s cannot multiply work.
-fn segs_match(pat: &[&str], path: &[&str]) -> bool {
-    let (n, m) = (pat.len(), path.len());
-    let mut dp = vec![vec![false; m + 1]; n + 1];
-    for i in (0..=n).rev() {
-        for j in (0..=m).rev() {
-            dp[i][j] = match pat.get(i) {
-                None => j == m,
-                Some(&"**") => dp[i + 1][j] || (j < m && dp[i][j + 1]),
-                Some(p) => j < m && seg_match(p.as_bytes(), path[j].as_bytes()) && dp[i + 1][j + 1],
-            };
-        }
-    }
-    dp[0][0]
-}
-
 /// Does `glob` cover the concrete file `path`? A glob without wildcards
 /// is a file or a directory: it covers itself and everything under it.
+/// One matcher for `areas:` and a delivery policy's `risk.when.paths`
+/// ([`cadence_core::delivery_rules::area_match`]), so the two cannot diverge.
 pub fn matches(glob: &str, path: &str) -> bool {
-    let pat = segments(glob);
-    let file: Vec<&str> = path.split('/').collect();
-    if segs_match(&pat, &file) {
-        return true;
-    }
-    !pat.iter().any(|s| is_wild(s)) && file.len() > pat.len() && file[..pat.len()] == pat[..]
+    cadence_core::delivery_rules::area_match(glob, path)
 }
 
 /// Can two globs cover a common file? Exact when either side is a plain
@@ -1609,7 +1519,10 @@ mod tests {
         evil.worker = Some("w\u{1b}[2J\u{202e}detaruS".into());
         evil.pr = Some("https://x/\u{7}pull/9".into());
         evil.changed = vec!["src/pe\u{1b}er.rs".into()];
-        assert!(!evil.label().chars().any(|c| c.is_control() || is_format(c)));
+        assert!(!evil
+            .label()
+            .chars()
+            .any(|c| c.is_control() || cadence_core::delivery_rules::is_format(c)));
         let ws = warnings(&[], &me("pm-a"), &["src/".into()], &[evil]);
         assert_eq!(kinds(&ws), vec!["overlap"]);
         let w = &ws[0];
@@ -1620,14 +1533,17 @@ mod tests {
             w["paths"].to_string(),
         ] {
             assert!(
-                !v.chars().any(|c| c.is_control() || is_format(c)),
+                !v.chars()
+                    .any(|c| c.is_control() || cadence_core::delivery_rules::is_format(c)),
                 "unscrubbed bytes in {v:?}"
             );
         }
         // The lease comment path is the same lines.
         for line in warning_lines(&json!({"warnings": ws, "config_error": null})) {
             assert!(
-                !line.chars().any(|c| c.is_control() || is_format(c)),
+                !line
+                    .chars()
+                    .any(|c| c.is_control() || cadence_core::delivery_rules::is_format(c)),
                 "{line:?}"
             );
         }
@@ -1640,7 +1556,9 @@ mod tests {
             "config_error": "k/PROJECT.md areas: area 'x\u{7}\u{202e}' bad",
         })) {
             assert!(
-                !line.chars().any(|c| c.is_control() || is_format(c)),
+                !line
+                    .chars()
+                    .any(|c| c.is_control() || cadence_core::delivery_rules::is_format(c)),
                 "{line:?}"
             );
         }

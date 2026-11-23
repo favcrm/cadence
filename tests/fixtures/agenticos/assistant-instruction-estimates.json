@@ -1,0 +1,14 @@
+{
+  "workspace": {
+    "instructions": "Be brief.\nAnswer in English.",
+    "revision": "41",
+    "built_in_instruction_tokens": 127
+  },
+  "personal": {
+    "instructions": "Call me Sam.",
+    "revision": 7,
+    "built_in_instruction_tokens": 127
+  },
+  "legacyWorkspace": { "instructions": "Be brief.\nAnswer in English.", "revision": "41" },
+  "legacyPersonal": { "instructions": "Call me Sam.", "revision": 7 }
+}

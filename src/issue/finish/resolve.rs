@@ -19,10 +19,32 @@ pub(crate) fn verify_checkout_ownership(
     issue: &str,
     expected_branch: Option<&str>,
 ) -> Result<Option<crate::worktree::lifecycle::Checkout>> {
+    verify_checkout_ownership_inner(root, path, issue, expected_branch, false)
+}
+
+/// The hosted assignment ledger can bind an older generic agent worktree
+/// whose lifecycle record predates issue ownership.
+pub(crate) fn verify_hosted_checkout_ownership(
+    root: &Path,
+    path: &Path,
+    issue: &str,
+    expected_branch: Option<&str>,
+) -> Result<Option<crate::worktree::lifecycle::Checkout>> {
+    verify_checkout_ownership_inner(root, path, issue, expected_branch, true)
+}
+
+fn verify_checkout_ownership_inner(
+    root: &Path,
+    path: &Path,
+    issue: &str,
+    expected_branch: Option<&str>,
+    hosted: bool,
+) -> Result<Option<crate::worktree::lifecycle::Checkout>> {
     let record = crate::worktree::lifecycle::managed_record(root, path)?;
     if let Some(record) = &record {
         if record.purpose != "development"
-            || record.issue.as_deref() != Some(issue)
+            || !(record.issue.as_deref() == Some(issue)
+                || (hosted && record.issue.is_none() && record.tool == "cadence agent worktree"))
             || expected_branch.is_some_and(|branch| record.branch.as_deref() != Some(branch))
             || record.state != "active"
         {

@@ -1,11 +1,23 @@
 @import "./foundation.css";
 
+/* App screens inherit the host board backdrop; keep the frame canvas transparent
+   so embedded apps never paint a mismatched box over the workspace theme. */
+html,
 body {
-  background: var(--color-ink-950);
+  background: transparent;
+}
+body {
   color: var(--color-ink-300);
   font-family: var(--font-sans);
   font-size: var(--text-body);
   line-height: 1.4;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+}
+
+/* Inside a Cadence host frame, keep the document canvas transparent onto the
+   host app-shell rather than painting an opaque inset panel over it. */
+html[data-cadence-kit],
+html[data-cadence-kit] body {
+  background: transparent;
 }

@@ -1,4 +1,4 @@
-import { aliasProblem, appliesText, durationText, hiredText, matchesRole, nextAlias, roleOf, suggestedRoles } from "../src/features/agents/agentRoles";
+import { aliasProblem, appliesText, durationText, hiredText, matchesRole, nextAlias, roleOf, roleOfProfile, suggestedRoles } from "../src/features/agents/agentRoles";
 import { historyKind, parseAgentTab } from "../src/features/agents/agentTabModel";
 import { locationHref, readLocation } from "../src/lib/router";
 import type { AgentRole } from "../src/lib/types";
@@ -20,7 +20,6 @@ const role = (id: string, category: string, title: string, job: string): AgentRo
   tools: [],
   first_tasks: [],
   instructions: "",
-  model: { id: "m", source: "role_default" },
 });
 const roles = [
   role("quotation", "business", "Quotation", "Turns a request into a quote."),
@@ -34,6 +33,8 @@ check(nextAlias("developer", []) === "developer-1", "first name");
 check(nextAlias("developer", ["developer-1", "developer-2"]) === "developer-3", "skips taken names");
 check(aliasProblem("developer-1", ["developer-1"]) !== null, "a taken name is refused");
 check(aliasProblem("bad name", []) !== null, "a name outside the alias grammar is refused");
+check(aliasProblem("-dev", []) !== null, "a leading dash is refused");
+check(aliasProblem("Dev", []) !== null, "an uppercase name is refused");
 check(aliasProblem("developer-1", []) === null, "a free name passes");
 
 // Suggested for you: from installed apps; nothing matching hides the section.
@@ -57,13 +58,14 @@ check(appliesText("next_turn") === "Applies from its next turn", "next turn word
 check(appliesText("not_delivered").startsWith("Saved, but"), "undelivered wording is honest");
 
 // Tabs and history chips.
-check(parseAgentTab("job") === "job" && parseAgentTab("nope") === "overview", "unknown tab falls back");
+check(parseAgentTab("instructions") === "instructions" && parseAgentTab("nope") === "overview" && parseAgentTab("constructor") === "overview", "unknown tab falls back");
+check(parseAgentTab("job") === "instructions" && parseAgentTab("access") === "settings" && parseAgentTab("knowledge") === "settings" && parseAgentTab("work") === "overview", "a moved section's old link lands where it went");
 check(historyKind("report_filed") === "reports" && historyKind("memory_proposed") === "memory", "history kinds");
 
 // The agent page and catalogue ride the URL.
-const page = readLocation("/agents/dev-1", "?tab=job");
-check(page.route.screen === "agents" && page.route.alias === "dev-1" && page.route.tab === "job", "tab is read from the query");
-check(locationHref(page, "") === "/agents/dev-1?tab=job", "tab is written back");
+const page = readLocation("/agents/dev-1", "?tab=instructions");
+check(page.route.screen === "agents" && page.route.alias === "dev-1" && page.route.tab === "instructions", "tab is read from the query");
+check(locationHref(page, "") === "/agents/dev-1?tab=instructions", "tab is written back");
 const plain = readLocation("/agents/dev-1", "");
 check(locationHref(plain, "") === "/agents/dev-1", "overview keeps a clean URL");
 const recruit = readLocation("/agents", "?recruit=1");
@@ -76,5 +78,8 @@ check(hiredText(null) === "—" && hiredText(1_792_000_000).length > 3, "hired d
 
 // A roster row carries only the catalogue id; the role resolves from it.
 const payload = { categories: [], roles, install: { hosted: false, provider: "pi", endpoint_kind: "managed" } };
-check(roleOf({ catalogue: "developer" }, payload)?.id === "developer", "role from the served catalogue id");
-check(roleOf({}, payload) === null, "no catalogue id, no role");
+const hired = [{ id: "dev-1", catalogue: "developer", runtimes: ["rt-1"] }] as never;
+check(roleOf({ alias: "rt-1" }, payload, hired)?.id === "developer", "role from the runtime's profile");
+check(roleOf({ alias: "other" }, payload, hired) === null, "no profile, no role");
+check(roleOfProfile({ catalogue: "developer", runtimes: [] } as never, payload)?.id === "developer", "a profile with no runtime still has its role");
+check(roleOfProfile({ catalogue: null, runtimes: [] } as never, payload) === null, "a hand-written profile has no role");

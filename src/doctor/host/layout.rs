@@ -1,10 +1,10 @@
 //! CAD-584: `cadence doctor host` check `layout` — the CADENCE_HOME
 //! resolution this host sees: which branch the resolver took
-//! (`CADENCE_HOME` or the legacy layout) and every path it yields.
-//! A `LAYOUT` marker at the resolved root is reported but never
-//! activates the new layout — only `CADENCE_HOME` does. The check
-//! fails only when resolution itself is refused — a non-absolute
-//! `CADENCE_HOME` breaks every cadence path lookup.
+//! (`CADENCE_HOME`, a first run, or the legacy layout) and every path it
+//! yields. A `LAYOUT` marker at the resolved root is reported but never
+//! activates the new layout — only `CADENCE_HOME` or a first run does.
+//! The check fails only when resolution itself is refused — a
+//! non-absolute `CADENCE_HOME` breaks every cadence path lookup.
 
 use super::*;
 
@@ -28,7 +28,7 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
                 json!({"error": e.to_string()}),
                 Value::Null,
                 format!("home resolution refused: {e}"),
-                "export CADENCE_HOME as an absolute path or unset it".to_string(),
+                "fix what the detail names: a non-absolute CADENCE_HOME, or two installations (the detail lists the evidence in each)".to_string(),
             );
         }
     };
@@ -37,6 +37,7 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
         ("state", crate::home::state_dir()),
         ("vault", crate::home::vault_dir()),
         ("repos", crate::home::repos_dir()),
+        ("config", crate::home::config_dir()),
     ];
     let detail = std::iter::once(format!(
         "{} → {}",
@@ -47,6 +48,32 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
         Ok(d) => format!("{name} {}", d.display()),
         Err(e) => format!("{name} unresolved ({e})"),
     }))
+    .chain((layout.source == crate::home::Source::Fresh).then(|| {
+        "first run on this account's own home — no existing tracker, state \
+             dir or hosted config was found"
+            .to_string()
+    }))
+    .chain((layout.source == crate::home::Source::Sandbox).then(|| {
+        "this process is a dev sandbox — its root is the home, so no \
+             production path is consulted"
+            .to_string()
+    }))
+    .chain({
+        let stray = if layout.source == crate::home::Source::Legacy {
+            crate::home::stray_home_entries(&layout.root)
+        } else {
+            Vec::new()
+        };
+        (!stray.is_empty()).then(|| {
+            format!(
+                "{} holds {} but no installation data (no tracker pm.yaml, daemon \
+                 database or hosted config) — ignored beside the legacy installation; \
+                 nothing was removed, and it may hold worktrees or other data",
+                layout.root.display(),
+                stray.join(", ")
+            )
+        })
+    })
     .chain(
         (layout.marker_present && layout.source == crate::home::Source::Legacy).then(|| {
             format!(
@@ -69,6 +96,7 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
             "state": dir_value(crate::home::state_dir()),
             "vault": dir_value(crate::home::vault_dir()),
             "repos": dir_value(crate::home::repos_dir()),
+            "config": dir_value(crate::home::config_dir()),
         }),
         Value::Null,
         detail,

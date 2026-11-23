@@ -196,6 +196,21 @@ fn schema(path: &[String]) -> Result<Value> {
             }
         }
     }
+    if canonical.as_slice() == ["issue", "ls"] {
+        let unsupported = remote::hosted_issue_ls_unsupported_flags();
+        for arg in &mut arguments {
+            let refused = arg
+                .get("long")
+                .and_then(Value::as_str)
+                .is_some_and(|flag| unsupported.contains(&flag));
+            if refused {
+                arg["hosted"] = json!({
+                    "client_route": "unsupported",
+                    "reason": remote::HOSTED_ISSUE_LS_REFUSAL,
+                });
+            }
+        }
+    }
     Ok(json!({
         "schema_version": 1,
         "path": canonical,
@@ -203,7 +218,7 @@ fn schema(path: &[String]) -> Result<Value> {
         "description": description,
         "aliases": aliases,
         "arguments": arguments,
-        "note": "The parser and handler remain authoritative. This is syntax only, not a permission, readiness, or response schema.",
+        "note": "The parser and handler remain authoritative. Hosted annotations describe this installed client's known refusals only. Unmarked options do not imply tenant support, authorization, or readiness; this is not a response schema.",
     }))
 }
 

@@ -1,21 +1,26 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState, type ReactNode } from "react";
 import type { ResourceState } from "../../lib/cache";
 import { issueIndex } from "../../lib/scope";
 import { useTranslate } from "../../lib/locale";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconSearch } from "../../ui/icons";
 import { resources } from "../../lib/resources";
+import { readTeamMembers } from "../../lib/teamRoster";
 import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
 import { HireBlock } from "../auth/WriteGate";
 import AgentAvatar from "./AgentAvatar";
-import SeatCard from "./SeatCard";
+import SeatCard, { PersonalSeat, TeammateSeat } from "./SeatCard";
+import MyAssistantPage from "./MyAssistantPage";
+import { hasScopedAssistantRoster, isCompanyMaster, masterShownTo, MASTER_LABEL, PERSONAL_ALIAS, personalOf } from "./personalAssistant";
 import { MASTER } from "../home/master";
 import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
+import type { ToastMsg } from "../../ui/Toast";
 import AgentPage from "./AgentPage";
-import { FirstJobs } from "./AgentTabs";
 import HireSheet from "./HireSheet";
+import ProfileSeat, { ConnectRuntime, workText } from "./ProfileSeat";
+import AgentSidebar from "./AgentSidebar";
 import NewAgentDialog from "./NewAgentDialog";
 import Recruit from "./Recruit";
 import { HireGate, RoleCard } from "./RecruitCards";
@@ -23,103 +28,212 @@ import {
   nextAlias,
   onTeamCount,
   roleOf,
-  runsOnText,
   suggestedRoles,
   useAgentRoles,
 } from "./agentRoles";
 import type { AgentTab } from "./agentTabModel";
 import {
-  AGENT_FILTERS,
+  agentLocation,
   agentMatchesFilter,
   agentMatchesSearch,
   agentOrder,
+  profileMatchesFilter,
+  profileMatchesSearch,
+  profileWork,
   type AgentFilter,
 } from "./agentView";
 import "./agents.css";
-import type { Agent, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
-
-/** The toolbar's segmented filters, in the order they read. */
-const TOOLBAR_FILTERS: AgentFilter[] = ["current", "attention", "working", "idle", "stopped", "inbox", "all"];
+import type { Agent, HiredProfile, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
 
 /** "Accountant · this computer": the catalogue title, else "Master", else the
  *  team role's label (never the raw id or the provider), then where it runs. */
-function roleLine(a: Agent, roleTitle: string | undefined, hosted: boolean, t: (s: string) => string): string {
+function roleLine(
+  a: Agent,
+  roleTitle: string | undefined,
+  hosted: boolean,
+  t: (s: string) => string,
+  company = false,
+): string {
+  // CAD-2353: the company Master says who may use it, not where it runs.
+  if (company) return t(MASTER_LABEL);
   const label = (id: string | null | undefined) => ROLES.find(([key]) => key === id)?.[1];
   const title =
     roleTitle ?? (a.alias === MASTER ? t("Master") : (label(a.team_role) ?? label(a.role) ?? t("Agent")));
-  return `${title} · ${hosted ? t("workspace") : t("this computer")}`;
+  const where = agentLocation(a) === "cloud" ? t("cloud") : hosted ? t("workspace") : t("this computer");
+  // The model a runtime resolved to; `inherit` is not a model, so it is not shown.
+  const model = a.model && a.model !== "inherit" ? ` · ${a.model}` : "";
+  return `${title} · ${where}${model}`;
 }
 
 export default function Agents({
   state,
   issues: issuesState,
   open,
+  openProfileId,
   tab,
+  routineAgent,
   recruit,
   ask,
   onAsk,
   onOpenAgent: setOpen,
   onTab,
+  onToast,
   onRecruit,
   onOpenIssue,
   onRetry,
+  operator,
+  onRetryAccess,
+  hostedBoard,
+  viewerSub,
 }: {
+  /** `true` alone lets the viewer read and send agent conversations, as on
+   *  Threads. `null` is an unanswered check, not a non-operator. */
+  operator: boolean | null;
+  onRetryAccess: () => void;
+  hostedBoard: boolean;
+  viewerSub?: string | null;
   state: ResourceState<AgentsPayload>;
   issues: ResourceState<IssueCard[]>;
   open: string | null;
+  openProfileId?: string;
   tab: AgentTab;
+  routineAgent?: typeof PERSONAL_ALIAS;
   recruit: boolean;
   ask: boolean;
   onAsk: () => void;
-  onOpenAgent: (alias: string | null) => void;
+  /** `tab` lands on a section instead of the chat (the company Master has no chat yet). */
+  onOpenAgent: (alias: string | null, tab?: AgentTab, profileId?: string) => void;
   onTab: (tab: AgentTab) => void;
+  onToast: (kind: ToastMsg["kind"], text: string) => void;
   onRecruit: (on: boolean) => void;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
 }) {
   const t = useTranslate();
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<AgentFilter>("current");
   const [creating, setCreating] = useState(false);
   const [picked, setPicked] = useState<AgentRole | null>(null);
-  const [joined, setJoined] = useState<{ alias: string; role: AgentRole } | null>(null);
+  const [joined, setJoined] = useState<{ profile: HiredProfile; role: AgentRole } | null>(null);
   const roles = useAgentRoles();
   const installed = useQuery(resources.apps);
   const hireBlock = useContext(HireBlock);
   const payload = state.data;
   const issueIndexed = issueIndex(issuesState.data ?? []);
   // Agents belong to the team, not a project: the roster lists them all.
-  const allAgents = payload?.agents ?? [];
-  const counts = Object.fromEntries(
-    AGENT_FILTERS.map(({ value }) => [value, allAgents.filter((a) => agentMatchesFilter(a, value)).length]),
-  ) as Record<AgentFilter, number>;
-  const agents = allAgents
-    .filter((a) => agentMatchesFilter(a, filter) && agentMatchesSearch(a, query, issueIndexed))
+  // CAD-2353: the company Master is for owners; a hosted roster that names the
+  // personal assistant does not list it to anyone else.
+  const roster = payload?.agents ?? [];
+  const allAgents = roster.filter((a) => masterShownTo(a, payload, hostedBoard, operator));
+  const personal = personalOf(payload);
+  const scopedRoster = hostedBoard && payload != null && hasScopedAssistantRoster(payload);
+  const directoryViewer = scopedRoster && !open && !openProfileId && !ask && !recruit ? viewerSub ?? null : null;
+  const [directory, setDirectory] = useState<{
+    viewer: string;
+    rows: { userId: string; name: string }[];
+  } | null>(null);
+  useEffect(() => {
+    if (!directoryViewer) {
+      setDirectory(null);
+      return;
+    }
+    // Every current workspace member has a personal seat. Show only the team
+    // roster name; never read a teammate's profile or whether they opened Home.
+    const abort = new AbortController();
+    readTeamMembers(abort.signal)
+      .then((members) => {
+        if (abort.signal.aborted) return;
+        setDirectory({
+          viewer: directoryViewer,
+          rows: members.flatMap(({ userId, name }) => {
+            if (userId === directoryViewer) return [];
+            const displayName = name.trim();
+            return [{ userId, name: /^\S+@\S+$/.test(displayName) ? "" : displayName }];
+          }),
+        });
+      })
+      .catch(() => {
+        if (!abort.signal.aborted) setDirectory(null);
+      });
+    return () => abort.abort();
+  }, [directoryViewer]);
+  const teammateRows = directory && directory.viewer === directoryViewer ? directory.rows : [];
+  const searchTerm = query.trim().toLowerCase();
+  const searchTerms = searchTerm ? searchTerm.split(/\s+/) : [];
+  const matchesName = (name: string) => {
+    const text = name.toLowerCase();
+    return searchTerms.every((term) => text.includes(term));
+  };
+  const matchingTeammates = searchTerm
+    ? teammateRows.filter(({ name }) => matchesName(name || t("Teammate")))
+    : teammateRows;
+  const companyMaster = allAgents.find((a) => isCompanyMaster(a, payload)) ?? null;
+  const personalMatches = personal !== null && matchesName(`${personal.name} ${PERSONAL_ALIAS}`);
+  const profiles = payload?.profiles ?? [];
+  const idleProfiles = profiles.filter((p) => profileMatchesFilter(p, "all"));
+  // The cards are the current team; a search reaches everyone. Stopped agents
+  // and mailboxes otherwise live in the sidebar's folded groups.
+  const searching = searchTerm !== "";
+  const filter: AgentFilter = searching ? "all" : "current";
+  const sidebarAgents = allAgents.filter((a) =>
+    agentMatchesSearch(a, query, issueIndexed, a === companyMaster ? a.name : undefined),
+  );
+  const sidebarProfiles = idleProfiles.filter((p) => profileMatchesSearch(p, query));
+  const shownProfiles = idleProfiles.filter(
+    (p) => profileMatchesFilter(p, filter) && profileMatchesSearch(p, query),
+  );
+  const agents = sidebarAgents
+    .filter((a) => agentMatchesFilter(a, filter))
     .sort(
       (a, b) =>
         Number(b.alias === MASTER) - Number(a.alias === MASTER) ||
-        Number(b.alias === joined?.alias) - Number(a.alias === joined?.alias) ||
         agentOrder(a) - agentOrder(b) ||
         a.alias.localeCompare(b.alias),
     );
   const emptyCopy =
-    allAgents.length === 0
+    allAgents.length + idleProfiles.length + teammateRows.length === 0 && !personal
       ? t("No agents registered.")
-      : filter === "current" && counts.current === 0 && !query.trim()
-        ? t("No current agents. Select All, Stopped, or Mailboxes to see the full roster.")
-        : t("No agents match these filters.");
+      : searching
+        ? t("No agents match “{query}”.").replace("{query}", () => query)
+        : t("No current agents. Search to find stopped agents and mailboxes.");
+  // A phone has no sidebar, so what it folds is listed under the cards there.
+  const folded = searching ? [] : allAgents.filter((a) => !agentMatchesFilter(a, "current"));
   const agent = allAgents.find((a) => a.alias === open);
   const hosted = roles.data?.install.hosted ?? false;
   const suggestion = suggestedRoles(installed.data ?? [], roles.data?.roles ?? []);
-  const taken = allAgents.map((a) => a.alias);
+  const groups = allAgents.filter((a) => a.role === "pm").map((a) => a.alias);
+  const taken = [...allAgents.map((a) => a.alias), ...profiles.map((p) => p.alias)];
   const askMaster = onAsk;
-  const hired = (alias: string, role: AgentRole) => {
+  // Until the company Master chat exists, its row opens its page, not a chat.
+  const openAgent = (alias: string) => {
+    if (scopedRoster && alias === PERSONAL_ALIAS) {
+      onToast("err", t("Agent details are unavailable."));
+      return;
+    }
+    if (alias === MASTER && companyMaster && operator === true) setOpen(alias, "instructions");
+    else setOpen(alias);
+  };
+  const openProfile = (profile: HiredProfile) => {
+    if (scopedRoster) setOpen(null, undefined, profile.id);
+    else openAgent(profile.alias);
+  };
+  const seat = (a: Agent) => (
+    <SeatCard
+      key={a.alias}
+      agent={a}
+      title={a === companyMaster ? (a.name ?? undefined) : undefined}
+      roleLine={roleLine(a, roleOf(a, roles.data, profiles)?.title, hosted, t, a === companyMaster)}
+      onOpen={() => openAgent(a.alias)}
+    />
+  );
+  const profileTitle = (profile: HiredProfile) =>
+    roles.data?.roles.find((r) => r.id === profile.catalogue)?.title ?? profile.role;
+  const issueCards = issuesState.data ?? [];
+  const hired = (profile: HiredProfile, role: AgentRole) => {
     setPicked(null);
-    setJoined({ alias, role });
+    setJoined({ profile, role });
     onRecruit(false);
     onRetry();
   };
-  const placeholder = joined !== null && !allAgents.some((a) => a.alias === joined.alias);
   const tile = (
     <button key="recruit-tile" type="button" className="rc-tile" onClick={() => onRecruit(true)}>
       <span className="plus" aria-hidden="true">＋</span>
@@ -139,34 +253,120 @@ export default function Agents({
     />
   );
 
-  if (open) {
-    return (
+  const selectedProfile = scopedRoster && openProfileId ? profiles.find((p) => p.id === openProfileId) : undefined;
+  const openAlias = selectedProfile?.alias ?? open;
+  const openHired = selectedProfile ?? profiles.find((p) => p.alias === open);
+  const shell = (content: ReactNode) => (
+    <div className="ag-shell">
+      <AgentSidebar
+        agents={sidebarAgents}
+        profiles={sidebarProfiles}
+        personal={personalMatches ? personal : null}
+        companyMaster={companyMaster}
+        profileStatus={(p) => {
+          const work = profileWork(p, issueCards);
+          return work ? workText(work, t) : t("Idle · no runtime");
+        }}
+        open={open}
+        openProfileId={openProfileId}
+        query={query}
+        hasTeammateMatches={matchingTeammates.length > 0}
+        onQuery={setQuery}
+        onOpen={openAgent}
+        onOpenProfile={openProfile}
+        onOpenPersonal={scopedRoster ? () => setOpen(PERSONAL_ALIAS) : null}
+        onOverview={() => setOpen(null)}
+        onRecruit={() => onRecruit(true)}
+      />
+      <div className="ag-shell-body">{content}</div>
+    </div>
+  );
+
+  // Only a roster response can establish that a hosted alias is legacy.
+  if (hostedBoard && payload == null && (open === PERSONAL_ALIAS || open === MASTER || openProfileId)) {
+    return shell(
+      <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
+        <button type="button" className="rc-back" onClick={() => setOpen(null)}>
+          ← {t("Agents")}
+        </button>
+        <ResourceGate state={state} loading="Loading agents…" failed="Could not load agents" onRetry={onRetry} />
+      </main>,
+    );
+  }
+  if (open === PERSONAL_ALIAS && personal) {
+    return shell(<MyAssistantPage row={personal} onBack={() => setOpen(null)} onToast={onToast} rosterStale={state.status === "stale" || (payload != null && state.status === "failed")} />);
+  }
+  const detailUnavailable = (scopedRoster && open === PERSONAL_ALIAS) || (openProfileId && !selectedProfile);
+  if (detailUnavailable || (scopedRoster && open === MASTER && operator !== true)) {
+    return shell(
+      <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
+        <button type="button" className="rc-back" onClick={() => setOpen(null)}>
+          ← {t("Agents")}
+        </button>
+        {detailUnavailable ? (
+          <>
+            <p className="rc-note" role="status">{t("Agent details are unavailable.")}</p>
+            <Button onClick={onRetry}>{t("Retry")}</Button>
+          </>
+        ) : operator === null ? (
+          <>
+            <p className="rc-note">{t("We couldn’t confirm your access")}</p>
+            <Button onClick={onRetryAccess}>{t("Retry")}</Button>
+          </>
+        ) : (
+          <>
+            <p className="rc-note">{t("Chat with the company Master is for owners. Your assistant is on Home.")}</p>
+            <Button href="/">{t("Open Home")}</Button>
+          </>
+        )}
+      </main>,
+    );
+  }
+  if (openAlias) {
+    return shell(
       <AgentPage
-        key={open}
-        alias={open}
-        observed={agent}
+        key={selectedProfile?.id ?? openAlias}
+        alias={openAlias}
+        observed={selectedProfile ? undefined : agent}
         roles={roles}
+        profiles={profiles}
+        selectedProfile={selectedProfile}
         tab={tab}
+        routineAgent={scopedRoster && open === MASTER && operator === true ? routineAgent : undefined}
         onTab={onTab}
         onBack={() => setOpen(null)}
         onOpenIssue={onOpenIssue}
+        hosted={hosted}
+        groups={groups}
+        rosterLoaded={payload != null}
+        rosterFailed={payload == null && state.status === "failed"}
+        rosterStale={state.status === "stale" || (payload != null && state.status === "failed")}
+        onRetryRoster={onRetry}
+        operator={operator}
+        onRetryAccess={onRetryAccess}
+        hostedBoard={hostedBoard}
+        scopedRoster={scopedRoster}
+        companyMaster={open === MASTER && companyMaster !== null}
+        hiredWork={openHired ? profileWork(openHired, issueCards) : null}
+        onToast={onToast}
       />
     );
   }
   if (ask) {
-    return (
+    return shell(
       <RecruitChat
+        showDecisions={scopedRoster && operator === true}
         hireBlock={hireBlock}
         onBack={() => setOpen(null)}
       />
     );
   }
   if (recruit) {
-    return (
+    return shell(
       <>
         <Recruit
           roles={roles}
-          agents={allAgents}
+          profiles={profiles}
           hireBlock={hireBlock}
           onBack={() => onRecruit(false)}
           onPick={setPicked}
@@ -187,7 +387,7 @@ export default function Agents({
     );
   }
 
-  return (
+  return shell(
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <div className="rc-head">
         <div>
@@ -208,22 +408,17 @@ export default function Agents({
         </div>
       </div>
       <HireGate reason={hireBlock} />
-      {joined && (
+      {joined && profiles.some((p) => p.id === joined.profile.id && p.runtimes.length === 0) && (
         <div className="rc-nudge" role="status">
-          <AgentAvatar slug="custom" look={joined.role.look} size={48} active />
+          <AgentAvatar slug="custom" look={joined.role.look} size={48} still />
           <div>
             <div className="t">
-              {t("{name} joined as {role}")
-                .replace("{name}", () => joined.alias)
+              {t("{name} was added as {role}")
+                .replace("{name}", () => joined.profile.alias)
                 .replace("{role}", () => joined.role.title)}
             </div>
-            <div className="s">
-              {t("Starting on {where}. Give a first job — it opens a thread.").replace(
-                "{where}",
-                () => t(runsOnText(hosted)),
-              )}
-            </div>
-            <FirstJobs alias={joined.alias} tasks={joined.role.first_tasks} />
+            <div className="s">{t("Idle · no runtime")}</div>
+            <ConnectRuntime profile={joined.profile} hosted={hosted} groups={groups} />
           </div>
         </div>
       )}
@@ -237,22 +432,6 @@ export default function Agents({
       {payload && (
         <>
           <div className="ag-toolbar" role="search" aria-label={t("Find agents")}>
-            <div className="ag-seg" role="group" aria-label={t("Filter agents by status")}>
-              {AGENT_FILTERS.filter((f) => TOOLBAR_FILTERS.includes(f.value))
-                .sort((x, y) => TOOLBAR_FILTERS.indexOf(x.value) - TOOLBAR_FILTERS.indexOf(y.value))
-                .map(({ value, label }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    className="ag-seg-btn"
-                    aria-pressed={filter === value}
-                    onClick={() => setFilter(value)}
-                  >
-                    {t(label)}
-                    <span className="num">{counts[value]}</span>
-                  </button>
-                ))}
-            </div>
             <label className="ag-search" htmlFor="agents-search">
               <IconSearch />
               <span className="sr-only">{t("Search agents")}</span>
@@ -266,33 +445,41 @@ export default function Agents({
             </label>
           </div>
           <div className="rc-seats">
-            {placeholder && joined && (
-              <div className="rc-seat new" aria-label={t("Agent {alias}").replace("{alias}", () => joined.alias)}>
-                <AgentAvatar slug="custom" look={joined.role.look} size={44} active />
-                <div>
-                  <div className="t">{joined.alias}</div>
-                  <div className="s">
-                    {joined.role.title} · {hosted ? t("workspace") : t("this computer")}
-                  </div>
-                </div>
-                <div className="st">
-                  <span className="rc-dot" style={{ "--c": "var(--color-warn)" } as React.CSSProperties} />
-                  {t("Starting…")}
-                </div>
-              </div>
-            )}
-            {agents.map((a) => (
-              <SeatCard
-                key={a.alias}
-                agent={a}
-                roleLine={roleLine(a, roleOf(a, roles.data)?.title, hosted, t)}
-                isNew={a.alias === joined?.alias}
-                onOpen={() => setOpen(a.alias)}
+            {personalMatches && personal && <PersonalSeat row={personal} onOpen={() => setOpen(PERSONAL_ALIAS)} />}
+            {agents.map(seat)}
+            {shownProfiles.map((profile) => (
+              <ProfileSeat
+                key={`profile-${profile.id}`}
+                profile={profile}
+                roleTitle={profileTitle(profile)}
+                work={profileWork(profile, issueCards)}
+                onOpen={() => openProfile(profile)}
               />
             ))}
-            {tile}
+            {!searching && tile}
           </div>
-          {agents.length === 0 && (
+          {matchingTeammates.length > 0 && (
+            <section aria-labelledby="teammate-assistants-heading">
+              <div className="rc-sec">
+                <h2 id="teammate-assistants-heading">{t("Teammate assistants")}</h2>
+              </div>
+              <ul className="rc-seats" role="list">
+                {matchingTeammates.map(({ userId, name }) => <TeammateSeat key={userId} name={name} />)}
+              </ul>
+              <p className="mt-2 text-label text-ink-500">{t("Only the teammate can open their personal assistant.")}</p>
+            </section>
+          )}
+          {folded.length > 0 && (
+            <details className="ag-folded">
+              <summary>
+                {t("Stopped and mailboxes")} <span className="num">{folded.length}</span>
+              </summary>
+              <div className="rc-seats">
+                {folded.map(seat)}
+              </div>
+            </details>
+          )}
+          {agents.length + shownProfiles.length + matchingTeammates.length === 0 && !personalMatches && (
             <p className="text-label text-ink-500 mt-3" role="status">
               {emptyCopy}
             </p>
@@ -309,7 +496,7 @@ export default function Agents({
                     key={role.id}
                     role={role}
                     payload={roles.data!}
-                    onTeam={onTeamCount(role, allAgents)}
+                    onTeam={onTeamCount(role, profiles)}
                     onPick={setPicked}
                   />
                 ))}

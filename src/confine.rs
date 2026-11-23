@@ -29,6 +29,9 @@
 
 use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
 use crate::error::{Error, Result};
 
 /// A filesystem policy: what the confined process may read, and what it
@@ -53,6 +56,53 @@ impl Policy {
             }
         }
         args
+    }
+}
+
+/// A Landlock ruleset built before `fork`, so a child can seal itself in
+/// `pre_exec` with syscalls alone. A child spawned by a multi-threaded
+/// parent must not allocate after `fork`; building the ruleset in the
+/// parent (path opens and CString allocation included) keeps the child
+/// side async-signal-safe.
+///
+/// The ruleset additionally denies inbound and outbound TCP when the
+/// kernel ABI supports network rules (Landlock ABI 4+). There are no
+/// network rules, so every TCP bind/connect is denied. UDP is outside
+/// Landlock's scope; callers that run untrusted content must also
+/// refuse URL-bearing input before they spawn.
+pub struct PreparedRuleset {
+    #[cfg(target_os = "linux")]
+    fd: std::os::fd::OwnedFd,
+}
+
+impl PreparedRuleset {
+    /// Build the ruleset. Refuses when Landlock is unavailable rather
+    /// than leaving the caller to run unconfined.
+    pub fn prepare(policy: &Policy) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                fd: landlock::prepare(policy, true)?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = policy;
+            Err(Error::provider(UNSUPPORTED))
+        }
+    }
+
+    /// Apply the ruleset in a `pre_exec` closure. Uses only `prctl` and
+    /// `landlock_restrict_self` — no allocation, no path resolution.
+    pub fn restrict_after_fork(&self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            landlock::restrict_after_fork(self.fd.as_raw_fd())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
     }
 }
 
@@ -110,6 +160,7 @@ fn restrict_self(_policy: &Policy) -> Result<()> {
 #[cfg(target_os = "linux")]
 mod landlock {
     use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
@@ -121,6 +172,9 @@ mod landlock {
     /// ABI 6 scopes.
     const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
     const SCOPE_SIGNAL: u64 = 1 << 1;
+    /// ABI 4 network rights.
+    const BIND_TCP: u64 = 1 << 0;
+    const CONNECT_TCP: u64 = 1 << 1;
 
     const EXECUTE: u64 = 1 << 0;
     const WRITE_FILE: u64 = 1 << 1;
@@ -187,15 +241,28 @@ mod landlock {
         }
     }
 
-    pub fn restrict_self(policy: &Policy) -> Result<()> {
+    /// Build a ruleset fd without restricting this process. The caller
+    /// applies it in the child's `pre_exec` (see
+    /// [`super::PreparedRuleset`]).
+    pub fn prepare(policy: &Policy, deny_tcp: bool) -> Result<OwnedFd> {
         let abi = abi_version();
         if abi < 1 {
             return Err(Error::provider(super::UNAVAILABLE));
         }
         let handled = handled(abi);
+        // ABI 4 added network rights. With the bits handled and no
+        // rules, every TCP bind/connect is denied; UDP is outside
+        // Landlock, so callers must also refuse URL-bearing input. The
+        // master/provider confinement does not ask for this: its
+        // provider must reach its API.
+        let handled_net = if deny_tcp && abi >= 4 {
+            BIND_TCP | CONNECT_TCP
+        } else {
+            0
+        };
         let attr = RulesetAttr {
             handled_access_fs: handled,
-            handled_access_net: 0,
+            handled_access_net: handled_net,
             scoped: scopes(abi),
         };
         // The struct size each ABI knows: `scoped` arrived in ABI 6,
@@ -214,28 +281,44 @@ mod landlock {
         if ruleset < 0 {
             return Err(os_err("landlock_create_ruleset"));
         }
-        let ruleset = ruleset as libc::c_int;
-        let result = (|| {
-            for p in &policy.read {
-                add_rule(ruleset, p, READ_RIGHTS & handled)?;
-            }
-            for p in &policy.write {
-                add_rule(ruleset, p, handled)?;
-            }
-            // SAFETY: plain prctl; required before an unprivileged
-            // landlock_restrict_self.
-            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-                return Err(os_err("prctl(PR_SET_NO_NEW_PRIVS)"));
-            }
-            // SAFETY: ruleset is an open landlock ruleset fd.
-            if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0u32) } != 0 {
-                return Err(os_err("landlock_restrict_self"));
-            }
-            Ok(())
-        })();
-        // SAFETY: closing the fd this function opened.
-        unsafe { libc::close(ruleset) };
-        result
+        // SAFETY: the syscall returned a new fd this process owns.
+        let ruleset = unsafe { OwnedFd::from_raw_fd(ruleset as libc::c_int) };
+        // The child needs the fd only through `pre_exec`; close it at
+        // exec so the renderer never inherits an unused ruleset handle.
+        // SAFETY: plain fcntl on the fd this function opened.
+        if unsafe { libc::fcntl(ruleset.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(os_err("fcntl(FD_CLOEXEC)"));
+        }
+        for p in &policy.read {
+            add_rule(ruleset.as_raw_fd(), p, READ_RIGHTS & handled)?;
+        }
+        for p in &policy.write {
+            add_rule(ruleset.as_raw_fd(), p, handled)?;
+        }
+        Ok(ruleset)
+    }
+
+    /// Apply a prepared ruleset from a `pre_exec` closure. Syscalls
+    /// only: a multi-threaded parent forbids allocation after fork.
+    pub fn restrict_after_fork(fd: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: plain prctl; required before an unprivileged
+        // landlock_restrict_self.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd is an open landlock ruleset fd.
+        if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0u32) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn restrict_self(policy: &Policy) -> Result<()> {
+        // Provider confinement must keep its network: only the caller
+        // that additionally asks for it gets TCP denied.
+        let ruleset = prepare(policy, false)?;
+        restrict_after_fork(ruleset.as_raw_fd())
+            .map_err(|e| Error::provider(format!("cadence confine: landlock_restrict_self: {e}")))
     }
 
     /// Allow `rights` beneath `path`. A missing path is skipped; a file

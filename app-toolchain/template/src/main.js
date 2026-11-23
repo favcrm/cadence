@@ -1,7 +1,7 @@
 import { createScreenReceiver, ScreenClosedError } from "@cadence/app-kit";
 
 const root = document.querySelector("#root") ?? document.body;
-const state = { connected: false, mode: "outlet", title: "App template", error: null, localDrawer: false };
+const state = { connected: false, mode: "outlet", role: "primary", readOnly: false, title: "App template", error: null, localDrawer: false };
 
 function node(tag, props = {}, children = []) {
   const element = document.createElement(tag);
@@ -35,8 +35,12 @@ function render() {
       text: "This surface is app-owned. The frame, board drawer, scrim and close affordance are host-owned.",
     }),
     node("p", { class: "muted", text: `Presentation: ${state.mode}` }),
-    node("button", { class: "btn", type: "button", onClick: openSettings, text: "Open settings drawer" }),
+    node("p", { class: "muted", text: `Surface role: ${state.role}, readOnly: ${state.readOnly}` }),
   ]);
+  // In the chat canvas the host says the app is read-only: hide edit controls.
+  if (!state.readOnly) {
+    body.append(node("button", { class: "btn", type: "button", onClick: openSettings, text: "Open settings drawer" }));
+  }
   if (state.error) body.append(node("p", { class: "error", text: state.error }));
   root.append(body);
   if (state.localDrawer) {
@@ -80,7 +84,7 @@ async function closeSettings() {
 }
 
 const receiver = createScreenReceiver({
-  accepts: ["screen.v2", "screen-actions.v1", "screen-presentation.v1"],
+  accepts: ["screen.v2", "screen-actions.v1", "screen-presentation.v1", "screen-surfaces.v1", "screen-canvas.v1"],
   onPush(push) {
     state.connected = true;
     state.title = String(push?.title ?? "Host connected");
@@ -89,6 +93,11 @@ const receiver = createScreenReceiver({
   },
   onPresentation(mode) {
     state.mode = mode;
+    render();
+  },
+  onSurface(role, _surface, _modal, readOnly) {
+    state.role = role;
+    state.readOnly = readOnly === true;
     render();
   },
   onError(reason) {

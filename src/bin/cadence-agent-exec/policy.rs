@@ -92,6 +92,8 @@ const ENV_NEVER_PREFIX: &[&str] = &["CADENCE_DEVIN_", "LD_", "PYTHON", "MALLOC_"
 #[derive(Debug)]
 pub enum Request {
     /// Fixed protected profile, never arbitrary provider argv or --env.
+    #[allow(dead_code)]
+    // CAD-1085: the split launch refuses; the parsed profile is not executed.
     PiGuest(crate::protected_pi_profile::Profile),
     /// `exec [--env K=V]… -- <argv…>` — spawn as the agent uid.
     Exec {

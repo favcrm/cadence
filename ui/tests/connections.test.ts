@@ -6,9 +6,11 @@ import {
   canManage,
   capabilityWords,
   connectionCapabilities,
+  connectionNeedsAttention,
   enrollmentShapes,
   enrollmentSupport,
   isAvailable,
+  connectionsNeedingAttention,
   pinWord,
   readinessText,
   scopeHint,
@@ -423,3 +425,37 @@ equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "loca
 // The Settings Connections route survives refresh and paste.
 equal(matchRoute("/settings/connections"), { screen: "settings", section: "connections" }, "match connections");
 equal(routePath({ screen: "settings", section: "connections" }), "/settings/connections", "print connections");
+
+// CAD-2114: a row's flag follows the daemon's rule for whether apps can use it.
+{
+  const base = { kind: "enrolled", status: { adapter_registered: true, descriptor_available: true, custody_available: true, manifest_status: "matched" } };
+  const withStatus = (manifest_status: string) => ({ ...base, status: { ...base.status, manifest_status } }) as unknown as Connection;
+  if (connectionsNeedingAttention([withStatus("matched"), withStatus("approved")]) !== 0) throw new Error("usable accounts raise no flag");
+  if (connectionsNeedingAttention([withStatus("drifted"), withStatus("missing")]) !== 2) throw new Error("an account apps are refused is flagged");
+  if (pinWord({ manifest_status: "approved" } as never) === "deployment differs from the reviewed contract") throw new Error("a hosted approved account does not read as differing");
+}
+
+// A provider with no hosted-social descriptor but a qualified connected read
+// is usable; its absence of a descriptor is not an unavailable connection.
+{
+  const gsc = row({
+    provider: "google_search_console",
+    status: {
+      adapter_registered: true,
+      descriptor_available: false,
+      custody_available: true,
+      manifest_status: "missing",
+      reviewed_pin: null,
+      reported_pin: null,
+      execution_authority: true,
+      network_checked: false,
+    },
+    read: { slug: "search_console_report", qualified: true, pinned: true, projected: true },
+  });
+  assert(isAvailable(gsc), "a qualified read is available without a social descriptor");
+  assert(!connectionNeedsAttention(gsc), "a qualified read is not an attention row");
+  assert(
+    readinessText(gsc).includes("search_console_report"),
+    "readiness names the qualified read",
+  );
+}

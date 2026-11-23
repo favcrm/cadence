@@ -1,22 +1,29 @@
 import { Fragment, useId, useLayoutEffect, useRef, type ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
-import type { AppNav } from "../features/app-shell/appNav";
+import type { AppNav, AppNavEntry } from "../features/app-shell/appNav";
 import { updateSidebarPrefs, useSidebarPrefs } from "../features/app-shell/sidebarPrefs";
-import { prefetchWorkspaceApp } from "../features/workspace-apps/workspaceApps";
+import { prefetchAppScope, prefetchWorkspaceApp } from "../features/workspace-apps/workspaceApps";
 import { navMatches } from "../features/issues/model";
 import { navItems, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
-import { IconAgents, IconApps, IconCaret, IconHome, IconMyWork, IconOutbox, IconPin, IconProjects, IconSettings, IconWiki, IconThreads } from "./icons";
+import { IconAgents, IconApps, IconCaret, IconDocuments, IconHome, IconMyWork, IconOutbox, IconPin, IconProjects, IconSettings, IconWiki, IconThreads } from "./icons";
+import { AppGlyph } from "../features/explorer/shared";
 import { useLocale } from "../lib/locale";
 import { useAssistantUnread } from "../features/app-shell/chat/assistantUnread";
+
+const prefetchApp = (app: Pick<AppNavEntry, "installId" | "kind">) => {
+  if (app.kind === "social-content") prefetchWorkspaceApp(app.installId);
+  else prefetchAppScope(app.installId);
+};
 
 const NAV_ICONS: Record<string, ReactNode> = {
   home: <IconHome size={16} />,
   myWork: <IconMyWork size={16} />,
   projects: <IconProjects size={16} />,
   wiki: <IconWiki size={16} />,
+  documents: <IconDocuments size={16} />,
   apps: <IconApps size={16} />,
   agents: <IconAgents size={16} />,
   threads: <IconThreads size={16} />,
@@ -36,9 +43,19 @@ function Fold({ id, open, children }: { id: string; open: boolean; children: Rea
 }
 
 /** The chevron button beside a nav row; the row's link keeps navigating. */
-function Disclosure({ open, controls, label, onToggle }: { open: boolean; controls: string; label: string; onToggle: () => void }) {
+function Disclosure({ open, controls, label, hidden = false, onToggle }: { open: boolean; controls: string; label: string; hidden?: boolean; onToggle: () => void }) {
   return (
-    <button type="button" className="navdisc" aria-expanded={open} aria-controls={controls} aria-label={label} title={label} onClick={onToggle}>
+    <button
+      type="button"
+      className="navdisc"
+      aria-expanded={open}
+      aria-controls={controls}
+      aria-label={label}
+      aria-hidden={hidden || undefined}
+      tabIndex={hidden ? -1 : undefined}
+      title={label}
+      onClick={onToggle}
+    >
       <IconCaret size={12} />
     </button>
   );
@@ -56,15 +73,19 @@ interface NavListProps {
   onNavigate?: () => void;
   /** Pending To do items for the Home row's badge (CAD-1216); hidden at 0 or unknown. */
   homeCount?: number;
-  /** A hosted tenant does not serve the wiki; do not advertise it there. */
-  hosted?: boolean;
+  /** The board does not serve the wiki (see wikiAvailable); do not advertise it there. */
+  noWiki?: boolean;
+  /** Additional nav screens unsupported on this board (see boardSupports). */
+  hiddenScreens?: readonly Screen[];
+  /** Desktop rail hides nested rows without changing their stored fold state. */
+  rail?: boolean;
 }
 
 /** The one nav row list: the desktop sidebar and the phone menu both
  *  render it, so there is a single row style. */
-export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, hosted = false }: NavListProps) {
+export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, noWiki = false, hiddenScreens, rail = false }: NavListProps) {
   const { t } = useLocale();
-  const items = navItems(hosted);
+  const items = navItems(noWiki, hiddenScreens);
   const prefs = useSidebarPrefs();
   const foldId = useId();
   // CAD-1700: a quiet dot where an assistant reply waits unseen.
@@ -75,6 +96,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
     <nav className="grid gap-[2px]" aria-label={t(label)}>
       {items.map((item) => {
         const here = navMatches(screen, item.screen);
+        const railLabel = item.screen === "home"
+          ? [t(item.label), homeCount > 0 ? `${homeCount} ${t("waiting for you")}` : "", assistantUnread.has("home") ? t("New assistant reply") : ""].filter(Boolean).join(" · ")
+          : t(item.label);
         if (item.screen !== "apps" || apps.length === 0) {
           return (
             <Fragment key={item.screen}>
@@ -82,10 +106,12 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 href={navHref(item.route)}
                 onClick={onNavigate}
                 className="navlink"
+                data-rail-label={railLabel}
+                aria-label={rail ? railLabel : undefined}
                 aria-current={here ? "page" : undefined}
               >
                 {NAV_ICONS[item.screen]}
-                {t(item.label)}
+                <span className="navlabel">{t(item.label)}</span>
                 {item.screen === "home" && homeCount > 0 && (
                   <span className="navbadge num" title={`${homeCount} ${t("waiting for you")}`}>
                     {homeCount}
@@ -95,63 +121,59 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                   <span className="navdot" role="img" aria-label={t("New assistant reply")} />
                 )}
               </Link>
-              {item.screen === "apps" && appMenu?.notice && <AppNotice notice={appMenu.notice} />}
+              {item.screen === "apps" && appMenu?.notice && <AppNotice notice={appMenu.notice} rail={rail} />}
             </Fragment>
           );
         }
         // With an app open under Apps the most specific row carries the accent;
         // the parent stays current for assistive tech only.
-        const parent = here && currentApp !== null;
         const open = prefs.appsOpen;
+        const parent = here && currentApp !== null && open && !rail;
         return (
-          <Fragment key={item.screen}>
+          <div key={item.screen} className="navgroup">
             <div className="navrow">
               <Link
                 href={navHref(item.route)}
                 onClick={onNavigate}
                 className="navlink"
+                data-rail-label={currentApp && here ? `${t(item.label)} · ${currentApp.title}` : t(item.label)}
+                aria-label={rail ? (currentApp && here ? `${t(item.label)} · ${currentApp.title}` : t(item.label)) : undefined}
                 aria-current={here ? (parent ? "true" : "page") : undefined}
                 data-parent-current={parent ? "" : undefined}
               >
                 {NAV_ICONS[item.screen]}
-                {t(item.label)}
+                <span className="navlabel">{t(item.label)}</span>
               </Link>
               <Disclosure
                 open={open}
                 controls={foldId}
                 label={t(open ? "Collapse apps" : "Expand apps")}
+                hidden={rail}
                 onToggle={() => updateSidebarPrefs((p) => ({ ...p, appsOpen: !p.appsOpen }))}
               />
             </div>
-            {appMenu?.notice && <AppNotice notice={appMenu.notice} />}
-            {/* Folded on an app screen: the open app keeps one row, so the sidebar still says where you are. */}
-            {!open && here && currentApp !== null && (
-              <div className="navtree">
-                <Link href={currentApp.href} onClick={onNavigate} className="navlink navlink-sub" title={currentApp.title} aria-current="page">
-                  <span className="truncate">{currentApp.title}</span>
-                </Link>
-              </div>
-            )}
-            <Fold id={foldId} open={open}>
+            {appMenu?.notice && <AppNotice notice={appMenu.notice} rail={rail} />}
+            {/* The Apps parent is current while the tree is folded or the rail is compact. */}
+            <Fold id={foldId} open={open && !rail}>
               <div className="navtree">
                 {apps.map((app) => {
-                  const sectionsOpen = !prefs.closedApps.includes(app.installId);
+                  const sectionsOpen = prefs.openApps.includes(app.installId);
                   const sectionsId = `${foldId}-${app.installId}`;
                   return (
-                    <Fragment key={app.installId}>
+                    <div key={app.installId} className="navgroup">
                       <div className="navrow">
                         <Link
                           href={app.href}
                           onClick={onNavigate}
-                          // CAD-1137: hover/focus warms the app's snapshot so
-                          // opening it paints the last data at once.
-                          onMouseEnter={() => prefetchWorkspaceApp(app.installId)}
-                          onFocus={() => prefetchWorkspaceApp(app.installId)}
+                          // CAD-1137 / CAD-2534: hover/focus warms the app's scope or legacy snapshot.
+                          onMouseEnter={() => prefetchApp(app)}
+                          onFocus={() => prefetchApp(app)}
                           className="navlink navlink-sub"
                           title={app.title}
                           aria-current={here && app.current ? (app.sections ? "true" : "page") : undefined}
                           data-parent-current={here && app.current && app.sections ? "" : undefined}
                         >
+                          <AppGlyph name={app.kind ?? app.installId} title={app.title} size="xs" />
                           <span className="truncate">{app.title}</span>
                           {assistantUnread.has(app.installId) && (
                             <span className="navdot" role="img" aria-label={t("New assistant reply")} />
@@ -162,25 +184,26 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                             open={sectionsOpen}
                             controls={sectionsId}
                             label={`${t(sectionsOpen ? "Collapse" : "Expand")} ${app.title} ${t("sections")}`}
+                            hidden={rail}
                             onToggle={() => updateSidebarPrefs((p) => ({
                               ...p,
-                              closedApps: p.closedApps.includes(app.installId)
-                                ? p.closedApps.filter((id) => id !== app.installId)
-                                : [...p.closedApps, app.installId],
+                              openApps: p.openApps.includes(app.installId)
+                                ? p.openApps.filter((id) => id !== app.installId)
+                                : [...p.openApps, app.installId],
                             }))}
                           />
                         )}
                       </div>
                       {app.sections && (
-                        <Fold id={sectionsId} open={sectionsOpen}>
+                        <Fold id={sectionsId} open={sectionsOpen && !rail}>
                           <nav aria-label={`${app.title} ${t("sections")}`} className="navtree">
                             {app.sections.map((s) => (
                               <Link
                                 key={s.label}
                                 href={s.href}
                                 onClick={onNavigate}
-                                onMouseEnter={() => prefetchWorkspaceApp(app.installId)}
-                                onFocus={() => prefetchWorkspaceApp(app.installId)}
+                                onMouseEnter={() => prefetchApp(app)}
+                                onFocus={() => prefetchApp(app)}
                                 className="navlink navlink-sub"
                                 aria-current={s.current && app.current ? "page" : undefined}
                               >
@@ -190,20 +213,24 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                           </nav>
                         </Fold>
                       )}
-                    </Fragment>
+                    </div>
                   );
                 })}
               </div>
             </Fold>
-          </Fragment>
+          </div>
         );
       })}
     </nav>
   );
 }
 
-function AppNotice({ notice }: { notice: NonNullable<AppNav["notice"]> }) {
+function AppNotice({ notice, rail = false }: { notice: NonNullable<AppNav["notice"]>; rail?: boolean }) {
   const { t } = useLocale();
+  if (rail) {
+    const label = `${t(notice.text)}${notice.retrying ? "" : ` · ${t("Retry")}`}`;
+    return <div role="status" className="rail-notice">{notice.retrying ? <span aria-label={label}>!</span> : <button type="button" aria-label={label} data-rail-label={label} onClick={notice.onRetry}>!</button>}</div>;
+  }
   return (
     <div role="status" className="ml-[10px] border-l border-ink-700 pl-[6px] py-[3px] text-label text-ink-400">
       {t(notice.text)}{" "}
@@ -236,7 +263,7 @@ export function ProjectsSection(props: ProjectListProps) {
           <IconCaret size={10} />
           {t("Projects")}
         </button>
-        <span className="num text-[10px] text-ink-500">{projectsOpen ? "~/pm" : props.projects.length}</span>
+        <span className="num text-[10px] text-ink-500">{projectsOpen && !props.hosted ? "~/pm" : props.projects.length}</span>
       </div>
       <Fold id={listId} open={projectsOpen}>
         <ProjectList {...props} />
@@ -253,6 +280,8 @@ interface ProjectListProps {
   /** Counts derive from the cards (counts.ts), not `/api/projects`. */
   issues: ResourceState<IssueCard[]>;
   projectsError?: string | null;
+  /** Hosted workspaces hide the local `~/pm` filesystem path hint. */
+  hosted?: boolean;
   onNavigate?: () => void;
 }
 
@@ -298,6 +327,7 @@ export function ProjectList({ project, projectHref, projects, issues, projectsEr
           onClick={onNavigate}
           className={`proj ${project === p.key ? "on" : ""}`}
           aria-current={project === p.key ? "page" : undefined}
+          title={p.key}
         >
           <span className="truncate">{p.key}</span>
           <span className="proj-prefix num">{p.prefix}</span>

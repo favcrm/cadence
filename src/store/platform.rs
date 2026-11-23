@@ -169,6 +169,21 @@ fn scopes_json(scopes: &[String]) -> Result<String> {
     Ok(serde_json::to_string(scopes)?)
 }
 
+/// CAD-1085: the stable agent UID a grant belongs to, resolved from the
+/// agent's durable identity inside the SAME authorizing transaction. A new
+/// writer never leaves the column stale; an unknown/legacy alias stamps NULL,
+/// and a NULL-UID grant never authorizes protected use.
+fn stamp_agent_uid(tx: &impl super::StoreConn, agent: &str) -> Result<Option<String>> {
+    let uid: Option<Option<String>> = tx
+        .query_row(
+            "SELECT uid FROM agents WHERE alias=?1",
+            params![agent],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(uid.flatten())
+}
+
 fn scopes_of(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
@@ -403,10 +418,11 @@ fn apply_derived(
         if scopes.is_empty() {
             continue;
         }
+        let agent_uid = stamp_agent_uid(tx, agent)?;
         tx.execute(
             "INSERT OR REPLACE INTO app_grants
-             (app, agent, platform, account, scopes, granted_at, by, install_id)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+             (app, agent, platform, account, scopes, granted_at, by, install_id, agent_uid)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 app,
                 agent,
@@ -415,7 +431,8 @@ fn apply_derived(
                 scopes_json(&scopes)?,
                 now(),
                 by,
-                install_id
+                install_id,
+                agent_uid,
             ],
         )?;
         let existing: Option<Grant> = tx
@@ -440,9 +457,17 @@ fn apply_derived(
         };
         tx.execute(
             "INSERT OR REPLACE INTO platform_grants
-             (agent, platform, account, scopes, granted_at, by)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![agent, platform, account, scopes_json(&merged)?, now(), by],
+             (agent, platform, account, scopes, granted_at, by, agent_uid)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                agent,
+                platform,
+                account,
+                scopes_json(&merged)?,
+                now(),
+                by,
+                agent_uid
+            ],
         )?;
         Store::event(
             tx,
@@ -907,10 +932,11 @@ impl Store {
                 granted_at: existing.as_ref().map_or(now(), |g| g.granted_at),
                 by: by.to_string(),
             };
+            let agent_uid = stamp_agent_uid(tx, agent)?;
             tx.execute(
                 "INSERT OR REPLACE INTO platform_grants
-                         (agent, platform, account, scopes, granted_at, by)
-                         VALUES(?1,?2,?3,?4,?5,?6)",
+                         (agent, platform, account, scopes, granted_at, by, agent_uid)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     grant.agent,
                     grant.platform,
@@ -918,6 +944,7 @@ impl Store {
                     scopes_json(&grant.scopes)?,
                     grant.granted_at,
                     grant.by,
+                    agent_uid,
                 ],
             )?;
             // Audit names the scopes this call added, not the merged set.

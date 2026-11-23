@@ -1,8 +1,8 @@
-import { useContext, useEffect, useRef, useState } from "react";
+import { useContext, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { IconClose } from "../../ui/icons";
 import Button from "../../ui/Button";
+import DrawerShell from "../app-shell/shared/DrawerShell";
 import { HireBlock } from "../auth/WriteGate";
 import { useTranslate } from "../../lib/locale";
 import { buildBody } from "./agentSetup";
@@ -16,7 +16,6 @@ export default function NewAgentDialog({
 }) {
   const t = useTranslate();
   const hireBlock = useContext(HireBlock);
-  const dialogRef = useRef<HTMLDialogElement>(null);
   const [alias, setAlias] = useState("");
   const [provider, setProvider] = useState("");
   const [endpointKind, setEndpointKind] = useState("");
@@ -28,19 +27,6 @@ export default function NewAgentDialog({
   const [cwd, setCwd] = useState("");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    const trigger = document.activeElement;
-    const overflow = document.body.style.overflow;
-    dialog?.showModal();
-    document.body.style.overflow = "hidden";
-    return () => {
-      dialog?.close();
-      document.body.style.overflow = overflow;
-      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus();
-    };
-  }, []);
 
   const save = async () => {
     if (hireBlock !== null || saving) return;
@@ -74,35 +60,46 @@ export default function NewAgentDialog({
   };
 
   return (
-    <dialog
-      ref={dialogRef}
-      className="agents-drawer bg-ink-875 border-l border-ink-700 text-ink-200"
-      aria-labelledby="new-agent-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
+    <DrawerShell
+      kind="new-agent"
+      scrim="board"
+      modal
+      trapFocus
+      size="md"
+      preventClose={saving}
+      label={t("New agent")}
+      title={t("New agent")}
+      onClose={onClose}
+      foot={
+        <>
+          <div className="s-drawer-actions crm-drawer-actions">
+            <Button variant="ghost" size="sm" onClick={onClose} disabled={saving}>
+              {t("Cancel")}
+            </Button>
+            <button
+              type="submit"
+              form="new-agent-form"
+              className="btn btn-sm btn-primary"
+              disabled={hireBlock !== null || saving}
+              aria-busy={saving || undefined}
+              title={hireBlock ?? undefined}
+            >
+              {saving && <span className="btn-spin" aria-hidden="true" />}
+              <span className="btn-label">{saving ? t("Saving…") : t("Create agent")}</span>
+            </button>
+          </div>
+          {hireBlock && <span className="s-drawer-note crm-drawer-note">{hireBlock}</span>}
+        </>
+      }
     >
       <form
-        className="flex flex-col gap-4 p-5"
+        id="new-agent-form"
+        className="agents-drawer-body flex flex-col gap-4"
         onSubmit={(event) => {
           event.preventDefault();
           void save();
         }}
       >
-        <div className="flex items-center justify-between gap-3">
-          <h2 id="new-agent-title" className="text-section font-semibold text-ink-100">
-            {t("New agent")}
-          </h2>
-          <Button
-            variant="ghost"
-            size="sm"
-            icon={<IconClose />}
-            aria-label={t("Close")}
-            onClick={onClose}
-          />
-        </div>
-
         <label className="field-control">
           <span className="slabel">{t("Alias")}</span>
           <input className="field" value={alias} onChange={(event) => setAlias(event.target.value)} />
@@ -147,17 +144,7 @@ export default function NewAgentDialog({
             {err}
           </p>
         )}
-        {hireBlock && <p className="text-label text-ink-500">{hireBlock}</p>}
-
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            {t("Cancel")}
-          </Button>
-          <Button type="submit" variant="primary" size="sm" disabled={hireBlock !== null || saving} title={hireBlock ?? undefined}>
-            {saving ? t("Saving…") : t("Create agent")}
-          </Button>
-        </div>
       </form>
-    </dialog>
+    </DrawerShell>
   );
 }

@@ -1,0 +1,42 @@
+name: review-dispatch
+
+# CAD-2194: start the two review workflows for a ready PR on main, so nobody has to
+# dispatch them by hand. pull_request_target runs this file from main, never the PR's
+# copy, and it can hold a token for a fork's PR, so this file stays small: no checkout,
+# no PR text, and no value from the event in a shell except through env. It passes only
+# the PR's number and head SHA. The review workflows check those again and keep their
+# own isolation. It is not a required check: a run that fails here costs a manual
+# dispatch, and the gate's refusal names the commands.
+#
+# A draft starts nothing, so iterate in draft: each push to a ready PR buys two reviews.
+# Reopened is left out because the board keeps the first row per head, so a second run
+# at the same head would pay for a model call and file nothing.
+on:
+  pull_request_target:
+    types: [opened, ready_for_review, synchronize]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: >-
+      github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.base.ref == 'main'
+      && github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start both review workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          for workflow in review-standards.yml review-spec.yml; do
+            gh workflow run "$workflow" --ref main -f pr="$PR" -f head_sha="$HEAD_SHA"
+          done

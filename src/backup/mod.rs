@@ -99,6 +99,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::printed_command::{path_arg, shown};
 use crate::rollout::{db_file, SCHEMA_VERSION};
 use crate::secret::{self, Allowlist, Severity};
 
@@ -108,32 +109,18 @@ pub mod portable_fence;
 pub mod portable_replace;
 
 #[cfg(test)]
-mod portable_acceptance;
-
-#[cfg(test)]
-mod cad1365_media_catalog_acceptance;
-
-#[cfg(test)]
-mod cad1554_foreign_key_acceptance;
-
-#[cfg(test)]
-mod cad1559_config_acceptance;
-
-#[cfg(test)]
-mod cad914_transfer_catalog_acceptance;
-
-#[cfg(test)]
 mod portable_selftest;
 
 #[cfg(test)]
 mod portable_activate_selftest;
 
+#[cfg(all(test, feature = "test-seam"))]
+mod cad2215_portable_cursor_acceptance;
+
 mod namespace;
 use namespace::ArtifactDir;
 #[cfg(test)]
 mod artifact4;
-#[cfg(test)]
-mod cad1128_portable_custody_acceptance;
 #[cfg(test)]
 mod tests;
 
@@ -2082,7 +2069,8 @@ pub fn interrupted_restore_leftovers(state_dir: &Path) -> Vec<PathBuf> {
 /// files exist. The daemon checks this before anything opens or creates
 /// `cadence.sqlite3`: a daemon started over them would build a fresh,
 /// empty store next to the previous one. The error names every leftover
-/// and the `mv` that recovers each case. CAD-767: record-file asides in
+/// and the `mv` that recovers each case, or the steps in words when those
+/// paths cannot be printed as safe commands. CAD-767: record-file asides in
 /// `app-records/` refuse the same way — each is put back into its own
 /// directory, never the state-dir root.
 pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
@@ -2090,7 +2078,31 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
     if leftovers.is_empty() {
         return Ok(());
     }
-    let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
+    // Each command names these paths, so all of them must be printable. The restored
+    // target has the leftover's own directory and a shorter name of the same file.
+    let aside_dir = default_dir(state_dir);
+    let printable = std::iter::once(aside_dir.as_path())
+        .chain(leftovers.iter().map(PathBuf::as_path))
+        .all(|p| path_arg(p).is_some());
+    if !printable {
+        return Err(Error::rejected(format!(
+            "an interrupted restore left {} in {}; refusing to open the store there. These \
+             paths cannot be printed as safe commands, so recover by hand. If {} exists and is \
+             the store you restored, move these files out of the state dir. If it is not, move \
+             it and its -wal/-shm out first, then rename each `.replaced-` file back to the name \
+             before that suffix. Remove any `.orphaned-` file after inspection; those are not \
+             previous files. Then start the daemon again",
+            leftovers
+                .iter()
+                .map(|p| shown(p))
+                .collect::<Vec<_>>()
+                .join(", "),
+            shown(state_dir),
+            shown(&db_file(state_dir)),
+        )));
+    }
+    // Unreachable after the check above, and harmless if that ever changes.
+    let quote = |p: &Path| path_arg(p).unwrap_or_else(|| "VALUE_1".to_string());
     let is_orphan = |p: &&PathBuf| {
         p.file_name()
             .unwrap_or_default()
@@ -2127,18 +2139,17 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
     };
     let listed = leftovers
         .iter()
-        .map(|p| p.display().to_string())
+        .map(|p| shown(p))
         .collect::<Vec<_>>()
         .join(", ");
     let live = db_file(state_dir);
     let recovery = if live.exists() {
-        let aside_dir = default_dir(state_dir);
         let mut s = if put_back.is_empty() {
             format!(
                 "{live} exists too. If it is not the store you restored (for \
                  example an empty store created after the interruption), move {live} and its \
                  -wal/-shm out of the state dir first",
-                live = live.display(),
+                live = shown(&live),
             )
         } else {
             format!(
@@ -2146,7 +2157,7 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
                  out of the state dir: mkdir -p {dir} && mv {files} {dir}. If it is not (for \
                  example an empty store created after the interruption), move {live} and its \
                  -wal/-shm out of the state dir first, then put the previous store back: {put_back}",
-                live = live.display(),
+                live = shown(&live),
                 dir = quote(&aside_dir),
                 files = leftovers
                     .iter()
@@ -2176,7 +2187,7 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
     Err(Error::rejected(format!(
         "an interrupted restore left {listed} in {}; refusing to open the store there. \
          {recovery}. Then start the daemon again",
-        state_dir.display()
+        shown(state_dir)
     )))
 }
 

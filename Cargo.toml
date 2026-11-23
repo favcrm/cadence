@@ -1,27 +1,20 @@
 [package]
 name = "cadence-agent"
-version = "0.3.2"
+version = "0.5.2"
 edition = "2021"
-# CAD-1727: `tests/*.rs` are modules of the one `suite` target below, not
-# one linked executable each. 109 executables cost 15.74 GiB per lane and
-# every `src/` change relinked all of them; sccache cannot cache `test`
-# crates (only rlib/metadata outputs). nextest still runs each test in its
-# own process, so isolation and suite-lock rules are unchanged.
+autobins = false
 autotests = false
 license = "MIT"
 description = "Local controller coordinating coding agents across terminals"
 
 [workspace]
-members = ["crates/cadence-core"]
+members = [".", "crates/cadence-core", "crates/cadence-ui", "crates/cadence-cli"]
+default-members = [".", "crates/cadence-ui", "crates/cadence-cli"]
 resolver = "2"
 
 [lib]
 name = "cadence_agent"
 path = "src/lib.rs"
-
-[[bin]]
-name = "cadence"
-path = "src/main.rs"
 
 # CAD-512 / ADR 0007 §5 L1: the setuid-root drop helper. Self-contained
 # (std + libc, no cadence_agent link) so its audit surface stays small;
@@ -44,6 +37,16 @@ path = "src/bin/cadence-installer-client/main.rs"
 name = "cadence-installer-observer"
 path = "src/bin/cadence-installer-observer/main.rs"
 
+# CAD-1085: separately provisioned root runtime owner; never an agent executor.
+[[bin]]
+name = "cadence-runtime-owner"
+path = "src/bin/cadence-runtime-owner/main.rs"
+
+# CAD-2721: keep the required CI check's entry point under protected tests/**.
+[[example]]
+name = "board_assertion_fixture"
+path = "tests/fixtures/agenticos/board_assertion_fixture.rs"
+
 [features]
 # Embed the built `ui/` SPA into the binary. Requires `bun run build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves
@@ -54,6 +57,14 @@ ui = []
 # and review tests can inject proc roots. The compile_error! in
 # src/test_seam.rs keeps these seams out of every release build.
 test-seam = []
+# CAD-1159 SEC-002: admit an owner-elected PUBLIC fixture image-verification
+# root into a separately labelled debug/test-seam constructor artifact. Opt-in
+# only, never a default: the compile_error! in src/test_seam.rs refuses every
+# combination other than debug_assertions + test-seam + this feature, and
+# build.rs admits only the fixed private descriptor
+# .cadence/native-fixture-public-root-v1.txt — no env/argv/request key path.
+native-fixture-admission = []
+
 # CAD-1568: manual cross-repository CLI/runtime acceptance. The ignored
 # packaged-CLI scenario drives a `cargo build --features test-seam` binary
 # against real AOS test handlers; never part of ordinary `cargo test`.
@@ -62,70 +73,14 @@ cli-runtime-test = ["test-seam"]
 # CAD-1727: the one integration-test binary; the remaining `tests/*.rs`
 # files are its modules. cad1703 keeps its `#![cfg(feature = "test-seam")]`
 # gate as a module attribute, so no required-features entry is needed.
-[[test]]
-name = "suite"
-path = "tests/suite.rs"
 
 # CAD-1727: these checks re-exec `current_exe()` with `--exact <fn>`; the
 # child filter only matches an unprefixed test name, which a module of
 # `suite` no longer has. Keep each as its own declared target instead of
 # editing acceptance checks written by reviewers.
-[[test]]
-name = "cad1065_operator_gate"
-path = "tests/cad1065_operator_gate.rs"
-[[test]]
-name = "cad1158_lease_off_smtp_refusal"
-path = "tests/cad1158_lease_off_smtp_refusal.rs"
-[[test]]
-name = "cad1158_smtp_startup"
-path = "tests/cad1158_smtp_startup.rs"
-[[test]]
-name = "cad1191_concurrent_start_acceptance"
-path = "tests/cad1191_concurrent_start_acceptance.rs"
-[[test]]
-name = "cad1196_finish_host_acceptance"
-path = "tests/cad1196_finish_host_acceptance.rs"
-[[test]]
-name = "cad1210_test_binary_guard_acceptance"
-path = "tests/cad1210_test_binary_guard_acceptance.rs"
-[[test]]
-name = "cad1236_host_requirements_acceptance"
-path = "tests/cad1236_host_requirements_acceptance.rs"
-[[test]]
-name = "cad1244_builtin_upgrade_acceptance"
-path = "tests/cad1244_builtin_upgrade_acceptance.rs"
-[[test]]
-name = "cad1425_client_update_refusal_acceptance"
-path = "tests/cad1425_client_update_refusal_acceptance.rs"
-[[test]]
-name = "cad1377_reconcile_acceptance"
-path = "tests/cad1377_reconcile_acceptance.rs"
-[[test]]
-name = "cad1508_binding_carry_acceptance"
-path = "tests/cad1508_binding_carry_acceptance.rs"
-[[test]]
-name = "cad1534_lane_base_acceptance"
-path = "tests/cad1534_lane_base_acceptance.rs"
-[[test]]
-name = "cad1676_seat_dispatch_acceptance"
-path = "tests/cad1676_seat_dispatch_acceptance.rs"
-[[test]]
-name = "cad848_deletion_refusal"
-path = "tests/cad848_deletion_refusal.rs"
-[[test]]
-name = "cad848_reclaim_enumeration_refusal"
-path = "tests/cad848_reclaim_enumeration_refusal.rs"
-# CAD-1739: the hosted app acceptance needs the caller-identity seam. Without
-# the entry `autotests = false` hides the file from `scripts/result-test-args`,
-# and without `required-features` a default `cargo test` lane would link a
-# target whose guard body only panics.
-[[test]]
-name = "cad1739_hosted_app_public_acceptance"
-path = "tests/cad1739_hosted_app_public_acceptance.rs"
-required-features = ["test-seam"]
 
 [dependencies]
-cadence-core = { path = "crates/cadence-core" }
+cadence-core = { path = "crates/cadence-core", features = ["custody-crypto"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 # Frozen app/agent identity receipts must survive production JSON reads.
@@ -181,11 +136,13 @@ p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
 # introduced for custody.
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+roxmltree = "=0.21.2"
 
 # CAD-1073: the legacy e2e target was retired with the suite; the
 # safety-floor binary in tests/ is autodiscovered and needs no entry.
 
 [dev-dependencies]
+cadence-ui = { path = "crates/cadence-ui" }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 jsonschema = { version = "=0.56.0", default-features = false }
 shlex = "2.0.1"
@@ -205,10 +162,23 @@ incremental = false
 # file:line while cutting that to ~3.2 GB and ~3.0 GB.
 debug = "line-tables-only"
 
+# CAD-1684: dependency debuginfo is not needed for this crate's own panic
+# and backtrace lines. Disable it for every non-workspace package; the
+# workspace crates (cadence-agent and cadence-core) keep the line tables
+# above, so panic locations and backtraces through our code still carry
+# file:line. `"*"` never matches a workspace member, and this setting is
+# part of the dependency fingerprint — hence the gate-test/gate-clippy/
+# cross-dual epoch bump in ci.yml.
+[profile.dev.package."*"]
+debug = false
+
 # CAD-1367: cached dependencies run faster in image-heavy acceptance tests.
 # Keep the workspace crate at O0 and retain test debug assertions.
+# CAD-1684: `test` inherits `dev`'s line tables for the workspace crate;
+# dependencies get no debuginfo here either, matching the dev profile.
 [profile.test.package."*"]
 opt-level = 1
+debug = false
 
 # CAD-1103: PR/merge-queue gate profile. Used ONLY by the ci.yml `build` and
 # `ui` jobs, which prove "compiles, links, no test seam, migration rehearsal",
@@ -226,4 +196,10 @@ lto = false
 # Dependencies keep opt-level 1; the one workspace crate is front-end bound,
 # so skipping its LLVM optimisation is the cheap win (CAD-1103 measurements).
 [profile.ci.package.cadence-agent]
+opt-level = 0
+
+[profile.ci.package.cadence-ui]
+opt-level = 0
+
+[profile.ci.package.cadence-cli]
 opt-level = 0

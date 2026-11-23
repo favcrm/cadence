@@ -150,6 +150,18 @@ impl Shared {
                 // A `done` issue's unrecorded PR is the operator's to
                 // wonder at, not a lane to staff.
                 None if rep.pr.is_some() && rep.sha.is_some() && rep.status != "done" => {
+                    // CAD-2215: no exact native dispatch receipt names
+                    // this report, so it cannot be promoted to ordinary.
+                    // A legacy candidate is admitted once as operator
+                    // recovery evidence; alias and file name prove nothing.
+                    if delivery::legacy_for_issue(&records, &rep.issue).is_some() {
+                        return Ok((
+                            Outcome::Leave,
+                            "an unverified delivery candidate waits on the operator — \
+                             nothing was routed"
+                                .to_string(),
+                        ));
+                    }
                     return self.adopt_and_route(agent, rep);
                 }
                 None => {}
@@ -207,16 +219,20 @@ impl Shared {
         Ok(None)
     }
 
-    /// A lane the master never dispatched still earned its review:
-    /// the record opens at the done report's own time — the report
-    /// predates the loop — then the routing pass runs.
+    /// A lane the master never dispatched used to be adopted into the
+    /// review loop from its done report. CAD-2215 removed that: a report
+    /// file's `agent:` and name are not provenance, so the candidate is
+    /// recorded for operator recovery and nothing is routed.
     fn adopt_and_route(
         self: &Arc<Self>,
         agent: &Agent,
         rep: &DoneRef,
     ) -> Result<(Outcome, String)> {
-        self.delivery_adopt(&rep.issue, &rep.project, &agent.alias, rep.at)?;
-        self.route_now(&rep.issue)
+        self.delivery_adopt(&rep.issue, &rep.project, &agent.alias, rep.at, &rep.name)?;
+        Ok((
+            Outcome::Leave,
+            "no exact native dispatch receipt — recorded for operator recovery only".to_string(),
+        ))
     }
 
     /// Route the record's outstanding done report now and answer with
@@ -276,6 +292,9 @@ impl Shared {
                 Outcome::Leave,
                 "delivery changed before repair; recheck its current state".to_string(),
             ));
+        }
+        if let Err(error) = self.require_ordinary(&*r, "a fix turn") {
+            return Ok((Outcome::Leave, error.to_string()));
         }
         let head = r.head.as_deref().unwrap_or_default();
         let applicable = if revise {
@@ -626,8 +645,15 @@ impl Shared {
                 format!("{id}'s kickoff is already in flight — nothing sent twice"),
             ));
         }
-        if let Err(e) = self.delivery_start(id, project, &agent.alias) {
-            tracing::warn!("delivery record for {id}: {e}");
+        match out["message"].as_str().filter(|m| !m.is_empty()) {
+            Some(message) => {
+                if let Err(e) = self.delivery_start(id, project, &agent.alias, message) {
+                    tracing::warn!("delivery record for {id}: {e}");
+                }
+            }
+            None => tracing::warn!(
+                "delivery record for {id}: the dispatch answered no accepted message id"
+            ),
         }
         let _ = self.store.event_public(
             DAEMON_ALIAS,
@@ -692,11 +718,15 @@ mod tests {
         let s = Shared::new(
             dir.path(),
             &ServeOptions {
-                checkup_dispatch: Some(Arc::new(move |_s, _pm, id, to| {
+                checkup_dispatch: Some(Arc::new(move |s, _pm, id, to| {
                     seen.lock().unwrap().push((id.to_string(), to.to_string()));
+                    // The kickoff row a real dispatch leaves behind, so the
+                    // loop's record can stand on it (CAD-2215).
+                    let kickoff = format!("d-{}", id.to_lowercase());
+                    dispatch_row(s, id, to, &kickoff);
                     Ok(json!({
-                        "dispatched": format!("d-{id}"),
-                        "message": format!("d-{id}"),
+                        "dispatched": kickoff,
+                        "message": kickoff,
                     }))
                 })),
                 ..ServeOptions::default()
@@ -838,10 +868,43 @@ mod tests {
         name
     }
 
-    /// Plant a delivery record, mutated by `edit`.
+    /// CAD-2215: an ordinary record stands on the exact native dispatch row
+    /// it names. Store the row `dispatch_send` writes for a plain issue
+    /// kickoff: source `dispatch`, no task, the ticket, the worker's lane and
+    /// an operator sender.
+    fn dispatch_row(s: &Shared, issue: &str, to: &str, id: &str) {
+        s.store
+            .enqueue_steered(
+                to,
+                &format!("kickoff {issue}"),
+                None,
+                id,
+                "dispatch",
+                None,
+                Some(issue),
+                Some("/tmp/cad2215-lane"),
+                &crate::store::Sender::Operator,
+                &crate::store::Steer::NONE,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    /// Plant a delivery record, mutated by `edit`. Its dispatch row is
+    /// stored and already worked, so the lane stays idle.
     fn record(s: &Arc<Shared>, id: &str, edit: impl FnOnce(&mut Record)) {
+        dispatch_row(s, id, "w1", "m-test");
+        let Take::Message(kickoff) = s.store.take_queued("w1").unwrap() else {
+            panic!("the planted kickoff must be taken");
+        };
+        assert_eq!(kickoff.id, "m-test", "the lane held another turn first");
+        s.store
+            .finish(&kickoff, "completed", &json!({}), None)
+            .unwrap();
         let mut all = delivery::load(&s.state_dir).unwrap();
-        let mut r = Record::new(id, "tst", "w1", 1);
+        let mut r = Record::new_ordinary(id, "tst", "w1", 1, "m-test");
         edit(&mut r);
         all.insert(id.to_string(), r);
         delivery::save(&s.state_dir, &all).unwrap();
@@ -1201,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecorded_done_report_is_adopted_and_routed() {
+    fn an_unrecorded_done_report_is_kept_for_operator_recovery_only() {
         let (_d, s, calls) = shared();
         worker(&s, "w1", "fake");
         staff(&s, "r1", "fake", "reviewer", "idle", None, None);
@@ -1210,7 +1273,7 @@ mod tests {
         s.provider_env
             .set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
         issue(pm.path(), "TST-1", "doing", "");
-        done_report(
+        let name = done_report(
             pm.path(),
             "TST-1",
             1_700_000_000,
@@ -1219,11 +1282,17 @@ mod tests {
             Some(PR1),
         );
 
+        // CAD-2215: a done report with no native dispatch receipt is kept
+        // for operator recovery only — recorded under its legacy key and
+        // never routed to a reviewer.
         s.checkup_tick();
-        assert_eq!(outcomes(&s, "w1"), ["review"]);
-        let rec = &records(&s)["TST-1"];
-        assert_eq!(rec.state, State::Reviewing);
-        assert_eq!(rec.reviewer.as_deref(), Some("r1"));
+        assert_eq!(outcomes(&s, "w1"), ["leave"]);
+        let all = records(&s);
+        assert!(!all.contains_key("TST-1"), "{all:?}");
+        let legacy = &all[&delivery::legacy_key("TST-1", &name)];
+        assert!(!legacy.origin.is_verified_ordinary());
+        assert!(legacy.reviewer.is_none());
+        assert!(s.store.queued_head("r1").unwrap().is_none());
         assert!(calls.lock().unwrap().is_empty());
     }
 

@@ -340,7 +340,18 @@ fn cad692_actual_v22_migration_is_atomic_and_preserves_context_and_legacy_receip
     drop(s);
     let db = dir.path().join("t.sqlite3");
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch("DROP TABLE app_effect_authorizations; DROP TABLE IF EXISTS app_bindings; ALTER TABLE platform_effects DROP COLUMN authorization_kind; UPDATE schema_version SET version=22;").unwrap();
+    // A genuine v22 store carries none of the CAD-1085 dispatch triggers;
+    // drop them before the downgrade so the fixture is faithful and the
+    // ALTER is not blocked by a trigger naming the dropped column.
+    conn.execute_batch(
+        "DROP TABLE app_effect_authorizations; DROP TABLE IF EXISTS app_bindings; \
+         DROP TRIGGER IF EXISTS cad1085_platform_effects_insert; \
+         DROP TRIGGER IF EXISTS cad1085_platform_effects_update; \
+         DROP TRIGGER IF EXISTS cad1085_platform_effects_delete; \
+         ALTER TABLE platform_effects DROP COLUMN authorization_kind; \
+         UPDATE schema_version SET version=22;",
+    )
+    .unwrap();
     conn.execute_batch("CREATE TRIGGER fail_release_migration BEFORE UPDATE ON schema_version BEGIN SELECT RAISE(ABORT,'forced release migration failure'); END;").unwrap();
     drop(conn);
     assert!(Store::open_for_schema_tests(&db).is_err());

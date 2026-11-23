@@ -12,7 +12,7 @@
 //! state, revision CAS, idempotency, nonces and audit stay host-side: the
 //! host passes the state it has already proven, and no caller-shaped proof
 //! flag can reach these functions.
-use crate::material::material;
+use crate::connection_dispatch::canonical::{canonical_bytes, APP_MATERIAL_DOMAIN};
 use serde_json::{json, Map, Value};
 
 /// Longest title in UTF-8 bytes.
@@ -134,6 +134,13 @@ fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, Violation> 
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid("invalid", format!("{key} is required")))
+}
+
+/// The exact string a material digest covers: the app-material domain line
+/// and the canonical JSON. Hosts apply SHA-256 to these UTF-8 bytes.
+fn material(value: &Value) -> String {
+    String::from_utf8(canonical_bytes(APP_MATERIAL_DOMAIN, value))
+        .expect("canonical JSON is UTF-8")
 }
 
 /// The material a revision's `contentDigest` covers.

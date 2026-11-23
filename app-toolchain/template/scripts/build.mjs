@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(here, "..");
+const root = process.argv[2] ? path.resolve(process.argv[2]) : path.resolve(here, "..");
 const appRoot = path.join(root, "app");
 const out = path.join(appRoot, "screens/main");
 
@@ -25,11 +25,16 @@ if (!appKit) {
 const manifest = readFileSync(path.join(appRoot, "app.md"), "utf8");
 const app = manifest.match(/^app:\s*(\S+)\s*$/m)?.[1];
 if (!app) throw new Error("build: app.md has no app id");
+const packageConfig = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+const screen = packageConfig.cadence?.screen ?? { host_contract: "screen-actions.v1", may: [] };
+if (!screen || typeof screen !== "object" || Array.isArray(screen) ||
+    Object.keys(screen).some((key) => !["host_contract", "may", "operations", "tools"].includes(key)))
+  throw new Error("build: invalid cadence.screen declaration");
 
-function digest(files) {
+function digest(files, base = root) {
   const hash = createHash("sha256");
   for (const file of files) {
-    hash.update(path.relative(root, file));
+    hash.update(path.relative(base, file).split(path.sep).join("/"));
     hash.update("\0");
     hash.update(readFileSync(file));
   }
@@ -41,14 +46,17 @@ const provenance = {
     path.join(root, "src/main.js"),
     path.join(root, "src/styles.css"),
     path.join(appRoot, "app.md"),
-    path.join(appRoot, "workflows/hello.md"),
+    ...(existsSync(path.join(appRoot, "workflows")) ? readdirSync(path.join(appRoot, "workflows"))
+      .filter((name) => name.endsWith(".md")).sort().map((name) => path.join(appRoot, "workflows", name)) : []),
   ]),
   sdk_digest: digest([
     path.join(appKit, "src/index.mjs"),
     path.join(appKit, "src/receiver.mjs"),
     path.join(appKit, "src/refusal.mjs"),
-  ]),
-  toolchain_digest: digest([path.join(root, "package.json"), path.join(root, "scripts/build.mjs")]),
+    path.join(appKit, "src/forms.mjs"),
+    path.join(appKit, "src/react.mjs"),
+  ], appKit),
+  toolchain_digest: digest([path.join(root, "package.json"), fileURLToPath(import.meta.url)]),
 };
 
 rmSync(out, { recursive: true, force: true });
@@ -67,6 +75,9 @@ const result = await Bun.build({
       setup(build) {
         build.onResolve({ filter: /^@cadence\/app-kit$/ }, () => ({
           path: path.join(appKit, "src/index.mjs"),
+        }));
+        build.onResolve({ filter: /^@cadence\/app-kit\/react$/ }, () => ({
+          path: path.join(appKit, "src/react.mjs"),
         }));
       },
     },
@@ -93,7 +104,7 @@ const assets = ["client.js", "styles.css"].map((name) => {
 writeFileSync(
   path.join(out, "screens.json"),
   `${JSON.stringify(
-    { contract: "app-screens/v2", app, entry: "client.js", assets, provenance, host_contract: "screen-actions.v1", may: [] },
+    { contract: "app-screens/v2", app, entry: "client.js", assets, provenance, ...screen },
     null,
     2,
   )}\n`,

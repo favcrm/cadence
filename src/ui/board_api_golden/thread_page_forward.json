@@ -54,6 +54,7 @@
       "thread": "THREAD"
     }
   ],
+  "more_after": false,
   "reply_seq": 0,
   "thread": {
     "alias": "master",

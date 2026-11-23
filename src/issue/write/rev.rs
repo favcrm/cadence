@@ -125,8 +125,15 @@ pub(super) fn check_rev(dir: &Path, if_rev: Option<&str>) -> Result<Option<Value
 /// response carries this warning.
 pub(crate) fn blocked_warnings(pm: &Pm, id: &str, state_dir: Option<&Path>) -> Result<Vec<String>> {
     let issues = board::load_all(&pm.dir, None)?;
-    let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    // `View::blocked` includes a job-blocked lane, so answering this
+    // advisory question needs the job table. Unknown state is an error
+    // the caller records as a post-commit warning — never a silent
+    // "no blockers".
+    let jobs = state_dir
+        .map(board::fetch_job_state)
+        .unwrap_or_else(board::JobState::tracker_only);
+    jobs.require("the blocked-by warning check")?;
+    let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
     let Some(v) = views.iter().find(|v| v.issue.front.id == id) else {
         return Ok(vec![]);
     };
@@ -176,7 +183,7 @@ pub(crate) fn blocked_warnings_best_effort(
 
 /// Record one post-commit failure: stderr now, JSON later.
 pub(crate) fn post_commit_warning(post: &mut Vec<String>, message: String) {
-    eprintln!("warning: {message} (the write itself committed)");
+    crate::output::eprint_line(&format!("warning: {message} (the write itself committed)"));
     post.push(message);
 }
 

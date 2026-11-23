@@ -20,27 +20,12 @@ publish to a live account to prove a release.
 - **Blast radius:** all tenants; stateless and immediate.
 - **Order:** review and merge the promotion, then dispatch `production-deploy.yml`
   pinned to the promotion merge's second parent (`source_sha`). Use the smallest
-  artifact that carries the fix; do not wait for an unrelated image cycle.
+  artifact that carries the fix.
 - **Rollback trigger / decision:** failed read-only smoke or a production
   regression; operator decides whether to roll back.
 - **Rollback:** redeploy the previous `source_sha`.
 - **Verify:** run the read-only route smoke first. Any optional canary is only
   on the test account, never a live account; do not publish to prove a release.
-
-## Runtime image (pins a Cadence build)
-
-- **Runner:** authorized operator; repin PR, promotion and deploy.
-- **Blast radius:** every tenant that takes the new image on cold start; awake
-  tenants require a planned restart.
-- **Order:** review the repin, promote and deploy; review pending migrations and
-  take the required backup before applying them. Restart only the planned test
-  tenant first, then expand in stages. Batch layers that share this restart.
-- **Rollback trigger / decision:** failed tenant probe, failed smoke, or a
-  migration/deploy failure; operator decides, and pauses expansion on failure.
-- **Rollback:** redeploy the coupled previous image and Worker versions; restore
-  migrated store data from the recorded backup when needed.
-- **Verify:** require a real tenant probe and read-only smoke before expanding
-  to the next tenant; a running/listed state is not proof that it answers.
 
 ## Cadence host binary
 
@@ -53,8 +38,7 @@ publish to a live account to prove a release.
   Automatic `workflow_run`/scheduled staging deliberately skips promotion.
   Only then hand over [the production update procedure](../../AGENTS.md#production-safety)
   to the operator. Verify `--check` reports the intended available SHA; stop on
-  a refusal or stale candidate. Batch host changes that need the same image
-  cycle with that cycle, not a separate restart.
+  a refusal or stale candidate.
 - **Rollback trigger / decision:** update refusal, failed read-only health
   probe, or regression; operator decides whether to restore the previous
   release.
@@ -74,6 +58,19 @@ adopting `delivery.integration_branch`. The operator then edits the project's
 policy and re-approves it through an operator connection using
 `cadence issue project approve-work <key>`. This is separate from source merge
 approval and is never performed by the source change itself.
+
+### Hosted review evidence is project-scoped (CAD-2001)
+
+Roll out the tenant server that serves the project-scoped review verbs
+(`audit_verdicts_project`, `audit_approval_project`, `audit_approve_project`,
+`audit_reviewers_project(_set)`, `audit_identities(_set)`) **before** the
+client that sends them, then install the matching `scripts/enqueue-reviewed`.
+A client newer than its tenant is refused by name and says so; it never falls
+back to the older repo-scoped evidence, and the gate reports that refusal as a
+refusal rather than as "no verdicts were filed". The owner records the
+workspace identity map (`cadence audit identities set`) and each project's
+review set (`cadence audit reviewers set --project <key>`) before a hosted
+verdict can count.
 
 Verify read-only requirements report the intended `base_ref`, and run the
 guarded enqueue dry-run against the exact head; all remaining review, CI and
@@ -99,7 +96,7 @@ superseded; a current failed, pending, missing, ambiguous, mis-bound or
 untrusted gate still refuses. Dry-run checks the same proof without posting
 evidence or enqueueing. The canonical ticket comment must name the selected
 CI URL and the exact head, base and base branch.
-For a script-only repair, no daemon restart or image cycle is needed when
+For a script-only repair, no daemon restart is needed when
 read-only native requirements already supply the matching target binding.
 
 ## App bundle

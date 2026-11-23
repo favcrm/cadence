@@ -1,0 +1,10 @@
+{
+  "synthetic": "SYNTHETIC TEST KEY - public RFC 8032 vector, signs nothing real. See assertion.contract.test.ts.",
+  "kid": "synthetic-fixture-kid",
+  "publicKeyX": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+  "issuer": "https://platform.synthetic.test",
+  "host": "acme.synthetic.test",
+  "company": "co_synthetic",
+  "now": 1800000000,
+  "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6InN5bnRoZXRpYy1maXh0dXJlLWtpZCJ9.eyJpc3MiOiJodHRwczovL3BsYXRmb3JtLnN5bnRoZXRpYy50ZXN0IiwiYXVkIjoiYWNtZS5zeW50aGV0aWMudGVzdCIsInN1YiI6InVzcl9zeW50aGV0aWMiLCJlbWFpbCI6Im1lbWJlckBzeW50aGV0aWMudGVzdCIsIm5hbWUiOiJTeW50aGV0aWMgTWVtYmVyIiwiY29tcGFueSI6ImNvX3N5bnRoZXRpYyIsInJvbGUiOiJvd25lciIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMDYwLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEifQ.FuDi8c4OfpaJ2otkGom9dGx9gj5kVvuQbNY7dCBOjA67JC2_zgFS2AYbXyxXd81LnQdg4IapPRqaTEO8KYBBCw"
+}

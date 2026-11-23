@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LedgerRecordV1",
+  "type": "object",
+  "properties": {
+    "database_epoch": {
+      "$ref": "#/$defs/Revision"
+    },
+    "digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "kind": {
+      "$ref": "#/$defs/LedgerMutationKindV1"
+    },
+    "previous_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "refs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Digest"
+      }
+    },
+    "sequence": {
+      "$ref": "#/$defs/Counter"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "sequence",
+    "database_epoch",
+    "previous_digest",
+    "kind",
+    "refs",
+    "digest"
+  ],
+  "$defs": {
+    "Counter": {
+      "description": "Nonnegative canonical decimal counter (`0|[1-9][0-9]*`, <= i64::MAX).",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "LedgerMutationKindV1": {
+      "type": "string",
+      "enum": [
+        "credential",
+        "grant",
+        "authorization",
+        "policy",
+        "claim",
+        "reservation",
+        "settlement",
+        "fence",
+        "restore"
+      ]
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    }
+  }
+}

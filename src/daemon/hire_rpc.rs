@@ -56,7 +56,9 @@ impl Shared {
         if let Some(name) = name {
             identifier(name, "Agent name")?;
             crate::master::refuse_reserved_alias(name)?;
-            if self.store.agent_opt(name)?.is_some() {
+            if self.store.agent_opt(name)?.is_some()
+                || crate::agent_settings::profile_exists(&self.store, name)?
+            {
                 return Err(Error::rejected(format!(
                     "Agent '{name}' already exists - propose another name, or none"
                 )));

@@ -54,6 +54,21 @@ compile_error!(
      be compiled into a release build (CAD-482)"
 );
 
+// CAD-1159 SEC-002: the fixture image-authority adapter exists only inside
+// the separately labelled debug + test-seam artifact. Every other
+// combination — each release build, or a debug build without the test seam —
+// refuses compilation here; the compiler cfg, never PROFILE, is
+// authoritative.
+#[cfg(all(
+    feature = "native-fixture-admission",
+    not(all(debug_assertions, feature = "test-seam"))
+))]
+compile_error!(
+    "feature `native-fixture-admission` admits an owner-elected fixture \
+     image-verification root; it requires a debug build with the test seam \
+     (native-fixture-admission-requires-debug-test-seam)"
+);
+
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;

@@ -37,6 +37,7 @@ pub(crate) struct Human {
 }
 
 pub(crate) fn list(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
+    super::admitted_for_export(pm, caller, path)?;
     let loaded = collection::root_and_project(pm, caller, path)?;
     let requests = match &loaded.review_project {
         Some(project) => load_requests(pm, caller, &loaded, project)?,
@@ -423,7 +424,7 @@ fn parse_citation(pm: &Pm, caller: &Caller, root: &str, row: &Value) -> Result<V
         )));
     }
     let segs: Vec<&str> = path.split('/').collect();
-    super::allowed(caller, super::Op::Read, &segs)?;
+    super::allowed(pm, caller, super::Op::Read, &segs)?;
     let selector = obj
         .get("revision")
         .and_then(Value::as_str)

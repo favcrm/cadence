@@ -5,6 +5,8 @@
  * `/my-work` is the Active tab sorted by last update.
  */
 
+import { PROJECT_KEY } from "./projectKey";
+
 export type MyWorkTab = "active" | "done" | "dropped" | "all";
 export type MyWorkSort = "updated" | "priority" | "created";
 export type MyWorkPriority = "P0" | "P1" | "P2" | "P3";
@@ -26,8 +28,6 @@ export const MY_WORK_SEARCH_MAX = 200;
 
 /** URL keys this view owns; navigation elsewhere drops them. */
 export const MY_WORK_URL_KEYS = ["tab", "search", "project", "priority", "blocked", "sort"] as const;
-
-const PROJECT_KEY = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 /** Read the view from a URL query. Unknown or malformed values fall back to the default. */
 export function readMyWorkView(q: URLSearchParams): MyWorkView {

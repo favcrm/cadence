@@ -6,8 +6,8 @@
     {
       "name": "client.js",
       "media_type": "text/javascript",
-      "sha256": "sha256:6f7b8a579588618e19751c9649a79f08d634b16c4da2a9379ba0a5ff6fcc2c4b",
-      "size": 13630
+      "sha256": "sha256:d9883b6882390f27fb384105afc1a48f0c6b7822acbf5e54adbec364bb361127",
+      "size": 27096
     },
     {
       "name": "styles.css",
@@ -17,9 +17,9 @@
     }
   ],
   "provenance": {
-    "source_digest": "sha256:36701e7f0114bcce1e119e09d5720582f628736a6e866d2ff0560f5f51be790d",
-    "sdk_digest": "sha256:5f5525b82a2dc2c19b71024678fdba9011c55737cb4ff47e88cd0b5c326d6726",
-    "toolchain_digest": "sha256:da23e33543cdbb97f107a7e0ceb98d798a7fc129c4d663e0c9588a580cfa4253"
+    "source_digest": "sha256:877798c93c037372e06a64cf36ca4e9dad248c581e9597ba376c70db2eee562d",
+    "sdk_digest": "sha256:fa4c01bbfe5746bbf16a178de5c89814e13556fa4c97c0e93ef1b02f2f61a2cd",
+    "toolchain_digest": "sha256:4f85f3dfa1083ff03a57ef9d40fead45a15ce1fe730a5150a736288f9a3418dc"
   },
   "host_contract": "screen-actions.v1",
   "may": []

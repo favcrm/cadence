@@ -21,6 +21,7 @@ mod plan;
 mod projects;
 mod rev;
 mod stage;
+mod ticket;
 
 use done::check_done_evidence;
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
@@ -30,9 +31,11 @@ pub(crate) use done::{
     mark_done_on_merge_waiting_with, stage, RealWait, WaitClock,
 };
 pub use done::{mark_done_on_merge, mark_done_on_merge_waiting, DoneWriteFailure};
+#[cfg(all(test, feature = "test-seam"))]
+pub use edit::keyed_commit_seam::{arm_keyed_commit_after_success, KeyedCommitSeam};
 pub use edit::{
-    add_comment, add_ref, add_report, attach, attach_bytes, close_ref, link, patch_issue,
-    set_fields, set_fields_if_rev, tag_edit, IssuePatch,
+    add_comment, add_comment_keyed, add_ref, add_report, attach, attach_bytes, close_ref, link,
+    patch_issue, set_fields, set_fields_if_rev, tag_edit, IssuePatch,
 };
 pub(crate) use edit::{
     apply_link, check_set_gates, comment_author, commit_front_with_comment, new_ref, sets_done,
@@ -42,8 +45,13 @@ pub use new::{master_issue_new_limits, new_issue};
 pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, GrantedPreview};
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
-pub(crate) use projects::{check_tags, issue_dir, load_front, save_front, split_tags};
-pub use projects::{project_add, set_acceptance, set_project_policy};
+pub(crate) use projects::{check_tags, load_front, save_front, split_tags};
+#[doc(hidden)]
+pub use projects::{checked_project_dirs, issue_dir};
+pub use projects::{
+    private_available, project_add, read_project_policy, set_acceptance, set_project_policy,
+    set_project_remote, PRIVATE_UNAVAILABLE,
+};
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use rev::blocked_warnings;
 use rev::check_rev;
@@ -53,7 +61,10 @@ pub(crate) use rev::{
     commit, commit_scoped, commit_who, commit_who_scoped, create_exclusive, file_preimage,
     post_commit_warning, restore_preimage, write_new,
 };
-
+pub(crate) use ticket::confirm_committed_selected_issue;
+pub use ticket::materialize_app_run_ticket;
+// The bind acceptance test is the only caller, and it compiles only with
+// the test seam. A plain library build must not carry the re-export.
 #[cfg(test)]
 use new::lock_for_new_issue_rounds;
 
@@ -100,7 +111,13 @@ mod tests {
         let before = std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap();
 
         // Private is refused until the isolation gate passes.
-        set_project_policy(&pm, key, project::Visibility::Private, &[], "").unwrap_err();
+        let err = set_project_policy(&pm, key, project::Visibility::Private, &[], "").unwrap_err();
+        assert_eq!(err.code(), Some("private_unavailable"), "{err}");
+        assert_eq!(
+            std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap(),
+            before,
+            "a refused private writes nothing"
+        );
 
         // Reserved grantee kinds and unknown projects are refused.
         set_project_policy(
@@ -165,6 +182,83 @@ mod tests {
         );
         assert!(clean(&pm), "a refused policy write left something behind");
         std::fs::remove_file(hook).unwrap();
+    }
+
+    #[test]
+    fn reading_a_policy_returns_recorded_state_without_mutating() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let yaml_path = pm.dir.join(key).join("project.yaml");
+
+        set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["users/mia".to_string()],
+            "",
+        )
+        .unwrap();
+        let before = std::fs::read(&yaml_path).unwrap();
+        let read = read_project_policy(&pm, key).unwrap();
+        assert_eq!(read["state"], "ok");
+        assert_eq!(read["project"], key);
+        assert_eq!(read["visibility"], "workspace-visible");
+        assert_eq!(read["grants"], json!(["users/mia"]));
+        assert!(read["version"].as_u64().is_some());
+        assert_eq!(
+            std::fs::read(&yaml_path).unwrap(),
+            before,
+            "policy read must leave project.yaml untouched"
+        );
+        assert!(clean(&pm));
+
+        let mut loaded = project::load(&yaml_path).unwrap();
+        loaded.policy = Some(project::ProjectPolicy {
+            version: 2,
+            visibility: project::Visibility::Private,
+            members: vec![project::Grant::parse("users/mia").unwrap()],
+        });
+        std::fs::write(&yaml_path, serde_yaml::to_string(&loaded).unwrap()).unwrap();
+        let private_read = read_project_policy(&pm, key).unwrap();
+        assert_eq!(
+            private_read,
+            json!({
+                "state": "ok",
+                "project": key,
+                "visibility": "private",
+                "grants": ["users/mia"],
+                "version": 2,
+            })
+        );
+
+        loaded.policy = None;
+        let yaml = serde_yaml::to_string(&loaded).unwrap();
+        std::fs::write(&yaml_path, yaml).unwrap();
+        let empty = read_project_policy(&pm, key).unwrap();
+        assert_eq!(
+            empty,
+            json!({
+                "state": "not_stored",
+                "project": key,
+                "visibility": null,
+                "grants": [],
+                "version": null,
+            })
+        );
+
+        assert!(read_project_policy(&pm, "absent").is_err());
+        assert!(read_project_policy(&pm, "../escape").is_err());
+
+        std::fs::write(&yaml_path, "policy:\n  visibility: [unclosed\n").unwrap();
+        assert!(read_project_policy(&pm, key).is_err());
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&yaml_path).unwrap();
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            std::os::unix::fs::symlink(outside.path(), &yaml_path).unwrap();
+            assert!(read_project_policy(&pm, key).is_err());
+        }
     }
 
     /// CAD-908: a created file is whole, a collision renames, and no
@@ -505,6 +599,276 @@ mod tests {
             head
         );
         assert!(clean(&pm), "refused project add left tracker changes");
+    }
+
+    fn git_with_origin(origin: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::issue::git(dir.path(), &["-c", "init.defaultBranch=main", "init", "-q"]).unwrap();
+        crate::issue::git(dir.path(), &["remote", "add", "origin", origin]).unwrap();
+        dir
+    }
+
+    fn add_with_remote(pm: &Pm, key: &str, prefix: &str, origin: &str) -> tempfile::TempDir {
+        let repo = git_with_origin(origin);
+        project_add(
+            pm,
+            key,
+            prefix,
+            &[repo.path().to_string_lossy().into_owned()],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        repo
+    }
+
+    /// CAD-1870: set-remote is a compare-and-swap on one `repos[].remote`.
+    #[test]
+    fn set_project_remote_updates_one_remote_and_drives_delivery_matching() {
+        let (_dir, pm) = tracker();
+        let _repo = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let yaml = pm.dir.join("mkt").join("project.yaml");
+        let before = project::load(&yaml).unwrap();
+        let id = before.id.clone();
+        let prefix = before.prefix.clone();
+        let path = before.repos[0].path.clone();
+        let policy = before.policy.clone();
+        let cadence_yaml = std::fs::read(pm.dir.join("cadence").join("project.yaml")).unwrap();
+        let new_pr = "https://github.com/agenticos-stack/marketing-v2/pull/1";
+        let old_pr = "https://github.com/favcrm/marketing-v2/pull/1";
+        let other_pr = "https://github.com/acme/other/pull/9";
+        assert!(
+            crate::delivery::project_pr_refusal(&pm.dir, "mkt", old_pr)
+                .unwrap()
+                .is_none(),
+            "the recorded remote should accept the old slug before the update"
+        );
+        assert!(crate::delivery::project_pr_refusal(&pm.dir, "mkt", new_pr)
+            .unwrap()
+            .is_some());
+
+        let out = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/favcrm/marketing-v2",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out["changed"], true);
+        assert_eq!(out["committed"], true);
+        assert_eq!(out["from"], "github.com/favcrm/marketing-v2");
+        assert_eq!(out["to"], "github.com/agenticos-stack/marketing-v2");
+
+        let after = project::load(&yaml).unwrap();
+        assert_eq!(after.id, id);
+        assert_eq!(after.prefix, prefix);
+        assert_eq!(after.policy, policy);
+        assert_eq!(after.repos[0].path, path);
+        assert_eq!(
+            after.repos[0].remote.as_deref(),
+            Some("github.com/agenticos-stack/marketing-v2")
+        );
+        assert_eq!(
+            std::fs::read(pm.dir.join("cadence").join("project.yaml")).unwrap(),
+            cadence_yaml,
+            "an unrelated project.yaml changed"
+        );
+        assert!(
+            crate::delivery::project_pr_refusal(&pm.dir, "mkt", new_pr)
+                .unwrap()
+                .is_none(),
+            "delivery must accept a PR on the new remote"
+        );
+        let unrelated = crate::delivery::project_pr_refusal(&pm.dir, "mkt", other_pr)
+            .unwrap()
+            .expect("unrelated remote must still be refused");
+        assert!(
+            unrelated.contains("not a repo of project mkt"),
+            "{unrelated}"
+        );
+        let old_now = crate::delivery::project_pr_refusal(&pm.dir, "mkt", old_pr)
+            .unwrap()
+            .expect("old slug stops matching; no compatibility shim");
+        assert!(old_now.contains("not a repo of project mkt"), "{old_now}");
+    }
+
+    #[test]
+    fn set_project_remote_refuses_stale_ambiguous_malformed_and_is_idempotent() {
+        let (_dir, pm) = tracker();
+        let _a = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let _b = add_with_remote(&pm, "other", "OTH", "https://github.com/acme/widgets.git");
+        let yaml = pm.dir.join("mkt").join("project.yaml");
+        let before = std::fs::read(&yaml).unwrap();
+        let head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+
+        let stale = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/nobody/missing",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(stale.contains("no registered remote"), "{stale}");
+
+        // CAD-2001: another project recording the target remote is a
+        // shared repo, not a conflict — a shared repo must be able to
+        // follow a transfer. It is exercised at the end of this test.
+        let bad_to = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/favcrm/marketing-v2",
+            "github.com/acme/widgets/extra",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(bad_to.contains("malformed"), "{bad_to}");
+
+        for bad in [
+            "",
+            "not-a-repo",
+            "github.com/onlyowner",
+            "github.com/a/b/c",
+            "../escape/x",
+        ] {
+            let err = set_project_remote(&pm, "mkt", bad, "github.com/acme/ok", "")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("malformed"), "{bad}: {err}");
+        }
+
+        let add_err = project_add(&pm, "mkt", "ZZZ", &[], &[], &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            add_err.contains("set-remote") && !add_err.contains("edit "),
+            "{add_err}"
+        );
+
+        let missing = set_project_remote(
+            &pm,
+            "ghost",
+            "github.com/favcrm/marketing-v2",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("no project 'ghost'"), "{missing}");
+
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+        assert!(clean(&pm), "a refused set-remote left tracker changes");
+
+        let noop = set_project_remote(
+            &pm,
+            "mkt",
+            "https://github.com/favcrm/marketing-v2.git",
+            "github.com/favcrm/marketing-v2",
+            "",
+        )
+        .unwrap();
+        assert_eq!(noop["changed"], false);
+        assert_eq!(noop["committed"], false);
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+
+        let r1 = git_with_origin("https://github.com/dup/one.git");
+        let r2 = git_with_origin("https://github.com/dup/one.git");
+        project_add(
+            &pm,
+            "dupes",
+            "DUP",
+            &[
+                r1.path().to_string_lossy().into_owned(),
+                r2.path().to_string_lossy().into_owned(),
+            ],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let ambiguous =
+            set_project_remote(&pm, "dupes", "github.com/dup/one", "github.com/dup/two", "")
+                .unwrap_err()
+                .to_string();
+        assert!(ambiguous.contains("more than one"), "{ambiguous}");
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+
+        // CAD-2001: `other` already records github.com/acme/widgets. mkt
+        // may adopt the same remote — a repo may be registered by
+        // several projects — and only mkt's own record changes.
+        let other_yaml = std::fs::read(pm.dir.join("other").join("project.yaml")).unwrap();
+        let shared = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/favcrm/marketing-v2",
+            "github.com/acme/widgets",
+            "",
+        )
+        .unwrap();
+        assert_eq!(shared["changed"], true, "{shared}");
+        assert_eq!(shared["to"], "github.com/acme/widgets");
+        assert_eq!(
+            project::load(&yaml).unwrap().repos[0].remote.as_deref(),
+            Some("github.com/acme/widgets")
+        );
+        assert_eq!(
+            std::fs::read(pm.dir.join("other").join("project.yaml")).unwrap(),
+            other_yaml,
+            "the other project's record changed"
+        );
+    }
+
+    #[test]
+    fn a_refused_set_remote_commit_leaves_the_record_alone() {
+        let (_dir, pm) = tracker();
+        let _repo = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let path = pm.dir.join("mkt").join("project.yaml");
+        let before = std::fs::read(&path).unwrap();
+        let hook = failing_hook(&pm);
+        assert!(
+            set_project_remote(
+                &pm,
+                "mkt",
+                "github.com/favcrm/marketing-v2",
+                "github.com/agenticos-stack/marketing-v2",
+                "",
+            )
+            .is_err(),
+            "the refused commit was reported as a success"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            clean(&pm),
+            "a refused set-remote write left something behind"
+        );
+        std::fs::remove_file(hook).unwrap();
     }
 
     /// CAD-449: a failed done commit restores `issue.md` and its index
@@ -1000,5 +1364,277 @@ mod tests {
         assert!(clean(&pm), "a refused attach left something behind");
         assert!(!pm.dir.join("cadence/CAD-1/artifacts/note-1.txt").exists());
         std::fs::remove_file(hook).unwrap();
+    }
+
+    #[test]
+    fn selected_app_ticket_is_created_once_and_omits_the_other_proposal() {
+        let (dir, pm) = tracker();
+        let reserved = json!({
+            "request_id": "ticket-req-1",
+            "run_id": "run-0123456789abcdef0123456789abcdef",
+            "artifact_id": "artifact-run-0123456789abcdef0123456789abcdef-s1",
+            "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "index": 1,
+            "count": 2,
+            "suggestion": "Publish the Tuesday menu on the board.",
+        });
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(first["created"], true);
+        let id = first["id"].as_str().unwrap();
+        let body =
+            std::fs::read_to_string(pm.dir.join("cadence").join(id).join("issue.md")).unwrap();
+        assert!(
+            body.contains("cadence-app-ticket-request: ticket-req-1"),
+            "{body}"
+        );
+        assert!(body.contains("- decision: accept"), "{body}");
+        assert!(
+            body.contains("- artifact: artifact-run-0123456789abcdef0123456789abcdef-s1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Publish the Tuesday menu on the board."),
+            "{body}"
+        );
+        assert!(
+            !body.contains("Ask the vendor for a written quote."),
+            "{body}"
+        );
+        let second = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(second["id"], id);
+        assert_eq!(second["created"], false);
+        let other = pm.dir.join("cadence/CAD-1/issue.md");
+        let mut text = std::fs::read_to_string(&other).unwrap();
+        text.push_str("\ncadence-app-ticket-request: ticket-req-1\n");
+        std::fs::write(&other, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+        assert!(err.to_string().contains("more than one"), "{err}");
+    }
+
+    fn app_ticket_reservation() -> Value {
+        json!({
+            "request_id": "ticket-req-1",
+            "run_id": "run-0123456789abcdef0123456789abcdef",
+            "artifact_id": "artifact-run-0123456789abcdef0123456789abcdef-s1",
+            "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "index": 1,
+            "count": 2,
+            "suggestion": "Publish the Tuesday menu on the board.",
+        })
+    }
+
+    /// A pre-existing issue that only contains the marker line is not the
+    /// selected proposal. Recovery must refuse it and must not create a
+    /// second issue that would leave two markers behind.
+    #[test]
+    fn planted_ticket_marker_is_not_bound() {
+        let (dir, pm) = tracker();
+        let marker = "\ncadence-app-ticket-request: ticket-req-1\n";
+        let planted = pm.dir.join("cadence/CAD-1/issue.md");
+        let mut text = std::fs::read_to_string(&planted).unwrap();
+        text.push_str(marker);
+        std::fs::write(&planted, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &app_ticket_reservation())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(
+            !pm.dir.join("cadence/CAD-2").exists(),
+            "a mismatched marker still created an issue"
+        );
+    }
+
+    /// The same marker in another project is not this reservation either.
+    #[test]
+    fn ticket_marker_in_another_project_is_not_bound() {
+        let (dir, pm) = tracker();
+        project_add(&pm, "other", "OTH", &[], &[], &[], None).unwrap();
+        new_issue(
+            &pm,
+            dir.path(),
+            Some("other"),
+            "elsewhere",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap();
+        let planted = pm.dir.join("other/OTH-1/issue.md");
+        let mut text = std::fs::read_to_string(&planted).unwrap();
+        text.push_str("\ncadence-app-ticket-request: ticket-req-1\n");
+        std::fs::write(&planted, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &app_ticket_reservation())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(!pm.dir.join("cadence/CAD-2").exists());
+    }
+
+    /// Editing the recorded digest after the commit must not make the next
+    /// retry treat that issue as the selected ticket.
+    #[test]
+    fn edited_ticket_provenance_is_not_reused() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        let id = first["id"].as_str().unwrap();
+        let path = pm.dir.join("cadence").join(id).join("issue.md");
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        std::fs::write(&path, text).unwrap();
+        let err = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match this reservation"),
+            "{err}"
+        );
+        assert!(!pm.dir.join("cadence/CAD-3").exists());
+    }
+
+    /// Two callers that both pass an unlocked pre-check must still commit
+    /// one issue. The marker search and the create share the tracker lock.
+    #[test]
+    fn concurrent_materialize_commits_one_ticket() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let cwd = dir.path().to_path_buf();
+        let pm_dir = pm.dir.clone();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cwd = cwd.clone();
+            let pm_dir = pm_dir.clone();
+            let reserved = reserved.clone();
+            handles.push(std::thread::spawn(move || {
+                let pm = Pm::at(&pm_dir).unwrap();
+                materialize_app_run_ticket(&pm, &cwd, "cadence", &reserved).unwrap()
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let id = results[0]["id"].as_str().unwrap();
+        assert!(results.iter().all(|row| row["id"] == id), "{results:?}");
+        assert_eq!(
+            results.iter().filter(|row| row["created"] == true).count(),
+            1,
+            "{results:?}"
+        );
+        let marked = std::fs::read_dir(pm.dir.join("cadence"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let file = entry.path().join("issue.md");
+                file.is_file()
+                    && std::fs::read_to_string(file)
+                        .unwrap()
+                        .contains("cadence-app-ticket-request: ticket-req-1")
+            })
+            .count();
+        assert_eq!(marked, 1, "more than one issue carries the request marker");
+    }
+
+    fn issue_names(pm: &Pm) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(pm.dir.join("cadence"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// CAD-1887 R1. A child is killed after the exact reservation is
+    /// written or staged and before commit. The retry must refuse, bind
+    /// nothing, allocate no second issue, make no commit, and leave the
+    /// crash marker and the issue bytes as the child left them.
+    #[test]
+    fn killed_writer_before_commit_does_not_bind_an_uncommitted_ticket() {
+        for role in ["hold_app_ticket", "hold_app_ticket_staged"] {
+            let (dir, pm) = tracker();
+            let reserved = app_ticket_reservation();
+            let body = super::ticket::app_ticket_body(&reserved).unwrap();
+            let title = super::ticket::app_ticket_title(reserved["suggestion"].as_str().unwrap());
+            assert!(pm.dir.join("cadence/CAD-1/issue.md").is_file());
+            assert!(!pm.dir.join("cadence/CAD-2").exists());
+            let head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+            let (child, _) = crate::issue::lock_tests::spawn_app_ticket_writer(
+                &pm, role, "cadence", "CAD-2", &title, &body,
+            );
+            crate::issue::lock_tests::sigkill(child);
+            let marker = pm.dir.join(".write.lock");
+            assert!(marker.exists(), "{role}: crash marker missing");
+            let issue = pm.dir.join("cadence/CAD-2/issue.md");
+            let before = std::fs::read(&issue).unwrap();
+            let err =
+                materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not a committed reservation") && msg.contains("refusing to bind"),
+                "{role}: {msg}"
+            );
+            assert!(msg.contains("left unchanged"), "{role}: {msg}");
+            assert_eq!(
+                std::fs::read(&issue).unwrap(),
+                before,
+                "{role}: issue bytes changed"
+            );
+            assert!(marker.exists(), "{role}: recovery marker was cleared");
+            assert!(
+                !pm.dir.join("cadence/CAD-3").exists(),
+                "{role}: a second issue was created"
+            );
+            assert_eq!(
+                crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+                head,
+                "{role}: a commit landed"
+            );
+            if role == "hold_app_ticket_staged" {
+                let staged =
+                    crate::issue::git(&pm.dir, &["diff", "--cached", "--name-only"]).unwrap();
+                assert!(
+                    staged.contains("cadence/CAD-2/issue.md"),
+                    "{role}: staged evidence cleared: {staged}"
+                );
+            } else {
+                let status =
+                    crate::issue::git(&pm.dir, &["status", "--porcelain", "--untracked-files=all"])
+                        .unwrap();
+                assert!(
+                    status.contains("cadence/CAD-2/issue.md"),
+                    "{role}: untracked evidence cleared: {status}"
+                );
+            }
+        }
+    }
+
+    /// The same request after a commit, then a killed holder on the clean
+    /// tree, reuses that committed issue and does not open another one.
+    #[test]
+    fn killed_writer_after_commit_reuses_the_committed_ticket() {
+        let (dir, pm) = tracker();
+        let reserved = app_ticket_reservation();
+        let first = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(first["created"], true);
+        let id = first["id"].as_str().unwrap().to_string();
+        let issue = pm.dir.join("cadence").join(&id).join("issue.md");
+        let committed = std::fs::read(&issue).unwrap();
+        let before = issue_names(&pm);
+        let (child, _) = crate::issue::lock_tests::spawn_writer(&pm, "hold", false);
+        crate::issue::lock_tests::sigkill(child);
+        assert!(pm.dir.join(".write.lock").exists());
+        let second = materialize_app_run_ticket(&pm, dir.path(), "cadence", &reserved).unwrap();
+        assert_eq!(second["id"], id);
+        assert_eq!(second["created"], false);
+        assert_eq!(std::fs::read(&issue).unwrap(), committed);
+        assert_eq!(issue_names(&pm), before);
     }
 }

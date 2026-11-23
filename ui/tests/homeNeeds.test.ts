@@ -7,11 +7,9 @@ import {
   kindSpec,
   KIND_TABLE,
   metaLine,
-  readRailCollapsed,
   todoCount,
   todoSplit,
   UNFENCE_CHOICES,
-  writeRailCollapsed,
 } from "../src/features/home/needs";
 import type { NeedsMe } from "../src/lib/types";
 
@@ -208,19 +206,13 @@ equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age l
   const d = askDraft(need);
   equal(d.text, "PR #187 has had no verdict for 24 days — what should we do?", "draft text");
   equal(d.refs, [{ kind: "pr", id: "acme/app#187" }], "subject → ref");
+  equal(askDraft(need, undefined, "我們應該怎樣做？").text, "PR #187 has had no verdict for 24 days — 我們應該怎樣做？", "localized draft question");
+  equal(askDraft(need, "Custom draft", "我們應該怎樣做？").text, "Custom draft", "explicit draft remains unchanged");
 
   const [plain] = homeNeeds([row({ kind: "approval", audience: "operator", title: "pick one", age: 1 })]);
   equal(askDraft(plain).refs, [], "no subject → no refs");
 }
 
-// CAD-574 — the collapsed rail persists per viewer; without storage it
-// just defaults open (a node run has no localStorage).
-{
-  equal(readRailCollapsed(), false, "unset → open");
-  writeRailCollapsed(true);
-  equal(readRailCollapsed(), typeof globalThis.localStorage === "undefined" ? false : true, "write then read");
-  writeRailCollapsed(false);
-}
 
 // CAD-574 r1 — Unfence's reconcile statuses: exactly the daemon's
 // vocabulary, each with a one-line explanation, and none flagged as a

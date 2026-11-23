@@ -211,8 +211,8 @@ pub(crate) fn in_use_blocks_with_process_probe(
                 "daemon-unreachable",
                 format!(
                     "Daemon unreachable while enumerating agents/tasks ({e}) — \
-                     a task-bound kickoff could be missed; rerun when the \
-                     daemon is up or pass --force"
+                     a task-bound kickoff could be missed; rerun once the \
+                     daemon answers or pass --force"
                 ),
             );
         }
@@ -278,7 +278,7 @@ pub(crate) fn in_use_blocks_with_process_probe(
                                 format!(
                                     "Daemon unreachable while checking a message's \
                                      task binding on '{alias}' — refusing to guess; \
-                                     rerun when the daemon is up or pass --force"
+                                     rerun once the daemon answers or pass --force"
                                 ),
                             ),
                             Bound::Unknown(ProbeKind::Inconclusive) => push_once(
@@ -335,9 +335,10 @@ pub(crate) fn in_use_blocks_with_process_probe(
                     &mut unreachable,
                     "daemon-unreachable",
                     format!(
-                        "Daemon unreachable while checking '{alias}' ({e}) — \
-                         the agent checks cannot run; rerun when the daemon is \
-                         up or pass --force"
+                        "Daemon unreachable while checking '{alias}' ({}) — \
+                         the agent checks cannot run; rerun once the daemon \
+                         answers or pass --force",
+                        probe_text(&e)
                     ),
                 ),
                 AgentLookup::Inconclusive(e) => push_once(
@@ -454,7 +455,15 @@ pub(crate) fn inspect_rest(
     // real changes and non-ignored untracked files do. A status that
     // cannot be read refuses too: an unreadable tree is not a clean one.
     if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
-        match git(d, &["status", "--porcelain", "--ignored"]) {
+        match git(
+            d,
+            &[
+                "status",
+                "--porcelain",
+                "--ignored",
+                "--untracked-files=normal",
+            ],
+        ) {
             Err(e) => blocks.push(Block {
                 tag: format!("dirty-check-failed: {e}"),
                 reason: format!(
@@ -523,7 +532,7 @@ pub(crate) fn inspect_rest(
     }
     // Survivability: the branch's work must survive somewhere — merged
     // into the repo's default branch or pushed.
-    if let (_, _, Some(b)) = survivability(ev, t) {
+    if let (_, _, Some(b)) = survivability(ev, &t.root, &t.branch) {
         blocks.push(b);
     }
     // Meta-failures last: a named owner, message, pid, dirty path or

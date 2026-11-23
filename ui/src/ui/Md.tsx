@@ -1,10 +1,14 @@
 import { createContext, isValidElement, useContext, useState, type ReactNode } from "react";
 import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { citationSpans, isWikiRevisionHref, wikiRevisionHref } from "../features/wiki/citations";
+import { citationSpans, isWikiRevisionHref, wikiLinkHref, wikiRevisionHref } from "../features/wiki/citations";
 import { useTranslate } from "../lib/localeText";
 import Link from "./Link";
 import SafeLink from "./SafeLink";
+import IdToken from "./IdToken";
+import StagedChip, { StagedSourceContext } from "./StagedChip";
+import { stagedRefKey } from "../features/decisions/stagedRef";
+import { isIdToken, splitIds } from "../features/home/turnText";
 
 // Bare issue ids become `issue:` links as a remark pass over `text` nodes
 // only, so code blocks, inline code, existing links and autolinked URLs
@@ -14,7 +18,161 @@ interface MdNode {
   value?: string;
   url?: string;
   children?: MdNode[];
+  data?: { hProperties?: Record<string, unknown> };
+  /** GFM table column alignment. */
+  align?: (string | null)[];
 }
+
+function addClass(node: MdNode, name: string): void {
+  const props = node.data?.hProperties ?? {};
+  const current = props.className;
+  const list = Array.isArray(current) ? current.map(String) : typeof current === "string" ? current.split(" ") : [];
+  node.data = { ...node.data, hProperties: { ...props, className: [...list.filter(Boolean), name] } };
+}
+
+/** The plain text a node carries, for classifying it. */
+function nodeText(node: MdNode): string {
+  if (node.value !== undefined && (node.type === "text" || node.type === "inlineCode")) return node.value;
+  return (node.children ?? []).map(nodeText).join("");
+}
+
+// CAD-2436: a paragraph is a section label only when its whole text is one
+// bold run ("**Where things stand**"). "**Payment:** FPS / Bank Transfer" is
+// a sentence with a bold lead-in and keeps body size. CSS cannot tell the two
+// apart (`:only-child` ignores text), so the renderer marks the label.
+function markSectionLabels(tree: MdNode): void {
+  for (const node of tree.children ?? []) {
+    if (node.type !== "paragraph") continue;
+    const kids = (node.children ?? []).filter((kid) => !(kid.type === "text" && !(kid.value ?? "").trim()));
+    if (kids.length === 1 && kids[0]!.type === "strong" && nodeText(kids[0]!).trim() !== "") addClass(node, "md-sect");
+  }
+}
+const remarkSectionLabels = () => (tree: MdNode) => markSectionLabels(tree);
+
+// CAD-2436: a table column whose body cells are all numbers (amounts,
+// quantities, percentages, an optional currency code) is right-aligned and
+// marked for tabular figures. An empty cell does not count against it.
+const NUMERIC_CELL = /^[-+(]?(?:[A-Z]{3}\s)?[-+(]?[$€£¥]?\s?\d[\d,.\s]*%?\)?(?:\s[A-Z]{3})?$/;
+function markNumericColumns(node: MdNode): void {
+  if (node.type === "table") {
+    const rows = (node.children ?? []).filter((row) => row.type === "tableRow");
+    const body = rows.slice(1);
+    const columns = Math.max(0, ...rows.map((row) => row.children?.length ?? 0));
+    for (let column = 0; column < columns; column++) {
+      const values = body.map((row) => nodeText(row.children?.[column] ?? { type: "text", value: "" }).trim());
+      const filled = values.filter((value) => value !== "");
+      if (filled.length === 0 || !filled.every((value) => NUMERIC_CELL.test(value))) continue;
+      const align = node.align ?? [];
+      if (!align[column]) {
+        align[column] = "right";
+        node.align = align;
+      }
+      for (const row of rows) {
+        const cell = row.children?.[column];
+        if (cell) addClass(cell, "md-num");
+      }
+    }
+    return;
+  }
+  for (const kid of node.children ?? []) markNumericColumns(kid);
+}
+const remarkNumericColumns = () => (tree: MdNode) => markNumericColumns(tree);
+
+type CalloutKind = "note" | "tip" | "important" | "warning" | "caution";
+
+const CALLOUT_LABELS: Record<CalloutKind, string> = {
+  note: "Note",
+  tip: "Tip",
+  important: "Important",
+  warning: "Warning",
+  caution: "Caution",
+};
+
+const CALLOUT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:[ \t]*\r?\n|[ \t]+|$)/i;
+
+function stripBlockquotePrefix(line: string): { quotes: number; rest: string } {
+  let pos = 0;
+  let quotes = 0;
+  while (pos < line.length) {
+    let spaces = 0;
+    while (spaces < 3 && pos + spaces < line.length && line.charCodeAt(pos + spaces) === 0x20) {
+      spaces += 1;
+    }
+    if (pos + spaces >= line.length || line.charCodeAt(pos + spaces) !== 0x3e) break;
+    quotes += 1;
+    pos += spaces + 1;
+    if (pos < line.length && line.charCodeAt(pos) === 0x20) pos += 1;
+  }
+  return { quotes, rest: line.slice(pos) };
+}
+
+function scanFence(rest: string): { ch: "`" | "~"; len: number; after: string } | null {
+  let i = 0;
+  while (i < 3 && i < rest.length && rest.charCodeAt(i) === 0x20) i += 1;
+  const first = rest[i];
+  if (first !== "`" && first !== "~") return null;
+  let end = i;
+  while (end < rest.length && rest[end] === first) end += 1;
+  const len = end - i;
+  return len >= 3 ? { ch: first, len, after: rest.slice(end) } : null;
+}
+
+/** Close an unfinished fenced code block at the end of an in-flight preview so
+ *  live streaming Markdown renders as a code surface instead of raw fences.
+ *  Presentation-only: stored entries and stream state keep the server's text. */
+export function healStreamingMarkdown(text: string): string {
+  let open: { ch: "`" | "~"; len: number; quotes: number } | null = null;
+  for (const line of text.split(/\r?\n|\u2028|\u2029/)) {
+    const { quotes, rest } = stripBlockquotePrefix(line);
+    if (open !== null) {
+      if (quotes < open.quotes) {
+        open = null;
+      } else {
+        if (quotes === open.quotes) {
+          const close = scanFence(rest);
+          if (close && close.ch === open.ch && close.len >= open.len && /^[ \t]*$/.test(close.after)) {
+            open = null;
+          }
+        }
+        continue;
+      }
+    }
+    const fence = scanFence(rest);
+    if (fence && (fence.ch === "~" || !fence.after.includes("`"))) {
+      open = { ch: fence.ch, len: fence.len, quotes };
+    }
+  }
+  if (open === null) return text;
+  return `${text}${text.endsWith("\n") ? "" : "\n"}${"> ".repeat(open.quotes)}${open.ch.repeat(open.len)}`;
+}
+
+function walkCallouts(node: MdNode): void {
+  const kids = node.children;
+  if (!kids) return;
+  if (node.type === "blockquote" && kids[0]?.type === "paragraph") {
+    const firstPara = kids[0];
+    const firstText = firstPara.children?.[0];
+    const match = firstText?.type === "text" && firstText.value ? CALLOUT_MARKER.exec(firstText.value) : null;
+    if (match && firstText?.value !== undefined && firstPara.children) {
+      const rest = firstText.value.slice(match[0].length);
+      if (rest === "") {
+        firstPara.children.shift();
+        if (firstPara.children[0]?.type === "break") firstPara.children.shift();
+      } else {
+        firstText.value = rest;
+      }
+      if (firstPara.children.length === 0) kids.shift();
+      const kind = match[1].toLowerCase();
+      node.data = {
+        ...node.data,
+        hProperties: { ...node.data?.hProperties, "data-callout": kind },
+      };
+    }
+  }
+  for (const kid of kids) walkCallouts(kid);
+}
+
+const remarkCallouts = () => (tree: MdNode) => walkCallouts(tree);
 
 // One id shape for both the linkifier (bounded, global) and the `issue:`
 // validator (anchored); digits are capped so a long run is not an id.
@@ -74,6 +232,36 @@ function linkifyCitations(node: MdNode): void {
 }
 
 const remarkWikiCitations = () => (tree: MdNode) => linkifyCitations(tree);
+
+// CAD-2363: in an assistant answer, a long hex identifier in running text
+// becomes an inline-code node, which the `code` component paints as a short
+// copyable token. Links keep their text; code is never rewritten.
+function markIds(node: MdNode): void {
+  const kids = node.children;
+  if (!kids || node.type === "link" || node.type === "linkReference") return;
+  const out: MdNode[] = [];
+  for (const kid of kids) {
+    if (kid.type !== "text" || !kid.value) {
+      markIds(kid);
+      out.push(kid);
+      continue;
+    }
+    for (const part of splitIds(kid.value)) out.push(part.id ? { type: "inlineCode", value: part.text } : { type: "text", value: part.text });
+  }
+  node.children = out;
+}
+const remarkIdTokens = () => (tree: MdNode) => markIds(tree);
+
+// CAD-1915: a wiki page's `<!-- … -->` notes are source annotations, not
+// content. Only html nodes that are nothing but comments are dropped; a
+// comment inside a code fence is a `code` node and stays visible.
+const COMMENT_ONLY = /^(?:\s*<!--(?:(?!-->)[\s\S])*-->)+\s*$/;
+function dropComments(node: MdNode): void {
+  if (!node.children) return;
+  node.children = node.children.filter((kid) => !(kid.type === "html" && COMMENT_ONLY.test(kid.value ?? "")));
+  node.children.forEach(dropComments);
+}
+const remarkDropComments = () => (tree: MdNode) => dropComments(tree);
 const remarkIssueLinks = () => (tree: MdNode) => linkifyChildren(tree);
 
 // Agent-written Markdown must not initiate third-party image requests. The
@@ -114,11 +302,21 @@ function codeBlock(children: ReactNode): { lang: string; code: string } {
 function CodeBlock({ children }: { children?: ReactNode }) {
   const t = useTranslate();
   const { lang, code } = codeBlock(children);
+  return (
+    <CodeSurface label={lang || t("code")} code={code}>
+      {children}
+    </CodeSurface>
+  );
+}
+
+/** One code surface: label, Copy and a scrollable, keyboard-reachable body. */
+export function CodeSurface({ label, code, children }: { label: string; code: string; children?: ReactNode }) {
+  const t = useTranslate();
   const [copied, setCopied] = useState(false);
   return (
     <div className="codeblock">
       <div className="codeblock-bar">
-        <span className="codeblock-lang num">{lang || t("code")}</span>
+        <span className="codeblock-lang num">{label}</span>
         <button
           type="button"
           className="lnk codeblock-copy"
@@ -135,20 +333,94 @@ function CodeBlock({ children }: { children?: ReactNode }) {
           {copied ? t("Copied") : t("Copy")}
         </button>
       </div>
-      <pre>{children}</pre>
+      <pre tabIndex={0} aria-label={label}>{children}</pre>
     </div>
+  );
+}
+
+function CalloutBlockquote({
+  callout,
+  children,
+}: {
+  callout?: string;
+  children?: ReactNode;
+}) {
+  const t = useTranslate();
+  const label = callout && Object.hasOwn(CALLOUT_LABELS, callout) ? CALLOUT_LABELS[callout as CalloutKind] : null;
+  if (label === null) return <blockquote>{children}</blockquote>;
+  return (
+    <blockquote data-callout={callout}>
+      <div className="md-callout-head">{t(label)}</div>
+      {children}
+    </blockquote>
   );
 }
 
 const InLinkContext = createContext(false);
 const handlerComponents = new WeakMap<object, Components>();
 let noHandlerComponents: Components | null = null;
+// CAD-2363: the same caches for answers that show identifiers as tokens.
+const idHandlerComponents = new WeakMap<object, Components>();
+let idComponents: Components | null = null;
+// CAD-1915: the set for the wiki page being read, so its own links open in
+// place. One slot: the view shows one page at a time, and a new page remounts.
+let pageComponents: { page: string; components: Components } | null = null;
 
 /** The renderer set is cached per issue handler. Recreating these component
  *  types on every thread update would make React unmount and reinsert old
  *  code, links and images, which a live log would announce as new content. */
-function buildComponents(onOpen?: (id: string) => void): Components {
+/** CAD-2363: inline code that is exactly one identifier is a copy token —
+ *  except inside a link, where a button would both copy and navigate.
+ *  CAD-2364: one that names a staged write this surface shows is its chip. */
+function IdCode({ className, children }: { className?: string; children?: ReactNode }) {
+  const linked = useContext(InLinkContext);
+  const staged = useContext(StagedSourceContext);
+  const plain = <code className={className}>{children}</code>;
+  // A fenced block without a language arrives here too, ending in a newline: it stays code.
+  if (className || linked || typeof children !== "string" || children.includes("\n")) return plain;
+  const fallback = isIdToken(children) ? <IdToken id={children} /> : plain;
+  return staged !== null && stagedRefKey(children) !== null ? (
+    <StagedChip source={staged} token={children} fallback={fallback} />
+  ) : (
+    fallback
+  );
+}
+
+function FocusableMarkdownTable({ children }: { children?: ReactNode }) {
+  const t = useTranslate();
+  return (
+    <div className="md-table-wrap" role="region" aria-label={t("Markdown table")} tabIndex={0}>
+      <table>{children}</table>
+    </div>
+  );
+}
+
+const focusableTableComponents = new WeakMap<Components, Components>();
+
+function withFocusableTables(components: Components): Components {
+  let focusable = focusableTableComponents.get(components);
+  if (!focusable) {
+    focusable = { ...components, table: FocusableMarkdownTable };
+    focusableTableComponents.set(components, focusable);
+  }
+  return focusable;
+}
+
+function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids = false, knownIssue?: (id: string) => boolean): Components {
   return {
+    ...(ids
+      ? {
+          // Only inline code that is exactly one identifier; block code keeps
+          // its `<code>` (CodeBlock reads these same props).
+          code: ({ className, children }) => <IdCode className={className}>{children}</IdCode>,
+        }
+      : {}),
+    table: ({ children }) => <div className="md-table-wrap"><table>{children}</table></div>,
+    blockquote: (props) => (
+      <CalloutBlockquote callout={(props as { "data-callout"?: string })["data-callout"]}>
+        {props.children}
+      </CalloutBlockquote>
+    ),
     img: ({ src, alt }) => {
       const linked = useContext(InLinkContext);
       const safe = markdownImageSrc(src);
@@ -167,6 +439,8 @@ function buildComponents(onOpen?: (id: string) => void): Components {
       const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
       const revisionHref = href?.startsWith("wiki-rev:") ? href.slice("wiki-rev:".length) : null;
       const nested = <InLinkContext.Provider value={true}>{children}</InLinkContext.Provider>;
+      const pageHref = wikiPage !== undefined && href && issueId === null && revisionHref === null ? wikiLinkHref(wikiPage, href) : null;
+      if (pageHref !== null) return <Link className="lnk" href={pageHref}>{nested}</Link>;
       if (revisionHref !== null) {
         return isWikiRevisionHref(revisionHref) ? (
           <Link className="lnk" href={revisionHref}>{nested}</Link>
@@ -180,7 +454,7 @@ function buildComponents(onOpen?: (id: string) => void): Components {
         <>{children}</>
       ) : issueId !== null ? (
         WHOLE_ISSUE_ID.test(issueId) ? (
-          onOpen ? (
+          onOpen && (!knownIssue || knownIssue(issueId)) ? (
             <button className="lnk num" onClick={() => onOpen(issueId)}>
               {nested}
             </button>
@@ -200,7 +474,19 @@ function buildComponents(onOpen?: (id: string) => void): Components {
   };
 }
 
-function componentsFor(onOpen?: (id: string) => void): Components {
+function componentsFor(onOpen?: (id: string) => void, wikiPage?: string, ids = false): Components {
+  if (ids) {
+    if (!onOpen) return (idComponents ??= buildComponents(undefined, undefined, true));
+    const cachedIds = idHandlerComponents.get(onOpen);
+    if (cachedIds) return cachedIds;
+    const builtIds = buildComponents(onOpen, undefined, true);
+    idHandlerComponents.set(onOpen, builtIds);
+    return builtIds;
+  }
+  if (wikiPage !== undefined) {
+    if (pageComponents?.page !== wikiPage) pageComponents = { page: wikiPage, components: buildComponents(undefined, wikiPage) };
+    return pageComponents.components;
+  }
   if (!onOpen) return (noHandlerComponents ??= buildComponents());
   const cached = handlerComponents.get(onOpen);
   if (cached) return cached;
@@ -209,22 +495,54 @@ function componentsFor(onOpen?: (id: string) => void): Components {
   return built;
 }
 
+// CAD-2387: the known-id variant, cached per (predicate, opener) so a stable
+// pair keeps one component set across renders.
+const knownHandlerComponents = new WeakMap<object, WeakMap<object, [Components?, Components?]>>();
+function knownComponents(onOpen: (id: string) => void, known: (id: string) => boolean, ids: boolean): Components {
+  let byOpen = knownHandlerComponents.get(known);
+  if (!byOpen) knownHandlerComponents.set(known, (byOpen = new WeakMap()));
+  let pair = byOpen.get(onOpen);
+  if (!pair) byOpen.set(onOpen, (pair = []));
+  const slot = ids ? 1 : 0;
+  return (pair[slot] ??= buildComponents(onOpen, undefined, ids, known));
+}
+
+const PLUGINS = [remarkGfm, remarkCallouts, remarkWikiCitations, remarkIssueLinks, remarkSectionLabels, remarkNumericColumns];
+const PAGE_PLUGINS = [...PLUGINS, remarkDropComments];
+const ID_PLUGINS = [...PLUGINS, remarkIdTokens];
+
 export default function Md({
   text,
   onOpen,
+  wikiPage,
+  idTokens = false,
+  knownIssue,
+  focusableTables = false,
 }: {
   text: string;
   onOpen?: (id: string) => void;
+  /** CAD-2387: when set, only an id it accepts becomes a link; others stay plain. */
+  knownIssue?: (id: string) => boolean;
+  /** CAD-1915: set only by the wiki page view — its links resolve against this path. */
+  wikiPage?: string;
+  /** CAD-2363: an assistant answer shows long hex identifiers as short copyable tokens. */
+  idTokens?: boolean;
+  /** Modal Markdown previews need explicit keyboard targets for horizontal scrolling. */
+  focusableTables?: boolean;
 }) {
+  const components =
+    knownIssue && onOpen && wikiPage === undefined
+      ? knownComponents(onOpen, knownIssue, idTokens)
+      : componentsFor(onOpen, wikiPage, idTokens && wikiPage === undefined);
   return (
     <Markdown
       // GFM (CAD-551): tables, task lists, strikethrough, autolinks —
       // the providers' answers lean on them.
-      remarkPlugins={[remarkGfm, remarkWikiCitations, remarkIssueLinks]}
+      remarkPlugins={wikiPage !== undefined ? PAGE_PLUGINS : idTokens ? ID_PLUGINS : PLUGINS}
       // `issue:` ids and pinned wiki revisions are ours; everything else
       // takes react-markdown's safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") || url.startsWith("wiki-rev:") ? url : defaultUrlTransform(url))}
-      components={componentsFor(onOpen)}
+      components={focusableTables ? withFocusableTables(components) : components}
     >
       {text}
     </Markdown>

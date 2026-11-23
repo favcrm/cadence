@@ -36,13 +36,13 @@ docs/*
 !docs/CLI.md
 !docs/DEV-CYCLE.md
 !docs/EXTERNAL-TEST-RECIPE.md
+!docs/FIRST-RUN.md
 !docs/HOSTED-LEASE.md
 !docs/INSTALL-AGENT.md
 !docs/NATIVE_MESSAGING.md
 !docs/RELEASING.md
 !docs/REMOTE-AUTH.md
 !docs/REMOTE-RESULT-OUTBOX.md
-!docs/REVIEW-EVIDENCE.md
 !docs/REVIEW-FLAKES.md
 !docs/SPLIT-MANIFESTS.md
 !docs/START-HERE.md
@@ -55,6 +55,8 @@ docs/cadence/*
 !docs/design/
 docs/design/*
 !docs/design/CAD-1109-app-chat-v1.md
+!docs/design/REVIEW-EVIDENCE.md
+!docs/design/ci-history-and-benchmarks.md
 !docs/design/CONTRACT-TEMPLATE.md
 !docs/design/DEVELOPMENT-TEAM.md
 !docs/design/app-catalog-foundation.md
@@ -79,6 +81,9 @@ docs/roles/*
 !docs/roles/one-review-paths.toml
 !docs/roles/risk-classes.md
 !docs/roles/risk-paths.toml
+!docs/roles/delivery-gate.allowed_signers
+!docs/roles/review-workflow-principals.toml
+!docs/roles/workflow-auto-paths.toml
 !docs/guides/
 docs/guides/*
 !docs/guides/agenticos-pi-workers.md
@@ -92,10 +97,12 @@ docs/guides/*
 !docs/guides/chat-attachments.md
 !docs/guides/ci-performance.md
 !docs/guides/connections.md
+!docs/guides/delivery.md
 !docs/guides/crm-package-setup.md
 !docs/guides/external-agents-social.md
 !docs/guides/hosted-image-media.md
 !docs/guides/hosted-workspace.md
+!docs/guides/member-assistant-enrollment.md
 !docs/guides/provider-deployment-metadata.md
 !docs/guides/rollout-checklist.md
 !docs/guides/wiki-knowledge.md

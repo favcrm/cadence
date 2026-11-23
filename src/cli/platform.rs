@@ -138,7 +138,7 @@ pub(crate) enum PlatformAction {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// List every registered adapter's reviewed tool table (local only).
+    /// List the selected org's available platform tools.
     Tools {
         /// Machine output: the RPC answer unchanged.
         #[arg(long)]
@@ -147,13 +147,31 @@ pub(crate) enum PlatformAction {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Call one reviewed platform tool through the daemon's gate.
+    /// Call one platform tool through the selected org's gate.
     Call {
         /// The tool name as `platform tools` prints it.
         tool: String,
-        /// Inline JSON, `@file`, a file path, or `-` for stdin.
+        /// The tool's input as one JSON object: inline, `@file`, a file path,
+        /// or `-` for stdin. A hosted org forwards this as the call's request
+        /// body; a local adapter takes it as its own input.
+        #[arg(long, required_unless_present = "query")]
+        input: Option<String>,
+        /// Hosted orgs only: the tool's query fields as one JSON object. A
+        /// tool may take query fields, a body, or both. Local adapters have
+        /// no query half, so they refuse this flag.
         #[arg(long)]
-        input: String,
+        query: Option<String>,
+        /// Stable handle for this call. Hosted calls derive one from the tool,
+        /// input and any connection when omitted, and replay the recorded
+        /// outcome of the same handle instead of charging twice. A local
+        /// connected read creates a fresh handle when omitted and reports it
+        /// if its outcome is unknown. For provider, connected-read or media
+        /// calls, inspect `platform status` after an uncertain result; an
+        /// unrecorded retry can charge again. App writes are not tracked
+        /// there: inspect the app's records and keep the same request and
+        /// input. Use a fresh handle only for a deliberate new call.
+        #[arg(long)]
+        request: Option<String>,
         /// Disambiguate when several adapters declare the same tool.
         #[arg(long)]
         platform: Option<String>,
@@ -163,6 +181,72 @@ pub(crate) enum PlatformAction {
         /// Project whose default account applies.
         #[arg(long)]
         project: Option<String>,
+        /// CAD-1974: the provider connection this read reads — required by a
+        /// tool listed with `connected_read`. Never inferred: a read of
+        /// somebody else's account is not a read the caller asked for.
+        #[arg(long)]
+        connection: Option<String>,
+        /// Local device connected-read ceiling in USD micro-units, required by
+        /// the existing device protocol. Hosted workspaces use their balance
+        /// and do not accept this flag.
+        #[arg(long)]
+        max_charge: Option<u64>,
+    },
+    /// Hosted orgs only: stage a draft/send connected tool for its owner's
+    /// approval. Nothing runs: the board holds the exact call until an owner
+    /// approves it there.
+    Stage {
+        /// The draft/send tool name (a connected tool, not a read).
+        tool: String,
+        /// The tool's input as one JSON object: inline, `@file`, a file path,
+        /// or `-` for stdin.
+        #[arg(long)]
+        input: String,
+        /// The provider connection the staged call would act through.
+        #[arg(long)]
+        connection: String,
+        /// Stable handle for the staged action. The same handle with the same
+        /// call replays the same action; the same handle with a different
+        /// call is refused. Omitted: derived from the tool, input and
+        /// connection.
+        #[arg(long)]
+        request: Option<String>,
+    },
+    /// Read-only lookup of a hosted platform call or media job by request handle
+    /// or job id. Never dispatches, reserves, settles or polls a provider.
+    Status {
+        /// Stable request handle (`--request` or derived `pcli_…` key).
+        #[arg(long, required_unless_present_any = ["job", "tool"])]
+        request: Option<String>,
+        /// Hosted media job id (`med_…`).
+        #[arg(long)]
+        job: Option<String>,
+        /// Tool name to derive the request key from (with `--input`/`--query`)
+        /// or verify same-key payload compatibility.
+        #[arg(long)]
+        tool: Option<String>,
+        /// Tool request body JSON (inline, `@file`, path, or `-`) used to derive
+        /// or verify the request key.
+        #[arg(long)]
+        input: Option<String>,
+        /// Hosted tool query JSON (inline, `@file`, path, or `-`) used to derive
+        /// or verify the request key.
+        #[arg(long)]
+        query: Option<String>,
+        /// Connection used by a hosted connected read. Supply the same
+        /// `--tool` and `--input` as the call to reconcile its exact payload.
+        #[arg(long)]
+        connection: Option<String>,
+    },
+    /// Download a completed hosted media artifact (`med_<jobId>.<sha256>`) to a
+    /// local file, verifying its SHA-256 digest and byte length before writing.
+    Artifact {
+        /// Durable media artifact reference (`med_<jobId>.<sha256>`).
+        #[arg(value_name = "REF")]
+        reference: String,
+        /// Local destination file path to create (refuses if the file already exists).
+        #[arg(long)]
+        out: PathBuf,
     },
     /// List the per-project default platform accounts.
     Defaults,
@@ -341,26 +425,56 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
         PlatformAction::Call {
             tool,
             input,
+            query,
+            request,
             platform,
             account,
             project,
+            connection,
+            max_charge,
         } => {
+            if query.is_some() {
+                return Err(Error::rejected(
+                    "local `platform call` takes one --input object: --query is a \
+                     hosted-org flag, where the platform splits query fields from \
+                     the request body",
+                ));
+            }
+            let input = input.as_deref().ok_or_else(|| {
+                Error::usage("platform call needs --input or, on a hosted org, --query")
+            })?;
+            // Read input before opening the session so a slow stdin cannot hold
+            // a daemon connection between discovery and the paid call.
+            let input = parse_platform_input(input)?;
             let mut listing = json!({});
             if let Some(project) = project {
                 listing["project"] = json!(project);
             }
-            let tools = rpc("platform_tools", listing)?;
-            let (owner, direct) = resolve_platform_tool(&tools, tool, platform.as_deref())?;
-            if !direct {
+            let mut session = client::RpcSession::connect(state_dir)?;
+            let tools = session.answer("platform_tools", listing)??;
+            let (owner, facts) = resolve_platform_tool(&tools, tool, platform.as_deref())?;
+            // A connector nobody has enrolled cannot run, and the listing says
+            // why: refusing here keeps the reason the daemon computed instead
+            // of a later "no credential" from a different layer.
+            if let Some(reason) = facts.unavailable {
+                return Err(Error::rejected(reason.to_string()));
+            }
+            if !facts.direct {
                 return Err(Error::rejected(format!(
                     "'{tool}' on '{owner}' has no plain platform call; it runs through \
                      its own reviewed path"
                 )));
             }
+            // CAD-1974: a connected read states its connection and the charge
+            // it accepts. Decided here, before the daemon loads a credential,
+            // so an incomplete call never reaches the platform.
+            let (connection, max_charge) =
+                connected_read_flags(tool, facts, connection.clone(), *max_charge)?;
+            let agenticos_provider = owner == cadence_agent::platform::agenticos_provider::PLATFORM;
             let mut params = json!({
                 "platform": owner,
                 "tool": tool,
-                "input": parse_platform_input(input)?,
+                "input": input,
             });
             if let Some(account) = account {
                 params["account"] = json!(account);
@@ -368,7 +482,72 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             if let Some(project) = project {
                 params["project"] = json!(project);
             }
-            print_json(&rpc("platform_call", params)?);
+            if !facts.connected_read {
+                if let Some(request) = request {
+                    params["request"] = json!(request);
+                }
+            }
+            if let Some(connection) = connection {
+                params["connection"] = json!(connection);
+            }
+            if let Some(max_charge) = max_charge {
+                params["max_charge_minor"] = json!(max_charge);
+            }
+            if facts.connected_read {
+                let generated;
+                let handle = match request.as_deref() {
+                    Some(handle) => handle,
+                    None => {
+                        generated = uuid::Uuid::new_v4().simple().to_string();
+                        &generated
+                    }
+                };
+                params["request"] = json!(handle);
+                let unknown = |reason: &str| {
+                    Error::unknown(format!(
+                        "Connected read outcome is unknown: {reason}. Provider key read-{handle}; reconcile with the same --request handle {handle:?}. No automatic retry was made."
+                    ))
+                };
+                let value = match session.answer("platform_call", params) {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) if matches!(error.kind(), "unknown" | "internal") => {
+                        return Err(unknown(&error.to_string()));
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => return Err(unknown(&error.to_string())),
+                };
+                if value["result"] != "executed"
+                    || value["effect"] != "read"
+                    || value.get("platform_result").is_none()
+                    || value["platform_result"].is_null()
+                    || (agenticos_provider
+                        && !cadence_agent::platform::agenticos_provider::valid_connected_read_receipt(
+                            &value["platform_result"],
+                        ))
+                {
+                    return Err(unknown("the daemon returned no confirmable receipt"));
+                }
+                print_json(&value);
+            } else {
+                drop(session);
+                print_json(&rpc("platform_call", params)?);
+            }
+        }
+        PlatformAction::Stage { .. } => {
+            return Err(Error::rejected(
+                "`platform stage` stages a connected tool for a hosted workspace owner's approval — pass `--org <workspace>`. Nothing was sent",
+            ));
+        }
+        PlatformAction::Status { .. } => {
+            return Err(Error::rejected(
+                "`platform status` reconciles a hosted workspace call — pass `--org <workspace>`, \
+                 or use `cadence platform effects` for local staged effects",
+            ));
+        }
+        PlatformAction::Artifact { .. } => {
+            return Err(Error::rejected(
+                "`platform artifact` downloads a hosted workspace media artifact — pass `--org <workspace>`",
+            ));
         }
         PlatformAction::Defaults => {
             print_json(&rpc("platform_defaults", json!({}))?);
@@ -422,13 +601,25 @@ pub(super) fn run(state_dir: PathBuf, action: PlatformAction) -> Result<i32> {
     run_platform(&state_dir, &action)
 }
 
+/// What a listing row says about one tool. `direct` is whether a plain
+/// `platform call` can run it; `connected_read` is whether that call must name
+/// its connection and ceiling first (CAD-1974).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ToolFacts<'a> {
+    pub(super) direct: bool,
+    pub(super) connected_read: bool,
+    /// Why this tool cannot run: either the daemon's own availability reason
+    /// or an unsupported connected-read recovery protocol.
+    pub(super) unavailable: Option<&'a str>,
+}
+
 /// One tool's owning platform from the listing. `platform` narrows it;
 /// without it the tool must have exactly one owner.
-fn resolve_platform_tool(
-    listing: &Value,
+fn resolve_platform_tool<'a>(
+    listing: &'a Value,
     tool: &str,
     platform: Option<&str>,
-) -> Result<(String, bool)> {
+) -> Result<(String, ToolFacts<'a>)> {
     let mut owners = Vec::new();
     for entry in listing["platforms"].as_array().into_iter().flatten() {
         let Some(name) = entry["platform"].as_str() else {
@@ -443,7 +634,22 @@ fn resolve_platform_tool(
             .flatten()
             .find(|decl| decl["tool"].as_str() == Some(tool))
         {
-            owners.push((name.to_string(), decl["direct"].as_bool().unwrap_or(false)));
+            let connected_read = decl["connected_read"].as_bool().unwrap_or(false);
+            let unavailable = decl["unavailable"].as_str().or_else(|| {
+                (connected_read && decl["connected_read_recovery"].as_bool() != Some(true))
+                    .then_some(
+                        "this daemon does not support connected-read recovery; update and restart \
+                         it before calling this tool",
+                    )
+            });
+            owners.push((
+                name.to_string(),
+                ToolFacts {
+                    direct: decl["direct"].as_bool().unwrap_or(false),
+                    connected_read,
+                    unavailable,
+                },
+            ));
         }
     }
     match owners.len() {
@@ -468,7 +674,7 @@ fn resolve_platform_tool(
 
 /// Bounded JSON object for one platform call: inline, `@file`, a path, or
 /// `-` for stdin. The daemon enforces its own bound as well.
-fn parse_platform_input(raw: &str) -> Result<Value> {
+pub(super) fn parse_platform_input(raw: &str) -> Result<Value> {
     use std::io::Read;
     const MAX_INPUT_BYTES: usize = 64 * 1024;
     let bytes = if raw == "-" {
@@ -517,34 +723,214 @@ fn parse_platform_input(raw: &str) -> Result<Value> {
     Ok(input)
 }
 
+/// Format scale-6 USD micro-units (1 USD = 1,000,000 units) unambiguously as
+/// `USD <whole>.<6-digits>` (e.g., `123456` -> `"USD 0.123456"`).
+pub(super) fn format_scale6_usd(charge_minor: u64) -> String {
+    format!(
+        "USD {}.{:06}",
+        charge_minor / 1_000_000,
+        charge_minor % 1_000_000
+    )
+}
+
+/// Human-facing price and outcome lines for a hosted platform response,
+/// preserving raw machine-readable JSON on stdout while stating scale-6 USD
+/// amounts and distinguishing informational provider credits.
+pub(super) fn platform_human_summary(body: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for entry in tools {
+            let name = entry
+                .get("tool")
+                .or_else(|| entry.get("slug"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(minor) = entry.pointer("/price/chargeMinor").and_then(Value::as_u64) {
+                lines.push(format!(
+                    "cadence platform price tool={name} {} (chargeMinor={minor}, scale=6 USD micro-units)",
+                    format_scale6_usd(minor)
+                ));
+            } else if let Some(amount) = entry.pointer("/price/amount").and_then(Value::as_str) {
+                let currency = entry
+                    .pointer("/price/currency")
+                    .and_then(Value::as_str)
+                    .unwrap_or("USD");
+                let unit = entry.pointer("/unitPrice/amount").and_then(Value::as_str);
+                let unit_currency = entry.pointer("/unitPrice/currency").and_then(Value::as_str);
+                let mut line = format!(
+                    "cadence platform price tool={name} per_call={currency} {amount} (scale=6)"
+                );
+                if let (Some(unit_amount), Some(unit_currency)) = (unit, unit_currency) {
+                    line.push_str(&format!(
+                        " per_unit={unit_currency} {unit_amount} (scale=6)"
+                    ));
+                }
+                lines.push(line);
+            }
+        }
+    }
+    let data = body.get("data").unwrap_or(body);
+    // AOS-627: a staged connected effect names the board's action, never a
+    // provider result. Say what its state means before anything else.
+    if let Some(action) = data.get("action_id").and_then(Value::as_str) {
+        let outcome = data.get("outcome").and_then(Value::as_str).unwrap_or("-");
+        let meaning = match outcome {
+            "pending" => {
+                "PENDING OWNER APPROVAL: the call did NOT run; nothing runs until an owner \
+                 approves this action on the board"
+            }
+            "applied" => "the owner already approved this action and it ran",
+            "failed" => "the owner approved this action but it failed",
+            "denied" => "the owner denied this action; it did not run",
+            _ => "unrecognised state; treat the call as not run",
+        };
+        lines.push(format!(
+            "cadence platform stage action={action} outcome={outcome}: {meaning}"
+        ));
+        if data.get("replayed").and_then(Value::as_bool) == Some(true) {
+            lines.push("cadence platform stage: replay of an action already staged under this request; nothing new was staged".into());
+        }
+        return lines;
+    }
+    if let Some(outcome) = data.get("outcome").and_then(Value::as_str) {
+        let key = data.get("key").and_then(Value::as_str).unwrap_or("-");
+        let job_status = data
+            .pointer("/job/status")
+            .or_else(|| data.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        lines.push(format!(
+            "cadence platform status outcome={outcome} request={key} job_status={job_status}"
+        ));
+    }
+    if let Some(minor) = data
+        .pointer("/job/price/chargeMinor")
+        .or_else(|| data.pointer("/billing/chargeMinor"))
+        .and_then(Value::as_u64)
+    {
+        let billing = data
+            .pointer("/job/billing")
+            .or_else(|| data.pointer("/billing/state"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut line = format!(
+            "cadence platform charge: {} (chargeMinor={minor}, scale=6 USD micro-units, billing={billing})",
+            format_scale6_usd(minor)
+        );
+        if let Some(credits) = data
+            .pointer("/job/usage/providerCredits")
+            .or_else(|| data.pointer("/billing/providerCredits"))
+            .and_then(Value::as_f64)
+        {
+            line.push_str(&format!(
+                "; providerCredits={credits} (informational provider credits, not USD customer charge)"
+            ));
+        }
+        lines.push(line);
+    } else if let Some(amount) = data.pointer("/price/amount").and_then(Value::as_str) {
+        let currency = data
+            .pointer("/price/currency")
+            .and_then(Value::as_str)
+            .unwrap_or("USD");
+        lines.push(format!(
+            "cadence platform charge: {currency} {amount} (scale=6)"
+        ));
+    }
+    lines
+}
+
 fn print_platform_tools(listing: &Value) {
-    println!(
-        "{:<16} {:<24} {:<7} {:<6} {:<16}",
-        "PLATFORM", "TOOL", "EFFECT", "DIRECT", "ACCOUNT"
-    );
+    for line in platform_tool_lines(listing) {
+        println!("{line}");
+    }
+}
+
+/// The `platform tools` table as text, one row per tool. Split out so the
+/// unavailable rule is checkable without capturing stdout.
+fn platform_tool_lines(listing: &Value) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:<20} {:<24} {:<7} {:<6} {:<9} {:<16}",
+        "PLATFORM", "TOOL", "EFFECT", "DIRECT", "CONNECTED", "ACCOUNT"
+    )];
     for entry in listing["platforms"].as_array().into_iter().flatten() {
         let platform = entry["platform"].as_str().unwrap_or_default();
         let account = entry["default_account"].as_str().unwrap_or("");
         for decl in entry["tools"].as_array().into_iter().flatten() {
-            println!(
-                "{:<16} {:<24} {:<7} {:<6} {:<16}",
+            // CAD-1974: a tool with no enrolled account is not runnable, so it
+            // never prints as one. The reason follows the table.
+            let available = decl["available"].as_bool().unwrap_or(true);
+            if let Some(reason) = decl["unavailable"].as_str().filter(|_| !available) {
+                lines.push(format!(
+                    "{platform} {} is unavailable: {reason}",
+                    decl["tool"].as_str().unwrap_or_default()
+                ));
+            }
+            lines.push(format!(
+                "{:<20} {:<24} {:<7} {:<6} {:<9} {:<16}",
                 platform,
                 decl["tool"].as_str().unwrap_or_default(),
                 decl["effect"].as_str().unwrap_or_default(),
-                if decl["direct"].as_bool() == Some(true) {
+                if !available {
+                    "no"
+                } else if decl["direct"].as_bool() == Some(true) {
                     "yes"
                 } else {
                     "app"
                 },
+                if decl["connected_read"].as_bool() == Some(true) {
+                    "yes"
+                } else {
+                    ""
+                },
                 account,
-            );
+            ));
         }
     }
+    lines
+}
+
+/// CAD-1974: the flags one `platform call` must carry, decided from the
+/// listing's own declaration. A connected read needs both; any other tool
+/// takes neither, so a stray flag refuses instead of being dropped.
+fn connected_read_flags(
+    tool: &str,
+    facts: ToolFacts<'_>,
+    connection: Option<String>,
+    max_charge: Option<u64>,
+) -> Result<(Option<String>, Option<u64>)> {
+    if !facts.connected_read {
+        if connection.is_some() || max_charge.is_some() {
+            return Err(Error::usage(format!(
+                "--connection and --max-charge belong to a connected read; \
+                 '{tool}' takes neither"
+            )));
+        }
+        return Ok((None, None));
+    }
+    let connection = connection.ok_or_else(|| {
+        Error::usage(format!(
+            "'{tool}' reads one connection: pass --connection <id>"
+        ))
+    })?;
+    let max_charge = max_charge.ok_or_else(|| {
+        Error::usage(format!(
+            "'{tool}' is a priced read: pass --max-charge <minor units>"
+        ))
+    })?;
+    Ok((Some(connection), Some(max_charge)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CAD-1974 independent (non-author) refusal check: pins the admission rule
+    // this batch adds, written by a reviewer rather than the implementer.
+    #[path = "cad1974_refusal_tests.rs"]
+    mod cad1974_refusal_tests;
 
     fn listing() -> Value {
         json!({"platforms": [
@@ -556,15 +942,71 @@ mod tests {
              "tools": [{"tool":"post_draft","effect":"draft","scopes":["draft"],"label":"Draft","direct":true},
                        {"tool":"publish_post","effect":"send","scopes":["publish"],"label":null,"direct":true}]},
             {"platform": "local", "manifest_version": null, "default_account": null,
-             "tools": [{"tool":"publish","effect":"send","scopes":["publish"],"label":null,"direct":true}]}
+             "tools": [{"tool":"publish","effect":"send","scopes":["publish"],"label":null,"direct":true}]},
+            {"platform": "agenticos-provider", "manifest_version": "cadence-provider-tools@1",
+             "default_account": null,
+             "tools": [{"tool":"search_console_report","effect":"read","scopes":["provider.read"],"label":"Report","direct":true,"connected_read":true}]}
         ]})
     }
 
     #[test]
     fn a_tool_resolves_to_its_one_owner() {
-        let (owner, direct) = resolve_platform_tool(&listing(), "post_draft", None).unwrap();
+        let list = listing();
+        let (owner, facts) = resolve_platform_tool(&list, "post_draft", None).unwrap();
         assert_eq!(owner, "agenticos");
-        assert!(direct);
+        assert!(facts.direct);
+        assert!(!facts.connected_read);
+    }
+
+    /// CAD-1974: the listing is what tells `platform call` it must carry a
+    /// connection and a ceiling — never the tool's name.
+    /// CAD-1974: an unenrolled connector never prints as runnable, and the
+    /// listing's own reason is the one shown.
+    #[test]
+    fn an_unavailable_connected_read_prints_no_with_its_reason() {
+        let listing = json!({"platforms": [
+            {"platform": "agenticos-provider", "default_account": null,
+             "tools": [
+                {"tool":"search_console_report","effect":"read","direct":true,
+                 "connected_read":true,"available":true},
+                {"tool":"analytics_report","effect":"read","direct":true,
+                 "connected_read":true,"available":false,
+                 "unavailable":"no credential is enrolled for agenticos-provider"}]}
+        ]});
+        let text = platform_tool_lines(&listing).join("\n");
+        assert!(
+            text.contains("analytics_report is unavailable: no credential is enrolled"),
+            "{text}"
+        );
+        let unavailable_row = text
+            .lines()
+            .find(|line| {
+                line.starts_with("agenticos-provider") && line.contains("analytics_report")
+            })
+            .expect("the unavailable tool still prints a row");
+        assert!(
+            unavailable_row.contains(" no "),
+            "DIRECT must read `no`, not `yes`: {unavailable_row}"
+        );
+        let available_row = text
+            .lines()
+            .find(|line| {
+                line.starts_with("agenticos-provider") && line.contains("search_console_report")
+            })
+            .expect("the enrolled tool prints a row");
+        assert!(available_row.contains(" yes "), "{available_row}");
+    }
+
+    #[test]
+    fn a_connected_read_is_listed_as_one() {
+        let list = listing();
+        let (owner, facts) = resolve_platform_tool(&list, "search_console_report", None).unwrap();
+        assert_eq!(owner, "agenticos-provider");
+        assert!(
+            facts.direct,
+            "it is a plain platform call, with two required flags"
+        );
+        assert!(facts.connected_read);
     }
 
     #[test]
@@ -590,11 +1032,41 @@ mod tests {
         assert!(error.to_string().contains("does not declare"), "{error}");
     }
 
+    /// CAD-1974: the four flag shapes, decided before any daemon call.
+    #[test]
+    fn a_connected_read_requires_both_flags_and_other_tools_take_neither() {
+        let read = ToolFacts {
+            direct: true,
+            connected_read: true,
+            unavailable: None,
+        };
+        let plain = ToolFacts {
+            direct: true,
+            connected_read: false,
+            unavailable: None,
+        };
+        assert_eq!(
+            connected_read_flags("t", read, Some("con_a".into()), Some(25)).unwrap(),
+            (Some("con_a".to_string()), Some(25))
+        );
+        let error = connected_read_flags("t", read, None, Some(25)).unwrap_err();
+        assert!(error.to_string().contains("--connection"), "{error}");
+        let error = connected_read_flags("t", read, Some("con_a".into()), None).unwrap_err();
+        assert!(error.to_string().contains("--max-charge"), "{error}");
+        let error = connected_read_flags("t", plain, Some("con_a".into()), Some(25)).unwrap_err();
+        assert!(error.to_string().contains("takes neither"), "{error}");
+        assert_eq!(
+            connected_read_flags("t", plain, None, None).unwrap(),
+            (None, None)
+        );
+    }
+
     #[test]
     fn an_app_run_only_tool_is_listed_but_not_direct() {
-        let (owner, direct) = resolve_platform_tool(&listing(), "generate_image", None).unwrap();
+        let list = listing();
+        let (owner, facts) = resolve_platform_tool(&list, "generate_image", None).unwrap();
         assert_eq!(owner, "account-images");
-        assert!(!direct, "account images run only inside an app run");
+        assert!(!facts.direct, "account images run only inside an app run");
     }
 
     #[test]
@@ -630,5 +1102,154 @@ mod tests {
             "a".repeat(64 * 1024 - prefix.len() - suffix.len() + 1)
         );
         assert!(parse_platform_input(&over).is_err());
+    }
+
+    // CAD-2127: `chargeMinor` is scale-6 USD (micro-units), so it must never
+    // print as whole dollars or as cents. Independently authored from the
+    // ticket's money-units requirement.
+    #[test]
+    fn platform_charge_minor_formats_as_scale6_usd() {
+        assert_eq!(format_scale6_usd(123_456), "USD 0.123456");
+        assert_eq!(format_scale6_usd(60_000), "USD 0.060000");
+        assert_eq!(format_scale6_usd(0), "USD 0.000000");
+        assert_eq!(format_scale6_usd(1_250_000), "USD 1.250000");
+        // Above one dollar the whole part is not truncated to zero.
+        assert_eq!(format_scale6_usd(1_000_001), "USD 1.000001");
+    }
+
+    // CAD-2127: the human summary states the scale-6 USD charge next to the
+    // raw micro-units, and never lets informational provider credits stand in
+    // for the customer's USD charge.
+    #[test]
+    fn platform_human_summary_separates_usd_charge_from_provider_credits() {
+        let body = json!({
+            "ok": true,
+            "tools": [
+                {"tool": "generate_image", "price": {"chargeMinor": 60_000}},
+            ],
+            "data": {
+                "outcome": "recorded",
+                "key": "pcli_0123456789abcdef",
+                "job": {
+                    "status": "succeeded",
+                    "price": {"chargeMinor": 123_456},
+                    "billing": "settled",
+                    "usage": {"providerCredits": 2.5},
+                },
+            },
+        });
+        let lines = platform_human_summary(&body);
+        let text = lines.join("\n");
+
+        // The listed price is scale-6 USD, with the raw unit kept alongside.
+        assert!(text.contains("tool=generate_image USD 0.060000"), "{text}");
+        assert!(text.contains("chargeMinor=60000"), "{text}");
+
+        // The outcome line names the request handle and the job status.
+        assert!(text.contains("outcome=recorded"), "{text}");
+        assert!(text.contains("request=pcli_0123456789abcdef"), "{text}");
+        assert!(text.contains("job_status=succeeded"), "{text}");
+
+        // The charge itself is the chargeMinor, formatted from micro-units,
+        // and the billing state is stated with it.
+        let charge = lines
+            .iter()
+            .find(|line| line.contains("cadence platform charge:"))
+            .unwrap_or_else(|| panic!("no charge line in {text}"));
+        assert!(charge.contains("USD 0.123456"), "{charge}");
+        assert!(charge.contains("chargeMinor=123456"), "{charge}");
+        assert!(charge.contains("billing=settled"), "{charge}");
+
+        // providerCredits is labelled as informational provider credit, and
+        // is not printed as USD money or as the charge amount.
+        let credits = lines
+            .iter()
+            .find(|line| line.contains("providerCredits"))
+            .unwrap_or_else(|| panic!("no provider-credit line in {text}"));
+        assert!(credits.contains("providerCredits=2.5"), "{credits}");
+        assert!(credits.contains("informational"), "{credits}");
+        assert!(credits.contains("not USD customer charge"), "{credits}");
+        assert!(
+            !credits.contains("USD 2") && !credits.contains("chargeMinor=2"),
+            "provider credits must not be formatted as the USD charge: {credits}"
+        );
+        assert!(
+            charge.contains("providerCredits"),
+            "the informational credit belongs to the charge line, not a separate price: {charge}"
+        );
+
+        // A bare charge with no credits still states scale-6 USD and never
+        // invents a provider-credit figure.
+        let bare = platform_human_summary(
+            &json!({"data": {"job": {"price": {"chargeMinor": 1_250_000}}}}),
+        );
+        let bare_text = bare.join("\n");
+        assert!(bare_text.contains("USD 1.250000"), "{bare_text}");
+        assert!(!bare_text.contains("providerCredits"), "{bare_text}");
+    }
+
+    // CAD-2127 follow-up (independent security review): the runtime catalog
+    // publishes a zero base for a per-unit-priced tool (`price.amount`
+    // "0.000000") beside the real `unitPrice`. A human line showing only the
+    // base reads as a free invocation, so both rates must be labelled, kept
+    // distinct, and never collapsed into one "price".
+    #[test]
+    fn a_zero_call_price_with_a_unit_price_never_reads_as_free() {
+        let listing = json!({"tools": [{
+            "tool": "generate_video",
+            "effect": "draft",
+            "price": {"currency": "USD", "scale": 6, "amount": "0.000000"},
+            "unitPrice": {"currency": "USD", "scale": 6, "amount": "0.123456"},
+        }]});
+        let lines = platform_human_summary(&listing);
+        let price = lines
+            .iter()
+            .find(|line| line.contains("cadence platform price"))
+            .unwrap_or_else(|| panic!("no price line in {lines:?}"));
+
+        // Both rates are shown, each under its own label.
+        assert!(price.contains("per_call=USD 0.000000"), "{price}");
+        assert!(price.contains("per_unit=USD 0.123456"), "{price}");
+        // Neither label carries the other's amount.
+        assert!(!price.contains("per_call=USD 0.123456"), "{price}");
+        assert!(!price.contains("per_unit=USD 0.000000"), "{price}");
+        assert_eq!(price.matches("per_call=").count(), 1, "{price}");
+        assert_eq!(price.matches("per_unit=").count(), 1, "{price}");
+        // The zero base appears once, and only as the per-call part, so it can
+        // never be the whole price a caller reads.
+        assert_eq!(price.matches("0.000000").count(), 1, "{price}");
+        assert_eq!(price.matches("0.123456").count(), 1, "{price}");
+        // A catalog listing is not a charge line: nothing claims a $0 charge.
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("cadence platform charge")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 1, "one catalog tool, one line: {lines:?}");
+    }
+
+    // CAD-2127 follow-up: a tool name no catalog declares — including one
+    // whose newline could forge a correlation line — refuses while the call is
+    // still being resolved, before any daemon request exists.
+    #[test]
+    fn an_undeclared_or_unsafe_tool_name_refuses_before_a_platform_call() {
+        let list = listing();
+        for tool in [
+            "generate_image\nforged request=pcli_0000",
+            "Publish",
+            "publish post",
+            "-publish",
+            "",
+        ] {
+            let error = resolve_platform_tool(&list, tool, None)
+                .expect_err("a name no platform declares must refuse");
+            let message = error.to_string();
+            assert_eq!(error.kind(), "rejected", "{tool:?}: {message}");
+            assert!(message.contains("platform tools"), "{tool:?}: {message}");
+        }
+        // The declared name still resolves, so the refusal is about the name,
+        // not about every call.
+        assert!(resolve_platform_tool(&list, "publish", None).is_ok());
     }
 }

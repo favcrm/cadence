@@ -51,8 +51,15 @@ fn tagged_views<'v>(views: &'v [board::View], tag: &str) -> Vec<&'v board::View>
 
 fn live_views(pm: &Pm, state_dir: Option<&Path>) -> Result<Vec<board::View>> {
     let issues = board::load_all(&pm.dir, None)?;
-    let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-    Ok(board::views_with_jobs(
+    // Tracker-only callers (no runtime in hand) keep pre-job
+    // derivation; with one, both sprint verbs classify work by derived
+    // status, so unknown job state must refuse rather than carry a
+    // job-blocked ticket as a survivor or pick it as ready.
+    let jobs = state_dir
+        .map(board::fetch_job_state)
+        .unwrap_or_else(board::JobState::tracker_only);
+    jobs.require("issue sprint")?;
+    Ok(board::views_with_job_state(
         &pm.config.notes_dir(),
         issues,
         &jobs,

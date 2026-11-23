@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="lit" x1="0" y1="0" x2="0.574" y2="0.819" gradientUnits="objectBoundingBox">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="#0B0B0C"/>
+  <!-- inner highlight: soft white echo of the lit chevron, 8% -->
+  <path d="M 424 368 L 560 512 L 424 656" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- dim chevron -->
+  <path d="M 232 336 L 416 512 L 232 688" fill="none" stroke="#2DD4BF" stroke-opacity="0.55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- lit chevron -->
+  <path d="M 408 336 L 592 512 L 408 688" fill="none" stroke="url(#lit)" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- cursor block -->
+  <rect x="656" y="656" width="160" height="64" rx="32" fill="#2DD4BF" fill-opacity="0.7"/>
+</svg>

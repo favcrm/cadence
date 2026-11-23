@@ -157,15 +157,15 @@ pub fn secret_path(state_dir: &Path) -> PathBuf {
 fn check_dir(dir: &Path) -> Result<()> {
     let md = fs::symlink_metadata(dir).map_err(|e| {
         refuse(format!(
-            "{}: {e} — run `cadence ui login` to create the operator secret",
-            dir.display()
+            "Path {}: {e} — run `cadence ui login` to create the operator secret",
+            crate::printed_command::shown(dir)
         ))
     })?;
     if !md.is_dir() {
         return Err(refuse(format!(
-            "{} is not a directory (a symlink or a file) — refusing it; move it aside \
+            "Path {} is not a directory (a symlink or a file) — refusing it; move it aside \
              and run `cadence ui login --rotate`",
-            dir.display()
+            crate::printed_command::shown(dir)
         )));
     }
     if md.uid() != euid() {
@@ -178,10 +178,10 @@ fn check_dir(dir: &Path) -> Result<()> {
     }
     if md.mode() & 0o077 != 0 {
         return Err(refuse(format!(
-            "{} has mode {:03o}; it must be private — run `chmod 700 {}`",
-            dir.display(),
+            "Path {} has mode {:03o}; it must be private — run {}",
+            crate::printed_command::shown(dir),
             md.mode() & 0o777,
-            dir.display()
+            crate::printed_command::with_path("chmod 700", dir, "")
         )));
     }
     Ok(())
@@ -231,14 +231,14 @@ pub fn read_secret(state_dir: &Path) -> Result<String> {
         .map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) {
                 refuse(format!(
-                    "{} is a symlink — refusing it; remove it and run \
+                    "Path {} is a symlink — refusing it; remove it and run \
                      `cadence ui login --rotate`",
-                    path.display()
+                    crate::printed_command::shown(&path)
                 ))
             } else {
                 refuse(format!(
-                    "{}: {e} — run `cadence ui login` to create it",
-                    path.display()
+                    "Path {}: {e} — run `cadence ui login` to create it",
+                    crate::printed_command::shown(&path)
                 ))
             }
         })?;
@@ -259,11 +259,11 @@ pub fn read_secret(state_dir: &Path) -> Result<String> {
     }
     if md.mode() & 0o077 != 0 {
         return Err(refuse(format!(
-            "{} has mode {:03o}; it must be readable by this user only — run \
-             `chmod 600 {}`, then `cadence ui login --rotate` (another user may have read it)",
-            path.display(),
+            "Path {} has mode {:03o}; it must be readable by this user only — run \
+             {}, then `cadence ui login --rotate` (another user may have read it)",
+            crate::printed_command::shown(&path),
             md.mode() & 0o777,
-            path.display()
+            crate::printed_command::with_path("chmod 600", &path, "")
         )));
     }
     let mut raw = String::new();
@@ -271,8 +271,8 @@ pub fn read_secret(state_dir: &Path) -> Result<String> {
     let secret = raw.trim();
     if !well_formed(secret) {
         return Err(refuse(format!(
-            "{} does not hold a well-formed secret — run `cadence ui login --rotate`",
-            path.display()
+            "Path {} does not hold a well-formed secret — run `cadence ui login --rotate`",
+            crate::printed_command::shown(&path)
         )));
     }
     Ok(secret.to_string())
@@ -383,10 +383,10 @@ pub fn read_private(state_dir: &Path, name: &str) -> Result<Vec<u8>> {
         return Err(Error::invalid(
             "capability_unavailable",
             format!(
-                "{} has mode {:03o}; it must be private — run `chmod 600 {}`",
-                path.display(),
+                "Path {} has mode {:03o}; it must be private — run {}",
+                crate::printed_command::shown(&path),
                 md.mode() & 0o777,
-                path.display()
+                crate::printed_command::with_path("chmod 600", &path, "")
             ),
         ));
     }
@@ -409,7 +409,8 @@ pub enum LinkRefusal {
     AlreadyUsed,
     /// Older than [`LINK_TTL_SECS`].
     Expired,
-    /// Minted for the other origin (loopback vs tailnet).
+    /// Minted for another origin or audience (board vs the pinned entry
+    /// origin, or loopback vs tailnet).
     WrongOrigin,
 }
 
@@ -437,8 +438,9 @@ impl LinkRefusal {
             }
             Self::Expired => "this login link expired — run `cadence ui login` again",
             Self::WrongOrigin => {
-                "this login link was minted for another address (loopback vs tailnet) — \
-                 run `cadence ui login` (or `--tailnet`) for the address you opened"
+                "this login link was minted for another address or audience \
+                 (board vs trusted credential origin, or loopback vs tailnet) — \
+                 run the matching `cadence ui login` for the page you opened"
             }
         }
     }
@@ -513,6 +515,12 @@ pub struct PublicRealm {
     pub host: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DedicatedBinding {
+    pub deployment: String,
+    pub assertion_jti: String,
+}
+
 /// CAD-1374: a stored public row's identity, with no authority claim.
 /// `revoked` lets a denial be audited against a withdrawn session.
 pub(crate) struct PublicSnapshot {
@@ -520,6 +528,7 @@ pub(crate) struct PublicSnapshot {
     pub view: SessionView,
     pub realm: Option<PublicRealm>,
     pub revoked: bool,
+    pub dedicated: Option<DedicatedBinding>,
 }
 
 /// The verified platform tenancy a public session was opened under
@@ -545,6 +554,15 @@ struct Row {
     #[serde(default)]
     key_hash: String,
     origin: Origin,
+    /// CAD-1085: the exact root-pinned credential-entry origin this session
+    /// was issued for. `None` is an ordinary board session and can never
+    /// satisfy the typed entry check; an entry-scoped row can never satisfy
+    /// the ordinary board check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry_origin: Option<String>,
+    /// Private continuation scope. Device sessions do not use a board link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry_handoff: Option<EntryHandoff>,
     created: i64,
     last_used: i64,
     expires_at: i64,
@@ -565,6 +583,8 @@ struct Row {
     /// legacy public rows and on every local session.
     #[serde(default)]
     realm: Option<PublicRealm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dedicated: Option<DedicatedBinding>,
     /// CAD-1374: the platform authority of a public row is withdrawn. The
     /// row keeps its identity until its normal TTL, so a denial can name
     /// who was refused, but no authority lookup returns it.
@@ -676,6 +696,43 @@ struct SessionsFile {
     jtis: HashMap<String, i64>,
 }
 
+/// Private continuation scope, never part of the browser session view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EntryHandoff {
+    pub request_id: String,
+    pub public_owner_hash: Option<String>,
+}
+
+/// The typed audience of one login link. A board link and an entry link
+/// never exchange on one another's origin. The entry audience and source
+/// authority survive in the entry session, not in browser-supplied fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LinkScope {
+    Board,
+    /// Compare only the audience at exchange. The source authority comes
+    /// exclusively from the nonce's stored scope.
+    Entry {
+        origin: String,
+        handoff: EntryHandoff,
+    },
+}
+
+impl LinkScope {
+    fn same_audience(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Board, Self::Board) => true,
+            (
+                Self::Entry { origin, handoff },
+                Self::Entry {
+                    origin: other_origin,
+                    handoff: other_handoff,
+                },
+            ) => origin == other_origin && handoff.request_id == other_handoff.request_id,
+            _ => false,
+        }
+    }
+}
+
 /// The daemon's operator-auth state: live link nonces (memory only — a
 /// restart voids every unexchanged link), the spent ones (so a replay
 /// says "already used", not "unknown"), and the persisted sessions.
@@ -687,8 +744,8 @@ struct SessionsFile {
 pub struct Auth {
     path: PathBuf,
     sessions: Vec<Row>,
-    /// nonce hash → (origin, expires_at)
-    links: HashMap<String, (Origin, i64, Option<String>)>,
+    /// nonce hash → (origin, expires_at, upload account, typed audience)
+    links: HashMap<String, (Origin, i64, Option<String>, LinkScope)>,
     /// spent nonce hash → when it would have expired (pruned after)
     spent: HashMap<String, i64>,
     /// seen jti hash → its acceptance deadline (`exp + skew`) — the
@@ -772,7 +829,7 @@ impl Auth {
         // An expired link is kept one more TTL so its refusal can say
         // "expired" rather than "unknown".
         self.links
-            .retain(|_, (_, exp, _)| now <= *exp + LINK_TTL_SECS);
+            .retain(|_, (_, exp, _, _)| now <= *exp + LINK_TTL_SECS);
         self.spent.retain(|_, exp| now <= *exp + LINK_TTL_SECS);
         // A jti stays through its assertion's acceptance deadline — the
         // same horizon `verify` uses — so a replay inside the grace still
@@ -783,11 +840,21 @@ impl Auth {
         before != self.sessions.len()
     }
 
-    /// Mint a single-use link nonce for `origin`. The caller has already
-    /// proved the operator; this only records `sha256(nonce)`. `public`
-    /// is refused outright — those sessions are born only of a verified
-    /// platform assertion, never a login link (CAD-526).
+    /// Mint a single-use link nonce for `origin` on the ordinary board
+    /// audience. The caller has already proved the operator; this only
+    /// records `sha256(nonce)`. `public` is refused outright — those
+    /// sessions are born only of a verified platform assertion, never a
+    /// login link (CAD-526).
     pub fn mint(&mut self, origin: Origin, now: i64) -> Result<String> {
+        self.mint_scoped(origin, LinkScope::Board, now)
+    }
+
+    pub(crate) fn mint_scoped(
+        &mut self,
+        origin: Origin,
+        scope: LinkScope,
+        now: i64,
+    ) -> Result<String> {
         if origin == Origin::Public {
             return Err(Error::invalid(
                 "invalid_request",
@@ -797,15 +864,16 @@ impl Auth {
         self.prune(now);
         let nonce = random_credential()?;
         self.links
-            .insert(digest(&nonce), (origin, now + LINK_TTL_SECS, None));
+            .insert(digest(&nonce), (origin, now + LINK_TTL_SECS, None, scope));
         Ok(nonce)
     }
 
     /// Mint a login link bound to a durable account registered by the
     /// caller after independent native operator authentication.
-    pub fn mint_for_account(
+    pub(crate) fn mint_for_account(
         &mut self,
         origin: Origin,
+        scope: LinkScope,
         now: i64,
         account_id: String,
     ) -> Result<String> {
@@ -819,14 +887,15 @@ impl Auth {
         let nonce = random_credential()?;
         self.links.insert(
             digest(&nonce),
-            (origin, now + LINK_TTL_SECS, Some(account_id)),
+            (origin, now + LINK_TTL_SECS, Some(account_id), scope),
         );
         Ok(nonce)
     }
 
-    /// Exchange `nonce` for a session on `origin`. The nonce is spent by
-    /// the first attempt that names it, whatever the outcome — a refused
-    /// exchange (wrong origin, too late) cannot be retried.
+    /// Exchange `nonce` for an ordinary board session on `origin`. The
+    /// nonce is spent by the first attempt that names it, whatever the
+    /// outcome — a refused exchange (wrong origin/audience, too late)
+    /// cannot be retried.
     pub fn open(
         &mut self,
         nonce: &str,
@@ -834,6 +903,25 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> std::result::Result<Result<Opened>, LinkRefusal> {
+        self.open_scoped(nonce, origin, LinkScope::Board, user_agent, now)
+            .map(|created| created.map(|(opened, _)| opened))
+    }
+
+    /// Exchange `nonce` only for a session minted with the exact `scope`.
+    /// The live profile origin was already re-checked by the caller; this
+    /// enforces that a board link never becomes entry authority and an
+    /// entry link never becomes board authority. An entry audience also
+    /// carries the canonical request UUID that authorized it: a different
+    /// submitted request spends the nonce and creates no session, and the
+    /// returned stored scope is the ONLY destination the caller may use.
+    pub(crate) fn open_scoped(
+        &mut self,
+        nonce: &str,
+        origin: Origin,
+        scope: LinkScope,
+        user_agent: &str,
+        now: i64,
+    ) -> std::result::Result<Result<(Opened, LinkScope)>, LinkRefusal> {
         self.prune(now);
         if !well_formed(nonce) {
             return Err(LinkRefusal::Malformed);
@@ -842,17 +930,46 @@ impl Auth {
         if self.spent.contains_key(&hash) {
             return Err(LinkRefusal::AlreadyUsed);
         }
-        let Some((minted_for, expires, account_id)) = self.links.remove(&hash) else {
+        let Some((minted_for, expires, account_id, stored_scope)) = self.links.remove(&hash) else {
             return Err(LinkRefusal::Unknown);
         };
         self.spent.insert(hash, expires);
         if now > expires {
             return Err(LinkRefusal::Expired);
         }
-        if minted_for != origin {
+        if minted_for != origin || !stored_scope.same_audience(&scope) {
             return Err(LinkRefusal::WrongOrigin);
         }
-        Ok(self.create(origin, user_agent, now, account_id))
+        let (entry_origin, entry_handoff) = match &stored_scope {
+            LinkScope::Board => (None, None),
+            LinkScope::Entry { origin, handoff } => (Some(origin.clone()), Some(handoff.clone())),
+        };
+        let opened = self.create(
+            origin,
+            user_agent,
+            now,
+            account_id,
+            entry_origin,
+            entry_handoff,
+        );
+        Ok(opened.map(|opened| (opened, stored_scope)))
+    }
+
+    /// Spend one link nonce without creating a session. Used when the
+    /// submitted entry origin/profile no longer matches the stored audience:
+    /// the nonce is single-use even on refusal.
+    pub(crate) fn spend_link(&mut self, nonce: &str, now: i64) {
+        self.prune(now);
+        if !well_formed(nonce) {
+            return;
+        }
+        let hash = digest(nonce);
+        if self.spent.contains_key(&hash) {
+            return;
+        }
+        if let Some((_, expires, _, _)) = self.links.remove(&hash) {
+            self.spent.insert(hash, expires);
+        }
     }
 
     fn create(
@@ -861,6 +978,8 @@ impl Auth {
         user_agent: &str,
         now: i64,
         account_id: Option<String>,
+        entry_origin: Option<String>,
+        entry_handoff: Option<EntryHandoff>,
     ) -> Result<Opened> {
         let token = random_credential()?;
         let key = random_credential()?;
@@ -868,6 +987,8 @@ impl Auth {
             hash: digest(&token),
             key_hash: digest(&key),
             origin,
+            entry_origin,
+            entry_handoff,
             created: now,
             last_used: now,
             expires_at: now + ABSOLUTE_SECS,
@@ -875,6 +996,7 @@ impl Auth {
             max_idle_secs: default_idle_secs(),
             user: None,
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id,
@@ -907,9 +1029,14 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> Result<Opened> {
-        self.open_device_account(user, origin, user_agent, now, None)
+        self.open_device_account(user, origin, user_agent, now, None, None)
     }
 
+    /// `entry_origin` is the exact root-pinned credential-entry origin for a
+    /// sign-in performed on that separate browser origin. It is persisted on
+    /// the row and required by [`Self::check_entry`]; a board sign-in passes
+    /// `None`. Entry scope is loopback-only and never upgrades a caller
+    /// string: the daemon RPC validates it against the live profile first.
     pub fn open_device_account(
         &mut self,
         user: BoardUser,
@@ -917,6 +1044,7 @@ impl Auth {
         user_agent: &str,
         now: i64,
         account_id: Option<String>,
+        entry_origin: Option<String>,
     ) -> Result<Opened> {
         self.prune(now);
         if origin == Origin::Public {
@@ -925,6 +1053,18 @@ impl Auth {
                 "public sessions open through a verified assertion, not a device grant",
             ));
         }
+        if let Some(entry) = entry_origin.as_deref() {
+            if origin != Origin::Loopback
+                || !entry.starts_with("https://")
+                || entry.len() > 200
+                || entry.bytes().any(|b| b.is_ascii_whitespace())
+            {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "entry sessions open only for the exact pinned entry origin",
+                ));
+            }
+        }
         if !user.is_operator() {
             return Err(Error::invalid(
                 "invalid_request",
@@ -932,7 +1072,13 @@ impl Auth {
             ));
         }
         self.sessions.retain(|r| {
-            !(r.origin != Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub))
+            let same_subject =
+                r.origin != Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub);
+            // Board and the pinned entry origin are separate browser scopes:
+            // a fresh sign-in ends the earlier session in the SAME scope, not
+            // the operator's session in the other one.
+            let same_scope = r.entry_origin.as_deref() == entry_origin.as_deref();
+            !(same_subject && same_scope)
         });
         let token = random_credential()?;
         let key = random_credential()?;
@@ -940,6 +1086,8 @@ impl Auth {
             hash: digest(&token),
             key_hash: digest(&key),
             origin,
+            entry_origin,
+            entry_handoff: None,
             created: now,
             last_used: now,
             expires_at: now + crate::device_login::REMOTE_ABSOLUTE_SECS,
@@ -947,6 +1095,7 @@ impl Auth {
             max_idle_secs: crate::device_login::REMOTE_IDLE_SECS,
             user: Some(user),
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id,
@@ -976,7 +1125,7 @@ impl Auth {
             user,
             (jti, jti_exp),
             user_agent,
-            (None, None, None),
+            (None, None, None, None),
             now,
             |_| Ok(()),
         )
@@ -1000,7 +1149,7 @@ impl Auth {
             user,
             (jti, jti_exp),
             user_agent,
-            (Some(realm), None, None),
+            (Some(realm), None, None, None),
             now,
             |_| Ok(()),
         )
@@ -1016,7 +1165,7 @@ impl Auth {
         user: BoardUser,
         jti: (&str, i64),
         user_agent: &str,
-        realm: PublicRealm,
+        (realm, dedicated): (PublicRealm, Option<DedicatedBinding>),
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
@@ -1030,7 +1179,7 @@ impl Auth {
             user,
             jti,
             user_agent,
-            (Some(realm), Some(scope), None),
+            (Some(realm), Some(scope), None, dedicated),
             now,
             intent,
         )
@@ -1041,7 +1190,12 @@ impl Auth {
         user: BoardUser,
         (jti, jti_exp): (&str, i64),
         user_agent: &str,
-        (realm, scope, account_id): (Option<PublicRealm>, Option<HumanScope>, Option<String>),
+        (realm, scope, account_id, dedicated): (
+            Option<PublicRealm>,
+            Option<HumanScope>,
+            Option<String>,
+            Option<DedicatedBinding>,
+        ),
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
@@ -1072,6 +1226,8 @@ impl Auth {
             // keyed `check`.
             key_hash: String::new(),
             origin: Origin::Public,
+            entry_origin: None,
+            entry_handoff: None,
             created: now,
             last_used: now,
             expires_at: now + PUBLIC_SESSION_SECS,
@@ -1079,6 +1235,7 @@ impl Auth {
             max_idle_secs: default_idle_secs(),
             user: Some(user),
             realm,
+            dedicated,
             revoked: false,
             scope,
             account_id,
@@ -1172,6 +1329,56 @@ impl Auth {
         origin: Origin,
         now: i64,
     ) -> Result<Option<SessionView>> {
+        self.check_scoped(token, key, origin, None, now, Row::view)
+    }
+
+    /// Verify one live session bound to the exact root-pinned entry origin.
+    /// An ordinary board session never matches, and an entry session can
+    /// never satisfy [`Self::check`]: the entry cookie is a distinct scope,
+    /// not board authority.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn check_entry(
+        &mut self,
+        token: &str,
+        key: &str,
+        entry_origin: &str,
+        request_id: Option<&str>,
+        now: i64,
+    ) -> Result<Option<(SessionView, Option<String>)>> {
+        let checked = self.check_scoped(
+            token,
+            key,
+            Origin::Loopback,
+            Some(entry_origin),
+            now,
+            |row| {
+                let public_owner_hash = match &row.entry_handoff {
+                    Some(handoff) => {
+                        if request_id.is_some_and(|id| id != handoff.request_id) {
+                            return None;
+                        }
+                        handoff.public_owner_hash.clone()
+                    }
+                    // Device entry was authorized directly, not by a
+                    // board handoff. Other old rows must reauthorize.
+                    None if row.user.as_ref().is_some_and(BoardUser::is_operator) => None,
+                    None => return None,
+                };
+                Some((row.view(), public_owner_hash))
+            },
+        )?;
+        Ok(checked.flatten())
+    }
+
+    fn check_scoped<T>(
+        &mut self,
+        token: &str,
+        key: &str,
+        origin: Origin,
+        entry_origin: Option<&str>,
+        now: i64,
+        project: impl FnOnce(&Row) -> T,
+    ) -> Result<Option<T>> {
         let mut dirty = self.prune(now);
         if !well_formed(token) || !well_formed(key) {
             if dirty {
@@ -1188,14 +1395,24 @@ impl Auth {
                 // Both compared in full, whatever the first says.
                 let token_ok = same_credential(&r.hash, &hash);
                 let key_ok = same_credential(&r.key_hash, &key_hash);
-                token_ok & key_ok && r.origin == origin
+                let scope_ok = match entry_origin {
+                    // Ordinary board session: rows carrying an entry scope
+                    // are never board authority.
+                    None => r.entry_origin.is_none(),
+                    // Typed entry scope: loopback origin plus the exact
+                    // entry origin persisted at sign-in.
+                    Some(want) => {
+                        r.origin == Origin::Loopback && r.entry_origin.as_deref() == Some(want)
+                    }
+                };
+                token_ok & key_ok & (r.origin == origin) & scope_ok
             })
             .map(|row| {
                 if now - row.last_used >= TOUCH_EVERY_SECS {
                     row.last_used = now;
                     dirty = true;
                 }
-                row.view()
+                project(row)
             });
         if dirty {
             self.persist()?;
@@ -1325,7 +1542,7 @@ impl Auth {
         }
         let gone = self.sessions.len();
         self.sessions.clear();
-        for (hash, (_, exp, _)) in self.links.drain() {
+        for (hash, (_, exp, _, _)) in self.links.drain() {
             self.spent.insert(hash, exp);
         }
         self.persist()?;
@@ -1459,6 +1676,7 @@ impl Auth {
             hash: row.hash.clone(),
             view: row.view(),
             realm: row.realm.clone(),
+            dedicated: row.dedicated.clone(),
             revoked: row.revoked,
         })
     }
@@ -1473,6 +1691,7 @@ impl Auth {
                 hash: r.hash.clone(),
                 view: r.view(),
                 realm: r.realm.clone(),
+                dedicated: r.dedicated.clone(),
                 revoked: r.revoked,
             })
     }
@@ -1495,6 +1714,7 @@ impl Auth {
                 hash: r.hash.clone(),
                 view: r.view(),
                 realm: r.realm.clone(),
+                dedicated: r.dedicated.clone(),
                 revoked: r.revoked,
             })
             .collect()
@@ -1549,6 +1769,59 @@ mod tests {
         fs::symlink_metadata(path).unwrap().mode() & 0o777
     }
 
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn cad2487_continued_entry_session_cannot_authorize_another_request() {
+        let dir = state();
+        let mut auth = Auth::load(dir.path());
+        let now = 1_000;
+        let entry = "https://entry.example.test";
+        let request = "0b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b";
+        let account = "acu-11111111111111111111111111111111";
+        let owner_hash = digest("synthetic public session");
+        let scope = |public_owner_hash| LinkScope::Entry {
+            origin: entry.into(),
+            handoff: EntryHandoff {
+                request_id: request.into(),
+                public_owner_hash,
+            },
+        };
+        let nonce = auth
+            .mint_for_account(
+                Origin::Loopback,
+                scope(Some(owner_hash.clone())),
+                now,
+                account.into(),
+            )
+            .unwrap();
+        let (opened, _) = auth
+            .open_scoped(&nonce, Origin::Loopback, scope(None), "", now)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            auth.open_scoped(&nonce, Origin::Loopback, scope(None), "", now),
+            Err(LinkRefusal::AlreadyUsed)
+        ));
+
+        let mut auth = Auth::load(dir.path());
+        let (session, parent) = auth
+            .check_entry(&opened.token, &opened.key, entry, Some(request), now)
+            .unwrap()
+            .expect("the exchanged session can authorize the original request");
+        assert_eq!(session.account_id.as_deref(), Some(account));
+        assert_eq!(parent.as_deref(), Some(owner_hash.as_str()));
+        assert!(auth
+            .check_entry(
+                &opened.token,
+                &opened.key,
+                entry,
+                Some("1b9c53a1-6f0e-4b7a-9a4e-1f4d7f4f1a2b"),
+                now,
+            )
+            .unwrap()
+            .is_none());
+    }
+
     /// CAD-1006 follow-up: the cap binds a session by its row's FULL
     /// credential hash, not the 8-hex display `id`. Two rows that share
     /// the same first-8 prefix but differ after: revoking one must NOT
@@ -1566,6 +1839,8 @@ mod tests {
             hash: format!("{}{}", prefix, suffix),
             key_hash: "k".repeat(64),
             origin: Origin::Loopback,
+            entry_origin: None,
+            entry_handoff: None,
             created: now,
             last_used: now,
             expires_at: now + 10_000,
@@ -1573,6 +1848,7 @@ mod tests {
             max_idle_secs: IDLE_SECS,
             user: None,
             realm: None,
+            dedicated: None,
             revoked: false,
             scope: None,
             account_id: None,
@@ -1631,6 +1907,51 @@ mod tests {
         let first = read_secret(s.path()).unwrap();
         assert!(!ensure_secret(s.path()).unwrap());
         assert_eq!(read_secret(s.path()).unwrap(), first);
+    }
+
+    /// These paths used to print unquoted, so a crafted name ran as a command even
+    /// from the decoded message.
+    #[test]
+    fn a_loose_dir_prints_chmod_only_for_a_path_safe_to_paste() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("has;semi colon");
+        fs::create_dir(&state).unwrap();
+        ensure_secret(&state).unwrap();
+        chmod(&dir(&state), 0o755);
+        let shown = read_secret(&state).unwrap_err().to_string();
+        let quoted = format!("`chmod 700 '{}'`", dir(&state).display());
+        assert!(shown.contains(&quoted), "{shown}");
+
+        let state = root.path().join("it's");
+        fs::create_dir(&state).unwrap();
+        ensure_secret(&state).unwrap();
+        chmod(&dir(&state), 0o755);
+        let shown = read_secret(&state).unwrap_err().to_string();
+        assert!(shown.contains("`chmod 700 VALUE_1`"), "{shown}");
+        assert!(shown.contains("cannot be printed"), "{shown}");
+
+        for name in crate::printed_command::tests::CRAFTED {
+            let state = root.path().join(name);
+            fs::create_dir(&state).unwrap();
+            ensure_secret(&state).unwrap();
+            chmod(&dir(&state), 0o755);
+            let shown = read_secret(&state).unwrap_err().to_string();
+            crate::printed_command::tests::assert_inert_when_pasted(&shown);
+
+            // A malformed secret, and a symlink where the secret belongs.
+            chmod(&dir(&state), 0o700);
+            let path = secret_path(&state);
+            fs::write(&path, "not a secret").unwrap();
+            let shown = read_secret(&state).unwrap_err().to_string();
+            assert!(shown.contains("well-formed"), "{shown}");
+            crate::printed_command::tests::assert_inert_when_pasted(&shown);
+
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(root.path().join("elsewhere"), &path).unwrap();
+            let shown = read_secret(&state).unwrap_err().to_string();
+            assert!(shown.contains("symlink"), "{shown}");
+            crate::printed_command::tests::assert_inert_when_pasted(&shown);
+        }
     }
 
     /// S2: every loose shape is refused and never repaired — the mode is

@@ -16,14 +16,20 @@ import {
   ConnectIcon,
   CubeIcon,
   DashboardSquare01Icon,
+  Delete02Icon,
+  DeletePutBackIcon,
+  DocumentValidationIcon,
   File01Icon,
   Folder01Icon,
   Home01Icon,
+  InformationCircleIcon,
   KanbanIcon,
   MailSend01Icon,
   Menu01Icon,
   Moon02Icon,
   MoreHorizontalIcon,
+  PanelLeftOpenIcon,
+  PanelLeftCloseIcon,
   PinIcon,
   Pulse01Icon,
   RefreshIcon,
@@ -105,9 +111,21 @@ export const IconSettings = ({ size = 15, ...rest }: IconProps = {}) => (
 export const IconWiki = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={File01Icon} size={size} {...rest} />
 );
+/** Documents — the hosted document lifecycle (CAD-2286). */
+export const IconDocuments = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={DocumentValidationIcon} size={size} {...rest} />
+);
 /** A folder in the wiki tree and its empty state. */
 export const IconFolder = ({ size = 14, ...rest }: IconProps = {}) => (
   <Glyph icon={Folder01Icon} size={size} {...rest} />
+);
+/** The wiki's Trash: deleted landings an operator can restore. */
+export const IconTrash = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={Delete02Icon} size={size} {...rest} />
+);
+/** Restore one landing out of Trash. */
+export const IconRestore = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={DeletePutBackIcon} size={size} {...rest} />
 );
 /** The disclosure chevron; rotate it for open rows. */
 export const IconChevron = ({ size = 10, ...rest }: IconProps = {}) => (
@@ -116,6 +134,14 @@ export const IconChevron = ({ size = 10, ...rest }: IconProps = {}) => (
 /** Tree disclosure; the row rotates it when the folder is open. */
 export const IconCaret = ({ size = 10, ...rest }: IconProps = {}) => (
   <Glyph icon={ArrowRight01Icon} size={size} {...rest} />
+);
+/** Collapse the desktop sidebar to its compact rail. */
+export const IconSidebarCollapse = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={PanelLeftOpenIcon} size={size} {...rest} />
+);
+/** Expand the compact desktop rail. */
+export const IconSidebarExpand = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={PanelLeftCloseIcon} size={size} {...rest} />
 );
 /** Pin a row to the top of its list. */
 export const IconPin = ({ size = 12, ...rest }: IconProps = {}) => (
@@ -186,4 +212,9 @@ export const IconUpdate = ({ size = 18, ...rest }: IconProps = {}) => (
 /** Daemon connection — paired plugs, distinct from activity and refresh. */
 export const IconConnection = ({ size = 18, ...rest }: IconProps = {}) => (
   <Glyph icon={ConnectIcon} size={size} {...rest} />
+);
+
+/** Assistant details / About — an information affordance, not a warning. */
+export const IconInfo = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={InformationCircleIcon} size={size} {...rest} />
 );

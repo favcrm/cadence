@@ -1,0 +1,70 @@
+{
+  "role": "agent",
+  "kind": "record_ref",
+  "text": "2 of 120 contacts from Synthetic CRM.",
+  "payload": {
+    "v": 1,
+    "toolkit": "synthetic_crm",
+    "tool": "synthetic_crm_list_contacts",
+    "items": [
+      {
+        "id": "c_1001",
+        "name": "Alex Example",
+        "visits": 4,
+        "tags": ["vip"]
+      },
+      {
+        "id": "c_1002",
+        "name": "Sam Sample",
+        "visits": 1,
+        "tags": ["new", "internal"]
+      }
+    ],
+    "fields": [
+      {
+        "key": "id",
+        "label": "ID",
+        "type": "string",
+        "untrusted": false
+      },
+      {
+        "key": "name",
+        "label": "Name",
+        "type": "string",
+        "untrusted": true
+      },
+      {
+        "key": "visits",
+        "label": "Visits",
+        "type": "integer",
+        "untrusted": false
+      },
+      {
+        "key": "tags",
+        "label": "Tags",
+        "type": "string_array",
+        "untrusted": true
+      }
+    ],
+    "view": "list",
+    "roles": {
+      "title": "name",
+      "subtitle": "id",
+      "badge": "tags",
+      "labels": {
+        "vip": "VIP",
+        "new": "New",
+        "internal": null
+      },
+      "unread": {
+        "key": "tags",
+        "values": ["new"]
+      }
+    },
+    "truncated": true,
+    "tool_label": "List contacts",
+    "toolkit_label": "Synthetic CRM",
+    "account": "Main CRM",
+    "total": 120
+  }
+}

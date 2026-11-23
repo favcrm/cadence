@@ -27,6 +27,7 @@ globalThis.fetch = (async (input: unknown) => {
 }) as typeof fetch;
 const master = {
   alias: "master", provider: "fixture", endpoint_kind: "managed", live: true,
+  identity: { name: null, tone: null, look: "robot" as const, revision: "fixture" },
   turn: { state: "working" as const, message: "run-a", conversation: "conv-a", app_origin: { install_id: "install-a", context_id: "ctx-a", conversation_id: "conv-a" } },
   queue: [{ message: "queue-b", conversation: "conv-b" }, { message: "home-q", conversation: "home-thread" }],
 };

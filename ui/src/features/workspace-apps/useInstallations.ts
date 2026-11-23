@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { loadFailureMessage, loadWithBackoff } from "./installationsLoad";
-import { appExplorer, workspaceApps, type Installation } from "./workspaceApps";
+import { appExplorer, readInstallationsFresh, readInstallationsSnapshot, type Installation } from "./workspaceApps";
 
 export interface InstallationsState {
   /** The last good list; `null` until one answer has arrived. Kept across failed refreshes. */
@@ -32,12 +32,16 @@ async function memberRows(signal: AbortSignal): Promise<Installation[]> {
     name: row.name,
     title: row.title,
     removed: row.attention?.state === "removed" ? 1 : null,
+    state: row.attention?.state === "removed" ? "removed" : undefined,
     project_link: row.project ?? "",
+    navigation: row.navigation ?? null,
+    i18n: row.i18n ?? null,
+    listing: row.listing ?? null,
   }) as unknown as Installation);
 }
 
 export function useInstallations(enabled: boolean, refreshKey: unknown, source: "list" | "home" = "list"): InstallationsState {
-  const [list, setList] = useState<Installation[] | null>(null);
+  const [list, setList] = useState<Installation[] | null>(() => (enabled && source === "list" ? readInstallationsSnapshot() : null));
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -48,10 +52,13 @@ export function useInstallations(enabled: boolean, refreshKey: unknown, source: 
       setList(null); setError(null); setRetrying(false); setLoading(false);
       return;
     }
+    if (source === "list") {
+      setList((prev) => prev ?? readInstallationsSnapshot());
+    }
     const controller = new AbortController();
     setLoading(true);
     setRetrying(false);
-    loadWithBackoff(() => source === "home" ? memberRows(controller.signal) : workspaceApps.installations(controller.signal), {
+    loadWithBackoff(() => source === "home" ? memberRows(controller.signal) : readInstallationsFresh(controller.signal), {
       signal: controller.signal,
       onRetry: () => { if (!controller.signal.aborted) setRetrying(true); },
     }).then(

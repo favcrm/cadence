@@ -8,6 +8,16 @@ use crate::adapter::Probe;
 use crate::issue;
 use crate::peer::PeerTies;
 
+/// A server-derived send binding, never selected by message parameters.
+pub(super) enum SendBinding<'a> {
+    IssueLane {
+        issue: &'a str,
+        worktree: &'a str,
+        authorized_until: f64,
+    },
+    TopicPost(&'a str),
+}
+
 /// CAD-565: the largest window one `message read` returns — Unicode
 /// scalars, matching the pty paste ceiling so a single page can carry
 /// anything a pane could.
@@ -47,6 +57,53 @@ pub(super) fn admit_message_list(who: &caller_rule::Who, target: &str) -> Result
             "message_list refused: an unproven caller cannot list mail ({why})"
         ))),
     }
+}
+
+/// Whether a normal send actually supplied `value`: absent, null, false and
+/// empty containers are the shapes the CLI fills for unset flags, so they
+/// carry no instruction and are not treated as a field.
+fn send_field_supplied(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(false) => false,
+        Value::String(text) => !text.is_empty(),
+        Value::Array(rows) => !rows.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        _ => true,
+    }
+}
+
+/// The only normal-send fields a cloud target accepts. A cloud agent is one
+/// remote conversational turn: it has no live pane to steer, no local queue
+/// to prioritize or supersede, no task/job lane and no dispatch to attach. A
+/// supplied field outside this set is refused whole — never silently dropped,
+/// and never reinterpreted as a new paid turn. The local path's own refusals
+/// for these fields (`send --nudge`, forged `turn_id`, `expected_recipient_uid`,
+/// `issue`/`worktree`, `--task`, `reply_to`) run inside `send_with_…`, which a
+/// cloud alias never reaches, so this is that same envelope for the cloud
+/// route — checked BEFORE any transport call.
+fn admit_cloud_send(params: &Value) -> Result<()> {
+    const CLOUD_SEND_FIELDS: &[&str] = &["alias", "text", "message"];
+    let object = params
+        .as_object()
+        .ok_or_else(|| Error::rejected("cloud agent send parameters must be an object"))?;
+    let Some((key, value)) = object.iter().find(|(key, value)| {
+        send_field_supplied(value) && !CLOUD_SEND_FIELDS.contains(&key.as_str())
+    }) else {
+        return Ok(());
+    };
+    if key == "nudge" || (key == "source" && value.as_str() == Some(store::NUDGE_SOURCE)) {
+        return Err(Error::rejected(
+            "cloud agent send refused: --nudge is not steering for a cloud agent — it has no \
+             live pane to steer, and this is not turned into a new paid turn; send a normal \
+             message instead",
+        ));
+    }
+    Err(Error::rejected(format!(
+        "cloud agent send refused: '{key}' is not a cloud-agent send field — a cloud agent \
+         has no live pane, local queue, lane or dispatch, so only text and message apply; \
+         nothing was sent"
+    )))
 }
 
 impl Shared {
@@ -99,6 +156,35 @@ impl Shared {
         })
     }
 
+    /// The pinned library image's delivered bytes, proved before a send is
+    /// accepted. The delivery path re-proves the pin and the receiver; this
+    /// preflight only prevents a receipt for an image the turn could not take.
+    fn pinned_image_size(&self, pin: &Value) -> Result<u64> {
+        let rows = pin
+            .as_array()
+            .filter(|rows| rows.len() == 1)
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let asset_id = rows[0]["asset_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let revision = rows[0]["revision"]
+            .as_i64()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let sha = rows[0]["sha256"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let image = self
+            .store
+            .app_media_pinned_display(asset_id, revision, sha)?
+            .ok_or_else(|| {
+                Error::rejected("pinned library image no longer matches the retained bytes")
+            })?;
+        crate::attachment_image::validate_raster(&image.bytes, image.media_type).map_err(|e| {
+            Error::rejected(format!("pinned library image was refused before send: {e}"))
+        })?;
+        Ok(image.bytes.len() as u64)
+    }
+
     /// `agent_send` without a connection to attribute (unit tests):
     /// a threaded agent records the message as unattributed, and a
     /// steering send is the operator's.
@@ -113,6 +199,24 @@ impl Shared {
     /// who queued it, derived from the connection (CAD-319); a steering
     /// send's caller is derived the same way (CAD-158).
     pub(super) fn rpc_send_from(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        if let Some(task) = optional_str(params, "task") {
+            let caller = self.agent_caller(peer_pid, "send --task")?;
+            self.read_task_for(&caller, task)?;
+        }
+        // CAD-1853: a cloud target is not a local queue. The normal send
+        // path reaches the same canonical Thread through the cloud transport.
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if self
+            .store
+            .agent_opt(&alias)?
+            .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER)
+        {
+            // The envelope is validated HERE, before any transport call: the
+            // local path's steering/dispatch refusals must not be bypassed by
+            // routing a cloud alias early.
+            admit_cloud_send(params)?;
+            return self.cloud_send_from(&alias, params, peer_pid, None, None, "cloud agent send");
+        }
         self.send_with(
             params,
             &|alias| self.thread_sender(alias, peer_pid),
@@ -345,7 +449,11 @@ impl Shared {
             steer_refused,
             None,
             None,
-            Some((issue, lane.as_str(), authorized_until)),
+            Some(SendBinding::IssueLane {
+                issue,
+                worktree: lane.as_str(),
+                authorized_until,
+            }),
         )?;
         Ok(true)
     }
@@ -382,9 +490,9 @@ impl Shared {
     /// performer. `thread_send` passes both; every other caller reaches
     /// this through a wrapper above with `None`/`None` for whichever it
     /// does not derive.
-    /// CAD-225: `bound_lane` is `(issue, worktree, authorized_until)`,
-    /// derived server-side by `send_issue_followup`. Other paths pass
-    /// `None`; request fields cannot set lane tags or the grant deadline.
+    /// The server-owned binding supplies either a bounded issue lane or the
+    /// room/topic post whose request is committed atomically with this queue.
+    /// Request fields cannot set either binding or the grant deadline.
     pub(super) fn send_with_human_expected(
         self: &Arc<Self>,
         params: &Value,
@@ -392,8 +500,17 @@ impl Shared {
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
         human: Option<&Value>,
         expected_uid: Option<&str>,
-        bound_lane: Option<(&str, &str, f64)>,
+        binding: Option<SendBinding<'_>>,
     ) -> Result<Value> {
+        let (bound_lane, request_post) = match binding {
+            Some(SendBinding::IssueLane {
+                issue,
+                worktree,
+                authorized_until,
+            }) => (Some((issue, worktree, authorized_until)), None),
+            Some(SendBinding::TopicPost(post)) => (None, Some(post)),
+            None => (None, None),
+        };
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
         let target = self.store.agent_opt(&alias)?;
@@ -702,8 +819,8 @@ impl Shared {
                  needs rows; `cadence send` and `agent_send` carry none",
             ));
         }
-        let attachments = match params.get("attachments") {
-            None | Some(Value::Null) => None,
+        let (attachments, attachment_visual_bytes) = match params.get("attachments") {
+            None | Some(Value::Null) => (None, 0u64),
             Some(_) if sender != store::Sender::OperatorChat => {
                 return Err(Error::rejected(
                     "attachments is a thread_send field — only the operator's chat \
@@ -730,14 +847,15 @@ impl Shared {
                 } else {
                     None
                 };
-                Some(thread_attachments(
+                let (value, visual_bytes) = thread_attachments(
                     self,
                     v,
                     app.as_ref(),
                     account_id.as_deref(),
                     params.get("session").is_some(),
                     home_thread.as_deref().unwrap_or_default(),
-                )?)
+                )?;
+                (Some(value), visual_bytes)
             }
         };
         let media_refs = match params.get("media_refs") {
@@ -749,6 +867,39 @@ impl Shared {
             }
             Some(value) => Some(self.prove_media_refs(value)?),
         };
+        if nudge && (attachments.is_some() || media_refs.is_some()) {
+            return Err(Error::rejected(
+                "--nudge is steering, not a new turn — it cannot carry attachments or a \
+                 library image; send a normal queued message",
+            ));
+        }
+        // Visual delivery is proved before a fresh send receives a receipt:
+        // bounded conversion (an SVG is screened, then rendered), the selected
+        // live runtime/model's image support, and the combined turn-image
+        // bound. Delivery re-proves scope, digest and the model for queued
+        // changes.
+        let pinned_bytes = match &media_refs {
+            Some(pin) => self.pinned_image_size(pin)?,
+            None => 0,
+        };
+        let visual_total = attachment_visual_bytes
+            .checked_add(pinned_bytes)
+            .ok_or_else(|| Error::rejected("native image sizes overflow"))?;
+        if visual_total > crate::attachment_image::TURN_IMAGE_TOTAL_MAX as u64 {
+            return Err(Error::rejected(format!(
+                "the turn carries {visual_total} bytes of native images — over the \
+                 {}-byte cap; remove or downscale an attachment",
+                crate::attachment_image::TURN_IMAGE_TOTAL_MAX
+            )));
+        }
+        if visual_total > 0 && !self.store.message_exists(&message)? {
+            // No live adapter means the selected model's image support cannot
+            // be proved now. Refuse the fresh send rather than accept a queued
+            // turn that provably fails later; a retry of an already-enqueued
+            // message is not a new receipt.
+            let adapter = self.adapter_for(&alias)?;
+            adapter.preflight_turn_images()?;
+        }
         // CAD-1098: app conversations are the master's. Another agent has
         // no per-conversation session, so an app binding to it is refused.
         if home_conversation.is_some() && sender != store::Sender::OperatorChat {
@@ -838,6 +989,7 @@ impl Shared {
             media_refs.as_ref(),
             bound_lane.map(|(_, _, until)| until),
             None,
+            request_post,
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.
@@ -870,26 +1022,60 @@ impl Shared {
     ) -> Result<Value> {
         reject_identity_fields(params, "message_read")?;
         let id = required_str(params, "message")?;
+        let scope = self.project_scope(peer_pid, "message read")?;
+        let private_denials = if scope.is_some() {
+            Some(self.private_job_denials_for_read(params, None, None, peer_pid)?)
+        } else {
+            None
+        };
         let message = self
             .store
             .message(id)?
             .ok_or_else(|| Error::rejected(format!("No such message '{id}'")))?;
+        if scope.is_some() {
+            let task_issues = match message.task_id.as_deref() {
+                Some(task) => self.store.task_issue_bindings(&[task])?,
+                None => Default::default(),
+            };
+            if !super::identity::scope_allows_message(&scope, &message, &task_issues)
+                || private_denials
+                    .as_ref()
+                    .is_some_and(|denied| denied.hides_message(&message))
+            {
+                return Err(Error::rejected(format!("No such message '{id}'")));
+            }
+        }
         if message.source == "app_run_dispatch" {
             match self.connection_caller(peer_pid)? {
                 caller_rule::Who::Operator => {}
                 _ => {
-                    return Err(Error::rejected(
-                        "app mail inspection requires operator proof",
-                    ));
+                    return Err(Error::rejected(format!("No such message '{id}'")));
                 }
             }
         }
+        // CAD-1853: a routed cloud reply lives in the body of a
+        // `worker_result` on the invoker's ordinary alias. The projection
+        // binds those rows to the UIDs the delivery carried; the body reader
+        // asks the same policy, or it reads what `agent_show` withholds.
+        if !self.may_read_cloud_row(
+            peer_pid,
+            &message.alias,
+            &message.id,
+            message.sender_uid.as_deref(),
+            message.recipient_uid.as_deref(),
+        )? {
+            if scope.is_some() {
+                return Err(Error::rejected(format!("No such message '{id}'")));
+            }
+            return Err(Error::rejected(
+                "message_read refused: this message carries another source's cloud \
+                 result and is readable only by its sender, its recipient or the \
+                 operator",
+            ));
+        }
         if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
             if !self.store.agent_reads_message(&message, &caller)? {
-                return Err(Error::rejected(format!(
-                    "message_read refused: agent '{caller}' cannot read another \
-                     agent's mail (caller rule, CAD-480)"
-                )));
+                return Err(Error::rejected(format!("No such message '{id}'")));
             }
         }
         // CAD-1380 target-side privacy: a member assistant's stored message is
@@ -900,10 +1086,7 @@ impl Shared {
                 caller_rule::Who::Operator => {}
                 caller_rule::Who::Agent(caller) if caller == message.alias => {}
                 _ => {
-                    return Err(Error::rejected(
-                        "message_read refused: a member assistant's message is private \
-                         to its assistant (CAD-1380 target-side privacy)",
-                    ))
+                    return Err(Error::rejected(format!("No such message '{id}'")));
                 }
             }
         }
@@ -922,6 +1105,15 @@ impl Shared {
             .ok()
             .flatten()
             .unwrap_or(Value::Null);
+        if let Some(previous) = &private_denials {
+            if self.project_scope(peer_pid, "message read")? != scope
+                || self.private_job_denials_for_read(params, None, None, peer_pid)? != *previous
+            {
+                return Err(Error::rejected(
+                    "message read refused: reader access changed",
+                ));
+            }
+        }
         Ok(json!({
             "message": message.id,
             "text": text,
@@ -947,6 +1139,19 @@ impl Shared {
         let alias = self.resolve_alias(to)?;
         let who = self.connection_caller(peer_pid)?;
         admit_message_list(&who, &alias)?;
+        let scope = self.project_scope(peer_pid, "message list")?;
+        let private_denials = if scope.is_some() {
+            Some(self.private_job_denials_for_read(params, None, None, peer_pid)?)
+        } else {
+            None
+        };
+        let allowed_issues = scope.as_ref().map(|(readable, issues)| {
+            issues
+                .iter()
+                .filter(|(_, project)| readable.contains(*project))
+                .map(|(issue, _)| issue.as_str())
+                .collect::<Vec<_>>()
+        });
         let states = match params.get("state") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(items)) => items
@@ -994,11 +1199,41 @@ impl Shared {
                 since: since.as_deref(),
                 limit,
                 include_app,
+                allowed_issues: allowed_issues.as_deref(),
+                denied_tasks: private_denials.as_ref().map(|denied| &denied.tasks),
+                denied_issues: private_denials.as_ref().map(|denied| &denied.issues),
+                exclude_cloud: private_denials
+                    .as_ref()
+                    .is_some_and(|denied| denied.exclude_cloud),
             },
         )?;
+        let messages = page
+            .rows
+            .iter()
+            .map(|row| {
+                let mut value = row.to_json();
+                if scope.is_some() {
+                    let fields = value.as_object_mut().expect("message index is an object");
+                    // `id` is the continuation handle. The table-global sequence
+                    // exposes activity in unrelated mailboxes and is not needed.
+                    fields.remove("seq");
+                    fields.remove("reply_to");
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        if let Some(previous) = &private_denials {
+            if self.project_scope(peer_pid, "message list")? != scope
+                || self.private_job_denials_for_read(params, None, None, peer_pid)? != *previous
+            {
+                return Err(Error::rejected(
+                    "message list refused: reader access changed",
+                ));
+            }
+        }
         Ok(json!({
             "alias": alias,
-            "messages": page.rows.iter().map(store::MessageIndex::to_json).collect::<Vec<_>>(),
+            "messages": messages,
             "limit": limit,
             "omitted": page.omitted,
             "truncated": page.omitted > 0,
@@ -1790,12 +2025,22 @@ impl Shared {
                     match completion {
                         Ok(finished) => {
                             self.notify_routed_target(&finished, &stored);
+                            // CAD-2215: the durable completion is the
+                            // private ledger's trigger — a member-owned
+                            // kickoff's result is recorded now, not on a
+                            // later verdict or manual reconcile.
+                            let private_delivery = if finished.source == "job_dispatch" {
+                                self.settle_private_completion(&finished.id)
+                            } else {
+                                json!({"state": "not_private"})
+                            };
                             // The report frees the actor's one turn — wake
                             // it so the next queued delivery is claimed
                             // now, not on the idle poll.
                             self.notify_agent(&finished.alias);
                             self.wake();
-                            return Ok(json!({"state": "reported", "kind": kind}));
+                            return Ok(json!({"state": "reported", "kind": kind,
+                                             "private_delivery": private_delivery}));
                         }
                         Err(current) => {
                             current.ok_or_else(|| Error::rejected("Unknown message"))?
@@ -1817,7 +2062,17 @@ impl Shared {
                             "Message already completed with a different result",
                         ));
                     }
-                    return Ok(json!({"state": "completed", "duplicate": true}));
+                    // The completion is already durable (another writer
+                    // or a retried report): settle its private delivery
+                    // here too, idempotently, so the owner is not left
+                    // waiting for a verdict.
+                    let private_delivery = if message.source == "job_dispatch" {
+                        self.settle_private_completion(&message.id)
+                    } else {
+                        json!({"state": "not_private"})
+                    };
+                    return Ok(json!({"state": "completed", "duplicate": true,
+                                     "private_delivery": private_delivery}));
                 } else {
                     return Err(Error::rejected(format!(
                         "Message is not awaiting a report (state {})",
@@ -1899,8 +2154,11 @@ impl Shared {
             &expect,
             &message.id,
             token,
-            action,
-            expected_revision,
+            store::AssistantBootstrapUpdate {
+                action,
+                expected_revision,
+                look: profile.as_ref().and_then(|p| p.look.as_deref()),
+            },
             || {
                 if let Some(p) = profile.as_ref() {
                     bootstrap_files::write_profile(&root, p)?;
@@ -1945,10 +2203,19 @@ impl Shared {
         if let Some(result) = message.result.clone() {
             self.notify_routed_target(&message, &result);
         }
+        // CAD-2215: an operator reconcile to `completed` is a real
+        // completion of the kickoff, so the private ledger settles here
+        // through the same canonical evidence — still no shared effect.
+        let private_delivery = if message.source == "job_dispatch" {
+            self.settle_private_completion(&message.id)
+        } else {
+            json!({"state": "not_private"})
+        };
         // A live actor holding this cloud turn stops polling it now.
         self.notify_agent(&message.alias);
         self.wake();
-        Ok(json!({"state": "reconciled", "message": message.to_json()}))
+        Ok(json!({"state": "reconciled", "message": message.to_json(),
+                  "private_delivery": private_delivery}))
     }
 
     /// Cancel a still-`queued` message — never delivered. The store's

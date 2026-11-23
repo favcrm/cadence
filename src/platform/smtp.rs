@@ -35,7 +35,7 @@ use crate::error::{Error, Result};
 use crate::store::app_records::email_shape_valid;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -882,6 +882,26 @@ pub fn assemble_message(
     message: &SmtpMessage,
     content_digest: &str,
 ) -> Result<String> {
+    assemble_frozen(
+        &envelope.sender_name,
+        &envelope.sender,
+        &envelope.host,
+        message,
+        content_digest,
+    )
+}
+
+/// CAD-1085: assemble the exact RFC 5322 bytes from the non-secret sender
+/// projection alone, so a protected stage can freeze the committed body
+/// without materializing the credential. `assemble_message` delegates here, so
+/// the two can never drift.
+pub fn assemble_frozen(
+    sender_name: &str,
+    sender: &str,
+    host: &str,
+    message: &SmtpMessage,
+    content_digest: &str,
+) -> Result<String> {
     validate_sender(&message.to).map_err(|_| Error::rejected("SMTP recipient is invalid"))?;
     let boundary = format!(
         "cadence-{}",
@@ -900,14 +920,14 @@ pub fn assemble_message(
             {
                 return Err(Error::rejected("SMTP idempotency key exceeds its bounds"));
             }
-            format!("<{key}@{}>", sender_domain(&envelope.sender))
+            format!("<{key}@{}>", sender_domain(sender))
         }
-        None => format!("<{}@{}>", uuid::Uuid::new_v4().simple(), envelope.host),
+        None => format!("<{}@{}>", uuid::Uuid::new_v4().simple(), host),
     };
     let mut out = String::new();
     out.push_str(&format!(
         "From: {}\r\n",
-        header_address(&envelope.sender_name, &envelope.sender)?
+        header_address(sender_name, sender)?
     ));
     out.push_str(&format!("To: <{}>\r\n", message.to));
     out.push_str(&format!(
@@ -1006,32 +1026,46 @@ pub fn direct_dial_count() -> usize {
     DIRECT_DIALS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Resolve an enrolled SMTP host to the address set the session will use,
+/// applying the isolated-test `localhost` rule. Public callers that must vet
+/// the peer before any protocol byte resolve here once and pass the result to
+/// [`send_frozen`]; a later re-resolution can never move the socket.
+pub fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let addresses: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| Error::rejected("SMTP host does not resolve"))?
+        .collect();
+    if addresses.is_empty() {
+        return Err(Error::rejected("SMTP host does not resolve"));
+    }
+    // Refuse to open submission sockets at non-loopback addresses when
+    // the enrolled host is the isolated-test name: `localhost` must
+    // resolve to loopback, never to a LAN or public address a test CA
+    // would then vouch for.
+    if host == "localhost" && !addresses.iter().all(|addr| addr.ip().is_loopback()) {
+        return Err(Error::rejected(
+            "SMTP isolated-test host must resolve to loopback",
+        ));
+    }
+    Ok(addresses)
+}
+
 struct SmtpSession {
     wire: Wire,
 }
 
 impl SmtpSession {
-    fn dial(host: &str, port: u16) -> Result<TcpStream> {
+    /// Connect only to the addresses a caller already resolved and vetted.
+    /// The protected dispatch path uses this so the peer it reaches is the
+    /// exact public address set it checked before any protocol byte.
+    fn dial_resolved(addresses: &[SocketAddr]) -> Result<TcpStream> {
         DIRECT_DIALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let addresses: Vec<_> = (host, port)
-            .to_socket_addrs()
-            .map_err(|_| Error::rejected("SMTP host does not resolve"))?
-            .collect();
         if addresses.is_empty() {
             return Err(Error::rejected("SMTP host does not resolve"));
         }
-        // Refuse to open submission sockets at non-loopback
-        // addresses when the enrolled host is the isolated-test
-        // name: `localhost` must resolve to loopback, never to a
-        // LAN or public address a test CA would then vouch for.
-        if host == "localhost" && !addresses.iter().all(|addr| addr.ip().is_loopback()) {
-            return Err(Error::rejected(
-                "SMTP isolated-test host must resolve to loopback",
-            ));
-        }
         let mut last = Error::rejected("SMTP host is unreachable");
         for addr in addresses {
-            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
                 Ok(stream) => {
                     stream
                         .set_read_timeout(Some(IO_TIMEOUT))
@@ -1630,9 +1664,6 @@ pub fn verify_login(
         session = session
             .upgrade_tls(&envelope.host, &tls)
             .map_err(|f| f.classify(Step::Tls))?;
-        session
-            .command(&format!("EHLO {EHLO_NAME}"), &[250])
-            .map_err(|f| f.classify(Step::Tls))?;
     }
     let ehlo = session
         .command(&format!("EHLO {EHLO_NAME}"), &[250])
@@ -1696,34 +1727,44 @@ pub fn send_outcome(
     let secret_text = std::str::from_utf8(&envelope.secret)
         .map_err(|_| Error::rejected("SMTP secret exceeds its supported shape or bounds"))?;
     let tls = tls_config(extra_ca_pem)?;
-    let outcome = send_inner(envelope, message, &body, &tls, secret_text);
-    Ok(match outcome {
+    let addresses = resolve_host(&envelope.host, envelope.port)?;
+    let outcome = send_inner(envelope, message, &body, &tls, secret_text, &addresses);
+    Ok(screened_outcome(outcome, &envelope.secret))
+}
+
+/// Screen every wire result against the credential before it can leave the
+/// adapter.
+fn screened_outcome(
+    outcome: std::result::Result<SmtpReceipt, SmtpOutcome>,
+    secret: &[u8],
+) -> SmtpOutcome {
+    match outcome {
         Ok(receipt) => SmtpOutcome::Accepted {
             code: receipt.code,
-            message: screened(&receipt.message, &envelope.secret),
+            message: screened(&receipt.message, secret),
         },
         Err(SmtpOutcome::Accepted { code, message }) => SmtpOutcome::Accepted {
             code,
-            message: screened(&message, &envelope.secret),
+            message: screened(&message, secret),
         },
         Err(SmtpOutcome::Deferred { code, message }) => SmtpOutcome::Deferred {
             code,
-            message: screened(&message, &envelope.secret),
+            message: screened(&message, secret),
         },
         Err(SmtpOutcome::Rejected { code, message }) => SmtpOutcome::Rejected {
             code,
-            message: screened(&message, &envelope.secret),
+            message: screened(&message, secret),
         },
         Err(SmtpOutcome::NotSubmitted { message }) => SmtpOutcome::NotSubmitted {
-            message: screened(&message, &envelope.secret),
+            message: screened(&message, secret),
         },
         Err(SmtpOutcome::Uncertain { message }) => SmtpOutcome::Uncertain {
-            message: screened(&message, &envelope.secret),
+            message: screened(&message, secret),
         },
         Err(SmtpOutcome::PendingApproval { message }) => SmtpOutcome::PendingApproval {
-            message: screened(&message, &envelope.secret),
+            message: screened(&message, secret),
         },
-    })
+    }
 }
 
 /// Submit one message (CAD-785 test-send shape kept verbatim):
@@ -1750,6 +1791,49 @@ pub fn send(
     }
 }
 
+/// CAD-1085: submit the EXACT frozen RFC 5322 bytes one protected dispatch
+/// committed to. `body` is the byte-exact message the commitment binds — no
+/// re-assembly, no regenerated `Date`/`Message-ID` — and `addresses` is the
+/// public address set the caller vetted, so the socket reaches exactly the
+/// peer that was checked before the first protocol byte.
+pub fn send_frozen(
+    envelope: &SmtpEnvelope,
+    recipient: &str,
+    body: &str,
+    addresses: &[SocketAddr],
+    extra_ca_pem: Option<&[u8]>,
+) -> Result<SmtpOutcome> {
+    validate_sender(recipient).map_err(|_| Error::rejected("SMTP recipient is invalid"))?;
+    validate_port_tls(&envelope.host, envelope.port, &envelope.tls_mode)?;
+    if envelope.secret.iter().any(|b| *b == b'\r' || *b == b'\n') {
+        return Err(Error::rejected(
+            "SMTP secret exceeds its supported shape or bounds",
+        ));
+    }
+    std::str::from_utf8(&envelope.secret)
+        .map_err(|_| Error::rejected("SMTP secret exceeds its supported shape or bounds"))?;
+    if body.len() > 2 * MESSAGE_BYTES_CAP || body.is_empty() || body.as_bytes().contains(&0) {
+        return Err(Error::rejected(
+            "SMTP frozen body exceeds its supported bounds",
+        ));
+    }
+    // Only `to` is read by the dialog: MAIL FROM comes from the verified
+    // envelope and the body is written verbatim.
+    let message = SmtpMessage {
+        to: recipient.to_string(),
+        subject: String::new(),
+        html: String::new(),
+        text: String::new(),
+        unsubscribe_url: String::new(),
+        idempotency_key: None,
+    };
+    let secret_text = std::str::from_utf8(&envelope.secret)
+        .map_err(|_| Error::rejected("SMTP secret exceeds its supported shape or bounds"))?;
+    let tls = tls_config(extra_ca_pem)?;
+    let outcome = send_inner(envelope, &message, body, &tls, secret_text, addresses);
+    Ok(screened_outcome(outcome, &envelope.secret))
+}
+
 fn carries_secret(text: &str, secret: &[u8]) -> bool {
     let secret = String::from_utf8_lossy(secret);
     if secret.is_empty() {
@@ -1770,11 +1854,12 @@ fn send_inner(
     body: &str,
     tls: &Arc<rustls::ClientConfig>,
     secret: &str,
+    addresses: &[SocketAddr],
 ) -> std::result::Result<SmtpReceipt, SmtpOutcome> {
     if envelope.tls_mode == TLS_IMPLICIT {
-        send_implicit_tls(envelope, message, body, tls, secret)
+        send_implicit_tls(envelope, message, body, tls, secret, addresses)
     } else {
-        send_starttls(envelope, message, body, tls, secret)
+        send_starttls(envelope, message, body, tls, secret, addresses)
     }
 }
 
@@ -1787,14 +1872,13 @@ fn send_implicit_tls(
     body: &str,
     tls: &Arc<rustls::ClientConfig>,
     secret: &str,
+    addresses: &[SocketAddr],
 ) -> std::result::Result<SmtpReceipt, SmtpOutcome> {
     // TLS first: the handshake (with certificate verification)
     // completes on first I/O, before the SMTP greeting is read —
     // a server that talks plaintext here errors, never downgrades.
-    let stream = SmtpSession::dial(&envelope.host, envelope.port).map_err(|e| {
-        SmtpOutcome::NotSubmitted {
-            message: e.to_string(),
-        }
+    let stream = SmtpSession::dial_resolved(addresses).map_err(|e| SmtpOutcome::NotSubmitted {
+        message: e.to_string(),
     })?;
     let mut session =
         SmtpSession::tls(stream, &envelope.host, tls).map_err(|_| SmtpOutcome::NotSubmitted {
@@ -1826,11 +1910,10 @@ fn send_starttls(
     body: &str,
     tls: &Arc<rustls::ClientConfig>,
     secret: &str,
+    addresses: &[SocketAddr],
 ) -> std::result::Result<SmtpReceipt, SmtpOutcome> {
-    let stream = SmtpSession::dial(&envelope.host, envelope.port).map_err(|e| {
-        SmtpOutcome::NotSubmitted {
-            message: e.to_string(),
-        }
+    let stream = SmtpSession::dial_resolved(addresses).map_err(|e| SmtpOutcome::NotSubmitted {
+        message: e.to_string(),
     })?;
     let mut session = SmtpSession::plain(stream);
     let greeting = session

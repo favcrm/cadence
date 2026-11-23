@@ -6,7 +6,7 @@
 //! tmp from); `cat` on a blob reads the verified blob bytes directly
 //! once the daemon's ACL check passes.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
@@ -89,8 +89,11 @@ pub enum WikiAction {
     Rm { path: String },
     /// Ranked full-text search over wiki text pages and extracted sources.
     Search {
-        /// The query.
-        q: String,
+        /// The query: one or more words, no quotes needed. Separate words
+        /// are joined with spaces, so `wiki search acme invoice` is the
+        /// same search as `wiki search "acme invoice"` (CAD-1524).
+        #[arg(required = true, num_args = 1..)]
+        q: Vec<String>,
         /// Limit to a subtree (default: the whole wiki).
         #[arg(long)]
         path: Option<String>,
@@ -115,7 +118,11 @@ pub enum WikiAction {
     /// needs `--recursive`. `--update` pins current revisions and may
     /// replace bytes; the default is create-only. `--resume` continues
     /// one import job. `--wait-index` polls that job until the command
-    /// deadline.
+    /// deadline. A local board serves it, and so does a hosted board
+    /// released since 2026-11-12; an older hosted board answers
+    /// `not_implemented`. On a hosted board every operation is two requests
+    /// under one `--wake-timeout`, so a large copy needs a longer timeout or
+    /// `--resume <job>`; a hosted board also sets its own size limits.
     Cp {
         source: String,
         dest: String,
@@ -212,7 +219,7 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                     Ok(0)
                 }
                 Some("text") => {
-                    print!("{}", out["text"].as_str().unwrap_or(""));
+                    crate::output::print_text(out["text"].as_str().unwrap_or(""));
                     Ok(0)
                 }
                 Some("blob") if *meta => {
@@ -227,7 +234,9 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                     let bytes = std::fs::read(&blob).map_err(|e| {
                         Error::rejected(format!("cannot read blob {}: {e}", blob.display()))
                     })?;
-                    std::io::stdout().write_all(&bytes)?;
+                    // Raw blob bytes: a reader that stopped early already
+                    // has what it asked for, so it is not a failed read.
+                    crate::output::write_stdout(&bytes)?;
                     Ok(0)
                 }
                 Some("dir") => Err(Error::rejected(format!(
@@ -343,7 +352,7 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             let out = rpc(
                 state_dir,
                 "wiki_search",
-                json!({"q": q, "path": path.clone().unwrap_or_default()}),
+                json!({"q": q.join(" "), "path": path.clone().unwrap_or_default()}),
             )?;
             if *json {
                 crate::issue::cli::print_json(&out);

@@ -332,12 +332,9 @@ pub trait ReleaseSource {
              the online GitHub path downloads and proves a CI artifact",
         ))
     }
-    /// CAD-561: the PR titles merged between `base` and `head` — what
-    /// `cadence update --check` shows as the change summary. A squash
-    /// merge's subject is the PR title with its number, which is what
-    /// GitHub's compare endpoint returns; a source that cannot answer
-    /// returns an empty list rather than failing the check.
-    fn merged_titles(&self, base: &str, head: &str) -> Result<Vec<String>>;
+    /// PR titles merged between `base` and `head`. `None` means the source
+    /// cannot provide a change summary; an empty list is a verified result.
+    fn merged_titles(&self, base: &str, head: &str) -> Result<Option<Vec<String>>>;
     /// CAD-561: `SCHEMA_VERSION` in `src/rollout.rs` at `sha`, so
     /// `--check` can say whether the new build crosses the store's
     /// schema without downloading or running it. `None` when the file
@@ -529,7 +526,9 @@ impl ReleaseSource for Gh {
                 )));
             }
         }
-        let dir = tempfile::tempdir()?;
+        let dir = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()?;
         self.download(promotion.id, "production-candidate", dir.path())?;
         let receipt = fs::read_to_string(dir.path().join("production-candidate.json"))?;
         let candidate = parse_production_candidate(&receipt, &promotion)?;
@@ -692,10 +691,9 @@ impl ReleaseSource for Gh {
         )))
     }
 
-    /// The compare endpoint's commit subjects, filtered to the squash
-    /// merges that carry a PR number (`CAD-123: title (#456)`) — the
-    /// merged PR titles between the two builds, newest last.
-    fn merged_titles(&self, base: &str, head: &str) -> Result<Vec<String>> {
+    /// Compare subjects, when every commit is a squash merge carrying a PR
+    /// number (`CAD-123: title (#456)`) and the page is not truncated.
+    fn merged_titles(&self, base: &str, head: &str) -> Result<Option<Vec<String>>> {
         let path = format!("repos/{}/compare/{base}...{head}", self.repo);
         let out = self.run(
             &[
@@ -707,14 +705,26 @@ impl ReleaseSource for Gh {
             GH_TIMEOUT,
         )?;
         if !out.status.success() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| is_merged_pr_subject(line))
-            .map(str::to_string)
-            .collect())
+        let output = String::from_utf8_lossy(&out.stdout);
+        let mut subjects = Vec::new();
+        for subject in output.lines().map(str::trim) {
+            // An unlabelled commit or a full, potentially truncated compare
+            // page cannot support a complete PR summary.
+            if !is_merged_pr_subject(subject) {
+                return Ok(None);
+            }
+            subjects.push(subject.to_string());
+            if subjects.len() >= 250 {
+                return Ok(None);
+            }
+        }
+        if subjects.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(subjects))
+        }
     }
 
     /// `src/rollout.rs` at that sha, read as raw content, parsed for
@@ -877,6 +887,7 @@ pub struct Captured {
 fn capture_package(dir: &Path) -> Result<Captured> {
     let workspace = tempfile::Builder::new()
         .prefix("cadence-retained-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()?;
     let dest = workspace.path();
     for (name, max) in [
@@ -1277,8 +1288,8 @@ impl ReleaseSource for OfflineGh {
         Err(Error::rejected(OFFLINE_NO_LIVE))
     }
 
-    fn merged_titles(&self, _base: &str, _head: &str) -> Result<Vec<String>> {
-        Ok(Vec::new())
+    fn merged_titles(&self, _base: &str, _head: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
     }
 
     fn schema_version(&self, _sha: &str) -> Result<Option<i64>> {
@@ -1856,6 +1867,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
                 let id = verify_ci(src, &sha, &mut verified)?;
                 let tmp = tempfile::Builder::new()
                     .prefix("cadence-upgrade-")
+                    .permissions(fs::Permissions::from_mode(0o700))
                     .tempdir()?;
                 src.download(id, &artifact_name(&sha), tmp.path())?;
                 let d = verify_download(src, tmp.path(), &sha, &mut verified)?;

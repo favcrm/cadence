@@ -6,6 +6,12 @@ the app owns its surface and its domain. The shared transport is
 `@cadence/app-kit` plus the host's `screenProtocol`; the shared build input is
 the versioned app toolchain.
 
+For agent-guided day-to-day workflows across bridge caps, sandboxed forms,
+`app-storage/v1`, `@cadence/screen-ui`, and catalog validation, see the bundled
+[`cadence-app-dev`](../../skills/cadence-app-dev/SKILL.md) skill (readable via
+`cadence skill show cadence-app-dev` or linked into agent providers via
+`cadence skill install cadence-app-dev`).
+
 ## What is shared, and what stays app-owned
 
 | Layer | Owner | Contract |
@@ -14,7 +20,7 @@ the versioned app toolchain.
 | Frame, board drawer, scrim, close | Host | `ScreenOutlet` + `screenActions` |
 | Receiver, presentation and drawer helpers | App-kit | `createScreenReceiver`, `presentation()`, `openDrawer()`/`closeDrawer()` |
 | Surface content and app verbs | App | your projection, payload validation and actions |
-| Package and workflow | App | `app/app.md`, `screens/<tag>`, `workflows/` |
+| Package and workflow | App | `app/app.md`, `screens/<tag>`, `skills/<tag>`, `workflows/` |
 | Build toolchain | App repo, pinned | `cadence-app-toolchain-<tag>.tar.gz` |
 | Install and consent | Operator | local CLI catalog or hosted board |
 
@@ -111,8 +117,113 @@ Rules:
   intended path for a host that does not present.
 - The host owns the drawer geometry, scrim and close affordance. The app owns
   its surface and forwards close/Escape only when it has its own fallback.
+- An independent drawer open may carry a bounded, non-authoritative `context`
+  (plain JSON, at most 1024 UTF-8 bytes) for the host-created child. Only that
+  child may read it with `screen.drawer.context {}`; it is never backend or
+  capability authority, never crosses to a sibling mount, and a reopen starts
+  empty. An older host refuses the unknown open argument in place, so the app
+  keeps its local fallback.
 - The app still validates its own PUSH payload and its own verb arguments; the
   kit is transport and lifecycle only.
+
+For `records.create`, the host forwards `validation_failed` only for the
+typed HTTP 400 response: it means no create was committed, so the app can
+keep the draft open for correction and resubmission. A generic rejection or
+missing response doesn't establish whether a record was created. Check fresh
+records before offering another create in those cases.
+
+### Retained source reads
+
+A `screen-actions.v1` screen whose manifest declares the draft alias may read
+the install's retained source library through its verified mount:
+
+- `social.sources.page` — request `{alias, cursor?}`, response
+  `{items, next_cursor, availability}`. An item is `{handle, post}`, where
+  `post` is `{id, caption, published_at, permalink, media_kind, thumb_url?,
+  receipt_id}` (`published_at` is epoch seconds) and a run-bound item also
+  carries `run_id`. Pages are count- and byte-bounded. Omit `cursor` for the
+  first page; a present cursor must be a string. `next_cursor` is opaque and
+  null at the end of the retained scan, not the end of provider history.
+  `availability` is `partial` only when retained material is known but cannot
+  be verified or delivered — another page does not make it partial.
+- `social.sources.get` — request `{alias, receipt_id, post_id}`, response
+  `{item}` or `{item: null}`. It resolves an older draft's exact receipt/post
+  pair (including its `run_id`) without paging; a missing, foreign or
+  mismatched pair never reveals another receipt.
+
+Scope is the host's verified mount and context, never a request field. A scan
+is a snapshot: its cursor is bound to the scope and the scan's fence. Later
+inserts are excluded or the host refuses with `stale_cursor` when it cannot
+continue that snapshot; malformed cursors return `invalid_cursor`. In either
+case the client can restart without discarding cards it already showed.
+For a standalone source-backed draft, the receipt must still be attached to
+the context and the handle must remain a saved source. A run-backed draft
+instead proves the selected receipt and post against its own scoped run.
+
+### Hosted CRM record merge
+
+Declare `records.merge` with `records.call` on a `screen-records.v1` CRM screen
+to merge duplicate customer records on a hosted board. It is a write, not a
+confirmation slot or a read-only capability. The hosted worker requires a
+workspace owner and both the source and target record revisions. The native
+validator accepts the declaration, but the native daemon does not execute it.
+
+### Dated items: `calendar.query`
+
+A `screen-records.v1` screen that declares `calendar.query` (with the
+`records.call` permission) can show the workspace's dated items without reading
+other apps' records. It is a read, so members and read-only mounts may call it.
+
+- Request `{from, to}`: `YYYY-MM-DD` days, half-open (`to` is not included),
+  `to` after `from`, at most 62 days. Anything else, and any other key, is
+  refused.
+- Reply exactly `{entries, zone, sources}`.
+  - `entry` is `{source, id, title, state, needs_you}` plus exactly one of
+    `starts_at` (an RFC 3339 UTC instant) or `date` (an all-day `YYYY-MM-DD`).
+    `source` is `post`, `crm`, `routine`, `task` or `holiday`.
+  - `sources` is `{source, ok}` for each source the host attempted. A source
+    that could not be read is `ok: false`; the others still return. A source
+    the host did not attempt is absent.
+  - `zone` is an IANA zone. The host returns UTC instants; the app places them
+    in `zone`. Until the workspace has a company zone, it is the first social
+    connection's zone, else `UTC`.
+- Sources today: `post` (scheduled social posts), `routine` (slots expanded
+  from the routine's schedule in its own zone, plus its runs), `task` (a
+  project milestone's `target_date` and a campaign work `due_at`, all-day on
+  that date only). `crm` and `holiday` are not served yet.
+- It carries titles, times and status only: never a customer list, message
+  text, caption or recipient. The consent page shows the host's own sentence
+  for an app that declares it; the bundle cannot reword it.
+
+### Routines: `routines.list`
+
+A `screen-records.v1` screen that declares `routines.list` (with the
+`records.call` permission) can list the workspace's routines without reading
+their content. Routines are an operator read today, so only an operator session
+may call it; a member or a read-only mount is refused with the same forbidden
+refusal as any other operator-only call, and no row is returned.
+
+- Request `{}`: no arguments. Any key is refused.
+- Reply exactly `{routines: [row]}`, at most 500 rows, ordered by agent then
+  name. A row has exactly these keys:
+  - `id`: the routine id.
+  - `name`: at most 200 characters.
+  - `agent`: the owning agent alias, at most 120 characters.
+  - `schedule_text`: a plain summary of the trigger, at most 300 characters,
+    such as "Weekdays at 09:00 (Asia/Hong_Kong)", "Every 15 min" or
+    "When <event>". A schedule is written in the company time zone; a routine
+    that names a different zone is written in its own zone, named in the text.
+  - `next_run_at`: optional, an RFC 3339 UTC instant of the next due time.
+    Omitted when there is none.
+  - `status`: `on`, `paused`, `waiting` or `repoint`. `waiting` is a routine
+    waiting for the owner's approval; any other status the host does not
+    recognise reads as `paused`. An app on an older parser sees `waiting` as an
+    unrecognised status, so ship the app after or with the host.
+  - `asks_first`: true when any checklist step requires approval.
+- It never carries routine markdown or script content, paths, digests, inputs,
+  the destination thread, the connection account or run output. The consent
+  page shows the host's own row, "Lists your routines: names, schedules and
+  status only", for an app that declares it.
 
 ## 4. Local loop
 
@@ -199,30 +310,135 @@ Hosted boards read catalogue metadata from `api.internal`; the release document
 is proxied through the closed `catalogue-packages.internal` broker. Every
 install/update is operator-only.
 
+Where private uploads are available, an owner can select **Add private app**
+in Apps, check the ZIP, review the app's description (when the checked package
+provides one), exact version and requested access, then explicitly install it.
+Expand **Technical details** to inspect the package
+digest, file list and precise screen operations. A check does not grant
+access or review the app's behavior.
+When GitHub release ZIPs are enabled, owners can instead enter a public GitHub
+release asset URL (`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>.zip`).
+The ZIP must be no larger than 8 MiB. The check downloads it once; installation
+uses the same checked bytes, not a new download. Technical details show the
+requested URL and downloaded ZIP SHA-256 as provenance, not a safety certification.
+If the install or update result is unconfirmed, it may already have committed.
+Refresh Apps and inspect the installed version before checking the ZIP again;
+do not blindly resubmit it.
+
 ## 7. Existing apps
 
-**Social Content** is the closest, but still has an older path:
+**Social Content** (`0.13.0`) uses the pinned `@cadence/app-kit` through
+`src/screens/receiver.mjs`; `screen-v2.mjs` validates its projection, and the
+screen advertises `screen-surfaces.v1` with an app-local drawer fallback. The
+remaining cleanup is a toolchain bump to `v0.3.20` (app-kit `0.2.0`) and a
+decision on whether the local receiver wrapper still earns its keep. It already
+has the `cadence` package contract, so `cadence app dev --package` is the local
+loop.
 
-1. Pin the first toolchain release that carries app-kit 0.1.2.
-2. Replace `src/screens/receiver.mjs` / `screen-v2.mjs` with the pinned
-   app-kit; do not keep a parallel receiver.
-3. Add the `cadence` contract to `package.json` (app, dev, check) so
-   `cadence app dev --package` is the local loop.
-4. Advertise `screen-presentation.v1` and use the host drawer on a presenting
-   host; keep the app-local drawer only as the fallback.
-5. Remove the locally staged app-kit from the preview; the toolchain is the
-   source. Keep one preview harness.
+**CRM** (`0.3.6`) is a records screen on the vendored app-kit `0.2.0` receiver
+from `cadence-app-toolchain-v0.3.20`; `app-kit.lock.json` pins every file.
+`src/bridge/channel.ts` keeps CRM's request/CSV limits, timeout, guards and
+`ApiError` mapping around the shared receiver. Use it as the records reference:
+`screen-records.v1` plus `screen-startup`, with the app owning the projection
+and the host owning effects and approval.
 
-**CRM** is currently a metadata bundle with host-compiled screens, not a
-screen app. Decide explicitly:
+**WhatsApp Business.** On an owner mount that offers the WhatsApp reply composer,
+the installed bundle may nominate an existing linked-device conversation. The
+board verifies the recipient and owns both the draft and the Send control.
+The send uses the existing one-time confirmation and delivery receipt; status
+checks never resend. Within the same board session, switching threads preserves
+an uncertain reply or the latest accepted direct reply still awaiting delivery.
+Only uncertainty pauses sending. Recovery keeps no message text or confirmation
+token. Older boards and the Official API keep the approval card.
+While recipient verification is pending or unavailable, the board leaves the
+dock in place with a read-only draft and disabled Send. A compatible bundle
+opts into `screen-whatsapp-reply-availability.v1` only when the mount URL offers
+`wa_compose_availability=1`. The board publishes presentation state with the
+ordinal of the existing nomination on that port. It never publishes a
+recipient proof, confirmation token, or draft in this event. Older bundles
+get the status in the dock instead.
+On the primary inbox mount, the `wa_compose_layout=1` offer lets a bundle
+with reply availability opt into `screen-whatsapp-reply-layout.v1`. The
+bundle may send `whatsapp-reply-layout` with the current `nomination` and
+`bounds`: two ordered integers from 0 to 10000 for the physical left and
+right edges of the message pane, relative to the iframe viewport. Use `null`
+when details replace the pane. An old nomination cannot change the layout.
+Unnegotiated or malformed messages close the port. This hint only positions
+or hides the existing dock; it changes no draft, recipient, or send rights.
+If the mount also offers `wa_compose_inset_ack=1`, the bundle may select
+`screen-whatsapp-reply-layout.v2` instead of v1, using the same layout nomination
+and bounds. The board then positions its dock over the measured pane without
+shortening the iframe. It sends `{v:2, op:"whatsapp-reply-inset", nomination, seq, px}`.
+`seq` increases within a nomination; `px` is the requested height, including
+bottom safe-area space, in whole CSS pixels from 0 to 512 (zero means hidden).
+Apply the clearance to the conversation's scroll content, not to the frame or
+the inbox rail. The WABA composer is a solid board-owned card over the pane;
+its bottom inset becomes trailing space in the message list so the latest
+message can scroll clear.
+After the inset and pinned scroll position are committed, echo `nomination`,
+`seq` and `px` in `{v:2, op:"whatsapp-reply-inset-ready", nomination, seq, px}`.
+The board only paints within confirmed space. Ignore old nominations and sequences.
+A v1 or unnegotiated dock stays below the iframe and never sends an inset.
 
-- make it a screen app and adopt the template/toolchain/app-kit; or
-- keep it host-native and do not present the lane-only `src/bridge` preview as
-  the shipped model.
+Do not ship two bridge protocols for one app. A local adapter around app-kit is
+fine when it carries app-specific policy; a second MessagePort implementation is
+not.
 
-Do not ship two bridge protocols for one app.
+## 8. Skill packages
 
-## 8. Do not
+A workflow step can name packaged instructions and helper files instead of
+repeating them in the ticket body. Declare it as the step's last metadata line
+and put the package in the bundle:
+
+```text
+app/
+  workflows/meeting.md       # a step carries `skill: meeting-writer`
+  skills/meeting-writer/
+    skill.json               # {"schema":1,"name":"meeting-writer","files":[…]}
+    SKILL.md
+    references/style.md
+    scripts/build.py
+```
+
+Rules that `cadence app check` enforces offline:
+
+- `skill.json` is a closed decode: `schema: 1`, `name` equal to the directory
+  name, `files` listing every member the package ships and nothing else.
+  `SKILL.md` must be declared; `skill.json` must not list itself.
+- Declared set equals present set in both directions; each mismatch names the
+  path.
+- Members are flat root leaves (`md`, `txt`, `json`, `yaml`, `yml`, `csv`,
+  `css`, `svg`), `scripts/<stem>.py|sh|js|mjs`, or `references/<stem>.md|txt`.
+  No deeper nesting, no dotfiles, no links.
+- Caps: 16 declared members, 16 KiB per member, 4 KiB manifest, 32 KiB per
+  package including the manifest.
+- A token in any declared text file that names package material —
+  `scripts/…`, `references/…`, `skills/<tag>/…`, `./` forms, or a bare
+  `name.ext` with an allowed extension — must name a declared member. This is a
+  declared-inventory contract, not import analysis: the check reads names, so a
+  path assembled at run time is invisible to it, and a bare word that looks
+  like a filename is treated as package material. Keep prose free of
+  path-shaped words, or declare the file.
+- `skill: <tag>` is static and must be the step's last metadata line; it is part
+  of the workflow's gate digest, so changing it re-gates the app approval.
+
+What the host does with a package: at run creation it resolves the tag from the
+installed bundle's file map and freezes the manifest and every declared member,
+with their digests, into `snapshot.workflow.steps[].skill`; dispatch sends that
+frozen object in the kickoff. Nothing is materialized on disk and a later
+bundle update cannot change an existing run's material. `skill:` is refused on
+every path that freezes nothing — `cadence workflow check`, `cadence plan
+propose --workflow <stored-name>`, and `cadence plan propose --workflow
+<app>/<workflow>`.
+
+The limit to state honestly: **script execution is agent-side and unattested.**
+The host freezes bytes and hands them to the assigned worker. It does not run
+`scripts/` itself, does not sandbox them beyond that worker's existing
+confinement, and cannot prove what a worker did with them. A frozen digest
+proves which bytes a run received — never that a script ran, or ran as written.
+Do not present a package digest as evidence of execution.
+
+## 9. Do not
 
 - write a private `postMessage` receiver or a second `screen-surfaces` bridge;
 - copy, patch or vendor the host frame; use `cadence app frame-kit`;
@@ -231,7 +447,8 @@ Do not ship two bridge protocols for one app.
 - use the retired `builtin:` source;
 - assume arbitrary source-based app management works remotely; the published-release catalog commands are the remote path, and source/Git updates use the board;
 - edit the packaged app-kit or regenerate its lockfile;
-- claim the host board is the app's surface; the app owns its surface.
+- claim the host board is the app's surface; the app owns its surface;
+- present a frozen skill-package digest as proof that a script ran.
 
 ## References
 

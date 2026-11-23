@@ -2,6 +2,69 @@
 
 use super::*;
 
+mod links;
+
+pub use links::{add_ref, close_ref, link};
+pub(crate) use links::{apply_link, new_ref};
+
+/// Test-only fault/observation point after a keyed comment's real
+/// `commit_who_scoped` succeeded and before the writer handles its result.
+/// The hook may return an artificial error (simulating an uncertain
+/// commit) but cannot fabricate success or alter production, which is
+/// compiled without this module.
+#[cfg(all(test, feature = "test-seam"))]
+pub mod keyed_commit_seam {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use crate::error::Result;
+
+    pub type Hook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+    static HOOKS: LazyLock<Mutex<BTreeMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    /// Tracker-dir-scoped RAII registration; Drop removes only its own hook.
+    pub struct KeyedCommitSeam {
+        tracker_dir: PathBuf,
+        hook: Hook,
+    }
+
+    impl Drop for KeyedCommitSeam {
+        fn drop(&mut self) {
+            let Ok(mut hooks) = HOOKS.lock() else {
+                return;
+            };
+            let ours = hooks
+                .get(&self.tracker_dir)
+                .is_some_and(|hook| Arc::ptr_eq(hook, &self.hook));
+            if ours {
+                hooks.remove(&self.tracker_dir);
+            }
+        }
+    }
+
+    pub fn arm_keyed_commit_after_success(tracker_dir: &Path, hook: Hook) -> KeyedCommitSeam {
+        let tracker_dir = tracker_dir.to_path_buf();
+        if let Ok(mut hooks) = HOOKS.lock() {
+            hooks.insert(tracker_dir.clone(), Arc::clone(&hook));
+        }
+        KeyedCommitSeam { tracker_dir, hook }
+    }
+
+    pub(super) fn fire(tracker_dir: &Path) -> Result<()> {
+        let hook = HOOKS
+            .lock()
+            .ok()
+            .and_then(|hooks| hooks.get(tracker_dir).cloned());
+        match hook {
+            Some(hook) => hook(),
+            None => Ok(()),
+        }
+    }
+}
+
 /// `key=value` pairs that set `status=done` — the one test `issue set`
 /// and `issue edit` share for the worktree-open hint.
 pub(crate) fn sets_done(pairs: &[String]) -> bool {
@@ -31,7 +94,7 @@ pub(crate) fn check_set_gates(
         // CAD-360: an unapproved plan's tickets stay in backlog.
         crate::issue::plan::check_status_write(&pm.dir, front, &front.status)?;
         if front.status == "done" {
-            check_done_evidence(pm, front, force, staged_artifacts)?;
+            check_done_evidence(pm, project, front, force, staged_artifacts)?;
             forced = force.map(|r| r.trim().to_string());
         }
         // CAD-757: `ready` is the dispatch queue — a blocked ticket
@@ -222,9 +285,14 @@ pub fn patch_issue(
     if patch.status.is_some() {
         // A derived status is not file-writable: roll-up containers,
         // job-bound and note-driven issues refuse with the reason.
+        // Proving "file-authoritative" needs the job table; without it
+        // the gate cannot clear a job-derived status and must refuse.
         let issues = board::load_all(&pm.dir, None)?;
-        let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
-        let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+        let jobs = state_dir
+            .map(board::fetch_job_state)
+            .unwrap_or_else(board::JobState::tracker_only);
+        jobs.require(&format!("patching {id}'s status"))?;
+        let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
         let src = views
             .iter()
             .find(|v| v.issue.front.id == id)
@@ -311,256 +379,6 @@ pub fn patch_issue(
     attach_post_warnings(&mut out, &post);
     attach_foreign(&mut out, &foreign);
     Ok(out)
-}
-
-/// One link/unlink applied to `front` in memory — every check `issue
-/// link` makes except the structural one over the whole board. Shared
-/// with `issue edit`.
-pub(crate) fn apply_link(
-    pm: &Pm,
-    front: &mut Front,
-    kind: &str,
-    target: &str,
-    unlink: bool,
-) -> Result<()> {
-    let id = front.id.clone();
-    let id = id.as_str();
-    match kind {
-        "blocked_by" | "relates" => {
-            let list = if kind == "blocked_by" {
-                &mut front.blocked_by
-            } else {
-                &mut front.relates
-            };
-            if unlink {
-                if !list.iter().any(|t| t == target) {
-                    return Err(Error::rejected(format!(
-                        "{id} has no {kind} link to {target} — \
-                         `cadence issue show {id}` lists links"
-                    )));
-                }
-                list.retain(|t| t != target);
-            } else {
-                if target == id {
-                    return Err(Error::rejected(format!("{id} cannot link to itself")));
-                }
-                board::find_issue(&pm.dir, target)?; // must exist
-                if list.iter().any(|t| t == target) {
-                    return Err(Error::rejected(format!(
-                        "{id} already links {kind} {target} — nothing to do"
-                    )));
-                }
-                list.push(target.to_string());
-            }
-        }
-        "parent" | "duplicate_of" => {
-            if kind == "parent" {
-                // CAD-360: a plan ticket keeps its epic; nothing joins
-                // a plan by link.
-                crate::issue::plan::check_parent_change(
-                    &pm.dir,
-                    front,
-                    (!unlink).then_some(target),
-                )?;
-            }
-            let slot = if kind == "parent" {
-                &mut front.parent
-            } else {
-                &mut front.duplicate_of
-            };
-            if unlink {
-                if slot.as_deref() != Some(target) {
-                    return Err(Error::rejected(format!(
-                        "{id} has {kind}={} — not {target}",
-                        slot.as_deref().unwrap_or("none")
-                    )));
-                }
-                *slot = None;
-            } else {
-                if target == id {
-                    return Err(Error::rejected(format!("{id} cannot link to itself")));
-                }
-                board::find_issue(&pm.dir, target)?;
-                *slot = Some(target.to_string());
-            }
-        }
-        _ => unreachable!(),
-    }
-    Ok(())
-}
-
-/// `issue link` / `issue unlink`. `blocked_by`/`relates` are list
-/// fields; `parent`/`duplicate_of` are scalars.
-#[allow(clippy::too_many_arguments)]
-#[track_caller]
-pub fn link(
-    pm: &Pm,
-    id: &str,
-    kind: &str,
-    target: &str,
-    unlink: bool,
-    if_rev: Option<&str>,
-    actor: &str,
-    state_dir: Option<&Path>,
-) -> Result<Value> {
-    model::check_link_kind(kind)?;
-    model::check_id(target)?;
-    let (_project, dir) = issue_dir(pm, id)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    if let Some(conflict) = check_rev(&dir, if_rev)? {
-        return Ok(conflict);
-    }
-    let (mut front, body) = load_front(&dir)?;
-    let verb = if unlink { "unlink" } else { "link" };
-    apply_link(pm, &mut front, kind, target, unlink)?;
-    // Structural check before the file is written — a rejected link
-    // leaves the folder untouched.
-    let issues = board::load_all(&pm.dir, None)?;
-    let mut preview: Vec<board::Issue> = issues;
-    if let Some(this) = preview.iter_mut().find(|i| i.front.id == id) {
-        this.front = front.clone();
-    }
-    check_structure(&preview, id)?;
-    let file = dir.join("issue.md");
-    let prev = file_preimage(&file);
-    save_front(&dir, &front, &body)?;
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&file),
-        &format!("{id}: {verb} {kind} {target}"),
-        &[id, target],
-        actor,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            restore_preimage(&file, prev);
-            return Err(e);
-        }
-    };
-    let mut post = Vec::new();
-    let warnings = blocked_warnings_best_effort(pm, id, state_dir, &mut post);
-    let mut out = json!({"id": id, "link": kind, "target": target,
-              "unlink": unlink, "committed": true, "warnings": warnings});
-    attach_post_warnings(&mut out, &post);
-    // CAD-757: a new blocker on an active issue tells its holders —
-    // by name, best-effort, never blocking the link itself.
-    if kind == "blocked_by" && !unlink {
-        out["blocker_notice"] =
-            crate::issue::blocked::notify_new_blocker(&front, target, state_dir);
-    }
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// A ref as `issue ref` stores it: an http(s) target is a `url`,
-/// anything else a `path`. Shared with `issue edit`.
-pub(crate) fn new_ref(
-    kind: &str,
-    target: &str,
-    label: Option<&str>,
-    worktree: Option<&str>,
-    agent: Option<&str>,
-) -> Ref {
-    let is_url = target.starts_with("http://") || target.starts_with("https://");
-    Ref {
-        kind: kind.to_string(),
-        url: is_url.then(|| target.to_string()),
-        path: (!is_url).then(|| target.to_string()),
-        label: label.map(str::to_string),
-        closed: None,
-        worktree: worktree.map(str::to_string),
-        cargo_target: None,
-        agent: agent.map(str::to_string),
-    }
-}
-
-/// `issue ref <ID> <kind> <url-or-path> [--label x]`. A scheme makes it
-/// `url:`; everything else is a `path:` (previews store publish paths).
-/// `worktree` scopes a `message` ref to the pair it was dispatched
-/// against; other kinds leave it `None`.
-#[allow(clippy::too_many_arguments)]
-#[track_caller]
-pub fn add_ref(
-    pm: &Pm,
-    id: &str,
-    kind: &str,
-    target: &str,
-    label: Option<&str>,
-    worktree: Option<&str>,
-    agent: Option<&str>,
-    if_rev: Option<&str>,
-    actor: &str,
-) -> Result<Value> {
-    model::check_ref_kind(kind)?;
-    model::check_ref_value(target)?;
-    let (_project, dir) = issue_dir(pm, id)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    if let Some(conflict) = check_rev(&dir, if_rev)? {
-        return Ok(conflict);
-    }
-    let (mut front, body) = load_front(&dir)?;
-    front
-        .refs
-        .push(new_ref(kind, target, label, worktree, agent));
-    let file = dir.join("issue.md");
-    let prev = file_preimage(&file);
-    save_front(&dir, &front, &body)?;
-    let foreign = match commit_scoped(
-        pm,
-        &lock,
-        std::slice::from_ref(&file),
-        &format!("{id}: ref {kind}"),
-        &[id],
-        actor,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            restore_preimage(&file, prev);
-            return Err(e);
-        }
-    };
-    let mut out = json!({"id": id, "ref": {"kind": kind, "target": target},
-              "committed": true});
-    attach_foreign(&mut out, &foreign);
-    Ok(out)
-}
-
-/// Mark every open `<kind>` ref naming `target` closed — kept as
-/// history but no longer counted by `issue finish`. A dispatch whose
-/// send failed leaves its pre-recorded `message` ref orphaned;
-/// closing it keeps the attempt's history without letting it read as
-/// a live binding (or a "dispatch recorded during finish" stale
-/// reason) to a concurrent finish.
-#[track_caller]
-pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Result<()> {
-    let (_project, dir) = issue_dir(pm, id)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
-    let (mut front, body) = load_front(&dir)?;
-    let mut hit = false;
-    for r in &mut front.refs {
-        if r.kind == kind && r.path.as_deref() == Some(target) && r.closed != Some(true) {
-            r.closed = Some(true);
-            hit = true;
-        }
-    }
-    if hit {
-        let file = dir.join("issue.md");
-        let prev = file_preimage(&file);
-        save_front(&dir, &front, &body)?;
-        if let Err(e) = commit_scoped(
-            pm,
-            &lock,
-            std::slice::from_ref(&file),
-            &format!("{id}: ref {kind} closed"),
-            &[id],
-            actor,
-        ) {
-            restore_preimage(&file, prev);
-            return Err(e);
-        }
-    }
-    Ok(())
 }
 
 /// The author a comment is recorded under: `--author`, else
@@ -652,6 +470,281 @@ pub fn add_comment(
     }
     attach_foreign(&mut out, &foreign);
     Ok(out)
+}
+
+/// CAD-2215: one comment with a caller-held stable key, written exactly
+/// once and safe to retry.
+///
+/// The filename keeps the documented UTC-basic prefix (comment readers
+/// sort by name) and appends the key: `<UTC-basic at>-<author>-<key>.md`.
+/// `at` is the receipt's original timestamp, so a retry reuses the same
+/// name instead of today's clock.
+///
+/// Creation is `write_new` (O_EXCL), never `create_exclusive` (which
+/// auto-suffixes and would duplicate). If the file already exists it is
+/// accepted only when its parsed body is byte-identical AND the exact
+/// file is committed at HEAD; a present-but-uncommitted (interrupted)
+/// file, a conflict, or an unprovable commit is refused and left
+/// untouched. A concurrent caller therefore converges on one file.
+#[allow(clippy::too_many_arguments)]
+pub fn add_comment_keyed(
+    pm: &Pm,
+    id: &str,
+    expected_project: &str,
+    body: &str,
+    author: Option<&str>,
+    kind: Option<&str>,
+    at: i64,
+    key: &str,
+    actor: &str,
+) -> Result<Value> {
+    let (_initial_project, initial_dir) = issue_dir(pm, id)?;
+    let author_opt = author;
+    let author = comment_author(author_opt)?;
+    if body.trim().is_empty() {
+        return Err(Error::rejected("Comment body is empty — pass -m or --file"));
+    }
+    if key.is_empty()
+        || key.len() > 64
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(Error::rejected(
+            "keyed comment key must be 1-64 lowercase letters, digits or '-'",
+        ));
+    }
+    let secret_warnings = crate::secret::guard(&format!("{id}: comment"), body)?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&initial_dir))?;
+    // Re-resolve the ticket under the tracker lock: a move to another
+    // project/directory, or a policy that no longer admits the operator,
+    // must never receive this write.
+    let (project, dir) = issue_dir(pm, id)?;
+    if dir != initial_dir || project.key != expected_project {
+        return Err(Error::rejected(format!(
+            "{id}: issue moved from project {expected_project} to {} while publishing — \
+             refusing",
+            project.key
+        )));
+    }
+    if !project.allows(crate::issue::project::ProjectCaller::Operator) {
+        return Err(Error::rejected(format!(
+            "{id}: project {} no longer admits the operator for this write — refusing",
+            project.key
+        )));
+    }
+    let comments = dir.join("comments");
+    if comments.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{id}: comments/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
+    std::fs::create_dir_all(&comments)?;
+    let name = format!("{}-{author}-{key}.md", time::basic(at));
+    let path = comments.join(&name);
+    let rel = path
+        .strip_prefix(&pm.dir)
+        .map_err(|_| Error::rejected(format!("{id}: keyed comment is outside the tracker")))?
+        .to_string_lossy()
+        .to_string();
+    // Prove the destination is absent from BOTH HEAD and the worktree
+    // before creating. A successful `ls-tree` with empty output is the
+    // only "absent" answer; a git/read failure is unprovable and refuses.
+    let tracked = match head_names_entry(pm, &rel) {
+        Ok(found) => found,
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "{id}: cannot prove keyed comment {name} is absent at HEAD ({e}) — refusing"
+            )))
+        }
+    };
+    let worktree = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => true,
+        Ok(_) => {
+            return Err(Error::rejected(format!(
+                "{id}: keyed comment {name} is not a regular file"
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    if !worktree && tracked {
+        return Err(Error::rejected(format!(
+            "{id}: keyed comment {name} is tracked at HEAD but missing from the worktree — \
+             refusing to recreate or replace it"
+        )));
+    }
+    let mut duplicate = worktree;
+    let mut created_inode: Option<(u64, u64)> = None;
+    if worktree {
+        verify_keyed_comment(pm, &path, body, id, &name)?;
+    } else {
+        match write_new(
+            &path,
+            parse::render(
+                &crate::issue::model::CommentFront {
+                    author: author.clone(),
+                    at: time::iso(at),
+                    kind: kind.map(str::to_string),
+                },
+                body,
+            )?
+            .as_bytes(),
+        ) {
+            Ok(()) => {
+                use std::os::unix::fs::MetadataExt;
+                created_inode = std::fs::symlink_metadata(&path)
+                    .ok()
+                    .filter(|meta| meta.file_type().is_file())
+                    .map(|meta| (meta.dev(), meta.ino()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A concurrent caller created it after our absence proof.
+                verify_keyed_comment(pm, &path, body, id, &name)?;
+                duplicate = true;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if !duplicate {
+        let committed = {
+            let result = commit_who_scoped(
+                pm,
+                &lock,
+                std::slice::from_ref(&path),
+                &format!("{id}: publication comment by {author}"),
+                &[id],
+                actor,
+                author_opt,
+            );
+            // Test-only: after a genuine commit success the hook may
+            // produce a synthetic uncertain-commit error, which must flow
+            // through the same cleanup/unknown handler below.
+            #[cfg(all(test, feature = "test-seam"))]
+            let result = match result {
+                Ok(foreign) => keyed_commit_seam::fire(&pm.dir).map(|()| foreign),
+                Err(e) => Err(e),
+            };
+            result
+        };
+        let foreign = match committed {
+            Ok(f) => f,
+            Err(e) => {
+                // A nonzero/unknown commit result does not prove HEAD did
+                // not advance. Keep the file unless HEAD provably does not
+                // name it AND the worktree entry is still the inode this
+                // call created; an unprovable case stays for keyed
+                // recovery. Never delete a substituted file.
+                use std::os::unix::fs::MetadataExt;
+                let head_has_it = head_names_entry(pm, &rel).unwrap_or(true);
+                if !head_has_it {
+                    if let Some((dev, ino)) = created_inode {
+                        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                            if meta.file_type().is_file() && meta.dev() == dev && meta.ino() == ino
+                            {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
+        let mut out = json!({"id": id, "comment": name, "author": author,
+                  "committed": true, "duplicate": false});
+        if !secret_warnings.is_empty() {
+            out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
+        }
+        attach_foreign(&mut out, &foreign);
+        return Ok(out);
+    }
+    let mut out = json!({"id": id, "comment": name, "author": author,
+              "committed": true, "duplicate": true});
+    if !secret_warnings.is_empty() {
+        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
+    }
+    Ok(out)
+}
+
+/// Does HEAD name `rel`? A successful `ls-tree` is the only proof: empty
+/// output = absent, non-empty = present, any git failure is unprovable.
+fn head_names_entry(pm: &Pm, rel: &str) -> Result<bool> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(&pm.dir)
+        .arg("ls-tree")
+        .arg("-z")
+        .arg("HEAD")
+        .arg("--")
+        .arg(rel);
+    let out = crate::reaper::output(&mut cmd)?;
+    if !out.status.success() {
+        return Err(Error::rejected("git ls-tree failed"));
+    }
+    Ok(!out.stdout.is_empty())
+}
+
+/// Accept an existing keyed comment only when it is the exact expected
+/// body and committed at HEAD. Never removes or overwrites it.
+fn verify_keyed_comment(pm: &Pm, path: &Path, body: &str, id: &str, name: &str) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(Error::rejected(format!(
+            "{id}: keyed comment {name} is not a regular file"
+        )));
+    }
+    let existing = std::fs::read_to_string(path)?;
+    let (_front, existing_body) = parse::parse_comment(&existing)?;
+    if existing_body != body {
+        return Err(Error::rejected(format!(
+            "{id}: keyed comment {name} already exists with different content — refusing to \
+             overwrite it"
+        )));
+    }
+    if !committed_at_head(pm, path) {
+        return Err(Error::rejected(format!(
+            "{id}: keyed comment {name} exists but is not committed at HEAD — the write was \
+             interrupted or the tracker is dirty; refusing to claim it"
+        )));
+    }
+    Ok(())
+}
+
+/// Is `path` the committed HEAD version of itself — tracked at HEAD and
+/// clean in the worktree, with the tracker fence intact? Never follows a
+/// symlink (the caller already refuses one) and never guesses.
+fn committed_at_head(pm: &Pm, path: &Path) -> bool {
+    if pm.fence_check().is_err() {
+        return false;
+    }
+    let Ok(rel) = path.strip_prefix(&pm.dir) else {
+        return false;
+    };
+    let rel = rel.to_string_lossy().to_string();
+    // Read the committed blob itself. `diff --quiet` is not byte-proof:
+    // assume-unchanged/skip-worktree index flags can hide modified
+    // worktree content. `issue::git` trims output, so use reaper::output
+    // and compare raw bytes.
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(&pm.dir)
+        .arg("cat-file")
+        .arg("blob")
+        .arg(format!("HEAD:{rel}"));
+    let out = match crate::reaper::output(&mut cmd) {
+        Ok(out) if out.status.success() => out,
+        _ => return false,
+    };
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    match std::fs::read(path) {
+        Ok(work) => work == out.stdout,
+        Err(_) => false,
+    }
 }
 
 /// CAD-383: write `front` and one comment by `author` in a single tracker

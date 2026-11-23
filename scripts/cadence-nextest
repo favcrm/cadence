@@ -18,7 +18,7 @@ for v in $(env | sed -n 's/^\(CADENCE_[A-Za-z0-9_]*\)=.*/\1/p'); do
     case $cadence_env_allow in *" $v "*) ;; *) unset "$v" ;; esac
 done
 
-PINNED_NEXTEST_VERSION=0.9.145
+PINNED_NEXTEST_VERSION=0.9.150
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/scripts/suite-lock-config"
 # CADENCE_NEXTTEST_BIN wins; else the durable tools dir that

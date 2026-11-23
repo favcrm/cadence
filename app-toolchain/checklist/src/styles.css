@@ -1,0 +1,15 @@
+:root { font: 14px/1.5 system-ui, sans-serif; color: var(--fg, #242b29); }
+body { margin: 0; padding: 24px; }
+main { max-width: 680px; margin: auto; }
+h1 { font-size: 1.4rem; margin: 0; }
+.composer { display: flex; gap: 8px; margin: 20px 0; }
+p { margin: 8px 0; }
+input[type=text] { flex: 1; min-width: 0; }
+input, button { font: inherit; padding: 8px; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+ul { padding: 0; list-style: none; }
+li { display: flex; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border, #d9dfdc); }
+li span { flex: 1; overflow-wrap: anywhere; }
+.done { text-decoration: line-through; opacity: .65; }
+.error { color: var(--error, #9b2738); }

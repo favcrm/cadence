@@ -445,8 +445,13 @@ impl Store {
             }
             // Inbox agents are durable mailboxes, not processes: they
             // register directly into `idle` with a stable pseudo-endpoint
-            // (so `dead` reads false) and never spawn an actor.
-            let (state, endpoint) = if !registry::has_actor(new.provider, new.endpoint_kind) {
+            // (so `dead` reads false) and never spawn an actor. A hosted
+            // cloud agent is also actorless but is NOT a mailbox: its
+            // truthful endpoint is the remote runtime (none locally), so it
+            // gets `idle` with no pseudo-inbox.
+            let (state, endpoint) = if new.endpoint_kind == "cloud" {
+                ("idle", None)
+            } else if !registry::has_actor(new.provider, new.endpoint_kind) {
                 ("idle", Some(format!("inbox://{}", new.alias)))
             } else {
                 ("starting", None)
@@ -500,7 +505,7 @@ impl Store {
         }
     }
 
-    pub(super) fn agent_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Agent> {
+    pub(crate) fn agent_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Agent> {
         conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Error::rejected("Unknown managed agent"),

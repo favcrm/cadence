@@ -21,10 +21,9 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 print_json(&report);
                 Ok(0)
             } else {
-                eprintln!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).unwrap_or_default()
-                );
+                // The report precedes the nonzero status: a closed stderr
+                // must not panic it into success.
+                eprint_line(&serde_json::to_string_pretty(&report).unwrap_or_default());
                 Ok(1)
             }
         }
@@ -50,16 +49,37 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 print_json(&out);
                 Ok(0)
             }
+            ProjectAction::SetRemote { key, from, to } => {
+                let pm = open_pm()?;
+                let out = write::set_project_remote(&pm, key, from, to, "")?;
+                print_json(&out);
+                Ok(0)
+            }
             ProjectAction::Policy {
                 key,
                 visibility,
                 grants,
+                clear_grants,
+                json: _,
             } => {
+                let desired =
+                    resolve_project_policy_request(key, *visibility, grants, *clear_grants)?;
                 let pm = open_pm()?;
-                let out = write::set_project_policy(&pm, key, visibility.recorded(), grants, "")?;
+                let out = match desired {
+                    None => write::read_project_policy(&pm, key)?,
+                    Some(vis) => write::set_project_policy(&pm, key, vis.recorded(), grants, "")?,
+                };
                 print_json(&out);
                 Ok(0)
             }
+            ProjectAction::Delivery { .. } => Err(Error::usage(
+                "`issue project delivery` records a hosted org's delivery inputs; \
+                 locally, `issue project add --repo` and the project's PROJECT.md hold them",
+            )),
+            ProjectAction::Timeline { .. } => Err(Error::usage(
+                "`issue project timeline` reads a hosted org's project timeline; \
+                 a local board records none",
+            )),
             ProjectAction::ApproveWork { key } => {
                 model::check_key(key)?;
                 print_json(&crate::client::rpc(
@@ -87,7 +107,7 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                         let file = crate::issue::delivery_policy::load(&pm.dir, &p.key);
                         let eff = crate::issue::delivery_policy::effective(
                             &p.key,
-                            file,
+                            file.map_err(|e| e.to_string()),
                             approvals.get(&p.key),
                         );
                         json!({

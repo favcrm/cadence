@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LedgerHeadV1",
+  "type": "object",
+  "properties": {
+    "database_epoch": {
+      "$ref": "#/$defs/Revision"
+    },
+    "digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "sequence": {
+      "$ref": "#/$defs/Counter"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "sequence",
+    "database_epoch",
+    "digest"
+  ],
+  "$defs": {
+    "Counter": {
+      "description": "Nonnegative canonical decimal counter (`0|[1-9][0-9]*`, <= i64::MAX).",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    }
+  }
+}

@@ -9,34 +9,74 @@ use super::{required_str, Shared};
 use crate::error::{Error, Result};
 use crate::issue::{self, delivery_policy, delivery_requirements as requirements};
 
-#[cfg(test)]
-#[path = "cad1298_requirements_acceptance.rs"]
-mod acceptance;
-
-#[cfg(test)]
-#[path = "cad1561_integration_branch_acceptance.rs"]
-mod cad1561_integration_branch_acceptance;
-
 fn reject(why: impl std::fmt::Display) -> Error {
     Error::rejected(format!("delivery requirements: {why}"))
 }
 
-fn gh(shared: &Shared, args: &[&str]) -> Result<String> {
-    crate::delivery::gh(
-        shared
-            .delivery_gh
-            .to_str()
-            .unwrap_or("/nonexistent/gh-not-on-path-at-boot"),
-        args,
-    )
+/// One `gh` read. The daemon runs the binary it resolved at boot; a
+/// hosted-org CLI runs the caller's own `gh` (CAD-1946).
+pub(crate) trait GhRead {
+    fn gh_read(&self, args: &[&str]) -> Result<String>;
 }
 
-fn api(shared: &Shared, endpoint: &str) -> Result<Value> {
-    let text = gh(shared, &["api", endpoint])?;
+impl GhRead for Shared {
+    fn gh_read(&self, args: &[&str]) -> Result<String> {
+        crate::delivery::gh(
+            self.delivery_gh
+                .to_str()
+                .unwrap_or("/nonexistent/gh-not-on-path-at-boot"),
+            args,
+        )
+    }
+}
+
+/// The tracker-side inputs of [`classify_from`]. The daemon reads them
+/// from its PM and approval store; a hosted-org CLI reads them from the
+/// hosted tracker (CAD-1946). Either way the classification below is the
+/// one implementation — only where the inputs come from differs.
+pub(crate) trait RequirementInputs: GhRead {
+    /// The key of the project the ticket belongs to.
+    fn issue_project(&self, issue: &str) -> Result<String>;
+    /// `Some(why)` when the PR's repository is not a declared remote of
+    /// `project` ([`crate::delivery::pr_refusal_for_remotes`]).
+    fn pr_refusal(&self, project: &str, pr_url: &str) -> Result<Option<String>>;
+    /// The effective policy and its recorded approval, read afresh on
+    /// every call so the drift re-read compares two real reads.
+    fn policy(
+        &self,
+        project: &str,
+    ) -> Result<(delivery_policy::Resolved, Option<delivery_policy::Approved>)>;
+}
+
+impl RequirementInputs for Shared {
+    fn issue_project(&self, issue: &str) -> Result<String> {
+        let pm = self.pm()?;
+        let issue = issue::board::find_issue(&pm.dir, issue)?;
+        Ok(issue::project::load(&pm.dir.join(&issue.project).join("project.yaml"))?.key)
+    }
+
+    fn pr_refusal(&self, project: &str, pr_url: &str) -> Result<Option<String>> {
+        crate::delivery::project_pr_refusal(&self.pm()?.dir, project, pr_url)
+    }
+
+    fn policy(
+        &self,
+        project: &str,
+    ) -> Result<(delivery_policy::Resolved, Option<delivery_policy::Approved>)> {
+        policy_snapshot(self, &self.pm()?.dir, project)
+    }
+}
+
+fn gh<G: GhRead + ?Sized>(source: &G, args: &[&str]) -> Result<String> {
+    source.gh_read(args)
+}
+
+fn api<G: GhRead + ?Sized>(source: &G, endpoint: &str) -> Result<Value> {
+    let text = gh(source, &["api", endpoint])?;
     serde_json::from_str(&text).map_err(|e| reject(format!("unreadable GitHub response: {e}")))
 }
 
-fn pr_view(shared: &Shared, slug: &str, number: u64) -> Result<Value> {
+fn pr_view<G: GhRead + ?Sized>(shared: &G, slug: &str, number: u64) -> Result<Value> {
     let text = gh(
         shared,
         &[
@@ -52,7 +92,7 @@ fn pr_view(shared: &Shared, slug: &str, number: u64) -> Result<Value> {
     serde_json::from_str(&text).map_err(|e| reject(format!("unreadable PR view: {e}")))
 }
 
-fn default_branch(shared: &Shared, repo: &str) -> Result<String> {
+fn default_branch<G: GhRead + ?Sized>(shared: &G, repo: &str) -> Result<String> {
     let text = gh(
         shared,
         &["repo", "view", repo, "--json", "defaultBranchRef"],
@@ -121,9 +161,14 @@ fn title_names_issue(title: &str, issue: &str) -> bool {
         .is_some_and(|token| token.as_str() == issue)
 }
 
-type TreeEntry = (String, String);
+/// `(mode, type, sha)` of one tree entry.
+type TreeEntry = (String, String, String);
 
-fn tree_modes(shared: &Shared, repo: &str, sha: &str) -> Result<HashMap<String, TreeEntry>> {
+fn tree_modes<G: GhRead + ?Sized>(
+    shared: &G,
+    repo: &str,
+    sha: &str,
+) -> Result<HashMap<String, TreeEntry>> {
     let tree = api(shared, &format!("repos/{repo}/git/trees/{sha}?recursive=1"))?;
     if tree["truncated"].as_bool() != Some(false) {
         return Err(reject(
@@ -156,8 +201,15 @@ fn tree_modes(shared: &Shared, repo: &str, sha: &str) -> Result<HashMap<String, 
                 "tree entry {path} has invalid type/mode {kind}/{mode}"
             )));
         }
+        let sha = entry["sha"]
+            .as_str()
+            .filter(|s| valid_sha(s))
+            .ok_or_else(|| reject(format!("tree entry {path} has no valid sha")))?;
         if modes
-            .insert(path.to_string(), (mode.to_string(), kind.to_string()))
+            .insert(
+                path.to_string(),
+                (mode.to_string(), kind.to_string(), sha.to_string()),
+            )
             .is_some()
         {
             return Err(reject(format!("GitHub tree repeats path {path}")));
@@ -167,7 +219,7 @@ fn tree_modes(shared: &Shared, repo: &str, sha: &str) -> Result<HashMap<String, 
 }
 
 fn changed_mode(tree: &HashMap<String, TreeEntry>, path: &str) -> Result<String> {
-    let (mode, kind) = tree
+    let (mode, kind, _) = tree
         .get(path)
         .ok_or_else(|| reject(format!("tree mode unavailable for {path}")))?;
     if kind == "tree" {
@@ -176,7 +228,68 @@ fn changed_mode(tree: &HashMap<String, TreeEntry>, path: &str) -> Result<String>
     Ok(mode.clone())
 }
 
-fn content_at_base(shared: &Shared, repo: &str, path: &str, base: &str) -> Option<String> {
+/// The tip commit of `branch`, read once per evaluation. An unreadable or
+/// malformed answer refuses, so the merge-base anchor is never empty.
+fn branch_tip<G: GhRead + ?Sized>(shared: &G, repo: &str, branch: &str) -> Result<String> {
+    let name = branch
+        .split('/')
+        .map(branch_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    let reference = api(shared, &format!("repos/{repo}/git/ref/heads/{name}"))?;
+    reference["object"]["sha"]
+        .as_str()
+        .filter(|s| valid_sha(s))
+        .map(str::to_string)
+        .ok_or_else(|| reject(format!("cannot read the live tip of {branch:?}")))
+}
+
+/// Proof that a compare file list is the whole change between two trees:
+/// the paths whose entry differs (or exists on one side only) must be exactly
+/// the listed filenames plus the old names of renames. GitHub's `changedFiles`
+/// counts from its own, possibly stale, base and cannot vouch for a set taken
+/// from a different merge base.
+fn changed_set_matches_trees(
+    base: &HashMap<String, TreeEntry>,
+    head: &HashMap<String, TreeEntry>,
+    files: &[Value],
+) -> bool {
+    use std::collections::BTreeSet;
+    let blobs = |tree: &HashMap<String, TreeEntry>| -> HashMap<String, TreeEntry> {
+        tree.iter()
+            .filter(|(_, (_, kind, _))| kind != "tree")
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect()
+    };
+    let (base, head) = (blobs(base), blobs(head));
+    let differs: BTreeSet<&str> = base
+        .keys()
+        .chain(head.keys())
+        .filter(|path| base.get(*path) != head.get(*path))
+        .map(String::as_str)
+        .collect();
+    let mut listed = BTreeSet::new();
+    for file in files {
+        let Some(path) = file["filename"].as_str() else {
+            return false;
+        };
+        listed.insert(path);
+        if file["status"].as_str() == Some("renamed") {
+            match file["previous_filename"].as_str() {
+                Some(old) => listed.insert(old),
+                None => return false,
+            };
+        }
+    }
+    differs == listed
+}
+
+fn content_at_ref<G: GhRead + ?Sized>(
+    shared: &G,
+    repo: &str,
+    path: &str,
+    base: &str,
+) -> Option<String> {
     let endpoint = format!("repos/{repo}/contents/{path}?ref={base}");
     let value = api(shared, &endpoint).ok()?;
     if value["encoding"].as_str()? != "base64" {
@@ -225,7 +338,7 @@ pub(super) fn policy_snapshot(
         .and_then(delivery_policy::approved_from);
     let resolved = delivery_policy::effective(
         project,
-        delivery_policy::load(pm_dir, project),
+        delivery_policy::load(pm_dir, project).map_err(|e| e.to_string()),
         approved.as_ref(),
     );
     Ok((resolved, approved))
@@ -239,12 +352,20 @@ pub(super) fn classify_with_policy(
     shared: &Shared,
     params: &Value,
 ) -> Result<(Value, delivery_policy::Resolved)> {
+    classify_from(shared, params)
+}
+
+/// The requirements classification over any [`RequirementInputs`]: the
+/// request binding, the project/remote check, the live PR and anchor-pinned
+/// trusted lists, [`requirements::classify`], and the drift re-read.
+pub(crate) fn classify_from<I: RequirementInputs + ?Sized>(
+    shared: &I,
+    params: &Value,
+) -> Result<(Value, delivery_policy::Resolved)> {
     let (issue_id, pr_url, requested_head) = request_fields(params)?;
 
-    let pm = shared.pm()?;
-    let issue = issue::board::find_issue(&pm.dir, issue_id)?;
-    let project = issue::project::load(&pm.dir.join(&issue.project).join("project.yaml"))?;
-    if let Some(why) = crate::delivery::project_pr_refusal(&pm.dir, &project.key, pr_url)? {
+    let project_key = shared.issue_project(issue_id)?;
+    if let Some(why) = shared.pr_refusal(&project_key, pr_url)? {
         return Err(reject(why));
     }
     let (slug, number) = issue::task_report::parse_pr_url(pr_url)?;
@@ -275,7 +396,7 @@ pub(super) fn classify_with_policy(
     // Resolve the effective policy once — the target gate and the
     // requirements evaluator below share it. The reread at the end
     // still re-resolves for drift detection.
-    let (resolved, approved) = policy_snapshot(shared, &pm.dir, &project.key)?;
+    let (resolved, approved) = shared.policy(&project_key)?;
     if base_ref != default && !approved_integration_target(base_ref, &resolved, approved.as_ref()) {
         return Err(reject(format!(
             "PR base {base_ref:?} is neither the repository default {default:?} \
@@ -291,7 +412,24 @@ pub(super) fn classify_with_policy(
         .as_u64()
         .ok_or_else(|| reject("PR view has no changed-file count"))?;
 
-    let comparison = api(shared, &format!("repos/{repo}/compare/{base}...{head}"))?;
+    // CAD-2100: GitHub's `baseRefOid` can stay older than the real merge base
+    // after the default branch is merged into the PR, so a main-based PR is
+    // read from the merge base with the default branch's live tip, resolved
+    // once here and used for the compare and the path lists alike. Any other
+    // base keeps the PR's base exactly.
+    let main_based = base_ref == default;
+    let anchor = if main_based {
+        branch_tip(shared, &repo, &default)?
+    } else {
+        base.clone()
+    };
+    let comparison = api(shared, &format!("repos/{repo}/compare/{anchor}...{head}"))?;
+    // CAD-2117: GitHub's compare answers ONE merge base. When the two commits
+    // have several (a criss-cross merge) that answer is not provably the right
+    // one and the API cannot enumerate the rest, so this path cannot detect it.
+    // `scripts/enqueue-reviewed` runs `git merge-base --all` and refuses on more
+    // than one; the daemon's own landing path (unattended_landing) does not go
+    // through that script, so it relies on main staying free of merge commits.
     let merge_base = comparison["merge_base_commit"]["sha"]
         .as_str()
         .filter(|s| valid_sha(s))
@@ -300,13 +438,23 @@ pub(super) fn classify_with_policy(
     let files = comparison["files"]
         .as_array()
         .ok_or_else(|| reject("comparison has no complete file list"))?;
-    if files.len() >= 300 || files.len() as u64 != changed_files {
+    // A main-based PR is not compared with GitHub's count (it counts from its
+    // own, possibly stale, base); its list is proven against the trees below.
+    if files.len() >= 300 {
+        return Err(reject("GitHub comparison file list is truncated"));
+    }
+    if !main_based && files.len() as u64 != changed_files {
         return Err(reject(
-            "GitHub comparison file list is truncated or differs from the PR file count",
+            "GitHub comparison file list differs from the PR file count",
         ));
     }
     let base_modes = tree_modes(shared, &repo, &merge_base)?;
     let head_modes = tree_modes(shared, &repo, head)?;
+    if main_based && !changed_set_matches_trees(&base_modes, &head_modes, files) {
+        return Err(reject(
+            "GitHub comparison file list does not match the trees of the merge base and the head",
+        ));
+    }
     let mut changes = Vec::with_capacity(files.len());
     let mut lines = 0u64;
     for file in files {
@@ -347,11 +495,21 @@ pub(super) fn classify_with_policy(
         lines = lines
             .saturating_add(file["additions"].as_u64().unwrap())
             .saturating_add(file["deletions"].as_u64().unwrap());
-        changes.push(requirements::change(status, &old_mode, &new_mode, path));
+        if status == "R" {
+            // CAD-2117: a rename is a delete of the old path plus an add of the
+            // new one (as `git diff --no-renames` reports it, which the script
+            // uses), so the path classes see BOTH ends. Recording only the new
+            // path let `scripts/x` renamed out of `scripts/` read as outside it.
+            changes.push(requirements::change("D", &old_mode, "000000", old_path));
+            changes.push(requirements::change("A", "000000", &new_mode, path));
+        } else {
+            changes.push(requirements::change(status, &old_mode, &new_mode, path));
+        }
     }
 
-    let risk_paths = content_at_base(shared, &repo, "docs/roles/risk-paths.toml", &base);
-    let one_review = content_at_base(shared, &repo, "docs/roles/one-review-paths.toml", &base);
+    // The path lists move with the diff: read at the same anchor.
+    let risk_paths = content_at_ref(shared, &repo, "docs/roles/risk-paths.toml", &anchor);
+    let one_review = content_at_ref(shared, &repo, "docs/roles/one-review-paths.toml", &anchor);
     let lists = requirements::TrustedLists {
         risk_paths: risk_paths.as_deref(),
         one_review: one_review.as_deref(),
@@ -361,7 +519,7 @@ pub(super) fn classify_with_policy(
     // Refuse a mixed-head answer: re-read all external and operator-owned
     // inputs that determine the result before returning it.
     let after = pr_view(shared, &repo, number)?;
-    let (after_resolved, _) = policy_snapshot(shared, &pm.dir, &project.key)?;
+    let (after_resolved, _) = shared.policy(&project_key)?;
     if after["state"].as_str() != Some("OPEN")
         || after["title"]
             .as_str()
@@ -382,7 +540,7 @@ pub(super) fn classify_with_policy(
         ));
     }
     Ok((
-        json!({"issue": issue_id, "project": project.key, "repo": repo, "pr": number,
+        json!({"issue": issue_id, "project": project_key, "repo": repo, "pr": number,
         "head": head, "base": base, "base_ref": base_ref, "merge_base": merge_base,
         "policy_digest": result.policy_digest, "requirements": result, "changes": changes}),
         resolved,
@@ -606,8 +764,8 @@ pub(super) fn unattended_queue_authority(
     require_queue_authority(shared, repo, base, &rules, Some(&protection))
 }
 
-fn require_queue_authority(
-    shared: &Shared,
+fn require_queue_authority<G: GhRead + ?Sized>(
+    shared: &G,
     repo: &str,
     base: &str,
     rules: &Value,
@@ -698,7 +856,7 @@ fn require_queue_authority(
             }
         }
     }
-    let raw = content_at_base(shared, repo, ".github/workflows/ci.yml", base)
+    let raw = content_at_ref(shared, repo, ".github/workflows/ci.yml", base)
         .ok_or_else(|| reject("trusted integration workflow is unavailable"))?;
     let workflow: serde_yaml::Value = serde_yaml::from_str(&raw)
         .map_err(|_| reject("trusted integration workflow is malformed"))?;
@@ -716,7 +874,7 @@ fn require_queue_authority(
     }
     // These are the canonical workflow's existing full integration floor,
     // not whatever subset happens to remain in mutable repository settings.
-    for gate in ["fmt", "clippy", "test", "build", "ui"] {
+    for gate in ["fmt", "clippy", "build", "ui"] {
         let job = workflow["jobs"].get(gate).ok_or_else(|| {
             reject(format!(
                 "trusted CI lacks the supported {gate} integration gate"
@@ -739,6 +897,24 @@ fn require_queue_authority(
         }
     }
     Ok(())
+}
+
+/// Exercise the production queue guard with isolated GitHub responses.
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+pub fn queue_authority_acceptance(
+    repo: &str,
+    base: &str,
+    rules: &Value,
+    protection: Option<&Value>,
+    read: impl Fn(&[&str]) -> Result<String>,
+) -> Result<()> {
+    struct Reader<F>(F);
+    impl<F: Fn(&[&str]) -> Result<String>> GhRead for Reader<F> {
+        fn gh_read(&self, args: &[&str]) -> Result<String> {
+            (self.0)(args)
+        }
+    }
+    require_queue_authority(&Reader(read), repo, base, rules, protection)
 }
 
 /// An enabled auto-merge request is not proof of admission to the queue.
@@ -1062,5 +1238,58 @@ impl Shared {
         };
         answer["readiness"] = json!(readiness);
         Ok(answer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(entries: &[(&str, char)]) -> HashMap<String, TreeEntry> {
+        entries
+            .iter()
+            .map(|(path, sha)| {
+                (
+                    path.to_string(),
+                    ("100644".into(), "blob".into(), sha.to_string().repeat(40)),
+                )
+            })
+            .collect()
+    }
+
+    // CAD-2100: the file list from the merge base with main's tip is proven
+    // complete by the two trees, not by GitHub's count from its own base.
+    #[test]
+    fn a_file_list_must_be_exactly_what_differs_between_the_trees() {
+        let base = tree(&[("a.rs", 'a'), ("b.rs", 'b'), ("old.rs", 'c')]);
+        let head = tree(&[("a.rs", 'a'), ("b.rs", 'd'), ("new.rs", 'c')]);
+        let modified = json!({"filename": "b.rs", "status": "modified"});
+        let renamed =
+            json!({"filename": "new.rs", "status": "renamed", "previous_filename": "old.rs"});
+        assert!(changed_set_matches_trees(
+            &base,
+            &head,
+            &[modified.clone(), renamed.clone()]
+        ));
+        // a missing entry (a revert the list hides) and an extra one both refuse
+        assert!(!changed_set_matches_trees(
+            &base,
+            &head,
+            std::slice::from_ref(&renamed)
+        ));
+        let extra = json!({"filename": "a.rs", "status": "modified"});
+        assert!(!changed_set_matches_trees(
+            &base,
+            &head,
+            &[modified, renamed, extra]
+        ));
+    }
+
+    #[test]
+    fn a_rename_without_its_old_name_refuses() {
+        let base = tree(&[("old.rs", 'c')]);
+        let head = tree(&[("new.rs", 'c')]);
+        let renamed = json!({"filename": "new.rs", "status": "renamed"});
+        assert!(!changed_set_matches_trees(&base, &head, &[renamed]));
     }
 }

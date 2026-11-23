@@ -19,12 +19,12 @@ use std::time::Duration;
 /// Fixtures map it to loopback only; the production endpoint rule and
 /// parser are never touched.
 #[cfg(any(test, feature = "test-seam"))]
-pub(crate) const CANONICAL_BOARD_HOST: &str = "lc.cadencecloud.app";
+#[doc(hidden)]
+pub const CANONICAL_BOARD_HOST: &str = "lc.cadencecloud.app";
 
 /// Build the agent from the caller's finished `ureq` config builder.
-pub(crate) fn agent(
-    builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
-) -> ureq::Agent {
+#[doc(hidden)]
+pub fn agent(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
     build(builder)
 }
 
@@ -40,11 +40,16 @@ fn build(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> u
 
 #[cfg(all(not(test), feature = "test-seam"))]
 fn build(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
-    env_fixture::agent(builder)
+    if test_fixture::has_in_process_fixture() {
+        test_fixture::agent(builder)
+    } else {
+        env_fixture::agent(builder)
+    }
 }
 
 /// The JWKS fetch agent, production shape unchanged.
-pub(crate) fn jwks_agent(timeout: Duration) -> ureq::Agent {
+#[doc(hidden)]
+pub fn jwks_agent(timeout: Duration) -> ureq::Agent {
     agent(
         ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
@@ -55,7 +60,8 @@ pub(crate) fn jwks_agent(timeout: Duration) -> ureq::Agent {
 /// Outbound WSS uses the same WebPKI/fixture trust policy as issuer HTTP.
 /// Dial and resumable TLS/HTTP upgrade share one deadline; connected I/O stays
 /// interruptible so an unavailable peer cannot hold daemon shutdown.
-pub(crate) fn websocket(
+#[doc(hidden)]
+pub fn websocket(
     request: tungstenite::http::Request<()>,
     config: Option<tungstenite::protocol::WebSocketConfig>,
     timeout: Duration,
@@ -249,7 +255,11 @@ fn websocket_fixture(host: &str) -> crate::error::Result<Option<WebSocketFixture
     }
     #[cfg(all(not(test), feature = "test-seam"))]
     {
-        env_fixture::websocket_fixture(host)
+        if test_fixture::has_websocket_fixture() {
+            test_fixture::websocket_fixture(host)
+        } else {
+            env_fixture::websocket_fixture(host)
+        }
     }
     #[cfg(all(not(test), not(feature = "test-seam")))]
     {
@@ -391,7 +401,7 @@ mod env_fixture {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 pub(crate) mod test_fixture {
     use std::cell::RefCell;
     use std::net::SocketAddr;
@@ -424,38 +434,6 @@ pub(crate) mod test_fixture {
     /// is resolving. Other hosts stay on that fixture's TLS loopback. Drop
     /// removes the route. Existing fixtures that never call this are unchanged.
     /// The only caller is the test-seam membership acceptance.
-    #[cfg(feature = "test-seam")]
-    pub(crate) fn route_plain_http(
-        tls_loopback: SocketAddr,
-        host: &str,
-        plain: SocketAddr,
-    ) -> PlainRoute {
-        PLAIN_HTTP
-            .lock()
-            .unwrap()
-            .push((tls_loopback, host.to_string(), plain));
-        PlainRoute {
-            tls_loopback,
-            host: host.to_string(),
-        }
-    }
-
-    #[cfg(feature = "test-seam")]
-    pub(crate) struct PlainRoute {
-        tls_loopback: SocketAddr,
-        host: String,
-    }
-
-    #[cfg(feature = "test-seam")]
-    impl Drop for PlainRoute {
-        fn drop(&mut self) {
-            PLAIN_HTTP
-                .lock()
-                .unwrap()
-                .retain(|(tls, host, _)| !(*tls == self.tls_loopback && host == &self.host));
-        }
-    }
-
     fn plain_target(tls_loopback: SocketAddr, host: &str) -> Option<SocketAddr> {
         PLAIN_HTTP
             .lock()
@@ -481,18 +459,16 @@ pub(crate) mod test_fixture {
         !PLAIN_HTTP.lock().unwrap().is_empty()
     }
 
-    /// Install `fixture` on this thread until the guard drops.
-    pub(crate) fn install(fixture: Fixture) -> Guard {
-        FIXTURE.with(|slot| *slot.borrow_mut() = Some(fixture));
-        Guard
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn has_in_process_fixture() -> bool {
+        FIXTURE.with(|slot| slot.borrow().is_some())
+            || plain_routes_present()
+            || crate::test_web_issuer_tls::is_installed()
     }
 
-    pub(crate) struct Guard;
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            FIXTURE.with(|slot| *slot.borrow_mut() = None);
-        }
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn has_websocket_fixture() -> bool {
+        FIXTURE.with(|slot| slot.borrow().is_some())
     }
 
     /// A logical host the fixture resolves to loopback: the canonical board

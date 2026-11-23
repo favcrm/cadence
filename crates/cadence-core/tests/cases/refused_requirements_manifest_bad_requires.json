@@ -1,0 +1,18 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.requirements.evaluate",
+    "input": {
+      "manifest": "---\nname: demo\nneeds:\n  requires:\n    core: 2\n---\nbody\n",
+      "target": {
+        "core": "0.3.0",
+        "contracts": {}
+      }
+    }
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_manifest",
+    "message": "app.md `needs.requires.core` is one range string — e.g. \">=0.2.0 <2.0.0\""
+  }
+}

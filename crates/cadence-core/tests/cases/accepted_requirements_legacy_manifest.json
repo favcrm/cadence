@@ -1,0 +1,31 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.requirements.evaluate",
+    "input": {
+      "manifest": "---\nname: demo\n---\nbody\n",
+      "target": {
+        "core": "0.3.0",
+        "contracts": {}
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "app.requirements.evaluate",
+    "value": {
+      "schema": 1,
+      "ok": true,
+      "compatible": true,
+      "unmet": null,
+      "declared": false,
+      "core": null,
+      "contracts": {},
+      "host": {
+        "core": "0.3.0",
+        "contracts": {}
+      },
+      "checks": []
+    }
+  }
+}

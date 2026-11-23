@@ -12,13 +12,24 @@
 //! keys `cost`, `price` and `pricing` fail the parse wherever they
 //! appear, at any depth, in `listing` or anywhere else in the
 //! frontmatter. The host's spend safety stays in the frozen quote,
-//! `max_charge_minor` and the price_changed refusal — the UI simply
+//! `max_charge_minor` and the global per-call bound — the UI simply
 //! never renders a price.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
 
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::model;
+
+mod i18n;
+mod validate;
+
+use i18n::parse_listing_i18n;
+pub(crate) use i18n::parse_manifest_i18n;
+pub(crate) use validate::refuse_price_keys;
+use validate::{asset_path, known_keys, plain_multiline_text, plain_text, seq, yget};
 
 /// Largest `listing` block, measured on its YAML source, bytes.
 const LISTING_CAP: usize = 16 * 1024;
@@ -33,10 +44,6 @@ const CATEGORIES: &[&str] = &[
     "other",
 ];
 
-/// `app.md` keys a price would hide behind (decision 8): refused
-/// anywhere in the frontmatter mapping, at any depth.
-const PRICE_KEYS: &[&str] = &["cost", "price", "pricing"];
-
 /// One parsed `listing` block — plain JSON value, already checked,
 /// plus the asset paths it references (the caller proves each exists
 /// in the bundle's own file inventory).
@@ -44,131 +51,6 @@ const PRICE_KEYS: &[&str] = &["cost", "price", "pricing"];
 pub struct Listing {
     pub value: Value,
     pub assets: Vec<String>,
-}
-
-fn plain_text(value: &serde_yaml::Value, what: &str, max: usize) -> Result<String> {
-    let Some(text) = value.as_str() else {
-        return Err(Error::rejected(format!("listing {what} is a plain string")));
-    };
-    let text = text.trim();
-    if text.is_empty()
-        || text.chars().count() > max
-        || text.chars().any(|c| c.is_control() && c != '\n')
-        || text.contains('<')
-        || text.contains('>')
-        || text.contains("](")
-        || text.starts_with('#')
-        || text.starts_with("http://")
-        || text.starts_with("https://")
-    {
-        return Err(Error::rejected(format!(
-            "listing {what} is ≤{max} chars of plain text — no markup, links or controls"
-        )));
-    }
-    Ok(text.to_string())
-}
-
-/// `assets/<leaf>.svg` — flat, tag-shaped stem, real file under the
-/// bundle's `assets/` (paths outside are refused).
-fn asset_path(value: &serde_yaml::Value, what: &str, max_kb: u64) -> Result<String> {
-    let raw = value
-        .as_str()
-        .ok_or_else(|| Error::rejected(format!("listing {what} is an assets/ path")))?;
-    if raw.len() > 128 {
-        return Err(Error::rejected(format!("listing {what} path is too long")));
-    }
-    let Some(leaf) = raw.strip_prefix("assets/") else {
-        return Err(Error::rejected(format!(
-            "listing {what} '{raw}' — assets stay under assets/"
-        )));
-    };
-    let Some(stem) = leaf.strip_suffix(".svg") else {
-        return Err(Error::rejected(format!(
-            "listing {what} '{raw}' — assets are flat *.svg files"
-        )));
-    };
-    if stem.is_empty()
-        || stem.contains('/')
-        || !stem
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return Err(Error::rejected(format!(
-            "listing {what} '{raw}' — the file name is [A-Za-z0-9_-]+.svg"
-        )));
-    }
-    let _ = max_kb;
-    Ok(raw.to_string())
-}
-
-fn known_keys(map: &serde_yaml::Mapping, allowed: &[&str], what: &str) -> Result<()> {
-    for key in map.keys() {
-        let Some(k) = key.as_str() else {
-            return Err(Error::rejected(format!(
-                "listing {what} has a non-string key"
-            )));
-        };
-        if !allowed.contains(&k) {
-            return Err(Error::rejected(format!(
-                "listing {what} key '{k}' is unknown — v1 knows {}",
-                allowed.join(", ")
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn yget<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
-    map.get(serde_yaml::Value::String(key.to_string()))
-}
-
-fn seq<'a>(
-    map: &'a serde_yaml::Mapping,
-    key: &str,
-    what: &str,
-    max: usize,
-) -> Result<Vec<&'a serde_yaml::Value>> {
-    match yget(map, key) {
-        None | Some(serde_yaml::Value::Null) => Ok(vec![]),
-        Some(serde_yaml::Value::Sequence(items)) => {
-            if items.len() > max {
-                return Err(Error::rejected(format!(
-                    "listing {what} carries more than {max} entries"
-                )));
-            }
-            Ok(items.iter().collect())
-        }
-        Some(_) => Err(Error::rejected(format!("listing {what} is a list"))),
-    }
-}
-
-/// Refuse `cost`/`price`/`pricing` at any depth of a YAML value
-/// (decision 8) — including `listing` and every other frontmatter key.
-pub(crate) fn refuse_price_keys(value: &serde_yaml::Value) -> Result<()> {
-    match value {
-        serde_yaml::Value::Mapping(map) => {
-            for (k, v) in map {
-                if let Some(key) = k.as_str() {
-                    if PRICE_KEYS.contains(&key) {
-                        return Err(Error::rejected(format!(
-                            "app.md key '{key}': prices are not shown (CAD-1129 decision 8) — \
-                             spend safety lives in the host's frozen quote, the charge \
-                             ceiling and the price_changed refusal"
-                        )));
-                    }
-                }
-                refuse_price_keys(v)?;
-            }
-            Ok(())
-        }
-        serde_yaml::Value::Sequence(items) => {
-            for item in items {
-                refuse_price_keys(item)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Parse `listing` from the frontmatter's raw YAML value. `slots` is
@@ -206,6 +88,7 @@ pub(crate) fn parse(
             "changes",
             "setup",
             "data",
+            "i18n",
         ],
         "",
     )?;
@@ -294,7 +177,7 @@ pub(crate) fn parse(
             )),
         };
     let about = match yget(map, "about") {
-        Some(v) => Some(plain_text(v, "about", 600)?),
+        Some(v) => Some(plain_multiline_text(v, "about", 600)?),
         None => None,
     };
     let mut can = Vec::new();
@@ -426,6 +309,10 @@ pub(crate) fn parse(
             ))
         }
     };
+    let i18n = match yget(map, "i18n") {
+        None | Some(serde_yaml::Value::Null) => Value::Null,
+        Some(value) => parse_listing_i18n(value, slots)?,
+    };
     // The referenced assets: the caller proves each is in the
     // bundle's inventory (`assets/` flat *.svg). Collected, not
     // checked here — the parse runs before the file list exists.
@@ -453,6 +340,94 @@ pub(crate) fn parse(
             "changes": changes,
             "setup": setup,
             "data": data,
+            "i18n": i18n,
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_listing_i18n_and_refuses_invalid_entries() {
+        let slots = vec!["crm.read".to_string()];
+        let y = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+        let p = parse(
+            &y("{tagline: T., i18n: {zh-TW: {title: 客, tagline: 輕, summary: 總, about: 介, can: [維], access_notes: {crm.read: 讀}}, zh-HK: {title: 客}}}"),
+            512,
+            &slots,
+        )
+        .unwrap();
+        assert_eq!(p.value["i18n"]["zh-TW"]["title"], "客");
+        assert_eq!(p.value["i18n"]["zh-TW"]["access_notes"]["crm.read"], "讀");
+        assert_eq!(p.value["i18n"]["zh-HK"]["title"], "客");
+
+        for bad in [
+            "{}",
+            "{zh_TW: {title: A}}",
+            "{zh-tw: {title: A}, zh-TW: {title: B}}",
+            "{zh-TW: {}}",
+            "{zh-TW: {unknown: 1}}",
+            "{zh-TW: {access_notes: {missing.slot: x}}}",
+            "{zh-TW: {title: \"客\", access_notes: {}}}",
+            "{zh-TW: {title: \"a\\nb\"}}",
+            "{zh-TW: {title: \"a\\u2028b\"}}",
+        ] {
+            assert!(
+                parse(&y(&format!("{{i18n: {bad}}}")), 256, &slots).is_err(),
+                "{bad}"
+            );
+        }
+
+        let ml = parse(
+            &y("{i18n: {zh-TW: {summary: \"a\\nb\", about: \"c\\nd\"}}}"),
+            512,
+            &slots,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                &ml.value["i18n"]["zh-TW"]["summary"],
+                &ml.value["i18n"]["zh-TW"]["about"]
+            ),
+            (&json!("a\nb"), &json!("c\nd"))
+        );
+
+        for (k, ch, n, ok) in [
+            ("summary", "x", 280, true),
+            ("summary", "x", 281, false),
+            ("title", "😀", 40, true),
+            ("title", "😀", 41, false),
+        ] {
+            assert_eq!(
+                parse(
+                    &y(&format!("{{i18n: {{zh-TW: {{{k}: {}}}}}}}", ch.repeat(n))),
+                    512,
+                    &slots
+                )
+                .is_ok(),
+                ok,
+                "{k}:{n}"
+            );
+        }
+
+        let nine: String = (0..9)
+            .map(|i| format!("en-x{i}: {{title: T{i}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(parse(&y(&format!("{{i18n: {{{nine}}}}}")), 512, &slots).is_err());
+    }
+
+    #[test]
+    fn parses_manifest_top_level_i18n() {
+        let y = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+        assert_eq!(
+            parse_manifest_i18n(&y("{zh-TW: {title: 客, summary: 總}}")).unwrap()["zh-TW"]["title"],
+            "客"
+        );
+        for bad in ["{zh-TW: {about: x}}", "{zh-TW: {title: '<b>bad</b>'}}"] {
+            assert!(parse_manifest_i18n(&y(bad)).is_err(), "{bad}");
+        }
+    }
 }

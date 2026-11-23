@@ -1,8 +1,18 @@
 //! Retrieval matching and freshness labelling: which accepted memories
 //! apply to a dispatch context, how they rank, and how their evidence
 //! is labelled or withheld. Scope globs, the freshness window and the
-//! stale-withhold policy all live here; quorum and finalization stay in
-//! the parent — `match_memories` still calls `retrieval_status`.
+//! validity-withhold policy all live here; native policy qualification stays
+//! in the parent — `match_memories` still calls `retrieval_status`.
+//!
+//! Two path axes reach a lesson: concrete paths already in the context
+//! (recorded commits) through `glob_match`, and an issue's declared
+//! planned paths — directories and globs included — as the set of files
+//! they cover (`Planned::reaches`). The planned axis only ever adds
+//! selections inside the lesson's own scope; it never widens a lesson
+//! past what a commit of the same file would select.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
 
 use std::path::Path;
 
@@ -12,6 +22,11 @@ use crate::issue::{project, time};
 
 use super::{retrieval_status, Memory, Scope};
 
+mod glob;
+
+pub use glob::glob_match;
+use glob::Planned;
+
 /// What a dispatch/match call knows about the target.
 #[derive(Clone, Debug, Default)]
 pub struct MatchCtx {
@@ -20,50 +35,20 @@ pub struct MatchCtx {
     pub paths: Vec<String>,
     pub providers: Vec<String>,
     pub tags: Vec<String>,
-}
-
-/// `*` within a path segment, `**` across segments, `?` one char.
-/// Unanchored suffixes (`src/**` alone) still require the leading
-/// segments to match — globs are anchored at both ends.
-pub fn glob_match(pattern: &str, path: &str) -> bool {
-    fn inner(p: &[u8], s: &[u8]) -> bool {
-        if p.is_empty() {
-            return s.is_empty();
-        }
-        if p.starts_with(b"**") {
-            let rest = &p[2..];
-            let rest = rest.strip_prefix(b"/").unwrap_or(rest);
-            // `**` spans slashes: try every split point of the string.
-            return (0..=s.len()).any(|i| inner(rest, &s[i..]));
-        }
-        match p[0] {
-            b'*' => {
-                for i in 0..=s.len() {
-                    if inner(&p[1..], &s[i..]) {
-                        return true;
-                    }
-                    if i == s.len() || s[i] == b'/' {
-                        return false;
-                    }
-                }
-                false
-            }
-            b'?' => !s.is_empty() && s[0] != b'/' && inner(&p[1..], &s[1..]),
-            c => !s.is_empty() && s[0] == c && inner(&p[1..], &s[1..]),
-        }
-    }
-    inner(pattern.as_bytes(), path.as_bytes())
+    /// Native assigned task/team roles; unknown is an empty set.
+    pub roles: Vec<String>,
 }
 
 /// Union semantics per the kickoff: a memory applies when ANY scope
-/// axis matches the context.
-fn applies(scope: &Scope, ctx: &MatchCtx) -> bool {
+/// axis matches the context. Declared planned paths are a path axis too,
+/// matched as the set of files a declaration covers — never as one
+/// string — so a directory or glob declaration still selects the lesson.
+fn applies(scope: &Scope, ctx: &MatchCtx, planned: &[Planned]) -> bool {
     scope.project
         || scope.components.iter().any(|c| ctx.components.contains(c))
-        || scope
-            .paths
-            .iter()
-            .any(|g| ctx.paths.iter().any(|p| glob_match(g, p)))
+        || scope.paths.iter().any(|g| {
+            ctx.paths.iter().any(|p| glob_match(g, p)) || planned.iter().any(|decl| decl.reaches(g))
+        })
         || scope.tags.iter().any(|t| ctx.tags.contains(t))
         || scope.providers.iter().any(|p| ctx.providers.contains(p))
 }
@@ -134,6 +119,10 @@ impl Freshness {
 /// so an accepted lesson with no verify finalization is unverified —
 /// including legacy records whose `verified_at` was stamped at accept.
 pub fn last_verified(mem: &Memory) -> Option<&str> {
+    if mem.front.policy.is_some() {
+        // Policy review/source attestation is not a CAD-348 check receipt.
+        return None;
+    }
     if mem.front.review_cycle < 2 {
         return None;
     }
@@ -175,13 +164,17 @@ pub fn stale_reason(mem: &Memory) -> Option<String> {
     })
 }
 
+pub(super) fn withhold_reason(mem: &Memory, fresh: &Freshness) -> Option<String> {
+    stale_reason(mem).or_else(|| super::v2::unused_reason(mem, fresh.now))
+}
+
 /// A lesson's evidence as retrieval reads it — the one view dispatch,
 /// the board and `memory ls --stale` share: `withheld` with its reason
 /// when explicitly marked stale, else the `evidence_label` (`verified`
 /// only inside the window). `last_verified` is the verify finalization,
 /// never the raw `verified_at` field.
 pub fn evidence_json(mem: &Memory, fresh: &Freshness) -> Value {
-    let (state, label, reason) = match stale_reason(mem) {
+    let (state, label, reason) = match withhold_reason(mem, fresh) {
         Some(reason) => ("withheld", "withheld".to_string(), Some(reason)),
         None if current_verify(mem, fresh).is_some() => {
             ("verified", evidence_label(mem, fresh), None)
@@ -203,8 +196,8 @@ pub fn evidence_json(mem: &Memory, fresh: &Freshness) -> Value {
 pub struct Matched {
     /// Injectable lessons, ranked.
     pub lessons: Vec<Memory>,
-    /// Review-eligible lessons in scope but withheld for stale evidence,
-    /// each with its reason — "why did I not get this?".
+    /// Policy-qualified lessons withheld for validity or unknown target role,
+    /// with the reason needed to explain absent guidance.
     pub withheld: Vec<(Memory, String)>,
     pub fresh: Freshness,
 }
@@ -221,16 +214,48 @@ impl Matched {
 /// verified first (unverified and decayed last). Explicitly stale ones
 /// are withheld with a reason.
 pub fn match_memories(memories: &[Memory], ctx: &MatchCtx, fresh: &Freshness) -> Matched {
+    ranked(memories, ctx, fresh, &[])
+}
+
+/// `match_memories` plus the target's declared planned paths: validated
+/// repo-relative files or globs an issue plans to touch, matched before
+/// any commit exists. Every other axis, the ranking and the withholding
+/// policy are exactly `match_memories`; a declaration only ever reaches
+/// a lesson through that lesson's own path scope.
+pub fn match_memories_planned(
+    memories: &[Memory],
+    ctx: &MatchCtx,
+    fresh: &Freshness,
+    planned: &[String],
+) -> Matched {
+    ranked(memories, ctx, fresh, planned)
+}
+
+fn ranked(memories: &[Memory], ctx: &MatchCtx, fresh: &Freshness, planned: &[String]) -> Matched {
+    // One automaton per declaration, shared by every candidate lesson.
+    let planned: Vec<Planned> = planned.iter().map(|decl| Planned::build(decl)).collect();
     let mut out = Matched {
         lessons: Vec::new(),
         withheld: Vec::new(),
         fresh: *fresh,
     };
     for m in memories {
-        if m.front.status != "accepted" || !retrieval_status(m).0 || !applies(&m.front.scope, ctx) {
+        if m.front.status != "accepted"
+            || !retrieval_status(m).0
+            || !applies(&m.front.scope, ctx, &planned)
+        {
             continue;
         }
-        match stale_reason(m) {
+        if !super::v2::role_matches(m, ctx.roles.iter().map(String::as_str)) {
+            if ctx.roles.is_empty() {
+                out.withheld.push((
+                    m.clone(),
+                    "native target role is unavailable for role-scoped guidance".to_owned(),
+                ));
+            }
+            continue;
+        }
+        match withhold_reason(m, fresh) {
             Some(reason) => out.withheld.push((m.clone(), reason)),
             None => out.lessons.push(m.clone()),
         }

@@ -4,10 +4,12 @@ import { onPrivateSessionReset } from "../../lib/privateSession";
 /** Per-browser sidebar layout (CAD-1692): what is folded and which
  *  projects are pinned. The desktop sidebar and the phone menu share it. */
 export interface SidebarPrefs {
+  /** Desktop icon rail preference; mobile drawer visibility is separate. */
+  collapsed: boolean;
   /** The Apps tree is unfolded. */
   appsOpen: boolean;
-  /** Installations whose section list the user folded. */
-  closedApps: string[];
+  /** Installations whose section list is unfolded (allowlist; collapsed by default). */
+  openApps: string[];
   /** The Projects section is unfolded. */
   projectsOpen: boolean;
   /** Project keys pinned to the top, in pin order. */
@@ -19,8 +21,9 @@ export interface SidebarPrefs {
 export const SIDEBAR_PREFS_KEY = "cadence.sidebar";
 
 export const DEFAULT_SIDEBAR_PREFS: SidebarPrefs = Object.freeze({
-  appsOpen: true,
-  closedApps: [],
+  collapsed: false,
+  appsOpen: false,
+  openApps: [],
   projectsOpen: true,
   pinned: [],
   showAll: false,
@@ -30,7 +33,9 @@ const flag = (v: unknown, fallback: boolean) => (typeof v === "boolean" ? v : fa
 const ids = (v: unknown) => (Array.isArray(v) ? [...new Set(v.filter((x): x is string => typeof x === "string" && x !== ""))] : []);
 
 /** Storage that is missing, throws or holds anything malformed means the
- *  defaults, never an error. */
+ *  defaults, never an error. Legacy payloads (before `openApps` existed,
+ *  when `appsOpen: true` and `closedApps: []` were defaults) reset only the
+ *  Apps fold state to the calm default while preserving rail and project pins. */
 export function readSidebarPrefs(storage: Pick<Storage, "getItem"> | null = safeStorage()): SidebarPrefs {
   try {
     const raw = storage?.getItem(SIDEBAR_PREFS_KEY);
@@ -38,9 +43,11 @@ export function readSidebarPrefs(storage: Pick<Storage, "getItem"> | null = safe
     const v = JSON.parse(raw) as Partial<Record<keyof SidebarPrefs, unknown>> | null;
     if (v === null || typeof v !== "object") return DEFAULT_SIDEBAR_PREFS;
     const d = DEFAULT_SIDEBAR_PREFS;
+    const hasAllowlist = Object.hasOwn(v, "openApps");
     return {
-      appsOpen: flag(v.appsOpen, d.appsOpen),
-      closedApps: ids(v.closedApps),
+      collapsed: flag(v.collapsed, d.collapsed),
+      appsOpen: hasAllowlist ? flag(v.appsOpen, d.appsOpen) : d.appsOpen,
+      openApps: hasAllowlist ? ids(v.openApps) : d.openApps,
       projectsOpen: flag(v.projectsOpen, d.projectsOpen),
       pinned: ids(v.pinned),
       showAll: flag(v.showAll, d.showAll),
@@ -91,11 +98,9 @@ export function useSidebarPrefs(): SidebarPrefs {
 const LOADING = Symbol("loading");
 let seenApp: string | null | typeof LOADING | undefined;
 
-/** Entering an app unfolds Apps and that app's sections; loading the
- *  board straight onto an app page, staying on one app, and leaving an
- *  app never change a fold. `onAppScreen` comes from the route (known at
- *  once); `installId` is the resolved current installation, or null while
- *  the installed-app list or the app's receipt is still loading. */
+/** Entering an app unfolds Apps and switches open app sections to that
+ *  active app (accordion); loading the board straight onto an app page,
+ *  staying on one app, and leaving an app never change a fold. */
 export function noteAppScreen(onAppScreen: boolean, installId: string | null): void {
   if (!onAppScreen) {
     seenApp = null;
@@ -113,9 +118,9 @@ export function noteAppScreen(onAppScreen: boolean, installId: string | null): v
   if (installId === seenApp) return;
   seenApp = installId;
   updateSidebarPrefs((p) =>
-    p.appsOpen && !p.closedApps.includes(installId)
+    p.appsOpen && p.openApps.length === 1 && p.openApps[0] === installId
       ? p
-      : { ...p, appsOpen: true, closedApps: p.closedApps.filter((id) => id !== installId) });
+      : { ...p, appsOpen: true, openApps: [installId] });
 }
 
 onPrivateSessionReset(() => {

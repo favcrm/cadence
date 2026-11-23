@@ -511,6 +511,111 @@ fn the_hook_validates_the_staged_content_not_the_working_trees() {
     assert_eq!(worktree_content(&pm, "tracked.txt"), "working\n");
 }
 
+/// CAD-2184: the directory the pre-commit hook runs in holds a copy of
+/// the staged content, which may be private, so its mode must not come
+/// from the caller's umask. Under umask 0002 an ordinary new directory
+/// is 0775 — readable and writable by the group — so this test re-runs
+/// itself with exactly that umask and asserts the materialized
+/// directory is 0700 while still holding the STAGED bytes and a gitfile
+/// that points at the real repository.
+#[test]
+fn the_materialized_copy_is_owner_only_under_a_permissive_umask() {
+    const CHILD: &str = "CADENCE_TEST_RECOVERY_SCRATCH_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, pm) = tracker();
+        // The child really is running with the permissive umask: a
+        // directory made the ordinary way is group-writable.
+        let control = tmp.path().join("control");
+        std::fs::create_dir(&control).unwrap();
+        let control_mode = std::fs::metadata(&control).unwrap().permissions().mode();
+        assert_eq!(
+            control_mode & 0o777,
+            0o775,
+            "the child did not inherit umask 0002"
+        );
+
+        // The staged copy and the working tree's copy differ, so the
+        // materialized bytes show which one was used.
+        std::fs::write(pm.dir.join("tracked.txt"), "staged\n").unwrap();
+        git(&pm.dir, &["add", "tracked.txt"]).unwrap();
+        std::fs::write(pm.dir.join("tracked.txt"), "working\n").unwrap();
+
+        let git_dir = super::git_dir_of(&pm).unwrap();
+        let index = super::index_path(&pm).unwrap();
+        let copy = super::materialize_index(&pm, &git_dir, &index).unwrap();
+        let scratch = copy.path();
+        let mode = std::fs::metadata(scratch).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the materialized directory must be owner-only, got {mode:o}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("tracked.txt")).unwrap(),
+            "staged\n",
+            "the copy must be the index's content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.join(".git")).unwrap(),
+            format!("gitdir: {}\n", git_dir.display()),
+            "the copy must point at the real repository"
+        );
+        // The gitfile is what makes the copy the hook's worktree: the
+        // hook's own `git rev-parse --show-toplevel` resolves here.
+        let toplevel = git(scratch, &["rev-parse", "--show-toplevel"]).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(scratch).unwrap(),
+            std::fs::canonicalize(&toplevel).unwrap(),
+            "the gitfile must make the copy the hook's worktree"
+        );
+        // The copy lives exactly as long as the handle that made it.
+        let first = scratch.to_path_buf();
+        drop(copy);
+        assert!(
+            !first.exists(),
+            "the scratch copy must be removed with its handle"
+        );
+        return;
+    }
+    // The child owns its environment: an inherited GIT_DIR, GIT_WORK_TREE,
+    // GIT_INDEX_FILE, GIT_TEMPLATE_DIR or GIT_CONFIG_* routing would
+    // point its git at whatever repository launched this test, and an
+    // inherited config would bring that config's hooks along. So the
+    // environment is cleared and only what the fixture needs is supplied,
+    // config and identity included.
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg("umask 0002 && exec \"$0\" --exact \"$1\" --test-threads=1")
+        .arg(std::env::current_exe().unwrap())
+        .arg(concat!(
+            "issue::recovery::recovery_tests::",
+            "the_materialized_copy_is_owner_only_under_a_permissive_umask"
+        ))
+        .env_clear()
+        .env(CHILD, "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "cadence")
+        .env("GIT_CONFIG_KEY_1", "user.email")
+        .env("GIT_CONFIG_VALUE_1", "cadence@localhost");
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Some(tmp) = std::env::var_os("TMPDIR") {
+        cmd.env("TMPDIR", tmp);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// CAD-1601: the mutation boundary does not follow a symlinked
 /// ancestor. A removal under one fails instead of deleting the file
 /// outside the tracker.

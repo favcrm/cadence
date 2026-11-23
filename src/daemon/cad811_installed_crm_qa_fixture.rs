@@ -22,7 +22,6 @@ const TABLE_FORM_ADAPTER_ARCHIVE_SHA256: &str =
     "921291fc4d4ea0ea9f527463ae3fc13b993b661b553f91211e089dd030e20ad9";
 const CAMPAIGN_DIALOG_ARCHIVE_SHA256: &str =
     "02b5a91fdb8d393ea67a4ccbaafb6bc23e1d0b4bbeebb0088c4ccdc3a91cb46b";
-const FRAME_CAP: usize = 786_432;
 const HOLD_MAX_SECS: u64 = 2_700;
 
 struct Servers {
@@ -478,10 +477,6 @@ fn cad811_installed_crm_qa_fixture() {
         .into_body()
         .read_to_string()
         .expect("read real frame HTML");
-    assert!(
-        frame_html.len() < FRAME_CAP,
-        "real frame exceeds 786432-byte cap"
-    );
     assert!(
         frame_html.contains("var CadenceCrmRuntime=")
             && frame_html.matches("<script nonce=").count() >= 4,

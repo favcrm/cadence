@@ -20,10 +20,37 @@ PIN_NAMES = ("react", "react-dom", "vite", "@vitejs/plugin-react")
 APP_KIT_FILES = (
     "README.md",
     "package.json",
+    "src/forms.mjs",
     "src/index.mjs",
+    "src/react.mjs",
     "src/receiver.mjs",
     "src/refusal.mjs",
     "types/index.d.ts",
+    "types/react.d.ts",
+)
+TEMPLATE_FILES = (
+    "README.md",
+    "package.json",
+    "preview.html",
+    "app/app.md",
+    "app/workflows/hello.md",
+    "scripts/build.mjs",
+    "scripts/dev-preview.mjs",
+    "scripts/package.mjs",
+    "scripts/pre-push",
+    "src/main.js",
+    "src/styles.css",
+    "tests/template.test.mjs",
+)
+CHECKLIST_FILES = (
+    "README.md",
+    "package.json",
+    "app/app.md",
+    "app/app-storage.json",
+    "app/storage/001-tasks.json",
+    "app/workflows/plan.md",
+    "src/main.js",
+    "src/styles.css",
 )
 
 
@@ -101,6 +128,24 @@ def main():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             app_kit_files[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
+        template_files = {}
+        for relative in TEMPLATE_FILES:
+            source = ROOT / "app-toolchain/template" / relative
+            if not source.is_file() or source.is_symlink():
+                fail(f"template source is missing or not a regular file: {relative}")
+            target = stage / "template" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            template_files[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
+        checklist_files = {}
+        for relative in CHECKLIST_FILES:
+            source = ROOT / "app-toolchain/checklist" / relative
+            if not source.is_file() or source.is_symlink():
+                fail(f"checklist source is missing or not a regular file: {relative}")
+            target = stage / "checklist" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            checklist_files[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
         (stage / "toolchain.json").write_text(json.dumps({
             "schema": SCHEMA,
             "tag": args.tag,
@@ -108,6 +153,8 @@ def main():
             "package_manager": manager,
             "pins": pins,
             "app_kit": {"version": app_kit_version, "files": app_kit_files},
+            "template": {"files": template_files},
+            "checklist": {"files": checklist_files},
         }, indent=2) + "\n")
         frame = stage / "frame-kit"
         subprocess.run(
@@ -119,6 +166,8 @@ def main():
             "LICENSE", "README.md", "frame-kit/frame.html", "frame-kit/kit.css",
             "frame-kit/metadata.json", "package.json", "bun.lock", "toolchain.json",
             *(f"app-kit/{relative}" for relative in APP_KIT_FILES),
+            *(f"template/{relative}" for relative in TEMPLATE_FILES),
+            *(f"checklist/{relative}" for relative in CHECKLIST_FILES),
         ]
         for member in members:
             if not (stage / member).is_file():

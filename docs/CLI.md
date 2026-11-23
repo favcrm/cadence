@@ -35,11 +35,32 @@ local-only before any transport, credential read or container wake, and
 `--org local`/`CADENCE_ORG=local` selects the registered local
 connection. A `--state-dir` pin stays a plain local binding.
 
+The `cadence org=local ...` receipt identifies the installation being
+maintained, not the saved default for ordinary commands. Native update and
+`--check` also print their local-only scope on stderr. When resolving the
+command already read the local registry, the receipt may name the saved
+default separately; it is not used or changed by the update.
+
+The change summary is a list of merged pull-request titles, not a complete
+changelog. An owned release snapshot does not carry those titles, and an
+unavailable or incomplete comparison cannot prove an empty summary. In
+`--check --json`, `changes_available: false` with `changes: null` and
+`change_count: null` means unavailable; an available empty summary uses
+`true`, `[]` and `0`. The board treats older cached reports without the
+availability field as unknown rather than as zero changes.
+
+On the board's `GET /api/update`, an unavailable-summary check is carried in
+`check_with_unavailable_summary` while the legacy `check` field is null.
+Updated clients use that field; a tab loaded before the update sees its
+check as unavailable rather than crashing or receiving a fabricated empty
+summary.
+
 `cadence update` is operator-only and proves it the same way
 `rollout claim --as` does: the process must run outside every pane and
-managed endpoint, which an agent, a pane descendant or an unproven
-caller can never satisfy — a forged `--as` or scrubbed environment
-changes nothing. `--as operator:<name>` is now optional: it only names
+managed endpoint, which a process in a registered agent's pane or a pane
+descendant cannot satisfy. A forged `--as` changes nothing. Scrubbing alone does
+not help a process cadence launched, but scrubbing and detaching can, and a
+hand-started process needs less: see `docs/AUDIT.md`. `--as operator:<name>` is now optional: it only names
 the audit label. Without it, the run is labelled from the proven local
 OS identity (the real uid and pid), never from `$USER`,
 `$CADENCE_ALIAS` or a client-supplied field.
@@ -72,6 +93,19 @@ update's exit status. File match and provider links do not mean an agent
 session has reloaded the guidance — start a fresh session or reread it at
 a task boundary. Client-only update does not install guidance or start a
 daemon. A sandbox profile still does not write the shared home.
+
+After a successful switch, the updater process can still be the previous
+binary while the local daemon answers on the new build. Guidance calls this
+expected only when the switch and health receipt, the old updater build and
+the observed daemon build agree. A mismatch during a rollback or an
+unconfirmed switch remains a warning. If either build is unknown, guidance
+says that it cannot make the comparison.
+
+In an unmanaged native session, `cadence skill status` and `cadence skill show`
+inspect this machine even when a hosted org is the saved default. An explicit
+remote `--org` or `CADENCE_ORG` is refused rather than ignored. Managed and
+grant-bound sessions retain their existing routing and permission checks.
+This does not change skill installation authority or client-only policy.
 
 `--to` runs the same checks as `upgrade --sha`: the sha is on main, CI's
 `test` job passed on that exact sha, the sha256 and manifest match, and the
@@ -124,9 +158,27 @@ candidate only after its build-provenance attestation verifies and its
 manifest matches this platform and version. It does not downgrade, delete old
 releases or touch the daemon.
 
+Older client updaters can reject newer release manifests after the CI check
+list or macOS runner changes. If an installed updater reports a manifest
+mismatch, use the signed release's `install.sh --client-only` to reinstall;
+the old updater cannot repair its own manifest validation.
+
 From a client-only installation, local daemon and state commands refuse with
 exit 3. Remote org verbs route to their org, and bounded
 login, auth, org and offline management stays available.
+
+An unmanaged client-only installation can read its bundled guidance offline:
+
+```sh
+cadence-client skill show cadence --file SKILL.md
+```
+
+This reads the copy embedded in the installed executable, not a workspace or
+an installed provider skill; it makes no request and does not change the
+workspace default. Omit `--file` for the bundled file manifest. Managed
+callers keep their existing routing and permission checks; installation and
+status commands remain unchanged. Reading it does not mean an already-running
+agent session has reloaded it.
 
 This mode needs a published release whose `cadence update --help` carries the
 client-only marker (`Upgrade a client-only installation`). The published
@@ -150,7 +202,7 @@ per-agent filesystem confinement and provider sandboxes remain separate.
 ```
 cadence dev up [--name <n>] [--build <path>]   # create/start; writes the dev marker into the store
 eval "$(cadence dev env)"                      # point this shell at it
-cadence dev reload [--build <path>]            # restart from a local binary
+cadence dev reload [--name <n>] [--build <path>]  # restart from a local binary (clean shell, not one `dev env` exported)
 cadence dev status | down | env | ls | reset <name>
 ```
 
@@ -160,9 +212,29 @@ transport or container wake path. An explicitly remote `--org` or
 `CADENCE_ORG` refuses; explicit local state/tracker bindings and managed
 callers' identity restrictions remain in force.
 
+`reload`, `down` and `reset` delete or restart a sandbox, so they refuse in a
+shell that `dev env` exported (the exports name the sandbox's own roots, and a
+marker is not proof). Do not simply retry them from a clean shell. First check
+the sandbox root the refusal names: if it is a live installation (a tracker, a
+daemon database, hosted credentials), its marker is planted — stop, and run
+nothing. Only when this shell came from `cadence dev env` and that root is a
+disposable sandbox, run the verb with the sandbox exports removed: `env -u
+CADENCE_STATE_DIR -u CADENCE_PM_DIR -u XDG_CONFIG_HOME -u CADENCE_PROFILE
+cadence dev down <name>` (likewise `dev reload --name <name>`, which takes
+`--name`, and `dev reset <name>`). The refusal prints the same warning first.
+So the sequence `eval "$(cadence dev env kk)"; cadence dev reload` is not
+available in one shell: open a clean shell for the restart.
+
 `dev reload` defaults to the newest of the repo's `target/release/cadence` and
 `target/debug/cadence`. It claims no rollout lease, checks no attestation and
 takes no backup.
+
+For source-build tracker smoke, put the selected build directory on the
+development process's `PATH` as well. Tracker Git hooks invoke
+`cadence issue lint`; an older installed CLI can otherwise reject a new
+schema even though `--build` selected the new daemon. Keep that executable
+binding inside the disposable instance; do not replace the production binary
+to make a local smoke pass.
 
 Daemon and board startup must return valid JSON with a nonempty string
 `state`; malformed or missing startup state is an error, not null success.
@@ -213,6 +285,15 @@ and scripts. Prefer `cadence update`; it does their steps in order.
   low-level verified install that `update` calls. `--allow-unattested` rolls
   back to a hand-built release already on disk.
 
+## Root names
+
+The default `cadence --help` lists nouns. Actions sit under them.
+
+- `issue epic propose`, `issue epic approve` and `issue epic reject` write a plan. `plan propose`, `plan approve` and `plan reject` are the same writes. `plan ls` and `plan show` stay: `issue epic ls` and `issue epic show` are the epic board, not the proposal list.
+- `agent join <group> <provider>` adds a worker. `cadence join` still parses.
+- `message send` is the canonical enqueue. `cadence send` still parses.
+- Dispatch stays `cadence dispatch <id> --to <alias>`. It starts an issue, so it is not under `agent`.
+
 ## Finding a command
 
 `cadence commands` and `cadence schema` are offline. They do not open a
@@ -228,6 +309,9 @@ cadence commands "issue comment" --limit 20
 cadence commands --all                   # every public path
 cadence schema issue comment
 cadence schema agent wait
+cadence schema issue ls                  # known hosted-client restrictions
+cadence commands "create project"
+cadence schema project new
 ```
 
 `commands` with a query returns `{schema_version, commands, total, truncated}`.
@@ -242,6 +326,23 @@ spelling, aliases, required, arity, action, possible values, help), not
 default values. A public alias resolves to the canonical path. An unknown
 or hidden path exits 2 and writes nothing to stdout.
 
+Some arguments include `hosted: { "client_route": "unsupported", "reason": ... }`.
+This records a refusal by the installed CLI before it contacts a hosted
+workspace. An absent annotation does not promise hosted support: the live
+workspace version, its configuration and the caller's permissions may differ.
+Local options remain available as documented.
+
+`project new` has different effects by destination. Locally it can register a
+repository and seed `PROJECT.md`; on a selected hosted workspace it registers
+an empty project, requires `--name` and an authorized live human owner, and
+does not create a local repository. Inspect `cadence schema project new` before
+acting.
+
+`issue project timeline <key>` reads a hosted workspace's project timeline
+(ticket changes, comments, role messages and reviews, newest first) with
+`--since`, `--kind`, `--open`, `--limit` and `--before <cursor>`; a local board
+refuses it.
+
 These streams stay raw and are not part of discovery: inbox and events
 NDJSON, logs and content bytes, a bare `build-slot acquire` token, and
 `build-slot run` child stdout.
@@ -253,23 +354,303 @@ Two selectors, never one:
 - `--org <slug>` selects whose board the command acts on — `local` (the
   default) or a hosted workspace. It never says where an agent runs.
 - `--placement local|cloud|queue` filters `agent list` and `status` by
-  where the agent's process runs: `local` on the daemon's host, `cloud`
-  for a provider-hosted session (`devin · cloud`), `queue` for a mailbox
-  with no process. The value is derived from `(provider, endpoint_kind)`;
-  the flag only selects it.
+  where the runtime executes: `local` on the daemon's host, `cloud`
+  for a provider-hosted runtime (including Worker/Pi conversations),
+  `queue` for a mailbox. The value is derived from
+  `(provider, endpoint_kind)`; the flag only selects it.
 
 `--org acme --placement local` is therefore the local-assignment plane:
 the board owns the ticket and this machine runs it. `--org local` alone
 is the standalone board, not "the local agent".
 
 The hosted binding lives under the `agent` noun:
-`agent connect|watch|assignments|disconnect|reassign`, each taking
-`--org <hosted>`. `local-agent` remains a hidden alias for one release;
-`local-agent report` is still the explicit claim reporter.
+`agent connect|watch|assignments|disconnect|reassign|report|tool`, each taking
+`--org <hosted>`. `agent report` is the explicit claim reporter.
+`agent connect --fyi-only` registers an extra alias and leaves the
+assignment default in place.
 
 `cadence send <alias> --wait[=SECS]` waits for the turn's terminal state
 (the same path as the hidden `message ask`). A remote send is a durable
 enqueue only and refuses `--wait`.
+
+## Guidance diagnostics
+
+Plain local `cadence doctor` includes `checks.guidance`, comparing only the
+bundled `cadence` files with the copy in the caller's `$HOME/.agents/skills`.
+It reports `missing`, `stale`, `current`, or `unknown`; the storage check still
+determines its exit code. This does not establish provider discovery or what a
+running session read. `cadence skill sync` refreshes bundled guidance;
+`cadence skill install <name>` replaces the selected bundle after you review
+local changes.
+
+`cadence doctor --agent <alias> [--skill <bundled-name>]` checks the named
+native agent, defaulting to `cadence`. Run it **inside that runner** to check
+the bundled copies in `$HOME/.agents/skills` and `./.agents/skills` for the
+invocation. The daemon verifies that the caller is the named runner before
+the CLI checks either directory. An outside invocation reads no target files
+and leaves `copies` null; run inside the runner or supply the guidance
+through an authorized task route.
+
+`installed` (exit 0) means a copy matches this CLI's bundle, not that the
+provider discovers or has read it. Managed Pi/omp reports `disabled` (exit 1)
+even with a matching copy. If neither can be established, the report is
+`unknown` (exit 1). The `copies` and `discovery` fields keep these facts separate.
+
+`cadence --org <org> doctor --agent <profile-id> [--skill <name>]` instead
+checks profile assignment and the workspace catalog's approved revision and
+digest, using the selected caller. It reports `not_assigned`, `missing`,
+`unapproved`, `available`, or `unknown`; `available` concerns the profile's
+board dispatch only, not an actual run or SOP compliance. Older boards,
+refusals and malformed metadata are unknown. Targeted hosted diagnostics
+require an explicit `--org`; `--offline` sends no requests and reports unknown.
+Targeted reports exit 0 only for available. These options do not change
+ordinary hosted connection checks or `doctor --host`.
+
+## Cadence home, overrides and isolation (CAD-1922)
+
+One resolver (`src/home.rs`) answers every Cadence path, and `cadence doctor
+--host` reports the branch it took under the `layout` check. It only resolves:
+nothing here creates, moves, copies or deletes an installation's data.
+
+**A first run** — no existing tracker, state directory or hosted config is
+present anywhere — uses one consolidated home, `~/.cadence` (or
+`$CADENCE_HOME` when set):
+
+| Path | Contents |
+| --- | --- |
+| `~/.cadence/state/` | runtime state, socket, database (0700) |
+| `~/.cadence/tracker/` | Git tracker |
+| `~/.cadence/vault/` | knowledge vault |
+| `~/.cadence/workspace/` | operational upload workspace |
+| `~/.cadence/repos/` | managed repo checkouts |
+| `~/.cadence/config/` | hosted config and credentials, private (0700; files 0600) |
+
+The executable stays wherever it was installed (`~/.local/bin`). A directory
+the consolidated home creates is made 0700 (the home root and every missing
+ancestor below it, on the first credential write) and the home root of a first
+run is kept 0700; a directory that already exists keeps its mode, and an
+existing installation's directories are never re-chmod'ed.
+
+**An existing installation keeps the paths it has**: tracker `~/pm`, runtime
+state `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`, vault
+`<tracker>/wiki`, hosted config and credentials `$XDG_CONFIG_HOME/cadence`.
+Any one of those present keeps every path on the legacy branch, so resolution
+cannot switch a live install away from its data. A bare `state/`, `tracker/` or
+`config/` directory under `~/.cadence` — an `overview-gh.json` cache, lane
+worktrees under `~/.cadence/wt` — is not an installation and never overrides a
+legacy one; `cadence doctor --host` reports such a stray home, and nothing in
+it is removed. The branch is sticky: once `~/.cadence` holds real installation
+data (the tracker's `pm.yaml`, the daemon database `state/cadence.sqlite3`, or
+the hosted `config/orgs.json` / `config/remote-auth/credential.json`), a legacy path that turns
+up later (a stray `~/pm`, an old saved binding) can neither flip the
+installation nor be preferred silently — **both at once is refused**, naming
+every root, so nothing is guessed. A probe that cannot be answered (a
+permission error, a dangling symlink) counts as present, so an installation the
+resolver could not inspect is never switched. There is **no automatic
+migration, no implicit default switch and no new empty tracker**: moving an
+existing installation is a separate operator-approved, backed-up operation with
+validation and rollback, which this build does not perform. A
+`~/.cadence/LAYOUT` marker, the directory's existence or same-uid ownership are
+reported at most; none of them switches a live install.
+
+The vault follows the tracker the consolidated branch owns: `<home>/tracker`
+keeps `<home>/vault`, and every other tracker — the legacy `~/pm`, or any
+`CADENCE_PM_DIR` that is not that one, including one that merely sits under the
+home — keeps `<tracker>/wiki`. An explicit `CADENCE_HOME` is the exception it
+always was: it keeps `<home>/vault` for every tracker. The branch's own
+tracker, not the string prefix of a path, decides the rest, so a
+per-directory override (`cadence switch local` exports the pair, a sandbox
+exports its own) only overrides its own directory and never moves the vault or
+the hosted config.
+
+A CI job, container or test suite with its own `$HOME` is a first run like any
+other and gets `~/.cadence` **inside that isolated home** — never the host's
+installation. Name it explicitly with `CADENCE_HOME` when the environment
+wants a fixed root.
+
+**Documented overrides.** `CADENCE_HOME`, `XDG_CONFIG_HOME` and `--auth-dir`
+must be absolute and a relative value is refused; `CADENCE_PM_DIR`,
+`CADENCE_STATE_DIR` and `XDG_STATE_HOME` are used as given, as they always
+were.
+
+- `CADENCE_HOME` — the consolidated home root. Use it for a system install
+  (`CADENCE_HOME=/var/lib/cadence`), for a separate profile, or to return to
+  `~/.cadence` after an installation exists elsewhere. Hosted credentials
+  follow the evidence, not the flag: an exported `XDG_CONFIG_HOME` names
+  their root (`$XDG_CONFIG_HOME/cadence`, whether or not it exists yet), a
+  legacy root that already holds something keeps them, and otherwise they
+  live in `<CADENCE_HOME>/config` — including when
+  `CADENCE_PM_DIR`/`CADENCE_STATE_DIR` are also set.
+- `CADENCE_PM_DIR` — tracker, in either layout. Overrides only the tracker.
+- `CADENCE_STATE_DIR` — runtime state, in either layout. Overrides only the
+  state dir.
+- `--state-dir` — the same per command, and what a sandbox passes. Naming a
+  legacy root counts as the same explicit choice of that installation as the
+  exported variable.
+- `--auth-dir` — hosted credentials, per command.
+
+None of these chooses the layout, with one exception: exporting
+`CADENCE_STATE_DIR` or `CADENCE_PM_DIR`, or passing `--state-dir`, *at a legacy root* (`$XDG_STATE_HOME/
+cadence`, `~/.local/state/cadence`, `~/pm`) is an explicit choice of that
+installation, and it resolves to the legacy branch — creating that directory
+would otherwise make the installation ambiguous on the next run. Every other
+override (including the pair `cadence switch local` exports into its own
+process) changes its own directory and nothing else, so one command cannot
+flip the vault or the hosted config mid-run.
+
+`CADENCE_HOME` is refused when it contains `..` or when any existing ancestor
+is a symlink: that root is authoritative for credentials, so a planted link
+above it would redirect them.
+
+`XDG_CONFIG_HOME` names the config root of a legacy installation, and of any
+run given an explicit `CADENCE_HOME`, where it names the credential root
+whether or not it exists yet. A consolidated installation — a genuine first
+run, or one already living in `~/.cadence` — keeps its config under its own
+home even when the variable is exported: writing the first credential into the
+legacy root would make the next run see both layouts and refuse the
+installation as ambiguous. With `HOME` absent and no explicit home or
+sandbox profile, an absolute `XDG_CONFIG_HOME` still names the hosted config
+root. An absolute `CADENCE_HOME` without either variable uses its own `config`
+directory. An invalid declared home or stale sandbox profile refuses rather
+than falling back to another root. Inside the consolidated home a symlinked
+`~/.cadence`, `~/.cadence/config` or credential directory is refused.
+
+The state directory holds the daemon socket, so `<state>/cadence.sock` must
+fit the 107-byte Unix socket limit; `setup` and `dev up` refuse a longer path
+rather than failing later.
+
+`cadence dev` instances are isolated on every axis: `dev up` exports
+`CADENCE_PROFILE`, `CADENCE_STATE_DIR`, `CADENCE_PM_DIR` and
+`XDG_CONFIG_HOME` for its own root, and the resolver maps that profile to the
+sandbox root as the home — `CADENCE_HOME` is deliberately *not* exported, so
+the overlap guard can read it as evidence of a real installation. A caller's
+consolidated home, system install or hosted credentials therefore never leak
+in, and every verb refuses a root
+that overlaps production's state dir, tracker, home or config dir — including
+one named by an exported `CADENCE_HOME`. `status`, `env` and the global opt-in
+gate exempt an exported dir that is exactly the sandbox's own, so a shell
+exported by `dev env` can inspect itself; `reset`, `down` and `reload` keep
+the strict inventory with no exemption. A sandbox
+created before this change keeps its old vault at `<root>/pm/wiki`; its
+vault now resolves to `<root>/vault`, so `cadence dev reset <name>` starts it
+over rather than migrating it.
+
+## Native cloud-agent connections (CAD-1853)
+
+This unreleased integration connects a **local** Cadence coordinator to the
+matching AgenticOS Worker/Pi cloud-chat runtime. It is not a hosted Linux/git
+executor or the personal assistant. There is no `cloud-agent` command.
+`agent connect --local` (the default) claims hosted work and runs it here.
+`agent connect --cloud` connects the Worker/Pi agent; that flag is the
+consent for paid model turns. A turn is `send`. Both native and platform
+versions must support the new contract.
+
+From an operator connection, grant the saved workspace explicit cloud scopes,
+then connect it:
+
+```sh
+cadence login acme --cloud-agent
+cadence agent connect --cloud
+cadence send cloud --text "Explain this task" --wait 60
+```
+
+The workspace hint for `login` is positional (`cadence login <slug>`): global
+`--org` is the legacy bound-login workspace id and conflicts with
+`--cloud-agent`. With one saved login, `--cloud` uses it. With more than
+one, pass `--workspace <slug>`. Neither flag changes the local coordinator,
+and global `--org` must not be used as the cloud connection's target. The
+Threads alias defaults to `cloud`; `--alias` overrides it. A local
+`--state-dir` pin remains supported.
+Connect performs identity/capability discovery, not a model invocation.
+Existing `cli.*`, wiki or settings permission does not imply cloud consent.
+
+`cadence login acme --cloud-agent` is that same board login plus
+`bridge.enroll`, `cloud_agent.read`, and `cloud_agent.write`. It combines
+with `--web` and `--settings`. The issuer may not drop the CLI pair or those
+three cloud scopes, and a login without the flag cannot gain them from a
+response. One workspace keeps one saved login, so the board and
+`agent connect --cloud` use it together. Renewal rotates that login and must
+return the same scopes. An operator can enroll a managed local peer with
+`agent cloud enroll-peer <connection-id> --agent <alias>`. It requires the
+supported split-UID process boundary and live registration proof; same-UID
+peers are refused before cloud access. Each peer uses its own cloud-only child
+credential, never the human login. Credentials stay with the daemon and are
+not exported to the peer, browser or command output.
+
+Normal `send` and its terminal wait use canonical messages. An asynchronous
+peer request receives the existing UID-bound result report automatically.
+**Threads owns the conversation**; Agent pages show runtime, capabilities and
+provider-session metadata and link to it. Provider transcripts are distinct
+from local work history. Refreshing the same owner's credential preserves
+context; another issuer/subject or agent registration cannot inherit it.
+
+Generic body reads, including direct message IDs and board previews, apply the
+same source/owner admission to canonical cloud history. Routed local reports
+retain their immutable sender/recipient UID binding **and** require the current
+caller's read authority on each backing cloud connection. One connection's proof
+never authorizes another, and an empty snapshot grants no authority over replies
+that arrive after admission.
+
+Generic `thread_read`, `agent_show` and `agent_events` responses withhold cloud
+request/result content on expected cloud-scope denials, missing cloud authority
+or remote uncertainty, while preserving ordinary local history. An optional
+`cloud_withheld` reason code identifies incomplete history; it is absent on a
+clean read. Identity, isolation, provenance, execution-mode and local storage
+failures remain hard errors. Dedicated cloud read/send refusals are unchanged.
+
+Thread pages retain their raw scanned cursors even when every entry is hidden.
+The thread stream emits `event: cloud_withheld` with
+`{"cloud_withheld":"<reason>"}` or `{"cloud_withheld":null}` to clear it, including
+when no entries arrive. Home and Threads show **Cloud content unavailable**,
+evict cached cloud-marked rows without discarding ordinary history or pending
+messages, and reload cloud history after read authority is restored.
+
+`agent cloud ls|show` inspect connections. Connecting is `agent connect --cloud`, not a verb under `agent cloud`. `agent cloud read <connection-id>
+<operation-id>` reconciles an existing receipt without a new submission.
+`agent cloud send` accepts an explicit `--operation-id`; reuse that ID and the
+identical payload when resolving an interrupted request, not a new ID. A
+`--no-wake` request stays locally queued until explicitly woken. One unsettled
+turn holds its provider session; a busy refusal does not retain another turn.
+Unknown outcomes retain their original binding and reconcile by readback.
+
+This runtime advertises no tools, skills, MCP, profile/memory sync, shell, git,
+business-effect approval or cancellation. `agent cloud cancel` reports
+unsupported rather than claiming a stop. `agent cloud disconnect` stops local
+admission/readback and drops local consent; it does not cancel accepted remote
+work. A new grant cannot revive queued work whose original cloud authority
+was revoked.
+
+Local Workerd/scripted-model and native transport fixtures do not establish a
+live Cloudflare/model qualification. That requires an explicitly authorized
+isolated tenant/model route and a real split-UID peer runtime, separately from
+source checks, reviews, deployment and installation.
+
+## Agent endpoints (CAD-1857)
+
+An endpoint is one agent's receiving identity — `email`, `webhook` or
+`schedule` — bound to exactly one stored workflow. It is created **disabled
+and unverified**; `verify` and `enable` are separate steps. Skills are not
+chosen on the endpoint: a workflow step declares its own `uses:` skill.
+
+```
+cadence endpoint add <agent> --kind email --slug billing \
+  --project <key> --workflow <name>
+cadence endpoint ls [--agent <alias>] [--state enabled|disabled]
+cadence endpoint show <id>
+cadence endpoint verify <id>
+cadence endpoint enable <id>
+cadence endpoint disable <id>
+cadence endpoint rm <id>
+```
+
+`add` pins the stored workflow's source digest (`sha256:…`). A duplicate
+`(kind, slug)`, an unknown agent or workflow, an invalid slug and a malformed
+digest are refused. A slug is 1–20 lowercase letters, digits or hyphens. The
+endpoint is bound to the agent's durable `uid`; re-registering an alias does
+not move it.
+
+Ingress, wake, address/secret allocation and the v2 projection are separate
+tickets; this registry does not accept events by itself.
 
 ## Settings > Agents management (CAD-1586)
 
@@ -313,9 +694,49 @@ cadence settings agents profile sync review --expected-revision "$REV"
 
 Capture the new revision after each configuration change. Saving does not
 sync exports. Sync reports per-file status and a `snapshot`; it preserves
-unmanaged files. Preview starts no process and proves neither authentication
-nor future launch success. Launch saved profiles through the existing
+unmanaged files. A sync that may have changed an export reports an unknown
+outcome: inspect `cadence settings agents show` in the same workspace before
+repeating it. Preview starts no process and proves neither authentication nor
+future launch success. Launch saved profiles through the existing
 `cadence join ... --profile review` path.
+
+### Dedicated AgenticOS model gateway
+
+The protected native master can use an owner-configured AgenticOS gateway.
+Configure the protected runtime and its encrypted custody first. The ordinary
+same-UID sandbox is not eligible.
+
+- In the root-owned `native-model.json` profile, select `routes.agenticos`
+  instead of `routes.devin` and choose exactly one origin class:
+  - Same host: use literal `https://127.0.0.1:<port>` origins and
+    `tls_root_pem` containing the private gateway CA certificate; omit
+    `tls_mode`. The certificate must have a `127.0.0.1` IP SAN.
+  - Production: set both `origins` and `default_origin` to the exact origin
+    `https://api-v2.agenticos.hk` (with `origins` as an array containing that
+    string), set `tls_mode` to `webpki`, and omit `tls_root_pem`. Rustls
+    verifies the public WebPKI chain and hostname.
+  Mixed modes, other hosts or aliases, explicit production ports, paths and
+  queries refuse. Plain HTTP, proxies and redirects are not used.
+- Omit the Devin `sdk` section. The frozen catalog has one explicit
+  `author/model` variant per family. Configure the protected guest for
+  `agenticos` and that model. Effort defaults to `off`; the exact model
+  `agenticos/tencent/hy4` also accepts explicit `high`. Other AgenticOS models
+  accept only `off`. In Settings > Agents, grant that model to the master only.
+  Set the route's `workspace_id` to the AgenticOS workspace that issues the
+  device credential; this is not the native board id.
+- In AgenticOS, approve a device credential for `model.infer` only. In the
+  local Cadence operator session, run
+  `cadence connection enroll agenticos --shape native-model-api-key --no-open`.
+  Open its trusted credential-entry link and enter the scoped device bearer.
+  Do not pass it on the command line or put it in Pi configuration.
+
+Cadence sends one bounded gateway request for the admitted model turn. It
+uses the broker's durable request id for idempotency. The protected guest
+receives the terminal model receipt, not upstream connection headers or a
+live token stream. The gateway owns provider and billing authorization.
+For Hy4 with `high`, the admitted gateway request includes
+`"reasoning":{"effort":"high"}`; with `off` the field is omitted. Deploy the
+compatible AgenticOS ingress and adapter before using `high`.
 
 ### Managing-agent authorization
 
@@ -343,6 +764,13 @@ not its pathname. Changed content is refused. Optional `--digest sha256:<hex>`
 checks canonical payload JSON, not a raw-file `sha256sum`. An argv-only master
 permission cannot authorize a Settings mutation or issue another grant.
 App-scoped assistant turns gain no settings authority.
+
+A profile's job (standing instructions) is readable by the operator and by a
+runtime registered against that profile (`agent context <profile>`); other
+agents and members get none (`agent list` omits it, `agent context` refuses).
+One stated exception: a group-root agent can register a member against a
+profile, and so can read that job through `agent show`, because a root's `join`
+needs the job to write the member's briefing.
 
 ### Master recovery and hosted use
 
@@ -373,6 +801,41 @@ hosted CLI login is deferred to CAD-1592. Managing agents running on the local
 or hosted runtime use that runtime's local daemon and exact grants instead.
 
 
+## Company time zone (CAD-2378)
+
+A workspace has one company time zone, an IANA name such as `Asia/Hong_Kong`.
+Every schedule runs in it. The owner sets it in Settings > General. When it is
+unset it is the first social connection's zone, else UTC. `cadence routine
+create` without `--tz` stores the company zone; an explicit `--tz` is kept, and
+an invalid name is refused. Existing routines keep their stored zone.
+
+A person can pick a display zone in Settings > Preferences. It changes only how
+the board shows times to that person, always with the zone's name; it never
+changes when a routine runs. The board serves both at `/api/time-zone`; a board
+that predates it answers 404 and the UI shows times in UTC.
+
+## Connected-read recovery
+
+A local `platform call` for a connected read uses `--request` as its stable
+handle. If omitted, the CLI creates one before requesting the read. An
+unknown outcome reports both that handle and the provider key; it does not
+automatically retry the call.
+
+To reconcile, repeat the same call in the same workspace with the same account,
+connection, input and charge control, passing the reported **handle** as
+`--request`. Do not pass the `read-`-prefixed provider key as the handle: the
+daemon adds that prefix. The platform may still report the original call as in
+progress; do not start a new key merely because the first answer was lost.
+
+The CLI requires a daemon that advertises connected-read recovery. An older
+daemon is refused before dispatch; update and restart it before making the
+call. Discovery and the read use the same daemon connection, so a daemon
+replacement cannot redirect an admitted read to an older process.
+
+Direct `platform_call` RPC callers must provide `request` for a connected
+read. Without a caller-held handle, a lost daemon reply would leave no safe
+way to recover the provider key, so the daemon refuses before dispatch.
+
 ## Observation output
 
 `status`, `overview`, `memory ls`, and `build-slot status` print a table
@@ -386,6 +849,28 @@ ignored.
 `milestone ls`, and `memory ls`, follow that decision. They do not need
 a separate `--json` when stdout is already JSON, and they are refused
 on a table.
+
+For live local `issue ls` and `issue show`, JSON includes `job_state.state`:
+`known`, `unavailable`, or `malformed`. When job state is not known,
+readiness is not asserted; the unfiltered tracker read remains available.
+Malformed state includes invalid daemon response frames and issue-bound job
+rows without usable selection fields or task summaries.
+`issue ls --ready` and `--blocked` refuse rather than report an authoritative
+filtered list. Text output warns on stderr. Historical `--at` reads keep
+their historical derivation without consulting the daemon. Job and approval
+probes use bounded deadlines.
+
+`CADENCE_JSON=pretty` or `compact` also controls JSON from org commands,
+hosted answers and offline result receipts. Raw text and byte streams retain
+their own formats.
+
+CLI-owned finite console output does not interrupt a command when its consumer
+closes stdout or stderr; the command's own result still determines the exit
+status. Other I/O errors remain failures. A follower stops before its next
+read, execution or sync after a stdout write detects a closed consumer, while
+finishing the current page, acknowledgement or sync result. Closing stderr
+alone does not cancel work. A follower cannot detect closure until it writes;
+inbox child-process output is not an observation by the parent.
 
 With `--watch`, machine mode writes one compact JSON value per line and
 no terminal-control bytes, including when `CADENCE_JSON=pretty`. A
@@ -439,11 +924,85 @@ coordination projection and credential scrub/scan, and builds the package.
 Independent package validation, comparison with the captured tracker inventory,
 and a final source-tracker recheck must pass before no-replace publication.
 Owned temporary capture and staging directories are cleaned on refusal.
+Temporary tracker captures and their Git indexes, historical exports, and
+recovery-hook worktrees request owner-only `0700` at creation, before tracker
+content is written; a more restrictive umask can narrow it.
 A source-change refusal is not an automatic retry.
 
-The coordination projection removes related private rows in one transaction
-on the private database copy. Foreign keys remain enabled; their checks are
-deferred until commit so removing human-room topics and metadata does not
+A coordination export refuses a source that holds private or private-capable
+state: queued but unpromoted member requests, member-private job ownership,
+shares, stall checks and job subscriptions, member assistants, app member
+grants in any state (revoked tombstones included), app contexts, app team
+defaults (`app-teams.json`), per-installation app record files under
+`app-records/`, app conversations, chat attachments (`chat_files`, the legacy
+workspace custody `.cadence/chat-files`, and the state `chat-files/`), chat
+upload accounts (`chat_upload_accounts`), issue artifacts (`artifacts`,
+`artifacts/`), member-private job specs (`assist_jobs/`), upload staging under
+`wiki-uploads/`, human-room transcripts and membership, cloud-agent state (its
+tables, a `provider=agenticos-cloud` alias or a `source=cloud_agent` message),
+a recorded private delivery or publication, a publication comment in the
+tracker, or a project whose `project.yaml` records `visibility: private`.
+These are all data the coordination profile never carries, and each can hold
+private work with no remaining grant, conversation or marker to classify it, so
+presence refuses rather than omitting it behind the coordination label. Empty
+or absent custody roots (`app-records/`, `chat-files/`, `artifacts/`,
+`assist_jobs/`, `wiki-uploads/`, an empty `app-teams.json` object) stay clean;
+an unreadable or unparseable one refuses.
+
+Chat attachment custody has no single establishable root. The legacy PM-rooted
+custody is `<pm dir>/.cadence/chat-files` (both the root and nested `pm/`
+layouts are inspected). The operational custody is a per-user tree under the
+workspace the daemon resolved from its captured provider environment; the
+daemon persists no binding for it, and this process's `HOME`/`CADENCE_HOME`
+would name a different root, so it is never guessed. A store restore can
+replace the database with an older copy while that root keeps attachment bytes
+no surviving row names, so an empty `chat_files` or `chat_upload_accounts`
+table does not prove it empty. Proving absence needs a complete,
+restore-surviving record of every operational workspace this store has ever
+used, and no such record exists: a forward-only sidecar or the current
+environment cannot establish history. An otherwise-clean source therefore
+refuses unless the operator states the fact for that source with
+`--attest-chat-custody-absent`. The flag records the assertion in the
+manifest's `package_exclusions`; it never overrides a classifiable private
+record, which still refuses. Without it, a source that holds no private row
+still refuses, because an unknown root cannot be proved empty.
+
+The profile carries no ownership, grants, conversations or receipts for that
+work, so packaging it would expose the work without its provenance.
+Classification runs on the live store before any snapshot copy is written — a
+refusal creates nothing at all — and again on the private snapshot after the
+catalog check, before the projection or any tracker blob is copied. Because the
+store snapshot, the pinned tracker tree and the private ledger are not one
+atomic snapshot, the source is classified once more after the package is
+complete, and the ordinary export also re-proves the tracker is still the clean
+pinned revision; private work or a moved tracker observed during packaging
+refuses publication. Private content that appears after that re-check is not in
+the package. A refusal names the classes found — never a member, request, job,
+conversation, project or file — publishes no package, and leaves the source
+store, tracker and state directory unchanged. The check covers the classes that
+leave evidence in the store, the tracker tree or the state directory; it does
+not claim to detect arbitrary private text that left no row, ledger record or
+marker. Keep the source workspace as the record of that private work and export
+a workspace that holds none of it. A record that cannot be read or decoded
+refuses too: an unreadable policy is not a public one.
+
+`inspect-portable` and every restore apply the same rule to the package. The
+package's PM root is derived from its verified member inventory, not from the
+manifest field, and a mismatch refuses; a project-shaped record the carried
+root cannot authorize refuses even when no `pm.yaml` is present; a staged store
+that carries an app conversation, a human-room topic or a cloud-agent marker,
+and a tracker that carries a publication comment or a private or undecodable
+project record, refuse instead of being imported with their grants and
+receipts left behind. Each tracker member is read once and that same buffer is
+hashed and classified — on export into the package, on inspection, and on the
+staged restore before publication — so a concurrent replacement cannot show a
+public blob to the classifier and a private one to the hash.
+
+The coordination projection still removes any residual cloud-agent or
+human-room rows in one transaction
+on the private database copy, as defence in depth behind that classification.
+Foreign keys remain enabled; their checks are
+deferred until commit so that removal does not
 fail on an intermediate state. A foreign-key failure at commit refuses the
 export without publishing a package. The source database is unchanged.
 
@@ -508,7 +1067,10 @@ Destination compatibility and owner authorization remain separate checks.
 This is a **coordination package, not a full workspace backup**:
 `full_workspace=false`. App/business data, credentials/grants, local
 checkouts and runtime files are excluded; execution authority is removed
-and imported actors/dispatch disabled. Manifest SHA-256 detects changed
+and imported actors/dispatch disabled. Private member work is not excluded
+from a package that also carries the work itself: its presence refuses the
+export, so a published package never publishes a private job, conversation or
+grant without its provenance. Manifest SHA-256 detects changed
 bytes, not a producer who rewrites both the package and its manifest.
 Neither command grants an agent new source access or production privileges,
 uploads data, imports a tenant, reconnects executors or activates a root.

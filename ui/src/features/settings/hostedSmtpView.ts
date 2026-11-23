@@ -75,7 +75,7 @@ const WORDS: Record<string, string> = {
 export function connectErrorText(error: unknown): string {
   const code = error instanceof ApiError ? error.code : undefined;
   if (code !== undefined && code in WORDS) return WORDS[code];
-  return "Couldn't confirm the connection. Refresh and check before trying again.";
+  return "Couldn't confirm the connection. Check it before trying again.";
 }
 
 /** Security follows the port: 465 is SSL/TLS, 587 is STARTTLS. */

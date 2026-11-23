@@ -15,12 +15,21 @@
 //! (`app_chat_descriptor`) only as far as size and JSON validity; the
 //! client's `parseAppChat` still fails closed on a bad descriptor.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
+mod fields;
+
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use serde_json::Value;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
+use fields::{
+    array, card_i18n, context_i18n, fail, ident, is_match, is_screen, label_i18n, object, prompts,
+    scan, text, unique,
+};
 
 /// The package member holding the descriptor, a top-level regular file.
 pub const FILE: &str = "app-chat.json";
@@ -62,131 +71,6 @@ fn grammar() -> &'static Grammar {
     })
 }
 
-fn fail<T>(path: &str, message: impl std::fmt::Display) -> Result<T> {
-    Err(Error::rejected(format!("{FILE}: {path}: {message}")))
-}
-
-fn is_control(c: char) -> bool {
-    matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}' | '\u{2028}' | '\u{2029}')
-}
-
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    s.len() <= 64
-        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-}
-
-fn is_match(s: &str) -> bool {
-    let Some(rest) = s.strip_prefix("cadence_") else {
-        return false;
-    };
-    let mut chars = rest.chars();
-    rest.len() <= 48
-        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-}
-
-fn is_screen(s: &str) -> bool {
-    s.strip_prefix("screen:")
-        .is_some_and(crate::issue::app_screen_pkg::valid_tag)
-}
-
-/// Bounds first, as the client does: depth, node count and forbidden keys
-/// at every level, so the shape checks never run over a hostile shell.
-fn scan(value: &Value, path: &str, nodes: &mut usize, depth: usize) -> Result<()> {
-    if depth > MAX_DEPTH {
-        return fail(path, "nested too deeply");
-    }
-    *nodes += 1;
-    if *nodes > MAX_NODES {
-        return fail(path, "too many nodes");
-    }
-    match value {
-        Value::Array(items) => {
-            for (i, item) in items.iter().enumerate() {
-                scan(item, &format!("{path}.{i}"), nodes, depth + 1)?;
-            }
-        }
-        Value::Object(map) => {
-            for (key, item) in map {
-                if grammar().forbidden.contains(key) {
-                    return fail(path, format!("forbidden descriptor key: {key}"));
-                }
-                scan(item, &format!("{path}.{key}"), nodes, depth + 1)?;
-            }
-        }
-        Value::Number(n) if n.as_f64().is_none_or(|f| !f.is_finite()) => {
-            return fail(path, "expected plain JSON data")
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn object<'a>(
-    value: &'a Value,
-    path: &str,
-    allowed: &[&str],
-) -> Result<&'a serde_json::Map<String, Value>> {
-    let Some(map) = value.as_object() else {
-        return fail(path, "expected an object");
-    };
-    if let Some(key) = map.keys().find(|k| !allowed.contains(&k.as_str())) {
-        return fail(path, format!("unknown key: {key}"));
-    }
-    Ok(map)
-}
-
-fn text(value: Option<&Value>, path: &str, max: usize) -> Result<String> {
-    let Some(s) = value.and_then(Value::as_str) else {
-        return fail(path, "expected a non-empty string");
-    };
-    if s.is_empty() {
-        return fail(path, "expected a non-empty string");
-    }
-    if s.encode_utf16().count() > max {
-        return fail(path, format!("string is longer than {max} characters"));
-    }
-    if s.chars().any(is_control) {
-        return fail(path, "control characters are not allowed");
-    }
-    Ok(s.to_string())
-}
-
-fn ident(value: Option<&Value>, path: &str) -> Result<String> {
-    let s = text(value, path, 64)?;
-    if !is_ident(&s) {
-        return fail(path, format!("unsafe identifier: {s:?}"));
-    }
-    Ok(s)
-}
-
-fn array<'a>(value: Option<&'a Value>, path: &str, max: usize) -> Result<&'a [Value]> {
-    let Some(value) = value else { return Ok(&[]) };
-    let Some(items) = value.as_array() else {
-        return fail(path, "expected an array");
-    };
-    if items.len() > max {
-        return fail(path, format!("more than {max} entries"));
-    }
-    Ok(items)
-}
-
-fn prompts(value: Option<&Value>, path: &str) -> Result<()> {
-    for (i, p) in array(value, path, 3)?.iter().enumerate() {
-        text(Some(p), &format!("{path}.{i}"), 80)?;
-    }
-    Ok(())
-}
-
-fn unique(seen: &mut HashSet<String>, key: String, path: &str, what: &str) -> Result<()> {
-    if !seen.insert(key.clone()) {
-        return fail(path, format!("duplicate {what}: {key}"));
-    }
-    Ok(())
-}
-
 /// Refuse the descriptor text unless it is a valid `app-chat/v1` for
 /// `installed_app` (the manifest's `app`). Returns the parsed value.
 pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
@@ -224,7 +108,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         .enumerate()
     {
         let p = format!("contexts.{i}");
-        let c = object(c, &p, &["id", "label", "prompts", "record"])?;
+        let c = object(c, &p, &["id", "label", "prompts", "record", "i18n"])?;
         unique(
             &mut seen,
             ident(c.get("id"), &format!("{p}.id"))?,
@@ -233,11 +117,13 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         )?;
         text(c.get("label"), &format!("{p}.label"), 40)?;
         prompts(c.get("prompts"), &format!("{p}.prompts"))?;
+        context_i18n(c, &p)?;
         if let Some(r) = c.get("record") {
             let rp = format!("{p}.record");
-            let r = object(r, &rp, &["label", "prompts"])?;
+            let r = object(r, &rp, &["label", "prompts", "i18n"])?;
             text(r.get("label"), &format!("{rp}.label"), 40)?;
             prompts(r.get("prompts"), &format!("{rp}.prompts"))?;
+            context_i18n(r, &rp)?;
         }
     }
     let mut seen = HashSet::new();
@@ -246,7 +132,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         .enumerate()
     {
         let p = format!("attachments.{i}");
-        let a = object(a, &p, &["id", "label"])?;
+        let a = object(a, &p, &["id", "label", "i18n"])?;
         let id = ident(a.get("id"), &format!("{p}.id"))?;
         if !grammar().attachments.contains(&id) {
             return fail(&format!("{p}.id"), format!("not a host capability: {id}"));
@@ -255,6 +141,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         if a.contains_key("label") {
             text(a.get("label"), &format!("{p}.label"), 40)?;
         }
+        label_i18n(a, &p)?;
     }
     let mut seen = HashSet::new();
     for (i, d) in array(root.get("directives"), "directives", 8)?
@@ -295,7 +182,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
         .enumerate()
     {
         let p = format!("subjects.{i}");
-        let s = object(s, &p, &["kind", "label"])?;
+        let s = object(s, &p, &["kind", "label", "i18n"])?;
         unique(
             &mut seen,
             ident(s.get("kind"), &format!("{p}.kind"))?,
@@ -303,6 +190,7 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
             "subject kind",
         )?;
         text(s.get("label"), &format!("{p}.label"), 40)?;
+        label_i18n(s, &p)?;
     }
     if let Some(pres) = root.get("presentation") {
         let pres = object(pres, "presentation", &["showContext"])?;
@@ -314,26 +202,28 @@ pub fn validate(raw: &str, installed_app: &str) -> Result<Value> {
 }
 
 fn card_shape(card: &Value, p: &str) -> Result<()> {
-    let c = object(card, p, &["title", "text", "fields", "buttons"])?;
+    let c = object(card, p, &["title", "text", "fields", "buttons", "i18n"])?;
     text(c.get("title"), &format!("{p}.title"), 80)?;
     if c.contains_key("text") {
         text(c.get("text"), &format!("{p}.text"), 240)?;
     }
+    card_i18n(c, p)?;
     for (i, f) in array(c.get("fields"), &format!("{p}.fields"), 4)?
         .iter()
         .enumerate()
     {
         let fp = format!("{p}.fields.{i}");
-        let f = object(f, &fp, &["label", "from"])?;
+        let f = object(f, &fp, &["label", "from", "i18n"])?;
         text(f.get("label"), &format!("{fp}.label"), 40)?;
         ident(f.get("from"), &format!("{fp}.from"))?;
+        label_i18n(f, &fp)?;
     }
     for (i, b) in array(c.get("buttons"), &format!("{p}.buttons"), 2)?
         .iter()
         .enumerate()
     {
         let bp = format!("{p}.buttons.{i}");
-        let b = object(b, &bp, &["label", "run", "view"])?;
+        let b = object(b, &bp, &["label", "run", "view", "i18n"])?;
         text(b.get("label"), &format!("{bp}.label"), 40)?;
         let run = ident(b.get("run"), &format!("{bp}.run"))?;
         if !grammar().actions.contains(&run) {
@@ -341,6 +231,7 @@ fn card_shape(card: &Value, p: &str) -> Result<()> {
         }
         // open-view is the one v1 action and takes exactly a view id.
         ident(b.get("view"), &format!("{bp}.view"))?;
+        label_i18n(b, &bp)?;
     }
     Ok(())
 }
@@ -426,5 +317,54 @@ mod tests {
         assert_eq!(g.attachments, ["csv-import"]);
         assert_eq!(g.actions, ["open-view"]);
         assert!(g.forbidden.contains("install_id") && g.forbidden.contains("action"));
+    }
+
+    #[test]
+    fn validates_i18n_at_each_display_surface_and_refuses_violations() {
+        let mut ok = good();
+        ok["contexts"][0]["i18n"] = json!({"zh-TW":{"label":"客","prompts":["列"]}});
+        ok["contexts"][0]["record"] =
+            json!({"label":"R","prompts":["R0"],"i18n":{"zh-TW":{"label":"客","prompts":["摘"]}}});
+        ok["attachments"] =
+            json!([{"id":"csv-import","label":"Imp","i18n":{"zh-TW":{"label":"匯"}}}]);
+        ok["subjects"] = json!([{"kind":"c","label":"C","i18n":{"zh-TW":{"label":"客"}}}]);
+        ok["directives"] = json!([{"match":"cadence_m","card":{"title":"T","text":"D","i18n":{"zh-TW":{"title":"匯","text":"完"}},"fields":[{"label":"R","from":"r","i18n":{"zh-TW":{"label":"筆"}}}],"buttons":[{"label":"O","run":"open-view","view":"v","i18n":{"zh-TW":{"label":"開"}}}]}}]);
+        validate(&ok.to_string(), "demo").unwrap();
+
+        for (k, v) in [
+            ("ctx", json!({})),
+            ("ctx", json!({"zh_TW":{"label":"客"}})),
+            ("ctx", json!({"zh-TW":{}})),
+            ("ctx", json!({"zh-TW":{"prompts":[]}})),
+            ("ctx", json!({"zh-TW":{"label":"   "}})),
+            ("ctx", json!({"zh-TW":{"prompts":["\u{0085}"]}})),
+            ("att", json!({"zh-TW":{"title":"x"}})),
+            ("att", json!({"zh-TW":{"label":"   "}})),
+            ("card", json!({"zh-TW":{"label":"x"}})),
+            ("card", json!({"zh-TW":{"text":"x\u{0085}y"}})),
+            ("sub", json!({"zh-TW":{"label":"客\n"}})),
+            ("sub", json!({"zh-TW":{"label":"\u{0085}"}})),
+            ("sub", json!({"zh-TW":{"label":"   "}})),
+            (
+                "sub",
+                json!({"zh-tw":{"label":"客"},"zh-TW":{"label":"客"}}),
+            ),
+        ] {
+            let mut b = ok.clone();
+            match k {
+                "ctx" => b["contexts"][0]["i18n"] = v,
+                "att" => b["attachments"][0]["i18n"] = v,
+                "card" => b["directives"][0]["card"]["i18n"] = v,
+                _ => b["subjects"][0]["i18n"] = v,
+            }
+            assert!(validate(&b.to_string(), "demo").is_err(), "{k}");
+        }
+        let mut b = ok.clone();
+        b["subjects"][0]["i18n"] = Value::Object(
+            (0..9)
+                .map(|i| (format!("en-x{i}"), json!({"label":"X"})))
+                .collect(),
+        );
+        assert!(validate(&b.to_string(), "demo").is_err());
     }
 }

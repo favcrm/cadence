@@ -4,15 +4,18 @@
 //! `cadence/<name>`, owned by [`layout`]) and the `.cadence/` ignore
 //! rule.
 
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::issue::{git, project};
 use crate::proto;
 
+mod hooks;
 pub mod layout;
 pub mod lifecycle;
+
+pub use hooks::{install_pre_push_hook, setup_development, shared_target_dir, HOOKS_DIR};
+pub(crate) use hooks::{lane_env_is_setups, record_lane_env};
 
 /// Keep `.cadence/` out of a repo's index: append the entry to its
 /// `.gitignore` when nothing already covers it.
@@ -114,6 +117,12 @@ pub fn add(root: &Path, dir: &Path, branch: Option<&str>, base: &str) -> Result<
 /// new checkout becomes the agent's cwd. Clean failures: no git repo
 /// under `base`, a pre-existing worktree dir, or a branch collision.
 pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
+    create_worktree_on(base, name, None)
+}
+
+/// Create a lane cut from an explicitly named base ref. `None` keeps the
+/// historical resolution (configured integration ref, then the remote HEAD).
+pub fn create_worktree_on(base: &Path, name: &str, base_ref: Option<&str>) -> Result<PathBuf> {
     proto::identifier(name, "Worktree name")?;
     let root = main_root(base)?;
     let dir = layout::worktree_dir(&root, name);
@@ -159,7 +168,7 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
                 "Branch '{branch}' already exists without matching lifecycle ownership — refusing reuse"
             )));
         }
-        let resolved = crate::issue::start::resolve_base(&root, None, None)?;
+        let resolved = crate::issue::start::resolve_base(&root, base_ref, None)?;
         if let Some(warning) = &resolved.warning {
             eprintln!("cadence: {warning}");
         }
@@ -235,285 +244,6 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
         return Err(e);
     }
     Ok(dir)
-}
-
-/// The shared cargo cache for a repo — `<root>/.cadence/target/
-/// shared`. One dependency-artifact store for every `.cadence/wt`
-/// lane: dependency artifacts are built once per host instead of once
-/// per worktree.
-pub fn shared_target_dir(root: &Path) -> PathBuf {
-    root.join(".cadence").join("target").join("shared")
-}
-
-/// CAD-1021 slice 1: the lane's pre-push gate. Linked worktrees share
-/// the common `.git/hooks`, so the hook can never live there — it is a
-/// per-worktree `core.hooksPath` (written to the worktree's own
-/// `config.worktree`, never the shared `config`) pointing at a hooks
-/// dir under the worktree's own git dir. `extensions.worktreeConfig`
-/// is the one shared-config key the install sets (idempotent); the main
-/// checkout keeps no hook either way.
-pub const HOOKS_DIR: &str = "cadence-hooks";
-
-/// The hook script installed at `<git-dir>/cadence-hooks/pre-push`.
-/// Git runs pre-push hooks with GIT_DIR already pointed at the
-/// worktree's git dir and cwd at the worktree root, so the receipt and
-/// `scripts/pre-push` both resolve per-lane. The receipt is written
-/// atomically (tmp+rename) under the worktree's git dir — a `--no-verify`
-/// push leaves no receipt, which is the detection signal (contract D3).
-const PRE_PUSH_HOOK: &str = r#"#!/bin/sh
-# CAD-1021: run scripts/pre-push on every push; a non-zero step blocks it.
-# The receipt records the checked head, lane and per-step exit codes under
-# this worktree's git dir — a pushed head with no receipt was pushed with
-# --no-verify, and that absence is the audit signal.
-top=$(git rev-parse --show-toplevel) || exit 1
-gd=$(git rev-parse --absolute-git-dir) || exit 1
-cd "$top" || exit 1
-# git exports GIT_DIR/GIT_WORK_TREE/etc for the hook — unset them before
-# spawning scripts/pre-push so its own `git` calls (and any subprocess that
-# shells out to git, e.g. the contract tests) resolve the worktree normally
-# instead of running inside the bare-dir context the hook inherits.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_QUARANTINE_PATH
-tmp="$gd/cadence-pre-push-receipt.tmp"
-out="$gd/cadence-pre-push-receipt"
-# A worktree without scripts/pre-push (a fixture, a sparse lane, a repo that
-# never carried the script) has no gate to run — record that and let the push
-# through rather than blocking on a script that isn't there.
-if [ ! -x scripts/pre-push ]; then
-    printf 'head=%s lane=%s kind=none steps=skipped:no-pre-push rc=0 at=%s\n' \
-        "$(git rev-parse HEAD 2>/dev/null || echo '?')" \
-        "${CADENCE_ALIAS:-$USER}" "$(date +%s)" > "$tmp" 2>/dev/null && mv "$tmp" "$out"
-    exit 0
-fi
-line=$(scripts/pre-push --receipt ${PRE_PUSH_TESTS:+--tests})
-rc=$?
-printf '%s\n' "$line" > "$tmp" && mv "$tmp" "$out"
-exit $rc
-"#;
-
-/// Install the lane's pre-push hook: write `<git-dir>/cadence-hooks/
-/// pre-push` (0755) under the worktree's OWN git dir, enable
-/// `extensions.worktreeConfig` on the shared config once, then point
-/// this worktree's `config.worktree` `core.hooksPath` at that dir.
-/// Also sets this worktree's `core.editor` to `true` so commits in the lane
-/// never open an interactive editor; an explicit `GIT_EDITOR` still overrides.
-/// Idempotent — a re-start re-heals; an identical hook is left alone.
-/// Fail-closed: `issue start` treats a failed install as a failed lane
-/// (same rollback as `configure_cargo_target`), because a lane that
-/// cannot enforce the gate must not be minted.
-pub fn install_pre_push_hook(wt_dir: &Path) -> Result<PathBuf> {
-    let git_dir = PathBuf::from(git(wt_dir, &["rev-parse", "--absolute-git-dir"])?);
-    let hooks = git_dir.join(HOOKS_DIR);
-    std::fs::create_dir_all(&hooks)?;
-    let script = hooks.join("pre-push");
-    // Write the script first (atomic tmp+rename), then config — a crash
-    // between the two leaves an unused flag or an un-pointed script, both
-    // re-healed by the next `issue start`.
-    let needs_write = match std::fs::read_to_string(&script) {
-        Ok(existing) => existing != PRE_PUSH_HOOK,
-        Err(_) => true,
-    };
-    if needs_write {
-        let tmp = hooks.join(".pre-push.tmp");
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o755)
-                .open(&tmp)?;
-            f.write_all(PRE_PUSH_HOOK.as_bytes())?;
-        }
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::rename(&tmp, &script)?;
-    }
-    // Shared config: enable per-worktree config (idempotent — already
-    // true is a no-op), then this worktree's own hooksPath.
-    git(wt_dir, &["config", "extensions.worktreeConfig", "true"])?;
-    git(
-        wt_dir,
-        &[
-            "config",
-            "--worktree",
-            "core.hooksPath",
-            &hooks.to_string_lossy(),
-        ],
-    )?;
-    // Lane-local noninteractive commit messages: a sentinel or interactive
-    // editor must not block `git commit`. An explicit GIT_EDITOR still wins.
-    git(wt_dir, &["config", "--worktree", "core.editor", "true"])?;
-    install_cargo_shim(wt_dir)?;
-    Ok(script)
-}
-
-/// Apply shared cargo-target and pre-push setup to a development checkout.
-/// Ownership, tracker binding and rollback remain with the caller.
-pub fn setup_development(wt_dir: &Path, root: &Path, shared: bool) -> Result<Option<PathBuf>> {
-    ensure_cadence_ignored(root)?;
-    let target = configure_cargo_target(wt_dir, root, shared)?;
-    install_pre_push_hook(wt_dir)?;
-    Ok(target)
-}
-
-/// CAD-1021 slice 3: the lane's `cargo` shim, at
-/// `<git-dir>/cadence-hooks/bin/cargo`. Placed on the lane's PATH (via
-/// the worktree `.env`'s `PATH=` line) it routes cargo work through
-/// `cadence build-slot run <kind>` so a lane's compiles are always
-/// admitted. The routing is an ALLOWLIST of clearly-light subcommands —
-/// everything else, including unknown subcommands and aliases, queues on
-/// the build pool. That is the operator's goal: no local compile escapes
-/// the queue (AGENTS.md — allowlists, not denylists). `cargo test` takes
-/// the test pool and `cargo nextest` the suite pool.
-///
-/// Lane-local: the script and its PATH entry live under the lane's own
-/// git dir / `.env` — the main checkout and CI never see it. The shim
-/// fails OPEN to a real cargo when `cadence` is unreachable so a lane
-/// is never bricked by a missing daemon; the receipt/pre-push gate,
-/// not the shim, is the enforcement.
-const CARGO_SHIM: &str = r##"#!/bin/sh
-# CAD-1021: route cargo work through `cadence build-slot run`.
-# Only the clearly-light, never-compiling subcommands pass straight to
-# the real cargo — an allowlist (AGENTS.md: allowlists, not denylists),
-# so `cargo run`/`bench`/`doc`/`rustc`/`llvm-cov`/`package`/`publish`,
-# every alias and every unknown subcommand all queue as `build`.
-# Inside a slot (CADENCE_BUILD_SLOT_PID names a live holder) a nested
-# cargo passes through too, so `build-slot run` of a recipe that itself
-# calls cargo never re-queues on itself.
-
-real_cargo() {
-    # Resolve the real cargo: the shim dir is never on this lookup's
-    # PATH (we strip it) so it can never re-enter itself.
-    PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$shim_dir" | tr '\n' ':')"
-    export PATH
-    command -v cargo
-}
-
-shim_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-
-# Pass-through: a held slot's children re-use it — the pid must name a
-# LIVE holder, so a forged CADENCE_BUILD_SLOT_PID names no live pid and
-# falls through to the queue path like any caller.
-if [ -n "$CADENCE_BUILD_SLOT_PID" ] && kill -0 "$CADENCE_BUILD_SLOT_PID" 2>/dev/null; then
-    exec "$(real_cargo)" "$@"
-fi
-
-case "${1:-}" in
-    # Allowlist — subcommands that never compile. A bare `cargo` (no
-    # subcommand) prints help; version/help flags are light too.
-    ''|fmt|metadata|tree|locate-project|version|-V|--version|help|-h|--help|\
-    add|remove|search|pkgid|verify-project|read-manifest|generate-lockfile|\
-    owner|login|logout|yank)
-        exec "$(real_cargo)" "$@" ;;
-    test)
-        slot_kind=test ;;
-    nextest)
-        slot_kind=suite ;;
-    *)
-        slot_kind=build ;;
-esac
-
-# The absolute admission helper is embedded by the lane generator; do not
-# depend on scrubbed CADENCE_* environment or fall back to ambient PATH.
-cad=@@CADENCE_BUILD_SLOT@@
-"$cad" build-slot run "$slot_kind" -- cargo "$@"
-rc=$?
-[ "$rc" -eq 0 ] || exit "$rc"
-"##;
-
-/// Write the shim under `<git-dir>/cadence-hooks/bin/cargo` (0755) and
-/// record its PATH prefix in the worktree's `.env`. Idempotent; a lane
-/// minted before slice 3 re-heals on the next `issue start` (the reuse
-/// path calls `install_pre_push_hook`, which now calls this).
-fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
-    let helper = std::env::current_exe()
-        .map_err(|e| Error::internal(format!("could not resolve lane build-slot helper: {e}")))?;
-    if !helper.is_absolute() {
-        return Err(Error::internal(format!(
-            "lane build-slot helper path is not absolute: {}",
-            helper.display()
-        )));
-    }
-    let helper = helper.to_str().ok_or_else(|| {
-        Error::internal("lane build-slot helper path is not valid UTF-8 for the shell shim")
-    })?;
-    let cargo_shim = CARGO_SHIM.replace(
-        "@@CADENCE_BUILD_SLOT@@",
-        &format!("'{}'", helper.replace('\'', "'\\''")),
-    );
-    let git_dir = PathBuf::from(git(wt_dir, &["rev-parse", "--absolute-git-dir"])?);
-    let bin = git_dir.join(HOOKS_DIR).join("bin");
-    std::fs::create_dir_all(&bin)?;
-    let shim = bin.join("cargo");
-    let needs_write = match std::fs::read_to_string(&shim) {
-        Ok(existing) => existing != cargo_shim,
-        Err(_) => true,
-    };
-    if needs_write {
-        let tmp = bin.join(".cargo.tmp");
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o755)
-                .open(&tmp)?;
-            f.write_all(cargo_shim.as_bytes())?;
-        }
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::rename(&tmp, &shim)?;
-    }
-    // Record the shim dir on the lane's `.env` PATH so a shell that
-    // sources the lane env resolves `cargo` here first. `.env` is the
-    // existing lane-env file `write_slot_env` owns; we prepend our dir
-    // under the same tmp+rename discipline, keeping every other line AND
-    // an existing file's mode (a `0600`→`0640` the operator set survives).
-    let file = wt_dir.join(".env");
-    let mut mode = 0o600;
-    let mut text = String::new();
-    let mut wrote_path = false;
-    if let Ok(meta) = std::fs::symlink_metadata(&file) {
-        if meta.file_type().is_symlink() {
-            return Err(Error::rejected(format!(
-                "{} is a symlink — refusing to write the slot env through it",
-                file.display()
-            )));
-        }
-        mode = meta.permissions().mode() & 0o777;
-    }
-    if let Ok(existing) = std::fs::read_to_string(&file) {
-        for line in existing.lines() {
-            if let Some(rest) = line.strip_prefix("PATH=") {
-                if !rest.split(':').any(|p| p == bin.to_string_lossy()) {
-                    text.push_str(&format!("PATH={}:{rest}\n", bin.display()));
-                } else {
-                    text.push_str(line);
-                    text.push('\n');
-                }
-                wrote_path = true;
-            } else {
-                text.push_str(line);
-                text.push('\n');
-            }
-        }
-    }
-    if !wrote_path {
-        text.push_str(&format!("PATH={}:$PATH\n", bin.display()));
-    }
-    let tmp = wt_dir.join(".env.tmp");
-    {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-    }
-    std::fs::rename(&tmp, &file)?;
-    Ok(shim)
 }
 
 /// The `debug/` children cargo fills with *hashed* names —
@@ -923,6 +653,8 @@ pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -1288,5 +1020,241 @@ mod tests {
         )
         .unwrap();
         assert_eq!(effective_target_dir(&repo), PathBuf::from("/mine"));
+    }
+
+    // ---- CAD-2403: the installed lane pre-push hook, run as a script ----
+
+    const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+    const EMPTY_PATCH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// Commit an executable script at `scripts/<name>` in the repo.
+    fn commit_script(repo: &Path, name: &str, body: &str) {
+        let dir = repo.join("scripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", &format!("add {name}")]);
+    }
+
+    /// A fake `scripts/pre-push` recording argv (one arg per line, plus a
+    /// marker line per run) under `rec` (outside the repo, so the tree
+    /// stays clean) and exiting `rc`.
+    fn recording_pre_push(rec: &Path, rc: i32) -> String {
+        format!(
+            "#!/bin/sh\necho run >> '{r}/runs'\nfor a in \"$@\"; do echo \"$a\" >> '{r}/argv'; done\n: >> '{r}/argv'\necho some plan output\nexit {rc}\n",
+            r = rec.display()
+        )
+    }
+
+    /// Install the hook and run it directly with one pre-push stdin line.
+    /// Returns (exit code, last line of the receipt).
+    fn run_hook(repo: &Path, pushed: &str) -> (i32, String) {
+        use std::io::Write;
+        let hook = install_pre_push_hook(repo).unwrap();
+        let home = TempDir::new().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg(&hook)
+            .current_dir(repo)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("USER", "tester")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let line = format!("refs/heads/x {pushed} refs/heads/x {ZERO_SHA}\n");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let gd = git(repo, &["rev-parse", "--absolute-git-dir"]);
+        let receipt = std::fs::read_to_string(Path::new(&gd).join("cadence-pre-push-receipt"))
+            .unwrap_or_default();
+        let last = receipt.lines().last().unwrap_or("").to_string();
+        let rc = out.status.code().unwrap_or(-1);
+        eprintln!(
+            "hook rc={rc} receipt={last:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (rc, last)
+    }
+
+    #[test]
+    fn pre_push_hook_no_pre_push_script_skips() {
+        let repo = git_repo();
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0);
+        assert!(
+            receipt.contains("steps=skipped:no-pre-push rc=0"),
+            "{receipt}"
+        );
+    }
+
+    #[test]
+    fn pre_push_hook_repo_mode_runs_repo_script_without_args() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0, "{receipt}");
+        assert!(receipt.starts_with(&format!("head={head} ")), "{receipt}");
+        assert!(receipt.contains("mode=repo"), "{receipt}");
+        assert!(receipt.contains("rc=0"), "{receipt}");
+        assert_eq!(
+            std::fs::read_to_string(rec.path().join("runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        // A customer script gets no Cadence flags (no --receipt, no --tests).
+        assert_eq!(
+            std::fs::read_to_string(rec.path().join("argv"))
+                .unwrap()
+                .trim(),
+            "",
+            "repo-mode pre-push must receive no arguments"
+        );
+    }
+
+    #[test]
+    fn pre_push_hook_repo_mode_failing_script_blocks_push() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 1));
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_ne!(rc, 0, "{receipt}");
+        assert!(receipt.contains("mode=repo"), "{receipt}");
+        assert!(receipt.contains("rc=1"), "{receipt}");
+    }
+
+    #[test]
+    fn pre_push_hook_repo_mode_refuses_pushed_sha_not_head() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
+        let first = git(repo.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join("g"), "y").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-qm", "second"]);
+        assert_ne!(first, git(repo.path(), &["rev-parse", "HEAD"]));
+        let (rc, receipt) = run_hook(repo.path(), &first);
+        assert_ne!(rc, 0, "{receipt}");
+        assert!(receipt.contains("steps=refused:head-mismatch"), "{receipt}");
+        assert!(
+            !rec.path().join("runs").exists(),
+            "the plan must not run against a different working tree"
+        );
+    }
+
+    // CAD-2403 review: a repository's own script runs like a git hook — git's
+    // remote and URL as arguments, the ref lines on stdin and
+    // CADENCE_PRE_PUSH_MODE=repo — and never receives this repository's
+    // `--receipt`, even with CADENCE_PRE_PUSH_LOCAL=1.
+    #[test]
+    fn pre_push_hook_repo_mode_passes_git_args_refs_and_mode() {
+        use std::io::Write;
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        let d = rec.path().display();
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {d}/argv\ncat > {d}/stdin\nprintf '%s' \"$CADENCE_PRE_PUSH_MODE\" > {d}/mode\nexit 0\n"
+        );
+        commit_script(repo.path(), "pre-push", &body);
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let hook = install_pre_push_hook(repo.path()).unwrap();
+        let home = TempDir::new().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg(&hook)
+            .arg("origin")
+            .arg("git@example.com:o/r.git")
+            .current_dir(repo.path())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("USER", "tester")
+            .env("CADENCE_PRE_PUSH_LOCAL", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let line = format!("refs/heads/x {head} refs/heads/x {ZERO_SHA}\n");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{:?}", out);
+        let read = |n: &str| std::fs::read_to_string(rec.path().join(n)).unwrap();
+        assert_eq!(read("argv"), "origin\ngit@example.com:o/r.git\n");
+        assert_eq!(read("stdin"), line);
+        assert_eq!(read("mode"), "repo");
+    }
+
+    #[test]
+    fn pre_push_hook_repo_mode_clean_pass_is_not_rerun() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        // Installing the hook writes the lane's `.env` (the cargo shim's PATH);
+        // a repository that ignores it keeps a clean tree, which the skip needs.
+        // Without the ignore the tree is dirty and the plan simply runs again.
+        std::fs::write(repo.path().join(".gitignore"), ".env\n").unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0, "{receipt}");
+        assert!(receipt.ends_with("tree=clean"), "{receipt}");
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0, "{receipt}");
+        assert_eq!(
+            std::fs::read_to_string(rec.path().join("runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "second push of the same clean HEAD must not re-run the script"
+        );
+    }
+
+    #[test]
+    fn pre_push_hook_boat_build_present_uses_boat_route() {
+        let repo = git_repo();
+        let rec = TempDir::new().unwrap();
+        commit_script(repo.path(), "pre-push", &recording_pre_push(rec.path(), 0));
+        // The fake Boat helper echoes the head it was asked to check ($3 of
+        // `--receipt --head <sha>`) in a receipt line.
+        let boat = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"$a\" >> '{r}/boat-argv'; done\necho \"head=$3 lane=x mode=boat patch={EMPTY_PATCH} rc=0 at=1\"\n",
+            r = rec.path().display()
+        );
+        commit_script(repo.path(), "boat-build", &boat);
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let (rc, receipt) = run_hook(repo.path(), &head);
+        assert_eq!(rc, 0, "{receipt}");
+        assert_eq!(
+            std::fs::read_to_string(rec.path().join("boat-argv")).unwrap(),
+            format!("--receipt\n--head\n{head}\n")
+        );
+        assert!(
+            !rec.path().join("runs").exists(),
+            "the repo's own pre-push must not be called directly on the Boat route"
+        );
+        assert!(
+            receipt.starts_with(&format!("head={head} lane=x mode=boat")),
+            "{receipt}"
+        );
     }
 }

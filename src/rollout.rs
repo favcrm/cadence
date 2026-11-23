@@ -115,7 +115,55 @@ pub use migration::{
 /// v55 (CAD-1353) adds `messages.stall_secs`, the budget chosen for one
 /// dispatch, leaving `jobs.stall_secs` as the shared default.
 /// v56 (CAD-1726) adds `artifacts`, the agent canvas artifact versions.
-pub const SCHEMA_VERSION: i64 = 56;
+/// v57 (CAD-1853) adds the cloud-agent connection, its per-thread remote
+/// session bindings, the explicit local assistant consent and the durable
+/// operation correlation rows.
+/// v58 records the operator's per-install automatic-update choice. The row
+/// is a preference, not a grant: a routine checked release may apply, and a
+/// release that changes declared access still waits for Apply.
+/// v59 (CAD-1887) adds one operator disposition per succeeded run and at
+/// most one selected ticket. Neither publishes the artifact.
+///
+/// v60 (CAD-1085) adds the protected Connection authority (config, reviewed
+/// operation policy, approved manifest, one-use approval, quotes, immutable
+/// dispatch rows, protected ledger and the metadata-only credential-entry
+/// tables).
+///
+/// v61 (CAD-1962) adds workspace custody for an image an installation
+/// imported into the shared media library, plus its accepted-intent ledger.
+///
+/// v62 (CAD-2042) denormalizes an owning run's installation/context and the
+/// source-read marker onto capability receipts, with a partial scoped index,
+/// so the retained-source page is an ordered range instead of a join+sort.
+/// v63 (CAD-1857) adds `agent_endpoints`, the agent ingress endpoint registry.
+///
+/// v64 (CAD-2215) adds `assist_request_queue`, the durable acceptance of a
+/// member job request before its canonical job exists. One row per
+/// `(org, sub, request_key)` keeps a request pending behind an occupied
+/// issue instead of refusing it; the joined autonomous promotion worker
+/// turns it into the ordinary one-nonterminal-job-per-issue draft.
+///
+/// v65 (CAD-2215) adds `app_member_grants`, the explicit per-member grant for
+/// one exact app conversation, retained as a revocable tombstone.
+///
+/// v66 (CAD-2215) adds the nullable
+/// `connection_metadata.cursor_keyring_fingerprint`. `NULL` means the
+/// operator never explicitly initialized the scoped-cursor keyring; the
+/// migration never writes a value, so only the operator RPC can bind one.
+///
+/// v67 (CAD-2215) gives each app-conversation grant an authorization epoch.
+/// Existing grants keep their authority; an explicit re-grant changes the
+/// epoch, fencing readers that selected data under the previous grant.
+///
+/// v68 (CAD-2317) adds `routines`, `routine_runs`, `connection_policies`, and
+/// `staged_routine_proposals`.
+///
+/// v69 (CAD-2378) adds `workspace_settings`, the company time zone.
+///
+/// v70 (CAD-2019 / CAD-2316 / CAD-2022) adds
+/// `business_template_versions.source_format` (docx/html/authoring) and
+/// `business_documents.has_unresolved_pricing`.
+pub const SCHEMA_VERSION: i64 = 70;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

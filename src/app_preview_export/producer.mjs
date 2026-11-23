@@ -1,3 +1,51 @@
+//#region src/lib/privateSession.ts
+var generation = 0;
+var privateSessionGeneration = () => generation;
+//#endregion
+//#region src/lib/sessionKey.ts
+/**
+* The operator session's second credential (CAD-313, review round 2 of
+* PR #249). The board's HttpOnly cookie alone is no session: every
+* request also carries `X-Cadence-Session: <key>`. The key is scoped to
+* the exact origin, port included — so a server on another port that
+* receives the cookie (cookies ignore ports) never sees it, and a
+* cross-site page cannot set the header.
+*
+* It lives in `localStorage` so the same browser (a new tab, a reload,
+* or a browser restart) keeps the session the cookie already carries;
+* `sessionStorage` is read as a fallback so a tab opened before this
+* change still works, and written too so a store that blocks
+* `localStorage` degrades to the old per-tab behavior instead of
+* signing out. Clearing the key is what ends this browser's session.
+*/
+var SESSION_KEY_STORE = "cadence.sessionKey";
+var entryMemoryKey = null;
+function entryMode() {
+	try {
+		return globalThis.__CADENCE_ENTRY_MODE__ === true;
+	} catch {
+		return false;
+	}
+}
+function consumeEntryBootstrap() {
+	if (!entryMode()) return;
+	const scope = globalThis;
+	const bootstrap = scope.__CADENCE_ENTRY_BOOTSTRAP__;
+	if (bootstrap && typeof bootstrap.key === "string" && /^[0-9a-f]{64}$/.test(bootstrap.key)) entryMemoryKey = bootstrap.key;
+	try {
+		delete scope.__CADENCE_ENTRY_BOOTSTRAP__;
+	} catch {}
+}
+consumeEntryBootstrap();
+function sessionKey() {
+	if (entryMode()) return entryMemoryKey;
+	for (const kind of ["local", "session"]) try {
+		const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(SESSION_KEY_STORE);
+		if (key) return key;
+	} catch {}
+	return null;
+}
+//#endregion
 //#region src/lib/conditionalGet.ts
 /** Bounded validators, scoped to this tab's current operator credential.
 * 304 is useful only with a matching in-memory representation; no disk cache.
@@ -55,48 +103,23 @@ var ConditionalGet = class {
 		};
 	}
 };
-//#endregion
-//#region src/lib/sessionKey.ts
-/**
-* The operator session's second credential (CAD-313, review round 2 of
-* PR #249). The board's HttpOnly cookie alone is no session: every
-* request also carries `X-Cadence-Session: <key>`. The key is scoped to
-* the exact origin, port included — so a server on another port that
-* receives the cookie (cookies ignore ports) never sees it, and a
-* cross-site page cannot set the header.
-*
-* It lives in `localStorage` so the same browser (a new tab, a reload,
-* or a browser restart) keeps the session the cookie already carries;
-* `sessionStorage` is read as a fallback so a tab opened before this
-* change still works, and written too so a store that blocks
-* `localStorage` degrades to the old per-tab behavior instead of
-* signing out. Clearing the key is what ends this browser's session.
-*/
-var SESSION_KEY_STORE = "cadence.sessionKey";
-function sessionKey() {
-	for (const kind of ["local", "session"]) try {
-		const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(SESSION_KEY_STORE);
-		if (key) return key;
-	} catch {}
-	return null;
-}
-//#endregion
-//#region src/lib/privateSession.ts
-var generation = 0;
-var privateSessionGeneration = () => generation;
 new ConditionalGet((input, init) => fetch(input, init), () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`);
-//#endregion
-//#region src/features/workspace-apps/screen/screenProtocol.ts
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
-*  port. `call` verbs never spend or publish; every spend or publish verb is a
-*  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
-*  verbs arrive with HP4: add them here and in the host's dispatch table. */
+*  port. `call` verbs run directly: the install's own config and drafts, and
+*  (CAD-1918, operator decision) the app's own publish confirmation and
+*  schedule — the human's press inside the app is the one approval, bound by
+*  the operator session, the host-held action token and the install-bound
+*  stored effect. `slot` verbs wait for a tap on a host-drawn button: a run
+*  start, the original download and the image picker. Confirm and schedule
+*  also stay slot verbs until every installed app sends them as calls
+*  (Social Content 0.12.10 still sends slots). */
 var CALL_VERBS = [
 	"read.run",
 	"context.defaults.save",
 	"open-link",
 	"screen.drawer.open",
 	"screen.drawer.close",
+	"screen.drawer.context",
 	"social.drafts.list",
 	"social.drafts.show",
 	"social.drafts.create",
@@ -104,20 +127,28 @@ var CALL_VERBS = [
 	"social.drafts.discard",
 	"social.drafts.publish.stage",
 	"social.sources.show",
+	"social.sources.page",
+	"social.sources.get",
 	"social.sources.save",
 	"social.destinations.list",
-	"media.read",
-	"media.publish",
-	"media.chat.attach"
-];
-var SLOT_VERBS = [
-	"run.start",
+	"publish.consent.status",
 	"publish.destination.use",
+	"publish.destination.remove",
+	"publish.settings.save",
 	"publish.draft.confirm",
 	"publish.draft.schedule",
 	"publish.draft.reschedule",
 	"publish.draft.cancel",
-	"publish.settings.save",
+	"media.read",
+	"media.publish",
+	"media.import",
+	"media.chat.attach"
+];
+var SLOT_VERBS = [
+	"run.start",
+	"publish.draft.confirm",
+	"publish.draft.schedule",
+	"publish.consent.allow",
 	"media.original.download",
 	"social.image.pick"
 ];
@@ -131,18 +162,22 @@ var ORIGINAL_DOWNLOAD_VERB = "media.original.download";
 var MEDIA_VERBS = [
 	"media.read",
 	"media.publish",
+	"media.import",
 	"media.chat.attach"
 ];
 /** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
 *  deliberately absent; the channel appends a mount's declared media
 *  rights itself. */
-var ACTION_VERBS = [...CALL_VERBS.filter((v) => !MEDIA_VERBS.includes(v)), ...SLOT_VERBS.filter((v) => v !== ORIGINAL_DOWNLOAD_VERB)];
+var ACTION_VERBS = [.../* @__PURE__ */ new Set([...CALL_VERBS.filter((v) => !MEDIA_VERBS.includes(v) && v !== "screen.drawer.context"), ...SLOT_VERBS.filter((v) => v !== ORIGINAL_DOWNLOAD_VERB)])];
 var RECORD_CALL_VERBS = [
 	"records.list",
 	"records.show",
 	"records.create",
 	"records.update",
 	"records.csv.preview",
+	"records.batch",
+	"records.aggregate",
+	"records.merge",
 	"segments.list",
 	"segments.show",
 	"segments.save",
@@ -172,6 +207,7 @@ var RECORD_CALL_VERBS = [
 	"sends.prepare",
 	"sends.show",
 	"sends.list",
+	"sends.cancel",
 	"smtp.show",
 	"origin.show",
 	"campaign-work.show",
@@ -207,7 +243,12 @@ var RECORD_CALL_VERBS = [
 	"works.patch",
 	"works.trash",
 	"works.restore",
-	"works.request_review"
+	"works.request_review",
+	"calendar.query",
+	"routines.list",
+	"connections.assets",
+	"catalog.call",
+	"catalog.status"
 ];
 var RECORD_SLOT_VERBS = [
 	"records.csv.import",
@@ -231,19 +272,23 @@ var RECORD_SLOT_VERBS = [
 	"whatsapp.handoff.release",
 	"chat.whatsapp.brief",
 	"works.review",
-	"works.export"
+	"works.export",
+	"catalog.confirm"
 ];
 [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
+Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")?.get;
 var LINK_ID_MAX = 128;
 var V2_TOP = [
 	"sources",
 	"defaults",
+	"publish_settings",
 	"readiness",
 	"actions",
 	"run_receipts",
 	"original_downloads",
 	"media_previews",
 	"media_chat_references",
+	"audio_capture",
 	"route",
 	"read_observations",
 	"presentation_locale"
@@ -307,6 +352,13 @@ var omit = (key) => (p) => ({
 });
 var DEGRADE = [
 	omit("caption_excerpt"),
+	(p) => ({
+		...p,
+		sources: p.sources && {
+			...p.sources,
+			collections: void 0
+		}
+	}),
 	({ sources: _s, ...p }) => p,
 	omit("inputs_used"),
 	(p) => ({
@@ -477,6 +529,8 @@ function intentRefusal(intent) {
 var EXCERPT_MAX = 600;
 var RATIONALE_MAX = 280;
 var POSTS_MAX = 24;
+/** SOC-54: how many handles `sources.collections` may name (the app saves 20). */
+var LIBRARY_HANDLES_MAX = 20;
 var STEPS_MAX = 16;
 var KEYS_MAX = 16;
 /** The wire grammars the package adapter (screen-v2.mjs) checks. */
@@ -610,8 +664,9 @@ function runV2(run, installation, extras) {
 function latestSourceRun(installation, runs) {
 	return runs.filter((run) => run.state === "succeeded" && Object.keys(run.snapshot.capabilities ?? {}).some((slot) => installation.capabilities?.[slot]?.effect === "read")).reduce((newest, run) => !newest || (run.updated ?? 0) >= (newest.updated ?? 0) ? run : newest, null);
 }
-/** One normalized source post, honestly shown (link + time) or withheld. */
-function sourcePost(post, seen) {
+/** One normalized source post, honestly shown (link + time) or withheld.
+*  `receiptId` is the retained read that returned it (SOC-54). */
+function sourcePost(post, seen, receiptId) {
 	const permalink = instagramLink(post.permalink);
 	const published = epoch(post.published_at_unix ?? void 0);
 	if (typeof post.id !== "string" || !isId(post.id) || seen.has(post.id) || !permalink || published === null) return null;
@@ -622,8 +677,32 @@ function sourcePost(post, seen) {
 		published_at: published,
 		permalink,
 		media_kind: text(post.media_kind ?? "", 32),
-		thumb_url: instagramThumb(post.preview_url)
+		thumb_url: instagramThumb(post.preview_url),
+		receipt_id: receiptId
 	});
+}
+/** SOC-54: how much of the enumeration a PUSH should normally carry. This is a
+*  preference, not the guarantee: `shapeFor` strips `collections` before it
+*  drops `sources`, because only the assembled message knows what the newest
+*  page plus the rest of the screen cost. Trimming here keeps most of the
+*  history for a large screen instead of losing it whole. */
+var COLLECTIONS_BYTES_MAX = 49152;
+/** Trim the enumeration to the wire budget: oldest posts first, from the
+*  handle holding the most, so one profile's long captions cannot drop
+*  another profile entirely. */
+function budgeted(collections) {
+	const out = collections.map((entry) => ({
+		...entry,
+		posts: [...entry.posts]
+	})).filter((entry) => entry.posts.length > 0);
+	const bytes = () => new TextEncoder().encode(JSON.stringify(out)).byteLength;
+	while (out.length > 0 && bytes() > COLLECTIONS_BYTES_MAX) {
+		let richest = 0;
+		for (let i = 1; i < out.length; i += 1) if (out[i].posts.length > out[richest].posts.length) richest = i;
+		out[richest].posts.pop();
+		for (let i = out.length - 1; i >= 0; i -= 1) if (out[i].posts.length === 0) out.splice(i, 1);
+	}
+	return out;
 }
 /** The library, or `null` (omitted: the frame shows it as unavailable)
 *  while no verified read is held. One authoritative latest source
@@ -638,16 +717,46 @@ function sourcePost(post, seen) {
 *  reload — the frame always shows the posts the user last fetched,
 *  never a stale source that merely ran a workflow earlier. */
 function sourcesOf(installation, scopedRuns, extras) {
-	const postsFrom = (posts) => {
+	const postsFrom = (posts, receiptId) => {
 		const seen = /* @__PURE__ */ new Set();
 		const out = [];
 		for (const post of list(posts)) {
 			if (out.length >= POSTS_MAX) break;
-			const row = sourcePost(post, seen);
+			const row = sourcePost(post, seen, receiptId);
 			if (row) out.push(row);
 		}
 		return out;
 	};
+	const retainedReads = () => extras?.tools ? extras.tools.filter((r) => r.install_id === installation.install_id && installation.capabilities?.[r.slot]?.effect === "read" && r.result?.kind === "social.source.posts" && typeof r.result.handle === "string" && HANDLE.test(r.result.handle)).sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0)) : [];
+	/** SOC-54: the retained history (bounded) grouped by handle, newest read
+	*  first, so a reload shows more than the last fetch.
+	*  A newer page wins for a post it repeats; an older read still contributes
+	*  the posts it proved and the rest of the page list, so a reload shows more
+	*  than the last fetch. Bounded per handle and in handle count. Run-bound
+	*  reads stay out: a draft from one is a `run` source, which `sources` names. */
+	const reads = retainedReads();
+	const collections = () => {
+		const byHandle = /* @__PURE__ */ new Map();
+		for (const read of reads) {
+			const handle = read.result.handle.replace(/^@/, "").toLowerCase();
+			const entry = byHandle.get(handle) ?? {
+				handle,
+				fetched_at: epoch(read.created_at) ?? void 0,
+				tool_receipt_id: read.id,
+				posts: []
+			};
+			const seen = new Set(entry.posts.map((post) => post.id));
+			for (const row of postsFrom(read.result.posts, read.id)) {
+				if (entry.posts.length >= POSTS_MAX) break;
+				if (seen.has(row.id)) continue;
+				seen.add(row.id);
+				entry.posts.push(row);
+			}
+			byHandle.set(handle, entry);
+		}
+		return [...byHandle.values()].slice(0, LIBRARY_HANDLES_MAX);
+	};
+	const library = budgeted(collections());
 	const latest = latestSourceRun(installation, scopedRuns);
 	const runReceipt = latest && extras?.source && extras.source.runId === latest.id ? extras.source.receipts.find((v) => v.run_id === latest.id && v.result?.kind === "social.source.posts") : void 0;
 	const runRead = latest && runReceipt && typeof runReceipt.result.handle === "string" && HANDLE.test(runReceipt.result.handle) ? {
@@ -656,18 +765,22 @@ function sourcesOf(installation, scopedRuns, extras) {
 		when: epoch(latest.updated),
 		posts: postsFrom(runReceipt.result.posts)
 	} : null;
-	const toolRead = extras?.tools ? extras.tools.filter((r) => r.install_id === installation.install_id && installation.capabilities?.[r.slot]?.effect === "read" && r.result?.kind === "social.source.posts" && typeof r.result.handle === "string" && HANDLE.test(r.result.handle)).sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))[0] ?? null : null;
-	if (toolRead && (!runRead || (toolRead.created_at ?? 0) > (runRead.when ?? 0)) && toolRead) return present({
+	const toolRead = reads[0] ?? null;
+	const useTool = toolRead && (!runRead || (toolRead.created_at ?? 0) > (runRead.when ?? 0));
+	const spelled = library.length ? { collections: library } : {};
+	if (useTool && toolRead) return present({
 		handle: toolRead.result.handle,
 		tool_receipt_id: toolRead.id,
 		fetched_at: epoch(toolRead.created_at),
-		posts: postsFrom(toolRead.result.posts)
+		posts: postsFrom(toolRead.result.posts, toolRead.id),
+		...spelled
 	});
 	if (runRead) return present({
 		handle: runRead.handle,
 		run_id: runRead.run.id,
 		fetched_at: runRead.when,
-		posts: runRead.posts
+		posts: runRead.posts,
+		...spelled
 	});
 	return null;
 }
@@ -682,6 +795,26 @@ function defaultsOf(installation, context) {
 		const value = typeof saved === "string" ? saved : appDefault;
 		if (typeof value === "string" && value.length <= 512) out.values[key] = value;
 	}
+	return out;
+}
+/** The app's own publish_settings grammars (cadence-app-social-content
+*  screen-v2.mjs): a field that fails one is omitted, never coerced. */
+var PUBLISH_DEST = /^[A-Za-z0-9._-]{1,120}$/;
+var PUBLISH_ZONE = /^[A-Za-z0-9/_+-]+$/;
+var CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
+/** CAD-1902: the configured publication binding for this install and scope
+*  at the installed bundle, as the frame's read-only publish_settings. The
+*  mounted context's own binding wins over the install-wide one. */
+function publishSettingsOf(installation, contextId, extras) {
+	const candidates = (extras?.bindings ?? []).filter((b) => b.install_id === installation.install_id && b.state === "configured" && b.config.bundle_digest === installation.digest && b.config.publish && typeof b.config.publish === "object" && ((b.context_id ?? "") === contextId || (b.context_id ?? "") === ""));
+	const binding = candidates.find((b) => (b.context_id ?? "") === contextId) ?? candidates.find((b) => (b.context_id ?? "") === "");
+	if (!binding || !Number.isSafeInteger(binding.revision) || binding.revision < 0) return void 0;
+	const publish = binding.config.publish;
+	const out = { revision: binding.revision };
+	if (typeof publish.destination_id === "string" && PUBLISH_DEST.test(publish.destination_id)) out.destination_id = publish.destination_id;
+	if (typeof publish.destination_label === "string" && publish.destination_label.trim().length > 0 && publish.destination_label.length <= 80 && !CONTROL_CHARS.test(publish.destination_label)) out.destination_label = publish.destination_label;
+	if (publish.toolkit === "instagram" || publish.toolkit === "facebook") out.toolkit = publish.toolkit;
+	if (typeof publish.timezone === "string" && PUBLISH_ZONE.test(publish.timezone) && isZone(publish.timezone)) out.timezone = publish.timezone;
 	return out;
 }
 function readinessOf(installation, contextId, extras) {
@@ -747,6 +880,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 		publish_intents: scopedIntents(intents, installation.install_id, contextId, new Map(scopedRuns.map((r) => [r.id, r.context_id ?? ""])), true),
 		...present({ sources: sourcesOf(installation, scopedRuns, scoped) }),
 		defaults: defaultsOf(installation, active.find((c) => c.id === contextId)),
+		...present({ publish_settings: publishSettingsOf(installation, contextId, scoped) }),
 		readiness: readinessOf(installation, contextId, scoped),
 		actions: scoped ? [...ACTION_VERBS] : [],
 		now: Math.floor(Date.now() / 1e3)
@@ -758,7 +892,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/4";
+var CONTRACT = "app-screen-projection-fixtures/10";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",

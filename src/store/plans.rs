@@ -14,6 +14,9 @@ use super::messages::{row_message, Message, Priority};
 use super::StoreConn;
 use super::{is_task_terminal, is_terminal, now, take_bytes, Sender, Store};
 
+const OPEN_JOB_FOR_ISSUE: &str =
+    "SELECT id FROM jobs WHERE issue_id=? AND state NOT IN ('done','cancelled','failed')";
+
 /// CAD-1239: an archived worker cannot be assigned new work or have a
 /// terminal task reopened onto it. Runs inside the assignment transaction.
 fn refuse_archived_assignee(worker: &Agent) -> Result<()> {
@@ -31,7 +34,7 @@ pub const JOB_STATES: &[&str] = &["draft", "open", "done", "failed", "cancelled"
 
 /// A job: the rollup container binding a spec, a PM (group root) and a
 /// set of tasks. `state`: `draft|open|done|failed|cancelled`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     pub id: String,
     pub title: Option<String>,
@@ -74,7 +77,7 @@ pub struct JobTaskSummary {
 
 /// A task: the dispatch/QA unit inside a job. `revision` counts
 /// attempts; each attempt is one kickoff message (`dispatch_message`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub id: String,
     pub job_id: String,
@@ -95,6 +98,27 @@ pub struct Task {
     pub error: Option<String>,
     pub created: f64,
     pub updated: f64,
+}
+
+/// One durable dispatch/report event for a task. `None` means the field
+/// was missing or the payload was unreadable — never a value to guess at.
+#[derive(Clone, Debug)]
+pub(crate) struct TaskHistoryEvent {
+    pub kind: String,
+    pub alias: String,
+    pub task: Option<String>,
+    pub job: Option<String>,
+    pub revision: Option<i64>,
+    pub message: Option<String>,
+    pub assignee: Option<String>,
+    /// `Some(None)` is an explicitly recorded null (a legitimate SHA-less
+    /// completion); `None` means the field was absent. `sha_bad` marks a
+    /// field present with a non-string, non-null type.
+    pub sha: Option<Option<String>>,
+    pub sha_bad: bool,
+    /// The project bound at dispatch. `None` on a pre-cutover or corrupt
+    /// event — historical recovery refuses rather than rebinding.
+    pub project: Option<String>,
 }
 
 /// A verdict: the QA record bound to one exact `(task, revision, sha)`.
@@ -225,20 +249,106 @@ impl Verdict {
     }
 }
 
-/// A pre-dispatch plan: the exact revision, kickoff id and body a fresh
-/// `dispatch_task` will use. `duplicate` means a live kickoff already
-/// exists and no new revision will be minted.
+/// A pre-dispatch snapshot: the exact native task/job/worker inputs and
+/// proposed kickoff revision/id. Capture source bytes outside the write
+/// transaction, then fence this snapshot when admitting the prepared delivery.
 pub struct DispatchPlan {
     pub task: Task,
     pub job: Job,
     pub worker: Agent,
     pub revision: i64,
     pub message_id: String,
-    pub body: String,
     pub duplicate: bool,
 }
 
+impl DispatchPlan {
+    /// Source capture must not authorize a changed task/job/worker. Compare
+    /// the material rows, not timestamps alone, inside the admission write.
+    pub(super) fn verify_current(
+        &self,
+        task: &Task,
+        job: &Job,
+        worker: &Agent,
+        revision: i64,
+        message: &str,
+    ) -> Result<()> {
+        if self.duplicate
+            || task != &self.task
+            || job != &self.job
+            || revision != self.revision
+            || message != self.message_id
+            || worker.alias != self.worker.alias
+            || worker.uid != self.worker.uid
+            || worker.provider != self.worker.provider
+            || worker.endpoint_kind != self.worker.endpoint_kind
+            || worker.role != self.worker.role
+            || worker.team_role != self.worker.team_role
+            || worker.cwd != self.worker.cwd
+            || worker.sandbox != self.worker.sandbox
+            || worker.instructions != self.worker.instructions
+            || worker.params != self.worker.params
+            || worker.model_selection != self.worker.model_selection
+        {
+            return Err(Error::rejected(format!(
+                "context refused: stale-task-inputs: task '{}' or its job/worker changed \
+                 while preparing context — retry to capture its current scope; nothing was queued",
+                self.task.id
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct DispatchPreparation<'a> {
+    pub(super) plan: &'a DispatchPlan,
+    /// Absent only when the captured plan already names an accepted kickoff.
+    pub(super) delivery: Option<(String, super::messages::IssueSelection)>,
+    /// The ticket's project at this dispatch, recorded in the durable
+    /// `task_dispatched` event so a later recovery never re-derives it from
+    /// the ticket's current location.
+    pub(super) project: Option<&'a str>,
+}
+
 impl Store {
+    /// Re-prove assist provenance at the message admission boundary, including
+    /// the automatic-monitor path when it consumes a prepared native dispatch.
+    pub(super) fn task_dispatch_authority_in(
+        &self,
+        tx: &impl StoreConn,
+        task: &Task,
+        expect: Option<&AssistDispatchExpect>,
+    ) -> Result<()> {
+        match expect {
+            Some(expect) => {
+                if expect.job != task.job_id {
+                    return Err(Error::rejected(
+                        "task dispatch refused: the captured assist provenance names a \
+                         different job (CAD-1380)",
+                    ));
+                }
+                self.assist_expect_in(tx, expect)?;
+            }
+            None => {
+                let bound = task.job_id.starts_with("assist-")
+                    || tx
+                        .query_opt(
+                            "SELECT 1 FROM assist_requests WHERE job=?",
+                            [task.job_id.as_str()],
+                            |_| Ok(()),
+                        )?
+                        .is_some();
+                if bound {
+                    return Err(Error::rejected(format!(
+                        "task dispatch refused: job '{}' is assist-bound and needs its \
+                         member provenance re-proven (CAD-1380)",
+                        task.job_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn job_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Job> {
         conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job)
             .map_err(|e| match e {
@@ -257,6 +367,18 @@ impl Store {
                 }
                 other => other.into(),
             })
+    }
+
+    /// Optional job read: `Ok(None)` only when no row exists. Any other
+    /// store failure propagates, so a caller can never mistake a failed
+    /// read for an absent job.
+    pub(crate) fn job_opt(&self, id: &str) -> Result<Option<Job>> {
+        let conn = self.conn();
+        match conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job) {
+            Ok(job) => Ok(Some(job)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn job(&self, id: &str) -> Result<Job> {
@@ -373,6 +495,13 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub(crate) fn has_open_job_for_issue(&self, issue: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_opt(OPEN_JOB_FOR_ISSUE, [issue], |_| Ok(()))?
+            .is_some())
+    }
+
     pub fn tasks_for_job(&self, job_id: &str) -> Result<Vec<Task>> {
         self.read_tx(|conn| {
             let stmt_sql = "SELECT * FROM tasks WHERE job_id=? ORDER BY created";
@@ -380,6 +509,39 @@ impl Store {
                 .query_vec(stmt_sql, [job_id], row_task)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// Resolve task ids to their jobs' issue bindings in bounded batches.
+    pub(crate) fn task_issue_bindings<S: AsRef<str>>(
+        &self,
+        ids: &[S],
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        self.read_tx(|conn| {
+            let mut bindings = std::collections::HashMap::with_capacity(ids.len());
+            for chunk in ids.chunks(500) {
+                let mut placeholders = String::with_capacity(chunk.len() * 2 - 1);
+                for index in 0..chunk.len() {
+                    if index > 0 {
+                        placeholders.push(',');
+                    }
+                    placeholders.push('?');
+                }
+                let sql = format!(
+                    "SELECT t.id, NULLIF(j.issue_id, '') FROM tasks t
+                     LEFT JOIN jobs j ON j.id = t.job_id WHERE t.id IN ({placeholders})"
+                );
+                let rows = conn.query_vec(
+                    &sql,
+                    rusqlite::params_from_iter(chunk.iter().map(|id| id.as_ref())),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?;
+                bindings.extend(rows);
+            }
+            Ok(bindings)
         })
     }
 
@@ -425,6 +587,77 @@ impl Store {
         })
     }
 
+    /// Native history for exactly one job/task: the durable
+    /// `task_dispatched` and `task_reported` rows, oldest first. Scoped by
+    /// the stored job/task columns. A payload field that is missing or
+    /// unreadable stays `None` so the caller refuses rather than guesses.
+    pub(crate) fn task_history_events(
+        &self,
+        job: &str,
+        task: &str,
+    ) -> Result<Vec<TaskHistoryEvent>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT kind,alias,payload FROM events
+                 WHERE job_id=? AND task_id=?
+                   AND kind IN ('task_dispatched','task_reported')
+                 ORDER BY seq",
+                params![job, task],
+                |row| {
+                    let payload: String = row.get(2)?;
+                    let value: Option<Value> = serde_json::from_str(&payload).ok();
+                    let text = |key: &str| {
+                        value
+                            .as_ref()
+                            .and_then(|value| value.get(key))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    };
+                    Ok(TaskHistoryEvent {
+                        kind: row.get(0)?,
+                        alias: row.get(1)?,
+                        task: text("task"),
+                        job: text("job"),
+                        revision: value
+                            .as_ref()
+                            .and_then(|value| value.get("revision"))
+                            .and_then(Value::as_i64),
+                        message: text("message"),
+                        assignee: text("assignee"),
+                        sha: match value.as_ref().and_then(|value| value.get("sha")) {
+                            None => None,
+                            Some(Value::Null) => Some(None),
+                            Some(Value::String(sha)) => Some(Some(sha.clone())),
+                            Some(_) => None,
+                        },
+                        sha_bad: matches!(
+                            value.as_ref().and_then(|value| value.get("sha")),
+                            Some(Value::Bool(_))
+                                | Some(Value::Number(_))
+                                | Some(Value::Array(_))
+                                | Some(Value::Object(_))
+                        ),
+                        project: text("project"),
+                    })
+                },
+            )?)
+        })
+    }
+
+    /// Every durable dispatch message the store wrote for this task,
+    /// oldest first. Native rows only; nothing is parsed from prose.
+    pub(crate) fn task_dispatch_messages(&self, task: &str) -> Result<Vec<Message>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT * FROM messages
+                 WHERE task_id=? AND source='job_dispatch'
+                 ORDER BY created, rowid",
+                params![task],
+                row_message,
+            )?)
+        })
+    }
+
     /// An alias's non-terminal task assignments — derived, never stored.
     pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
         self.read_tx(|conn| {
@@ -462,26 +695,20 @@ impl Store {
         })
     }
 
-    /// CAD-1752: the issue ids of each assignee's non-terminal tasks (a
-    /// task's job binds the issue), for `agent list --project`.
-    pub fn open_task_issues_by_assignee(
+    /// The issue binding of each assigned, non-terminal task in the fleet.
+    pub(crate) fn open_task_issue_bindings(
         &self,
-    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
         self.read_tx(|conn| {
             let rows = conn.query_vec(
-                "SELECT t.assignee, j.issue_id FROM tasks t JOIN jobs j ON j.id = t.job_id
-                 WHERE t.assignee IS NOT NULL AND COALESCE(j.issue_id,'') != ''
-                 AND t.state NOT IN ('verified','done','cancelled','failed')
-                 ORDER BY t.updated",
+                "SELECT t.id, NULLIF(j.issue_id, '') FROM tasks t
+                 LEFT JOIN jobs j ON j.id = t.job_id
+                 WHERE t.assignee IS NOT NULL
+                 AND t.state NOT IN ('verified','done','cancelled','failed')",
                 [],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )?;
-            let mut by_assignee: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for (assignee, issue) in rows {
-                by_assignee.entry(assignee).or_default().push(issue);
-            }
-            Ok(by_assignee)
+            Ok(rows.into_iter().collect())
         })
     }
 
@@ -584,14 +811,8 @@ impl Store {
                 return Ok((true, existing));
             }
             if let Some(issue) = issue_id {
-                let holder: Option<String> = tx
-                    .query_row(
-                        "SELECT id FROM jobs WHERE issue_id=?
-                                 AND state NOT IN ('done','cancelled','failed')",
-                        [issue],
-                        |r| r.get(0),
-                    )
-                    .ok();
+                let holder: Option<String> =
+                    tx.query_opt(OPEN_JOB_FOR_ISSUE, [issue], |r| r.get(0))?;
                 if let Some(holder) = holder {
                     return Err(Error::rejected(format!(
                         "Issue {issue} already maps to job '{holder}' — \
@@ -749,11 +970,9 @@ impl Store {
         Ok(())
     }
 
-    /// The read-only half of `job dispatch`, used by the cloud runner to
-    /// obtain the exact revision, kickoff id and body before any local
-    /// write. The caller creates the remote job (AOS enforces the
-    /// entitlement) and passes the same message id into `dispatch_task`;
-    /// a race is caught by comparing the returned revision/message.
+    /// Capture native dispatch inputs before resolving task/project sources.
+    /// A live or uncertain accepted kickoff returns its original identity;
+    /// callers must not recapture source bytes for that retry.
     pub fn plan_task_dispatch(
         &self,
         task_id: &str,
@@ -784,7 +1003,10 @@ impl Store {
                     .dispatch_message
                     .as_deref()
                     .and_then(|id| self.message(id).ok().flatten())
-                    .filter(|message| !is_terminal(&message.state));
+                    .filter(|message| {
+                        !is_terminal(&message.state)
+                            || (message.state == "unknown" && message.source == "job_dispatch")
+                    });
                 if let Some(live) = live {
                     if to.is_some() && to != task.assignee.as_deref() {
                         return Err(Error::rejected(format!(
@@ -799,7 +1021,6 @@ impl Store {
                         worker,
                         revision: current_revision,
                         message_id: live.id,
-                        body: String::new(),
                         duplicate: true,
                     });
                 }
@@ -823,11 +1044,14 @@ impl Store {
                 )));
             }
         }
-        let attempt = self
-            .messages_for_task(task_id)?
-            .iter()
-            .filter(|message| message.source == "job_dispatch")
-            .count() as i64;
+        let attempt: i64 = self.read_tx(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE task_id=? AND source='job_dispatch'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })?;
         let message_id = requested_message_id.map(str::to_string).unwrap_or_else(|| {
             Uuid::new_v5(
                 &Uuid::NAMESPACE_URL,
@@ -836,16 +1060,12 @@ impl Store {
             .simple()
             .to_string()
         });
-        let body = kickoff_body(&job, &task, revision, &message_id, &worker)?;
-        let mut planned_task = task;
-        planned_task.revision = revision;
         Ok(DispatchPlan {
-            task: planned_task,
+            task,
             job,
             worker,
             revision,
             message_id,
-            body,
             duplicate: false,
         })
     }
@@ -870,7 +1090,7 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, None, None, None)
+        self.dispatch_task_inner(task_id, to, message_id, by, None, None, None, None)
     }
 
     /// `dispatch_task` for a caller that selected the backend from the
@@ -885,7 +1105,16 @@ impl Store {
         by: &str,
         expected_worker: Option<&Agent>,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, expected_worker, None, None)
+        self.dispatch_task_inner(
+            task_id,
+            to,
+            message_id,
+            by,
+            expected_worker,
+            None,
+            None,
+            None,
+        )
     }
 
     /// `dispatch_task` with the caller's per-dispatch stall budget. The
@@ -900,28 +1129,34 @@ impl Store {
         by: &str,
         stall_secs: Option<i64>,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, None, None, stall_secs)
+        self.dispatch_task_inner(task_id, to, message_id, by, None, None, stall_secs, None)
     }
 
-    /// `dispatch_task_for` with the per-dispatch stall budget.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_task_for_with_stall(
+    /// Admit a daemon-prepared delivery with the existing native job guards.
+    /// The optional delivery is consumed only for a genuinely new kickoff;
+    /// an accepted duplicate retains its original message and selection.
+    pub(crate) fn dispatch_task_planned(
         &self,
-        task_id: &str,
-        to: Option<&str>,
-        message_id: Option<&str>,
+        plan: &DispatchPlan,
+        delivery: Option<(String, super::messages::IssueSelection)>,
         by: &str,
-        expected_worker: Option<&Agent>,
+        expect: Option<&AssistDispatchExpect>,
         stall_secs: Option<i64>,
+        project: Option<&str>,
     ) -> Result<(Task, String, bool, bool)> {
         self.dispatch_task_inner(
-            task_id,
-            to,
-            message_id,
+            &plan.task.id,
+            Some(&plan.worker.alias),
+            Some(&plan.message_id),
             by,
-            expected_worker,
-            None,
+            Some(&plan.worker),
+            expect,
             stall_secs,
+            Some(DispatchPreparation {
+                plan,
+                delivery,
+                project,
+            }),
         )
     }
 
@@ -937,7 +1172,7 @@ impl Store {
         by: &str,
         expect: &AssistDispatchExpect,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect), None)
+        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect), None, None)
     }
 
     /// `dispatch_task_expecting` with the pre-transaction assignee pinned
@@ -960,6 +1195,7 @@ impl Store {
             expected_worker,
             Some(expect),
             None,
+            None,
         )
     }
 
@@ -973,29 +1209,15 @@ impl Store {
         expect: &AssistDispatchExpect,
         stall_secs: Option<i64>,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect), stall_secs)
-    }
-
-    /// `dispatch_task_expecting_for` with the per-dispatch stall budget.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_task_expecting_for_with_stall(
-        &self,
-        task_id: &str,
-        to: Option<&str>,
-        message_id: Option<&str>,
-        by: &str,
-        expect: &AssistDispatchExpect,
-        expected_worker: Option<&Agent>,
-        stall_secs: Option<i64>,
-    ) -> Result<(Task, String, bool, bool)> {
         self.dispatch_task_inner(
             task_id,
             to,
             message_id,
             by,
-            expected_worker,
+            None,
             Some(expect),
             stall_secs,
+            None,
         )
     }
 
@@ -1009,44 +1231,29 @@ impl Store {
         expected_worker: Option<&Agent>,
         expect: Option<&AssistDispatchExpect>,
         stall_secs: Option<i64>,
+        prepared: Option<DispatchPreparation<'_>>,
     ) -> Result<(Task, String, bool, bool)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
             let job = self.job_in(&tx, &task.job_id)?;
-            match expect {
-                Some(expect) => {
-                    // The captured tuple must name THIS task's job before its
-                    // provenance is compared.
-                    if expect.job != task.job_id {
-                        return Err(Error::rejected(
-                            "task dispatch refused: the captured assist provenance names a \
-                             different job (CAD-1380)",
-                        ));
-                    }
-                    self.assist_expect_in(&tx, expect)?;
-                }
-                // Ordinary dispatch of an assist-bound job fails closed in this
-                // same transaction, never reaching the plain wrapper unchecked.
-                None => {
-                    let bound = task.job_id.starts_with("assist-")
-                        || tx
-                            .query_opt(
-                                "SELECT 1 FROM assist_requests WHERE job=?",
-                                [task.job_id.as_str()],
-                                |_| Ok(()),
-                            )?
-                            .is_some();
-                    if bound {
-                        return Err(Error::rejected(format!(
-                            "task dispatch refused: job '{}' is assist-bound and needs its \
-                             member provenance re-proven (CAD-1380)",
-                            task.job_id
-                        )));
-                    }
+            let private = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assist_requests WHERE job=?)",
+                [job.id.as_str()],
+                |r| r.get::<_, bool>(0),
+            )?;
+            if private {
+                let project = prepared.as_ref().and_then(|prepared| prepared.project);
+                if project.is_none_or(|project| project.trim().is_empty()) {
+                    return Err(Error::rejected(format!(
+                        "task dispatch refused: private job '{}' has no proven \
+                         dispatch-time project",
+                        job.id
+                    )));
                 }
             }
+            self.task_dispatch_authority_in(&tx, &task, expect)?;
             if job.state != "open" {
                 return Err(Error::rejected(format!(
                     "Job '{}' is '{}' — dispatch needs an open job",
@@ -1150,11 +1357,35 @@ impl Store {
                 .simple()
                 .to_string()
             });
-            let body = kickoff_body(&job, &task, revision, &kickoff, &worker)?;
+            let project = prepared.as_ref().and_then(|prepared| prepared.project);
+            if let Some(prepared) = prepared.as_ref() {
+                prepared
+                    .plan
+                    .verify_current(&task, &job, &worker, revision, &kickoff)?;
+            }
+            let (body, selection) = match prepared {
+                Some(prepared) => {
+                    let (body, selection) = prepared.delivery.ok_or_else(|| {
+                        Error::rejected(format!(
+                            "Task '{}' no longer has the captured live kickoff — retry to \
+                             select its new task context before dispatch",
+                            prepared.plan.task.id
+                        ))
+                    })?;
+                    (body, Some(selection))
+                }
+                None => (
+                    kickoff_body(&job, &task, revision, &kickoff, &worker)?,
+                    None,
+                ),
+            };
             // PM self-task: the PM's own turn IS the report path — a
             // reply_to to itself would fail enqueue's self-reply rule.
             let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
-            let (duplicate, _state) = self.enqueue_tx(
+            if matches!(&selection, Some(super::messages::IssueSelection::Pin(_))) {
+                Self::ensure_thread_in(&tx, assignee)?;
+            }
+            let (duplicate, _state) = self.enqueue_tx_with_conversation(
                 &tx,
                 assignee,
                 &body,
@@ -1166,9 +1397,14 @@ impl Store {
                 task.worktree.as_deref(),
                 &Sender::Unattributed,
                 Priority::Normal,
+                false,
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
+                selection,
             )?;
             if !duplicate {
                 if let Some(secs) = stall_secs {
@@ -1195,7 +1431,8 @@ impl Store {
                 &job.pm_alias,
                 "task_dispatched",
                 json!({"task": task_id, "job": job.id, "assignee": assignee,
-                               "revision": revision, "message": kickoff, "by": by}),
+                               "revision": revision, "message": kickoff, "by": by,
+                               "project": project}),
                 Some(&job.id),
                 Some(task_id),
             )?;

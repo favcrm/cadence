@@ -1,11 +1,22 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
+import { Window } from "happy-dom";
 import {
+  DRAWER_CONTEXT_BYTES,
+  HOST_DRAWER_VERBS,
   MAX_ASSET_BYTES,
+  MAX_AUDIO_TRANSCRIPT_CHARS,
+  MAX_AUDIO_UPLOAD_BYTES,
+  MAX_REPLY_DATA_BYTES,
   MAX_STATE_BYTES,
+  SCREEN_AUDIO_V1,
+  SCREEN_AUDIO_V2,
+  ScreenBridgeError,
   ScreenClosedError,
   ScreenRefusalError,
   ScreenTimeoutError,
+  createScreenBridge,
   createScreenReceiver,
   readBoot,
   validateBoot,
@@ -107,6 +118,74 @@ test("init posts to the exact origin with one transferred port, then ready", asy
   assert.deepEqual(inbox[0], { v: 1, op: "ready", accepts: ["screen.v2"] });
 });
 
+test("surfaces opt-in is advertised and the drawer surface is dispatched", async () => {
+  const seen = [];
+  const { inbox, host } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"], onSurface: (...args) => seen.push(args) });
+  await tick();
+  assert.deepEqual(inbox[0].accepts, ["screen.v2", "screen-surfaces.v1"]);
+  const { receiver } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  assert.equal(receiver.surfaceRole(), "primary");
+  assert.equal(receiver.surface(), undefined);
+  host.postMessage({ v: 1, op: "surface", role: "drawer", modal: false, surface: "settings" });
+  await tick();
+  assert.deepEqual(seen.pop(), ["drawer", "settings", false]);
+});
+
+test("canvas role and readOnly need the screen-canvas.v1 opt-in (CAD-2525)", async () => {
+  const seen = [];
+  const accepts = ["screen.v2", "screen-surfaces.v1", "screen-canvas.v1"];
+  const { inbox, host, receiver } = connect({ accepts, onSurface: (...a) => seen.push(a) });
+  await tick();
+  assert.deepEqual(inbox[0].accepts, accepts);
+  assert.equal(receiver.readOnly(), false);
+  host.postMessage({ v: 1, op: "surface", role: "canvas", modal: false, readOnly: true });
+  await tick();
+  assert.equal(receiver.surfaceRole(), "canvas");
+  assert.equal(receiver.readOnly(), true);
+  assert.deepEqual(seen.pop(), ["canvas", undefined, false, true]);
+  // A later primary message clears readOnly.
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  await tick();
+  assert.equal(receiver.readOnly(), false);
+  // An app that did not opt in refuses canvas and readOnly.
+  for (const shape of [{ role: "canvas" }, { role: "primary", readOnly: true }]) {
+    const plain = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+    plain.host.postMessage({ v: 1, op: "surface", modal: false, ...shape });
+    await tick();
+    assert.equal(plain.errors.length, 1, `${JSON.stringify(shape)} is refused without the opt-in`);
+  }
+  assert.throws(() => connect({ accepts: ["screen.v2", "screen-canvas.v1"] }), /needs screen-surfaces\.v1/);
+});
+
+test("every surface shape the host sends is admitted", async () => {
+  const shapes = [
+    { v: 1, op: "surface", role: "primary", modal: false },
+    { v: 1, op: "surface", role: "drawer", modal: false, surface: "settings" },
+    { v: 1, op: "surface", role: "primary" },
+  ];
+  for (const shape of shapes) {
+    const seen = [];
+    const { host, receiver } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"], onSurface: (...a) => seen.push(a) });
+    host.postMessage(shape);
+    await tick();
+    assert.equal(seen.length, 1, `host shape ${JSON.stringify(shape)} is admitted`);
+    assert.equal(receiver.surfaceRole(), shape.role);
+    assert.equal(receiver.surface(), shape.surface);
+  }
+  const bad = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  bad.host.postMessage({ v: 1, op: "surface", role: "primary", modal: "no" });
+  await tick();
+  assert.equal(bad.receiver.accepted(), false, "a non-boolean modal still refuses");
+});
+
+test("a drawer surface opens no further drawer", async () => {
+  const { receiver, host } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  host.postMessage({ v: 1, op: "surface", role: "drawer", modal: false, surface: "post" });
+  await tick();
+  assert.equal(receiver.surfaceRole(), "drawer");
+  await assert.rejects(receiver.openDrawer("settings"), /no further drawer/);
+});
+
 test("presentation opt-in is advertised and dispatched; the default is outlet", async () => {
   const modes = [];
   const { receiver, inbox, host } = connect({
@@ -151,6 +230,30 @@ test("drawer helpers send host UI verbs and validate the surface", async () => {
   host.postMessage({ v: 2, op: "reply", id: close.id, ok: true, data: { mode: "outlet" } });
   assert.deepEqual(await closing, { mode: "outlet" });
   await assert.rejects(receiver.openDrawer("not a surface!"), /surface/);
+});
+
+test("openDrawer passes an optional size and refuses an unknown one", async () => {
+  const { receiver, inbox, host, pushes } = connect({
+    accepts: ["screen.v2", "screen-actions.v1", "screen-presentation.v1"],
+  });
+  await waitFor(() => inbox.find((m) => m.op === "ready"), "ready");
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the push");
+  host.postMessage({ v: 1, op: "presentation", mode: "drawer" });
+  await waitFor(() => receiver.presentation() === "drawer", "the presentation");
+  const opening = receiver.openDrawer("draft", { size: "wide" });
+  const open = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.open"), "the drawer open");
+  assert.deepEqual(open.args, { surface: "draft", size: "wide" });
+  host.postMessage({ v: 2, op: "reply", id: open.id, ok: true, data: { mode: "drawer", surface: "draft" } });
+  assert.deepEqual(await opening, { mode: "drawer", surface: "draft" });
+  const narrow = receiver.openDrawer("draft", { size: "narrow" });
+  const second = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.open" && m.id !== open.id), "the narrow open");
+  assert.deepEqual(second.args, { surface: "draft", size: "narrow" });
+  host.postMessage({ v: 2, op: "reply", id: second.id, ok: true, data: { mode: "drawer", surface: "draft" } });
+  await narrow;
+  const sent = inbox.length;
+  await assert.rejects(receiver.openDrawer("draft", { size: "huge" }), /size/);
+  assert.equal(inbox.length, sent, "an unknown size is never sent");
 });
 
 test("drawer helpers refuse without the presentation opt-in", async () => {
@@ -338,6 +441,94 @@ test("request shapes are bounded at send time", async () => {
   assert.equal(inbox.filter((m) => m.op === "call" || m.op === "slot" || m.op === "tool").length, 0);
 });
 
+test("screen-locale.v1 is advertised on any screen.v2 mount without requiring records", async () => {
+  const { inbox: standalone } = connect({ accepts: ["screen.v2", "screen-surfaces.v1", "screen-locale.v1"] });
+  const { inbox: fiveCap } = connect({
+    accepts: ["screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"],
+  });
+  await tick();
+  assert.deepEqual(standalone[0], {
+    v: 1,
+    op: "ready",
+    accepts: ["screen.v2", "screen-surfaces.v1", "screen-locale.v1"],
+  });
+  assert.deepEqual(fiveCap[0], {
+    v: 1,
+    op: "ready",
+    accepts: ["screen.v2", "screen-actions.v1", "screen-media.v1", "screen-surfaces.v1", "screen-locale.v1"],
+  });
+});
+
+test("capabilities require screen.v2, reject legacy crm tokens, and fit the six-capability bound", async () => {
+  const base = { boot, parent: { postMessage() {} }, onPush() {}, timeoutMs: 100 };
+  assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-records.v1"] }),
+    /screen-records\.v1 needs screen\.v2/,
+  );
+  assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-locale.v1"] }),
+    /screen-locale\.v1 needs screen\.v2/,
+  );
+  assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-audio.v1"] }),
+    /screen-audio\.v1 needs screen\.v2/,
+  );
+  assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v1", "screen-media.v1"] }),
+    /screen-media\.v1 needs screen\.v2/,
+  );
+  assert.throws(
+    () => createScreenReceiver({ ...base, accepts: ["screen.v2", "crm-locale.v1"] }),
+    /accepts must name/,
+  );
+  const { inbox: sixCap } = connect({
+    accepts: [
+      "screen.v2",
+      "screen-actions.v1",
+      "screen-records.v1",
+      "screen-surfaces.v1",
+      "screen-locale.v1",
+      "screen-audio.v1",
+    ],
+  });
+  await tick();
+  assert.equal(sixCap[0].accepts.length, 6);
+  assert.throws(
+    () =>
+      createScreenReceiver({
+        ...base,
+        accepts: [
+          "screen.v2",
+          "screen-actions.v1",
+          "screen-media.v1",
+          "screen-presentation.v1",
+          "screen-surfaces.v1",
+          "screen-locale.v1",
+          "screen-audio.v1",
+        ],
+      }),
+    /at most six ready capabilities/,
+  );
+});
+
+test("maxArgsBytes admits a records CSV-sized call", async () => {
+  const { host, inbox, pushes, receiver } = connect({
+    accepts: ["screen.v2", "screen-records.v1"],
+    maxArgsBytes: 327680,
+  });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const csvText = "x".repeat(200 * 1024);
+  const reply = receiver.call("records.csv.preview", { csv_text: csvText });
+  const request = await waitFor(
+    () => inbox.find((m) => m.op === "call" && m.verb === "records.csv.preview"),
+    "the CSV call",
+  );
+  assert.equal(request.args.csv_text.length, csvText.length);
+  host.postMessage({ v: 2, op: "reply", id: request.id, ok: true, data: { rows: 1 } });
+  assert.deepEqual(await reply, { rows: 1 });
+});
+
 test("a slot resolves the host's event, not just its state", async () => {
   const { host, inbox, pushes, receiver } = connect();
   host.postMessage(push());
@@ -429,11 +620,46 @@ test("a refused boot returns an inert receiver whose calls also report closed", 
   assert.equal(receiver.boot, null);
   assert.equal(errors.length, 1);
   assert.equal(receiver.presentation(), "outlet");
+  assert.equal(receiver.surfaceRole(), "primary");
+  assert.equal(receiver.surface(), undefined);
+  assert.equal(receiver.ownLeaveState(), null);
   await assert.rejects(receiver.openDrawer("settings"), ScreenClosedError);
   await assert.rejects(receiver.closeDrawer(), ScreenClosedError);
+  await assert.rejects(receiver.drawerContext(), ScreenClosedError);
   await assert.rejects(receiver.call("read.run", {}), ScreenClosedError);
+  await assert.rejects(receiver.audioCapture(), ScreenClosedError);
   await assert.rejects(receiver.asset("media:1"), ScreenClosedError);
   assert.equal(receiver.state("x"), false);
+
+  // Expected tag pin and top-level window guard also fail closed into inert().
+  assert.throws(() => validateBoot(boot, "other-tag"), /tag mismatch/);
+  const tagMismatch = [];
+  const wrongTag = createScreenReceiver({
+    tag: "other-tag",
+    boot,
+    parent: { postMessage() {} },
+    onPush() {},
+    onError: (reason) => tagMismatch.push(reason),
+  });
+  assert.equal(wrongTag.boot, null);
+  assert.match(tagMismatch[0], /tag mismatch/);
+
+  const topWindow = { postMessage() {} };
+  const topErrors = [];
+  const prevParent = globalThis.parent;
+  globalThis.parent = topWindow;
+  try {
+    const selfFramed = createScreenReceiver({
+      boot,
+      window: topWindow,
+      onPush() {},
+      onError: (reason) => topErrors.push(reason),
+    });
+    assert.equal(selfFramed.boot, null);
+    assert.ok(topErrors.some((msg) => /child frame/.test(msg)));
+  } finally {
+    globalThis.parent = prevParent;
+  }
 });
 
 test("a v1-only receiver sends the bare ready envelope", async () => {
@@ -591,4 +817,938 @@ test("an invalid generation_scope is refused before posting", async () => {
     await assert.rejects(receiver.tool("caption.generate", {}, "req-1", scope), /generation_scope/);
   }
   assert.equal(inbox.filter((m) => m.op === "tool").length, 0);
+});
+
+// CAD-1921: a host that cannot serve a ref never answers it. `asset(ref, {timeoutMs})`
+// rejects, frees the ref for a re-request, and tolerates the host's late answer.
+const PNG = "data:image/png;base64,iVBORw0KGgo=";
+test("an asset request with a timeout rejects, and the same ref can be requested again", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), (error) => {
+    assert.ok(error instanceof ScreenTimeoutError);
+    assert.equal(error.code, "timeout");
+    return true;
+  });
+  const again = receiver.asset("media:1", { timeoutMs: 1000 });
+  await waitFor(() => inbox.filter((m) => m.op === "asset").length === 2, "the re-request");
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  assert.equal(await again, PNG);
+  assert.deepEqual(errors, []);
+});
+
+test("a late asset reply after a timeout is dropped once, not a teardown", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), ScreenTimeoutError);
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, [], "the late answer is dropped");
+  // Only that one late answer: a second unsolicited reply still tears down.
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await waitFor(() => errors.length === 1, "the unsolicited teardown");
+});
+
+test("a late reply that crosses a re-request answers the re-request", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.asset("media:1", { timeoutMs: 20 }), ScreenTimeoutError);
+  const again = receiver.asset("media:1", { timeoutMs: 1000 });
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  assert.equal(await again, PNG);
+  // The host may still answer the re-request itself: dropped, not a teardown.
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, []);
+});
+
+test("an asset request without a timeout waits as before; a bad timeout is refused", async () => {
+  const { host, pushes, receiver } = connect({ timeoutMs: 20 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const open = receiver.asset("media:1");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(await Promise.race([open.then(() => "settled", () => "settled"), tick().then(() => "open")]), "open");
+  for (const bad of [0, -1, 1.5, "20", Number.MAX_SAFE_INTEGER + 1]) {
+    await assert.rejects(receiver.asset("media:2", { timeoutMs: bad }), TypeError);
+  }
+});
+
+test("late replies for every ref the host can still hold are dropped, oldest first", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const refs = Array.from({ length: 256 }, (_, i) => `media:${i}`);
+  await Promise.all(refs.map((ref) => assert.rejects(receiver.asset(ref, { timeoutMs: 20 }), ScreenTimeoutError)));
+  for (const ref of refs) host.postMessage({ v: 2, op: "asset", ref, data_url: PNG });
+  await tick();
+  await tick();
+  assert.deepEqual(errors, [], "the host answers in queue order; none tears down");
+});
+
+test("a call reply's asset_refs admit those refs; a reply without them (an older host) admits none", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const ref = "draft-image:sdr-1:social.draft";
+  const old = receiver.call("social.drafts.show", { draft_id: "sdr-1" });
+  const first = await waitFor(() => inbox.find((m) => m.op === "call"), "the first call");
+  host.postMessage({ v: 2, op: "reply", id: first.id, ok: true, data: { draft_id: "sdr-1", asset_id: "ast-1" } });
+  assert.deepEqual(await old, { draft_id: "sdr-1", asset_id: "ast-1" });
+  assert.equal(receiver.assetAdmitted(ref), false, "an older host never says so");
+  const told = receiver.call("social.drafts.show", { draft_id: "sdr-1" });
+  const second = await waitFor(() => inbox.filter((m) => m.op === "call")[1], "the second call");
+  host.postMessage({ v: 2, op: "reply", id: second.id, ok: true, data: { draft_id: "sdr-1", asset_id: "ast-1" }, asset_refs: [ref, 7, ""] });
+  assert.deepEqual(await told, { draft_id: "sdr-1", asset_id: "ast-1" }, "the app still gets only data");
+  assert.equal(receiver.assetAdmitted(ref), true);
+  assert.deepEqual(errors, []);
+});
+
+test("openDrawer carries bounded plain-JSON context on surfaces and drawerContext unwraps it on drawer mounts", async () => {
+  const { receiver, inbox, host, pushes } = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the primary push");
+  await assert.rejects(receiver.drawerContext(), /only a drawer surface/);
+  await assert.rejects(receiver.openDrawer("detail", { context: new Date() }), TypeError);
+  await assert.rejects(receiver.openDrawer("detail", { context: { pad: "x".repeat(DRAWER_CONTEXT_BYTES) } }), TypeError);
+
+  const opening = receiver.openDrawer("detail", { size: "wide", context: { record_id: "rec_1", tab: 2 } });
+  const open = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.open"), "drawer open");
+  assert.deepEqual(open.args, { surface: "detail", size: "wide", context: { record_id: "rec_1", tab: 2 } });
+  host.postMessage({ v: 2, op: "reply", id: open.id, ok: true, data: { mode: "drawer", surface: "detail" } });
+  await opening;
+
+  const pres = connect({ accepts: ["screen.v2", "screen-presentation.v1"] });
+  pres.host.postMessage(push());
+  await waitFor(() => pres.pushes.length === 1, "the presentation push");
+  pres.host.postMessage({ v: 1, op: "presentation", mode: "outlet" });
+  await tick();
+  await assert.rejects(pres.receiver.openDrawer("detail", { context: { a: 1 } }), ScreenClosedError);
+
+  const drawer = connect({ accepts: ["screen.v2", "screen-surfaces.v1"] });
+  drawer.host.postMessage({ v: 1, op: "surface", role: "drawer", modal: false, surface: "detail" });
+  drawer.host.postMessage(push());
+  await waitFor(() => drawer.pushes.length === 1, "the drawer push");
+  const reading = drawer.receiver.drawerContext();
+  const ctxCall = await waitFor(() => drawer.inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.context"), "ctx call");
+  assert.deepEqual(ctxCall.args, {});
+  drawer.host.postMessage({ v: 2, op: "reply", id: ctxCall.id, ok: true, data: { context: { record_id: "rec_1" } } });
+  assert.deepEqual(await reading, { record_id: "rec_1" });
+
+  const badRead = drawer.receiver.drawerContext();
+  const badCall = await waitFor(() => drawer.inbox.filter((m) => m.op === "call" && m.verb === "screen.drawer.context")[1], "bad ctx call");
+  drawer.host.postMessage({ v: 2, op: "reply", id: badCall.id, ok: true, data: "not-an-object" });
+  await assert.rejects(badRead, ScreenClosedError);
+});
+
+test("ownLeaveState publishes v2 leave booleans and symbol-fences overlapping handles", async () => {
+  let syncAcquired = false;
+  let receiverRef = null;
+  const { host, inbox, receiver } = connect({
+    onPush() {
+      const handle = receiverRef.ownLeaveState();
+      syncAcquired = handle !== null;
+      handle?.release();
+    },
+  });
+  receiverRef = receiver;
+  assert.equal(receiver.ownLeaveState(), null);
+  host.postMessage(push());
+  await waitFor(() => syncAcquired, "synchronous ownLeaveState inside onPush");
+
+  const first = receiver.ownLeaveState();
+  assert.equal(first.publish(true), true);
+  assert.equal(first.publish("yes"), false);
+  await waitFor(() => inbox.some((m) => m.v === 2 && m.op === "leave" && m.unsaved === true), "dirty leave");
+
+  const second = receiver.ownLeaveState();
+  assert.equal(second.publish(true), true);
+  await waitFor(() => inbox.filter((m) => m.op === "leave" && m.unsaved === true).length === 2, "second dirty leave");
+  const leavesBeforeStaleRelease = inbox.filter((m) => m.op === "leave").length;
+  first.release();
+  assert.equal(first.publish(false), false);
+  await tick();
+  assert.equal(inbox.filter((m) => m.op === "leave").length, leavesBeforeStaleRelease);
+
+  second.release();
+  await waitFor(() => inbox.at(-1)?.op === "leave" && inbox.at(-1)?.unsaved === false, "active release");
+
+  const v1 = connect({ accepts: ["screen.v1"] });
+  v1.host.postMessage(push({ v: 1 }));
+  await waitFor(() => v1.pushes.length === 1, "v1 push");
+  assert.equal(v1.receiver.ownLeaveState(), null);
+});
+
+function fullPush(overrides = {}) {
+  const install_id = overrides.install_id ?? "install-1";
+  const digest = overrides.digest ?? "sha256:" + "b".repeat(64);
+  return {
+    v: 2, op: "screen", tag: "notes", install_id, digest, context_id: "",
+    installation: { install_id, name: "notes", title: "Meeting Notes", version: "0.4.0", digest, summary: "Notes app" },
+    contexts: [{ id: "ctx-1", label: "Team" }], runs: [], outbox: [],
+    actions: ["records.list", "records.create", "screen.route.patch", ...HOST_DRAWER_VERBS],
+    now: 1700000000, presentation_locale: "zh-TW",
+    route: { section: "open", view: "list", record_id: "rec_1", segment_id: null },
+    ...overrides,
+  };
+}
+
+function startBridge(bridge, bootOverride = { ...boot, tag: bridge.tag }) {
+  let host;
+  const inbox = [];
+  const parent = {
+    postMessage(_msg, _origin, transfer) {
+      host = transfer?.[0];
+      if (host) host.onmessage = (event) => inbox.push(event.data);
+    },
+  };
+  bridge.start({ boot: bootOverride, parent });
+  live.push({ teardown: () => bridge.reset() });
+  return { host, inbox };
+}
+
+test("createScreenBridge transitions to a new error snapshot when initial push or boot is refused", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes", appName: "notes", records: true, surfaces: true, locale: true, calls: { "records.list": ["query"] },
+  });
+  const states = [];
+  bridge.subscribe(() => states.push(bridge.getState()));
+  const initial = bridge.getState();
+  assert.equal(initial.status, "loading");
+
+  const { host } = startBridge(bridge);
+  host.postMessage(fullPush({ actions: ["records.list", "BAD VERB!"] }));
+  await waitFor(() => bridge.getState().status === "error", "error transition");
+  const failed = bridge.getState();
+  assert.notEqual(failed, initial);
+  assert.equal(failed.snapshot, null);
+  assert.ok(failed.error instanceof ScreenBridgeError);
+  assert.equal(failed.error.status, 502);
+  assert.equal(states.at(-1), failed);
+
+  bridge.reset();
+  startBridge(bridge, { ...boot, tag: "wrong-tag" });
+  assert.equal(bridge.getState().status, "error");
+  assert.equal(bridge.getState().error.status, 502);
+});
+
+test("createScreenBridge separates host drawer verbs from app capabilities and parses locale/route/observations", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes", appName: "notes", records: true, surfaces: true, locale: true,
+    calls: { "records.list": ["query", "limit"], "records.create": ["record_id", "profile"], "screen.route.patch": ["section", "view", "record_id"] },
+    observations: ["records.list"],
+    route: { sections: ["all", "open"], defaultSection: "all" },
+  });
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(inbox[0], {
+    v: 1, op: "ready", accepts: ["screen.v2", "screen-surfaces.v1", "screen-records.v1", "screen-locale.v1"],
+  });
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(fullPush({ read_observations: [{ operation: "records.list", args: { limit: 20 }, data: { items: [] } }] }));
+  await waitFor(() => bridge.getState().status === "ready", "ready transition");
+
+  const snap = bridge.getSnapshot();
+  assert.equal(snap.presentationLocale, "zh-TW");
+  assert.deepEqual(snap.route, { section: "open", view: "list", record_id: "rec_1", segment_id: null });
+  assert.equal(snap.observations.length, 1);
+  assert.deepEqual(snap.actions, ["records.list", "records.create", "screen.route.patch"]);
+  assert.equal(bridge.can("records.list"), true);
+  assert.equal(bridge.can("screen.drawer.open"), false);
+  await assert.rejects(bridge.call(snap.scope, "screen.drawer.open", { surface: "detail" }), (err) => err.status === 403);
+});
+
+test("createScreenBridge enforces arg allowlists, per-verb byte limits, concurrency, reply bounds, and write/read retirement", async () => {
+  let writes = 0;
+  const bridge = createScreenBridge({
+    tag: "notes", records: true, surfaces: true,
+    calls: { "records.list": ["query"], "records.create": ["record_id", "profile"], "screen.route.patch": ["section", "view", "record_id"] },
+    slots: { "records.export": ["format"] },
+    argBytes: { "records.create": 32768 },
+    singleFlight: ["records."],
+    writeVerbs: ["records.create", "screen.route.patch"],
+    route: { sections: ["all", "open"] },
+    maxInFlight: 2,
+  });
+  bridge.onWrite(() => { writes += 1; });
+  const { host, inbox } = startBridge(bridge);
+  host.postMessage(fullPush({ actions: ["records.list", "records.create", "records.export", "screen.route.patch"] }));
+  await waitFor(() => bridge.getState().status === "ready", "ready transition");
+  const { scope } = bridge.getSnapshot();
+
+  await assert.rejects(bridge.call(scope, "records.list", { bogus: 1 }), (err) => err.status === 400);
+  await assert.rejects(bridge.call(scope, "records.list", { query: "x".repeat(17 * 1024) }), (err) => err.status === 400);
+
+  const createCall = bridge.call(scope, "records.create", {
+    record_id: "rec_1", profile: { body: "x".repeat(20 * 1024) }, extraUndefined: undefined,
+  });
+  await assert.rejects(bridge.call(scope, "records.list", { query: "a" }), (err) => err.status === 429);
+  const createMsg = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "records.create"), "create call");
+  assert.deepEqual(Object.keys(createMsg.args), ["record_id", "profile"]);
+  host.postMessage({ v: 2, op: "reply", id: createMsg.id, ok: true, data: { record_id: "rec_1" } });
+  assert.deepEqual(await createCall, { record_id: "rec_1" });
+  assert.equal(writes, 1);
+
+  const writeForbidden = bridge.call(scope, "records.create", { record_id: "rec_2" });
+  const wfMsg = await waitFor(() => inbox.filter((m) => m.op === "call" && m.verb === "records.create")[1], "forbidden write");
+  host.postMessage({ v: 2, op: "reply", id: wfMsg.id, ok: false, refusal: { code: "forbidden", text: "viewer only" } });
+  await assert.rejects(writeForbidden, (err) => err.status === 403);
+  assert.equal(bridge.getState().status, "ready");
+
+  const slotDone = bridge.slot(scope, "records.export", { format: "csv" });
+  const slotMsg = await waitFor(() => inbox.find((m) => m.op === "slot"), "slot message");
+  host.postMessage({ v: 2, op: "slot-state", id: slotMsg.id, state: "done", data: { exported: 3 } });
+  assert.deepEqual(await slotDone, { exported: 3 });
+
+  const callsBeforePatch = inbox.filter((m) => m.verb === "screen.route.patch").length;
+  bridge.patchRoute({ record_id: "INVALID ID!" });
+  await tick();
+  assert.equal(inbox.filter((m) => m.verb === "screen.route.patch").length, callsBeforePatch);
+  bridge.patchRoute({ section: "open", record_id: "rec_1" });
+  const patchMsg = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.route.patch"), "route patch");
+  host.postMessage({ v: 2, op: "reply", id: patchMsg.id, ok: true, data: {} });
+  await tick();
+  assert.equal(writes, 1);
+
+  const leave = bridge.ownLeaveState();
+  assert.equal(leave.publish(true), true);
+  await waitFor(() => inbox.some((m) => m.op === "leave" && m.unsaved === true), "bridge leave");
+
+  const poisoned = bridge.call(scope, "records.list", { query: "ok" });
+  const listMsg = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "records.list"), "list call");
+  host.postMessage({ v: 2, op: "reply", id: listMsg.id, ok: true, data: { items: [{ nested: { action_token: "leaked" } }] } });
+  await assert.rejects(poisoned, (err) => err.status === 502);
+  assert.equal(bridge.getState().status, "error");
+  assert.equal(leave.publish(false), false);
+
+  bridge.reset();
+  const second = startBridge(bridge);
+  second.host.postMessage(fullPush({ actions: ["records.list"] }));
+  await waitFor(() => bridge.getState().status === "ready", "second ready");
+  const huge = bridge.call(bridge.getSnapshot().scope, "records.list", {});
+  const hugeMsg = await waitFor(() => second.inbox.find((m) => m.op === "call"), "huge call");
+  second.host.postMessage({ v: 2, op: "reply", id: hugeMsg.id, ok: true, data: { blob: "x".repeat(MAX_REPLY_DATA_BYTES) } });
+  await assert.rejects(huge, (err) => err.status === 502);
+  assert.equal(bridge.getState().status, "error");
+});
+
+test("createScreenBridge supports actions/media tool, asset, and state channels", async () => {
+  const bridge = createScreenBridge({ tag: "studio", actions: true, media: true, locale: true, calls: { "social.drafts.list": [] } });
+  const { host, inbox } = startBridge(bridge);
+  host.postMessage(fullPush({
+    tag: "studio",
+    installation: { install_id: "install-1", name: "studio", title: "Studio", version: "1.0.0", digest: "sha256:" + "b".repeat(64), summary: "Studio" },
+    actions: ["social.drafts.list", "social.publish", ...HOST_DRAWER_VERBS],
+  }));
+  await waitFor(() => bridge.getState().status === "ready", "studio ready");
+  const { scope, actions } = bridge.getSnapshot();
+  assert.deepEqual(actions, ["social.drafts.list", "social.publish"]);
+
+  const toolPending = bridge.tool(scope, "social.publish", { text: "hi" }, "req-1");
+  const toolMsg = await waitFor(() => inbox.find((m) => m.op === "tool"), "bridge tool");
+  host.postMessage({ v: 2, op: "tool-reply", id: toolMsg.id, ok: true, data: { posted: true } });
+  assert.deepEqual(await toolPending, { posted: true });
+
+  const assetPending = bridge.asset(scope, "media:1", { timeoutMs: 500 });
+  await waitFor(() => inbox.some((m) => m.op === "asset" && m.ref === "media:1"), "bridge asset");
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: PNG });
+  assert.equal(await assetPending, PNG);
+
+  assert.equal(bridge.state("resume-snapshot"), true);
+  await waitFor(() => inbox.some((m) => m.op === "state" && m.data === "resume-snapshot"), "bridge state");
+});
+
+test("receiver.audioCapture negotiates screen-audio.v1, waits without default timeout, enforces single-flight, and validates replies", async () => {
+  const unopted = connect();
+  unopted.host.postMessage(push());
+  await waitFor(() => unopted.pushes.length === 1, "unopted push");
+  await assert.rejects(unopted.receiver.audioCapture(), (err) => err instanceof ScreenClosedError && /screen-audio\.v1/.test(err.message));
+
+  const { host, inbox, pushes, errors, receiver } = connect({
+    accepts: ["screen.v2", SCREEN_AUDIO_V1],
+    timeoutMs: 20,
+  });
+  await tick();
+  assert.deepEqual(inbox[0], { v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v1"] });
+  await assert.rejects(receiver.audioCapture(), ScreenClosedError);
+
+  host.postMessage(push({ audio_capture: 1 }));
+  await waitFor(() => pushes.length === 1, "audio push");
+  await assert.rejects(receiver.audioCapture({ mode: "stream" }), TypeError);
+  await assert.rejects(receiver.audioCapture({ extra: true }), TypeError);
+  await assert.rejects(receiver.audioCapture({ timeoutMs: 0 }), TypeError);
+
+  // Interactive audio modal stays open past receiver timeoutMs (20ms) when timeoutMs is omitted.
+  const recording = receiver.audioCapture();
+  const req1 = await waitFor(() => inbox.find((m) => m.op === "audio"), "record request");
+  assert.deepEqual(req1, { v: 2, op: "audio", id: req1.id, mode: "record" });
+  await new Promise((resolve) => setTimeout(resolve, 55));
+  assert.equal(await Promise.race([recording.then(() => "settled", () => "settled"), tick().then(() => "open")]), "open");
+
+  // Single-flight refuses a concurrent capture without tearing down the port.
+  await assert.rejects(receiver.audioCapture({ mode: "upload" }), (err) => err instanceof ScreenRefusalError && err.code === "conflict");
+  assert.equal(inbox.filter((m) => m.op === "audio").length, 1);
+
+  const capturePayload = {
+    transcript: "Reviewed Q4 launch checklist.",
+    duration_seconds: 185,
+    held_at: "2026-11-13T03:00:00.000Z",
+    source: "recording",
+  };
+  host.postMessage({ v: 2, op: "audio-reply", id: req1.id, ok: true, data: capturePayload });
+  const result = await recording;
+  assert.deepEqual(result, capturePayload);
+  assert.equal(Object.isFrozen(result), true);
+  assert.deepEqual(errors, []);
+
+  // Malformed audio-reply data tears down the port.
+  const broken = receiver.audioCapture({ mode: "upload" });
+  const brokenRejected = assert.rejects(broken, ScreenClosedError);
+  const req2 = await waitFor(() => inbox.filter((m) => m.op === "audio")[1], "upload request");
+  assert.equal(req2.mode, "upload");
+  host.postMessage({
+    v: 2,
+    op: "audio-reply",
+    id: req2.id,
+    ok: true,
+    data: { transcript: "x".repeat(MAX_AUDIO_TRANSCRIPT_CHARS + 1), duration_seconds: 10, held_at: "2026-11-13T03:00:00Z", source: "upload" },
+  });
+  await waitFor(() => errors.length === 1, "malformed audio-reply teardown");
+  await brokenRejected;
+});
+
+test("createScreenBridge projects audioCapture, preserves state on cancel/refusal, and retires on unauthorized or malformed replies", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes",
+    appName: "notes",
+    records: true,
+    surfaces: true,
+    locale: true,
+    audio: true,
+    calls: { "records.list": ["query"] },
+  });
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(inbox[0], {
+    v: 1,
+    op: "ready",
+    accepts: ["screen.v2", "screen-surfaces.v1", "screen-records.v1", "screen-locale.v1", "screen-audio.v1"],
+  });
+
+  // Without audio_capture: 1, canAudioCapture() is false and audioCapture refuses locally with 403.
+  host.postMessage(fullPush({ actions: ["records.list"] }));
+  await waitFor(() => bridge.getState().status === "ready", "ready without audio_capture");
+  assert.equal(bridge.canAudioCapture(), false);
+  await assert.rejects(
+    bridge.audioCapture(bridge.getSnapshot().scope, { mode: "record" }),
+    (err) => err.status === 403 && err.code === "forbidden",
+  );
+  assert.equal(bridge.getState().status, "ready");
+
+  // With audio_capture: 1, record and upload resolve and cancelled/owner_required keep the bridge ready.
+  host.postMessage(fullPush({ actions: ["records.list"], audio_capture: 1 }));
+  await waitFor(() => bridge.getState().pushes === 2, "push with audio_capture");
+  assert.equal(bridge.canAudioCapture(), true);
+  const { scope } = bridge.getSnapshot();
+
+  const cancelled = bridge.audioCapture(scope, { mode: "record" });
+  const cancelMsg = await waitFor(() => inbox.find((m) => m.op === "audio"), "cancel audio op");
+  host.postMessage({ v: 2, op: "audio-reply", id: cancelMsg.id, ok: false, refusal: { code: "cancelled", text: "Audio capture was cancelled." } });
+  await assert.rejects(cancelled, (err) => err.status === 400 && err.code === "cancelled");
+  assert.equal(bridge.getState().status, "ready", "cancelling the audio modal leaves the screen bridge ready");
+
+  const ownerRefused = bridge.audioCapture(scope, { mode: "upload" });
+  const ownerMsg = await waitFor(() => inbox.filter((m) => m.op === "audio")[1], "owner_required audio op");
+  host.postMessage({ v: 2, op: "audio-reply", id: ownerMsg.id, ok: false, refusal: { code: "owner_required", text: "Workspace owner required." } });
+  await assert.rejects(ownerRefused, (err) => err.status === 403 && err.code === "owner_required");
+  assert.equal(bridge.getState().status, "ready");
+
+  const uploaded = bridge.audioCapture(scope, { mode: "upload" });
+  const uploadMsg = await waitFor(() => inbox.filter((m) => m.op === "audio")[2], "upload audio op");
+  const uploadData = {
+    transcript: "Uploaded voice memo transcript.",
+    duration_seconds: 42,
+    held_at: "2026-11-13T02:30:00.000Z",
+    source: "upload",
+  };
+  host.postMessage({ v: 2, op: "audio-reply", id: uploadMsg.id, ok: true, data: uploadData });
+  assert.deepEqual(await uploaded, uploadData);
+  assert.equal(bridge.getState().status, "ready");
+
+  // Unauthorized retires the bridge.
+  const unauth = bridge.audioCapture(scope, { mode: "record" });
+  const unauthMsg = await waitFor(() => inbox.filter((m) => m.op === "audio")[3], "unauthorized audio op");
+  host.postMessage({ v: 2, op: "audio-reply", id: unauthMsg.id, ok: false, refusal: { code: "unauthorized", text: "Session expired." } });
+  await assert.rejects(unauth, (err) => err.status === 401);
+  assert.equal(bridge.getState().status, "error");
+
+  // Forged audio_capture marker (not 1) is rejected on push.
+  bridge.reset();
+  const second = startBridge(bridge);
+  second.host.postMessage(fullPush({ actions: ["records.list"], audio_capture: 2 }));
+  await waitFor(() => bridge.getState().status === "error", "forged audio_capture error");
+  assert.equal(bridge.getState().error.status, 502);
+});
+
+const sessionSnapshot = (overrides = {}) => ({
+  session_id: "sess_01",
+  mode: "record",
+  phase: "recording",
+  held_at: "2026-11-13T05:00:00.000Z",
+  elapsed_seconds: 12,
+  level: 44,
+  peak: 68,
+  segments_total: 1,
+  segments_done: 1,
+  segments_in_flight: 0,
+  segments_failed: 0,
+  no_speech_segments: 0,
+  transcript: "Inline transcript ready.",
+  error: null,
+  ...overrides,
+});
+
+test("screen-audio.v2 negotiates mutually exclusively with v1, validates audioSession commands, and streams events", async () => {
+  assert.equal(SCREEN_AUDIO_V2, "screen-audio.v2");
+  assert.throws(
+    () => connect({ accepts: ["screen.v2", SCREEN_AUDIO_V1, SCREEN_AUDIO_V2] }),
+    /cannot combine screen-audio\.v1 and screen-audio\.v2/,
+  );
+
+  const unopted = connect({ accepts: ["screen.v2"] });
+  unopted.host.postMessage(push());
+  await waitFor(() => unopted.pushes.length === 1, "unopted push");
+  await assert.rejects(unopted.receiver.audioSession({ action: "start" }), ScreenClosedError);
+  unopted.host.postMessage({ v: 2, op: "audio-session-event", state: sessionSnapshot() });
+  await waitFor(() => unopted.errors.length === 1, "unsolicited audio-session-event teardown");
+
+  const events = [];
+  const { receiver, host, inbox, pushes, errors } = connect({
+    accepts: ["screen.v2", SCREEN_AUDIO_V2],
+    onAudioSessionEvent: (snap) => events.push(snap),
+  });
+  await tick();
+  assert.deepEqual(inbox[0], { v: 1, op: "ready", accepts: ["screen.v2", "screen-audio.v2"] });
+  host.postMessage(push({ audio_capture: 1 }));
+  await waitFor(() => pushes.length === 1, "audio v2 push");
+
+  await assert.rejects(receiver.audioSession({ action: "unknown" }), TypeError);
+  await assert.rejects(receiver.audioSession({ action: "start", language: "fr" }), TypeError);
+  await assert.rejects(receiver.audioSession({ action: "pause", extra: true }), TypeError);
+  await assert.rejects(
+    receiver.audioSession({ action: "upload", bytes: new ArrayBuffer(0), mimeType: "audio/wav" }),
+    TypeError,
+  );
+  await assert.rejects(
+    receiver.audioSession({
+      action: "upload",
+      bytes: { [Symbol.toStringTag]: "ArrayBuffer", byteLength: 16 },
+      mimeType: "audio/wav",
+    }),
+    TypeError,
+  );
+  await assert.rejects(
+    receiver.audioSession({
+      action: "upload",
+      bytes: { [Symbol.toStringTag]: "ArrayBuffer", byteLength: Number.NaN },
+      mimeType: "audio/wav",
+    }),
+    TypeError,
+  );
+  await assert.rejects(
+    receiver.audioSession({
+      action: "upload",
+      bytes: new ArrayBuffer(MAX_AUDIO_UPLOAD_BYTES + 1),
+      mimeType: "audio/wav",
+    }),
+    TypeError,
+  );
+
+  // Streaming host events reach onAudioSessionEvent frozen.
+  host.postMessage({ v: 2, op: "audio-session-event", state: sessionSnapshot({ level: 71, peak: 85 }) });
+  await waitFor(() => events.length === 1, "streamed audio-session-event");
+  assert.equal(events[0].level, 71);
+  assert.equal(Object.isFrozen(events[0]), true);
+
+  // Start, pause, stop, and upload round-trip cleanly.
+  const starting = receiver.audioSession({ action: "start", language: "zh" });
+  const startMsg = await waitFor(() => inbox.find((m) => m.op === "audio-session"), "start request");
+  assert.deepEqual(startMsg, { v: 2, op: "audio-session", id: startMsg.id, action: "start", language: "zh" });
+  host.postMessage({ v: 2, op: "audio-session-reply", id: startMsg.id, ok: true, data: sessionSnapshot() });
+  assert.equal((await starting).phase, "recording");
+
+  const buf = vm.runInNewContext("new Uint8Array([1, 2, 3, 4]).buffer");
+  const uploading = receiver.audioSession({
+    action: "upload",
+    bytes: buf,
+    mimeType: "audio/mp4",
+    fileName: "memo.m4a",
+    lastModified: 1_763_000_000_000,
+    language: "",
+  });
+  const uploadMsg = await waitFor(
+    () => inbox.find((m) => m.op === "audio-session" && m.action === "upload"),
+    "upload request",
+  );
+  assert.equal(uploadMsg.mime_type, "audio/mp4");
+  assert.equal(uploadMsg.file_name, "memo.m4a");
+  assert.equal(uploadMsg.last_modified, 1_763_000_000_000);
+  assert.equal(uploadMsg.bytes.byteLength, 4);
+  const uploadDone = sessionSnapshot({ mode: "upload", phase: "ready", transcript: "Uploaded clip." });
+  host.postMessage({ v: 2, op: "audio-session-reply", id: uploadMsg.id, ok: true, data: uploadDone });
+  assert.deepEqual(await uploading, uploadDone);
+  assert.deepEqual(errors, []);
+
+  // Malformed audio-session-event tears down the port.
+  host.postMessage({ v: 2, op: "audio-session-event", state: { ...sessionSnapshot(), level: 101 } });
+  await waitFor(() => errors.length === 1, "malformed audio-session-event teardown");
+});
+
+test("createScreenBridge audio: 'v2' streams audioSession snapshots and preserves bridge state on user/device refusals", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes",
+    appName: "notes",
+    records: true,
+    locale: true,
+    audio: "v2",
+    calls: { "records.list": ["query"] },
+  });
+  const observed = [];
+  const unsub = bridge.onAudioSession((snap) => observed.push(snap));
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(inbox[0], {
+    v: 1,
+    op: "ready",
+    accepts: ["screen.v2", "screen-records.v1", "screen-locale.v1", "screen-audio.v2"],
+  });
+
+  host.postMessage(fullPush({ actions: ["records.list"], audio_capture: 1 }));
+  await waitFor(() => bridge.getState().status === "ready", "ready with audio v2");
+  assert.equal(bridge.canAudioCapture(), true);
+  const { scope } = bridge.getSnapshot();
+
+  host.postMessage({ v: 2, op: "audio-session-event", state: sessionSnapshot({ elapsed_seconds: 5 }) });
+  await waitFor(() => observed.length === 1, "bridge streamed session event");
+  assert.equal(bridge.getAudioSession().elapsed_seconds, 5);
+
+  const micDenied = bridge.audioSession(scope, { action: "start" });
+  const micMsg = await waitFor(() => inbox.find((m) => m.op === "audio-session"), "mic_unavailable start");
+  host.postMessage({
+    v: 2,
+    op: "audio-session-reply",
+    id: micMsg.id,
+    ok: false,
+    refusal: { code: "mic_unavailable", text: "Microphone access was blocked." },
+  });
+  await assert.rejects(micDenied, (err) => err.code === "mic_unavailable");
+  assert.equal(bridge.getState().status, "ready", "mic refusal keeps bridge alive");
+
+  const stopped = bridge.audioSession(scope, { action: "stop" });
+  const stopMsg = await waitFor(
+    () => inbox.find((m) => m.op === "audio-session" && m.action === "stop"),
+    "stop session",
+  );
+  const readySnap = sessionSnapshot({ phase: "ready", elapsed_seconds: 34, transcript: "Final line." });
+  host.postMessage({ v: 2, op: "audio-session-reply", id: stopMsg.id, ok: true, data: readySnap });
+  assert.deepEqual(await stopped, readySnap);
+  assert.equal(bridge.getAudioSession().phase, "ready");
+  unsub();
+});
+
+test("createScreenBridge sandboxForms prevents default actionless submit and cleans up on retire and reset", async () => {
+  for (const action of ["retire", "reset"]) {
+    const win = new Window({ url: "https://frame.local/" });
+    try {
+      const form = win.document.createElement("form");
+      win.document.body.append(form);
+      const bridge = createScreenBridge({
+        tag: "notes",
+        appName: "notes",
+        sandboxForms: true,
+      });
+      bridge.start({
+        boot: { ...boot, tag: "notes" },
+        document: win.document,
+        parent: { postMessage() {} },
+      });
+
+      const before = new win.Event("submit", { bubbles: true, cancelable: true });
+      form.dispatchEvent(before);
+      assert.equal(before.defaultPrevented, true, `${action}: actionless submit prevented while active`);
+
+      if (action === "retire") bridge.retire("done");
+      else bridge.reset();
+
+      const after = new win.Event("submit", { bubbles: true, cancelable: true });
+      form.dispatchEvent(after);
+      assert.equal(after.defaultPrevented, false, `${action}: listener cleaned up`);
+    } finally {
+      win.close();
+    }
+  }
+});
+
+test("createScreenBridge keeps mount alive on write/owner_required/slot 403 and retires on access revocation 403", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes",
+    appName: "notes",
+    records: true,
+    surfaces: true,
+    calls: { "records.list": [], "records.create": ["name"] },
+    slots: { "publish.cancel": [] },
+    writeVerbs: ["records.create"],
+  });
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(fullPush({ actions: ["records.list", "records.create", "publish.cancel"] }));
+  await waitFor(() => bridge.getState().status === "ready", "bridge ready for 403 tests");
+  const { scope } = bridge.getSnapshot();
+
+  const writeForbidden = bridge.call(scope, "records.create", { name: "Ada" });
+  const writeReq = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "records.create"), "write call");
+  host.postMessage({ v: 2, op: "reply", id: writeReq.id, ok: false, refusal: { code: "forbidden", text: "Read-only role." } });
+  await assert.rejects(writeForbidden, (err) => err instanceof ScreenBridgeError && err.status === 403);
+  assert.equal(bridge.getState().status, "ready");
+
+  const ownerRequired = bridge.call(scope, "records.list", {});
+  const ownerReq = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "records.list"), "owner_required call");
+  host.postMessage({ v: 2, op: "reply", id: ownerReq.id, ok: false, refusal: { code: "owner_required", text: "Owner required." } });
+  await assert.rejects(ownerRequired, (err) => err instanceof ScreenBridgeError && err.status === 403 && err.code === "owner_required");
+  assert.equal(bridge.getState().status, "ready");
+
+  const slotForbidden = bridge.slot(scope, "publish.cancel", {});
+  const slotReq = await waitFor(() => inbox.find((m) => m.op === "slot" && m.verb === "publish.cancel"), "slot call");
+  host.postMessage({ v: 2, op: "slot-state", id: slotReq.id, state: "refused", refusal: { code: "forbidden", text: "Slot refused." } });
+  await assert.rejects(slotForbidden, (err) => err instanceof ScreenBridgeError && err.status === 403);
+  assert.equal(bridge.getState().status, "ready");
+
+  const revoked = bridge.call(scope, "records.create", { name: "Grace" });
+  const revokedReq = await waitFor(() => inbox.filter((m) => m.op === "call" && m.verb === "records.create")[1], "revoked write call");
+  host.postMessage({
+    v: 2,
+    op: "reply",
+    id: revokedReq.id,
+    ok: false,
+    refusal: { code: "forbidden", text: "This app's access is no longer available." },
+  });
+  await assert.rejects(revoked, (err) => err instanceof ScreenBridgeError && err.status === 403);
+  assert.equal(bridge.getState().status, "error");
+});
+
+// The host below is the transferred MessageChannel port, not a bridge mock.
+const catalogInput = { body: { query: "synthetic" } };
+const catalogReceiptFixture = {
+  slug: "synthetic-read",
+  effect: "read",
+  price: { currency: "USD", scale: 6, amount: "0.000000" },
+  result: { message: "synthetic result" },
+};
+async function catalogFixture(timeoutMs = 100) {
+  const bridge = createScreenBridge({ tag: "notes", appName: "notes", records: true, catalog: true, timeoutMs });
+  const { host, inbox } = startBridge(bridge);
+  host.postMessage(fullPush({ actions: ["catalog.call", "catalog.confirm", "catalog.status"] }));
+  await waitFor(() => bridge.getState().status === "ready", "catalog bridge ready");
+  return { bridge, scope: bridge.getSnapshot().scope, host, inbox };
+}
+
+test("catalogue direct free receipt goes through one call and no host slot", async () => {
+  const { bridge, scope, host, inbox } = await catalogFixture();
+  const pending = bridge.catalog(scope, "lookup", catalogInput, "request-free-1");
+  const sent = await waitFor(() => inbox.find((message) => message.op === "call" && message.verb === "catalog.call"), "catalog call");
+  assert.deepEqual(sent.args, { slot: "lookup", input: catalogInput, request_id: "request-free-1" });
+  host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data: catalogReceiptFixture });
+  assert.deepEqual(await pending, catalogReceiptFixture);
+  await tick();
+  assert.equal(inbox.filter((message) => message.op === "call").length, 1);
+  assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+});
+
+test("catalogue paid confirmation uses one host-owned slot and never sends a token into the app", async () => {
+  const { bridge, scope, host, inbox } = await catalogFixture();
+  const pending = bridge.catalog(scope, "lookup", catalogInput, "request-paid-1");
+  const sent = await waitFor(() => inbox.find((message) => message.op === "call"), "initial call");
+  host.postMessage({ v: 2, op: "reply", id: sent.id, ok: false,
+    refusal: { code: "confirmation_required", text: "Review this paid tool." } });
+  const slot = await waitFor(() => inbox.find((message) => message.op === "slot"), "host confirmation slot");
+  assert.equal(slot.verb, "catalog.confirm");
+  assert.deepEqual(slot.args, { slot: "lookup", input: catalogInput, request_id: "request-paid-1" });
+  assert.equal(slot.anchor, "footer");
+  // The token is host-private: the app receives only the final receipt.
+  const hostOnlyToken = "synthetic-host-secret-confirmation-token";
+  const paid = { ...catalogReceiptFixture, price: { currency: "USD", scale: 6, amount: "0.001500" } };
+  host.postMessage({ v: 2, op: "slot-state", id: slot.id, state: "done", data: paid });
+  const receipt = await pending;
+  assert.deepEqual(receipt, paid);
+  assert.ok(!JSON.stringify(receipt).includes(hostOnlyToken));
+  assert.ok(!JSON.stringify(inbox).includes(hostOnlyToken));
+  assert.equal(inbox.filter((message) => message.op === "call").length, 1);
+  assert.equal(inbox.filter((message) => message.op === "slot").length, 1);
+});
+
+test("catalogue uncertainty and network refusal never automatically retry or open a slot", async () => {
+  for (const code of ["uncertain", "unavailable"]) {
+    const { bridge, scope, host, inbox } = await catalogFixture();
+    const pending = bridge.catalog(scope, "lookup", catalogInput, `request-${code}-1`);
+    const sent = await waitFor(() => inbox.find((message) => message.op === "call"), `${code} call`);
+    host.postMessage({ v: 2, op: "reply", id: sent.id, ok: false, refusal: { code, text: "Synthetic failure" } });
+    await assert.rejects(pending);
+    await tick();
+    assert.equal(inbox.filter((message) => message.op === "call").length, 1);
+    assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+  }
+});
+
+test("catalogue timeout permits status recovery without repeating the call", async () => {
+  const { bridge, scope, host, inbox } = await catalogFixture(20);
+  await assert.rejects(bridge.catalog(scope, "lookup", catalogInput, "request-timeout-1"));
+  const original = inbox.find((message) => message.op === "call" && message.verb === "catalog.call");
+  assert.ok(original);
+  const pending = bridge.catalogStatus(scope, "lookup", catalogInput, "request-timeout-1");
+  const status = await waitFor(() => inbox.find((message) => message.op === "call" && message.verb === "catalog.status"), "recovery status");
+  assert.deepEqual(status.args, original.args);
+  host.postMessage({ v: 2, op: "reply", id: status.id, ok: true, data: { state: "uncertain" } });
+  assert.deepEqual(await pending, { state: "uncertain" });
+  host.postMessage({ v: 2, op: "reply", id: original.id, ok: true, data: catalogReceiptFixture });
+  await tick();
+  assert.equal(bridge.getState().status, "ready");
+  assert.equal(inbox.filter((message) => message.op === "call" && message.verb === "catalog.call").length, 1);
+  assert.equal(inbox.filter((message) => message.op === "call" && message.verb === "catalog.status").length, 1);
+  assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+});
+
+test("catalogue status normalizes legacy refusals for both bridge entry points", async () => {
+  const { bridge, scope, host, inbox } = await catalogFixture();
+  const statuses = [
+    { wire: { state: "not_started" }, expected: { state: "uncertain" } },
+    { wire: { state: "review_required" }, expected: { state: "uncertain" } },
+    { wire: { state: "uncertain" }, expected: { state: "uncertain" } },
+    { wire: { state: "settled", result_available: false }, expected: { state: "settled", result_available: false } },
+    { wire: { state: "settled", result_available: true, receipt: catalogReceiptFixture },
+      expected: { state: "settled", result_available: true, receipt: catalogReceiptFixture } },
+  ];
+  let sentCount = 0;
+  for (const [index, { wire, expected }] of statuses.entries()) {
+    for (const generic of [false, true]) {
+      const requestId = `request-status-${index}-${generic}`;
+      const args = { slot: "lookup", input: catalogInput, request_id: requestId };
+      const pending = generic
+        ? bridge.call(scope, "catalog.status", args)
+        : bridge.catalogStatus(scope, "lookup", catalogInput, requestId);
+      const sent = await waitFor(() => inbox.filter((message) => message.op === "call" && message.verb === "catalog.status")[sentCount], "status request");
+      sentCount++;
+      assert.deepEqual(sent.args, args);
+      host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data: wire });
+      assert.deepEqual(await pending, expected);
+    }
+  }
+  assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+});
+
+test("catalogue receipt validation fails closed for malformed and secret-bearing replies", async () => {
+  for (const data of [
+    { ...catalogReceiptFixture, effect: "send" },
+    { ...catalogReceiptFixture, price: { currency: "USD", scale: 6, amount: "NaN" } },
+    { ...catalogReceiptFixture, result: { confirmation_token: "synthetic-secret" } },
+  ]) {
+    const { bridge, scope, host, inbox } = await catalogFixture();
+    const pending = bridge.catalog(scope, "lookup", catalogInput, "request-invalid-1");
+    const sent = await waitFor(() => inbox.find((message) => message.op === "call"), "invalid receipt call");
+    host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data });
+    await assert.rejects(pending);
+    assert.equal(bridge.getState().status, "error");
+    assert.equal(inbox.filter((message) => message.op === "slot").length, 0);
+  }
+});
+
+test("catalogue status rejects invalid and invented settlement shapes", async () => {
+  for (const data of [
+    { state: "settled" },
+    { state: "settled", result_available: true },
+    { state: "settled", result_available: false, receipt: catalogReceiptFixture },
+    { state: "uncertain", receipt: catalogReceiptFixture },
+    { state: "settled", result_available: true, receipt: { ...catalogReceiptFixture, effect: "send" } },
+  ]) {
+    const { bridge, scope, host, inbox } = await catalogFixture();
+    const pending = bridge.catalogStatus(scope, "lookup", catalogInput, "request-invalid-status-1");
+    const sent = await waitFor(() => inbox.find((message) => message.op === "call"), "invalid status call");
+    host.postMessage({ v: 2, op: "reply", id: sent.id, ok: true, data });
+    await assert.rejects(pending);
+    assert.equal(bridge.getState().status, "error");
+  }
+});
+
+test("screen-route-params.v1: opt-in, route params and patchRoute params (CAD-2555)", async () => {
+  // The receiver: advertised at ready, and only with records.
+  const accepts = ["screen.v2", "screen-records.v1", "screen-route-params.v1"];
+  const { inbox } = connect({ accepts });
+  await waitFor(() => inbox[0], "the ready message");
+  assert.deepEqual(inbox[0].accepts, accepts);
+  assert.throws(() => connect({ accepts: ["screen.v2", "screen-route-params.v1"] }), /needs screen-records\.v1/);
+
+  const options = {
+    tag: "notes", records: true, surfaces: true, routeParams: true,
+    calls: { "screen.route.patch": ["section", "view", "record_id"] },
+    route: { sections: ["all", "open"], defaultSection: "all" },
+  };
+  assert.throws(() => createScreenBridge({ ...options, route: undefined }), /routeParams needs a records screen with a route/);
+  assert.throws(() => createScreenBridge({ ...options, records: false }), /routeParams needs a records screen with a route/);
+  const bridge = createScreenBridge(options);
+  const { host, inbox: sent } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(sent[0].accepts, ["screen.v2", "screen-surfaces.v1", "screen-records.v1", "screen-route-params.v1"]);
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(fullPush({
+    actions: ["screen.route.patch"],
+    route: { section: "open", view: "list", record_id: "pnl", segment_id: null, params: { from: "2026-07-01", to: "2026-09-30" } },
+  }));
+  await waitFor(() => bridge.getState().status === "ready", "ready transition");
+  assert.deepEqual(bridge.getSnapshot().route.params, { from: "2026-07-01", to: "2026-09-30" });
+  assert.throws(() => { bridge.getSnapshot().route.params.from = "x"; }, TypeError, "route params are frozen");
+
+  // patchRoute sends params; a bad set is dropped before it is sent.
+  const patches = () => sent.filter((m) => m.op === "call" && m.verb === "screen.route.patch");
+  bridge.patchRoute({ params: { From: "2026-07-01" } });
+  bridge.patchRoute({ params: { from: "" } });
+  bridge.patchRoute({ params: ["x"] });
+  await tick();
+  assert.equal(patches().length, 0);
+  bridge.patchRoute({ section: "open", params: { from: "2026-10-01" } });
+  const msg = await waitFor(() => patches()[0], "route patch with params");
+  assert.deepEqual(msg.args, { section: "open", params: { from: "2026-10-01" } });
+  host.postMessage({ v: 2, op: "reply", id: msg.id, ok: true, data: {} });
+  await tick();
+
+  // A route push without params reads as `{}`; a malformed one is refused.
+  host.postMessage(fullPush({ actions: ["screen.route.patch"], route: { section: "open", view: "list", record_id: null, segment_id: null } }));
+  await waitFor(() => Object.keys(bridge.getSnapshot().route.params).length === 0, "params cleared");
+  host.postMessage(fullPush({ actions: ["screen.route.patch"], route: { section: "open", view: "list", record_id: null, segment_id: null, params: { From: "x" } } }));
+  await waitFor(() => bridge.getState().status === "error", "malformed params refused");
+});
+
+test("a bridge without routeParams never sees params and cannot send them (CAD-2555)", async () => {
+  const bridge = createScreenBridge({
+    tag: "notes", records: true, surfaces: true,
+    calls: { "screen.route.patch": ["section", "view", "record_id"] },
+    route: { sections: ["all", "open"], defaultSection: "all" },
+  });
+  const { host, inbox } = startBridge(bridge);
+  await tick();
+  assert.deepEqual(inbox[0].accepts, ["screen.v2", "screen-surfaces.v1", "screen-records.v1"]);
+  host.postMessage({ v: 1, op: "surface", role: "primary", modal: false });
+  host.postMessage(fullPush({ actions: ["screen.route.patch"] }));
+  await waitFor(() => bridge.getState().status === "ready", "ready transition");
+  assert.deepEqual(bridge.getSnapshot().route, { section: "open", view: "list", record_id: "rec_1", segment_id: null });
+  bridge.patchRoute({ params: { from: "2026-07-01" } });
+  await tick();
+  assert.equal(inbox.filter((m) => m.verb === "screen.route.patch").length, 0);
+  host.postMessage(fullPush({ actions: ["screen.route.patch"], route: { section: "open", view: "list", record_id: null, segment_id: null, params: { from: "2026-07-01" } } }));
+  await waitFor(() => bridge.getState().status === "error", "an unrequested params key is refused");
 });

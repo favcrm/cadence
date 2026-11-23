@@ -1,8 +1,13 @@
+/// <reference lib="es2024.promise" />
 import "fake-indexeddb/auto";
 import { streamFixture } from "./streamFixture";
 /** CAD-1098 S3: per-app assistant conversations in the shell chat. */
 import type * as SeenModule from "../src/features/app-shell/chat/unreadSeen";
 import type * as ConversationModule from "../src/features/app-shell/chat/Conversation";
+import type * as ConversationClient from "../src/features/app-shell/conversationClient";
+import type { MasterState } from "../src/lib/types";
+import type * as CanvasStoreModule from "../src/features/canvas/canvasStore";
+import type * as ComposerStoreModule from "../src/features/app-shell/chat/composerStore";
 declare function require(name: string): any;
 declare const process: { cwd(): string };
 export {};
@@ -36,11 +41,23 @@ const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof 
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const AppShellComponent = require("../src/features/app-shell/AppShell").default;
-const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
-  React.createElement(LocaleProvider, null,
-    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
+const CanvasDrawer = require("../src/features/canvas/CanvasDrawer").default;
+const { canvasSnapshot, openArtifact, closeTab } = require("../src/features/canvas/canvasStore") as typeof CanvasStoreModule;
+const { composerDraftState, setComposerContent } = require("../src/features/app-shell/chat/composerStore") as typeof ComposerStoreModule;
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => {
+  const [breadcrumbs, setBreadcrumbs] = React.useState<HTMLElement | null>(null);
+  const [actions, setActions] = React.useState<HTMLElement | null>(null);
+  return React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children:
+      React.createElement(React.Fragment, null,
+        React.createElement("nav", { ref: setBreadcrumbs }),
+        React.createElement("div", { ref: setActions }),
+        React.createElement(AppShellComponent, { ...props, header: { breadcrumbs, actions } }),
+        React.createElement(CanvasDrawer)) }));
+};
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList, readChatCollapsedChoice, selectConversation } = require("../src/features/app-shell/conversationClient") as typeof ConversationClient;
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { readSeen } = require("../src/features/app-shell/chat/unreadSeen") as typeof SeenModule;
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
@@ -48,12 +65,14 @@ equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parse
 const inst = (id: string, name: string) => ({ install_id: id, title: name, name, version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, approval: { state: "approved", epoch: 1 }, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] });
 let crmContext = "ctx-a";
 const ctxs = (id: string) => ({ contexts: [{ id: id === "install-crm" ? crmContext : "ctx-a", install_id: id, revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] });
-const ent = (seq: number, role: string, kind: string, text: string, message: string) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
+const ent = (seq: number, role: string, kind: string, text: string, message: string | null) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
 const conv = (id: string, over: object = {}) => ({ id, title: null, subject: null, is_general: false, ...over });
 const convs: Record<string, any[]> = {
   "install-crm": [conv("c-gen", { is_general: true }), conv("c-camp", { subject: "campaign:cmp-1", title: "Spring launch" })],
   "install-other": [conv("o-gen", { is_general: true })],
   "install-social": [conv("s-gen", { is_general: true }), conv("s-full", { title: "Has messages" })],
+  "install-native-approval": [conv("native-gen", { is_general: true })],
+  "install-native-approval-other": [conv("native-other-gen", { is_general: true })],
 };
 const threads: Record<string, any[]> = {
   "c-gen": [ent(1, "operator", "message", "general question", "m-gen"), ent(2, "agent", "turn_result", "general answer", "m-gen")],
@@ -64,32 +83,50 @@ const threads: Record<string, any[]> = {
   "o-gen": [],
   "s-gen": [],
   "s-full": [ent(1, "operator", "message", "earlier question", "m-s")],
+  "native-gen": [],
+  "native-other-gen": [],
 };
 let turn: any = null;
 // CAD-1700: the master queue in delivery order, and the board commands posted.
 let queue: { message: string; conversation: string | null }[] = [];
 let operations: unknown[] = [];
+let nativePermissionPending = false;
 let controlledTranscript = false;
 let holdReconnect = false;
 let disconnectTranscript: (() => void) | null = null;
 let heldOperations: Array<(response: Response) => void> | null = null;
 const commandPosts: unknown[] = [];
+const commandSearches: string[] = [];
+let commandAnswer: unknown = null;
 // Set inside a check to hold one send in flight (pending state "sending").
 let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
 const messagePosts: any[] = [];
 const createPosts: any[] = [];
 let created = 0;
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
+let hostedIdentity = false;
+let identityUnavailable = false;
+const masterSnapshot = (conversation: string): MasterState => ({
+  alias: "master",
+  identity: { name: null, tone: null, look: "robot", revision: "fixture" },
+  provider: "p", endpoint_kind: "k", live: true,
+  turn: hostedIdentity && conversation === "home-thread" ? null : turn,
+  queue: hostedIdentity && conversation === "home-thread" ? [] : queue,
+  ...(hostedIdentity ? { actor_identity: {
+    scope: "personal", conversation_id: conversation,
+    identity: { name: "Poppy", tone: "Warm", look: "designer", revision: 1 },
+  } } : {}),
+});
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   const method = init?.method ?? "GET";
   if (url.pathname.endsWith("/stream")) {
     if (!controlledTranscript || url.pathname !== "/api/threads/master/stream")
-      return streamFixture(url.href, { alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue }, init?.signal);
+      return streamFixture(url.href, masterSnapshot(url.searchParams.get("conversation") ?? "home-thread"), init?.signal);
     if (holdReconnect) return new Response(null, { status: 503 });
     let closed = false;
     const body = new ReadableStream<Uint8Array>({ start(controller) {
-      controller.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue })}\n\n`));
+      controller.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify(masterSnapshot(url.searchParams.get("conversation") ?? "home-thread"))}\n\n`));
       const close = () => { if (!closed) { closed = true; controller.close(); } };
       disconnectTranscript = close;
       init?.signal?.addEventListener("abort", close, { once: true });
@@ -127,14 +164,27 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const id = url.searchParams.get("conversation") ?? "";
     return json({ thread: { id: id || "home-thread", alias: "master" }, entries: threads[id] ?? [], more_before: false });
   }
-  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue });
+  if (url.pathname === "/api/master/state") return identityUnavailable
+    ? json({ error: "Identity unavailable" }, 503)
+    : json(masterSnapshot(url.searchParams.get("conversation") ?? "home-thread"));
   if (url.pathname === "/api/master/command") {
     commandPosts.push(JSON.parse(String(init!.body)));
+    commandSearches.push(url.search);
+    if (hostedIdentity) { turn = null; queue = []; }
+    if (commandAnswer !== null) return json(commandAnswer);
     return json({ command: "x", ok: true, result: {} });
   }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
-  if (url.pathname === "/api/master/permissions") return json({ rules: [], requests: [{ id: "permission-old", status: "allowed_once", command: "old command", cwd: null, reason: "Previously decided", risk: "low", prefix: [] }] });
+  if (url.pathname === "/api/master/permissions") return json({ rules: [], requests: [
+    { id: "permission-old", status: "allowed_once", command: "old command", cwd: null, reason: "Previously decided", risk: "low", prefix: [] },
+    ...(nativePermissionPending ? [
+      { id: "permission-native", status: "pending", command: "echo preview", cwd: null, reason: "Review this command", risk: "low", prefix: [] },
+      { id: "permission-native-other", status: "pending", command: "echo other", cwd: null, reason: "Review the other command", risk: "low", prefix: [] },
+    ] : []),
+  ] });
+  if (url.pathname === "/api/artifacts/focus-doc/1")
+    return new Response("A synthetic canvas document.", { headers: { "Content-Type": "text/markdown" } });
   if (url.pathname.endsWith("/assistant/actions")) return json({ actions: [] });
   if (url.pathname.endsWith("/assistant/operations"))
     return heldOperations === null ? json({ operations }) : new Promise<Response>((resolve) => heldOperations!.push(resolve));
@@ -147,7 +197,9 @@ document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 const settle = async () => { for (let i = 0; i < 8; i++) await flush(); };
+let mountedInstall = "";
 async function mount(installId: string, viewer = { operator: true, readOnly: false }, context = "ctx-a") {
+  mountedInstall = installId;
   history.pushState(null, "", `/app-installations/${installId}?ctx=${context}`);
   await React.act(async () => {
     win.dispatchEvent(new win.PopStateEvent("popstate"));
@@ -155,26 +207,17 @@ async function mount(installId: string, viewer = { operator: true, readOnly: fal
   });
   await settle();
 }
-// CAD-1700: the header names the open conversation; the Conversations menu
-// (history icon) lists them, the current one checked.
-const histBtn = () => host.querySelector('[aria-label="Conversations"]') as HTMLButtonElement;
-const rows = () => Array.from(host.querySelectorAll('[data-chat-history] [role="menuitemradio"]')) as HTMLButtonElement[];
-async function openHistory() {
-  if (!host.querySelector("[data-chat-history]")) {
-    await React.act(async () => { histBtn().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-  }
-}
-const rowName = (r: Element) => r.querySelector(".app-chat-history-name")?.textContent ?? null;
-const optionLabels = async () => { await openHistory(); return rows().map(rowName); };
 const openLabel = () => host.querySelector("[data-chat-conv-label]")?.textContent?.replace(/^·\s*/, "") ?? null;
 const pane = () => (host.querySelector("[data-chat-pane]") as HTMLElement).textContent ?? "";
 const box = () => host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement;
-const newButton = () => host.querySelector("[data-chat-new]") as HTMLButtonElement;
+// Drive the same host selection used by app routes and reply notifications.
 async function pick(label: string) {
-  await openHistory();
-  const row = rows().find((r) => rowName(r) === label);
-  assert(row, `history lists ${label}`);
-  await React.act(async () => { row!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  const conversation = convs[mountedInstall].find((c) => (c.is_general ? "General" : c.title) === label);
+  assert(conversation, `${mountedInstall} has a ${label} fixture`);
+  await React.act(async () => {
+    selectConversation(mountedInstall, conversation.id);
+    host.querySelector<HTMLButtonElement>('.app-header-assistant[aria-expanded="false"]')?.click();
+  });
   await settle();
 }
 async function type(text: string, key = "Enter") {
@@ -188,14 +231,13 @@ async function type(text: string, key = "Enter") {
 
 await mount("install-crm");
 
-// Picker: General, the campaign conversation, and + New; only the selected conversation's entries show.
-equal(await optionLabels(), ["General", "Spring launch"], "history lists General and the campaign conversation");
-assert(newButton() && newButton().getAttribute("aria-label") === "New conversation", "the + icon (New conversation) sits in the header tools");
-assert(newButton().closest(".app-chat-head-tools") && newButton().nextElementSibling === histBtn(), "New sits before the history button in the header tools");
-assert(!host.querySelector('select[aria-label="Conversation"], [data-chat-home-link], [data-chat-conversations]'), "no conversation select, row or Home link");
+// The app header names the selected conversation without duplicating navigation.
+equal(
+  Array.from(host.querySelectorAll(".app-chat-head button"), (button) => button.getAttribute("aria-label")),
+  ["Copy last answer", "Collapse assistant chat"],
+  "the app header keeps copy and collapse as its only actions",
+);
 equal(openLabel(), "General", "General is the default and the scope row names it");
-await optionLabels();
-equal(rows()[0].getAttribute("aria-checked"), "true", "the Conversations menu checks General as the open one");
 assert(pane().includes("general answer") && !pane().includes("campaign brief"), "General shows only its own thread");
 await pick("Spring launch");
 assert(pane().includes("campaign brief") && !pane().includes("general answer"), "the campaign conversation shows only its own thread");
@@ -210,20 +252,11 @@ for (const forged of ["subject", "scope", "thread", "install_id", "is_general"])
 await type("/new");
 equal(messagePosts.length, 1, "/new is not sent as a message");
 equal(createPosts, [{ install: "install-crm", body: { context_id: "ctx-a" } }], "/new creates one conversation with no subject");
-assert(openLabel() !== null, "the fresh conversation has an open-conversation label");
-await openHistory(); // CAD-1700: the shareable link lives in the Conversations menu.
-const newConversationLink = host.querySelector("[data-chat-conversation-link]") as HTMLAnchorElement | null;
-assert(newConversationLink, "the fresh conversation has a shareable link");
-equal(new URL(newConversationLink.href).searchParams.get("conversation"), "new-1", "the fresh conversation is the selected conversation");
-assert((await optionLabels()).length === 3 && (await optionLabels()).includes("General"), "older conversations stay listed");
+equal(canvasSnapshot().conversation, "new-1", "/new selects the exact conversation returned by the create");
 equal(box().value, "", "the command is cleared from the composer");
 await type("/clear");
 equal(messagePosts.length, 1, "/clear is not sent as a message");
-equal(createPosts.length, 2, "/clear creates another conversation");
-await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-await settle();
-equal(createPosts.length, 3, "+ New is the same call");
-equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "ctx-a" }, { context_id: "ctx-a" }], "New never carries a subject");
+equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "ctx-a" }], "both commands create a fresh conversation without a subject");
 
 // Create-on-first-send: opening a campaign page creates nothing; the first message
 // creates the conversation (idempotent subject) and is sent to the returned id.
@@ -245,19 +278,135 @@ equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "c
 const bar = () => host.querySelector("[data-turn-bar]") as HTMLElement | null;
 const barButton = (label: string) =>
   Array.from(bar()?.querySelectorAll("button") ?? []).find((b) => b.textContent === label) ?? null;
+// CAD-1880: the running turn's Stop is the composer's send slot; a working
+// turn paints no dock row at all.
+const stopButton = () => host.querySelector<HTMLButtonElement>('[aria-label="Stop this turn"]');
+const typingBubble = () => host.querySelector('[data-kind="typing"]');
 await pick("Spring launch");
+
+// A native request opens an untouched default; explicit choices remain authoritative.
+{
+  const previousViewport = win.innerWidth;
+  await React.act(async () => {
+    Object.defineProperty(win, "innerWidth", { value: 390, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
+  await mount("install-native-approval");
+  await React.act(async () => { await resources.masterState.refresh(); });
+  const disclosure = host.querySelector<HTMLButtonElement>(".app-header-assistant")!;
+  equal(disclosure.getAttribute("aria-expanded"), "false", "a fresh app starts with the default collapsed choice");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a&appview=new"); });
+  equal(readChatCollapsedChoice("install-native-approval"), null, "content navigation leaves the default collapse choice untouched");
+  await React.act(async () => {
+    nativePermissionPending = true;
+    threads["native-gen"].push({
+      ...ent(1, "system", "message", "Permission requested (permission-native, risk low): echo preview", null),
+      payload: { source: "permission" },
+    });
+    await conversationThread("native-gen").refresh();
+  });
+  equal(disclosure.getAttribute("aria-expanded"), "true", "a native permission request reveals its approval controls");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a"); });
+  equal(disclosure.getAttribute("aria-expanded"), "false", "content navigation reveals the narrow workspace even with a pending decision");
+  equal(readChatCollapsedChoice("install-native-approval"), null, "content navigation does not persist a collapse over the pending decision");
+  threads["native-other-gen"].push({
+    ...ent(1, "system", "message", "Permission requested (permission-native-other, risk low): echo other", null),
+    payload: { source: "permission" },
+  });
+  await mount("install-native-approval-other");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "the other app reveals its own pending permission");
+  await mount("install-native-approval");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "returning to a cached pending app reveals its approval");
+  await mount("install-native-approval-other");
+  equal(disclosure.getAttribute("aria-expanded"), "true", "switching between two cached pending apps reveals the current approval");
+  await mount("install-native-approval");
+  await React.act(async () => { disclosure.click(); });
+  equal(disclosure.getAttribute("aria-expanded"), "false", "an explicit collapse still wins over a pending request");
+  await React.act(async () => {
+    nativePermissionPending = false;
+    const { noteMasterChanged } = require("../src/lib/masterChanged");
+    noteMasterChanged();
+    await resources.masterState.refresh();
+  });
+  equal(disclosure.getAttribute("aria-expanded"), "false", "resolving the request preserves the explicit choice");
+  await React.act(async () => { navigate("/app-installations/install-native-approval?ctx=ctx-a&conversation=native-gen"); });
+  equal(disclosure.getAttribute("aria-expanded"), "true", "a conversation link reveals the assistant despite a saved collapse");
+  equal(readChatCollapsedChoice("install-native-approval"), true, "opening a conversation link does not overwrite the saved preference");
+  for (const width of [390, 1440]) {
+    await React.act(async () => { root.render(null); });
+    history.pushState(null, "", "/app-installations/install-native-approval?ctx=ctx-a&conversation=native-gen");
+    await React.act(async () => {
+      Object.defineProperty(win, "innerWidth", { value: width, configurable: true, writable: true });
+      win.dispatchEvent(new win.PopStateEvent("popstate"));
+      root.render(React.createElement(AppShell, { installId: "install-native-approval", viewer: { operator: true, readOnly: false } }));
+    });
+    await settle();
+    equal(host.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "true", `a direct conversation link opens the assistant at ${width}px`);
+    equal(readChatCollapsedChoice("install-native-approval"), true, "a direct conversation link preserves the saved collapse");
+  }
+  await React.act(async () => {
+    Object.defineProperty(win, "innerWidth", { value: previousViewport, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
+  await mount("install-crm");
+  await pick("Spring launch");
+}
+
+// Canvas Ask to change opens the owning app composer before focusing it,
+// keeping the draft and reference without sending a message.
+{
+  const beforeCanvas = canvasSnapshot();
+  const key = beforeCanvas.composerKey;
+  assert(key && beforeCanvas.conversation === "c-camp", "the active pane publishes its own composer binding");
+  const before = composerDraftState(key);
+  const previousWidth = win.innerWidth;
+  const sendsBefore = messagePosts.length;
+  const originalBox = box();
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "Keep this canvas draft");
+    box().dispatchEvent(new Event("input", { bubbles: true }));
+    (host.querySelector(".app-header-assistant") as HTMLButtonElement).click();
+    Object.defineProperty(win, "innerWidth", { value: 375, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+    openArtifact({ id: "focus-doc", version: 1, kind: "md", title: "Focus document", bytes: 28 });
+  });
+  const drawer = host.querySelector('.canvas-drawer[data-mode="sheet"]');
+  assert(drawer, "a narrow app canvas is a sheet");
+  equal(host.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "false", "the canvas began over collapsed chat");
+  const ask = Array.from(drawer.querySelectorAll<HTMLButtonElement>("button")).find((b) => b.textContent === "Ask to change");
+  assert(ask && !ask.disabled, "the document offers Ask to change");
+  await React.act(async () => { ask.click(); });
+  await React.act(async () => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    requestAnimationFrame(() => resolve());
+    await promise;
+  });
+  assert(!host.querySelector(".canvas-drawer"), "the sheet closes for the edit request");
+  equal(host.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "true", "Ask to change reveals the assistant");
+  assert(box() === originalBox && document.activeElement === originalBox, "the existing composer receives focus");
+  equal(box().value, "Keep this canvas draft", "the edit request preserves the typed draft");
+  assert(composerDraftState(key).refs.some((ref) => ref.kind === "artifact"), "the composer retains the document reference");
+  equal(messagePosts.length, sendsBefore, "Ask to change never sends");
+  await React.act(async () => {
+    closeTab("focus-doc");
+    setComposerContent(key, before.text, before.refs);
+    Object.defineProperty(win, "innerWidth", { value: previousWidth, configurable: true, writable: true });
+    win.dispatchEvent(new Event("resize"));
+  });
+}
+
 turn = { state: "working", message: "m-gen-elsewhere", conversation: "c-gen" };
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
-assert(bar()?.dataset.state !== "working" && bar()?.dataset.state !== "queued", `another conversation's running turn never shows Working or Queued here (got ${bar()?.dataset.state})`);
+assert(bar()?.dataset.state !== "working" && bar()?.dataset.state !== "queued" && stopButton() === null, `another conversation's running turn shows no Working row and no Stop here (got ${bar()?.dataset.state})`);
 turn = null;
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
 
 // The selected conversation's own turn: Sending while its POST is in flight;
 // Queued (with Cancel, never Stop) once the daemon queues it behind another
-// conversation's turn; Working with Stop carrying this exact message once it
-// runs. Nothing bleeds into another conversation.
+// conversation's turn; Working with Stop in the composer carrying this exact
+// message once it runs. Nothing bleeds into another conversation.
 await pick("Spring launch");
 {
   let resolveSend: ((r: Response) => void) | null = null;
@@ -276,7 +425,7 @@ await pick("Spring launch");
   await settle();
   equal(bar()?.dataset.state, "queued", "an owned queued message shows Queued");
   assert(bar()!.textContent!.includes("after General"), `Queued names what is ahead; got ${bar()?.textContent}`);
-  assert(barButton("Stop") === null, "a queued message offers no Stop");
+  assert(barButton("Stop") === null && stopButton() === null, "a queued message offers no Stop");
   turn = { state: "working", message: "m-home", conversation: "home-thread" };
   await React.act(async () => {
     await resources.masterThread.refresh();
@@ -307,8 +456,50 @@ await pick("Spring launch");
   // No timer: a `master` stream frame invalidates the state (CAD-1700).
   await React.act(async () => { await resources.masterState.invalidate(); });
   await settle();
-  equal(bar()?.dataset.state, "working", "the owned running turn shows Working after a master frame");
-  assert(bar()!.textContent!.includes("customers.search"), "Working names the live step");
+  assert(bar() === null, "the owned running turn paints no dock row after a master frame");
+  assert(typingBubble() !== null, "the owned running turn shows its inline typing bubble");
+  assert(stopButton() !== null, "the owned running turn offers Stop in the composer");
+  // CAD-1859 + CAD-1884: the app pane paints the same inline typing bubble as
+  // Home. The run that owns the turn paints it, so there is exactly one and
+  // no second standalone row behind it.
+  const typingRows = Array.from(host.querySelectorAll('.app-chat-list [data-kind="typing"]')) as HTMLElement[];
+  assert(typingRows.length === 1, `a working turn paints exactly one typing bubble (got ${typingRows.length})`);
+  const owner = typingRows[0].closest("[data-chat-run], [data-chat-typing]");
+  assert(owner !== null, "the typing bubble is the turn's own row or the pane's tail row");
+  const paneRows = Array.from(host.querySelectorAll(".app-chat-list > li")) as HTMLElement[];
+  assert(paneRows.length > 0 && paneRows[paneRows.length - 1] === owner, "the typing turn is the last row in the pane");
+  // CAD-1880: `writing` is the same running turn with its assistant text
+  // last. The dock row is gone, so the bubble must survive that transition
+  // or the pane would show nothing at all while it writes.
+  threads["c-camp"].push(ent(4, "agent", "assistant_text", "Drafting the brief", sentMessage));
+  await React.act(async () => { await conversationThread("c-camp").refresh(); });
+  await settle();
+  assert(bar() === null, "a writing turn paints no dock row");
+  assert(
+    host.querySelector('.app-chat-list [data-chat-run] [data-kind="typing"]') !== null,
+    "a writing turn keeps the inline typing bubble in the pane",
+  );
+  // CAD-1886: two days of transcript paint two day rules, and the rule
+  // belongs to the list, not to a turn.
+  threads["c-camp"].push({ ...ent(9, "operator", "message", "yesterday's note", "m-yest"), created: "2026-10-02T00:00:00Z" });
+  await React.act(async () => { await conversationThread("c-camp").refresh(); });
+  await settle();
+  const dayRules = Array.from(host.querySelectorAll("[data-day-sep]"));
+  assert(dayRules.length === 2, `two days paint two day rules (got ${dayRules.length})`);
+  assert(dayRules.every((rule) => !rule.closest("[data-chat-run]")), "a day rule is its own list row");
+  // The store state the daemon's own operator entry produces: the optimistic
+  // row retires, so nothing is left sending or working for this pane.
+  turn = null;
+  await React.act(async () => {
+    const held = conversationThread("c-camp").get().data;
+    if (held) conversationThread("c-camp").write(() => ({ ...held, pending: [] }));
+    await resources.masterState.refresh();
+  });
+  await settle();
+  assert(host.querySelectorAll(".app-chat-list [data-chat-typing]").length === 0, "a settled turn leaves no typing row behind");
+  turn = { state: "working", message: sentMessage, conversation: "c-camp", summary: "customers.search" };
+  await React.act(async () => { await resources.masterState.invalidate(); });
+  await settle();
   operations = [{
     id: "op-tags", action_id: "customer.tags.update", status: "pending_permission", revision: 1,
     summary: "Tag the selected customer", resource_refs: [],
@@ -321,7 +512,7 @@ await pick("Spring launch");
   const { noteMasterChanged } = require("../src/lib/masterChanged");
   await React.act(async () => { noteMasterChanged(); });
   await settle();
-  assert(barButton("Review") !== null && barButton("Stop") === null, "a pushed operation permission replaces Stop with Review");
+  assert(barButton("Review") !== null && barButton("Stop") === null && stopButton() === null, "a pushed operation permission replaces Stop with Review");
   const approval = host.querySelector('[data-operation-status="pending_permission"]') as HTMLElement;
   assert(approval, "the actionable app approval card is mounted");
   assert(host.querySelector('[data-permission-thread="permission-old"] [data-permission-decided]'), "a decided historic permission precedes the current operation");
@@ -337,7 +528,7 @@ await pick("Spring launch");
   operations = [];
   await React.act(async () => { noteMasterChanged(); });
   await settle();
-  await React.act(async () => { barButton("Stop")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await React.act(async () => { stopButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
   equal(commandPosts.at(-1), { command: "stop", message: sentMessage }, "Stop names exactly this conversation's running turn");
 
@@ -411,7 +602,7 @@ await pick("Spring launch");
 // CAD-1810: an app page may open with the assistant collapsed (unless a
 // decision is waiting); this test needs the pane visible.
 if (host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed")) {
-  await React.act(async () => { (host.querySelector(".app-chat-rail") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await React.act(async () => { (host.querySelector(".app-header-assistant") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
 }
 assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the assistant is visible for this check");
@@ -434,14 +625,14 @@ await settle();
 equal((await readSeen("install-crm"))["c-gen"], 5, "returning to the visible pane marks the displayed reply seen");
 
 // Collapse state is per app.
-await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await React.act(async () => { (host.querySelector(".app-chat-close") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "CRM chat collapses");
 await mount("install-other");
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app opens with its own assistant collapsed");
-await React.act(async () => { (host.querySelector(".app-chat-rail") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await React.act(async () => { (host.querySelector(".app-header-assistant") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app's chat expands independently");
-equal(await optionLabels(), ["General"], "another app lists only its own conversations");
+equal(openLabel(), "General", "the other app shows its own General conversation");
 await mount("install-crm");
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the CRM chat stays collapsed");
 await mount("install-other");
@@ -465,7 +656,7 @@ assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed
     return fixtureFetch(input as RequestInfo | URL, init);
   }) as typeof fetch;
   try {
-    await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await React.act(async () => { (host.querySelector(".app-chat-close") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
     await settle();
     await React.act(async () => { await conversationList("install-crm").refresh(); });
     await settle();
@@ -500,23 +691,20 @@ const prompts = () => host.querySelector("[data-chat-prompts]");
 assert(prompts(), "an empty conversation shows the quick actions");
 await pick("Has messages");
 assert(!prompts(), "a conversation with messages hides the quick actions");
-await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-await settle();
+await type("/new");
 assert(prompts(), "a new empty conversation brings the quick actions back");
 
-// A read-only viewer cannot create a conversation by any route.
+// A read-only viewer cannot create a conversation from the composer.
 await mount("install-crm", { operator: true, readOnly: true });
 const before = createPosts.length;
-assert(newButton().disabled, "+ New is disabled read-only");
 assert(box().disabled, "the composer (and so /new) is disabled read-only");
-await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-await settle();
+await type("/new");
 equal(createPosts.length, before, "no conversation is created read-only");
 await pick("General");
 turn = { state: "working", message: "m-gen", conversation: "c-gen" };
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
-assert(bar() && !barButton("Stop"), "a read-only pane observes its working turn without offering a mutating Stop");
+assert(bar() === null && !stopButton() && typingBubble() !== null, "a read-only pane observes its working turn through the inline bubble, without offering a mutating Stop");
 turn = { state: "working", message: "m-elsewhere", conversation: "c-camp" };
 queue = [{ message: "m-gen", conversation: "c-gen" }];
 await React.act(async () => { await resources.masterState.refresh(); });
@@ -546,13 +734,13 @@ controlledTranscript = true;
 turn = { state: "working", message: "m-reconnect", conversation: "c-gen" };
 await renderPane("ctx-a");
 await pick("General");
-assert(barButton("Stop"), "the connected General pane has its own live turn");
+assert(stopButton(), "the connected General pane has its own live turn");
 holdReconnect = true;
 await React.act(async () => { disconnectTranscript?.(); });
 await settle();
-assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "the actual stream disconnect hides turn actions");
+assert(host.querySelector('[data-chat-conv-label][data-stale="true"]')?.textContent?.includes("Reconnecting…") && !stopButton(), "the actual stream disconnect marks the link last known and hides turn actions");
 await renderPane("ctx-b");
-assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "a same-conversation context change must not declare the disconnected stream live");
+assert(host.querySelector('[data-chat-conv-label][data-stale="true"]') !== null && !stopButton(), "a same-conversation context change must not declare the disconnected stream live");
 
 // A fresh snapshot is not actionable until this scope's operation read
 // has reconciled. A failed read remains stale, then a real Retry recovers.
@@ -560,13 +748,13 @@ await React.act(async () => { root.render(null); });
 holdReconnect = false;
 heldOperations = [];
 await renderPane("ctx-a");
-assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "a turn snapshot cannot enable Stop before scoped approval reconciliation");
+assert(host.querySelector('[data-chat-conv-label][data-stale="true"]') !== null && !stopButton(), "a turn snapshot cannot enable Stop before scoped approval reconciliation");
 // Settle the discarded pre-snapshot batch, then its fenced follow-up.
 for (let batch = 0; batch < 2; batch++) {
   await React.act(async () => { heldOperations!.splice(0).forEach((resolve) => resolve(json({ error: "Unavailable" }, 503))); });
   await settle();
 }
-assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "failed post-reconnect operation reads keep actions hidden");
+assert(host.querySelector('[data-chat-conv-label][data-stale="true"]') !== null && !stopButton(), "failed post-reconnect operation reads keep actions hidden");
 operations = [{
   id: "op-reconnected", action_id: "customer.tags.update", status: "pending_permission", revision: 1,
   summary: "Review the reconnected change", resource_refs: [],
@@ -579,7 +767,286 @@ const retryActivity = Array.from(host.querySelectorAll(".app-assistant-activity 
 assert(retryActivity, "the failed activity read offers its existing Retry");
 await React.act(async () => { (retryActivity as HTMLButtonElement).click(); });
 await settle();
-assert(!bar()?.dataset.stale && barButton("Review") && !barButton("Stop") && host.querySelector('[data-operation-status="pending_permission"]'), "reconciliation exposes the real approval card and Review, never a transient Stop");
+assert(!bar()?.dataset.stale && barButton("Review") && !barButton("Stop") && !stopButton() && host.querySelector('[data-operation-status="pending_permission"]'), "reconciliation exposes the real approval card and Review, never a transient Stop");
+
+// AOS-378: a failed canonical identity refresh cannot leave a stale private
+// profile labelled current, nor borrow Home/the coordinator as a fallback.
+hostedIdentity = true;
+controlledTranscript = false;
+turn = null;
+operations = [];
+await React.act(async () => { await resources.masterState.refresh(); });
+await mount("install-crm");
+await pick("General");
+assert(host.querySelector("[data-assistant-name]")?.textContent === "Poppy", "the selected hosted conversation names its own assistant");
+assert(host.querySelector("[data-identity-state]")?.getAttribute("data-identity-state") === "ready", "the fresh private profile is current");
+// Home is idle while this hosted app has its own running/queued operation.
+// Both display and command reconciliation must read the selected scope.
+turn = { state: "working", message: "m-gen", conversation: "c-gen", summary: "customers.search" };
+await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
+await settle();
+assert(bar() === null && stopButton(), "a hosted app shows its own working turn while Home is idle");
+conversationThread("c-gen").write((state) => ({ ...state!, pending: [{ message: "m-queued", text: "queued behind it", state: "sent", at: 1 }] }));
+commandAnswer = { ok: true, result: "Stopped.", withdrawn: ["m-queued"] };
+await React.act(async () => { stopButton()!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await settle();
+commandAnswer = null;
+equal(commandPosts.at(-1), { command: "stop", message: "m-gen" }, "hosted Stop controls the selected app message");
+{
+  const row = conversationThread("c-gen").get().data?.pending.find((p) => p.text === "queued behind it");
+  equal(row?.state, "failed", "the app pane hands back a message Stop withdrew");
+  assert(row?.message !== "m-queued", "the handed-back row has a fresh id");
+  conversationThread("c-gen").write((state) => ({ ...state!, pending: [] }));
+}
+assert((commandSearches.at(-1) ?? "").startsWith("?conversation=") && !commandSearches.at(-1)?.includes("home-thread"), `hosted Stop names its conversation, not Home (got ${commandSearches.at(-1)})`);
+assert(!stopButton(), "Stop refreshes the selected hosted conversation after the operation ends");
+turn = { state: "working", message: "m-other", conversation: "c-camp" };
+queue = [{ message: "m-gen", conversation: "c-gen" }];
+await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
+await settle();
+assert(bar()?.dataset.state === "queued" && barButton("Cancel") && !barButton("Stop") && !stopButton(), "a hosted app shows its own queued turn without borrowing idle Home");
+await React.act(async () => { barButton("Cancel")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await settle();
+equal(commandPosts.at(-1), { command: "cancel", message: "m-gen" }, "hosted Cancel controls the selected queued app message");
+assert(!barButton("Cancel"), "Cancel refreshes the selected hosted conversation after queue removal");
+identityUnavailable = true;
+await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
+await settle();
+assert(host.querySelector("[data-identity-state]")?.getAttribute("data-identity-state") === "unavailable", "a 503 makes the retained private profile unavailable, not current");
+assert(!host.querySelector("[data-assistant-identity]"), "an unreadable profile does not claim private/workspace ownership from stale data");
+assert(host.querySelector("[data-assistant-name]")?.textContent !== "Poppy", "a failed identity read never displays the stale committed name as current");
+
+// CAD-1993: the pane's send keeps one identity from the working placeholder
+// through the first step, and a turn split by a system row keeps distinct
+// segment keys — one head and one typing row, never two.
+convs["install-crm"].push(conv("c-split", { title: "Split turn" }));
+threads["c-split"] = [ent(1, "operator", "message", "split ask", "m-split")];
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn");
+identityUnavailable = false;
+turn = { state: "working", message: "m-split", conversation: "c-split" };
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+const placeholder = host.querySelector(".app-chat-list [data-chat-typing]") as HTMLElement | null;
+assert(placeholder !== null, "a working turn with no stored step paints the send placeholder");
+// A queued message after the working send must not take over the
+// placeholder's key: the first step still has to update this row.
+threads["c-split"].push(ent(2, "operator", "message", "queued behind", "m-next"));
+queue = [{ message: "m-next", conversation: "c-split" }];
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+assert(placeholder.isConnected, "a newer queued send leaves the working placeholder mounted");
+threads["c-split"].push(ent(3, "agent", "thinking", "plan the split", null));
+await React.act(async () => { await conversationThread("c-split").refresh(); });
+await settle();
+const landed = host.querySelector(".app-chat-list [data-chat-run]") as HTMLElement | null;
+assert(landed !== null, "the first step paints the turn row");
+assert(landed === placeholder, "the head updates in place when the first step lands");
+// Completion must not rename the run to the queued send either.
+threads["c-split"].push(ent(4, "agent", "turn_result", "Split answer.", null));
+turn = null;
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the head survives completion past a queued send");
+// The queued send starting must not re-attribute the answered run to it.
+queue = [];
+turn = { state: "working", message: "m-next", conversation: "c-split" };
+threads["c-split"].push(ent(5, "agent", "thinking", "B starts", null));
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the answered run keeps its identity when the queued send starts");
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 2, "each send paints its own head");
+assert(landed.querySelector('[data-turn-state="running"]') === null, "the answered run is not marked running for the new send");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the new send is typing");
+// The daemon's working id differs from the send id and a system row
+// splits the untagged run: ownership follows the adopted send, so the
+// last segment paints the dots and no second head appears.
+threads["c-split"] = [
+  ent(1, "operator", "message", "split ask", "m-split"),
+  ent(2, "agent", "thinking", "plan the split", null),
+  ent(3, "system", "message", "system note", null),
+  ent(4, "agent", "tool_call", "Bash: cadence board read", null),
+];
+turn = { state: "working", message: "server-split", conversation: "c-split" };
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 1, "a split turn paints one head");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "a split turn paints one typing row");
+equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows a split turn");
+assert(host.querySelector(".app-chat-list [data-chat-run]") === landed, "the split keeps the head's identity");
+// A system row between the working send and a queued message is transparent:
+// the real run is still adopted, so there is one head and one typing row.
+threads["c-split"] = [
+  ent(1, "operator", "message", "split ask", "m-split"),
+  ent(2, "system", "message", "system note", null),
+  ent(3, "operator", "message", "queued behind", "m-next"),
+  ent(4, "agent", "thinking", "plan the split", null),
+];
+turn = { state: "working", message: "m-split", conversation: "c-split" };
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+equal(host.querySelectorAll(".app-chat-list [data-chat-run] .turn-head").length, 1, "a system-only gap paints one head");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "a system-only gap paints one typing row");
+equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "a system-only gap appends no standalone typing head");
+// A conversation opened cold: completed untagged history must keep its own
+// send, and the working send must own the typing bubble.
+threads["c-split"] = [
+  ent(1, "operator", "message", "old ask", "m-old"),
+  ent(2, "agent", "thinking", "old work", null),
+  ent(3, "agent", "turn_result", "old answer", null),
+  ent(4, "operator", "message", "new ask", "m-next"),
+  ent(5, "agent", "thinking", "new work", null),
+];
+turn = { state: "working", message: "m-next", conversation: "c-split" };
+await pick("General");
+await pick("Split turn");
+await React.act(async () => {
+  await conversationThread("c-split").refresh();
+  await resources.masterConversation("c-split").refresh();
+});
+await settle();
+const coldRuns = Array.from(host.querySelectorAll(".app-chat-list [data-chat-run]")) as HTMLElement[];
+equal(coldRuns.length, 2, "cold history and the new send paint two runs");
+assert(coldRuns[0].querySelector(".turn-head") !== null, "the historical run keeps its head");
+assert(coldRuns[1].querySelector(".turn-head") !== null, "the new send paints its own head");
+assert(coldRuns[1].querySelector('[data-kind="typing"]') !== null, "the new send's run owns the typing bubble");
+assert(coldRuns[0].querySelector('[data-kind="typing"]') === null, "the historical run is not typing for the new send");
+equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows cold history");
+// CAD-2011: a hosted board reports its working turn with no message id. The
+// open run is that turn: it types, and no second assistant head follows it.
+{
+  const before = turn;
+  convs["install-crm"].push(conv("c-hosted", { title: "Hosted turn" }));
+  threads["c-hosted"] = [
+    ent(1, "operator", "message", "hosted ask", "m-hosted"),
+    ent(2, "agent", "tool_call", "catalog_search: website", null),
+    ent(3, "agent", "tool_result", "ok", null),
+  ];
+  turn = { state: "working", message: null, conversation: "c-hosted" } as never;
+  await React.act(async () => { await conversationList("install-crm").refresh(); });
+  await settle();
+  await pick("Hosted turn");
+  await React.act(async () => {
+    await conversationThread("c-hosted").refresh();
+    await resources.masterConversation("c-hosted").refresh();
+  });
+  await settle();
+  equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "the open run types for an unnamed turn");
+  equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head follows an unnamed turn's run");
+  // The answer lands a read before the working flag clears: still one head.
+  threads["c-hosted"].push(ent(4, "agent", "turn_result", "hosted answer", null));
+  await React.act(async () => {
+    await conversationThread("c-hosted").refresh();
+    await resources.masterConversation("c-hosted").refresh();
+  });
+  await settle();
+  equal(host.querySelectorAll(".app-chat-list [data-chat-typing]").length, 0, "no standalone typing head under an unnamed turn's answer");
+  turn = before;
+  await React.act(async () => { await resources.masterConversation("c-hosted").refresh(); });
+  await settle();
+}
+// A differing daemon id whose rows are untagged must keep the adopted send
+// when the queue changes; otherwise the queued send steals the identity.
+convs["install-crm"].push(conv("c-split2", { title: "Split turn two" }));
+threads["c-split2"] = [
+  ent(1, "operator", "message", "mismatch ask", "m-split"),
+  ent(2, "operator", "message", "queued behind", "m-next"),
+  ent(3, "agent", "thinking", "mismatched work", null),
+];
+queue = [{ message: "m-next", conversation: "c-split2" }];
+turn = { state: "working", message: "server-split", conversation: "c-split2" };
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn two");
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+const mismatchRun = host.querySelector(".app-chat-list [data-chat-run]") as HTMLElement | null;
+assert(mismatchRun !== null, "the mismatched working id still paints the run");
+threads["c-split2"].push(ent(4, "agent", "turn_result", "mismatched answer", null));
+turn = null;
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+queue = [];
+turn = { state: "working", message: "m-next", conversation: "c-split2" };
+threads["c-split2"].push(ent(5, "agent", "thinking", "queued work starts", null));
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === mismatchRun, "an answered run keeps its adopted send when the queued send starts");
+assert(mismatchRun.querySelector('[data-kind="typing"]') === null, "the answered run is not typing for the queued send");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the queued send types");
+assert(host.querySelectorAll(".app-chat-list [data-chat-typing]").length === 0, "no standalone typing head follows the adopted run");
+// A later queued send must not rekey the one already running.
+threads["c-split2"].push(ent(6, "operator", "message", "third ask", "m-third"));
+queue = [{ message: "m-third", conversation: "c-split2" }];
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+const runningRun = host.querySelectorAll(".app-chat-list [data-chat-run]")[1] as HTMLElement | undefined;
+assert(runningRun !== undefined, "the running send has its own run");
+queue = [];
+turn = { state: "working", message: "m-third", conversation: "c-split2" };
+threads["c-split2"].push(ent(7, "agent", "thinking", "third works", null));
+await React.act(async () => {
+  await conversationThread("c-split2").refresh();
+  await resources.masterConversation("c-split2").refresh();
+});
+await settle();
+assert(host.querySelectorAll(".app-chat-list [data-chat-run]")[1] === runningRun, "the running send keeps its identity when another starts");
+equal(host.querySelectorAll('.app-chat-list [data-chat-run] [data-kind="typing"]').length, 1, "only the newest send types");
+// Before any step exists, a mismatched daemon id plus a queued user must
+// still key the placeholder to the send being worked.
+convs["install-crm"].push(conv("c-split3", { title: "Split turn three" }));
+threads["c-split3"] = [
+  ent(1, "operator", "message", "mismatch ask", "m-split"),
+  ent(2, "operator", "message", "queued behind", "m-next"),
+];
+queue = [{ message: "m-next", conversation: "c-split3" }];
+turn = { state: "working", message: "server-split", conversation: "c-split3" };
+await React.act(async () => { await conversationList("install-crm").refresh(); });
+await settle();
+await pick("Split turn three");
+await React.act(async () => {
+  await conversationThread("c-split3").refresh();
+  await resources.masterConversation("c-split3").refresh();
+});
+await settle();
+const noOpener = host.querySelector(".app-chat-list [data-chat-typing]") as HTMLElement | null;
+assert(noOpener !== null, "a mismatched working id paints the placeholder before any step");
+threads["c-split3"].push(ent(3, "agent", "thinking", "mismatched work", null));
+await React.act(async () => { await conversationThread("c-split3").refresh(); });
+await settle();
+assert(host.querySelector(".app-chat-list [data-chat-run]") === noOpener, "the placeholder updates in place when the mismatched first step lands");
+
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");
 }

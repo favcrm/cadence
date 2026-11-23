@@ -26,7 +26,8 @@ export function capLabel(cap = MAX_UPLOAD_BYTES): string {
 }
 
 /** The pre-check's reason, or null when the file may go. */
-export function sizeError(size: number, cap = MAX_UPLOAD_BYTES): string | null {
+export function sizeError(size: number, cap = MAX_UPLOAD_BYTES, refuseEmpty = false): string | null {
+  if (refuseEmpty && size === 0) return "empty file — rejected";
   return size > cap ? `over ${capLabel(cap)} — rejected` : null;
 }
 
@@ -35,9 +36,10 @@ export function queued(
   files: { name: string; size: number }[],
   startId = 0,
   cap = MAX_UPLOAD_BYTES,
+  refuseEmpty = false,
 ): UploadItem[] {
   return files.map((file, i) => {
-    const bad = sizeError(file.size, cap);
+    const bad = sizeError(file.size, cap, refuseEmpty);
     return {
       id: `u${startId + i}`,
       name: file.name,

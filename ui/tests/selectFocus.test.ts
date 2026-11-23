@@ -148,4 +148,72 @@ function searchField(): HTMLInputElement {
   assert(document.activeElement !== trigger, "tab does not pull focus back to the trigger");
 }
 
+// CAD-2286 Browser QA: Escape that closes an open list is the list's alone. A
+// drawer or dialog listening on the window must not also close, so the Select
+// cancels it and stops it; with the list closed, Escape passes through.
+{
+  document.body.replaceChildren();
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  act(() => {
+    root.render(react.createElement(Select, { "aria-label": "role", value: "grok", onChange: () => undefined, options }));
+  });
+  const trigger = host.querySelector("button");
+  if (!trigger) throw new Error("missing trigger");
+  const reached: boolean[] = [];
+  const onWindowKey = (event: KeyboardEvent) => {
+    if (event.key === "Escape") reached.push(event.defaultPrevented);
+  };
+  const target = win as unknown as Window;
+  target.addEventListener("keydown", onWindowKey);
+  act(() => {
+    trigger.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+  });
+  assert(document.querySelector("[role='listbox']") !== null, "the list is open");
+  let prevented = false;
+  act(() => {
+    const event = new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    trigger.dispatchEvent(event);
+    prevented = event.defaultPrevented;
+  });
+  assert(document.querySelector("[role='listbox']") === null, "escape closes the open list");
+  assert(prevented, "escape on an open list is cancelled");
+  assert(reached.length === 0, `escape on an open list never reaches the window (reached ${JSON.stringify(reached)})`);
+  act(() => {
+    trigger.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  assert(reached.length === 1 && reached[0] === false, `escape with the list closed reaches the window untouched (reached ${JSON.stringify(reached)})`);
+  target.removeEventListener("keydown", onWindowKey);
+  act(() => root.unmount());
+  document.body.replaceChildren();
+}
+
+// The searchable list's Escape starts in its search field, inside the portal
+// on document.body: it closes the list and still stops short of the window.
+{
+  document.body.replaceChildren();
+  const trigger = openSearchable();
+  const search = searchField();
+  const reached: boolean[] = [];
+  const onWindowKey = (event: KeyboardEvent) => {
+    if (event.key === "Escape") reached.push(event.defaultPrevented);
+  };
+  const target = win as unknown as Window;
+  target.addEventListener("keydown", onWindowKey);
+  assert(search.closest("[role='listbox']") === null && document.body.contains(search), "the search field is in the body portal");
+  let prevented = false;
+  act(() => {
+    const event = new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    search.dispatchEvent(event);
+    prevented = event.defaultPrevented;
+  });
+  assert(document.querySelector("input[aria-label='Search options']") === null, "escape in the search field closes the list");
+  assert(prevented, "escape in the search field is cancelled");
+  assert(reached.length === 0, `escape in the search field never reaches the window (reached ${JSON.stringify(reached)})`);
+  assert(document.activeElement === trigger, "focus returns to the trigger");
+  target.removeEventListener("keydown", onWindowKey);
+  document.body.replaceChildren();
+}
+
 export {};

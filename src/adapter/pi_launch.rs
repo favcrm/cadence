@@ -258,15 +258,6 @@ pub(super) fn pi_worker_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     Ok(state_dir.join("agents").join(alias))
 }
 
-/// CAD-1752: the working dir of an agent hired without a repo —
-/// `<state>/agents/<alias>/home`, created 0700. Only this subdir is the
-/// agent's cwd; the parent also holds its `pi/` login and session file.
-pub fn pi_agent_home(state_dir: &Path, alias: &str) -> Result<PathBuf> {
-    let home = pi_worker_dir(state_dir, alias)?.join("home");
-    ensure_private_dir(&home)?;
-    Ok(home)
-}
-
 /// The worker's private `PI_CODING_AGENT_DIR` (`<worker>/pi`) — created
 /// 0700 on open, holding its copied `auth.json`.
 pub(super) fn pi_worker_config_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
@@ -506,16 +497,18 @@ pub(super) fn pi_cache_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     }
 }
 
-/// Create `dir` (recursive) at mode 0700, tightening an existing one.
-pub(super) fn ensure_private_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
+/// Pi's reviewer `gh` environment: the shared pin, under this worker's own
+/// directory (`super::reviewer_gh_env`, CAD-844).
+pub(super) fn reviewer_gh_env(
+    env: &ProviderEnv,
+    role: &str,
+    state_dir: &std::path::Path,
+    alias: &str,
+) -> Result<crate::adapter::RoleEnv> {
+    crate::adapter::reviewer_gh_env(env, role, &pi_worker_dir(state_dir, alias)?)
 }
+
+pub(super) use crate::adapter::ensure_private_dir;
 
 /// Copy the operator's `auth.json` into `dir` (0600, atomic via
 /// `auth.json.tmp` rename) when the dir has no non-empty login of its
@@ -742,12 +735,37 @@ pub(super) fn build_command(
                 ]);
             }
         }
-        let tools = if agent.provider == "omp" {
+        // CAD-2092: expose only the selected bundled skills from this agent's
+        // private staged directory while `--no-skills` blocks ambient discovery.
+        if let Some(raw_skills) = params.get("skills").filter(|v| !v.is_null()) {
+            let selected = crate::skill::validate_skills_param(raw_skills)?;
+            for (_, dir) in crate::skill::stage_agent_skills(state_dir, &agent.alias, &selected)? {
+                cmd.extend(["--skill".to_string(), dir.to_string_lossy().to_string()]);
+            }
+        }
+        let disabled_tools = match params.get("disabled_tools").filter(|v| !v.is_null()) {
+            Some(v) => crate::adapter::registry::validate_disabled_tools_param(
+                &agent.provider,
+                &agent.endpoint_kind,
+                v,
+            )?,
+            None => Vec::new(),
+        };
+        let base_tools = if agent.provider == "omp" {
             OMP_WORKER_TOOLS
         } else {
             PI_WORKER_TOOLS
         };
-        cmd.extend(["--tools".to_string(), tools.join(",")]);
+        let tools: Vec<&str> = base_tools
+            .iter()
+            .copied()
+            .filter(|tool| !disabled_tools.iter().any(|d| d == tool))
+            .collect();
+        if tools.is_empty() {
+            cmd.push("--no-tools".to_string());
+        } else {
+            cmd.extend(["--tools".to_string(), tools.join(",")]);
+        }
     }
     // `agent.model` is the provider's report, never a launch param —
     // only the configured param is replayed (same rule as Claude).

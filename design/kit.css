@@ -34,7 +34,6 @@ svg { display: inline-block; vertical-align: middle; }
   font-variant-numeric: tabular-nums lining-nums;
 }
 .card {
-  border: 1px solid var(--color-ink-700);
   background: var(--color-ink-850);
   border-radius: .5rem;
   transition: border-color .15s ease, background-color .15s ease;
@@ -204,19 +203,24 @@ a.lnk:hover, button.lnk:hover {
 .btn-icon, .btn-spin { flex: none; }
 .btn-sm { height: 1.75rem; padding: 0 .6rem; font-size: var(--text-micro); }
 .btn-full { width: 100%; }
-.btn:hover { border-color: var(--color-edge-hover); background: var(--color-ink-800); }
+.btn:hover:not(:disabled):not([aria-disabled="true"]) { border-color: var(--color-edge-hover); background: var(--color-ink-800); }
+/* Secondary surfaces and text must switch themes together, not tween through
+   light-on-light frames. Keep hover distinct without animating the fill. */
+.btn:where(:not(.btn-primary, .btn-acc, .btn-ghost, .btn-danger)) { background: var(--color-ink-800); color: var(--color-ink-100); transition: border-color .15s ease; }
+.btn:where(:not(.btn-primary, .btn-acc, .btn-ghost, .btn-danger)):hover:not(:disabled):not([aria-disabled="true"]) { background: var(--color-ink-700); }
 .btn:focus-visible, .field:focus, .select-trigger:focus-visible, .select-search:focus {
   outline: none; border-color: var(--color-accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
 }
 .btn-acc, .btn-primary {
   border-color: transparent;
-  background: var(--color-accent); color: var(--color-on-accent);
+  background: var(--color-ink-200); color: var(--color-ink-950);
   font-weight: 500;
+  transition: border-color .15s ease;
 }
 .btn-acc:hover:not(:disabled):not([aria-disabled="true"]),
 .btn-primary:hover:not(:disabled):not([aria-disabled="true"]) {
-  background: var(--color-accent); filter: brightness(1.1);
+  background: var(--color-ink-100);
 }
 .btn-ghost {
   background: transparent; border-color: transparent; color: var(--color-ink-300);

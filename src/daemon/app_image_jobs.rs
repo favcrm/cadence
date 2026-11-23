@@ -215,7 +215,12 @@ impl Shared {
             if let Some(created) = receipt["created_at"].as_f64() {
                 #[cfg(feature = "test-seam")]
                 test_probe::before_receipt_attach(&job.request_id, id);
-                records.app_social_tool_receipt_attach(&job.context_id, id, created)?;
+                records.app_social_tool_receipt_attach(
+                    &job.context_id,
+                    id,
+                    created,
+                    receipt["result"]["kind"].as_str().unwrap_or(""),
+                )?;
             }
             settle(ImageSettlement::Succeeded { receipt: id })?;
             self.social_attach_image(&records, &job.context_id, &job.request_id, id);
@@ -351,7 +356,12 @@ impl Shared {
         if let Some(created) = receipt["created_at"].as_f64() {
             #[cfg(feature = "test-seam")]
             test_probe::before_receipt_attach(&job.request_id, id);
-            records.app_social_tool_receipt_attach(&job.context_id, id, created)?;
+            records.app_social_tool_receipt_attach(
+                &job.context_id,
+                id,
+                created,
+                receipt["result"]["kind"].as_str().unwrap_or(""),
+            )?;
         }
         records.app_social_image_job_settle(
             &job.call_id,

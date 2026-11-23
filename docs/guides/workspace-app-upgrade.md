@@ -26,6 +26,10 @@ pointing at different bytes. Omitting both the locator and that resolution
 refuses the update when a locator is already stored. A catalogue locator on
 the upgrade itself must match the new package and an installable directory
 release, and it cannot move the installation to an older ordered version.
+For a published release, **Review published versions** on Manage opens the
+existing catalogue review for that exact installation. If no catalogue
+provenance was recorded, **Browse published apps** opens the directory
+instead; select the app there. Neither link changes the installation.
 Git installs are prefilled with their recorded URL, and other installs start empty for an
 absolute path or Git URL. A historical built-in install (CAD-1422 retired
 the embedded catalog) updates from the app's detached repository — name its

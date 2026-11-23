@@ -8,6 +8,13 @@ export type CardAgent = Api.CardAgent;
 
 export type Ref = Api.Ref;
 
+/** CAD-1817: the canonical avatar catalog slug — the daemon's closed union,
+ *  matching `AVATAR_LOOKS` in `features/agents/AgentAvatar.tsx`. */
+export type AvatarLook = Api.AvatarLook;
+
+/** CAD-1817: the workspace coordinator's committed identity projection. */
+export type MasterIdentity = Api.MasterIdentity;
+
 /** A board card (`GET /api/issues` row): the core card, its work block and
  *  the bound-agent strip. Generated from the daemon's Rust type. */
 export type IssueCard = Api.IssueListItem;
@@ -80,6 +87,63 @@ export interface LinkRef {
   status?: string;
   status_source?: StatusSource;
   missing: boolean;
+}
+
+/** CAD-2195 / CAD-2253: one project-scoped approval head on `GET /api/issues/:id`. */
+export interface IssueApprovalHead {
+  head_sha: string;
+  repo: string;
+  pr: number;
+  state: "in-force" | "missing" | "unavailable";
+  approval_id?: string;
+  source?: string;
+  action?: string;
+  recorded_at?: string;
+  reason?: string;
+}
+
+/** Hosted issue approval projection (`hosted-cadence-issue-approvals.v1`). */
+export interface IssueApprovals {
+  version: string;
+  scope: string;
+  available: boolean;
+  reason: string | null;
+  complete: boolean;
+  heads: IssueApprovalHead[];
+  heads_truncated?: boolean;
+}
+
+/** One participant-visible hosted assignment row on `GET /api/issues/:id`. */
+export interface IssueAssignmentRow {
+  assignment_id?: string;
+  issue_id?: string;
+  target?: string | null;
+  state: string;
+  text?: string | null;
+  text_truncated?: boolean;
+  deliverable?: { type: "artifact" | "link"; ref: string; title?: string | null } | null;
+  deliverable_check?: { found: boolean | null; reason: string | null };
+  updated_at?: string | null;
+}
+
+/** Hosted participant-scoped assignment projection on `GET /api/issues/:id`. */
+export interface IssueLocalAssignment {
+  version?: string;
+  source?: string;
+  scope?: string;
+  available: boolean;
+  reason: string | null;
+  observed_at?: string;
+  truncated?: boolean;
+  complete?: boolean;
+  assignments: IssueAssignmentRow[];
+}
+
+/** Hosted agent run summary on `GET /api/issues/:id`. */
+export interface IssueAgentRun {
+  agent?: string | null;
+  agent_name?: string | null;
+  state?: string | null;
 }
 
 export interface ActivityItem {
@@ -156,6 +220,12 @@ export interface IssueDetail extends Omit<IssueCard, "counts"> {
   plan?: PlanBlock | null;
   /** CAD-341 task reports on the ticket (questions carry `open`). */
   reports?: TaskReport[];
+  /** Hosted project-scoped approval heads (`hosted-cadence-issue-approvals.v1`). */
+  approvals?: IssueApprovals | null;
+  /** Hosted participant-scoped assignment read. */
+  local_assignment?: IssueLocalAssignment | null;
+  /** Hosted agent-run state when an agent run was dispatched on the ticket. */
+  agent_run?: IssueAgentRun | null;
 }
 
 /** One ticket of a plan, with its derived status. */
@@ -403,14 +473,11 @@ export interface OverviewProject {
   areas_error?: string | null;
 }
 
-export interface MonitorAlert {
-  seq: number;
+interface MonitorAlertBase {
   monitor: string;
   project: string;
   monitor_owner: string;
   task?: string | null;
-  event_seq: number;
-  fingerprint: string;
   kind: string;
   payload: unknown;
   state: "open" | "acknowledged" | "resolved" | string;
@@ -422,14 +489,30 @@ export interface MonitorAlert {
   next_action: string;
   next_owner: string;
   authority: string;
-  evidence: {
-    monitor: string;
-    alert_seq: number;
-    event_seq: number;
-    fingerprint: string;
-    payload: unknown;
-  };
 }
+
+export type MonitorAlert = MonitorAlertBase & (
+  | {
+      seq: number;
+      event_seq: number;
+      fingerprint: string;
+      id?: never;
+      evidence: {
+        monitor: string;
+        alert_seq: number;
+        event_seq: number;
+        fingerprint: string;
+        payload: unknown;
+      };
+    }
+  | {
+      id: string;
+      seq?: never;
+      event_seq?: never;
+      fingerprint?: never;
+      evidence: { monitor: string; alert: string; payload: unknown };
+    }
+);
 
 export interface MonitorRow {
   id: string;
@@ -441,7 +524,7 @@ export interface MonitorRow {
   last_check_at?: number | null;
   last_success_at?: number | null;
   next_check_at?: number | null;
-  event_cursor: number;
+  event_cursor?: number;
   coverage: string[];
   delivery: { configured: boolean; state: string; push?: boolean; detail?: string };
   dispatch_enabled: boolean;
@@ -466,9 +549,28 @@ export interface Monitoring {
   alerts: MonitorAlert[];
 }
 
+export interface DocumentFollowUp {
+  id: string;
+  version: number;
+  title: string;
+  project: string | null;
+  href: string;
+  /** Server-recorded time in epoch milliseconds. */
+  at: number;
+}
+
+export type DocumentFollowUps =
+  | {
+      status: "ready";
+      pending: DocumentFollowUp[];
+      recent: (DocumentFollowUp & { outcome: "approved" | "delivered" })[];
+    }
+  | { status: "unavailable" };
+
 /** `GET /api/overview` — everything derived, nothing stored. */
 export interface Overview {
   needs_me: NeedsMe[];
+  document_follow_ups?: DocumentFollowUps;
   drift: Drift;
   projects: OverviewProject[];
   github: {
@@ -484,6 +586,12 @@ export interface Overview {
   monitoring?: Monitoring;
   /** Sources that missed their time bound — the view narrowed. */
   degraded?: { source: string; subject?: string; detail: string }[];
+  /** CAD-2317: operator-only routines awaiting approval or repointing. */
+  routine_needs?: Routine[];
+  /** CAD-2317: operator-only pending staged routine/playbook proposals. */
+  routine_proposals?: StagedRoutineProposal[];
+  /** CAD-2317: operator-only routine runs paused on an approval-gated checklist step. */
+  routine_step_holds?: RoutineRun[];
   generated_at: number;
 }
 
@@ -536,13 +644,9 @@ export interface UsageLimit {
  * `local` sends the existing provider and endpoint kind plus cwd. No
  * per-issue location exists.
  */
-/** CAD-1752: a hire from the built-in role catalogue sends `catalogue` and
- *  no location, provider or endpoint kind — the install picks the runtime. */
 export interface AgentRegisterBody {
   alias: string;
   location?: "local" | "cloud";
-  catalogue?: string;
-  look?: string;
   provider?: string;
   endpoint_kind?: string;
   role?: string;
@@ -554,7 +658,10 @@ export interface AgentRegisterBody {
   params?: string;
 }
 
-/** One role of `GET /api/agent-roles`. */
+/** CAD-1989: `POST /api/agent-profiles` body, generated from the Rust type. */
+export type AgentProfileBody = Api.AgentProfileReq;
+
+/** One role of `GET /api/agent-roles`. Roles carry no model. */
 export interface AgentRole {
   id: string;
   category: string;
@@ -569,8 +676,6 @@ export interface AgentRole {
   first_tasks: string[];
   /** The text a hire stores as the agent's instructions. */
   instructions: string;
-  /** The model a hire would launch on, or why none resolves. */
-  model: { id: string; source: string } | { error: string };
 }
 
 export interface AgentRolesPayload {
@@ -590,18 +695,86 @@ export interface InstructionsResult {
   new_sha256?: string;
 }
 
+/** `GET|POST /api/agent-profiles/<id>` on a hosted board: the stored profile
+ *  with the `revision` its writes are fenced on. Typed here because the board
+ *  API generator covers the roster row, which carries neither. */
+export interface StoredAgentProfile {
+  id: string;
+  name: string;
+  role: string;
+  responsibilities: string;
+  skills: string[];
+  status: "active" | "archived";
+  revision: number;
+  created_at: number;
+  updated_at: number;
+  created_by: string;
+  catalogue: string | null;
+  model: string;
+  /** AOS-495: tool groups switched off. Absent means none are. */
+  disabled_tools?: string[];
+  /** AOS-679: opt-in tool groups switched on. Absent means none are. */
+  enabled_tools?: string[];
+}
+
+/** `GET /api/workspace-skills` on a hosted board (agenticos-v2 AOS-626): one
+ *  skill of the workspace library. `latest_revision` may be a draft. */
+export interface WorkspaceSkillSummary {
+  name: string;
+  latest_revision: number;
+  latest_digest: string;
+  description: string;
+  /** Null until an owner approves a revision, and again after a revoke. */
+  approved: { revision: number; digest: string; by: string; at: number } | null;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  /** CAD-2429: the agents whose profile lists this skill. A board that
+   *  predates it omits the field (agenticos-v2 #2193); absent is unknown, never none. */
+  used_by?: WorkspaceSkillUser[];
+}
+
+export interface WorkspaceSkillUser {
+  profile_id: string;
+  name: string;
+  status: "active" | "archived";
+}
+
+/** `GET /api/workspace-skills/<name>[?revision=N]`: one revision, its files as text. */
+export interface WorkspaceSkillRead {
+  notice: string;
+  skill: WorkspaceSkillSummary;
+  revision: {
+    name: string;
+    revision: number;
+    digest: string;
+    description: string;
+    files: Record<string, string>;
+    created_by: string;
+    author: string | null;
+    created_at: number;
+  };
+  /** Whether the revision shown is the approved one. */
+  approved: boolean;
+}
+
 /** One `/api/agents` row. Generated from the daemon's Rust type, except the
- *  fields re-declared here: a registered agent always reports `provider`,
- *  `endpoint_kind` and `state` (only the Rust row type is lenient), the board
- *  reads the allowance record as the wider `UsageLimit`, and the detail read
- *  merges the launch `params` in. */
+ *  fields re-declared here: a registered agent always reports `provider` and
+ *  `endpoint_kind`, the board reads the allowance record as the wider
+ *  `UsageLimit`, and the detail read merges the launch `params` in.
+ *  CAD-2215: a scoped row reports `state` only when the reader's own work
+ *  proves it (`"busy"`, else `null`) and omits `dead`/`fenced`, so those are
+ *  nullable/optional here — absence is unavailable, never false. */
 export type Agent = Omit<
   Api.AgentRow,
-  "provider" | "endpoint_kind" | "state" | "quota" | "usage_limit" | "model_selection" | "last_activity"
+  "provider" | "endpoint_kind" | "state" | "dead" | "fenced" | "quota" | "usage_limit" | "model_selection" | "last_activity"
 > & {
   provider: string;
   endpoint_kind: string;
-  state: string;
+  /** `"busy"` on work the reader can see running; `null` when unreported. */
+  state: string | null;
+  dead?: boolean | null;
+  fenced?: boolean | null;
   /** Launch params; the detail read carries them. */
   params?: Record<string, unknown>;
   model_selection?: {
@@ -614,10 +787,37 @@ export type Agent = Omit<
   usage_limit?: UsageLimit | null;
   /** Daemon messages use epoch seconds; older observations may use ISO text. */
   last_activity?: string | number | null;
+  /** CAD-2353: hosted only. The `master` row says `"workspace"` (the company
+   *  Master); absent on an older API and on native boards. */
+  scope?: "workspace";
+  /** The workspace's own name for the company Master, when it has one. */
+  name?: string | null;
 };
 
+/** CAD-2353: the caller's own assistant, beside the roster (hosted `GET
+ *  /api/agents`). Absent on an older API and on native boards. `name` already
+ *  carries the "Assistant" fallback; `conversation_id` is null until Home has
+ *  been opened once. */
+export interface PersonalAssistantRow {
+  scope: "personal";
+  opens: "home";
+  name: string;
+  look?: string | null;
+  bootstrap_state?: string | null;
+  conversation_id?: string | null;
+}
+
 /** `GET /api/agents` (the roster beside its snapshot's freshness). */
-export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent[] };
+export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & {
+  agents: Agent[];
+  /** CAD-2353: the caller's own assistant; hosted only, absent on an older API. */
+  personal_assistant?: PersonalAssistantRow | null;
+};
+
+/** One profile of `GET /api/agents` (CAD-1989): who an agent is, with the
+ *  aliases of the runtimes registered against it. */
+/** `wiki_root` is the hosted board's: a native profile's folder is its alias. */
+export type HiredProfile = Api.AgentProfile & { wiki_root?: string };
 
 /** Best-effort destination for a verified app-scoped master turn. This is
  * navigation metadata only; the app route proves its binding independently. */
@@ -672,6 +872,17 @@ export interface MasterState {
   /** Queued master messages in delivery order (max 20). */
   queue?: { message: string; conversation?: string | null }[];
   queued?: number;
+  /**
+   * The runtime's own sentence for a blocking compaction that failed and left
+   * its run unanswered, or null. Never provider text.
+   */
+  compaction_failure?: string | null;
+  /** CAD-1817: the workspace coordinator's committed identity — its own
+   *  protected IDENTITY/SOUL projection, never a member's private profile.
+   *  Generated as `MasterIdentity` from the daemon's Rust type. */
+  identity: MasterIdentity;
+  /** Hosted-only actor projection, bound to its selected conversation. */
+  actor_identity?: Api.MasterState["actor_identity"];
 }
 
 /** `POST /api/master/command` — one allowlisted session verb's answer. */
@@ -679,6 +890,8 @@ export interface MasterCommandResult {
   command: string;
   ok: boolean;
   result?: unknown;
+  /** Queued messages the command withdrew: this surface offers them back. */
+  withdrawn?: string[];
 }
 
 /**
@@ -705,6 +918,47 @@ export interface ThreadRef {
   id: string;
 }
 
+/** CAD-2092: one bundled skill on a native agent detail payload. */
+export interface NativeSkillItem {
+  name: string;
+  line: string;
+  source: string;
+  bundled: boolean;
+  required: boolean;
+  enabled: boolean;
+  /** Strictly from live runtime evidence; null when the runtime did not report. */
+  loaded: boolean | null;
+  applies: "next_launch" | "immediate";
+  skill_md: string;
+  files: string[];
+}
+
+/** CAD-2092: one built-in runtime tool on a native agent detail payload. */
+export interface NativeToolItem {
+  name: string;
+  line: string;
+  description: string;
+  source: string;
+  bundled: boolean;
+  required: boolean;
+  enabled: boolean;
+  applies: "next_launch" | "immediate";
+}
+
+export interface AgentSkillsResult {
+  alias: string;
+  state: string;
+  applies: string;
+  skills: string[];
+}
+
+export interface AgentToolsResult {
+  alias: string;
+  state: string;
+  applies: string;
+  disabled_tools: string[];
+}
+
 /** GET /api/agents/<alias> — the drawer detail. */
 export interface AgentDetail {
   agent: {
@@ -727,13 +981,14 @@ export interface AgentDetail {
     quota?: UsageLimit | null;
     usage_limit?: UsageLimit | null;
     pid?: number | null;
-    state: string;
+    /** `"busy"` on work the reader can see running; `null` when unreported. */
+    state: string | null;
     enabled: boolean;
     error?: string | null;
     endpoint?: string | null;
     params?: Record<string, unknown>;
     generation?: number;
-    dead?: boolean;
+    dead?: boolean | null;
     silent_secs?: number;
     stalled?: boolean;
     capabilities?: Record<string, unknown> | null;
@@ -743,6 +998,8 @@ export interface AgentDetail {
     /** The stored job, when the board serves it. */
     instructions?: string | null;
     team_role?: string | null;
+    /** CAD-2092: runtime-reported loaded skill names for the live session only. */
+    loaded_skills?: string[] | null;
   };
   queued: number;
   unknown: number;
@@ -755,6 +1012,10 @@ export interface AgentDetail {
     prs_merged: number | null;
     drafts_sent: number | null;
   } | null;
+  /** CAD-2092: native bundled skills with per-agent toggle and runtime evidence. */
+  native_skills?: NativeSkillItem[] | null;
+  /** CAD-2092: native built-in runtime tools with per-agent toggle. */
+  native_tools?: NativeToolItem[] | null;
   running: {
     id: string;
     task?: string;
@@ -763,16 +1024,17 @@ export interface AgentDetail {
   }[];
   /** Why `events` is empty when the daemon's event read failed. */
   events_error?: string | null;
-  events: {
-    seq: number;
+  events: ({
     alias: string;
     kind: string;
     payload?: Record<string, unknown>;
     job_id?: string | null;
     task_id?: string | null;
     at: string;
-  }[];
-  fenced: boolean;
+  } & ({ seq: number; id?: never; cursor?: never } | { id: string; cursor: string; seq?: never }))[];
+  /** Whether the agent is fenced; `null`/absent for a scoped reader, whose
+   *  daemon reports no state to decide it from. */
+  fenced?: boolean | null;
   recovery?: string | null;
   resume?: string | null;
   tasks?: string[];
@@ -784,7 +1046,21 @@ export interface AgentDetail {
  *  plus the build identity of the serving binary and the daemon's when
  *  reachable. Tailnet-shared boards resolve the actor from Tailscale
  *  identity headers; `read_only` boards refuse every write. */
-export type Meta = Api.MetaResponse;
+export type Meta = Api.MetaResponse & {
+  /** A hosted board sets this when its Worker serves /api/wiki. */
+  wiki?: boolean;
+  wiki_managed_files?: true;
+  /** Optional capability flags advertised by a hosted board's /api/meta. */
+  my_work?: boolean;
+  milestones?: boolean;
+  workflows?: boolean;
+  work_conversations?: boolean;
+  human_threads?: boolean;
+  credential_requests?: boolean;
+  app_automatic_updates?: boolean;
+  /** The Settings sections this board serves for this viewer. Absent: not stated. */
+  settings_sections?: readonly string[];
+};
 
 export interface Health {
   ok: boolean;
@@ -806,9 +1082,9 @@ export interface MemoryQuorum {
   /** Whether this current revision is available to agents. */
   eligible: boolean;
   reason?: string | null;
-  /** Whether proposal receipts are ready for PM finalization. */
+  /** Whether the candidate's policy permits native finalization. */
   accept?: MemoryQuorumCheck | null;
-  /** Whether verification receipts are ready for PM finalization. */
+  /** Whether revalidation requirements permit native finalization. */
   verify?: MemoryQuorumCheck | null;
 }
 
@@ -822,7 +1098,7 @@ export interface MemoryFinalization {
 
 /** A lesson's freshness as retrieval reads it (CAD-395). */
 export interface MemoryEvidence {
-  /** verified (inside the window) | unverified | withheld (stale mark). */
+  /** verified | unverified | withheld (stale or unused-expired). */
   state: "verified" | "unverified" | "withheld" | string;
   /** "verified <date>", "unverified (last verified <date>)", "unverified" or "withheld". */
   label: string;
@@ -831,6 +1107,30 @@ export interface MemoryEvidence {
   /** The verify finalization time — not the raw verified_at field. */
   last_verified?: string | null;
   window_days?: number | null;
+}
+
+/** Bounded policy projection; canonical audit history stays in project memory. */
+export interface MemoryPolicyV2 {
+  revision: number;
+  nature: string;
+  provenance: string;
+  audience: string;
+  roles: string[];
+  author_vendor?: string | null;
+  contributors_count: number;
+  evidence_refs_count: number;
+  requirements: string[];
+  verification_condition?: {
+    check_id: string;
+    source_revision?: string | null;
+    target_revision?: string | null;
+  } | null;
+  feedback: {
+    used_reports: number;
+    wrong_reports: number;
+    reread_reports: number;
+    last_used_at?: string | null;
+  };
 }
 
 export interface MemoryCard {
@@ -860,7 +1160,10 @@ export interface MemoryCard {
   /** Immutable receipts retained across review cycles. */
   review_count?: number | null;
   finalization_count?: number | null;
+  /** V2 returns the latest eight decisions; full counts/history are retained. */
   finalized_operations?: MemoryFinalization[] | null;
+  /** Absent on older daemons or for an existing legacy record. */
+  policy?: MemoryPolicyV2 | null;
   /** Absent on older daemons; absence means verification is unavailable. */
   quorum?: MemoryQuorum | null;
   fact: string;
@@ -1284,11 +1587,14 @@ export interface WaitingTurn {
 export interface UpdateStatus {
   current: { sha: string | null; version: string | null };
   check: UpdateCheck | null;
+  /** Complete check when its summary cannot safely be represented to older tabs. */
+  check_with_unavailable_summary?: UpdateCheck | null;
   checked_at: number | null;
   checking: boolean;
   update_available: boolean;
-  change_count: number;
-  changes: string[];
+  changes_available?: boolean;
+  change_count: number | null;
+  changes: string[] | null;
   migration: boolean;
   blockers: string[];
   running: boolean;
@@ -1306,8 +1612,9 @@ export interface UpdateCheck {
   target: string;
   target_version: string | null;
   up_to_date: boolean;
-  changes: string[];
-  change_count: number;
+  changes_available?: boolean;
+  changes: string[] | null;
+  change_count: number | null;
   schema: { current: number | null; target: number | null; migration: boolean };
   lease: Record<string, unknown> | null;
   waiters: WaitingTurn[];
@@ -1376,7 +1683,17 @@ export interface ConnectionProvider {
   /** Always false: listing providers never checks the network. */
   network_checked: boolean;
   registration_digest: string | null;
+  /** The reviewed connected read this provider serves, or null. */
+  read?: {
+    slug: string;
+    qualified: boolean;
+    pinned: boolean;
+    projected: boolean;
+  } | null;
   verification_support?: ConnectionVerificationSupport | null;
+  /** CAD-2428: hosted platform toolkit details. Untrusted wire value — read it only through
+   *  `hostedProvider` (connectionsView), which treats a malformed shape as absent. */
+  hosted?: unknown;
 }
 
 export interface ConnectionProvidersPayload {
@@ -1389,6 +1706,95 @@ export interface ConnectionProvidersPayload {
  * or `enrolled` (an operator-enrolled credential). Carries metadata
  * only — never secret bytes.
  */
+/** CAD-1085: one metadata-only human credential request. No credential,
+ *  fragment, digest or entry-session binding is ever a field here — the
+ *  trusted entry page carries the value, never this record. */
+/** GET /api/protected-entry — where the trusted credential form lives. */
+export interface ProtectedEntry {
+  configured: boolean;
+  protected: boolean;
+  origin: string | null;
+  board_origin: string;
+}
+
+export interface CredentialRequest {
+  request_id: string;
+  request_revision: number;
+  provider: string;
+  verb: "enroll" | "rotate" | "verify";
+  connection_id: string | null;
+  /** Opaque target account for a fresh enrollment; the connection id for
+   *  rotate. Human-facing text is `display_alias`. */
+  target_id: string;
+  display_alias: string;
+  shape:
+    | "token"
+    | "smtp"
+    | "native-model-api-key"
+    | "native-model-devin-credentials"
+    | null;
+  scopes: string[];
+  expected_credential_revision: number | null;
+  expected_authorization_revision: number | null;
+  custody_domain: string;
+  custody_epoch: number;
+  context_digest: string;
+  requester_kind: "operator_cli" | "operator_ui" | "agent";
+  requester_participant: string | null;
+  conversation_id: string | null;
+  target_agent_uid: string | null;
+  state: "pending" | "submitting" | "done" | "cancelled" | "expired" | "unknown";
+  status: string;
+  result_code: string | null;
+  result_connection_id?: string | null;
+  verification_request_id: string | null;
+  /** CAD-1085: server-selected absolute URL of the trusted entry page for
+   *  this request. Present only when the deployment has a pinned separate
+   *  origin; never built from the current page origin. */
+  entry_url?: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+  expires_at_ms: number;
+  entry_path: string;
+  /** Read-only reconciliation; a locked key/advanced epoch is a blocker,
+   *  never a success claim. Absent on the create response path only. */
+  readiness?: {
+    ready: boolean;
+    blocker: string | null;
+    custody_epoch: number | null;
+    context_current: boolean;
+  };
+  /** CAD-2317: durable one-shot inline chat resume projection. */
+  resumed?: boolean;
+  resumed_connection_id?: string | null;
+  resumed_message_id?: string | null;
+}
+
+/** CAD-1085: an agent's durable connection/access projection — metadata
+ *  only, plus the daemon's reported custody facts. */
+export interface AgentAccess {
+  agent: string;
+  grants: {
+    agent: string;
+    platform: string;
+    account: string;
+    scopes: string[];
+    granted_at: number;
+    by: string;
+  }[];
+  connections: Connection[];
+  connections_error: string | null;
+  custody: {
+    configured: boolean;
+    unlocked: boolean;
+    fenced: boolean;
+    isolation: string;
+    protected: boolean;
+  };
+  network_checked: boolean;
+  execution_authority: boolean;
+}
+
 export interface Connection {
   id: string;
   provider: string;
@@ -1397,6 +1803,13 @@ export interface Connection {
   revision: number | null;
   registration_digest: string | null;
   scopes: string[];
+  /** The reviewed connected read this account serves, or null. */
+  read?: {
+    slug: string;
+    qualified: boolean;
+    pinned: boolean;
+    projected: boolean;
+  } | null;
   /**
    * Non-secret SMTP sender projection (CAD-785): transport and
    * verified sender from host custody. Absent for other providers —
@@ -1428,6 +1841,151 @@ export interface Connection {
     execution_authority: boolean;
     network_checked: boolean;
   };
+  /** CAD-2317: personal vs shared access & safety policy. */
+  policy?: ConnectionPolicy | null;
+  /** CAD-2428: hosted platform account details. Untrusted wire value — read it only through
+   *  `hostedAccount` (connectionsView), which treats a malformed shape as absent. */
+  hosted?: unknown;
+  /** AOS-682 / CAD-2556: additive Custom MCP metadata projected on `/api/connections`. */
+  custom_mcp?: unknown;
+}
+
+export type CustomMcpAuthKind = "auto" | "oauth" | "oauth_static" | "bearer" | "header" | "none";
+export type CustomMcpStoredAuthKind = "oauth" | "oauth_static" | "bearer" | "header" | "none";
+export type CustomMcpToolMode = "off" | "approval" | "read";
+export type CustomMcpStatus = "pending_oauth" | "active" | "auth_expired" | "needs_review" | "revoked";
+
+export interface CustomMcpToolPin {
+  tool_name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  annotations: Record<string, unknown> | null;
+  tool_digest: string;
+  mode: CustomMcpToolMode;
+  drifted: boolean;
+  pending_description: string | null;
+  pending_tool_digest: string | null;
+  updated_at: number;
+}
+
+export interface CustomMcpToolsSummary {
+  total: number;
+  read: number;
+  approval: number;
+  off: number;
+  drifted: number;
+}
+
+export interface CustomMcpConnectionSummary {
+  id: string;
+  name: string;
+  endpoint_url: string;
+  endpoint_host: string;
+  auth_kind: CustomMcpStoredAuthKind;
+  auth_hint: string | null;
+  oauth_issuer: string | null;
+  oauth_scopes: string[];
+  oauth_account: string | null;
+  visibility: "shared" | "personal";
+  status: CustomMcpStatus;
+  snapshot_revision: number;
+  pending_revision: number | null;
+  server_name: string | null;
+  server_version: string | null;
+  server_instructions_digest: string | null;
+  has_server_instructions: boolean;
+  instructions_drifted: boolean;
+  has_agent_guide: boolean;
+  agent_guide_source: string | null;
+  last_synced_at: number | null;
+  last_used_at: number | null;
+  created_at: number;
+  updated_at: number;
+  connected_by_you?: boolean;
+  tools_summary: CustomMcpToolsSummary;
+  tools?: CustomMcpToolPin[];
+  server_instructions?: string | null;
+  pending_server_instructions?: string | null;
+  agent_guide_md?: string | null;
+}
+
+export interface CustomMcpListPayload {
+  connections: CustomMcpConnectionSummary[];
+}
+
+export interface CustomMcpOAuthDiscovery {
+  issuer: string | null;
+  authorization_host: string;
+  registration: "dcr" | "static";
+  scopes: string[];
+  resource_metadata_url: string | null;
+}
+
+export type CustomMcpCreatePayload =
+  | { mode: "connected"; connection: CustomMcpConnectionSummary }
+  | {
+      mode: "oauth_redirect";
+      authorization_url: string;
+      connection_id: string;
+      discovery?: CustomMcpOAuthDiscovery;
+    };
+
+export interface CustomMcpOAuthStartPayload {
+  authorization_url: string;
+  connection_id: string;
+  discovery?: CustomMcpOAuthDiscovery;
+}
+
+export interface CustomMcpConnectionPayload {
+  connection: CustomMcpConnectionSummary;
+}
+
+export interface CustomMcpGuideImportPayload {
+  markdown: string;
+  source_url: string;
+  bytes: number;
+}
+
+export interface CustomMcpRevokePayload {
+  id: string;
+  status: string;
+}
+
+/** CAD-2428: one published tool an account can run. draft/send always wait for approval. */
+export interface HostedTool {
+  slug: string;
+  label: string;
+  effect: "read" | "draft" | "send";
+}
+
+/** CAD-2428: the narrowed `Connection.hosted`. */
+export interface HostedAccount {
+  label: string;
+  visibility: "personal" | "shared";
+  connectedByYou: boolean;
+  connectedAt: number | null;
+  lastUsedAt: number | null;
+  canChangeVisibility: boolean;
+  tools: HostedTool[];
+}
+
+/** CAD-2428: the narrowed `ConnectionProvider.hosted`. */
+export interface HostedProvider {
+  label: string;
+  tools: HostedTool[];
+}
+
+export interface ConnectionPolicy {
+  connection_id: string;
+  provider: string;
+  visibility: "shared" | "personal";
+  owner_user_id: string | null;
+  is_default: boolean;
+  write_mode: "ask_approval" | "read_only";
+  allow_external_triggers: boolean;
+  allowed_agents: string[];
+  policy_revision: number;
+  updated_at: number;
 }
 
 export interface ConnectionsPayload {
@@ -1435,10 +1993,65 @@ export interface ConnectionsPayload {
   /** CAD-1126: enrolled SMTP senders send through the hosted
    *  `smtp.internal` pass-through (a hosted workspace). */
   hosted_smtp?: boolean;
+  /** The list is partial: the board couldn't reach the platform's accounts. */
+  connections_unavailable?: { code?: string; message?: string };
 }
 
 export interface ConnectionPayload {
   connection: Connection;
+}
+
+/** One exact Search Console property the account can read. */
+export interface ConnectionSite {
+  site_url: string;
+  permission_level: string;
+}
+
+/** `GET /api/connections/<id>/sites` — exact properties and the current pin. */
+export interface ConnectionSitesPayload {
+  sites: ConnectionSite[];
+  selected: string | null;
+}
+
+/** `POST /api/connections/<id>/site` — the newly pinned property. */
+export interface ConnectionSitePayload {
+  site: ConnectionSite;
+}
+
+/** Provider asset kinds supported by `/api/connections/<id>/assets`. */
+export type ConnectionAssetKind =
+  | "search_console_site"
+  | "meta_ad_account"
+  | "google_ads_customer";
+
+/** One selectable provider asset returned by `GET /api/connections/<id>/assets`. */
+export interface ConnectionAsset {
+  value: string;
+  label: string;
+  permission: string;
+  selectable: boolean;
+  currency?: string;
+  timezone?: string;
+}
+
+/** `GET /api/connections/<id>/assets` — live assets and current connection-level pin. */
+export interface ConnectionAssetsPayload {
+  kind: ConnectionAssetKind;
+  assets: ConnectionAsset[];
+  selected: string | null;
+}
+
+/** One pinned provider asset returned by `POST /api/connections/<id>/asset`. */
+export interface ConnectionAssetSelection {
+  kind: ConnectionAssetKind;
+  value: string;
+  label: string;
+  permission: string | null;
+}
+
+/** `POST /api/connections/<id>/asset` — the newly pinned provider asset. */
+export interface ConnectionAssetPayload {
+  asset: ConnectionAssetSelection;
 }
 
 /**
@@ -1507,4 +2120,225 @@ export interface ConnectionVerificationReceipt {
 /** The typed envelope `POST /api/connections/<id>/test` returns. */
 export interface ConnectionVerificationPayload {
   verification: ConnectionVerificationReceipt;
+}
+
+/** CAD-2240: `GET /api/projects/<key>/timeline` on a hosted board
+ *  (`hosted-cadence-project-timeline.v1`), newest first. */
+export type TimelineKind = "created" | "status" | "owner" | "claim" | "comment" | "message" | "review";
+export interface TimelineEvent {
+  id: string;
+  at: string;
+  kind: TimelineKind;
+  ticket: string;
+  title: string;
+  actor: { name: string; kind: "member" | "agent" | "system" } | null;
+  from: string | null;
+  to: string | null;
+  landed: boolean;
+  text: string | null;
+  to_role: string | null;
+  decision: string | null;
+  open: boolean;
+  open_days: number | null;
+}
+export interface ProjectTimeline {
+  version: string;
+  project: string;
+  recording_since: string | null;
+  events: TimelineEvent[];
+  next_before: string | null;
+  truncated: boolean;
+}
+
+/** CAD-2317: Routines (`Context Markdown` playbooks & `sha256`-pinned scripts). */
+export interface ChecklistStep {
+  id: string;
+  label: string;
+  requires_approval: boolean;
+  state: string;
+}
+
+export interface RoutineRun {
+  id: string;
+  routine_id: string;
+  due_instant: number;
+  trigger_source: "manual" | "schedule" | "external_event" | string;
+  state:
+    | "running"
+    | "completed"
+    | "skipped_empty"
+    | "skipped_stale"
+    | "skipped_overlap"
+    | "waiting_approval"
+    | "failed"
+    | string;
+  approved_rev: string | null;
+  approved_sha256: string | null;
+  checklist_state: ChecklistStep[];
+  checklist?: ChecklistStep[];
+  script_output: unknown;
+  message_id: string | null;
+  error: string | null;
+  started_at: number;
+  finished_at: number | null;
+  deduped?: boolean;
+  routine_name?: string;
+  agent_alias?: string;
+}
+
+export interface Routine {
+  id: string;
+  name: string;
+  agent_alias: string;
+  trigger_kind: "schedule" | "event";
+  cron: string | null;
+  interval_mins: number | null;
+  timezone: string | null;
+  event_source: string | null;
+  target_kind: "markdown" | "script" | "script_then_markdown";
+  markdown_path: string | null;
+  approved_rev: string | null;
+  current_rev: string | null;
+  script_path: string | null;
+  approved_sha256: string | null;
+  current_sha256: string | null;
+  approval_drift: boolean;
+  destination_thread: string | null;
+  connection_account: string | null;
+  checklist: ChecklistStep[];
+  inputs: Record<string, unknown>;
+  status: "on" | "waiting_approval" | "repoint_required" | "paused";
+  stored_status: string;
+  pause_reason: string | null;
+  consecutive_failures: number;
+  next_due_at: number | null;
+  last_run_at: number | null;
+  last_run_state: string | null;
+  created: number;
+  updated: number;
+  runs?: RoutineRun[];
+}
+
+export interface StagedRoutineProposal {
+  id: string;
+  kind: "wiki_propose" | "routine_propose" | string;
+  proposed_by: string;
+  title: string;
+  payload: Record<string, unknown>;
+  state: "pending" | "approved" | "rejected" | string;
+  created_at: number;
+  decided_at: number | null;
+}
+
+export interface RoutinesPayload {
+  routines: Routine[];
+  staged_proposals: StagedRoutineProposal[];
+  waiting_runs?: RoutineRun[];
+}
+
+export interface RoutinePayload {
+  routine: Routine;
+}
+
+/** AOS-693 / CAD-2627: ephemeral user-triggered agent-to-agent temp channels. */
+export type TempChannelStatus = "open" | "closed" | "expired";
+export type TempChannelViewerRole = "host" | "peer" | "supervisor";
+export type TempChannelMessageRole = "host" | "peer" | "supervisor" | "system";
+export type TempChannelMessageKind =
+  | "request"
+  | "question"
+  | "report"
+  | "proposal"
+  | "decision"
+  | "system";
+export type TempChannelDecision = "handled" | "discarded" | "needs_human";
+export type TempChannelTriageStatus = "pending" | "handled" | "discarded" | "needs_human";
+export type TempChannelAuditStatusFilter = "all" | "open" | "needs_human" | "ended";
+
+export interface TempChannelSummary {
+  id: string;
+  workspace_id: string;
+  purpose: string;
+  status: TempChannelStatus;
+  created_at: number;
+  expires_at: number;
+  closed_at: number | null;
+  closed_reason: string | null;
+  max_messages: number;
+  message_count: number;
+  lock_first_peer: boolean;
+  peer_claimed: boolean;
+  peer_label: string | null;
+  peer_joined_at: number | null;
+  host_label: string | null;
+  latest_seq: number;
+}
+
+export interface TempChannelMessage {
+  seq: number;
+  id: string;
+  role: TempChannelMessageRole;
+  sender_label: string | null;
+  kind: TempChannelMessageKind;
+  body: string;
+  created_at: number;
+  in_reply_to: string | null;
+  triage_status: TempChannelTriageStatus | null;
+  decision_summary: string | null;
+  decided_at: number | null;
+  decided_by: string | null;
+  untrusted_external_data: boolean;
+}
+
+export interface TempChannelSnapshot {
+  channel: TempChannelSummary;
+  viewer_role: TempChannelViewerRole;
+  messages: TempChannelMessage[];
+  latest_seq: number;
+  security_notice: string;
+}
+
+export interface TempChannelAuditItem extends TempChannelSummary {
+  creator_user_id: string;
+  creator_label: string | null;
+  pending_count: number;
+  needs_human_count: number;
+  updated_at: number;
+}
+
+export interface TempChannelAuditCounts {
+  all: number;
+  open: number;
+  needs_human: number;
+  ended: number;
+}
+
+export interface TempChannelAuditListPayload {
+  channels: TempChannelAuditItem[];
+  total: number;
+  counts: TempChannelAuditCounts;
+}
+
+export interface TempChannelAuditDetailPayload {
+  snapshot: TempChannelSnapshot;
+  creator_user_id: string | null;
+  creator_label: string | null;
+}
+
+export interface TempChannelDecidePayload {
+  channel: TempChannelSummary;
+  target_message_id: string;
+  triage_status: TempChannelDecision;
+  decision_message: TempChannelMessage;
+}
+
+export interface TempChannelRotatePeerPayload {
+  channel: TempChannelSummary;
+  api_url: string;
+  peer_prompt: string;
+}
+
+export interface TempChannelClosePayload {
+  channel: TempChannelSummary;
+  message: TempChannelMessage | null;
 }

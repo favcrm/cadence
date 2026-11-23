@@ -1,0 +1,3 @@
+# CAD-1946: hosted delivery gate signer (agenticos-v2 DO/Worker); the merge queue's
+# delivery-gate job reads this file from the merge group's base. Rotating it is an operator-approved PR.
+cadence-hosted-delivery-gate namespaces="cadence-delivery-gate" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE2gFVuMB7cHulG5I/kSpzx6YXw9s5tWoia7zAP5ENfK

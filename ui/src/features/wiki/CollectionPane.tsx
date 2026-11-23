@@ -61,6 +61,7 @@ export default function CollectionPane({
   const [corrections, setCorrections] = useState<KnowledgeCorrection[] | null>(null);
   const [canReview, setCanReview] = useState(false);
   const [correctionError, setCorrectionError] = useState<string | null>(null);
+  const [unsupported, setUnsupported] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -74,6 +75,7 @@ export default function CollectionPane({
     }
     setError(null);
     setDenied(false);
+    setUnsupported(false);
     void readCollection(path, operation)
       .then((next) => {
         operation.assertCurrent();
@@ -86,6 +88,11 @@ export default function CollectionPane({
       .catch((reason: unknown) => {
         if (operation.signal.aborted) return;
         const status = reason instanceof Error && "status" in reason ? Number((reason as { status: number }).status) : 0;
+        if (status === 501) {
+          // The hosted Worker carries no collections: nothing to show, nothing to retry.
+          setUnsupported(true);
+          return;
+        }
         if (status === 401 || status === 403) {
           setDenied(true);
           setState(null);
@@ -110,6 +117,10 @@ export default function CollectionPane({
       })
       .catch((reason: unknown) => {
         if (reviews.signal.aborted) return;
+        if (reason instanceof Error && "status" in reason && Number((reason as { status: number }).status) === 501) {
+          setCorrections([]);
+          return;
+        }
         setCorrectionError(reason instanceof Error ? reason.message : String(reason));
       })
       .finally(() => reviews.dispose());
@@ -192,6 +203,7 @@ export default function CollectionPane({
     }
   };
 
+  if (unsupported) return null;
   if (denied) return <Note warn>{t("Access denied. Collection names, originals and corrections stay hidden.")}</Note>;
   if (error) return <Failure what="could not load collection metadata" error={error} onRetry={load} />;
   if (!state || !draft) return <Loading what="loading collection metadata…" />;

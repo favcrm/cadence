@@ -1,7 +1,7 @@
 {
-  "contract": "app-screen-projection-fixtures/4",
-  "artifact_sha256": "70f6d304ff4b6f75b353178972facca1024291816d634f6a9446750110253e98",
-  "golden_sha256": "1e478429a81facf60b5df2df3a77f909d5465ca4d690ca47763796c8d0f97171",
+  "contract": "app-screen-projection-fixtures/10",
+  "artifact_sha256": "a2b939e1ac6871703d549b2c24d0e5d7bc4be14aa10980c1913e48743e8c20f3",
+  "golden_sha256": "1007c16866a6e0f4f1f3bcf0d141e7c19ee6817217746f28814d1254b3f360f1",
   "scenarios": [
     "empty",
     "loading",
@@ -13,19 +13,19 @@
   "dependencies": [
     {
       "path": "ui/scripts/app-fixtures/producer.ts",
-      "sha256": "4e7f9ac451a141eeb9eeec7d276f09f09a7271a39e9116ef6283b1ace0622f63"
+      "sha256": "9189cd880b82574b84878855d4718335c103969f8f044da2b61bf6769bd1b0b4"
     },
     {
       "path": "ui/src/features/workspace-apps/screen/screenProjection.ts",
-      "sha256": "6b4b1d4e100bbc682dbcbbc8b3da6fd90bd2ca65bd7ad1104e4f77c7f30e707c"
+      "sha256": "6fed151bb28308d116f9ac313793d787bdcddc01c89c1d8a70f0a769c90f6804"
     },
     {
       "path": "ui/src/features/workspace-apps/screen/screenProtocol.ts",
-      "sha256": "a666924343eaa642c58dfb2d8d5adb3463afadfc2fac5e2b26f01d28651f8019"
+      "sha256": "9b8851ce6c5faa4fe31714db39d62a3b293c131ec8be9963c8ad4119d4df6c1f"
     },
     {
       "path": "ui/src/lib/api.ts",
-      "sha256": "adafd655df3a9c149ad34a511bc54580d7c54d84b8c95dcfdea6769e6697da1d"
+      "sha256": "8b3290a352ca21a5c2bc5c23bc16b5efd77d7140b09de388d5f95a1e2c22e671"
     },
     {
       "path": "ui/src/lib/conditionalGet.ts",
@@ -37,7 +37,7 @@
     },
     {
       "path": "ui/src/lib/sessionKey.ts",
-      "sha256": "26812f403555cff2c2025603d1c4d378932d1b0cc653c61cfb0304aab0a7fe70"
+      "sha256": "e3be9a441ffa88896832fd976db69c4a9b68f707767a72d07e4d921966bd6bda"
     }
   ]
 }

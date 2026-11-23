@@ -20,13 +20,16 @@ const hits: SearchHit[] = [
 ];
 
 equal(TYPE_FILTERS, ["all", "pages", "images", "video", "pdf"], "the chips");
-equal(hits.map(hitKind), ["pages", "images", "video", "pdf", "pages"], "each hit's kind");
+equal(hits.map(hitKind), ["pages", "images", "video", "pdf", null], "each hit's kind; an attachment with no chip of its own has none");
 equal(filterHits(hits, "all").length, 5, "all keeps everything");
-equal(filterHits(hits, "pages").map((h) => h.name), ["tokens.md", "exports.zip"], "pages keeps md and other text");
+equal(filterHits(hits, "pages").map((h) => h.name), ["tokens.md"], "pages keeps pages only — a zip is not a page");
 equal(filterHits(hits, "images").map((h) => h.name), ["board-v5.png"], "images");
 equal(filterHits(hits, "video").map((h) => h.name), ["demo-cut.mp4"], "video");
 equal(filterHits(hits, "pdf").map((h) => h.name), ["spec-draft.pdf"], "pdf");
 equal(filterHits([], "images"), [], "an empty result stays empty");
+// The hosted board says which hits are attachments; that beats the name.
+equal(hitKind({ ...hits[0], kind: "file" }), null, "a host-declared file is never counted as a page");
+equal(hitKind({ path: "global/report.pdf", name: "report.pdf", kind: "file", snippet: "x" }), "pdf", "an attachment takes its own chip");
 
 const repeated = [hits[0], hits[1], { ...hits[0], line: 8, snippet: "another tokens match" }];
 const grouped = groupHits(repeated);

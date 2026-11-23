@@ -12,7 +12,7 @@ When defining or revising a standard, put a short human-readable style guide in 
 
 Reuse an adequate existing guide; do not redefine the company's style on every request. Analyse new references or gaps only as needed for the selected output.
 
-A financial template (`kind` `quotation` or `invoice`) does not gain authoring guideline or reference fields. Its presentation standard is the existing approved DOCX. A separately selected company reference pack may inform a review of that DOCX or its export. It is not the financial renderer and it is not approval of the financial version. Do not write authoring guidelines into a financial template or change a financial template or retained record from this guide. Any change to that DOCX or its spec is a financial revision and still needs the required operator approval.
+A financial template (`kind` `quotation` or `invoice`) does not gain authoring guideline or reference fields. Its presentation standard is the existing approved DOCX. A separately selected company reference pack may inform a review of that DOCX or its export. It is not the financial renderer and it is not approval of the financial version. Do not write authoring guidelines into a financial template or change a financial template or retained record from this guide. Any change to that DOCX or its spec is a financial revision and still needs the owner's approval.
 
 Label every choice:
 
@@ -61,14 +61,14 @@ For DOCX, PPTX, XLSX, or text, apply the same grammar in that format's real styl
 
 ## Quotations and invoices
 
-Use the financial path for amounts and for the file the reader sees: the approved quotation or invoice DOCX, the confirmed native calculation, the retained draft, and DOCX plus PDF export. That approved DOCX is the presentation standard. Do not author an HTML quotation or invoice as a substitute renderer, and do not treat a company reference pack as one. Shared print judgement below is a review of that exported surface. Where the DOCX path cannot repeat a header, avoid a clip, or match a reference-pack observation, report the limitation. Matching the pack is not a reason to edit the approved template or the retained draft in place.
+An issuable quotation or invoice uses the financial path: the approved template, the confirmed calculation, the retained draft and its export. Where that template is DOCX, it is the presentation standard. An HTML view of a priced draft is allowed under `references/quotation.md`; it never replaces an approved template the company already has, and a company reference pack does not become a renderer. Shared print judgement below is a review of the surface the reader sees. Where the DOCX path cannot repeat a header, avoid a clip, or match a reference-pack observation, report the limitation. Matching the pack is not a reason to edit the approved template or the retained draft in place.
 
-Styling does not create facts. Identifiers, dates, status, currency, tax, discounts, totals, and payment details come from the authorised commercial inputs and the native calculation. Do not invent a number, a paid state, or a bank detail.
+Styling does not create facts. Identifiers, dates, status, currency, tax, discounts, totals, and payment details come from the authorised commercial inputs and the calculation. Do not invent a number, a paid state, or a bank detail.
 
 On the actual exported pages, check:
 
 - Identifiers, dates, status, and payment instructions match their provenance.
-- Each displayed amount matches the native result: line extensions, selected subtotal, discount, tax, and total. A styling pass does not recalculate.
+- Each displayed amount matches the calculated result: line extensions, selected subtotal, discount, tax, and total. A styling pass does not recalculate.
 - A long item list stays readable: the header row repeats, a figure stays with its description, and totals remain with their labels. Report clipping, overlap, or a dropped repeating header instead of hiding it.
 
-Layout repair stays in Stage 2. A change to price, selection, status, or payment returns to confirmation. Nothing here grants approval, numbering, issue, or send.
+Layout repair needs no new confirmation. A change to price, selection, status, or payment does. Nothing here grants approval, numbering, issue, or send.

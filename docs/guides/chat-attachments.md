@@ -18,31 +18,68 @@ The local-administrative session represents one shared local-admin account,
 not distinct human users; older unbound sessions must reauthenticate. Verified
 named issuer/workspace/subject accounts remain distinct.
 
-**Availability: text, Markdown and CSV only.** The allowlist is `.txt`,
-`.md` and `.csv`. A Home message carries Home uploads; an app conversation
+**Availability: PDF, UTF-8 text, and verified images.** A file is admitted by
+its bytes, not by a short extension list: any bounded UTF-8 text document,
+including ordinary source files, plus `.pdf`, plus PNG, JPEG and WebP rasters
+and inert SVG source. An image is only admitted when the selected model
+actually accepts visual input; otherwise the upload refuses with a reason and
+the draft survives. A Home message carries Home uploads; an app conversation
 carries uploads scoped to its installation, context and conversation, and only
 while the installation's current exact-approved bundle declares `file.upload`
-(see [Scope and retry rules](#scope-and-retry-rules)). **PDF and image files
-(`.pdf`, `.png`, `.jpg`, `.jpeg`, `.webp`) are refused with a specific reason**
-at the composer, the board route and the daemon: their processing is CAD-1233.
-An uploaded CSV is a retained text attachment the assistant can read; it is
-not a staged import — the CRM review/mapping bridge (preview, field mapping,
-consent) is CAD-1233, so nothing here imports rows, infers consent or builds a
-campaign. Retention and quota are described in
-[Quota admission contract](#quota-admission-contract).
+(see [Scope and retry rules](#scope-and-retry-rules)). An uploaded CSV is a
+retained text attachment the assistant can read; it is not a staged import —
+the CRM review/mapping bridge (preview, field mapping, consent) is CAD-1233, so
+nothing here imports rows, infers consent or builds a campaign. Retention and
+quota are described in [Quota admission contract](#quota-admission-contract).
 
 ## What an operator can attach
 
-- Kinds (interim allowlist, enforced by daemon byte-sniff, not the extension
-  alone): `.txt`, `.md`, `.csv`. The extension must match the sniffed bytes.
-- Size: at most **10 MiB** per file; at most **5 files** per message.
+- Kinds, decided by the daemon from the bytes rather than the name:
+  - **UTF-8 text**, at any extension the composer offers except the names the
+    daemon refuses outright: executables, archives and packages (`.exe`,
+    `.dll`, `.so`, `.wasm`, `.jar`, `.zip`, `.tar`, `.gz`, `.7z`, `.deb`,
+    `.rpm`, `.apk` and their siblings) and media containers (`.heic`, `.mp4`,
+    `.mov`, `.mkv`, `.mp3`, `.wav` and their siblings). A NUL byte, invalid
+    UTF-8 or an empty body refuses too, so an unknown binary is never retained
+    as text.
+  - **`.pdf`**, retained as the original and read through the same bounded
+    `pdftotext` seam the wiki ingest uses, under the attachment text cap. A
+    corrupt, encrypted or text-free (image-only) PDF is refused at upload with
+    its own reason — never retained as an attachment the assistant cannot read,
+    and no OCR is attempted. `pdftotext` comes from `poppler-utils`, which the
+    host must install; without it a PDF is refused with a message naming the
+    missing tool rather than as a bad file, and the `tests` workflow installs it
+    on its runner.
+  - **`.png`, `.jpg`, `.jpeg`, `.webp`**, admitted only after a real decoder
+    accepts the whole file within the dimension, pixel and allocation bounds.
+    The extension must match the sniffed bytes and the decoded dimensions must
+    match the header's.
+  - **`.svg`**, retained as inert source and rendered to a bounded raster for
+    the model. The source is parsed with `roxmltree` (document types disabled)
+    and refused whole if it carries script, embedded markup, animation, an
+    event handler, a CSS escape, or any reference outside a same-document
+    fragment or an embedded PNG/JPEG/WebP data URI. The stylesheet is judged as
+    the renderer concatenates it, so a comment cannot split a forbidden token,
+    and an XML declaration may not name an encoding other than UTF-8 — a second
+    declared encoding would be a second parse of the same bytes. The renderer is
+    `rsvg-convert` from `PATH`, which must be root-owned and not writable;
+    it runs under a Landlock ruleset built before fork plus
+    `RLIMIT_CPU/AS/FSIZE/CORE/NOFILE/NPROC` and a process-group deadline. Text
+    outside the host font set renders as missing glyphs, which the model sees
+    as-is.
+- Size: at most **10 MiB** per file; at most **5 files** per message. A visual
+  attachment is additionally bounded at delivery: at most 4 MiB per raster
+  after conversion, and at most 16 MiB of native image bytes across one turn
+  (a library image pin plus the attachments).
 - Attachments fail closed: unsafe symlinks or ownership/modes in the captured
   operational workspace path, or in legacy quota custody, make uploads refuse.
-- The composer pre-checks the same list and cap and its file picker offers
-  only `.txt,.md,.csv`; the daemon's checks are the enforcement. A `.pdf`,
-  `.png`, `.jpg`, `.jpeg` or `.webp` upload (by name or by sniffed bytes) is
-  refused with "PDF and image processing is not available yet" — no parser,
-  OCR or image processing runs on attachments.
+- The composer pre-checks only the size and count caps and its file picker
+  offers every kind; the daemon's byte checks are the enforcement. A visual
+  attachment is proved at upload, not only at send: an SVG must screen and
+  render, a raster must decode inside the bounds, and the selected model must
+  admit image input (native) or publish an image policy (hosted). A refusal
+  leaves the file unretained and the draft intact, and names which of those
+  failed.
 
 ## The path a file takes
 
@@ -94,11 +131,15 @@ campaign. Retention and quota are described in
    carries a daemon-minted `chf-<32-hex>` id and its digest is verified on read.
 5. `thread_send` accepts `attachments: [{id}]` (1–5 ids, `chf-` grammar) from
    the operator chat only. **Readiness is checked against the actual bytes,
-   not the row's existence**: the row must be a text kind, the blob must
-   exist as a regular file, and its bounded content must still match the
-   declared size and digest, sniff as an allowed text kind, decode as UTF-8
-   and pass the secret gate. An altered, unreadable, oversized or
-   non-text row refuses the send before the message is queued. Version-1
+   not the row's existence**: the blob must exist as a regular file, and its
+   bounded content must still match the declared size and digest and sniff as
+   the declared kind. A PDF must extract through the bounded converter, a text
+   kind must decode, and a raster must decode to pixels — it has no text to
+   extract. Text kinds also pass the secret gate. A visual kind is
+   additionally proved here and at upload: an SVG screens and renders, a
+   raster decodes inside the bounds, and the selected model admits image
+   input. An altered, unreadable, oversized or mislabelled row refuses the
+   send before the message is queued. Version-1
    paths derive from the validated stored owner/thread/attachment tuple;
    legacy paths derive from the validated stored digest, never request data.
 6. The resolved `{id,name,size,mime,sha256}` rows are stored on the entry's
@@ -127,10 +168,13 @@ campaign. Retention and quota are described in
    any byte is read. A non-master agent is refused. The master's gate-2
    allowlists admit `chat_file_read` in home and app turns.
 9. Read re-verifies the same opened bytes (bounded by the cap) against the
-   row's digest and returns `{extractable:true, text: <bounded>}` for text
-   kinds (≤64k chars, `secret::guard` re-run). A non-text row (none can be
-   uploaded) returns `{extractable:false}` metadata only — no fabricated
-   extraction.
+   row's digest, re-proves that its bytes still sniff as the row's declared
+   kind — the Home operator read reaches this projection without the readiness
+   helper, so the proof lives here too — and returns
+   `{extractable:true, text: <bounded>}` for a readable kind (≤64k chars,
+   `secret::guard` re-run). A raster has no text projection: it is delivered as
+   pixels to a vision-capable turn, never decoded into a fabricated caption. A
+   mislabelled row is refused; no fabricated extraction is ever returned.
 
 ## Scope and retry rules
 
@@ -175,15 +219,24 @@ campaign. Retention and quota are described in
   caller-supplied ancestor alias that no longer resolves to the staging
   dir (the source is read through the server-owned staging directory, not
   the caller's path); a retained file whose on-disk bytes no longer match
-  its recorded size/digest, that no longer sniffs as an allowed text kind,
+  its recorded size/digest, that no longer sniffs as its recorded kind,
   or whose digest path is a symlink or FIFO (`thread_send` and
   `chat_file_read` both re-check with a bounded no-follow open).
 - A board upload-staging name that already exists (the board uses
   exclusive create and never truncates or deletes a path it did not create).
-- Empty or oversized files; extensions outside the interim allowlist;
-  extension/magic mismatches; unknown or grammar-bad `chf-` ids on
+- Empty or oversized files; an extension that does not match the sniffed
+  bytes; an unknown or unsupported kind; unknown or grammar-bad `chf-` ids on
   `thread_send`.
-- PDF/image uploads, whatever their extension or claimed MIME.
+- A raster whose container is truncated, whose declared dimensions disagree
+  with its decoded pixels, that exceeds the side/pixel/allocation bound, or
+  that the decoder rejects. A PDF is accepted when its bytes are a PDF and its
+  text extracts; a corrupt, encrypted or text-free PDF is refused.
+- An SVG that is not well-formed XML, declares a document type, carries a
+  processing instruction, or trips any rule in
+  [What an operator can attach](#what-an-operator-can-attach); additionally an
+  SVG whose rasterized output cannot be brought under the image bound.
+- Visual delivery when the running runtime build cannot present an image or the
+  resolved model publishes no image policy.
 - An app-scoped upload or send without the exact-approved `file.upload`
   declaration, or whose installation, context or conversation does not match
   the stored row.
@@ -304,3 +357,37 @@ require the AOS-269 admission extension, a reference-capable published model and
 an enabled, priced image-to-image variant. Earlier native image audiences
 deliberately refuse editing. Do not remove the ceiling or treat source changes
 or an isolated loopback smoke as installation or paid operational verification.
+
+## Reading an attachment back to the board (CAD-2219)
+
+The hosted board serves an operator's own attachment back to the browser at
+`GET /api/chat/attachments/<chf-id>?conversation=<id>`. The route is scoped
+exactly as a send is — the signed-in subject and the resolved conversation — so
+an unknown id, another conversation's row or a missing blob answers `404`. Only
+a raster (PNG/JPEG/WebP), a PDF or an MP4/WebM is served. An SVG upload's
+retained source is never served: the preview is the bounded raster the model was
+shown, when one exists. A PDF is served `inline` with no sandbox policy so the
+browser's own viewer opens it in a new tab; every other kind carries `nosniff`,
+`Content-Security-Policy: sandbox; default-src 'none'` and `private, no-store`.
+
+Video uploads are accepted at up to 20 MiB (text, PDF and raster stay at
+10 MiB). A video is stored and played, never decoded: the model still receives
+its name, size and type only. A local board has no such route, and the client
+keeps the metadata chips there without requesting attachment bytes.
+
+### Give the assistant selected PDF pages as images
+
+On the hosted board, click the name of a PDF already in the conversation.
+In the dialog, enter page numbers and ranges, for example `1, 3–5`, and choose
+**Add to draft**. Duplicates are removed and the selected pages are attached
+as separate PNGs in document order. The batch must fit in the draft’s five
+attachment slots. **Open original PDF** opens the unchanged file. Draft PDFs
+attach and send normally.
+
+Your browser renders the pages locally, including scans, then uploads the PNGs
+through the normal private attachment queue. Converting never sends a message
+or opens the assistant’s browser. A failed conversion changes nothing in the
+draft; if a PNG upload fails, use the attachment’s retry or remove action.
+Image attachments still require a model that accepts visual input.
+On browsers that cannot run the PDF renderer, opening the original still works;
+update your browser to use page capture.

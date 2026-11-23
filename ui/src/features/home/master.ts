@@ -8,6 +8,8 @@ export const RESUME_COMMAND = "cadence agent resume master";
 export type MasterStatus =
   /** Agents not loaded yet. */
   | { kind: "unknown" }
+  /** Scoped readers cannot see the master's runtime state. */
+  | { kind: "unavailable" }
   /** The daemon is down — nothing can be sent. */
   | { kind: "offline" }
   /** No agent named `master` is registered. */
@@ -30,6 +32,7 @@ export function masterStatus(agents: AgentsPayload | null, threadMissing: boolea
   if (row.state === "stopped" || row.dead) {
     return { kind: "stopped", label: row.state_label ?? (row.dead ? "its process is gone" : "stopped") };
   }
+  if (row.state === null) return { kind: "unavailable" };
   return { kind: "running", state: row.state };
 }
 
@@ -40,6 +43,9 @@ export function composerBlock(block: string | null, status: MasterStatus, hosted
   switch (status.kind) {
     case "unknown":
       return "Checking whether the master is running…";
+    case "unavailable":
+      // Let the daemon decide whether the submitted message can be accepted.
+      return null;
     case "offline":
       return "The daemon is not reachable — messages send once it is back.";
     case "absent":
@@ -57,10 +63,9 @@ export function composerBlock(block: string | null, status: MasterStatus, hosted
 
 // ---- CAD-551: the composer's `/` verbs and the working row ----
 
-/** One `/` verb (CAD-551). `help` is composer-local — it never crosses
- * the board; the rest post to `/api/master/command`, whose own
- * allowlist is the daemon's set. `arg` is the autocomplete hint's
- * placeholder, `kind` splits reads from mutations for styling. */
+/** One `/` verb (CAD-551). `help` and `skills` stay in the UI; the other
+ * verbs post to `/api/master/command`. `arg` is the autocomplete hint's
+ * placeholder; `kind` splits reads from mutations for styling. */
 export interface SlashCommand {
   name: string;
   arg?: string;
@@ -77,9 +82,32 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "levels", blurb: "Thinking levels the provider offers", kind: "read" },
   { name: "effort", arg: "level", blurb: "Set the thinking level (bare: levels + current)", kind: "set" },
   { name: "compact", blurb: "Compact the session context now", kind: "act" },
-  { name: "new", blurb: "Restart the provider session — fresh context", kind: "act" },
+  { name: "new", blurb: "Start fresh — the assistant stops using the messages so far", kind: "act" },
   { name: "stop", blurb: "Interrupt the running turn", kind: "act" },
+  { name: "permissions", blurb: "Pending permission requests and saved rules", kind: "read" },
 ];
+
+export const WORKSPACE_SKILLS_COMMAND: SlashCommand = {
+  name: "skills",
+  blurb: "Browse approved workspace skills",
+  kind: "read",
+};
+
+/** Native boards offer `/permissions`; hosted Home has its local `/skills`
+ *  command, `/help` and the other verbs the board advertises. */
+export function offeredCommands(
+  hosted: boolean | null | undefined,
+  advertised: readonly string[] | null | undefined,
+): SlashCommand[] {
+  if (hosted === false) return SLASH_COMMANDS;
+  if (hosted !== true) return SLASH_COMMANDS.filter((c) => c.name !== "permissions");
+  return [
+    ...SLASH_COMMANDS.filter(
+      (c) => c.name !== "permissions" && (c.name === "help" || (advertised ?? []).includes(c.name)),
+    ),
+    WORKSPACE_SKILLS_COMMAND,
+  ];
+}
 
 /** `/name` or `/name arg…` — null when the draft is not a command. */
 export function parseSlash(draft: string): { name: string; arg: string } | null {
@@ -92,8 +120,8 @@ export function parseSlash(draft: string): { name: string; arg: string } | null 
 }
 
 /** Verbs whose name starts with `prefix` — the autocomplete rows. */
-export function slashMatches(prefix: string): SlashCommand[] {
-  return SLASH_COMMANDS.filter((c) => c.name.startsWith(prefix));
+export function slashMatches(prefix: string, commands: readonly SlashCommand[] = SLASH_COMMANDS): SlashCommand[] {
+  return commands.filter((c) => c.name.startsWith(prefix));
 }
 
 // ---- Command results as fields (CAD-551 r2) ----
@@ -245,6 +273,16 @@ export function turnState(
   if (row && row.queued > 0) return { kind: "queued" };
   if (submitting) return { kind: "submitting" };
   return { kind: "idle" };
+}
+
+/** The header's word for an agent state when this surface has no turn of its
+ *  own. `running` is a live session with nothing to do, which is how a hosted
+ *  board reports itself between turns; `busy` is real work elsewhere. A state
+ *  not listed here returns null: it is shown as it is, never as healthy. */
+export function restingStatus(state: string): "Available" | "Working" | null {
+  if (state === "idle" || state === "running") return "Available";
+  if (state === "busy") return "Working";
+  return null;
 }
 
 // ---- CAD-574: the model/effort dropdowns ----

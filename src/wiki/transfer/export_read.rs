@@ -206,7 +206,7 @@ fn locate(pm: &Pm, caller: &Caller, path: &str) -> Result<Located> {
         return Err(reject("wiki read '' refused: the root is a directory"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Read, &segs)?;
+    allowed(pm, caller, Op::Read, &segs)?;
     match classify(&segs) {
         View::Profile { alias } => {
             if segs.len() != 4 {
@@ -223,6 +223,9 @@ fn locate(pm: &Pm, caller: &Caller, path: &str) -> Result<Located> {
             })
         }
         View::Memory { alias } => {
+            if matches!(segs.len(), 3 | 4) {
+                return Ok(Located::Dir);
+            }
             if segs.len() != 5 {
                 return Err(reject(format!(
                     "wiki read '{norm}' refused: memory/ reads are \
@@ -544,7 +547,7 @@ fn dispatch(
     }
 }
 
-/// One file slice. `Ok(None)` means the path is a real directory.
+/// One file slice. `Ok(None)` means the path is a directory.
 /// `rev` is compared with the revision just computed from the file;
 /// the returned `rev` is that computed value.
 pub(super) fn file_export(
@@ -560,7 +563,7 @@ pub(super) fn file_export(
 }
 
 /// File metadata without a body: `path`, `kind`, `rev`, `size`, `sha256`.
-/// `Ok(None)` means a real directory. Uses the same stamp cache as
+/// `Ok(None)` means a directory. Uses the same stamp cache as
 /// [`file_export`] and does not open blob objects.
 pub(super) fn file_metadata(pm: &Pm, caller: &Caller, path: &str) -> Result<Option<Value>> {
     dispatch(pm, locate(pm, caller, path)?, None, None)

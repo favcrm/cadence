@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""CAD-1285: refuse DDL edits to a shipped store migration block.
+
+Compares src/store/schema.rs at a base (default: merge-base with origin/main)
+with the head (default HEAD). A block `if version < N { ... }` that exists at
+the base must keep its body, and the `execute_batch(<module>::SCHEMA*)`
+constants it applies must keep their text. New DDL goes in a new version.
+Full-line `//` comments and trailing whitespace are ignored; any other change
+fails. Allowlist: `// migration-lint: allow <N> -- <reason>` inside, or
+directly above, block N (reason required). Only an annotation the change adds
+counts; one already on the base excepted an earlier change.
+
+Prints one reason per line. Exit 0 clean, 1 refused, 2 cannot check.
+"""
+import argparse
+import re
+import subprocess
+import sys
+
+SCHEMA = "src/store/schema.rs"
+BLOCK = re.compile(r"^(\s*)if version < (\d+) \{\s*$")
+APPLY = re.compile(r"execute_batch\(\s*((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*,?\s*\)")
+ALLOW = re.compile(r"//\s*migration-lint:\s*allow\s+(\d+)\b\s*(?:(?:--|—|–|-|:)\s*)?(.*?)\s*$")
+CONST = r"const\s+{}\s*:\s*&(?:'static\s+)?str\s*="
+
+
+class Cannot(Exception):
+    pass
+
+
+def git(*args):
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    if r.returncode:
+        raise Cannot(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def show(ref, path):
+    return git("show", f"{ref}:{path}")
+
+
+def blocks(text, label):
+    """{N: (body_lines, line_index_of_header)}; closed by the matching-indent brace."""
+    lines = text.split("\n")
+    out = {}
+    i = 0
+    while i < len(lines):
+        m = BLOCK.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        indent, n = m.group(1), int(m.group(2))
+        end = next((j for j in range(i + 1, len(lines)) if lines[j] == indent + "}"), None)
+        if end is None:
+            raise Cannot(f"{label}: block `version < {n}` has no closing brace")
+        if n in out:
+            raise Cannot(f"{label}: duplicate block `version < {n}`")
+        out[n] = (lines[i + 1:end], i, lines)
+        i = end + 1
+    if not out:
+        raise Cannot(f"{label}: no `if version < N` blocks found in {SCHEMA}")
+    return out
+
+
+def norm(body):
+    return [l.rstrip() for l in body if not l.lstrip().startswith("//")]
+
+
+def annotations(n, body, header, lines):
+    """Allow-annotation lines for block N: inside it or directly above it."""
+    cands = list(body)
+    j = header - 1
+    while j >= 0 and lines[j].lstrip().startswith("//"):
+        cands.append(lines[j])
+        j -= 1
+    out = []
+    for l in cands:
+        m = ALLOW.search(l)
+        if m and int(m.group(1)) == n and l.lstrip().startswith("//"):
+            out.append((l.strip(), m.group(2)))
+    return out
+
+
+def allowed(n, old, new):
+    """None if this change adds no annotation, else its reason ('' when missing).
+    An annotation already on the base excepted an earlier change, not this one."""
+    shipped = {line for line, _ in annotations(n, *old)}
+    for line, reason in annotations(n, *new):
+        if line not in shipped:
+            return reason
+    return None
+
+
+def module_path(ref, mod):
+    for p in (f"src/store/{mod}.rs", f"src/store/{mod}/mod.rs", f"src/{mod}.rs"):
+        r = subprocess.run(["git", "cat-file", "-e", f"{ref}:{p}"], capture_output=True)
+        if r.returncode == 0:
+            return p
+    raise Cannot(f"{ref}: cannot find module file for `{mod}`")
+
+
+def const_text(ref, ref_path, name):
+    text = show(ref, ref_path)
+    m = re.search(CONST.format(re.escape(name)), text)
+    if not m:
+        return None
+    s = text[m.end():].lstrip()
+    raw = re.match(r'r(#*)"', s)
+    if raw:
+        close = '"' + raw.group(1)
+        end = s.find(close, raw.end())
+        lit = s[:end + len(close)] if end >= 0 else None
+    elif s.startswith('"'):
+        k = 1
+        while k < len(s) and s[k] != '"':
+            k += 2 if s[k] == "\\" else 1
+        lit = s[:k + 1] if k < len(s) else None
+    else:
+        lit = None
+    if lit is None:
+        raise Cannot(f"{ref_path}: `{name}` is not a plain string literal; cannot compare")
+    return [l.rstrip() for l in lit.split("\n")]
+
+
+def constants(body):
+    joined = "\n".join(norm(body))
+    out = set()
+    for m in APPLY.finditer(joined):
+        parts = m.group(1).split("::")
+        if len(parts) >= 2 and "SCHEMA" in parts[-1]:
+            out.add((parts[-2], parts[-1]))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--base", help="base ref (default: merge-base HEAD origin/main)")
+    ap.add_argument("--head", default="HEAD")
+    a = ap.parse_args()
+    try:
+        base = a.base or git("merge-base", a.head, "origin/main").strip()
+        old = blocks(show(base, SCHEMA), "base")
+        new = blocks(show(a.head, SCHEMA), "head")
+        fails = []
+        for n, (obody, _, _) in sorted(old.items()):
+            if n not in new:
+                fails.append(f"version < {n}: shipped block removed")
+                continue
+            nbody = new[n][0]
+            reason = allowed(n, old[n], new[n])
+            problems = []
+            if norm(obody) != norm(nbody):
+                problems.append(f"version < {n}: shipped migration block edited; add a new version instead")
+            for mod, name in sorted(constants(obody) | constants(nbody)):
+                ot = const_text(base, module_path(base, mod), name)
+                nt = const_text(a.head, module_path(a.head, mod), name)
+                if ot != nt:
+                    problems.append(f"version < {n}: {mod}::{name} edited (applied by shipped block {n}); add a new version instead")
+            if reason == "":
+                fails.append(f"version < {n}: migration-lint allow annotation has no reason")
+            elif reason is None:
+                fails += problems
+    except Cannot as e:
+        print(f"check-migration-ddl: cannot check: {e}")
+        return 2
+    for f in fails:
+        print(f"check-migration-ddl: {f}")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

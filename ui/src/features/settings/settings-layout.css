@@ -1,95 +1,159 @@
-/* Settings shell (CAD-1797): one compact sub-navigation beside the content.
-   Reuses the board's tokens; no new palette or global theme change. */
+/* Settings shell: a full-height second menu, like the one on /agents. Rows are
+   the primary menu's `.navlink`; only the panel around them lives here. */
 
 .settings-layout {
   display: grid;
-  grid-template-columns: 190px minmax(0, 1fr);
-  gap: 30px;
-  align-items: start;
-  max-width: 1180px;
-  /* CAD-1813: left-align the shell; the app shell supplies the page inset. */
-  margin-inline: 0;
-  padding: 20px 0 40px;
+  grid-template-columns: 208px minmax(0, 1fr);
+  align-items: stretch;
+  min-height: 100%;
 }
 
 .settings-subnav {
-  position: sticky;
-  top: 48px;
   display: grid;
-  gap: 1px;
-  padding-left: 32px;
+  align-content: start;
+  gap: 2px;
+  padding: 16px 14px;
+  border-right: 1px solid var(--color-ink-700);
+}
+
+.settings-subnav-title {
+  margin: 0 9px 10px;
+  color: var(--color-ink-100);
+  font-size: var(--text-cardtitle);
+  font-weight: 600;
 }
 
 .settings-subnav-group {
   display: grid;
-  gap: 1px;
+  gap: 2px;
 }
 
 .settings-subnav-label {
-  margin: 12px 0 2px;
-  padding: 0 9px;
-  font: 500 9px/1.4 "IBM Plex Mono", monospace;
-  letter-spacing: 0.09em;
+  margin: 14px 9px 4px;
+  font: 500 var(--text-micro) var(--font-mono);
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--color-ink-500);
 }
 
-.settings-subnav-group:first-child .settings-subnav-label {
+.settings-subnav-group:first-of-type .settings-subnav-label {
   margin-top: 0;
 }
 
-.settings-subnav-link {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-height: 30px;
-  padding: 4px 9px;
-  border-radius: 5px;
-  color: var(--color-ink-300);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 1.4;
-  text-decoration: none;
-}
-
-.settings-subnav-link:hover {
-  background: var(--color-ink-800);
-  color: var(--color-ink-100);
-}
-
-.settings-subnav-link[data-on] {
-  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-ink-850));
-  color: var(--color-accent);
-}
-
-.settings-subnav-link[data-on]::after {
-  content: "";
-  width: 5px;
-  height: 5px;
-  margin-left: auto;
-  border-radius: 50%;
-  background: var(--color-accent);
+.settings-subnav-icon {
+  display: inline-flex;
+  flex: none;
 }
 
 .settings-content {
   min-width: 0;
+  max-width: 860px;
+}
+
+/* A row is a name and one line; the whole row opens the drawer. */
+.settings-rows {
+  display: grid;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 50px;
+  padding: 0.55rem 0.75rem;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+  min-width: 0;
+}
+
+.settings-row + .settings-row,
+.settings-rows > li + li {
+  border-top: 1px solid var(--color-ink-700);
+}
+
+.settings-rows > li {
+  list-style: none;
+  min-width: 0;
+}
+
+button.settings-row,
+a.settings-row {
+  cursor: pointer;
+}
+
+button.settings-row:hover,
+a.settings-row:hover {
+  background: var(--color-ink-800);
+}
+
+.settings-row:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+.settings-row-text {
+  display: grid;
+  flex: 1;
+  gap: 1px;
+  min-width: 0;
+}
+
+.settings-row-text b {
+  color: var(--color-ink-100);
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.settings-row-text small {
+  color: var(--color-ink-500);
+  font-size: var(--text-label);
+  overflow-wrap: anywhere;
+}
+
+.settings-quiet {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 8px;
+  border-radius: 5px;
+  color: var(--color-ink-300);
+  font-size: var(--text-secondary);
+}
+
+.settings-quiet:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
 }
 
 @media (max-width: 960px) {
   .settings-layout {
     grid-template-columns: minmax(0, 1fr);
-    gap: 8px;
-    padding: 12px 0 32px;
+    align-content: start;
   }
 
   .settings-subnav {
-    position: static;
     display: flex;
-    gap: 6px;
+    gap: 2px;
     overflow-x: auto;
-    padding: 0 16px 8px;
+    padding: 8px 16px;
+    border-right: 0;
     border-bottom: 1px solid var(--color-ink-700);
     scrollbar-width: thin;
+  }
+
+  .settings-subnav-title,
+  .settings-subnav-label,
+  .settings-subnav-icon {
+    display: none;
   }
 
   .settings-subnav-group {
@@ -97,12 +161,11 @@
     gap: 2px;
   }
 
-  .settings-subnav-label {
-    display: none;
+  .settings-subnav .navlink {
+    white-space: nowrap;
   }
 
-  .settings-subnav-link {
-    min-height: 32px;
-    white-space: nowrap;
+  .settings-content {
+    max-width: none;
   }
 }

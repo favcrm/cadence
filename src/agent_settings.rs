@@ -2,13 +2,12 @@
 //! model defaults, Pi policy, and profile text. `.pi/agents` and
 //! `.claude/agents` under the PM root are generated exports.
 
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::io::Read;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::adapter::registry::{self, EndpointSpec};
 use crate::error::{Error, Result};
+use crate::fd_fs;
 use crate::issue::Pm;
 use crate::master;
 use crate::model_defaults::{
@@ -25,6 +25,13 @@ use crate::model_defaults::{
 };
 use crate::pi_policy::{self, PiPolicy};
 use crate::store::{Agent, Store};
+
+mod export_fs;
+
+use export_fs::{
+    export_sync_unknown, open_export_root, read_export, safe_export_id, walk_export_dir,
+    write_export_at, ExportRead,
+};
 
 const PROFILE_MARKER: &str = "cadence_profile";
 const GEN_MARKER: &str = "cadence-agent-profile";
@@ -37,6 +44,10 @@ struct Profile {
     model: String,
     job: String,
     text: String,
+    /// CAD-1989: the catalogue role a hire copied this profile from, and the
+    /// avatar look chosen for it. Both are optional front matter.
+    catalogue: Option<String>,
+    look: Option<String>,
 }
 
 struct Overlay {
@@ -84,9 +95,17 @@ pub fn save(
     let _ = crate::secret::guard("agents settings", &config.to_string())?;
     store.import_legacy_settings(&pm.dir)?;
     let overlay = parse_overlay(config)?;
-    let profiles = parse_profiles(config, &overlay)?;
+    let mut profiles = parse_profiles(config, &overlay)?;
     let current = store.settings()?;
     let previous = profiles_from(&current.doc.profiles)?;
+    // The Settings form does not carry the catalogue id or look; an edit
+    // must not drop what a hire recorded.
+    for profile in &mut profiles {
+        if let Some(prior) = previous.iter().find(|prev| prev.id == profile.id) {
+            profile.catalogue = prior.catalogue.clone();
+            profile.look = prior.look.clone();
+        }
+    }
     let policy = current.doc.pi.clone();
     let token = revision_token(
         current.revision,
@@ -217,10 +236,7 @@ pub fn catalog(_pm_dir: &Path, provider: &str) -> Result<Value> {
         Ok(err(message.to_string()))
     };
     let mut pipe = child.stdout.take().expect("catalog stdout was piped");
-    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
+    if fd_fs::set_nonblocking(pipe.as_fd()).is_err() {
         return fail(&mut child, "catalog stdout could not be made nonblocking");
     }
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -332,6 +348,7 @@ pub fn sync(
         }
     }
     let mut files = Vec::new();
+    let mut wrote_export = false;
     for profile in selected {
         for harness in ["pi", "claude"] {
             let path = export_path(&pm.dir, harness, &profile.id);
@@ -345,7 +362,14 @@ pub fn sync(
                 }));
                 continue;
             }
-            write_export(&pm.dir, harness, &profile.id, profile)?;
+            write_export(&pm.dir, harness, &profile.id, profile).map_err(|error| {
+                if wrote_export {
+                    export_sync_unknown(error)
+                } else {
+                    error
+                }
+            })?;
+            wrote_export = true;
             files.push(json!({
                 "profile": profile.id,
                 "harness": harness,
@@ -354,15 +378,21 @@ pub fn sync(
             }));
         }
     }
-    let profiles = profiles_from(&current.doc.profiles)?;
     let token = revision_token(
         current.revision,
         &current.doc.model_defaults.agent_settings,
         &profiles,
         policy.as_ref(),
     );
+    let history = store.settings_history(8).map_err(|error| {
+        if wrote_export {
+            export_sync_unknown(error)
+        } else {
+            error
+        }
+    })?;
     Ok(json!({
-        "snapshot": build_snapshot(token, &present_overlay(&current.doc.model_defaults, policy.as_ref()), &profiles, policy.as_ref(), agents, &pm.dir, &store.settings_history(8)?),
+        "snapshot": build_snapshot(token, &present_overlay(&current.doc.model_defaults, policy.as_ref()), &profiles, policy.as_ref(), agents, &pm.dir, &history),
         "files": files,
     }))
 }
@@ -961,6 +991,8 @@ fn parse_profiles(config: &Value, overlay: &Overlay) -> Result<Vec<Profile>> {
             model,
             job,
             text: String::new(),
+            catalogue: None,
+            look: None,
         };
         out.push(profile);
     }
@@ -994,6 +1026,8 @@ fn check_references(
     agents: &[Agent],
 ) -> Result<()> {
     let next_models = ids_of(&overlay.models);
+    let runtime_aliases: Vec<&str> = agents.iter().map(|a| a.alias.as_str()).collect();
+    refuse_runtime_names(profiles, previous, &runtime_aliases)?;
     for profile in profiles {
         if profile.model != "inherit" && !next_models.contains(profile.model.as_str()) {
             return Err(Error::invalid(
@@ -1486,6 +1520,8 @@ fn project_pi(stored: &Option<PiPolicy>, overlay: &Overlay) -> Result<Option<PiP
     Ok(Some(policy))
 }
 
+// Hosted receipt validators in remote_cli.rs mirror this module's normalization and
+// projection; change them together (see "Seam note (CAD-2096)" there).
 fn build_snapshot(
     token: String,
     overlay: &Overlay,
@@ -1771,6 +1807,8 @@ fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
             model: "inherit".to_string(),
             job: text.trim().to_string(),
             text: text.to_string(),
+            catalogue: None,
+            look: None,
         });
     };
     let Some((front, body)) = rest.split_once("\n---\n") else {
@@ -1780,15 +1818,19 @@ fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
             model: "inherit".to_string(),
             job: text.trim().to_string(),
             text: text.to_string(),
+            catalogue: None,
+            look: None,
         });
     };
     let mut role = None;
     let mut model = None;
+    let mut catalogue = None;
+    let mut look = None;
     for line in front.lines() {
         let Some((key, raw)) = line.split_once(':') else {
             continue;
         };
-        if !matches!(key.trim(), "role" | "model") {
+        if !matches!(key.trim(), "role" | "model" | "catalogue" | "look") {
             continue;
         }
         let raw = raw.trim();
@@ -1805,6 +1847,8 @@ fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
         match key.trim() {
             "role" => role = Some(value),
             "model" => model = Some(value),
+            "catalogue" => catalogue = Some(value).filter(|v| !v.is_empty()),
+            "look" => look = Some(value).filter(|v| !v.is_empty()),
             _ => unreachable!(),
         }
     }
@@ -1821,12 +1865,23 @@ fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
         model,
         job: body.trim().to_string(),
         text: text.to_string(),
+        catalogue,
+        look,
     })
 }
 
 fn render_agent(profile: &Profile) -> String {
+    let mut extra = String::new();
+    for (key, value) in [("catalogue", &profile.catalogue), ("look", &profile.look)] {
+        if let Some(value) = value {
+            extra.push_str(&format!(
+                "{key}: {}\n",
+                serde_json::to_string(value).expect("profile field is a serializable string")
+            ));
+        }
+    }
     format!(
-        "---\n{PROFILE_MARKER}: \"1\"\nrole: {}\nmodel: {}\n---\n{}\n",
+        "---\n{PROFILE_MARKER}: \"1\"\nrole: {}\nmodel: {}\n{extra}---\n{}\n",
         serde_json::to_string(&profile.role).expect("profile role is a serializable string"),
         serde_json::to_string(&profile.model).expect("profile model is a serializable string"),
         profile.job.trim()
@@ -2052,280 +2107,6 @@ fn digest(text: &str) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-enum ExportRead {
-    Missing,
-    Keep,
-    Body(String),
-}
-
-fn safe_export_id(id: &str) -> bool {
-    !id.is_empty()
-        && id != "."
-        && id != ".."
-        && !id.contains('/')
-        && !id.contains('\\')
-        && !id.contains('\0')
-}
-
-fn export_component(name: &str) -> Result<CString> {
-    CString::new(name).map_err(|_| Error::rejected("export path contains an interior nul"))
-}
-
-fn open_export_root(pm_dir: &Path) -> Result<Option<OwnedFd>> {
-    let name = CString::new(pm_dir.as_os_str().as_bytes())
-        .map_err(|_| Error::rejected("PM directory contains an interior nul"))?;
-    let fd = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(Error::from(err));
-    }
-    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
-}
-
-fn kind_at(dir: &OwnedFd, name: &str) -> Result<AtExport> {
-    let c_name = export_component(name)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(AtExport::Missing);
-        }
-        return Err(Error::from(err));
-    }
-    Ok(match st.st_mode & libc::S_IFMT {
-        mode if mode == libc::S_IFLNK => AtExport::Symlink,
-        mode if mode == libc::S_IFDIR => AtExport::Dir,
-        _ => AtExport::Other,
-    })
-}
-
-enum AtExport {
-    Missing,
-    Symlink,
-    Dir,
-    Other,
-}
-
-fn open_export_dir(dir: &OwnedFd, name: &str) -> Result<OwnedFd> {
-    let c_name = export_component(name)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(format!(
-            "{name} is a symlink or not a directory"
-        )));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn mkdir_export(dir: &OwnedFd, name: &str) -> Result<()> {
-    let c_name = export_component(name)?;
-    let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c_name.as_ptr(), 0o755) };
-    if rc == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    if err.kind() == std::io::ErrorKind::AlreadyExists {
-        return Ok(());
-    }
-    Err(Error::from(err))
-}
-
-fn open_or_make(parent: &OwnedFd, name: &str, create: bool) -> Result<Option<OwnedFd>> {
-    match kind_at(parent, name)? {
-        AtExport::Missing if !create => Ok(None),
-        AtExport::Missing => {
-            mkdir_export(parent, name)?;
-            Ok(Some(open_export_dir(parent, name)?))
-        }
-        AtExport::Dir => Ok(Some(open_export_dir(parent, name)?)),
-        AtExport::Symlink | AtExport::Other => Err(Error::rejected(format!(
-            "{name} is a symlink or not a directory; refusing to follow it"
-        ))),
-    }
-}
-
-fn walk_export_dir(root: &OwnedFd, harness: &str, create: bool) -> Result<Option<OwnedFd>> {
-    let top = if harness == "claude" {
-        ".claude"
-    } else {
-        ".pi"
-    };
-    let Some(first) = open_or_make(root, top, create)? else {
-        return Ok(None);
-    };
-    open_or_make(&first, "agents", create)
-}
-
-fn read_regular_at(dir: &OwnedFd, name: &str) -> Result<Option<String>> {
-    let c_name = export_component(name)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(Error::rejected(format!(
-            "{name} is a symlink or cannot be opened"
-        )));
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let meta = file.metadata()?;
-    if !meta.file_type().is_file() {
-        return Err(Error::rejected(format!("{name} is not a regular file")));
-    }
-    let mut text = String::new();
-    Read::take(&mut file, 1024 * 1024).read_to_string(&mut text)?;
-    Ok(Some(text))
-}
-
-fn read_export(pm_dir: &Path, harness: &str, id: &str) -> ExportRead {
-    if !safe_export_id(id) {
-        return ExportRead::Keep;
-    }
-    let Ok(Some(root)) = open_export_root(pm_dir) else {
-        return ExportRead::Missing;
-    };
-    let dir = match walk_export_dir(&root, harness, false) {
-        Ok(Some(dir)) => dir,
-        Ok(None) => return ExportRead::Missing,
-        Err(_) => return ExportRead::Keep,
-    };
-    match read_regular_at(&dir, &format!("{id}.md")) {
-        Ok(None) => ExportRead::Missing,
-        Ok(Some(text)) if text.starts_with(&format!("---\n# {GEN_MARKER} ")) => {
-            ExportRead::Body(text)
-        }
-        Ok(Some(_)) | Err(_) => ExportRead::Keep,
-    }
-}
-
-fn write_export_at(dir: &OwnedFd, name: &str, text: &str) -> Result<()> {
-    let cname = export_component(name)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            cname.as_ptr(),
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
-    };
-    if fd >= 0 {
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(Error::rejected("export is not a private regular file"));
-        }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(Error::rejected("export is busy; retry sync"));
-        }
-        let mut previous = String::new();
-        Read::take(&mut file, 1024 * 1024).read_to_string(&mut previous)?;
-        if !previous.starts_with(&format!("---\n# {GEN_MARKER} ")) {
-            return Err(Error::rejected(format!(
-                "{name} is unmanaged; refusing to write it"
-            )));
-        }
-        // Write the validated inode, never a replacement at `name`. Preserve
-        // the ownership header through partial writes; truncate only afterward.
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(text.as_bytes())?;
-        file.set_len(text.len() as u64)?;
-        file.sync_all()?;
-        let current_fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                cname.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if current_fd < 0 {
-            return Err(Error::rejected("export destination changed during sync"));
-        }
-        let current = unsafe { File::from_raw_fd(current_fd) }.metadata()?;
-        if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
-            return Err(Error::rejected("export destination changed during sync"));
-        }
-        return Ok(());
-    }
-    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
-        return Err(Error::rejected("export is a symlink or cannot be opened"));
-    }
-    let tmp = format!(
-        ".{}.{}.tmp",
-        name.trim_end_matches(".md"),
-        uuid::Uuid::new_v4().simple()
-    );
-    let ctmp = export_component(&tmp)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            ctmp.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::rejected(
-            "export temp could not be created exclusively",
-        ));
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let written = file
-        .write_all(text.as_bytes())
-        .and_then(|_| file.sync_all());
-    drop(file);
-    if written.is_err() {
-        unsafe { libc::unlinkat(dir.as_raw_fd(), ctmp.as_ptr(), 0) };
-        return Err(Error::rejected("export write failed"));
-    }
-    // Publish only if the destination is still absent; never replace an entry
-    // another writer created after the absence check.
-    let rc = unsafe {
-        libc::linkat(
-            dir.as_raw_fd(),
-            ctmp.as_ptr(),
-            dir.as_raw_fd(),
-            cname.as_ptr(),
-            0,
-        )
-    };
-    unsafe { libc::unlinkat(dir.as_raw_fd(), ctmp.as_ptr(), 0) };
-    if rc != 0 {
-        return Err(Error::rejected("export destination appeared during sync"));
-    }
-    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
-        return Err(Error::rejected("export directory sync failed"));
-    }
-    Ok(())
-}
-
 fn iso_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2416,6 +2197,27 @@ pub struct LaunchProfile {
     pub digest: String,
 }
 
+/// What an `inherit` profile launches with: the role default when this
+/// harness can carry it, else `inherit` for the runtime to resolve. Never a
+/// refusal - only a model the profile or the caller names is strict.
+fn inherited_launch_model(
+    resolved: Option<&str>,
+    provider: &str,
+    endpoint: &str,
+    models: &[Value],
+    providers: &[Value],
+) -> String {
+    match resolved {
+        Some(model)
+            if registry::supports_model(provider, endpoint)
+                && validate_model_harness(model, provider, models, providers).is_ok() =>
+        {
+            model.to_string()
+        }
+        _ => "inherit".to_string(),
+    }
+}
+
 /// Resolve a settings profile for registration. The job is the instruction
 /// text. `role` is the team-role lookup, not the runtime role.
 pub fn launch_profile(
@@ -2442,13 +2244,16 @@ pub fn launch_profile(
     }
     let requested_model = requested_model.map(validate_model_id).transpose()?;
     let overlay = present_overlay(&current.doc.model_defaults, current.doc.pi.as_ref());
-    let model = resolve_model(&profile, &overlay)
-        .map(|(id, _)| id)
-        .unwrap_or_else(|| "inherit".to_string());
-    let selected = requested_model
-        .as_deref()
-        .or_else(|| (!provider_default && model != "inherit").then_some(model.as_str()));
-    if let Some(selected) = selected {
+    let resolved = resolve_model(&profile, &overlay).map(|(id, _)| id);
+    let model = resolved.clone().unwrap_or_else(|| "inherit".to_string());
+    // Only a model the profile or the caller names is strict. `inherit`
+    // takes the role default when this harness can carry it and otherwise
+    // stays `inherit` for the runtime to resolve - it is never a refusal.
+    let strict = requested_model
+        .clone()
+        .or_else(|| (!provider_default && profile.model != "inherit").then(|| model.clone()));
+    let mut model = model;
+    if let Some(selected) = strict {
         if !registry::supports_model(provider, endpoint) {
             return Err(Error::rejected(format!(
                 "harness '{provider}' does not accept a model"
@@ -2457,13 +2262,21 @@ pub fn launch_profile(
         let record = overlay
             .models
             .iter()
-            .find(|record| record["id"].as_str() == Some(selected));
+            .find(|record| record["id"].as_str() == Some(selected.as_str()));
         if record.is_none() && requested_model.is_none() {
             return Err(Error::rejected(format!(
                 "profile model '{selected}' has no registered provider"
             )));
         }
-        validate_model_harness(selected, provider, &overlay.models, &overlay.providers)?;
+        validate_model_harness(&selected, provider, &overlay.models, &overlay.providers)?;
+    } else if profile.model == "inherit" && !provider_default {
+        model = inherited_launch_model(
+            resolved.as_deref(),
+            provider,
+            endpoint,
+            &overlay.models,
+            &overlay.providers,
+        );
     }
     Ok(LaunchProfile {
         id: profile.id,
@@ -2615,10 +2428,13 @@ mod fleet_check_tests {
             .unwrap_or("")
             .contains("no model configured"));
         assert_eq!(refused[2]["alias"], "dev-d");
+        // The padded id is refused as an invalid model id before the
+        // exact-membership allowlist is consulted; either refusal is
+        // fail-closed, and this one is the earlier, stronger check.
         assert!(refused[2]["reason"]
             .as_str()
             .unwrap_or("")
-            .contains("allowlist"));
+            .contains("not a valid model id"));
     }
 
     /// An absent policy allows nothing; the check must report that instead of
@@ -2657,3 +2473,308 @@ mod omp_harness_tests {
         assert!(!pi_family("", None));
     }
 }
+
+/// CAD-1989: one profile as the board and `agent context` show it. `role` is
+/// the catalogue role's title when the profile came from one, else the team
+/// role; `team_role` is always the stored team role.
+fn profile_json(profile: &Profile, runtimes: &[String], with_job: bool) -> Value {
+    let role = profile
+        .catalogue
+        .as_deref()
+        .and_then(crate::agent_roles::find)
+        .map_or(profile.role.as_str(), |role| role.title);
+    json!({
+        "id": profile.id, "alias": profile.id, "role": role,
+        "team_role": profile.role, "catalogue": profile.catalogue,
+        "look": profile.look, "job": with_job.then_some(&profile.job),
+        "model": profile.model, "runtimes": runtimes,
+    })
+}
+
+/// Does a settings profile have this id?
+pub fn profile_exists(store: &Store, id: &str) -> Result<bool> {
+    Ok(store
+        .settings()?
+        .doc
+        .profiles
+        .iter()
+        .any(|profile| profile.id == id))
+}
+
+/// A new runtime may not take an alias a profile holds: two cards with one
+/// name would be two things to @-mention. A runtime row that already holds
+/// the alias is left to the store's duplicate error, so reopening an old
+/// runtime keeps working.
+pub fn refuse_profile_alias(store: &Store, alias: &str) -> Result<()> {
+    if profile_exists(store, alias)? && store.agent_opt(alias)?.is_none() {
+        return Err(Error::rejected(format!(
+            "'{alias}' is already an agent profile - give the runtime another alias"
+        )));
+    }
+    Ok(())
+}
+
+/// A profile saved under a name a runtime already holds is refused.
+fn refuse_runtime_names(
+    profiles: &[Profile],
+    previous: &[Profile],
+    runtime_aliases: &[&str],
+) -> Result<()> {
+    for profile in profiles {
+        if !previous.iter().any(|p| p.id == profile.id)
+            && runtime_aliases.contains(&profile.id.as_str())
+        {
+            return Err(Error::rejected(format!(
+                "'{}' is already an agent - pick another profile id",
+                profile.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Every settings profile with the aliases of the runtimes registered
+/// against it (`params.profile == id`). The job is the operator's to read:
+/// `with_job` is false unless the caller proved it. A body that cannot be
+/// parsed is logged and skipped, so one bad row does not fail the list.
+pub fn profile_list(store: &Store, agents: &[Agent], with_job: bool) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for body in &store.settings()?.doc.profiles {
+        let profile = match parse_agent(&body.id, &body.text) {
+            Ok(profile) => profile,
+            Err(err) => {
+                eprintln!(
+                    "cadence: skipping unreadable agent profile '{}': {err}",
+                    body.id
+                );
+                continue;
+            }
+        };
+        let runtimes: Vec<String> = agents
+            .iter()
+            .filter(|agent| agent_profile(agent) == Some(profile.id.as_str()))
+            .map(|agent| agent.alias.clone())
+            .collect();
+        out.push(profile_json(&profile, &runtimes, with_job));
+    }
+    Ok(out)
+}
+
+/// `cadence agent context <id>` on a local board, in the hosted
+/// `agent_profile_context` envelope: `{context: {profile, identity,
+/// knowledge, unavailable}}`. A native board keeps no per-profile wiki areas,
+/// so each is named in `unavailable` rather than invented. `revision` is the
+/// settings revision the profile was read at.
+pub fn profile_context(store: &Store, agents: &[Agent], id: &str) -> Result<Value> {
+    let listed = profile_list(store, agents, true)?
+        .into_iter()
+        .find(|profile| profile["id"].as_str() == Some(id))
+        .ok_or_else(|| Error::rejected(format!("unknown profile '{id}'")))?;
+    let skills = listed["catalogue"]
+        .as_str()
+        .and_then(crate::agent_roles::find)
+        .map_or(&[][..], |role| role.skills);
+    let reason = "a native board keeps no per-profile wiki area";
+    let area = json!({"available": false, "reason": reason});
+    Ok(json!({"context": {
+        "profile": {
+            "id": listed["id"], "name": listed["alias"], "role": listed["role"],
+            "responsibilities": listed["job"], "skills": skills,
+            "status": "active", "revision": store.settings()?.revision,
+            "model": listed["model"],
+        },
+        "identity": {
+            "attribution": "external",
+            "agent_authenticated": false,
+            "note": "This profile is context for an external session. Loading it does not authenticate the session as the agent, and it grants no review, merge or execution authority.",
+        },
+        "knowledge": {"profile": area, "knowledge": area, "memory": area},
+        "unavailable": [
+            format!("profile: {reason}"),
+            format!("knowledge: {reason}"),
+            format!("memory: {reason}"),
+        ],
+    }}))
+}
+
+/// A hire from the role catalogue: save a settings profile and nothing else.
+/// No runtime row, no home directory, no launch. `job` replaces the role's
+/// instructions only when given; a model other than `inherit` must be a
+/// registered one (an explicit model stays strict).
+pub fn create_catalogue_profile(
+    store: &Store,
+    alias: &str,
+    role: &crate::agent_roles::Role,
+    look: &str,
+    job: Option<&str>,
+    model: Option<&str>,
+) -> Result<Value> {
+    crate::proto::identifier(alias, "Agent name")?;
+    master::refuse_reserved_alias(alias)?;
+    let current = store.settings()?;
+    let taken =
+        current.doc.profiles.iter().any(|p| p.id == alias) || store.agent_opt(alias)?.is_some();
+    if taken {
+        return Err(Error::conflict_coded(
+            "alias_taken",
+            format!("Agent '{alias}' already exists - pick another alias"),
+        ));
+    }
+    let model = validate_model_id(model.unwrap_or("inherit"))?;
+    if model != "inherit" {
+        let overlay = present_overlay(&current.doc.model_defaults, current.doc.pi.as_ref());
+        if !overlay
+            .models
+            .iter()
+            .any(|row| row["id"].as_str() == Some(model.as_str()))
+        {
+            return Err(Error::rejected(format!(
+                "model '{model}' is not a registered model - pick one from Settings > Agents or leave it to inherit"
+            )));
+        }
+    }
+    let job = job
+        .filter(|job| !job.trim().is_empty())
+        .map_or_else(|| role.instructions(), str::to_string);
+    check_markdown("profile job", &job, crate::master::AGENT_MAX_CHARS)?;
+    if job.len() > crate::store::MAX_INSTRUCTIONS_BYTES {
+        return Err(Error::rejected(format!(
+            "the job must be at most {} UTF-8 bytes",
+            crate::store::MAX_INSTRUCTIONS_BYTES
+        )));
+    }
+    let mut profile = Profile {
+        id: alias.to_string(),
+        role: role.team_role.to_string(),
+        model,
+        job,
+        text: String::new(),
+        catalogue: Some(role.id.to_string()),
+        look: Some(look.to_string()),
+    };
+    profile.text = render_agent(&profile);
+    master::check_file("AGENT.md", &profile.text)?;
+    let _ = crate::secret::guard("agent profile", &profile.text)?;
+    let mut doc = current.doc.clone();
+    doc.profiles.push(crate::store::ProfileBody {
+        id: profile.id.clone(),
+        text: profile.text.clone(),
+    });
+    store.save_settings(current.revision, doc, ACTOR)?;
+    Ok(profile_json(&profile, &[], true))
+}
+
+#[cfg(test)]
+mod profile_context_tests {
+    use super::*;
+
+    /// CAD-1989: the native context is the hosted `agent_profile_context`
+    /// envelope, and a hire writes a profile but no agent row.
+    #[test]
+    fn native_context_matches_the_hosted_envelope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let role = crate::agent_roles::find("developer").unwrap();
+        create_catalogue_profile(&store, "dev-1", role, role.look, None, None).unwrap();
+        assert!(store.agents().unwrap().is_empty());
+
+        let out = profile_context(&store, &[], "dev-1").unwrap();
+        let context = &out["context"];
+        assert_eq!(context["profile"]["id"], "dev-1");
+        assert_eq!(context["profile"]["model"], "inherit");
+        assert_eq!(context["profile"]["skills"], json!(role.skills));
+        assert_eq!(context["profile"]["status"], "active");
+        assert_eq!(context["identity"]["attribution"], "external");
+        assert_eq!(context["identity"]["agent_authenticated"], false);
+        assert_eq!(context["knowledge"]["memory"]["available"], false);
+        assert_eq!(context["unavailable"].as_array().unwrap().len(), 3);
+        assert!(profile_context(&store, &[], "nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod inherit_tests {
+    use super::*;
+
+    /// CAD-1989: a Pi role default is not a refusal for an `inherit` profile
+    /// joined on another harness; it is simply not used there.
+    #[test]
+    fn inherit_with_a_pi_role_default_is_not_refused_on_claude_or_codex() {
+        let models = [json!({"id": "pi/fast", "provider": "pi-ext"})];
+        let providers = [json!({"id": "pi-ext", "kind": "Pi extension"})];
+        let on = |provider: &str, endpoint: &str| {
+            inherited_launch_model(Some("pi/fast"), provider, endpoint, &models, &providers)
+        };
+        assert_eq!(on("claude", "pty"), "inherit");
+        assert_eq!(on("codex", "managed"), "inherit");
+        assert_eq!(on("pi", "managed"), "pi/fast");
+        assert_eq!(
+            inherited_launch_model(None, "pi", "managed", &models, &providers),
+            "inherit"
+        );
+    }
+
+    #[test]
+    fn a_profile_and_a_runtime_never_share_a_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let role = crate::agent_roles::find("developer").unwrap();
+        create_catalogue_profile(&store, "dev-1", role, role.look, None, None).unwrap();
+        // A new runtime may not take the profile's name ...
+        assert!(refuse_profile_alias(&store, "dev-1").is_err());
+        assert!(refuse_profile_alias(&store, "free").is_ok());
+        // ... but a runtime row that already holds it can still be reopened.
+        let cwd = dir.path().to_string_lossy().to_string();
+        store
+            .register_agent(&crate::store::NewAgent {
+                alias: "dev-1",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        assert!(refuse_profile_alias(&store, "dev-1").is_ok());
+        // Settings save refuses a NEW profile id that a runtime holds.
+        let p = |id: &str| Profile {
+            id: id.to_string(),
+            role: "worker".to_string(),
+            model: "inherit".to_string(),
+            job: "j".to_string(),
+            text: String::new(),
+            catalogue: None,
+            look: None,
+        };
+        assert!(refuse_runtime_names(&[p("rt-9")], &[], &["rt-9"]).is_err());
+        assert!(refuse_runtime_names(&[p("rt-9")], &[p("rt-9")], &["rt-9"]).is_ok());
+        assert!(refuse_runtime_names(&[p("fresh")], &[], &["rt-9"]).is_ok());
+    }
+
+    #[test]
+    fn one_unreadable_profile_does_not_fail_the_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let role = crate::agent_roles::find("developer").unwrap();
+        create_catalogue_profile(&store, "dev-1", role, role.look, None, None).unwrap();
+        let current = store.settings().unwrap();
+        let mut doc = current.doc.clone();
+        doc.profiles.push(crate::store::ProfileBody {
+            id: "broken".to_string(),
+            text: "---\nrole: \"unterminated\n---\nbody\n".to_string(),
+        });
+        store.save_settings(current.revision, doc, ACTOR).unwrap();
+        let listed = profile_list(&store, &[], false).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], "dev-1");
+        assert!(listed[0]["job"].is_null());
+    }
+}
+
+#[cfg(test)]
+#[path = "cad2009_profile_sync_acceptance.rs"]
+mod cad2009_profile_sync_acceptance;

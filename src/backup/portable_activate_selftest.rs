@@ -44,6 +44,7 @@ fn restored(name: &str) -> (PathBuf, PathBuf, PathBuf) {
             scope: Scope::Coordination,
             tracker: pm_dir,
             redact_history_secrets: false,
+            attest_chat_custody_absent: true,
         },
     )
     .expect("export");
@@ -250,6 +251,7 @@ fn restored_with_queued_message(name: &str) -> (PathBuf, PathBuf) {
             scope: Scope::Coordination,
             tracker: pm_dir,
             redact_history_secrets: false,
+            attest_chat_custody_absent: true,
         },
     )
     .expect("export");

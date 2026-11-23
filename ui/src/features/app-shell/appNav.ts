@@ -1,9 +1,19 @@
 import { onPrivateSessionReset } from "../../lib/privateSession";
+import {
+  localizedAppTitle,
+  localizedSectionLabel,
+  type AppDisplayI18n,
+  type ListingDisplayLocale,
+  type TranslateFn,
+} from "../workspace-apps/appLocale";
 import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
+import { setQueryParams } from "../workspace-apps/screen/routeParams";
 
 /** One installed app in the board's Apps menu (CAD-1116). */
 export interface AppNavEntry {
   installId: string;
+  /** Verified app package name/kind (used for consistent app iconography across locales). */
+  kind?: string;
   title: string;
   /** The installation itself. */
   href: string;
@@ -38,8 +48,13 @@ export interface VerifiedApp {
   installId: string;
   kind: string;
   title: string;
-  /** Consumed-mount declaration, pinned to verified package bytes by the host. */
+  /** Declared or consumed-mount navigation, pinned to verified package bytes by the host. */
   navigation?: ScreenNavigation | null;
+  i18n?: AppDisplayI18n | null;
+  listing?: {
+    tagline?: string | null;
+    i18n?: Record<string, ListingDisplayLocale> | null;
+  } | null;
 }
 
 /** Section rows for an app whose mounted screen declares navigation. */
@@ -50,21 +65,36 @@ interface KindSections {
   href: (base: string, section: string) => string;
 }
 
+/** Section navigation and app breadcrumbs share the same context-preserving URL. */
+export function appSectionHref(base: string, navigation: ScreenNavigation | null, section = navigation?.default_section): string {
+  const [path, search] = base.split("?");
+  const query = new URLSearchParams(search ?? "");
+  if (navigation) {
+    if (section === navigation.default_section) query.delete(navigation.section_query);
+    else if (section !== undefined) query.set(navigation.section_query, section);
+  }
+  query.delete("appview");
+  query.delete("record");
+  query.delete("segment");
+  // CAD-2555: a declared view's params belong to the page they were set on.
+  setQueryParams(query, {});
+  const next = query.toString();
+  return path + (next ? `?${next}` : "");
+}
+
 /** The section the URL is on, for a screen that declares sections. */
-function declaredSections(navigation: ScreenNavigation): KindSections {
+function declaredSections(
+  navigation: ScreenNavigation,
+  locale = "en",
+  t?: TranslateFn,
+): KindSections {
   return {
-    sections: navigation.sections.map(s => [s.id, s.label]),
+    sections: navigation.sections.map((s) => [s.id, localizedSectionLabel(s, locale, t)]),
     fromSearch: search => {
       const selected = new URLSearchParams(search).get(navigation.section_query);
       return navigation.sections.find(s => s.id === selected)?.id ?? navigation.default_section;
     },
-    href: (base, section) => {
-      const [path, search] = base.split("?");
-      const q = new URLSearchParams(search ?? "");
-      if (section === navigation.default_section) q.delete(navigation.section_query); else q.set(navigation.section_query, section);
-      q.delete("appview"); q.delete("record"); q.delete("segment");
-      const next = q.toString(); return path + (next ? `?${next}` : "");
-    },
+    href: (base, section) => appSectionHref(base, navigation, section),
   };
 }
 export function sectionFromSearch(search: string, navigation?: ScreenNavigation | null): string | null {
@@ -74,6 +104,8 @@ export function sectionFromSearch(search: string, navigation?: ScreenNavigation 
 export interface LastApp {
   installId: string;
   section: string | null;
+  appKey?: string | null;
+  sectionQuery?: string | null;
 }
 
 const LAST_APP_KEY = "cadence.apps.last";
@@ -91,7 +123,17 @@ export function readLastApp(storage: Pick<Storage, "getItem"> | null = safeStora
     if (!raw) return null;
     const v = JSON.parse(raw) as Partial<LastApp>;
     if (typeof v.installId !== "string" || v.installId === "") return null;
-    return { installId: v.installId, section: typeof v.section === "string" ? v.section : null };
+    const appKey = typeof v.appKey === "string" && v.appKey !== "" ? v.appKey : undefined;
+    const sectionQuery =
+      typeof v.sectionQuery === "string" && /^[a-z][a-z0-9_-]{0,31}$/.test(v.sectionQuery)
+        ? v.sectionQuery
+        : undefined;
+    return {
+      installId: v.installId,
+      section: typeof v.section === "string" ? v.section : null,
+      ...(appKey ? { appKey } : {}),
+      ...(sectionQuery ? { sectionQuery } : {}),
+    };
   } catch {
     return null;
   }
@@ -115,9 +157,9 @@ function safeStorage(): Storage | null {
 
 /**
  * The Apps menu data. Pure. `apps` must come only from the verified
- * installation list or receipt, never the route. On an app screen the
- * active app (`activeId`) expands, and only if it is verified; elsewhere
- * the remembered app expands, if it is still installed.
+ * installation list or receipt, never the route. Any installed app whose
+ * package declares screen navigation lists its sections persistently across
+ * screens, while the active or remembered app highlights/restores its section.
  */
 export function buildAppNav(input: {
   apps: VerifiedApp[];
@@ -127,25 +169,43 @@ export function buildAppNav(input: {
   activeHref: string;
   last: LastApp | null;
   installHref: (installId: string) => string;
+  locale?: string;
+  t?: TranslateFn;
 }): AppNav {
-  const { apps, onAppScreen, activeId, activeHref, last, installHref } = input;
-  const expandedId = onAppScreen ? activeId : last?.installId ?? null;
+  const { apps, onAppScreen, activeId, activeHref, last, installHref, locale = "en", t } = input;
   return {
     apps: apps.map((app) => {
-      const decl = app.navigation ? declaredSections(app.navigation) : null;
+      const decl = app.navigation ? declaredSections(app.navigation, locale, t) : null;
       const active = onAppScreen && app.installId === activeId;
+      const isLast = !active && app.installId === last?.installId;
       let sections: AppMenuSection[] | null = null;
       let href = active ? activeHref : installHref(app.installId);
-      if (decl && app.installId === expandedId) {
+      if (decl) {
         const base = active ? activeHref : installHref(app.installId);
         const current = active
           ? decl.fromSearch(activeHref.includes("?") ? activeHref.slice(activeHref.indexOf("?")) : "")
-          : last?.section ?? decl.sections[0][0];
-        sections = decl.sections.map(([key, label]) => ({ label, href: decl.href(base, key), current: current === key }));
+          : isLast
+            ? (last?.section ?? decl.sections[0]?.[0] ?? null)
+            : null;
+        sections = decl.sections.map(([key, label]) => ({
+          label,
+          href: decl.href(base, key),
+          current: active ? current === key : false,
+        }));
         // The app link of a remembered app returns to its last section.
-        if (!active) href = sections.find((x) => x.current)?.href ?? href;
+        if (isLast && current !== null) {
+          const matchedIndex = decl.sections.findIndex(([key]) => key === current);
+          if (matchedIndex >= 0) href = sections[matchedIndex].href;
+        }
       }
-      return { installId: app.installId, title: app.title, href, current: active, sections };
+      return {
+        installId: app.installId,
+        kind: app.kind,
+        title: localizedAppTitle(app, locale, t),
+        href,
+        current: active,
+        sections,
+      };
     }),
   };
 }

@@ -11,17 +11,22 @@ pub mod account_media;
 pub mod adapter;
 pub mod agenticos;
 pub mod agenticos_external;
+pub mod agenticos_provider;
 pub mod agenticos_web;
 pub mod connections;
 pub mod custody;
 pub mod deployments;
 pub(crate) mod encrypted_config;
 mod encrypted_fs;
+/// CAD-2215: the fixed owner-selected path-only scoped-cursor keyring
+/// record. `pub(crate)` — no platform/custody surface re-exports it.
+pub(crate) mod scoped_cursor_config;
 pub(crate) use encrypted_fs::Directories as ControlledDirectories;
 /// CAD-1128: the encrypted-SQLite custody vault. `pub(crate)` — the
 /// manager and its key material are daemon-internal; no public
 /// platform/custody re-export exposes them.
-pub(crate) mod encrypted_sqlite;
+#[doc(hidden)]
+pub mod encrypted_sqlite;
 pub mod hosted_email;
 pub mod hosted_whatsapp;
 pub mod local;
@@ -29,7 +34,8 @@ pub mod smtp;
 pub mod smtp_internal;
 
 pub use adapter::{
-    AppArtifactError, AppCapabilityError, ImageFailure, ImageReason, ImageSettle, PlatformAdapter,
+    AppArtifactError, AppCapabilityError, ConnectedRead, ImageFailure, ImageReason, ImageSettle,
+    PlatformAdapter,
 };
 
 /// One reviewed adapter tool, as registered at daemon startup.
@@ -153,7 +159,8 @@ pub struct AppCapabilityAsset {
 use crate::error::{Error, Result};
 use crate::store::{Grant, Store};
 
-pub(crate) use custody::{Custody, Key};
+#[doc(hidden)]
+pub use custody::{Custody, Key};
 
 pub(crate) use crate::daemon::custody_rpc::CustodyWitness;
 

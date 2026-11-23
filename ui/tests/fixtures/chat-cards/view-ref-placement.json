@@ -1,0 +1,16 @@
+{
+  "role": "agent",
+  "kind": "view_ref",
+  "text": "Opened Top customers beside the focused view (CRM · segments)",
+  "payload": {
+    "v": 1,
+    "app": "crm",
+    "app_label": "CRM",
+    "install_id": "install_crm",
+    "screen_tag": "crm",
+    "section": "customers",
+    "record_id": "cust-0001",
+    "title": "Ada Example",
+    "placement": "beside"
+  }
+}

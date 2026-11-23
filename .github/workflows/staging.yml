@@ -9,10 +9,7 @@ on:
       - 'scripts/delivery-candidate.py'
       - 'scripts/staging-rehearsal.py'
       - 'scripts/auto-stage.py'
-      - 'scripts/test_reduced_gate_release.py'
-      - 'scripts/test_workflow_cleanup.py'
       - 'config/production-baseline.json'
-      - 'scripts/e2e/**'
       - 'src/upgrade.rs'
   workflow_dispatch:
     inputs:

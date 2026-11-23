@@ -25,15 +25,9 @@
 mod capabilities;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod policy;
-#[cfg(target_os = "linux")]
-mod protected;
 #[path = "../../protected_pi_profile.rs"]
 #[allow(dead_code)] // Same grammar compiled into both artifacts, not a caller policy port.
 mod protected_pi_profile;
-#[cfg(all(target_os = "linux", test))]
-#[path = "tests/protected_profile_refusal_acceptance.rs"]
-#[allow(clippy::single_match)] // Preserve the independently authored assertions verbatim.
-mod protected_profile_refusal_acceptance;
 
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, OsString};
@@ -115,18 +109,16 @@ fn run() -> i32 {
     // Missing real private prerequisites refuse even for a kernel-admitted caller.
     enum Action {
         Legacy(policy::Request),
-        Protected(protected::OwnedLaunch),
     }
     let action = match request {
+        // CAD-1085: the split helper launch is superseded by the native
+        // runtime owner's measured console; this executor never provisions it.
         policy::Request::PiGuest(_) => match dispatch_protected_request(request) {
-            Ok(plan) => Action::Protected(plan),
+            Ok(never) => match never {},
             Err(e) => return refuse(&e.to_string()),
         },
         other => Action::Legacy(other),
     };
-    if matches!(&action, Action::Protected(_)) {
-        protected_effect();
-    }
     // Bounding/ambient removal and locked securebits require supervisor-side
     // authority. They happen before UID drop; explicit capset follows it.
     let mut capability_seal = capabilities::Linux;
@@ -134,9 +126,6 @@ fn run() -> i32 {
         Ok(last) => last,
         Err(e) => return fail(&format!("capability seal preparation: {e}")),
     };
-    if matches!(&action, Action::Protected(_)) {
-        protected_effect();
-    }
     if let Err(e) = drop_to(agent.uid, agent.gid, &supplementary) {
         return fail(&format!("privilege drop: {e}"));
     }
@@ -150,18 +139,7 @@ fn run() -> i32 {
     if let Err(e) = capability_seal.finish(last_cap) {
         return fail(&format!("capability seal verification: {e}"));
     }
-    let request = match action {
-        Action::Protected(plan) => {
-            return match plan.exec() {
-                Ok(()) => fail("protected exec unexpectedly returned"),
-                Err(e) => {
-                    eprintln!("cadence-agent-exec: protected exec: {e}");
-                    CANNOT_EXEC
-                }
-            }
-        }
-        Action::Legacy(request) => request,
-    };
+    let Action::Legacy(request) = action;
     match request {
         policy::Request::PiGuest(_) => refuse("protected request escaped private dispatcher"),
         policy::Request::Exec { env, argv } => exec(&agent, &env, &argv),
@@ -174,28 +152,45 @@ fn run() -> i32 {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn dispatch_protected_request(request: policy::Request) -> std::io::Result<protected::OwnedLaunch> {
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn dispatch_protected_request(
+    request: policy::Request,
+) -> std::io::Result<std::convert::Infallible> {
     match request {
-        policy::Request::PiGuest(profile) => protected::prepare(profile),
+        // CAD-1085: no production authority can provision the split helper.
+        policy::Request::PiGuest(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "protected split launch is not available; the native runtime owner is the only protected path",
+        )),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "not a protected request",
         )),
     }
 }
-#[cfg(all(target_os = "linux", test))]
-std::thread_local! { static PROTECTED_EFFECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-#[cfg(target_os = "linux")]
-fn protected_effect() {
-    #[cfg(test)]
-    PROTECTED_EFFECTS.with(|count| count.set(count.get() + 1));
-}
-#[cfg(all(target_os = "linux", test))]
-fn protected_effect_count() -> usize {
-    PROTECTED_EFFECTS.with(std::cell::Cell::get)
+
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+fn dispatch_protected_request(
+    request: policy::Request,
+) -> std::io::Result<std::convert::Infallible> {
+    refuse_unsupported_protected_request(request)
 }
 
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+#[cfg(all(target_os = "linux", any(test, not(target_arch = "x86_64"))))]
+fn refuse_unsupported_protected_request(
+    request: policy::Request,
+) -> std::io::Result<std::convert::Infallible> {
+    if let policy::Request::PiGuest(profile) = request {
+        profile
+            .selection()
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::PermissionDenied, why))?;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "protected Pi launch requires Linux x86_64 constructor custody; unsupported target refused",
+    ))
+}
 #[cfg(target_os = "linux")]
 fn refuse(why: &str) -> i32 {
     eprintln!("cadence-agent-exec: refused: {why}");

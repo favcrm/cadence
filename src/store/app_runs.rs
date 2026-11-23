@@ -6,7 +6,37 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// CAD-622: one run's frozen membership as the app-team guard reads it.
+/// `roles` is `Some` for the team-role map this build freezes (`role` →
+/// agent alias, an explicitly empty map included); `None` for a snapshot
+/// written before that member existed, whose role keys were never
+/// recorded. `inputs` is the run's whole frozen input map — content, and
+/// in a legacy snapshot the team-role bindings merged into it. The guard
+/// never reads a content input as an agent; a legacy snapshot's inputs
+/// are kept only so a question naming one of their values can hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunTeam {
+    /// The snapshot's own run id, for a hold that names the run.
+    pub id: String,
+    /// The run's lifecycle state (`awaiting_approval`, `approved`,
+    /// `running`, `succeeded`, `failed`, `cancelled`).
+    pub state: String,
+    /// The frozen role→alias map, or `None` when the snapshot predates it.
+    pub roles: Option<BTreeMap<String, String>>,
+    /// The frozen input map.
+    pub inputs: BTreeMap<String, String>,
+    /// The aliases the run assigned to its steps.
+    pub assigned: Vec<String>,
+    /// False only when the frozen workflow ran on the host, which takes
+    /// no team: such a legacy input map is provably content.
+    pub may_have_roles: bool,
+    /// True when the operator explicitly retired this terminal legacy
+    /// run's unrecorded provenance (`app_run_retire_legacy`): its input
+    /// values no longer hold the app-team check.
+    pub legacy_retired: bool,
+}
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
 pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -14,6 +44,12 @@ pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
 /// CAD-1123 R4: the stream that keeps each app run's approval record.
 /// Not an agent alias and not the pruned daemon stream, so it survives.
 pub const APP_RUN_APPROVAL_STREAM: &str = "app-run-approvals";
+
+/// CAD-622: the durable event that records an operator's explicit
+/// withdrawal of a terminal legacy run's unrecorded role provenance. A
+/// terminal run cannot be cancelled, so this is its retirement; it lives
+/// on the run-indexed approval stream, which is never pruned.
+pub const APP_RUN_LEGACY_RETIRED: &str = "app_run_legacy_retired";
 
 /// CAD-1374: a domain-specific HUMAN receipt. `None` (autonomous or local
 /// operator) returns the legacy payload unchanged. The helper never copies
@@ -151,9 +187,7 @@ pub fn artifact_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 pub fn material_digest(value: &Value) -> String {
-    // The canonicalisation is shared with every host: cadence-core's
-    // `material` is the one definition of the bytes a digest covers.
-    artifact_digest(cadence_core::material::material(value).as_bytes())
+    cadence_core::connection_dispatch::material_digest(value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +198,13 @@ pub struct LocalStep {
     pub assignee: String,
     pub dependencies: Vec<String>,
     pub instruction: String,
+    /// CAD-1867: the skill package this step was frozen with — resolved from
+    /// the INSTALLED bundle's file map at run creation and stored inside the
+    /// snapshot, so the digest covers it. `None` for a step that declares no
+    /// `skill:`. Nothing is materialized on disk: these bytes travel in the
+    /// kickoff envelope and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<crate::issue::app::SkillPackage>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -186,13 +227,48 @@ pub struct LocalWorkflow {
 fn execution_agent() -> String {
     "agent".into()
 }
+
+/// The non-installed resolver: a `skill:` tag names material only an installed
+/// bundle can freeze, so it refuses rather than resolving to nothing.
+fn refuse_skill_package(tag: &str) -> Result<crate::issue::app::SkillPackage> {
+    Err(Error::rejected(format!(
+        "`skill: {tag}` names installed-app skill material — only an installed app run \
+         freezes a skill package into its snapshot"
+    )))
+}
 impl LocalWorkflow {
+    /// The NON-installed parse: no bundle is being frozen here, so a `skill:`
+    /// directive refuses instead of being silently dropped.
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
+        Self::parse_with(text, inputs, &refuse_skill_package)
+    }
+
+    /// CAD-1867: the installed parse. `resolve` maps a step's `skill: <tag>` to
+    /// the package frozen out of the INSTALLED bundle's file map
+    /// (`crate::issue::app::skill_package`), which is the same validator
+    /// install ran — a package that is missing, incomplete or over bounds
+    /// refuses here, before any run row exists.
+    pub fn parse_installed(
+        text: &str,
+        inputs: &BTreeMap<String, String>,
+        resolve: &dyn Fn(&str) -> Result<crate::issue::app::SkillPackage>,
+    ) -> Result<Self> {
+        Self::parse_with(text, inputs, resolve)
+    }
+
+    fn parse_with(
+        text: &str,
+        inputs: &BTreeMap<String, String>,
+        resolve: &dyn Fn(&str) -> Result<crate::issue::app::SkillPackage>,
+    ) -> Result<Self> {
         let template = workflow::parse_template(text)?;
         let publication_slot = template.publication_slot;
         let capability_slots = template.capability_slots;
         let required_asset_slot = template.required_asset_slot;
         let execution = template.execution.as_str().to_string();
+        // CAD-1867: the per-step `skill:` tags of the TEMPLATE — the tags are
+        // static (a placeholder refuses), so the render cannot change them.
+        let skill_tags = workflow::skill_tags(text)?;
         let rendered = workflow::render(text, inputs)?;
         let parsed = plan::parse_plan(&rendered)?;
         let (_, body) =
@@ -200,6 +276,11 @@ impl LocalWorkflow {
         let metadata = workflow::ticket_meta(body)?;
         if parsed.tickets.len() > 16 {
             return Err(Error::rejected("local runs support at most 16 steps"));
+        }
+        if skill_tags.len() != parsed.tickets.len() {
+            return Err(Error::rejected(
+                "the rendered workflow has a different step count than its template",
+            ));
         }
         let mut steps = Vec::new();
         for (n, ticket) in parsed.tickets.iter().enumerate() {
@@ -213,7 +294,13 @@ impl LocalWorkflow {
                 .take_while(|line| !line.trim().is_empty())
             {
                 if let Some((key, _)) = line.split_once(':') {
-                    if !matches!(key.trim(), "action" | "uses" | "tries" | "reviewer") {
+                    // CAD-1867: `skill:` is a metadata line the plan parser
+                    // leaves in the body, so it appears here; the installed
+                    // parse resolves it, and the non-installed one refuses it.
+                    if !matches!(
+                        key.trim(),
+                        "action" | "uses" | "tries" | "reviewer" | "skill"
+                    ) {
                         return Err(Error::rejected("unsupported local step directive"));
                     }
                 }
@@ -293,12 +380,33 @@ impl LocalWorkflow {
                     "local step instruction exceeds its byte limit",
                 ));
             }
+            // CAD-1867: a declared tag is resolved NOW, from the installed
+            // bundle, and frozen into the step. A missing or incomplete
+            // package refuses here — before the run row exists.
+            let skill = match skill_tags[n].clone() {
+                Some(tag) => {
+                    // A host capability step runs in-process with no worker
+                    // and no kickoff, so frozen material would be dropped
+                    // silently. Refuse rather than pretend.
+                    if kind == "capability" {
+                        return Err(Error::rejected(format!(
+                            "step `skill: {tag}` — a host capability step runs no worker, \
+                             so it cannot use skill material"
+                        )));
+                    }
+                    Some(resolve(&tag).map_err(|error| {
+                        Error::rejected(format!("step `skill: {tag}` — {error}"))
+                    })?)
+                }
+                None => None,
+            };
             steps.push(LocalStep {
                 id: format!("s{}", n + 1),
                 kind: kind.into(),
                 assignee,
                 dependencies,
                 instruction,
+                skill,
             });
         }
         if execution == "host" && steps.iter().any(|step| step.kind != "capability") {
@@ -327,6 +435,58 @@ impl LocalWorkflow {
         })
     }
 }
+
+/// The exact kickoff body one step is dispatched with.
+///
+/// Creation measures this same body — for every step, with the run id it is
+/// about to write — plus [`KICKOFF_DEPENDENCY_BYTES`] per declared dependency,
+/// and refuses before any run row exists when it could not be transported.
+/// Dispatch sends the body this builds from the SNAPSHOT alone: `skill` is the
+/// material frozen at creation, never a re-read of the live bundle.
+fn kickoff_body(
+    run_id: &str,
+    step: &LocalStep,
+    dependencies: &[Value],
+    snapshot: &Value,
+) -> Result<String> {
+    let envelope = json!({"schema":1,"run_id":run_id,"step_id":step.id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
+        "skill":step.skill,
+        "source":snapshot["source"],
+        "capability_slots":snapshot["workflow"]["capability_slots"],
+        "required_asset_slot":snapshot["workflow"]["required_asset_slot"],
+        "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with the active message and turn token. An approve is refused unless this turn successfully fetched that dependency; revise does not require the fetch. Managed Codex: call MCP self, then MCP app_run_artifact with the dependency artifact_id and that response's exact id as message and turn_id as token. Other providers: cadence app run artifact ID --message MSG --token TOKEN. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+    serde_json::to_string(&envelope).map_err(|e| Error::internal(e.to_string()))
+}
+
+/// Worst-case bytes one `dependencies` entry adds to the kickoff body: the
+/// artifact id (`artifact-<run>-<step>`), the producer step id, the revision,
+/// the `sha256:` digest, a media type and a byte count. Creation reserves this
+/// per declared dependency because the artifact does not exist yet; dispatch
+/// then measures the real body again.
+const KICKOFF_DEPENDENCY_BYTES: usize = 320;
+
+pub(super) const OPERATOR_DECISION_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS app_run_dispositions(
+ run_id TEXT PRIMARY KEY REFERENCES app_runs(id),
+ request_id TEXT NOT NULL UNIQUE,
+ artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
+ artifact_digest TEXT NOT NULL,
+ decision TEXT NOT NULL CHECK(decision IN ('accept','decline')),
+ created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS app_run_tickets(
+ run_id TEXT PRIMARY KEY REFERENCES app_runs(id),
+ request_id TEXT NOT NULL UNIQUE,
+ artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
+ artifact_digest TEXT NOT NULL,
+ suggestion_index INTEGER NOT NULL CHECK(suggestion_index>=1),
+ suggestion_count INTEGER NOT NULL CHECK(suggestion_count>=2),
+ suggestion_text TEXT NOT NULL CHECK(length(suggestion_text)>0),
+ issue_id TEXT,
+ created REAL NOT NULL,
+ CHECK(issue_id IS NULL OR length(issue_id)>0));
+CREATE UNIQUE INDEX IF NOT EXISTS app_run_tickets_issue
+ ON app_run_tickets(issue_id) WHERE issue_id IS NOT NULL;
+";
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS app_install_capabilities(
@@ -370,6 +530,11 @@ CREATE TABLE IF NOT EXISTS app_run_artifact_fetches(
 pub struct LocalRunProvenance<'a> {
     pub selected_source: Option<(&'a str, &'a str)>,
     pub input_origins: &'a BTreeMap<String, String>,
+    /// CAD-622: the installation team's role → alias bindings this run
+    /// froze into its inputs, kept as their own member so the app-team
+    /// guard reads role provenance rather than guessing role names from
+    /// aliases (or from content inputs).
+    pub team_roles: &'a BTreeMap<String, String>,
     pub human: Option<&'a Value>,
 }
 
@@ -550,6 +715,7 @@ impl Store {
             LocalRunProvenance {
                 selected_source: None,
                 input_origins: &BTreeMap::new(),
+                team_roles: &BTreeMap::new(),
                 human: None,
             },
         )
@@ -600,6 +766,7 @@ impl Store {
         let LocalRunProvenance {
             selected_source,
             input_origins,
+            team_roles,
             human,
         } = provenance;
         let operation = uuid::Uuid::new_v4().to_string();
@@ -808,6 +975,13 @@ impl Store {
                     if !input_origins.is_empty() {
                         snapshot["input_origins"] = json!(input_origins);
                     }
+                    // CAD-622: the team-role bindings this run froze stay
+                    // in the snapshot as their own member, so a later team
+                    // edit cannot drop a historical member and a content
+                    // input can never be mistaken for a role name. Written
+                    // even when empty: a new snapshot must never be read as
+                    // a legacy one whose role keys were not recorded.
+                    snapshot["team_roles"] = json!(team_roles);
                     if let Some(proof) = context {
                         snapshot["schema"] = json!(2);
                         snapshot["context"] =
@@ -860,6 +1034,28 @@ impl Store {
                         return Self::app_run_show_in(&tx, &id);
                     }
                     let id = format!("run-{}", uuid::Uuid::new_v4().simple());
+                    // CAD-1867: the kickoff envelope a step will be dispatched
+                    // with is measured NOW — frozen skill material included —
+                    // before any row exists. A run whose material cannot reach
+                    // its worker is refused here, not half-created and then
+                    // un-dispatchable. A capability step enqueues no message,
+                    // so it has no envelope to fit.
+                    for step in &workflow.steps {
+                        if step.kind == "capability" {
+                            continue;
+                        }
+                        let bytes = kickoff_body(&id, step, &[], &snapshot)?.len()
+                            + step.dependencies.len() * KICKOFF_DEPENDENCY_BYTES;
+                        if bytes > super::ENQUEUE_BYTES {
+                            return Err(Error::rejected(format!(
+                                "encoded app kickoff for step {} exceeds the transport byte \
+                                 limit ({bytes} > {}) — reduce the skill package or the step \
+                                 instruction",
+                                step.id,
+                                super::ENQUEUE_BYTES
+                            )));
+                        }
+                    }
                     // CAD-1171: a host run stores an empty owner (its
                     // snapshot carries `owner_pm: null`).
                     let owner_row = owner_pm.unwrap_or_default();
@@ -910,6 +1106,89 @@ impl Store {
                     Self::app_run_show_in(&*tx, &id)
         })
     }
+    /// CAD-622: each run of `install_id` as the snapshot's frozen
+    /// team-role map (`team_roles`: role → alias, exactly the roles the
+    /// installation team supplied when the run was created), its frozen
+    /// `inputs` and the aliases it assigned to its steps — the run-time
+    /// half of an app's team, read from the run's own snapshot rather
+    /// than the current workflow or team record. A snapshot written
+    /// before `team_roles` existed returns `roles: None`: its inputs
+    /// merged the role bindings into content and nothing recorded which
+    /// keys were roles, so the guard holds rather than inferring them
+    /// from today's team or reading content values as agents. A snapshot
+    /// that cannot be parsed refuses; it is never read as "nobody".
+    pub fn app_run_team_inputs(&self, install_id: &str) -> Result<Vec<RunTeam>> {
+        let texts = self
+            .conn()
+            .prepare("SELECT id,state,snapshot FROM app_runs WHERE install_id=? ORDER BY created")?
+            .query_map([install_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Runs whose terminal legacy ambiguity the operator has retired.
+        let retired: BTreeSet<String> = self
+            .conn()
+            .prepare(
+                "SELECT DISTINCT e.job_id FROM events e JOIN app_runs r ON r.id=e.job_id \
+                 WHERE e.kind=?1 AND e.alias=?2 AND r.install_id=?3",
+            )?
+            .query_map(
+                params![APP_RUN_LEGACY_RETIRED, APP_RUN_APPROVAL_STREAM, install_id],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::new();
+        for (id, state, text) in texts {
+            let snapshot: Value = serde_json::from_str(&text)
+                .map_err(|_| Error::internal("app run snapshot is unreadable"))?;
+            let snapshot = snapshot
+                .as_object()
+                .ok_or_else(|| Error::internal("app run snapshot is unreadable"))?;
+            let roles = match snapshot.get("team_roles") {
+                None => None,
+                Some(value) => Some(
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| Error::internal("app run team roles are unreadable"))?,
+                ),
+            };
+            let inputs = match snapshot.get("inputs") {
+                None => BTreeMap::new(),
+                Some(value) => serde_json::from_value(value.clone())
+                    .map_err(|_| Error::internal("app run inputs are unreadable"))?,
+            };
+            let assigned = snapshot
+                .get("assignments")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.values()
+                        .filter_map(|step| step["alias"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // A host-execution workflow names no owner and takes no
+            // team, so it froze no role binding into its inputs.
+            let may_have_roles = snapshot
+                .get("workflow")
+                .and_then(|workflow| workflow.get("execution"))
+                .and_then(Value::as_str)
+                != Some("host");
+            out.push(RunTeam {
+                legacy_retired: retired.contains(&id),
+                id,
+                state,
+                roles,
+                inputs,
+                assigned,
+                may_have_roles,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn app_run_show(&self, id: &str) -> Result<Value> {
         self.read_tx(|conn| Self::app_run_show_in(&conn, id))
     }
@@ -984,6 +1263,8 @@ impl Store {
             }
             Ok(review)
         })?);
+        value["disposition"] = Self::operator_disposition_json(conn, id)?;
+        value["ticket"] = Self::operator_ticket_json(conn, id)?;
         Ok(value)
     }
     pub fn app_run_list(&self, install_id: Option<&str>) -> Result<Value> {
@@ -1084,6 +1365,60 @@ impl Store {
                     Self::app_run_show_in(&tx, id)
         })
     }
+
+    /// CAD-622: retire a terminal legacy run's unrecorded role
+    /// provenance. Its snapshot predates `team_roles`, so the app-team
+    /// guard cannot tell which of its inputs were roles, and a terminal
+    /// run cannot be cancelled (`app_run_decide_as` refuses that). The
+    /// operator records an explicit withdrawal instead: a durable,
+    /// run-indexed `app_run_legacy_retired` event. The lifecycle state
+    /// and history are untouched; from the moment the event exists the
+    /// guard stops holding that run's input values. Idempotent.
+    pub fn app_run_retire_legacy(&self, id: &str, human: Option<&Value>) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let run = Self::app_run_show_in(&tx, id)?;
+            if run["snapshot"].get("team_roles").is_some() {
+                return Err(Error::rejected(
+                    "only a run frozen before team-role provenance can be retired",
+                ));
+            }
+            let state = run["state"].as_str().unwrap_or_default();
+            if !matches!(state, "succeeded" | "failed") {
+                return Err(Error::rejected(
+                    "only a terminal run needs retirement — cancel a live run instead",
+                ));
+            }
+            let retired = tx
+                .query_row(
+                    "SELECT 1 FROM events WHERE job_id=?1 AND alias=?2 AND kind=?3 LIMIT 1",
+                    params![id, APP_RUN_APPROVAL_STREAM, APP_RUN_LEGACY_RETIRED],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !retired {
+                Self::event_scoped(
+                    &tx,
+                    APP_RUN_APPROVAL_STREAM,
+                    APP_RUN_LEGACY_RETIRED,
+                    human_receipt(
+                        json!({"run_id":id,"snapshot_digest":run["snapshot_digest"],"by":"operator"}),
+                        human,
+                        &operation,
+                        APP_RUN_LEGACY_RETIRED,
+                        &format!("app-run:{id}"),
+                        "retired",
+                    ),
+                    Some(id),
+                    None,
+                )?;
+            }
+            Self::app_run_show_in(&tx, id)
+        })
+    }
+
     pub(super) fn app_current_in(
         conn: &impl super::StoreConn,
         run: &Value,
@@ -1663,12 +1998,7 @@ impl Store {
                             ));
                         }
                         let message = format!("app-{id}-{step_id}-r1");
-                        let envelope = json!({"schema":1,"run_id":id,"step_id":step_id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
-                            "source":run["snapshot"]["source"],
-                            "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
-                            "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
-                            "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with the active message and turn token. An approve is refused unless this turn successfully fetched that dependency; revise does not require the fetch. Managed Codex: call MCP self, then MCP app_run_artifact with the dependency artifact_id and that response's exact id as message and turn_id as token. Other providers: cadence app run artifact ID --message MSG --token TOKEN. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
-                        let body = envelope.to_string();
+                        let body = kickoff_body(id, &step, &dependencies, &run["snapshot"])?;
                         if body.len() > super::ENQUEUE_BYTES {
                             return Err(Error::rejected(
                                 "encoded app kickoff exceeds transport byte limit",
@@ -1979,7 +2309,7 @@ pub(super) fn app_reason_class(detail: &str) -> &'static str {
     if lower.contains("binding") || lower.contains("receipt") {
         "run binding receipt is no longer current"
     } else if lower.contains("price") || lower.contains("quote") {
-        "capability price changed since run approval"
+        "capability price could not be confirmed"
     } else if lower.contains("context") {
         "run context was updated or archived"
     } else if lower.contains("connection") {
@@ -2686,6 +3016,21 @@ impl Store {
             .optional()?
             .unwrap_or(json!({"state":"unapproved"})))
     }
+
+    /// The install's one consent row, whichever digest it currently names.
+    /// An automatic update compares this with the digest it observed before
+    /// the package fetch. No row means nobody has decided the install.
+    pub fn app_install_consent_current(&self, id: &str) -> Result<Value> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT digest,state FROM app_install_capabilities WHERE install_id=?",
+                [id],
+                |r| Ok(json!({"digest": r.get::<_, String>(0)?, "state": r.get::<_, String>(1)?})),
+            )
+            .optional()?
+            .unwrap_or(json!({"state": "unapproved"})))
+    }
 }
 
 pub(super) enum AppCompletionProof {
@@ -2734,5 +3079,590 @@ impl Store {
             return Err(Error::rejected("local app runs authorize run-owned text artifacts only; account grants do not authorize app outward effects"));
         }
         Ok(())
+    }
+}
+
+/// CAD-1887: proposals under the meeting skill's `## Proposed next steps`
+/// heading. The heading match is exact. A later heading ends the section.
+/// Anything else in the section must be one bullet, so a prose line cannot
+/// be dropped on the way to a ticket. At most 64 proposals.
+pub(crate) fn parse_proposed_steps(text: &str) -> Result<Vec<String>> {
+    let mut sections = 0usize;
+    let mut items = Vec::new();
+    let mut in_section = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            if line == "## Proposed next steps" {
+                sections += 1;
+                if sections > 1 {
+                    return Err(Error::rejected(
+                        "artifact has more than one Proposed next steps section",
+                    ));
+                }
+                in_section = true;
+            } else if in_section {
+                in_section = false;
+            }
+            continue;
+        }
+        if !in_section || line.is_empty() {
+            continue;
+        }
+        let Some(item) = proposal_line(line) else {
+            return Err(Error::rejected(
+                "Proposed next steps contains a line that is not a single proposal",
+            ));
+        };
+        if item.is_empty() {
+            return Err(Error::rejected(
+                "Proposed next steps contains an empty proposal",
+            ));
+        }
+        items.push(item);
+        if items.len() > 64 {
+            return Err(Error::rejected("artifact has too many proposals"));
+        }
+    }
+    if sections == 0 {
+        return Err(Error::rejected(
+            "artifact has no Proposed next steps section",
+        ));
+    }
+    Ok(items)
+}
+
+fn proposal_line(line: &str) -> Option<String> {
+    let rest = if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        rest
+    } else {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == 0 || i >= bytes.len() {
+            return None;
+        }
+        if bytes[i] != b'.' && bytes[i] != b')' {
+            return None;
+        }
+        line[i + 1..].strip_prefix(' ')?
+    };
+    Some(rest.trim().to_string())
+}
+
+fn decision_artifact_id(id: &str) -> Result<()> {
+    if !id.is_empty()
+        && id.len() <= 160
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Ok(())
+    } else {
+        Err(Error::rejected(
+            "artifact id is not a stored app artifact id",
+        ))
+    }
+}
+
+fn decision_digest(digest: &str) -> Result<()> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(Error::rejected("operator decision needs a sha256 digest"));
+    };
+    if hex.len() == 64
+        && hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(Error::rejected("operator decision needs a sha256 digest"))
+    }
+}
+
+struct StoredDisposition {
+    run_id: String,
+    request_id: String,
+    artifact_id: String,
+    artifact_digest: String,
+    decision: String,
+    created: f64,
+}
+
+struct StoredTicket {
+    run_id: String,
+    request_id: String,
+    artifact_id: String,
+    artifact_digest: String,
+    index: i64,
+    count: i64,
+    text: String,
+    issue_id: Option<String>,
+    created: f64,
+}
+
+fn disposition_value(row: &StoredDisposition, replayed: bool) -> Value {
+    json!({
+        "run_id": row.run_id,
+        "request_id": row.request_id,
+        "artifact_id": row.artifact_id,
+        "artifact_digest": row.artifact_digest,
+        "decision": row.decision,
+        "created": row.created as i64,
+        "replayed": replayed,
+    })
+}
+
+fn ticket_value(row: &StoredTicket, replayed: bool) -> Value {
+    json!({
+        "run_id": row.run_id,
+        "request_id": row.request_id,
+        "artifact_id": row.artifact_id,
+        "artifact_digest": row.artifact_digest,
+        "index": row.index,
+        "count": row.count,
+        "suggestion": row.text,
+        "issue_id": row.issue_id,
+        "created": row.created as i64,
+        "replayed": replayed,
+    })
+}
+
+impl Store {
+    /// Accept or decline one reviewed artifact. This does not stage, publish,
+    /// or touch the effect ledger. One row per run; the same request replays.
+    pub fn app_run_disposition(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        artifact_id: &str,
+        digest: &str,
+        decision: &str,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        let run_id = crate::proto::identifier(run_id, "app run ID")?;
+        let request_id = crate::proto::identifier(request_id, "app run request ID")?;
+        decision_artifact_id(artifact_id)?;
+        decision_digest(digest)?;
+        if !matches!(decision, "accept" | "decline") {
+            return Err(Error::rejected("operator decision is accept or decline"));
+        }
+        let operation = uuid::Uuid::new_v4().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            Self::require_reviewed_artifact(&tx, &run_id, artifact_id, digest)?;
+            if let Some(row) = Self::disposition_by_run(&tx, &run_id)? {
+                if row.request_id == request_id
+                    && row.artifact_id == artifact_id
+                    && row.artifact_digest == digest
+                    && row.decision == decision
+                {
+                    return Ok(disposition_value(&row, true));
+                }
+                return Err(Error::rejected(if row.request_id == request_id {
+                    "this request id already records a different operator decision"
+                } else {
+                    "this run already has an operator decision"
+                }));
+            }
+            if Self::disposition_by_request(&tx, &request_id)?.is_some() {
+                return Err(Error::rejected(
+                    "this request id already records a different operator decision",
+                ));
+            }
+            tx.execute(
+                "INSERT INTO app_run_dispositions(run_id,request_id,artifact_id,artifact_digest,decision,created) VALUES(?,?,?,?,?,?)",
+                params![run_id, request_id, artifact_id, digest, decision, now()],
+            )?;
+            Self::event_scoped(
+                &tx,
+                APP_RUN_APPROVAL_STREAM,
+                "app_run_disposition_recorded",
+                human_receipt(
+                    json!({
+                        "run_id": run_id,
+                        // CAD-1374 owns `request_id` on a human receipt: it
+                        // is the operation UUID. The caller's idempotency
+                        // id is kept beside it.
+                        "decision_request_id": request_id,
+                        "artifact_id": artifact_id,
+                        "digest": digest,
+                        "decision": decision,
+                        "by": "operator",
+                    }),
+                    human,
+                    &operation,
+                    "app_run_disposition",
+                    &format!("app-run:{run_id}"),
+                    decision,
+                ),
+                Some(&run_id),
+                None,
+            )?;
+            let row = Self::disposition_by_run(&tx, &run_id)?
+                .ok_or_else(|| Error::internal("operator decision was not stored"))?;
+            Ok(disposition_value(&row, false))
+        })
+    }
+
+    /// Reserve the one selected proposal. The artifact text is parsed here so
+    /// the issue writer cannot substitute a different suggestion.
+    pub fn app_run_ticket_reserve(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        artifact_id: &str,
+        digest: &str,
+        index: u32,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        let run_id = crate::proto::identifier(run_id, "app run ID")?;
+        let request_id = crate::proto::identifier(request_id, "app run request ID")?;
+        decision_artifact_id(artifact_id)?;
+        decision_digest(digest)?;
+        if index == 0 || index > 64 {
+            return Err(Error::rejected(
+                "suggestion index is outside the proposal list",
+            ));
+        }
+        let operation = uuid::Uuid::new_v4().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let text = Self::require_reviewed_artifact(&tx, &run_id, artifact_id, digest)?;
+            let disposition = Self::disposition_by_run(&tx, &run_id)?.ok_or_else(|| {
+                Error::rejected("ticket needs an accepted disposition for this artifact")
+            })?;
+            if disposition.decision != "accept"
+                || disposition.artifact_id != artifact_id
+                || disposition.artifact_digest != digest
+            {
+                return Err(Error::rejected(
+                    "ticket needs an accepted disposition for this artifact",
+                ));
+            }
+            let steps = parse_proposed_steps(&text)?;
+            if steps.len() < 2 {
+                return Err(Error::rejected(
+                    "a selected ticket needs at least two proposals",
+                ));
+            }
+            if index as usize > steps.len() {
+                return Err(Error::rejected(
+                    "suggestion index is outside the proposal list",
+                ));
+            }
+            let suggestion = &steps[index as usize - 1];
+            if let Some(other) = Self::ticket_by_request(&tx, &request_id)? {
+                if other.run_id != run_id {
+                    return Err(Error::rejected(
+                        "this request id already records a different ticket",
+                    ));
+                }
+            }
+            if let Some(row) = Self::ticket_by_run(&tx, &run_id)? {
+                let same = row.request_id == request_id
+                    && row.artifact_id == artifact_id
+                    && row.artifact_digest == digest
+                    && row.index == i64::from(index)
+                    && row.count == steps.len() as i64
+                    && row.text == *suggestion;
+                if same {
+                    return Ok(ticket_value(&row, true));
+                }
+                return Err(Error::rejected(if row.request_id == request_id {
+                    "this request id already records a different ticket"
+                } else {
+                    "this run already has a selected ticket"
+                }));
+            }
+            tx.execute(
+                "INSERT INTO app_run_tickets(run_id,request_id,artifact_id,artifact_digest,suggestion_index,suggestion_count,suggestion_text,issue_id,created) VALUES(?,?,?,?,?,?,?,NULL,?)",
+                params![
+                    run_id,
+                    request_id,
+                    artifact_id,
+                    digest,
+                    i64::from(index),
+                    steps.len() as i64,
+                    suggestion,
+                    now()
+                ],
+            )?;
+            Self::event_scoped(
+                &tx,
+                APP_RUN_APPROVAL_STREAM,
+                "app_run_ticket_reserved",
+                human_receipt(
+                    json!({
+                        "run_id": run_id,
+                        "decision_request_id": request_id,
+                        "artifact_id": artifact_id,
+                        "digest": digest,
+                        "index": index,
+                        "count": steps.len(),
+                        "by": "operator",
+                    }),
+                    human,
+                    &operation,
+                    "app_run_ticket_reserve",
+                    &format!("app-run:{run_id}"),
+                    "reserved",
+                ),
+                Some(&run_id),
+                None,
+            )?;
+            let row = Self::ticket_by_run(&tx, &run_id)?
+                .ok_or_else(|| Error::internal("selected ticket was not stored"))?;
+            Ok(ticket_value(&row, false))
+        })
+    }
+
+    /// Attach the tracker issue created for a reservation. The same issue
+    /// replays; a second issue for the same run or request conflicts.
+    ///
+    /// Syntax, the reservation pair, and uniqueness are the whole check
+    /// here. This does not read the tracker. The daemon bind path confirms
+    /// the id is the committed selected issue before it calls this.
+    pub fn app_run_ticket_bind(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        issue_id: &str,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        let run_id = crate::proto::identifier(run_id, "app run ID")?;
+        let request_id = crate::proto::identifier(request_id, "app run request ID")?;
+        let issue_id = crate::issue::model::check_id(issue_id)?;
+        let operation = uuid::Uuid::new_v4().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let Some(row) = Self::ticket_by_run(&tx, &run_id)? else {
+                return Err(Error::rejected("ticket bind needs the reserved request"));
+            };
+            if row.request_id != request_id {
+                return Err(Error::rejected("ticket bind needs the reserved request"));
+            }
+            if let Some(bound) = &row.issue_id {
+                if bound == &issue_id {
+                    return Ok(ticket_value(&row, true));
+                }
+                return Err(Error::rejected(
+                    "ticket is already bound to a different issue",
+                ));
+            }
+            if let Some(owner) = tx
+                .query_row(
+                    "SELECT run_id FROM app_run_tickets WHERE issue_id=?",
+                    [&issue_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if owner != run_id {
+                    return Err(Error::rejected(
+                        "that issue is already bound to another run",
+                    ));
+                }
+            }
+            let updated = tx.execute(
+                "UPDATE app_run_tickets SET issue_id=? WHERE run_id=? AND request_id=? AND issue_id IS NULL",
+                params![issue_id, run_id, request_id],
+            )?;
+            if updated != 1 {
+                return Err(Error::rejected("ticket bind needs the reserved request"));
+            }
+            Self::event_scoped(
+                &tx,
+                APP_RUN_APPROVAL_STREAM,
+                "app_run_ticket_bound",
+                human_receipt(
+                    json!({
+                        "run_id": run_id,
+                        "decision_request_id": request_id,
+                        "issue_id": issue_id,
+                        "digest": row.artifact_digest,
+                        "by": "operator",
+                    }),
+                    human,
+                    &operation,
+                    "app_run_ticket_bind",
+                    &format!("app-run:{run_id}"),
+                    "bound",
+                ),
+                Some(&run_id),
+                None,
+            )?;
+            let row = Self::ticket_by_run(&tx, &run_id)?
+                .ok_or_else(|| Error::internal("selected ticket was not stored"))?;
+            Ok(ticket_value(&row, false))
+        })
+    }
+
+    fn operator_disposition_json(conn: &impl super::StoreConn, run_id: &str) -> Result<Value> {
+        Ok(match Self::disposition_by_run(conn, run_id)? {
+            None => Value::Null,
+            Some(row) => json!({
+                "request_id": row.request_id,
+                "artifact_id": row.artifact_id,
+                "artifact_digest": row.artifact_digest,
+                "decision": row.decision,
+                "created": row.created as i64,
+            }),
+        })
+    }
+
+    fn operator_ticket_json(conn: &impl super::StoreConn, run_id: &str) -> Result<Value> {
+        Ok(match Self::ticket_by_run(conn, run_id)? {
+            None => Value::Null,
+            Some(row) => json!({
+                "request_id": row.request_id,
+                "artifact_id": row.artifact_id,
+                "artifact_digest": row.artifact_digest,
+                "index": row.index,
+                "count": row.count,
+                "suggestion": row.text,
+                "issue_id": row.issue_id,
+                "created": row.created as i64,
+            }),
+        })
+    }
+
+    fn require_reviewed_artifact(
+        conn: &impl super::StoreConn,
+        run_id: &str,
+        artifact_id: &str,
+        digest: &str,
+    ) -> Result<String> {
+        let run = Self::app_run_show_in(conn, run_id)?;
+        if run["state"] != "succeeded" || run["approved_digest"] != run["snapshot_digest"] {
+            return Err(Error::rejected(
+                "operator decision needs a succeeded approved run",
+            ));
+        }
+        let (stored_digest, media, producer, bytes): (String, String, String, Vec<u8>) = conn
+            .query_row(
+                "SELECT digest, media_type, producer, content FROM app_run_artifacts WHERE id=? AND run_id=?",
+                params![artifact_id, run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("artifact is not part of this run"))?;
+        if stored_digest != digest
+            || artifact_digest(&bytes) != digest
+            || !matches!(media.as_str(), "text/plain" | "text/markdown")
+        {
+            return Err(Error::rejected(
+                "artifact digest does not match the stored bytes",
+            ));
+        }
+        let reviews: Vec<(String, String, String)> = conn.query_vec(
+            "SELECT reviewer, decision, artifact_digest FROM app_run_reviews WHERE run_id=? AND artifact_id=?",
+            params![run_id, artifact_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let mut independent = false;
+        for (reviewer, decision, review_digest) in reviews {
+            if decision == "approve" && reviewer == producer {
+                return Err(Error::rejected(
+                    "producer approval is not an independent review",
+                ));
+            }
+            if decision == "approve" && review_digest == digest && reviewer != producer {
+                independent = true;
+            }
+        }
+        if !independent {
+            return Err(Error::rejected(
+                "reviewed artifact needs an independent approval",
+            ));
+        }
+        String::from_utf8(bytes).map_err(|_| Error::rejected("stored text artifact is not UTF-8"))
+    }
+
+    fn disposition_by_run(
+        conn: &impl super::StoreConn,
+        run_id: &str,
+    ) -> Result<Option<StoredDisposition>> {
+        conn.query_row(
+            "SELECT run_id, request_id, artifact_id, artifact_digest, decision, created FROM app_run_dispositions WHERE run_id=?",
+            [run_id],
+            |r| {
+                Ok(StoredDisposition {
+                    run_id: r.get(0)?,
+                    request_id: r.get(1)?,
+                    artifact_id: r.get(2)?,
+                    artifact_digest: r.get(3)?,
+                    decision: r.get(4)?,
+                    created: r.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn disposition_by_request(
+        conn: &impl super::StoreConn,
+        request_id: &str,
+    ) -> Result<Option<StoredDisposition>> {
+        conn.query_row(
+            "SELECT run_id, request_id, artifact_id, artifact_digest, decision, created FROM app_run_dispositions WHERE request_id=?",
+            [request_id],
+            |r| {
+                Ok(StoredDisposition {
+                    run_id: r.get(0)?,
+                    request_id: r.get(1)?,
+                    artifact_id: r.get(2)?,
+                    artifact_digest: r.get(3)?,
+                    decision: r.get(4)?,
+                    created: r.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn ticket_by_run(conn: &impl super::StoreConn, run_id: &str) -> Result<Option<StoredTicket>> {
+        Self::ticket_row(
+            conn,
+            "SELECT run_id, request_id, artifact_id, artifact_digest, suggestion_index, suggestion_count, suggestion_text, issue_id, created FROM app_run_tickets WHERE run_id=?",
+            run_id,
+        )
+    }
+
+    fn ticket_by_request(
+        conn: &impl super::StoreConn,
+        request_id: &str,
+    ) -> Result<Option<StoredTicket>> {
+        Self::ticket_row(
+            conn,
+            "SELECT run_id, request_id, artifact_id, artifact_digest, suggestion_index, suggestion_count, suggestion_text, issue_id, created FROM app_run_tickets WHERE request_id=?",
+            request_id,
+        )
+    }
+
+    fn ticket_row(
+        conn: &impl super::StoreConn,
+        sql: &str,
+        key: &str,
+    ) -> Result<Option<StoredTicket>> {
+        conn.query_row(sql, [key], |r| {
+            Ok(StoredTicket {
+                run_id: r.get(0)?,
+                request_id: r.get(1)?,
+                artifact_id: r.get(2)?,
+                artifact_digest: r.get(3)?,
+                index: r.get(4)?,
+                count: r.get(5)?,
+                text: r.get(6)?,
+                issue_id: r.get(7)?,
+                created: r.get(8)?,
+            })
+        })
+        .optional()
+        .map_err(Into::into)
     }
 }

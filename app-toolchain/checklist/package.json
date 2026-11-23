@@ -1,0 +1,19 @@
+{
+  "name": "cadence-private-checklist-example",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "cadence": {
+    "app": "private-checklist",
+    "screen": {
+      "host_contract": "screen-records.v1",
+      "may": ["records.call"],
+      "tools": {},
+      "operations": ["records.list", "records.show", "records.create", "records.update"]
+    }
+  },
+  "scripts": {
+    "build": "bun ../template/scripts/build.mjs .",
+    "package": "bun ../template/scripts/build.mjs . && bun ../template/scripts/package.mjs ."
+  }
+}

@@ -60,20 +60,20 @@
 //! directory or member refuses, a FIFO refuses without ever blocking,
 //! and a swap between listing and open loses to the post-open `fstat`.
 //! No `symlink_metadata`-then-`PathBuf` rejoin and no `canonicalize`.
-//! The shape and bounds are the v0 bundle shape `app.rs` enforces:
-//! `app.md` plus flat `workflows/`/`rubrics/`/`templates/` only —
-//! nothing else, no dotfiles, no nested dirs — at most 128 files,
-//! each ≤ 256 KiB (`plan::MAX_PLAN_BYTES`; a screen JS/CSS ≤ 384 KiB,
-//! `app::MAX_SCREEN_ASSET_BYTES`), ≤ 2 MiB aggregate
-//! (`app::MAX_APP_BYTES`), read through `take(MAX_FILE_BYTES + 1)` so
-//! no unbounded allocation happens before the bound is proved.
+//! Snapshot paths and byte bounds follow the bundle grammar in `app.rs`.
+//! At most 128 files share the 2 MiB aggregate app budget; screen assets
+//! may use that budget, while screen declarations, skill packages and other
+//! members keep their published bounds. Each file is read through
+//! `take(file_cap + 1)`, so no unbounded allocation happens before its
+//! applicable bound is proved.
+
+#![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString};
-use std::fs::File;
+use std::ffi::CString;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path};
 use std::process::{Command, Output};
@@ -81,6 +81,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 use crate::error::{Error, Result};
+use crate::fd_fs::DirFd;
 use crate::issue::{app, model};
 
 /// Largest URL a selection may carry, bytes.
@@ -107,9 +108,19 @@ const TIMEOUT_KILL_CODE: i32 = 137;
 /// The v0 bundle shape — the same allowlist `app.rs` pins privately:
 /// `app.md` plus flat `workflows/`, `rubrics/`, `templates/` dirs,
 /// CAD-1006's `screens/` (one `<tag>/` subdir per package of flat
-/// `<stem>.<js|css|svg|json>` leaves + `screens.json`) and CAD-1129's
-/// `assets/` (flat `*.svg`). Kept identical by inspection parity.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens", "assets"];
+/// `<stem>.<js|css|svg|json>` leaves + `screens.json`), CAD-1129's
+/// `assets/` (flat `*.svg`) and CAD-1867's `skills/` (one `<tag>/`
+/// package of `skill.json` + declared members). Kept identical by
+/// inspection parity.
+const TOP_DIRS: &[&str] = &[
+    "workflows",
+    "rubrics",
+    "templates",
+    "screens",
+    "assets",
+    "storage",
+    "skills",
+];
 
 /// Most files a bundle may carry — pinned at `app.rs`'s private
 /// `MAX_FILES`.
@@ -262,7 +273,9 @@ fn check_dir(dir: &str) -> Result<()> {
 /// directory descriptor-relative. Every refusal is a plain `Err`; no
 /// record, journal or authority is touched.
 pub fn resolve(source: &SelectedGitSource) -> Result<ResolvedGitBundle> {
-    let tmp = tempfile::tempdir()?;
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let clone_dir = tmp.path().join("clone");
 
     // Full clone — no depth, no tags, no checkout yet.
@@ -490,44 +503,27 @@ fn tail_str(text: &str, max: usize) -> &str {
 }
 
 // ---------------------------------------------------------------------
-// Descriptor-anchored snapshot — O_NOFOLLOW everywhere, never a
-// `PathBuf` rejoin. Mirrors `app_catalog::fs`'s libc pattern.
+// Descriptor-anchored snapshot — O_NOFOLLOW everywhere via crate::fd_fs.
 // ---------------------------------------------------------------------
-
-const DIRECTORY: i32 = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
-const FILE: i32 = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
 
 fn cname(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bundle path contains a NUL"))
 }
 
-fn open_at(parent: &File, name: &[u8], flags: i32) -> io::Result<File> {
-    let name = cname(name)?;
-    // SAFETY: plain openat; the fd is checked before it is wrapped.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn open_dir_at(parent: &File, name: &[u8]) -> io::Result<File> {
-    open_at(parent, name, DIRECTORY)
+fn open_dir_at(parent: &DirFd, name: &[u8]) -> io::Result<DirFd> {
+    parent.open_child_dir(&cname(name)?)
 }
 
 /// Open `path` as a real directory, walking its components from the
 /// root anchor with `O_NOFOLLOW`/`O_DIRECTORY` — a swapped or linked
 /// ancestor refuses rather than being followed.
-fn open_dir_path(path: &Path) -> Result<File> {
-    let start = if path.is_absolute() { "/" } else { "." };
-    let c = cname(start.as_bytes())?;
-    // SAFETY: plain open; the fd is checked before it is wrapped.
-    let fd = unsafe { libc::open(c.as_ptr(), DIRECTORY) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    let mut dir = unsafe { File::from_raw_fd(fd) };
+fn open_dir_path(path: &Path) -> Result<DirFd> {
+    let mut dir = if path.is_absolute() {
+        DirFd::open_root()?
+    } else {
+        DirFd::open_nofollow(Path::new("."))?
+    };
     for part in path.components() {
         match part {
             Component::Normal(n) => dir = open_dir_at(&dir, n.as_bytes())?,
@@ -539,74 +535,15 @@ fn open_dir_path(path: &Path) -> Result<File> {
 }
 
 /// The `fstatat(AT_SYMLINK_NOFOLLOW)` kind of `name` under `parent`.
-fn kind_at(parent: &File, name: &[u8]) -> io::Result<libc::mode_t> {
-    let name = cname(name)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: the kernel writes `stat` through the pointer.
-    let rc = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT)
+fn kind_at(parent: &DirFd, name: &[u8]) -> io::Result<libc::mode_t> {
+    Ok(parent.fstatat_nofollow(&cname(name)?)?.st_mode & libc::S_IFMT)
 }
 
-/// Every entry name of `dir` (opened through a fresh `.` dup so a
-/// prior read's readdir cursor is never inherited), skipping `.`/`..`.
-fn list_dir(dir: &File) -> Result<Vec<Vec<u8>>> {
-    struct Owned(*mut libc::DIR);
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            // SAFETY: created by `fdopendir` in `list_dir`, closed once.
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-    let dup = open_dir_at(dir, b".")?;
-    let fd = dup.as_raw_fd();
-    std::mem::forget(dup);
-    // SAFETY: `fd` is a live directory fd `fdopendir` takes ownership of.
-    let raw = unsafe { libc::fdopendir(fd) };
-    if raw.is_null() {
-        // SAFETY: fdopendir failed, so `fd` is still ours to close.
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(io::Error::last_os_error().into());
-    }
-    let dir = Owned(raw);
+/// Every entry name of `dir`, skipping `.`/`..`.
+fn list_dir(dir: &DirFd) -> Result<Vec<Vec<u8>>> {
     let mut names = Vec::new();
-    loop {
-        #[cfg(target_os = "linux")]
-        let errno = unsafe { libc::__errno_location() };
-        #[cfg(target_os = "macos")]
-        let errno = unsafe { libc::__error() };
-        // SAFETY: __errno_location/__error return a live thread-local.
-        unsafe {
-            *errno = 0;
-        }
-        // SAFETY: `dir.0` is a live DIR*.
-        let next = unsafe { libc::readdir(dir.0) };
-        if next.is_null() {
-            // SAFETY: the errno cell above is still valid.
-            if unsafe { *errno } != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            break;
-        }
-        // SAFETY: `readdir` returned a valid dirent; d_name is a CStr.
-        let bytes = unsafe { CStr::from_ptr((*next).d_name.as_ptr()) }.to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        names.push(bytes.to_vec());
+    for entry in dir.read_dir()? {
+        names.push(entry?.into_bytes());
         if names.len() > MAX_FILES * 4 {
             return Err(Error::rejected(
                 "bundle directory carries implausibly many entries",
@@ -622,8 +559,9 @@ fn list_dir(dir: &File) -> Result<Vec<Vec<u8>>> {
 /// `fstat`ed a regular file within the bound BEFORE any byte is read,
 /// then read through `take(MAX_FILE_BYTES + 1)` — no unbounded
 /// allocation ever precedes the bound.
-fn read_bounded(dir: &File, name: &[u8], rel: &str) -> Result<String> {
-    let file = open_at(dir, name, FILE)
+fn read_bounded(dir: &DirFd, name: &[u8], rel: &str) -> Result<String> {
+    let file = cname(name)
+        .and_then(|c| dir.open_readonly_nofollow(&c))
         .map_err(|e| Error::rejected(format!("bundle entry '{rel}' cannot be opened: {e}")))?;
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -654,10 +592,10 @@ fn read_bounded(dir: &File, name: &[u8], rel: &str) -> Result<String> {
 /// `app.md` plus flat `workflows/`/`rubrics/`/`templates/` — under
 /// the pinned file-count, per-file and aggregate bounds, every member
 /// reached descriptor-relative with `O_NOFOLLOW`.
-fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
+fn snapshot_dir(dir: &DirFd) -> Result<BTreeMap<String, String>> {
     let mut files = BTreeMap::new();
     let mut bytes = 0u64;
-    let mut add = |dir: &File, name: &[u8], rel: String| -> Result<()> {
+    let mut add = |dir: &DirFd, name: &[u8], rel: String| -> Result<()> {
         if files.len() >= MAX_FILES {
             return Err(Error::rejected(format!(
                 "bundle carries more than {MAX_FILES} files"
@@ -805,6 +743,113 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                 }
                 continue;
             }
+            // CAD-1867: skills/<tag>/<member> — the package manifest, flat
+            // root text leaves, and scripts/ and references/ subdirectories.
+            if top_text == "skills" {
+                match kind_at(&sub, &leaf)? {
+                    libc::S_IFDIR => {
+                        if !model::valid_tag(leaf_text) {
+                            return Err(Error::rejected(format!(
+                                "bundle entry '{rel}': the skill package name \
+                                 '{leaf_text}' is not tag-shaped"
+                            )));
+                        }
+                        let tagdir = open_dir_at(&sub, &leaf).map_err(|e| {
+                            Error::rejected(format!(
+                                "bundle directory '{rel}' cannot be opened: {e}"
+                            ))
+                        })?;
+                        for member in list_dir(&tagdir)? {
+                            let member_text = std::str::from_utf8(&member).map_err(|_| {
+                                Error::rejected(format!("{rel}/ carries a non-UTF-8 name"))
+                            })?;
+                            let mrel = format!("{rel}/{member_text}");
+                            if member_text.starts_with('.') {
+                                return Err(Error::rejected(format!(
+                                    "bundle entry '{mrel}': dotfiles are not app content"
+                                )));
+                            }
+                            match kind_at(&tagdir, &member)? {
+                                libc::S_IFDIR => {
+                                    if !app::skill_subdir_ok(member_text) {
+                                        return Err(Error::rejected(format!(
+                                            "bundle entry '{mrel}': a skill package nests \
+                                             only scripts/ or references/"
+                                        )));
+                                    }
+                                    let memberdir = open_dir_at(&tagdir, &member).map_err(|e| {
+                                        Error::rejected(format!(
+                                            "bundle directory '{mrel}' cannot be opened: {e}"
+                                        ))
+                                    })?;
+                                    for leaf in list_dir(&memberdir)? {
+                                        let leaf_text =
+                                            std::str::from_utf8(&leaf).map_err(|_| {
+                                                Error::rejected(format!(
+                                                    "{mrel}/ carries a non-UTF-8 name"
+                                                ))
+                                            })?;
+                                        let lrel = format!("{mrel}/{leaf_text}");
+                                        if leaf_text.starts_with('.') {
+                                            return Err(Error::rejected(format!(
+                                                "bundle entry '{lrel}': dotfiles are not app \
+                                                 content"
+                                            )));
+                                        }
+                                        if kind_at(&memberdir, &leaf)? != libc::S_IFREG {
+                                            return Err(Error::rejected(format!(
+                                                "bundle entry '{lrel}' is not a regular file"
+                                            )));
+                                        }
+                                        if !app::skill_member_ok(&format!(
+                                            "{member_text}/{leaf_text}"
+                                        )) {
+                                            return Err(Error::rejected(format!(
+                                                "bundle entry '{lrel}': a scripts/ member is \
+                                                 <stem>.<py|sh|js|mjs> and a references/ \
+                                                 member is <stem>.<md|txt>"
+                                            )));
+                                        }
+                                        add(&memberdir, &leaf, lrel)?;
+                                    }
+                                }
+                                libc::S_IFREG => {
+                                    if !app::skill_member_ok(member_text) {
+                                        return Err(Error::rejected(format!(
+                                            "bundle entry '{mrel}': a skill package leaf is \
+                                             <stem>.(md|txt|json|yaml|yml|csv|css|svg)"
+                                        )));
+                                    }
+                                    add(&tagdir, &member, mrel)?;
+                                }
+                                libc::S_IFLNK => {
+                                    return Err(Error::rejected(format!(
+                                        "bundle entry '{mrel}' is a symlink — a bundle holds \
+                                         real files only"
+                                    )))
+                                }
+                                _ => {
+                                    return Err(Error::rejected(format!(
+                                        "bundle entry '{mrel}' is not a regular file"
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    libc::S_IFLNK => {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}' is a symlink — a bundle holds real \
+                             files only"
+                        )))
+                    }
+                    _ => {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}': a skill package is a <tag>/ directory"
+                        )))
+                    }
+                }
+                continue;
+            }
             let leaf_text = std::str::from_utf8(&leaf).map_err(|_| {
                 Error::rejected(format!("{top_text}/ carries a name that is not UTF-8"))
             })?;
@@ -836,6 +881,11 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                     {
                         return Err(Error::rejected(format!(
                             "bundle entry '{rel}': assets are flat <stem>.svg files"
+                        )));
+                    }
+                    if top_text == "storage" && !app::bundle_path_ok(&rel) {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}': storage migrations are flat <tag>.json files"
                         )));
                     }
                     add(&sub, &leaf, rel)?;

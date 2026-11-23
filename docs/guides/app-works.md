@@ -23,7 +23,9 @@ Declare only the operations your screen needs in `screens.json` under the
 | SLOT | `works.export` | Host-confirmed export receipt for the current approved revision |
 
 CALL operations are operator-only. Every Works operation is admitted only for a
-verified operator session on the installed screen. Screen arguments carry
+verified operator session on the installed screen. An operator's read-only
+canvas mount may call `works.query` and `works.get` and nothing else; a member's
+read-only mount is refused those reads too. Screen arguments carry
 selectors and content only. They never carry an installation, context, actor,
 reviewer identity, session, role or approval.
 

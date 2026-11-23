@@ -77,6 +77,11 @@ const refresh = async () => {
   assert(host.textContent?.includes("Agent work"), "usage appears");
   assert(host.querySelector<HTMLAnchorElement>(".account-actions a")?.target === "_blank", "safe manage link opens separately");
   assert(host.textContent?.includes("Member information is not available"), "member limitation is explicit");
+  const securityLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>(".account-members-note a"));
+  assert(
+    securityLinks.some((a) => a.href === connected.manage_url && a.target === "_blank" && a.textContent?.includes("Account security settings")),
+    "security settings note links to Manage account",
+  );
 
   await refresh();
   assert(host.textContent?.includes("Couldn’t refresh account"), "failed refresh is explicit");
@@ -95,6 +100,7 @@ const refresh = async () => {
   assert(host.textContent?.includes("No connected platform account"), "unconfigured state is explained");
   assert(host.querySelector(".account-actions button"), "unconfigured state can refresh");
   assert(!host.querySelector(".account-actions a"), "unconfigured state has no manage link");
+  assert(!host.querySelector(".account-members-note a"), "unconfigured state has no security link");
   assert(reads === 5, "each refresh made one read");
   await React.act(async () => root.unmount());
 })().catch((error) => { throw error; });

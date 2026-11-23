@@ -1,0 +1,55 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.requirements.evaluate",
+    "input": {
+      "manifest": "---\nname: demo\nneeds:\n  requires:\n    core: \">=0.2.0 <2.0.0\"\n    contracts: {app-storage: [1]}\n---\nbody\n",
+      "target": {
+        "core": "0.3.0",
+        "contracts": {
+          "app-storage": {
+            "majors": [1],
+            "stage": "sandboxed"
+          }
+        }
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "app.requirements.evaluate",
+    "value": {
+      "schema": 1,
+      "ok": true,
+      "compatible": true,
+      "unmet": null,
+      "declared": true,
+      "core": ">=0.2.0 <2.0.0",
+      "contracts": {
+        "app-storage": [1]
+      },
+      "host": {
+        "core": "0.3.0",
+        "contracts": {
+          "app-storage": [1]
+        }
+      },
+      "checks": [
+        {
+          "kind": "core",
+          "required": ">=0.2.0 <2.0.0",
+          "host": "0.3.0",
+          "ok": true
+        },
+        {
+          "kind": "contract",
+          "contract": "app-storage",
+          "required": [1],
+          "supported": [1],
+          "stage": "sandboxed",
+          "ok": true
+        }
+      ]
+    }
+  }
+}

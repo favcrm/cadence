@@ -136,6 +136,10 @@ pub fn run(state_dir: &Path) -> Result<Value> {
     let _ = std::fs::remove_file(probe.with_extension("sqlite3-wal"));
     let _ = std::fs::remove_file(probe.with_extension("sqlite3-shm"));
     checks["storage"] = storage;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute());
+    checks["guidance"] = crate::skill::guidance(home.as_deref(), "cadence")?;
     // Provider binaries are probed from the registry's `probe_bins`
     // entries — a new provider lands here with its spec, not by
     // hand-listing a command_version call.

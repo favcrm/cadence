@@ -32,6 +32,28 @@ deadline and 200ms receive bound remain. Maintenance of this protected check
 was explicitly operator-authorized and still needs independent review.
 This is test runtime evidence, not a measured whole-CI saving.
 
+The `build` job runs the platform-minted board assertion check as a named
+Cargo example (CAD-2721). It links the production verifier and shares the
+assertions with the scheduled library test. A missing example or a failed
+assertion fails the job; there is no test-name filter that can match zero tests.
+The manifest points to an entry point under the existing protected `tests/**`
+paths, so changes to either the runner or the shared assertions require
+operator approval.
+The [matched Boat benchmark](https://fav-limited.cadencecloud.app/projects/cadence/issues/CAD-2721)
+saved 50–65s with warm dependencies and 25–64s cold across the PR and merge-queue
+Rust sequences, compared with building the full library harness once
+(CAD-2460). These are Boat timings, not live CI savings.
+
+The scheduled Rust suite (CAD-2701) builds with pinned nextest once and
+uses the same binary metadata for execution and inventory. Inventory still
+lists tests directly from the binaries and checks JUnit completeness.
+`suite_build_seconds`, `suite_execution_seconds`, and `suite_inventory_seconds`
+separate the phases. The old inventory call rebuilt the workspace test
+harness on [two green runs](https://github.com/favcrm/cadence/actions/runs/43769564752)
+([second run](https://github.com/favcrm/cadence/actions/runs/43996845175)),
+adding 161s and 170s respectively. Those are historical compile costs,
+not a comparison against the new run.
+
 ## 2. The rust-cache staleness trap (the real bug)
 
 `Swatinem/rust-cache` **never overwrites an existing key**. The post-action
@@ -58,7 +80,7 @@ with `?key=v0-rust-<key>` — then let the next main push re-write it.
 and the default `cargo build --locked`. The test profile's dependency
 optimization differs from dev, so a test-only warm cache does not cover the
 second build. Producer and restore-only consumers share
-`cross-dual1-${{ matrix.target }}`; bump that epoch together when changing
+`cross-dual2-${{ matrix.target }}`; bump that epoch together when changing
 the warm inputs. Failed warm jobs do not save partial entries under the new
 immutable key. Main remains the only writer; native tests and builds still
 run on PRs and merge groups.
@@ -72,22 +94,32 @@ hit and took 2m10s. This is the baseline, not a claimed improvement.
 The introducing PR uses a cold epoch; assess the benefit only after main
 has saved both profiles and a later native consumer restores that entry.
 
-## 3. sccache scope — build/ui only, not shards
+## 3. sccache scope — build/ui and test-shards
 
 `cache-workspace-crates: false` on rust-cache, because workspace-source
 hashes change every merge (restoring them always misses). Workspace objects
 go through sccache instead — **but only where the job enables it**:
 
-- `cache-warm` legs run `READ_WRITE` under `sccache-writer` on main pushes.
-- `build` and `ui` gate jobs run `READ_ONLY` via `ci-sccache enable`.
-- **`test-shards` do not enable sccache** — they restore rust-cache, enable
-  the linker, and invoke the test runner directly. Their ~2m19s
-  `cadence-agent` compile is the raw workspace-crate codegen+link floor.
+- The `ci`-profile `cache-warm` leg can write under `sccache-writer` on main pushes.
+- `build`, `ui` and `test-shards` run `READ_ONLY` via `ci-sccache enable`.
 
-So the shard diagnostic is: if `cadence-agent` compiles once and takes
-~2min on a warm dep cache, that is expected — sccache never entered the
-shard path. Adding sccache to shards would help only for merges that don't
-touch the crate (rare); not worth the credential surface.
+CAD-2712 skips the `ci`-profile warm build on an exact GitHub dependency-cache
+hit. A miss or fallback restore still runs the full build. In the isolated
+successor comparison, neither the full nor library-only warmer yielded a
+Rust sccache hit on the next commit. Skipping saved 66.9s of combined build
+wall time in that run, with byte-identical successor binaries. This measures
+private disk caching in Boat, not production R2 latency.
+
+`test-shards` joined that list in CAD-1967. Six shards compile the same
+workspace crates, so the codegen was paid six times per run; with the cache
+enabled the library crates come from R2 and only the changed crate plus the
+final link are per-shard. Test binaries link, and sccache does not cache
+linking crates, so the link stays on every shard.
+
+The gate never writes: only `cache-warm` holds the read-write key, and the
+shards' key cannot poison the bucket. Read the `sccache statistics` step on
+a shard for the real Rust hit rate rather than assuming one; the warm leg
+must have written the same command and flags for a hit to be possible.
 
 Prefix is `v1/rustc-<toolchain>/` — a rustc bump re-zeros sccache too.
 

@@ -13,6 +13,14 @@ use clap::{Command, CommandFactory};
 /// The default root help: group title and its core verbs.
 const CORE: &[(&str, &[(&str, &str)])] = &[
     (
+        "Start",
+        &[
+            ("setup", "Set up Cadence on this machine"),
+            ("login", "Sign in to an existing hosted workspace"),
+            ("register", "Create a hosted workspace in the browser"),
+        ],
+    ),
+    (
         "Me",
         &[
             ("self", "Your alias, running message and report token"),
@@ -26,19 +34,14 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "Work",
-        &[
-            ("issue", "The issue board: the one public unit of work"),
-            ("plan", "Propose, decide and track an epic with its tickets"),
-        ],
+        &[(
+            "issue",
+            "The issue board: the one public unit of work, including epics",
+        )],
     ),
     (
         "Agents",
-        &[
-            ("send", "Enqueue a durable message to an agent"),
-            ("dispatch", "Start an issue and send its worker the kickoff"),
-            ("join", "Join a new worker agent to a group"),
-            ("agent", "List and manage registered agents"),
-        ],
+        &[("agent", "List and manage registered agents, including join")],
     ),
     (
         "Build",
@@ -64,7 +67,10 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         "Fleet",
         &[
             ("status", "One-screen fleet overview"),
-            ("doctor", "Check environment, storage and provider CLIs"),
+            (
+                "doctor",
+                "Check this machine, or your connection to a hosted org",
+            ),
         ],
     ),
     (
@@ -72,6 +78,11 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         &[
             ("memory", "Reviewed, scoped project facts"),
             ("wiki", "Shared, scoped knowledge pages"),
+            ("skill", "Read or install bundled public guidance"),
+            (
+                "workspace-skill",
+                "A hosted workspace's own skills: draft, check, owner approval",
+            ),
         ],
     ),
 ];
@@ -86,6 +97,7 @@ const OPERATOR: &[&str] = &[
     "inspect-portable",
     "ui",
     "master",
+    "routine",
     "connection",
     "platform",
     "app",
@@ -108,28 +120,26 @@ const ADVANCED: &[&str] = &[
     "claude",
     "codex",
     "commands",
+    "connect",
     "cursor",
     "delivery",
     "devin",
     "document",
+    "endpoint",
     "events",
     "idea",
     "intake",
     "interrupt",
     "job",
-    "login",
     "message",
     "milestone",
     "monitor",
     "overview",
     "project",
-    "register",
     "remote",
     "report",
     "resume",
     "schema",
-    "setup",
-    "skill",
     "stop",
     "template",
     "test",
@@ -137,6 +147,13 @@ const ADVANCED: &[&str] = &[
     "topic",
     "web",
     "workflow",
+    // Off the default help. Still listed by `help operator` / `help all`
+    // and still found by `cadence commands`. Canonical paths: `message send`,
+    // `agent join`, `issue epic`. `dispatch` stays this root verb.
+    "dispatch",
+    "join",
+    "plan",
+    "send",
 ];
 
 /// Verbs clap hides on purpose: plumbing no help view lists.
@@ -145,7 +162,6 @@ const ADVANCED: &[&str] = &[
 #[cfg(test)]
 const INTERNAL: &[&str] = &[
     "confine",
-    "local-agent",
     "mcp-agent",
     "mcp-permission",
     "rollout",
@@ -351,19 +367,25 @@ pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Resul
         }
         return Some(Ok(out));
     }
-    // Leaf: clap's usage for the command, built from the top tree so it
-    // keeps the full `cadence <path>` prefix. The global options and
-    // -h/--help are hidden: the guard admits none of them.
+    Some(master_leaf_text(&path))
+}
+
+/// The master's help for one admitted leaf path: clap's usage, built from
+/// the top tree so it keeps the full `cadence <path>` prefix (the global
+/// options and -h/--help are hidden: the guard admits none of them), then
+/// the path's limits and its guide (CAD-2309).
+fn master_leaf_text(path: &str) -> cadence_agent::error::Result<String> {
+    use cadence_agent::error::Error;
     let mut cmd = Cli::command();
     cmd.build();
     let mut node = &cmd;
-    for tok in target {
+    for tok in path.split(' ') {
         match node.find_subcommand(tok) {
             Some(sub) => node = sub,
             None => {
-                return Some(Err(Error::usage(format!(
+                return Err(Error::usage(format!(
                     "`{path}` is not a command path you may run"
-                ))));
+                )));
             }
         }
     }
@@ -376,10 +398,14 @@ pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Resul
     });
     let mut out = leaf.render_help().to_string().trim_end().to_string();
     out.push('\n');
-    if let Some(limits) = master_leaf_limits(&path) {
+    if let Some(limits) = master_leaf_limits(path) {
         out.push_str(&format!("\nLimits for you: {limits}\n"));
     }
-    Some(Ok(out))
+    // CAD-2309: the detail the master's AGENT.md points to.
+    if let Some(guide) = cadence_agent::master::help_guide(path) {
+        out.push_str(&format!("\nHow to use it:\n{guide}\n"));
+    }
+    Ok(out)
 }
 
 /// The master's bounded command listing: exactly the Home profile's
@@ -458,7 +484,10 @@ fn master_leaf_limits(path: &str) -> Option<&'static str> {
         "project new" => {
             "--goal and each --agent require --repo and take one plain token (letters, digits and . _ / = : -; no spaces, quotes or commas); repeat --agent for each agent"
         }
-        "plan propose" | "report file" | "master escalate" => {
+        "plan propose"
+        | "issue epic propose"
+        | "report file"
+        | "master escalate" => {
             "--file names a file under master/tmp (stage it with the write tool first)"
         }
         _ => return None,
@@ -496,6 +525,21 @@ mod tests {
         root_command(in_pane).render_help().to_string()
     }
 
+    /// CAD-2309: a leaf the master's briefing points to prints its guide
+    /// after clap's usage; a leaf with no guide prints none.
+    #[test]
+    fn master_leaf_help_carries_the_guide_the_briefing_points_to() {
+        let plan = master_leaf_text("plan propose").unwrap();
+        assert!(plan.contains("cadence plan propose"), "{plan}");
+        assert!(plan.contains("Limits for you:"), "{plan}");
+        assert!(plan.contains("How to use it:\n"), "{plan}");
+        assert!(plan.contains("### Acceptance"), "{plan}");
+        let wiki = master_leaf_text("wiki search").unwrap();
+        assert!(wiki.contains("at most 3 query variants"), "{wiki}");
+        let overview = master_leaf_text("overview").unwrap();
+        assert!(!overview.contains("How to use it:"), "{overview}");
+    }
+
     #[test]
     fn root_help_is_small_and_ends_with_the_pointer_line() {
         let help = render_root(false);
@@ -507,7 +551,10 @@ mod tests {
             }
         }
         // Operator and advanced verbs stay off the default list.
-        for hidden in ["daemon", "rollout", "upgrade", "backup", "delivery", "job"] {
+        for hidden in [
+            "daemon", "rollout", "upgrade", "backup", "delivery", "job", "plan", "send",
+            "dispatch", "join",
+        ] {
             assert!(!help.contains(&format!("  {hidden} ")), "{hidden} listed");
         }
     }
@@ -579,15 +626,16 @@ mod tests {
         walk(&Cli::command(), "cadence", &mut found);
         assert!(found >= 20, "only {found} listers found");
         for argv in [
-            ["cadence", "issue", "list"],
-            ["cadence", "issue", "ls"],
-            ["cadence", "agent", "ls"],
-            ["cadence", "agent", "list"],
-            ["cadence", "memory", "list"],
-            ["cadence", "memory", "ls"],
-            ["cadence", "wiki", "list"],
-            ["cadence", "plan", "list"],
-            ["cadence", "job", "ls"],
+            &["cadence", "issue", "list"][..],
+            &["cadence", "issue", "ls"][..],
+            &["cadence", "agent", "ls"][..],
+            &["cadence", "agent", "list"][..],
+            &["cadence", "memory", "list"][..],
+            &["cadence", "memory", "ls"][..],
+            &["cadence", "wiki", "list"][..],
+            &["cadence", "plan", "list"][..],
+            &["cadence", "issue", "epic", "list"][..],
+            &["cadence", "job", "ls"][..],
         ] {
             assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
         }
@@ -639,7 +687,7 @@ mod tests {
         let hidden = originally_hidden();
         // `skill sync` is the hidden implementation `cadence update` calls.
         // `cadence skill install` stays the visible manual repair.
-        assert_eq!(hidden.len(), 13, "{hidden:?}");
+        assert_eq!(hidden.len(), 12, "{hidden:?}");
         for view in [
             render_root(false),
             render_root(true),

@@ -1,14 +1,22 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
+import { routinesApi } from "../agents/routinesApi";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import { routePath, type ConnectionPage } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
-import type { Connection, ConnectionProvider } from "../../lib/types";
+import type {
+  Connection,
+  ConnectionProvider,
+  ConnectionSite,
+  CustomMcpConnectionSummary,
+  HostedAccount,
+  TempChannelAuditCounts,
+} from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
-import { IconRefresh, IconWarning } from "../../ui/icons";
+import { IconCheck, IconLock, IconPin, IconRefresh, IconWarning } from "../../ui/icons";
 import PageState from "../../ui/PageState";
 import {
   acceptsHosted,
@@ -17,28 +25,65 @@ import {
   canManage,
   capabilityWords,
   connectionCapabilities,
+  connectionNeedsAttention,
+  connectedBannerText,
   enrollmentSupport,
+  hostedAccount,
+  hostedAccountLine,
+  hostedProvider,
+  hostedReturn,
+  hostedTime,
   isAvailable,
   pinWord,
+  providerServiceLabel,
   readinessText,
+  returnedRow,
+  rowVisibility,
   scopeHint,
   serviceGroups,
   serviceLabel,
+  showsPolicyPanel,
   smtpPortTlsError,
   smtpSummary,
   isSmtpSender,
   smtpUnreadable,
   smtpErrorMessage,
+  toolAsksFirst,
+  toolsSummary,
   verificationSupport,
-  verificationResult,
-  type ServiceGroup,
+  visibilityBadge,
+  visibilityConfirmed,
   type VerificationOutcome,
 } from "./connectionsView";
-import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
+import { connectErrorText, PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
+import { errorCopy, openTrustedEntry } from "../connections/credentialRequestView";
+import { useProtectedEntry } from "../connections/useProtectedEntry";
+import { RecentCredentialRequestList } from "../connections/CredentialRequestCard";
 import SmtpAccountForm from "./SmtpAccountForm";
+import SettingsDrawer from "./SettingsDrawer";
+import TempChannelsTab from "./TempChannelsTab";
+import {
+  connectionsTabParam,
+  tempChannelFocusParam,
+  type ConnectionsTab,
+} from "./tempChannelsView";
+import {
+  CustomMcpConnectDrawer,
+  CustomMcpInspectDrawer,
+  type CustomMcpDrawerTab,
+} from "./CustomMcpDrawer";
+import {
+  customMcpAuthLabel,
+  customMcpReturn,
+  customMcpStatusView,
+  mcpFocusParam,
+  type CustomMcpReturn,
+} from "./customMcpView";
+import { withoutConnectParams } from "../workspace-apps/socialConnect";
 import { connectionLabel } from "../../lib/connections";
-import "./connections.css";
+import { hostedConnectError, hostedConnectUrl, UI_HOSTED_REFUSED } from "./hostedConnect";
 import { useTranslate } from "../../lib/locale";
+import { ConnectionAssetPicker, isAssetPinningProvider } from "./ConnectionAssetPicker";
 
 /**
  * CAD-1013 safe enrollment errors. A provider/daemon refusal can carry
@@ -52,7 +97,7 @@ import { useTranslate } from "../../lib/locale";
  */
 // UI-owned copy: kept as English keys, translated at render (never stored translated).
 const UI_CUSTODY_UNPROTECTED = "The daemon cannot isolate this credential from agents using the same system account, so it refused to store it — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.";
-const UI_ENROLL_UNCERTAIN = "Could not confirm the connection was added. Refresh connections before retrying.";
+const UI_ENROLL_UNCERTAIN = "Could not confirm the connection was added. Check your connections before retrying.";
 
 const ENROLL_ERROR: Record<string, string> = {
   // The only stable code the daemon actually emits on this path
@@ -91,38 +136,6 @@ function enrollErrorMessage(e: unknown): string {
   // daemon can commit before a lost response), so do not claim 'nothing
   // was saved' — ask the operator to confirm before retrying instead.
   return UI_ENROLL_UNCERTAIN;
-}
-
-/**
- * CAD-1839 hosted connect. The worker's success envelope is exactly
- * `{ok:true, hosted:true, url:<https>}`; any other shape — a falsy flag,
- * a missing or relative URL, a non-https scheme — is a refusal, never a
- * link to open. The credential and OAuth state never reach this board.
- */
-const UI_HOSTED_REFUSED =
-  "The deployment did not return a secure sign-in link — nothing was changed.";
-const UI_HOSTED_UNAVAILABLE =
-  "Hosted connections are not available for this service here — nothing was changed.";
-const UI_HOSTED_FAILED =
-  "Could not start the hosted sign-in. Reload the board and try again — nothing was changed.";
-
-function hostedConnectUrl(reply: unknown): string | null {
-  if (reply === null || typeof reply !== "object") return null;
-  const body = reply as { ok?: unknown; hosted?: unknown; url?: unknown };
-  if (body.ok !== true || body.hosted !== true || typeof body.url !== "string") return null;
-  try {
-    const url = new URL(body.url);
-    return url.protocol === "https:" ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
-
-function hostedConnectError(e: unknown): string {
-  // 404 is the deployment saying this provider has no hosted connect
-  // route; any other refusal keeps the generic retry line. Raw server
-  // text is never rendered on this path.
-  return e instanceof ApiError && e.status === 404 ? UI_HOSTED_UNAVAILABLE : UI_HOSTED_FAILED;
 }
 
 /** The add/setup/detail routes under the connections section. */
@@ -182,7 +195,10 @@ const emptyGate = {
 export default function Connections({
   viewer,
   page,
+  hostedBoard = false,
 }: {
+  /** A hosted board manages keys for you, and only serves the actions it can do. */
+  hostedBoard?: boolean;
   viewer: {
     operator: boolean | null;
     readOnly: boolean;
@@ -197,7 +213,7 @@ export default function Connections({
   // Unknown access grants nothing on any Connections route. Reuse the
   // index's checking/unavailable state until the bounded proof answers.
   if (viewer.operator === null) {
-    return <ConnectionsIndex viewer={viewer} canWrite={false} />;
+    return <ConnectionsIndex viewer={viewer} canWrite={false} hostedBoard={hostedBoard} />;
   }
   const provenViewer = { ...viewer, operator: viewer.operator };
   if (page?.kind === "add" || page?.kind === "addProvider") {
@@ -206,9 +222,9 @@ export default function Connections({
   if (page?.kind === "detail") {
     // Keyed to the id: an id change remounts the page so a stale
     // per-mount `answered` flag can never carry the proof across ids.
-    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} />;
+    return <ConnectionsDetail key={page.id} viewer={provenViewer} canWrite={canWrite} id={page.id} hostedBoard={hostedBoard} />;
   }
-  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} />;
+  return <ConnectionsIndex viewer={viewer} canWrite={canWrite} hostedBoard={hostedBoard} />;
 }
 
 /**
@@ -216,10 +232,88 @@ export default function Connections({
  * grouped by provider. Accounts are compact links to their own detail
  * pages — nothing expands in place.
  */
+/** The daemon's own custody facts, stated as reported — never inferred from
+ *  a stored flag and never presented as protection when isolation is absent. */
+export function CustodyStatusPanel({ canWrite }: { canWrite: boolean }) {
+  const t = useTranslate();
+  const [custody, setCustody] = useState<{
+    configured: boolean;
+    unlocked: boolean;
+    fenced: boolean;
+    isolation: string;
+    protected: boolean;
+  } | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let live = true;
+    api
+      .connectionCustodyStatus()
+      .then((reply) => {
+        if (live) setCustody(reply.custody);
+      })
+      .catch(() => {
+        if (live) setFailed(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const isolated = custody !== null && custody.isolation !== "none";
+  return (
+    <section className="card px-4 py-3.5 min-w-0" aria-labelledby="custody-title" data-custody-panel>
+      <h2 id="custody-title" className="text-cardtitle font-medium text-ink-100">{t("Credential custody")}</h2>
+      {custody === null ? (
+        <p className="text-label text-ink-500 mt-2" role={failed ? "alert" : "status"}>
+          {failed
+            ? t("The daemon did not report custody state — treat protected entry as unavailable.")
+            : t("Reading custody state…")}
+        </p>
+      ) : (
+        <dl className="mt-2 space-y-1 text-label min-w-0">
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Encrypted store")}</dt>
+            <dd className="text-ink-200">{custody.configured ? t("configured") : t("not configured")}</dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Key session")}</dt>
+            <dd className="text-ink-200">
+              {custody.fenced ? t("fenced") : custody.unlocked ? t("unlocked") : t("locked")}
+            </dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Runtime isolation")}</dt>
+            <dd className={isolated ? "text-ink-200" : "text-warn"}>
+              {isolated ? custody.isolation : t("none — encrypted storage only, not isolated from same-account agents")}
+            </dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Protected entry")}</dt>
+            <dd className={custody.protected && isolated ? "text-ink-200" : "text-warn"}>
+              {custody.protected && isolated
+                ? t("the daemon reports a protected profile")
+                : t("unavailable — protected enrollment/verification will refuse")}
+            </dd>
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <dt className="text-ink-500">{t("Loaded runtime")}</dt>
+            <dd className="text-ink-400">{t("not reported by this daemon")}</dd>
+          </div>
+        </dl>
+      )}
+      <p className="text-micro text-ink-500 mt-2 break-words">
+        {t("These are the daemon's reported facts. Encryption alone does not isolate a same-account agent, and a stored flag is not a verified runtime.")}
+        {canWrite ? "" : " " + t("Read-only access — nothing here can be changed.")}
+      </p>
+    </section>
+  );
+}
+
 function ConnectionsIndex({
   viewer,
   canWrite,
+  hostedBoard,
 }: {
+  hostedBoard: boolean;
   viewer: {
     operator: boolean | null;
     readOnly: boolean;
@@ -242,11 +336,141 @@ function ConnectionsIndex({
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
   const catalogUnavailable = providersState?.status === "empty";
-  const refresh = () => {
-    if (listRes) void listRes.revalidate();
-    if (providersRes) void providersRes.revalidate();
+  const partialRes = viewer.operator && hostedBoard ? resources.connectionsPartial : null;
+  const partialState = useMaybeResource(partialRes);
+  const partial = partialState?.data?.partial === true;
+
+  // CAD-2556: Custom MCP servers (hosted workspaces only; older deployments returning 404 degrade quietly).
+  const [mcpRows, setMcpRows] = useState<CustomMcpConnectionSummary[]>([]);
+  const [mcpLoaded, setMcpLoaded] = useState(false);
+  const [mcpConnectOpen, setMcpConnectOpen] = useState(false);
+  const [openMcpId, setOpenMcpId] = useState<string | null>(null);
+  const [openMcpTab, setOpenMcpTab] = useState<CustomMcpDrawerTab>("tools");
+  const [mcpReturned, setMcpReturned] = useState<CustomMcpReturn | null>(() =>
+    typeof window === "undefined" || !hostedBoard ? null : customMcpReturn(window.location.search),
+  );
+  const [mcpFocus, setMcpFocus] = useState<string | null>(() =>
+    typeof window === "undefined" || !hostedBoard ? null : mcpFocusParam(window.location.search),
+  );
+  const mcpAutoOpened = useRef(false);
+
+  // CAD-2627 / AOS-693: Hosted board underline tabs (Connected services | Temp channels).
+  const [activeTab, setActiveTab] = useState<ConnectionsTab>(() =>
+    typeof window === "undefined" || !hostedBoard ? "services" : connectionsTabParam(window.location.search),
+  );
+  const [initialTempChannelId] = useState<string | null>(() =>
+    typeof window === "undefined" || !hostedBoard ? null : tempChannelFocusParam(window.location.search),
+  );
+  const [tempCounts, setTempCounts] = useState<TempChannelAuditCounts | null>(null);
+  const servicesTabRef = useRef<HTMLButtonElement | null>(null);
+  const tempTabRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!hostedBoard || viewer.operator === null) return;
+    let alive = true;
+    void api
+      .tempChannelsList({ limit: 1 })
+      .then((res) => {
+        if (alive && res.counts) setTempCounts(res.counts);
+      })
+      .catch(() => {
+        // Older servers return 404; degrade silently until user opens the tab or upgrades.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [hostedBoard, viewer.operator]);
+
+  const loadCustomMcp = (stillMounted?: () => boolean) => {
+    if (!hostedBoard || viewer.operator === null) return;
+    api
+      .customMcpList(true)
+      .then((res) => {
+        if (stillMounted && !stillMounted()) return;
+        setMcpRows(res.connections ?? []);
+        setMcpLoaded(true);
+      })
+      .catch(() => {
+        if (!stillMounted || stillMounted()) setMcpLoaded(false);
+      });
   };
-  const groups = serviceGroups(providers, rows);
+
+  useEffect(() => {
+    let alive = true;
+    loadCustomMcp(() => alive);
+    return () => {
+      alive = false;
+    };
+  }, [hostedBoard, viewer.operator]);
+
+  const refresh = () => {
+    if (listRes) void listRes.refresh();
+    if (providersRes) void providersRes.revalidate();
+    loadCustomMcp();
+  };
+  const visibleRows = mcpLoaded ? rows.filter((row) => row.provider !== "custom_mcp") : rows;
+  const groups = serviceGroups(providers, visibleRows);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const open = visibleRows.find((row) => row.id === openId) ?? null;
+  const openMcp = mcpRows.find((row) => row.id === openMcpId) ?? null;
+  // CAD-2428: a hosted connect returns here with `?aos_connect=…&toolkit=…`. The URL is read once,
+  // then dropped so a reload does not repeat the banner; the account shown comes from the list.
+  const [returned, setReturned] = useState(() =>
+    typeof window === "undefined" ? null : hostedReturn(window.location.search),
+  );
+  useEffect(() => {
+    if (returned === null && mcpReturned === null && mcpFocus === null) return;
+    navigate(
+      window.location.pathname + withoutConnectParams(window.location.search) + window.location.hash,
+      { replace: true },
+    );
+  }, [returned, mcpReturned, mcpFocus]);
+
+  useEffect(() => {
+    if (!mcpLoaded || mcpAutoOpened.current) return;
+    if (mcpReturned?.outcome === "connected" && mcpReturned.connectionId) {
+      const hit = mcpRows.find((row) => row.id === mcpReturned.connectionId);
+      if (hit) {
+        mcpAutoOpened.current = true;
+        setOpenMcpId(hit.id);
+        setOpenMcpTab(hit.status === "auth_expired" ? "auth" : "tools");
+      }
+      return;
+    }
+    if (mcpFocus !== null) {
+      const norm = mcpFocus.toLowerCase();
+      const hit = mcpRows.find((row) => row.name.toLowerCase() === norm || row.id === mcpFocus);
+      if (hit) {
+        mcpAutoOpened.current = true;
+        setOpenMcpId(hit.id);
+        setOpenMcpTab(hit.status === "auth_expired" ? "auth" : "tools");
+      }
+    }
+  }, [mcpLoaded, mcpRows, mcpReturned, mcpFocus]);
+
+  const newRow =
+    returned?.outcome === "connected" && returned.toolkit !== "custom_mcp" && viewer.operator
+      ? returnedRow(visibleRows, returned.toolkit)
+      : null;
+
+  const onTabKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
+    const order: { id: ConnectionsTab; ref: React.RefObject<HTMLButtonElement | null> }[] = [
+      { id: "services", ref: servicesTabRef },
+      { id: "temp-channels", ref: tempTabRef },
+    ];
+    const idx = order.findIndex((item) => item.id === activeTab);
+    if (idx === -1) return;
+    let nextIdx = idx;
+    if (e.key === "ArrowRight") nextIdx = (idx + 1) % order.length;
+    else if (e.key === "ArrowLeft") nextIdx = (idx - 1 + order.length) % order.length;
+    else if (e.key === "Home") nextIdx = 0;
+    else if (e.key === "End") nextIdx = order.length - 1;
+    else return;
+    e.preventDefault();
+    const next = order[nextIdx];
+    setActiveTab(next.id);
+    next.ref.current?.focus();
+  };
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-title">
@@ -255,22 +479,60 @@ function ConnectionsIndex({
           <h1 id="connections-title" className="text-section font-medium text-ink-100">{t("Connections")}</h1>
           <p className="text-label text-ink-400 mt-1 break-words">{t("The accounts your apps use. Credentials stay here; each app chooses how it uses them.")}</p>
         </div>
-        {viewer.operator && (
-          <div className="flex flex-wrap gap-2 shrink-0 items-center">
+        {viewer.operator && (!hostedBoard || activeTab === "services") && (
+          <div className="flex flex-wrap gap-1.5 shrink-0 items-center">
             <StaleChip state={listState ?? emptyGate} />
             <StaleChip state={providersState ?? emptyGate} />
-            <Button
-              variant="ghost"
-              icon={<IconRefresh />}
-              loading={Boolean(listState?.inFlight || providersState?.inFlight)}
-              onClick={refresh}
-            >{t("Refresh")}</Button>
+            {canWrite && hostedBoard && (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => setMcpConnectOpen(true)}
+              >
+                {t("+ Connect custom MCP server")}
+              </Button>
+            )}
             {canWrite && (
-              <Button variant="primary" href={connectionAddHref()}>{t("Add connection")}</Button>
+              <Link href={connectionAddHref()} className="settings-quiet">{t("+ Add")}</Link>
             )}
           </div>
         )}
       </div>
+
+      {hostedBoard && viewer.operator !== null && (
+        <nav className="conn-tabs" role="tablist" aria-label={t("Connections sections")} onKeyDown={onTabKeyDown}>
+          <button
+            ref={servicesTabRef}
+            id="conn-tab-services"
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "services"}
+            aria-controls="conn-panel-services"
+            className="conn-tab"
+            onClick={() => setActiveTab("services")}
+          >
+            <span>{t("Connected services")}</span>
+          </button>
+          <button
+            ref={tempTabRef}
+            id="conn-tab-temp-channels"
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "temp-channels"}
+            aria-controls="conn-panel-temp-channels"
+            className="conn-tab"
+            onClick={() => setActiveTab("temp-channels")}
+          >
+            <span>{t("Temp channels")}</span>
+            {tempCounts !== null && <span className="conn-tabn">{tempCounts.all}</span>}
+            {tempCounts !== null && tempCounts.needs_human > 0 && (
+              <span className="conn-tabn conn-tabn-warn">
+                {t("{n} needs human").replace("{n}", String(tempCounts.needs_human))}
+              </span>
+            )}
+          </button>
+        </nav>
+      )}
 
       {viewer.operator === null ? (
         <PageState title={viewer.access === "unavailable" ? t("Access could not be confirmed") : t("Checking access…")}>
@@ -285,10 +547,80 @@ function ConnectionsIndex({
             t("Connections are available to the operator; the board is still proving this session.")
           )}
         </PageState>
+      ) : hostedBoard && activeTab === "temp-channels" ? (
+        <div id="conn-panel-temp-channels" role="tabpanel" aria-labelledby="conn-tab-temp-channels">
+          <TempChannelsTab
+            canWrite={!viewer.readOnly}
+            initialOpenId={initialTempChannelId}
+            onCountsChange={setTempCounts}
+          />
+        </div>
       ) : !viewer.operator ? (
-        <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
+        <div
+          id={hostedBoard ? "conn-panel-services" : undefined}
+          role={hostedBoard ? "tabpanel" : undefined}
+          aria-labelledby={hostedBoard ? "conn-tab-services" : undefined}
+          className="space-y-4 min-w-0"
+        >
+          <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
+          {hostedBoard && mcpRows.length > 0 && (
+            <CustomMcpServerList
+              rows={mcpRows}
+              highlightId={null}
+              readOnly
+              onOpen={(row) => {
+                setOpenMcpTab("tools");
+                setOpenMcpId(row.id);
+              }}
+            />
+          )}
+          {hostedBoard && openMcp && (
+            <CustomMcpInspectDrawer
+              key={`${openMcp.id}:${openMcpTab}`}
+              connection={openMcp}
+              canWrite={false}
+              initialTab={openMcpTab}
+              onClose={() => setOpenMcpId(null)}
+              onUpdated={(next) =>
+                setMcpRows((cur) => cur.map((item) => (item.id === next.id ? next : item)))
+              }
+              onRevoked={(revokedId) => {
+                setOpenMcpId(null);
+                setMcpRows((cur) => cur.filter((item) => item.id !== revokedId));
+              }}
+            />
+          )}
+        </div>
       ) : (
-        <>
+        <div
+          id={hostedBoard ? "conn-panel-services" : undefined}
+          role={hostedBoard ? "tabpanel" : undefined}
+          aria-labelledby={hostedBoard ? "conn-tab-services" : undefined}
+        >
+          {mcpReturned !== null && (
+            <CustomMcpReturnBanner
+              returned={mcpReturned}
+              connection={
+                mcpReturned.connectionId
+                  ? mcpRows.find((row) => row.id === mcpReturned.connectionId) ?? null
+                  : null
+              }
+              onDismiss={() => setMcpReturned(null)}
+            />
+          )}
+          {returned !== null && returned.toolkit !== "custom_mcp" && (
+            <HostedReturnBanner
+              returned={returned}
+              row={newRow}
+              provider={providers.find((p) => p.provider === returned.toolkit) ?? null}
+              onDismiss={() => setReturned(null)}
+            />
+          )}
+          {!hostedBoard && (
+            <div className="mb-3">
+              <RecentCredentialRequestList />
+            </div>
+          )}
           <ResourceGate
             state={listState ?? emptyGate}
             loading="loading connections…"
@@ -308,126 +640,257 @@ function ConnectionsIndex({
             />
           )}
           {listState?.data && (
-            <div className="space-y-3 min-w-0">
-              {groups.length === 0 ? (
-                <section className="card px-4 py-3.5 min-w-0" aria-label={t("connections")}>
-                  <p className="text-label text-ink-500">{t("No services are registered and no accounts are connected.")}</p>
-                  {canWrite && (
-                    <p className="text-label mt-2">
-                      <Link href={connectionAddHref()} className="lnk">{t("Add a connection")}</Link>
-                    </p>
-                  )}
+            <div className="space-y-4 min-w-0">
+              {partial && (
+                <p className="text-label text-fail flex flex-wrap items-center gap-2 mb-3" role="alert" data-state="connections-partial">
+                  {t("Some connected accounts couldn't be loaded, so this list may be incomplete.")}
+                  <Button size="sm" onClick={refresh}>{t("Retry")}</Button>
+                </p>
+              )}
+              {visibleRows.length === 0 && mcpRows.length === 0 && partial ? null : visibleRows.length === 0 && mcpRows.length === 0 ? (
+                <section className="settings-rows px-4 py-6 text-center" aria-label={t("connections")}>
+                  <p className="text-secondary text-ink-300">{t("No accounts connected")}</p>
+                  <p className="text-label text-ink-500 mt-1">{t("Connect an account so your apps can post or send email.")}</p>
                 </section>
               ) : (
-                groups.map((group) => (
-                  <ServiceSection
-                    key={group.provider}
-                    group={group}
-                    canWrite={canWrite}
-                  />
-                ))
+                <>
+                  {visibleRows.length > 0 && (
+                    <ConnectionsGroupedList
+                      rows={visibleRows}
+                      groups={groups}
+                      highlightId={newRow?.id ?? null}
+                      onOpen={(id) => setOpenId(id)}
+                    />
+                  )}
+                  {hostedBoard && mcpRows.length > 0 && (
+                    <CustomMcpServerList
+                      rows={mcpRows}
+                      highlightId={mcpReturned?.outcome === "connected" ? mcpReturned.connectionId : null}
+                      readOnly={!canWrite}
+                      onOpen={(row) => {
+                        setOpenMcpTab(row.status === "auth_expired" ? "auth" : "tools");
+                        setOpenMcpId(row.id);
+                      }}
+                    />
+                  )}
+                </>
               )}
             </div>
           )}
-        </>
+          {open && (
+            // Keyed to the account: rows stay reachable by keyboard behind the drawer, and a
+            // typed credential or armed Disconnect must never carry over to another account.
+            <SettingsDrawer
+              key={open.id}
+              title={
+                isSmtpSender(open) && open.smtp?.sender
+                  ? open.smtp.sender
+                  : (hostedAccount(open)?.label ?? open.account)
+              }
+              onClose={() => setOpenId(null)}
+            >
+              <ConnectionDetail
+                row={open}
+                provider={providers.find((item) => item.provider === open.provider) ?? null}
+                capabilities={connectionCapabilities(providers, open.provider)}
+                canWrite={canWrite}
+                standalone
+                hostedBoard={hostedBoard}
+                providerMetaPending={
+                  !providers.some((item) => item.provider === open.provider) &&
+                  providersState?.status !== "ok" &&
+                  !catalogUnavailable
+                }
+                onChanged={() => {
+                  if (listRes) void listRes.invalidate();
+                }}
+                onRevoked={() => {
+                  setOpenId(null);
+                  if (listRes) void listRes.invalidate();
+                }}
+              />
+            </SettingsDrawer>
+          )}
+          {hostedBoard && mcpConnectOpen && canWrite && (
+            <CustomMcpConnectDrawer
+              onClose={() => setMcpConnectOpen(false)}
+              onConnected={(created) => {
+                setMcpConnectOpen(false);
+                setMcpRows((cur) => [created, ...cur.filter((item) => item.id !== created.id)]);
+                setMcpLoaded(true);
+                setOpenMcpTab("tools");
+                setOpenMcpId(created.id);
+                refresh();
+              }}
+              onOAuthStarted={() => {
+                loadCustomMcp();
+              }}
+            />
+          )}
+          {hostedBoard && openMcp && (
+            <CustomMcpInspectDrawer
+              key={`${openMcp.id}:${openMcpTab}`}
+              connection={openMcp}
+              canWrite={canWrite}
+              initialTab={openMcpTab}
+              onClose={() => {
+                setOpenMcpId(null);
+                setMcpFocus(null);
+              }}
+              onUpdated={(next) => {
+                setMcpRows((cur) => cur.map((item) => (item.id === next.id ? next : item)));
+                if (listRes) void listRes.invalidate();
+              }}
+              onRevoked={(revokedId) => {
+                setOpenMcpId(null);
+                setMcpRows((cur) => cur.filter((item) => item.id !== revokedId));
+                refresh();
+              }}
+            />
+          )}
+        </div>
       )}
     </section>
   );
 }
 
-/**
- * One service group on the index: the provider heading, its account
- * links and a setup action when the service offers a reviewed
- * enrollment. Never silently drops an unavailable provider or an
- * orphaned account.
- */
-function ServiceSection({
-  group,
-  canWrite,
+function CustomMcpReturnBanner({
+  returned,
+  connection,
+  onDismiss,
 }: {
-  group: ServiceGroup;
-  canWrite: boolean;
+  returned: CustomMcpReturn;
+  connection: CustomMcpConnectionSummary | null;
+  onDismiss: () => void;
 }) {
   const t = useTranslate();
-  const support = enrollmentSupport(group.info);
+  const ok = returned.outcome === "connected";
+  const label = connection?.name ?? t("Custom MCP server");
+  const text = ok
+    ? connection
+      ? (connection.tools_summary.total === 1
+          ? t("{label} connected · 1 pinned tool ready for review.")
+          : t("{label} connected · {count} pinned tools ready for review.")
+        )
+          .replace("{label}", () => label)
+          .replace("{count}", String(connection.tools_summary.total))
+      : t("{label} sign-in finished — check your Custom MCP servers below.").replace("{label}", () => label)
+    : returned.outcome === "cancelled"
+      ? t("Custom MCP OAuth sign-in was cancelled. Nothing was changed.")
+      : t("Couldn't complete Custom MCP OAuth sign-in. Nothing was changed.");
   return (
-    <section
-      className="card px-4 py-3.5 min-w-0"
-      aria-label={t("{label} connections").replace("{label}", () => String(group.label ?? ""))}
+    <div
+      className="card px-3 py-2 mb-3 flex flex-wrap items-center gap-2 min-w-0"
+      role={ok ? "status" : "alert"}
+      data-state={ok ? "hosted-connected" : "hosted-failed"}
     >
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
-        <h2 className="slabel">{group.label}</h2>
-        <span className="text-micro text-ink-500">
-          {group.connections.length === 0
-            ? t("nothing connected")
-            : t("{count} connected").replace("{count}", String(group.connections.length))}
-        </span>
-        {group.builtin && (
-          <span className="chip bg-ink-800 text-ink-300">{t("built-in")}</span>
-        )}
-        {!group.builtin && canWrite && support.shapes.length > 0 && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="ml-auto"
-            href={connectionAddProviderHref(group.provider)}
-          >
-            {t("Set up {label}").replace("{label}", () => String(group.label ?? ""))}</Button>
-        )}
-        {!group.builtin && canWrite && group.provider === "smtp" && group.info === null && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="ml-auto"
-            href={connectionAddProviderHref("smtp")}
-          >
-            {group.connections.length === 0 ? t("Add email account") : t("Replace email account")}</Button>
-        )}
+      <span className={`text-label break-words min-w-0 flex-1 ${ok ? "text-ok" : "text-fail"}`}>
+        {text}
+      </span>
+      <Button size="sm" variant="ghost" onClick={onDismiss}>{t("Dismiss")}</Button>
+    </div>
+  );
+}
+
+function CustomMcpServerList({
+  rows,
+  highlightId,
+  readOnly,
+  onOpen,
+}: {
+  rows: CustomMcpConnectionSummary[];
+  highlightId: string | null;
+  readOnly: boolean;
+  onOpen: (row: CustomMcpConnectionSummary) => void;
+}) {
+  const t = useTranslate();
+  return (
+    <div className="space-y-1.5 min-w-0" data-connections-group="custom-mcp">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="slabel">
+          {readOnly ? t("Shared Custom MCP servers (read-only)") : t("Custom MCP servers")}
+        </h2>
       </div>
-      {group.connections.length === 0 ? (
-        <p className="text-label text-ink-500 break-words">
-          {group.builtin
-            ? t("No built-in accounts.")
-            : support.shapes.length === 0
-              ? support.reason
-              : t("No {label} account connected yet.").replace("{label}", () => String(group.label ?? ""))}
-        </p>
-      ) : (
-        <ul className="space-y-1.5">
-          {group.connections.map((row) => (
+      <ul className="settings-rows" aria-label={t("Custom MCP servers")}>
+        {rows.map((row) => {
+          const status = customMcpStatusView(row);
+          const statusClass =
+            status.tone === "ok"
+              ? "custmcp-chip-ok"
+              : status.tone === "warn"
+                ? "custmcp-chip-warn"
+                : status.tone === "fail"
+                  ? "custmcp-chip-fail"
+                  : "bg-ink-800 text-ink-400";
+          const toolCountLabel =
+            row.tools_summary.total === 1
+              ? t("{n} tool").replace("{n}", "1")
+              : t("{n} tools").replace("{n}", String(row.tools_summary.total));
+          return (
             <li key={row.id}>
-              <Link
-                href={connectionDetailHref(row.id)}
-                className="conn-row"
+              <button
+                type="button"
+                className="settings-row"
+                data-record-id={row.id}
+                data-new={row.id === highlightId ? "true" : undefined}
+                onClick={() => onOpen(row)}
               >
-                <span className="conn-row-main">
-                  <span className="text-label font-medium text-ink-100 min-w-0 break-words">
-                    {isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : connectionLabel(row)}
-                  </span>
-                  <span
-                    className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
-                  >
-                    {row.kind === "builtin" ? t("built-in") : t("enrolled")}
-                  </span>
-                  {!isAvailable(row) && (
-                    <span className="chip bg-warn/10 text-warn">{t("unavailable")}</span>
-                  )}
+                <span className="settings-row-text">
+                  <b>{row.name}</b>
+                  <small className="num">
+                    {row.endpoint_host} · {t(customMcpAuthLabel(row.auth_kind))} · {toolCountLabel}
+                  </small>
                 </span>
-                <span className="conn-row-sub text-micro text-ink-500 break-words">
-                  {readinessText(row)}
+                <span className="conn-row-chips">
+                  <span className="chip bg-ink-800 text-ink-300">
+                    {t(visibilityBadge({ visibility: row.visibility }))}
+                  </span>
+                  <span className={`chip ${statusClass}`}>{t(status.label)}</span>
                 </span>
-              </Link>
+              </button>
             </li>
-          ))}
-        </ul>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+/** CAD-2428: the return from a hosted connect — what happened, in the owner's words. */
+function HostedReturnBanner({
+  returned,
+  row,
+  provider,
+  onDismiss,
+}: {
+  returned: { outcome: "connected" | "failed"; toolkit: string };
+  row: Connection | null;
+  provider: ConnectionProvider | null;
+  onDismiss: () => void;
+}) {
+  const t = useTranslate();
+  const label =
+    (row ? hostedAccount(row)?.label : null) ??
+    (provider ? providerServiceLabel(provider) : serviceLabel(returned.toolkit));
+  const ok = returned.outcome === "connected";
+  return (
+    <div
+      className="card px-3 py-2 mb-3 flex flex-wrap items-center gap-2 min-w-0"
+      role={ok ? "status" : "alert"}
+      data-state={ok ? "hosted-connected" : "hosted-failed"}
+    >
+      <span className={`text-label break-words min-w-0 flex-1 ${ok ? "text-ok" : "text-fail"}`}>
+        {ok
+          ? connectedBannerText(label, row, t)
+          : t("Couldn't connect {label}. Nothing was changed.").replace("{label}", () => label)}
+      </span>
+      {!ok && (
+        <Link href={connectionAddProviderHref(returned.toolkit)} className="settings-quiet">
+          {t("Retry")}
+        </Link>
       )}
-      {group.builtin && (
-        <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in accounts are always present — they carry no credential and cannot be edited or disconnected here.")}</p>
-      )}
-      {!group.builtin && !group.info && group.provider !== "smtp" && (
-        <p className="text-micro text-ink-500 mt-2 break-words">{t("This provider's service metadata could not be loaded — the account stays under its recorded name. Refresh services; a failed load is not proof the provider was removed.")}</p>
-      )}
-    </section>
+      <Button size="sm" variant="ghost" onClick={onDismiss}>{t("Dismiss")}</Button>
+    </div>
   );
 }
 
@@ -448,6 +911,9 @@ function ConnectionsAdd({
   page: ConnectionPage & { kind: "add" | "addProvider" };
 }) {
   const t = useTranslate();
+  const protectedEntry = useProtectedEntry();
+  const protectedOnly =
+    protectedEntry.status === "ready" && protectedEntry.entry.configured;
   const providersRes = viewer.operator ? resources.connectionProviders : null;
   const listRes = viewer.operator ? resources.connections : null;
   const providersState = useMaybeResource(providersRes);
@@ -517,7 +983,11 @@ function ConnectionsAdd({
                 failed="could not load connections"
                 onRetry={refresh}
               />
-              {listState?.data && (
+              {listState?.data && protectedOnly ? (
+                <PageState title={t("Protected entry")}>
+                  {t("This protected profile collects credentials only on its separately served trusted entry page. Use `cadence connection enroll smtp` to create the request, complete it there, then return here.")}
+                </PageState>
+              ) : listState?.data ? (
                 <SmtpAccountForm
                   rows={rows}
                   onSaved={(id) => {
@@ -525,7 +995,7 @@ function ConnectionsAdd({
                     navigate(connectionDetailHref(id));
                   }}
                 />
-              )}
+              ) : null}
             </>
           ) : (
             <>
@@ -604,11 +1074,11 @@ function ServiceChooser({ providers }: { providers: ConnectionProvider[] }) {
               <Link href={connectionAddProviderHref(p.provider)} className="conn-row">
                 <span className="conn-row-main">
                   <span className="text-label font-medium text-ink-100 break-words">
-                    {serviceLabel(p.provider)}
+                    {providerServiceLabel(p)}
                   </span>
-                  {capabilityWords(p) && (
+                  {(toolsSummary(hostedProvider(p)?.tools ?? [], t) ?? capabilityWords(p)) && (
                     <span className="text-micro text-ink-500 break-words">
-                      {capabilityWords(p)}
+                      {toolsSummary(hostedProvider(p)?.tools ?? [], t) ?? capabilityWords(p)}
                     </span>
                   )}
                 </span>
@@ -630,7 +1100,7 @@ function ServiceChooser({ providers }: { providers: ConnectionProvider[] }) {
           <ul className="space-y-1.5">
             {unsupported.map((p) => (
               <li key={p.provider} className="px-3 py-2 rounded border border-ink-700 bg-ink-850">
-                <span className="text-label text-ink-300 break-words">{serviceLabel(p.provider)}</span>
+                <span className="text-label text-ink-300 break-words">{providerServiceLabel(p)}</span>
                 <span className="block text-micro text-ink-500 mt-0.5 break-words">
                   {enrollmentSupport(p).reason}
                 </span>
@@ -652,7 +1122,9 @@ function ConnectionsDetail({
   viewer,
   canWrite,
   id,
+  hostedBoard,
 }: {
+  hostedBoard: boolean;
   viewer: { operator: boolean; readOnly: boolean };
   canWrite: boolean;
   id: string;
@@ -756,6 +1228,7 @@ function ConnectionsDetail({
                 canWrite={canWrite}
                 standalone
                 providerMetaPending={providerUnknown}
+                hostedBoard={hostedBoard}
                 onChanged={refresh}
                 onRevoked={() => {
                   refresh();
@@ -781,6 +1254,293 @@ function ConnectionsDetail({
   );
 }
 
+/** A property permission that may be pinned. Static strings, exact match. */
+const SITE_SELECTABLE: Record<string, true> = {
+  siteOwner: true,
+  siteFullUser: true,
+};
+
+function sitePermissionLabel(permission: string): string {
+  if (permission === "siteOwner") return "Owner";
+  if (permission === "siteFullUser") return "Full access";
+  return "View only";
+}
+
+function siteKind(siteUrl: string): string {
+  return siteUrl.startsWith("sc-domain:") ? "Domain property" : "URL-prefix property";
+}
+
+/**
+ * The Search Console read target. A hosted Search Console account can expose
+ * several exact properties; one is pinned at connection level. The list is a
+ * provider read, never inferred from the account or the connection.
+ */
+function SearchConsoleProperty({ row, canWrite }: { row: Connection; canWrite: boolean }) {
+  const t = useTranslate();
+  const headingId = useId();
+  const [sites, setSites] = useState<ConnectionSite[] | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [reload, setReload] = useState(0);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setError(null);
+    setNote(null);
+    setSites(null);
+    setSelected(null);
+    setDraft(null);
+    api
+      .connectionSites(row.id)
+      .then((reply) => {
+        if (!alive) return;
+        setSites(reply.sites);
+        setSelected(reply.selected);
+        setDraft(reply.selected);
+      })
+      .catch((e: unknown) => {
+        if (!alive) return;
+        setError(e instanceof ApiError && e.message ? e.message : "The property list is unavailable.");
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [row.id, reload]);
+
+  const selectableSites = (sites ?? []).filter(
+    (site) => SITE_SELECTABLE[site.permission_level] === true,
+  );
+  const restrictedOnly = sites !== null && sites.length > 0 && selectableSites.length === 0;
+  const changed = draft !== null && draft !== selected;
+
+  const save = () => {
+    if (!draft || !changed || saving) return;
+    setSaving(true);
+    setError(null);
+    setNote(null);
+    api
+      .connectionSelectSite(row.id, { site_url: draft })
+      .then((reply) => {
+        setSelected(reply.site.site_url);
+        setDraft(reply.site.site_url);
+        setNote(
+          `Pinned. Search Console reports for this connection now use ${reply.site.site_url}.`,
+        );
+      })
+      .catch((e: unknown) => {
+        setError(e instanceof ApiError && e.message ? e.message : "The property could not be pinned.");
+      })
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <div className="mt-4 border-t border-ink-700 pt-4" aria-labelledby={headingId}>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="slabel">{t("Read target")}</div>
+          <h3 id={headingId} className="text-cardtitle font-medium text-ink-100 mt-1">
+            {t("Search Console property")}
+          </h3>
+          <p className="text-label text-ink-400 mt-1 max-w-[36rem] break-words">
+            {t(
+              "Reports use the exact property identifier. A domain property covers every URL on that domain; a URL-prefix property covers only that prefix.",
+            )}
+          </p>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setReload((value) => value + 1)}
+          loading={loading}
+          disabled={saving}
+          icon={<IconRefresh />}
+        >
+          {t("Refresh")}
+        </Button>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-ink-700 bg-ink-850 px-2.5 py-2 min-w-0">
+        <span className={`chip ${selected ? "bg-accent/10 text-accent" : "bg-ink-800 text-ink-400"}`}>
+          {selected ? <IconCheck size={11} /> : <IconPin size={11} />}
+          {selected ? t("Pinned") : t("Not pinned")}
+        </span>
+        {selected ? (
+          <code className="num text-label text-ink-200 break-all min-w-0">{selected}</code>
+        ) : (
+          <span className="text-label text-ink-400">{t("No property pinned")}</span>
+        )}
+        <span className="ml-auto text-micro text-ink-500">
+          {selected
+            ? t("Used by search_console_report")
+            : t("Reports must name a property until one is pinned")}
+        </span>
+      </div>
+
+      {loading && (
+        <div className="mt-3 grid gap-1.5" aria-label={t("Loading properties")} aria-busy="true">
+          {[0, 1, 2].map((index) => (
+            <div key={index} className="h-12 rounded border border-ink-700 bg-ink-850 animate-pulse" />
+          ))}
+        </div>
+      )}
+
+      {!loading && error && (
+        <div className="mt-3 rounded border border-fail/30 bg-fail/5 px-3 py-2.5" role="alert">
+          <p className="text-label text-ink-200 break-words">{t(error)}</p>
+          <Button
+            variant="secondary"
+            size="sm"
+            className="mt-2"
+            onClick={() => setReload((value) => value + 1)}
+            icon={<IconRefresh />}
+          >
+            {t("Try again")}
+          </Button>
+        </div>
+      )}
+
+      {!loading && !error && sites !== null && sites.length === 0 && (
+        <div className="mt-3 rounded border border-dashed border-ink-700 px-3 py-3">
+          <p className="text-label text-ink-200 font-medium">{t("No properties found")}</p>
+          <p className="text-label text-ink-400 mt-1 break-words">
+            {t(
+              "This account has no Search Console property it can read. Add the account to a property in Google Search Console, then refresh.",
+            )}
+          </p>
+          <Button
+            variant="secondary"
+            size="sm"
+            className="mt-2"
+            onClick={() => setReload((value) => value + 1)}
+            icon={<IconRefresh />}
+          >
+            {t("Refresh")}
+          </Button>
+        </div>
+      )}
+
+      {!loading && !error && sites !== null && sites.length > 0 && (
+        <div
+          className="mt-3 grid gap-1.5"
+          role="radiogroup"
+          aria-labelledby={headingId}
+          aria-label={t("Search Console properties")}
+        >
+          {sites.map((site, index) => {
+            const usable = SITE_SELECTABLE[site.permission_level] === true;
+            const checked = draft === site.site_url;
+            const inputId = `${headingId}-site-${index}`;
+            return (
+              <label
+                key={site.site_url}
+                htmlFor={inputId}
+                className={`flex items-start gap-2 rounded border px-2.5 py-2 min-w-0 ${
+                  checked
+                    ? "border-accent/50 bg-accent/10"
+                    : "border-ink-700 bg-ink-850"
+                } ${usable && canWrite && !saving ? "cursor-pointer" : "opacity-70"}`}
+              >
+                <input
+                  id={inputId}
+                  type="radio"
+                  name={`${headingId}-property`}
+                  value={site.site_url}
+                  checked={checked}
+                  disabled={!usable || !canWrite || saving}
+                  onChange={() => {
+                    setDraft(site.site_url);
+                    setNote(null);
+                  }}
+                  className="mt-1 accent-[var(--color-accent)]"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="num text-label text-ink-100 block break-words">
+                    {site.site_url}
+                  </span>
+                  <span className="text-micro text-ink-500 block">
+                    {t(siteKind(site.site_url))}
+                    {" · "}
+                    {usable
+                      ? t("Selectable for reports")
+                      : t("Owner or Full access required to pin")}
+                  </span>
+                </span>
+                <span
+                  className={`chip shrink-0 ${
+                    usable ? "bg-accent/10 text-accent" : "bg-ink-800 text-ink-500"
+                  }`}
+                >
+                  {t(sitePermissionLabel(site.permission_level))}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+
+      {!loading && !error && restrictedOnly && (
+        <p className="mt-2 flex items-start gap-1.5 text-label text-warn break-words" role="status">
+          <IconLock className="mt-0.5 shrink-0" />
+          <span>
+            {t(
+              "No property can be pinned. Every property on this account only grants view access; ask a property owner for Owner or Full access, then refresh.",
+            )}
+          </span>
+        </p>
+      )}
+
+      {!loading && !error && canWrite && selectableSites.length > 0 && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={save}
+            loading={saving}
+            disabled={!changed}
+          >
+            {changed ? t("Pin property") : t("Pinned")}
+          </Button>
+          <span className="text-micro text-ink-500 break-words">
+            {changed
+              ? t("Pin applies to reports for this connection; it does not change Google Search Console.")
+              : t("This property is already pinned.")}
+          </span>
+        </div>
+      )}
+
+      {!loading && !error && !canWrite && selectableSites.length > 0 && (
+        <p className="mt-2 text-micro text-ink-500">
+          {t("Only the workspace owner can pin a property.")}
+        </p>
+      )}
+
+      {note && (
+        <p className="mt-2 flex items-start gap-1.5 text-label text-accent break-words" role="status">
+          <IconCheck className="mt-0.5 shrink-0" />
+          <span>{t(note)}</span>
+        </p>
+      )}
+
+      <p className="mt-3 flex items-start gap-1.5 text-micro text-ink-500 break-words">
+        <IconLock className="mt-0.5 shrink-0" />
+        <span>
+          {t(
+            "Only Owner and Full access properties can be pinned. Refreshing reads the provider; it sends no report and makes no change.",
+          )}
+        </span>
+      </p>
+    </div>
+  );
+}
+
 /** One connection's detail: metadata, local check, rotate and revoke. */
 export function ConnectionDetail({
   row,
@@ -789,6 +1549,7 @@ export function ConnectionDetail({
   canWrite,
   standalone = false,
   providerMetaPending = false,
+  hostedBoard = false,
   onChanged,
   onRevoked,
 }: {
@@ -796,6 +1557,8 @@ export function ConnectionDetail({
   provider?: ConnectionProvider | null;
   capabilities: string | null;
   canWrite: boolean;
+  /** Only what this board serves: its own email accounts can be updated or removed. */
+  hostedBoard?: boolean;
   /** Standalone page: the card owns the heading; skip the inner title. */
   standalone?: boolean;
   /** Provider metadata is still loading or failed — its absence is not
@@ -806,6 +1569,11 @@ export function ConnectionDetail({
   onRevoked: () => void;
 }) {
   const t = useTranslate();
+  // CAD-1085: a protected profile collects secrets only on the pinned
+  // trusted origin. The legacy direct-input controls are absent there.
+  const protectedEntry = useProtectedEntry();
+  const entryRequired =
+    protectedEntry.status === "ready" && protectedEntry.entry.configured;
   const [rotating, setRotating] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -813,6 +1581,9 @@ export function ConnectionDetail({
   const [note, setNote] = useState<{ ok: boolean; warn?: boolean; text: string; suffix?: string } | null>(null);
   const [verifyNote, setVerifyNote] = useState<VerificationOutcome | null>(null);
   const managed = canManage(row);
+  const hosted = hostedAccount(row);
+  const shownCapabilities =
+    capabilities ?? (row.read?.qualified === true ? row.read.slug : null);
   const verify = providerMetaPending
     ? { supported: false, reason: "" }
     : verificationSupport(provider ?? null);
@@ -919,53 +1690,75 @@ export function ConnectionDetail({
       });
   };
 
-  // The approved broker no-send login test (CAD-1065/CAD-1085): it sends
-  // only the connection's id and the captured revision+registration
-  // digest, and renders only the typed receipt's fixed safe text. A
-  // stale/malformed/late response never becomes a positive result.
-  const test = () => {
+  // CAD-1085 r3: verification is the human's explicit act on the trusted
+  // entry page, bound to a stable request ID and a one-use nonce. This
+  // button only creates that metadata request; the page performs exactly
+  // one AUTH and never sends mail.
+  const verifyViaEntry = () => {
     if (testing) return;
-    const gen = ++checkGen.current;
-    const ctx = context;
-    const want = {
-      id: row.id,
-      revision: row.revision ?? null,
-      registration_digest: row.registration_digest ?? null,
-    };
     setTesting(true);
     setVerifyNote(null);
     api
-      .connectionTest(row.id, {
-        expected_revision: want.revision,
-        expected_registration_digest: want.registration_digest,
+      .credentialRequestCreate({
+        provider: row.provider,
+        verb: "verify",
+        connection_id: row.id,
+        ...(row.revision !== null ? { expected_credential_revision: row.revision } : {}),
       })
-      .then((out) => {
-        if (gen !== checkGen.current || latestCtx.current !== ctx) return;
-        const res = verificationResult(out, want);
-        if (res === null) {
+      .then(({ request }) => {
+        if (!openTrustedEntry(request)) {
           setVerifyNote({
             ok: false,
             stale: false,
             checkedAt: null,
-            text: "The check did not return a readable result — treat this as a configuration problem, not a connection that works.",
+            text: errorCopy("unsupported_deployment"),
           });
-        } else {
-          setVerifyNote(res);
-          if (res.stale) onChanged(); // a stale result re-reads the live identity
         }
       })
-      .catch(() => {
-        if (gen !== checkGen.current || latestCtx.current !== ctx) return;
+      .catch((error: unknown) => {
+        const code = error instanceof ApiError ? error.code : null;
         setVerifyNote({
           ok: false,
           stale: false,
           checkedAt: null,
-          text: "The verification could not be run — try again, or check the connection's configuration first.",
+          text: errorCopy(code),
         });
       })
-      .finally(() => {
-        if (gen === checkGen.current) setTesting(false);
-      });
+      .finally(() => setTesting(false));
+  };
+
+  // Rotation's secret also belongs on the trusted page, never in this form.
+  const rotateViaEntry = () => {
+    if (testing) return;
+    setTesting(true);
+    setVerifyNote(null);
+    api
+      .credentialRequestCreate({
+        provider: row.provider,
+        verb: "rotate",
+        connection_id: row.id,
+        ...(row.revision !== null ? { expected_credential_revision: row.revision } : {}),
+      })
+      .then(({ request }) => {
+        if (!openTrustedEntry(request)) {
+          setVerifyNote({
+            ok: false,
+            stale: false,
+            checkedAt: null,
+            text: errorCopy("unsupported_deployment"),
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        const code = error instanceof ApiError ? error.code : null;
+        setVerifyNote({
+          ok: false,
+          stale: false,
+          checkedAt: null,
+          text: errorCopy(code),
+        });
+      })
+      .finally(() => setTesting(false));
   };
 
   return (
@@ -983,9 +1776,34 @@ export function ConnectionDetail({
         <div className="flex flex-wrap gap-x-2">
           <dt className="text-ink-500">{t("Account")}</dt>
           <dd className="text-ink-200 break-words">
-            {row.provider} · {row.account}
+            {hosted ? hostedAccountLine(row, hosted) : `${row.provider} · ${row.account}`}
           </dd>
         </div>
+        {hosted && (
+          <>
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">{t("Access")}</dt>
+              <dd className="text-ink-200 break-words">
+                <span className="chip bg-ink-800 text-ink-300" data-hosted-visibility={hosted.visibility}>
+                  {t(visibilityBadge(hosted))}
+                </span>
+                {hosted.connectedByYou && <> {t("Connected by you")}</>}
+              </dd>
+            </div>
+            {hosted.connectedAt !== null && (
+              <div className="flex flex-wrap gap-x-2 min-w-0">
+                <dt className="text-ink-500">{t("Connected")}</dt>
+                <dd className="text-ink-200">{hostedTime(hosted.connectedAt)}</dd>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-x-2 min-w-0">
+              <dt className="text-ink-500">{t("Last used")}</dt>
+              <dd className="text-ink-200">
+                {hosted.lastUsedAt !== null ? hostedTime(hosted.lastUsedAt) : t("not used yet")}
+              </dd>
+            </div>
+          </>
+        )}
         <div className="flex flex-wrap gap-x-2 min-w-0">
           <dt className="text-ink-500">{t("Readiness")}</dt>
           <dd className="text-ink-200 break-words">{readinessText(row)}</dd>
@@ -1004,10 +1822,10 @@ export function ConnectionDetail({
             </dd>
           </div>
         )}
-        {capabilities && (
+        {shownCapabilities && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
             <dt className="text-ink-500">{t("Capabilities")}</dt>
-            <dd className="text-ink-200 break-words">{capabilities}</dd>
+            <dd className="text-ink-200 break-words">{shownCapabilities}</dd>
           </div>
         )}
       </dl>
@@ -1037,31 +1855,45 @@ export function ConnectionDetail({
               <dd className="num text-ink-200 break-all">{row.registration_digest}</dd>
             </div>
           )}
-          {row.status.reviewed_pin && (
+          {!hosted && row.status.reviewed_pin && (
             <div className="flex flex-wrap gap-x-2 min-w-0">
               <dt className="text-ink-500">{t("Reviewed pin")}</dt>
               <dd className="num text-ink-200 break-all">{row.status.reviewed_pin}</dd>
             </div>
           )}
-          {row.status.reported_pin && (
+          {!hosted && row.status.reported_pin && (
             <div className="flex flex-wrap gap-x-2 min-w-0">
               <dt className="text-ink-500">{t("Reported pin")}</dt>
               <dd className="num text-ink-200 break-all">{row.status.reported_pin}</dd>
             </div>
           )}
-          <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">{t("Deployment")}</dt>
-            <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2 min-w-0">
-            <dt className="text-ink-500">{t("Remote verification")}</dt>
-            <dd className="text-ink-200 break-words">
-              {providerMetaPending ? t("unknown — the service's metadata is still loading") : verify.supported ? t("available") : `unsupported — ${verify.reason}`}
-            </dd>
-          </div>
-          <p className="text-micro text-ink-500 pt-1 break-words">{t("Listing and local configuration reads never contact this account's network; a remote login test (when offered) is a separate explicit check. Either way the result is evidence only — it grants no execution permission and proves no message delivery or sender entitlement.")}</p>
+          {!hosted && (
+            <>
+              <div className="flex flex-wrap gap-x-2 min-w-0">
+                <dt className="text-ink-500">{t("Deployment")}</dt>
+                <dd className="text-ink-200 break-words">{pinWord(row.status)}</dd>
+              </div>
+              <div className="flex flex-wrap gap-x-2 min-w-0">
+                <dt className="text-ink-500">{t("Remote verification")}</dt>
+                <dd className="text-ink-200 break-words">
+                  {providerMetaPending ? t("unknown — the service's metadata is still loading") : verify.supported ? t("available") : `unsupported — ${verify.reason}`}
+                </dd>
+              </div>
+              <p className="text-micro text-ink-500 pt-1 break-words">{t("Listing and local configuration reads never contact this account's network. Verification, when offered, is a separate explicit human action on the trusted entry page with a one-use nonce; its result is evidence only — it grants no execution permission and proves no message delivery or sender entitlement.")}</p>
+            </>
+          )}
         </dl>
       </details>
+
+      {hosted && <HostedAccountPanel row={row} hosted={hosted} canWrite={canWrite} onChanged={onChanged} />}
+
+      {hostedBoard && row.provider === "google_search_console" && (
+        <SearchConsoleProperty row={row} canWrite={canWrite} />
+      )}
+
+      {hostedBoard && isAssetPinningProvider(row.provider) && (
+        <ConnectionAssetPicker row={row} provider={row.provider} canWrite={canWrite} />
+      )}
 
       {note && (
         <p className={`text-label mt-2 break-words ${note.ok ? "text-ink-300" : note.warn ? "text-warn" : "text-fail"}`} role={note.ok ? "status" : "alert"}>
@@ -1077,7 +1909,48 @@ export function ConnectionDetail({
           {t(verifyNote.text)}
         </p>
       )}
-      {canWrite && (
+      {canWrite && hostedBoard && !isSmtpSender(row) && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={() => {
+              setRotating(false);
+              setRevoking((v) => !v);
+            }}
+          >
+            {t("Disconnect…")}
+          </Button>
+          <span className="text-micro text-ink-500">
+            {row.provider === "google_search_console"
+              ? t("Disconnecting also removes this account's grants and pinned property.")
+              : isAssetPinningProvider(row.provider)
+                ? t("Disconnecting also removes this account's grants and pinned account.")
+                : t("Disconnecting also removes this account's grants.")}
+          </span>
+        </div>
+      )}
+      {canWrite && hostedBoard && isSmtpSender(row) && (
+        <div className="flex flex-wrap items-center gap-2 mt-3">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              setRevoking(false);
+              setRotating((v) => !v);
+            }}
+          >{t("Update credentials…")}</Button>
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={() => {
+              setRotating(false);
+              setRevoking((v) => !v);
+            }}
+          >{t("Disconnect…")}</Button>
+        </div>
+      )}
+      {canWrite && !hostedBoard && (
         <div className="flex flex-wrap items-center gap-2 mt-3">
           <Button variant="secondary" size="sm" onClick={check} loading={checking}>
             {checking ? t("Checking…") : t("Check configuration")}
@@ -1086,23 +1959,34 @@ export function ConnectionDetail({
             <Button
               variant="secondary"
               size="sm"
-              onClick={test}
+              onClick={verifyViaEntry}
               loading={testing}
               disabled={testing || checking}
+              title={t("Opens the trusted entry page; one explicit sign-in check, no email")}
             >
-              {testing ? t("Testing…") : t("Test SMTP login")}
+              {testing ? t("Opening…") : t("Verify sign-in…")}
             </Button>
           )}
           {managed && (
             <>
               <Button
-                variant="secondary"
+                variant="primary"
                 size="sm"
-                onClick={() => {
-                  setRevoking(false);
-                  setRotating((v) => !v);
-                }}
-              >{t("Update credentials…")}</Button>
+                onClick={rotateViaEntry}
+                loading={testing}
+                disabled={testing || checking}
+              >{t("Replace via secure entry…")}</Button>
+              {!entryRequired && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  title={t("Legacy direct-input path — explicitly unprotected same-account transport")}
+                  onClick={() => {
+                    setRevoking(false);
+                    setRotating((v) => !v);
+                  }}
+                >{t("Update credentials…")}</Button>
+              )}
               <Button
                 variant="danger"
                 size="sm"
@@ -1118,16 +2002,451 @@ export function ConnectionDetail({
       {!canWrite && managed && (
         <p className="text-micro text-ink-500 mt-2">{t("Updating credentials and disconnecting are the operator's on an editable board.")}</p>
       )}
-      {managed && rotating && (
-        <RotateForm row={row} onDone={onChanged} onClose={() => setRotating(false)} />
+      {managed && rotating && (hostedBoard || !entryRequired) && (
+        <RotateForm row={row} hostedBoard={hostedBoard} onDone={onChanged} onClose={() => setRotating(false)} />
       )}
       {managed && revoking && (
-        <RevokeConfirm row={row} onDone={onRevoked} onClose={() => setRevoking(false)} />
+        <RevokeConfirm
+          row={row}
+          onDone={onRevoked}
+          onClose={() => setRevoking(false)}
+          hostedPlatform={hostedBoard && !isSmtpSender(row)}
+        />
       )}
       {!managed && (
         <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in connections are always present — they carry no credential and cannot be edited or disconnected through credential management.")}</p>
       )}
+      {showsPolicyPanel(row, hostedBoard) && (
+        <ConnectionPolicyPanel row={row} canWrite={canWrite} onChanged={onChanged} />
+      )}
     </section>
+  );
+}
+
+function ConnectionsGroupedList({
+  rows,
+  groups,
+  highlightId = null,
+  onOpen,
+}: {
+  rows: Connection[];
+  groups: { provider: string; label: string }[];
+  /** The account a hosted connect just returned with. */
+  highlightId?: string | null;
+  onOpen: (id: string) => void;
+}) {
+  const t = useTranslate();
+  const personal = rows.filter((r) => rowVisibility(r) === "personal");
+  const shared = rows.filter((r) => rowVisibility(r) !== "personal");
+
+  const renderItem = (row: Connection) => {
+    const flagged = connectionNeedsAttention(row);
+    const hosted = hostedAccount(row);
+    const service = hosted?.label ?? groups.find((group) => group.provider === row.provider)?.label ?? row.provider;
+    return (
+      <li key={row.id}>
+        <button
+          type="button"
+          className="settings-row"
+          data-record-id={row.id}
+          data-new={row.id === highlightId ? "true" : undefined}
+          onClick={() => onOpen(row.id)}
+        >
+          <span className="settings-row-text">
+            <b>{service.charAt(0).toUpperCase() + service.slice(1)}</b>
+            <small>{isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : row.account}</small>
+          </span>
+          <span className="conn-row-chips">
+            {hosted && (
+              <span className="chip bg-ink-800 text-ink-300" data-hosted-visibility={hosted.visibility}>
+                {t(visibilityBadge(hosted))}
+              </span>
+            )}
+            {row.policy?.visibility === "personal" && row.policy?.is_default && (
+              <span className="chip bg-ink-800 text-ink-300">{t("Default")}</span>
+            )}
+            {row.policy?.write_mode === "read_only" && (
+              <span className="chip bg-ink-800 text-ink-300">{t("Read only")}</span>
+            )}
+            {flagged && <span className="chip bg-warn/10 text-warn">{t("Needs attention")}</span>}
+          </span>
+        </button>
+      </li>
+    );
+  };
+
+  return (
+    <div className="space-y-4 min-w-0">
+      {personal.length > 0 && (
+        <div className="space-y-1.5 min-w-0" data-connections-group="personal">
+          <h2 className="slabel">{t("Your accounts")}</h2>
+          <ul className="settings-rows" aria-label={t("Your accounts")}>
+            {personal.map(renderItem)}
+          </ul>
+        </div>
+      )}
+      {shared.length > 0 && (
+        <div className="space-y-1.5 min-w-0" data-connections-group="shared">
+          <h2 className="slabel">{t("Shared workspace accounts")}</h2>
+          <ul className="settings-rows" aria-label={t("connections")}>
+            {shared.map(renderItem)}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * CAD-2428: what a hosted platform account lets the assistant do, and who in the company
+ * can use it. The visibility switch only widens or narrows who may use the account — it
+ * never revokes or clears the credential, unlike the board-local Personal switch.
+ */
+function HostedAccountPanel({
+  row,
+  hosted,
+  canWrite,
+  onChanged,
+}: {
+  row: Connection;
+  hosted: HostedAccount;
+  canWrite: boolean;
+  onChanged: () => void;
+}) {
+  const t = useTranslate();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // The list answer is the truth; this only bridges the moment between a saved change and it.
+  const [saved, setSaved] = useState<"personal" | "shared" | null>(null);
+  useEffect(() => {
+    setSaved(null);
+    setError(null);
+  }, [row.id, hosted.visibility]);
+  const shared = (saved ?? hosted.visibility) === "shared";
+  const toggle = () => {
+    if (saving) return;
+    const next = shared ? "personal" : "shared";
+    setSaving(true);
+    setError(null);
+    api
+      .connectionVisibility(row.id, { visibility: next })
+      .then((reply) => {
+        if (!visibilityConfirmed(reply, next)) {
+          setError("Could not confirm the change. Refresh to see who can use this account.");
+          return;
+        }
+        setSaved(next);
+        onChanged();
+      })
+      .catch((e: unknown) =>
+        setError(
+          e instanceof ApiError && e.status === 403
+            ? "Only the workspace owner can change who uses this account."
+            : e instanceof ApiError && e.status === 404
+              ? "This account was not found. Refresh and try again."
+              : "Could not change who can use this account. Nothing was changed.",
+        ),
+      )
+      .finally(() => setSaving(false));
+  };
+  return (
+    <div className="conn-policy" data-hosted-account>
+      <div className="conn-policy-group">
+        <span className="slabel">{t("What Nova can do")}</span>
+        {hosted.tools.length === 0 ? (
+          <p className="text-micro text-ink-500 break-words">{t("No tools are available for this account right now.")}</p>
+        ) : (
+          <ul className="space-y-1" aria-label={t("What Nova can do")}>
+            {hosted.tools.map((tool) => (
+              <li key={tool.slug} className="flex flex-wrap items-center gap-x-2 text-label text-ink-200 min-w-0" data-tool-effect={tool.effect}>
+                <span className="break-words min-w-0">{tool.label}</span>
+                {toolAsksFirst(tool) && (
+                  <span className="chip bg-warn/10 text-warn">{t("asks you first")}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      {hosted.canChangeVisibility && canWrite && (
+        <div className="conn-policy-group">
+          <span className="slabel">{t("Who can use this account")}</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={shared}
+            disabled={saving}
+            className="conn-policy-toggle"
+            onClick={toggle}
+          >
+            <span className="conn-policy-box" aria-hidden>
+              {shared ? "✓" : ""}
+            </span>
+            <span className="min-w-0 break-words">
+              <b>{t("Shared with company")}</b>
+              <small className="block text-micro text-ink-400">
+                {t("Everyone in the company can use this account. Turning it off keeps the account connected, for you only.")}
+              </small>
+            </span>
+          </button>
+          {error && (
+            <p className="text-label text-fail break-words" role="alert">{t(error)}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConnectionPolicyPanel({
+  row,
+  canWrite,
+  onChanged,
+}: {
+  row: Connection;
+  canWrite: boolean;
+  onChanged: () => void;
+}) {
+  const t = useTranslate();
+  const baseVis = row.policy?.visibility ?? "shared";
+  const baseMode = row.policy?.write_mode ?? "ask_approval";
+  const baseExt = row.policy?.allow_external_triggers ?? false;
+  const baseDef = row.policy?.is_default ?? false;
+  const baseAgents = row.policy?.allowed_agents ?? [];
+
+  const [visibility, setVisibility] = useState<"shared" | "personal">(baseVis);
+  const [writeMode, setWriteMode] = useState<"ask_approval" | "read_only">(baseMode);
+  const [allowExternal, setAllowExternal] = useState(baseExt);
+  const [isDefault, setIsDefault] = useState(baseDef);
+  const [allowedAgents, setAllowedAgents] = useState<string[]>(baseAgents);
+  const [saving, setSaving] = useState(false);
+  const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const agentsState = useMaybeResource(resources.agents);
+
+  useEffect(() => {
+    setVisibility(row.policy?.visibility ?? "shared");
+    setWriteMode(row.policy?.write_mode ?? "ask_approval");
+    setAllowExternal(row.policy?.allow_external_triggers ?? false);
+    setIsDefault(row.policy?.is_default ?? false);
+    setAllowedAgents(row.policy?.allowed_agents ?? []);
+    setStatusMsg(null);
+  }, [
+    row.id,
+    row.policy?.visibility,
+    row.policy?.write_mode,
+    row.policy?.allow_external_triggers,
+    row.policy?.is_default,
+    row.policy?.policy_revision,
+  ]);
+
+  useEffect(() => {
+    if (visibility === "personal") {
+      void resources.agents.revalidate();
+    }
+  }, [visibility]);
+
+  const effectiveExt = visibility === "shared" ? allowExternal : false;
+  const effectiveDef = visibility === "personal" ? isDefault : false;
+  const effectiveAgents = visibility === "personal" ? allowedAgents : [];
+  const baseAgentsKey = [...baseAgents].sort().join(",");
+  const currAgentsKey = [...effectiveAgents].sort().join(",");
+  const dirty =
+    visibility !== baseVis ||
+    writeMode !== baseMode ||
+    effectiveExt !== baseExt ||
+    effectiveDef !== baseDef ||
+    currAgentsKey !== baseAgentsKey;
+  const clearsShared = baseVis === "shared" && visibility === "personal";
+  const rosterAgents = agentsState?.data?.agents ?? [];
+
+  const toggleAllowedAgent = (alias: string) => {
+    setAllowedAgents((prev) =>
+      prev.includes(alias) ? prev.filter((item) => item !== alias) : [...prev, alias],
+    );
+  };
+
+  const savePolicy = async () => {
+    if (saving || !canWrite) return;
+    setSaving(true);
+    setStatusMsg(null);
+    try {
+      const res = await routinesApi.connectionPolicySet(row.id, {
+        visibility,
+        write_mode: writeMode,
+        allow_external_triggers: effectiveExt,
+        is_default: effectiveDef,
+        allowed_agents: effectiveAgents,
+      });
+      setStatusMsg({
+        ok: true,
+        text: res.shared_credential_cleared
+          ? "Shared credential cleared and account switched to Personal."
+          : "Access settings saved.",
+      });
+      onChanged();
+    } catch {
+      setStatusMsg({
+        ok: false,
+        text: "Could not save access settings.",
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="conn-policy" data-connection-policy>
+      <div className="conn-policy-group">
+        <span className="slabel">{t("Who can use this account")}</span>
+        <div className="conn-policy-grid" role="radiogroup" aria-label={t("Who can use this account")}>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={visibility === "shared"}
+            disabled={!canWrite || saving}
+            className="conn-policy-opt"
+            onClick={() => setVisibility("shared")}
+          >
+            <b>{t("Shared with workspace")}</b>
+            <small>{t("Team members and assigned routines can use this connection.")}</small>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={visibility === "personal"}
+            disabled={!canWrite || saving}
+            className="conn-policy-opt"
+            onClick={() => setVisibility("personal")}
+          >
+            <b>{t("Just me (Personal)")}</b>
+            <small>{t("Only your turns and routines pinned to this account can use it.")}</small>
+          </button>
+        </div>
+        {clearsShared && (
+          <p className="text-micro text-warn mt-1 break-words" role="status">
+            {t(
+              "Switching a shared workspace account to Personal clears the stored shared credential first so you can connect your own account.",
+            )}
+          </p>
+        )}
+        {visibility === "personal" && (
+          <>
+            <button
+              type="button"
+              role="checkbox"
+              aria-checked={isDefault}
+              disabled={!canWrite || saving}
+              className="conn-policy-toggle mt-1"
+              onClick={() => setIsDefault((v) => !v)}
+            >
+              <span className="conn-policy-box" aria-hidden>
+                {isDefault ? "✓" : ""}
+              </span>
+              <span className="min-w-0 break-words">
+                {t("Default personal account for this service")}
+              </span>
+            </button>
+            {rosterAgents.length > 0 && (
+              <div className="mt-2 space-y-1.5 min-w-0">
+                <span className="slabel">{t("Agent access")}</span>
+                <p className="text-micro text-ink-400 break-words">
+                  {allowedAgents.length === 0
+                    ? t("All workspace agents can use this personal account on your turns. Select specific agents to restrict access.")
+                    : t("Only checked agents may call this personal account.")}
+                </p>
+                <div className="space-y-1">
+                  {rosterAgents.map((agentRow) => {
+                    const checked = allowedAgents.includes(agentRow.alias);
+                    return (
+                      <button
+                        key={agentRow.alias}
+                        type="button"
+                        role="checkbox"
+                        aria-checked={checked}
+                        disabled={!canWrite || saving}
+                        className="conn-policy-toggle"
+                        onClick={() => toggleAllowedAgent(agentRow.alias)}
+                      >
+                        <span className="conn-policy-box" aria-hidden>
+                          {checked ? "✓" : ""}
+                        </span>
+                        <span className="min-w-0 break-words num">{agentRow.alias}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="conn-policy-group">
+        <span className="slabel">{t("Action safety")}</span>
+        <div className="conn-policy-grid" role="radiogroup" aria-label={t("Action safety")}>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={writeMode === "ask_approval"}
+            disabled={!canWrite || saving}
+            className="conn-policy-opt"
+            onClick={() => setWriteMode("ask_approval")}
+          >
+            <b>{t("Ask for approval first")}</b>
+            <small>{t("Drafts and external writes wait for approval.")}</small>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={writeMode === "read_only"}
+            disabled={!canWrite || saving}
+            className="conn-policy-opt"
+            onClick={() => setWriteMode("read_only")}
+          >
+            <b>{t("Read only")}</b>
+            <small>{t("Agents can read data; external writes are blocked.")}</small>
+          </button>
+        </div>
+      </div>
+
+      {visibility === "shared" && (
+        <div className="conn-policy-group">
+          <span className="slabel">{t("Incoming triggers")}</span>
+          <button
+            type="button"
+            role="checkbox"
+            aria-checked={allowExternal}
+            disabled={!canWrite || saving}
+            className="conn-policy-toggle"
+            onClick={() => setAllowExternal((v) => !v)}
+          >
+            <span className="conn-policy-box" aria-hidden>
+              {allowExternal ? "✓" : ""}
+            </span>
+            <span className="min-w-0 break-words">
+              {t("Allow incoming emails or webhooks to trigger actions")}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {statusMsg && (
+        <p
+          className={`text-label break-words ${statusMsg.ok ? "text-ink-300" : "text-fail"}`}
+          role={statusMsg.ok ? "status" : "alert"}
+        >
+          {t(statusMsg.text)}
+        </p>
+      )}
+
+      {canWrite && dirty && (
+        <div>
+          <Button size="sm" variant="primary" onClick={() => void savePolicy()} loading={saving}>
+            {t("Save access settings")}
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1136,7 +2455,10 @@ export function RotateForm({
   row,
   onDone,
   onClose,
+  hostedBoard = false,
 }: {
+  /** A hosted board replaces the settings whole, so a blank field must send the live value. */
+  hostedBoard?: boolean;
   row: Connection;
   onDone: () => void;
   onClose: () => void;
@@ -1197,7 +2519,18 @@ export function RotateForm({
       const bad = smtpPortTlsError(effHost, String(effPort), effTls);
       if (bad) { setError(bad); return; }
     }
-    const body = isSmtp
+    const senderName = smtp.sender_name.trim() || row.smtp?.sender_name?.trim() || "";
+    const body = isSmtp && hostedBoard
+      ? {
+          secret: token.trim(),
+          host: effHost,
+          port: effPort,
+          tls_mode: effTls,
+          username: smtp.username.trim() || (row.smtp?.username ?? ""),
+          sender: smtp.sender.trim() || (row.smtp?.sender ?? ""),
+          ...(senderName ? { sender_name: senderName } : {}),
+        }
+      : isSmtp
       ? {
           ...base,
           secret: token.trim(),
@@ -1223,7 +2556,7 @@ export function RotateForm({
       })
       // CAD-1013: rotate also carries the fresh SMTP password — same
       // typed-code safe reason, never the raw downstream message.
-      .catch((e: ApiError) => setError(enrollErrorMessage(e)))
+      .catch((e: ApiError) => setError(hostedBoard ? connectErrorText(e) : enrollErrorMessage(e)))
       .finally(() => {
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.
@@ -1395,10 +2728,14 @@ function RevokeConfirm({
   row,
   onDone,
   onClose,
+  hostedPlatform = false,
 }: {
   row: Connection;
   onDone: () => void;
   onClose: () => void;
+  /** A hosted platform account: revoke disables the provider account and
+   *  removes its selected property, not a local SMTP binding. */
+  hostedPlatform?: boolean;
 }) {
   const t = useTranslate();
   const [armed, setArmed] = useState(false);
@@ -1445,7 +2782,15 @@ function RevokeConfirm({
 
   return (
     <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={t("disconnect {connectionLabel}").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}>
-      <p className="text-label text-ink-200 break-words">{t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}</p>
+      <p className="text-label text-ink-200 break-words">
+        {hostedPlatform
+          ? row.provider === "google_search_console"
+            ? t("Disconnecting disables this provider account and revokes its connection grants. The pinned Search Console property is removed. This cannot be undone — connecting the account again creates a new connection.")
+            : isAssetPinningProvider(row.provider)
+              ? t("Disconnecting disables this provider account and revokes its connection grants. Any pinned ad account is removed. This cannot be undone — connecting the account again creates a new connection.")
+              : t("Disconnecting disables this provider account and revokes its connection grants. This cannot be undone — connecting the account again creates a new connection.")
+          : t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}
+      </p>
       <label className="flex items-start gap-2 text-label text-ink-300">
         <input
           type="checkbox"
@@ -1455,7 +2800,14 @@ function RevokeConfirm({
           className="mt-0.5"
         />
         <span>
-          {t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}</span>
+          {hostedPlatform
+            ? row.provider === "google_search_console"
+              ? t("I understand disconnecting {connectionLabel} disables the provider account and removes its pinned property.").replace("{connectionLabel}", () => connectionLabel(row))
+              : isAssetPinningProvider(row.provider)
+                ? t("I understand disconnecting {connectionLabel} disables the provider account and removes its pinned account.").replace("{connectionLabel}", () => connectionLabel(row))
+                : t("I understand disconnecting {connectionLabel} disables the provider account and revokes its connection grants.").replace("{connectionLabel}", () => connectionLabel(row))
+            : t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}
+        </span>
       </label>
       {error && (
         <p className="text-label text-fail break-words" role="alert">
@@ -1464,7 +2816,11 @@ function RevokeConfirm({
       )}
       <div className="flex flex-wrap gap-2">
         <Button variant="danger" size="sm" onClick={submit} loading={busy} disabled={!armed}>
-          {busy ? t("Disconnecting…") : t("Disconnect")}
+          {busy
+            ? t("Disconnecting…")
+            : hostedPlatform
+              ? t("Disconnect account")
+              : t("Disconnect")}
         </Button>
         <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
       </div>
@@ -1528,7 +2884,7 @@ function HostedConnect({
         <Button variant="primary" loading={busy} onClick={connect}>
           {busy
             ? t("Opening sign-in…")
-            : t("Connect {label}").replace("{label}", () => serviceLabel(provider.provider))}
+            : t("Connect {label}").replace("{label}", () => providerServiceLabel(provider))}
         </Button>
         <Button variant="ghost" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
       </div>
@@ -1564,6 +2920,11 @@ export function AddConnection({
   onAdded: (id: string) => void;
 }) {
   const t = useTranslate();
+  // CAD-1085: on a protected profile the trusted entry page is the only
+  // credential collector; the legacy typed token/SMTP form is withheld.
+  const protectedEntry = useProtectedEntry();
+  const protectedOnly =
+    protectedEntry.status === "ready" && protectedEntry.entry.configured;
   const providerId = useId();
   const accountId = useId();
   const tokenId = useId();
@@ -1827,6 +3188,49 @@ export function AddConnection({
       });
   };
 
+  // CAD-1085: the protected path. It creates a metadata-only request and
+  // opens the trusted entry page; the operator types the credential,
+  // account handle and (for SMTP) transport there, never in this form.
+  const protectedEnroll = () => {
+    if (busy || provider === "" || unavailable || methodPending) return;
+    const wanted = smtpShape
+      ? smtpRequiredScopes(chosen)
+      : hint.filter((s) => scopePicks.has(s));
+    if (wanted.length === 0) {
+      setError(
+        smtpShape
+          ? "This provider does not offer SMTP sending — it has no reviewed send permission to enroll."
+          : "Tick at least one reviewed permission before requesting protected enrollment.",
+      );
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const gen = requestGen.current;
+    api
+      .credentialRequestCreate({
+        provider,
+        verb: "enroll",
+        shape: smtpShape ? "smtp" : "token",
+        scopes: wanted,
+      })
+      .then(({ request }) => {
+        if (!live(gen)) return;
+        setToken("");
+        if (!openTrustedEntry(request)) {
+          setError(errorCopy("unsupported_deployment"));
+        }
+      })
+      .catch((e: ApiError) => {
+        if (!live(gen)) return;
+        setError(errorCopy(e.code));
+      })
+      .finally(() => {
+        if (!live(gen)) return;
+        setBusy(false);
+      });
+  };
+
   // provider === "" is the choose-service placeholder; a selected
   // provider that is not currently enrollable (removed from the
   // registry, or its descriptor/shapes gone) is `unavailable`. Either
@@ -1911,7 +3315,27 @@ export function AddConnection({
             <p className="text-micro text-ink-500 break-words">
               {t("Choose how to connect {serviceLabel} — a scoped API token, or an SMTP sender.").replace("{serviceLabel}", () => serviceLabel(provider))}</p>
           )}
-          {!methodPending && (
+          {!methodPending && protectedOnly && (
+            <div className="card px-3 py-2.5 space-y-2" data-protected-enroll>
+              <p className="text-label font-medium text-ink-200">{t("Protected enrollment")}</p>
+              <p className="text-micro text-ink-500 break-words">
+                {t("This protected profile collects the account handle, SMTP transport and credential on the separately served trusted entry page, then sends them once to protected custody. Nothing is typed on this board.")}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="primary"
+                  size="sm"
+                  onClick={protectedEnroll}
+                  loading={busy}
+                  disabled={busy}
+                >
+                  {t("Continue on secure entry…")}
+                </Button>
+              </div>
+            </div>
+          )}
+          {!methodPending && !protectedOnly && (
           <>
           {smtpShape && (
           <fieldset className="space-y-2">

@@ -1,0 +1,829 @@
+import type { GenerationIdentity, OperationReply } from "./contract.ts";
+
+/**
+ * The one place that knows the engine's durable SQLite layout.
+ *
+ * The engine stores one row per task in `pi_tasks`; the harness configures the
+ * `pi_` prefix. A generation task keeps a `{ phase, attempt, cutoff, ... }`
+ * checkpoint, and its task id is stable across provider retries and crash
+ * recovery while a tool round advances `cutoff`. That pair — task id + cutoff
+ * — is the operation-scoped identity the funding ledger keys on, so this
+ * adapter exposes nothing else and fails closed on a missing or ambiguous
+ * running generation.
+ *
+ * A run's inputs (`pi.live.run.inputs`) are submission ids. `pi_submissions`
+ * records the entry each placed input became, and `pi_entries` holds that
+ * entry's own `kind`, `data` and user message — where the runtime's admission
+ * envelope lives. `readSubmissionEntry` exposes that for one submission root,
+ * and `readHeldSubmission` reads the same records from the other end: the
+ * submission, and the text and entry it was submitted with, for one operation
+ * id. A queued input has no entry yet; its draft lives in the engine's own
+ * inbox document, which the session reads through the engine's document API.
+ *
+ * A future engine release that changes these tables or shapes only needs this
+ * module updated; session and funding code consume the stable shapes.
+ */
+export interface TaskSql {
+  exec(
+    query: string,
+    ...bindings: (string | number | null)[]
+  ): { toArray(): Record<string, unknown>[] };
+}
+
+interface TaskRow {
+  id: number;
+  record: string;
+}
+
+const IDENTITY_PART = /^[A-Za-z0-9_-]{1,40}$/;
+
+interface GenerationCheckpoint {
+  phase?: unknown;
+  cutoff?: unknown;
+}
+
+interface GenerationRecord {
+  conversationId?: unknown;
+  kind?: unknown;
+  state?: { status?: unknown; checkpoint?: GenerationCheckpoint };
+}
+
+/** The one running request's identity, or `null` when it is absent or ambiguous. */
+export function readGenerationIdentity(
+  sql: TaskSql,
+): GenerationIdentity | null {
+  let rows: TaskRow[];
+  try {
+    rows = sql
+      .exec(
+        `SELECT id, record FROM pi_tasks
+          WHERE kind = '"pi.generation"' AND status = 'running'
+          ORDER BY id DESC LIMIT 2`,
+      )
+      .toArray()
+      .map((row) => ({ id: Number(row.id), record: String(row.record) }));
+  } catch {
+    return null;
+  }
+  // Two running generation tasks in one conversation object is ambiguous;
+  // choosing either could bill or replay the wrong operation.
+  if (rows.length !== 1) return null;
+  const row = rows[0]!;
+  let record: GenerationRecord;
+  try {
+    record = JSON.parse(row.record) as GenerationRecord;
+  } catch {
+    return null;
+  }
+  const checkpoint = record.state?.checkpoint;
+  if (
+    record.kind !== "pi.generation" ||
+    record.state?.status !== "running" ||
+    !checkpoint ||
+    checkpoint.phase !== "request"
+  ) {
+    return null;
+  }
+  const conversationId = record.conversationId;
+  const cutoff = checkpoint.cutoff;
+  const cutoffValue =
+    typeof cutoff === "number" && Number.isSafeInteger(cutoff) && cutoff >= 0
+      ? String(cutoff)
+      : typeof cutoff === "string"
+        ? cutoff
+        : null;
+  const conversation =
+    typeof conversationId === "number" && Number.isSafeInteger(conversationId)
+      ? String(conversationId)
+      : typeof conversationId === "string"
+        ? conversationId
+        : null;
+  const task = String(row.id);
+  if (
+    conversation === null ||
+    cutoffValue === null ||
+    !IDENTITY_PART.test(conversation) ||
+    !IDENTITY_PART.test(task) ||
+    !IDENTITY_PART.test(cutoffValue)
+  ) {
+    return null;
+  }
+  return { conversation, task, cutoff: cutoffValue };
+}
+
+/**
+ * The summarization request of the exact compaction task attested by the
+ * engine's current phase, or nothing. A task's pinned tail does not change on
+ * a retry or after recovery, and its task id is distinct from the generation
+ * waiting for it.
+ */
+export function readCompactionIdentity(sql: TaskSql, taskId: number): GenerationIdentity | null {
+  if (!Number.isSafeInteger(taskId) || taskId <= 0) return null;
+  try {
+    const rows = sql
+      .exec(
+        `SELECT id, conversation_id, record FROM pi_tasks
+          WHERE id = ? AND kind = '"pi.compaction"' AND status = 'running'`,
+        taskId,
+      )
+      .toArray();
+    const row = rows[0];
+    if (rows.length !== 1 || row?.id !== taskId) return null;
+    const record = parseRecord(row.record);
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
+    const checkpoint = (state as Record<string, unknown>).checkpoint;
+    if (
+      record?.id !== taskId ||
+      record.conversationId !== row.conversation_id ||
+      record.kind !== "pi.compaction" ||
+      (state as Record<string, unknown>).status !== "running" ||
+      typeof checkpoint !== "object" ||
+      checkpoint === null ||
+      Array.isArray(checkpoint)
+    )
+      return null;
+    const request = checkpoint as Record<string, unknown>;
+    if (request.phase !== "summarize") return null;
+    const part = (value: unknown): string | null =>
+      typeof value === "number" && Number.isSafeInteger(value) && value > 0
+        ? String(value)
+        : null;
+    const conversation = part(record.conversationId);
+    const cutoff = part(request.tail);
+    if (conversation === null || cutoff === null) return null;
+    return { conversation, task: String(taskId), cutoff };
+  } catch {
+    return null;
+  }
+}
+
+/** The engine's stored pieces of one entry: its kind, its data and its messages. */
+export interface StoredEntryData {
+  readonly kind: unknown;
+  readonly data: unknown;
+  /** The messages the entry contributes to the model context, when it has any. */
+  readonly model: unknown;
+}
+
+/**
+ * The entry one placed input submission became, as the engine stored it.
+ *
+ * Each of a run's inputs is a submission id. Its record names the placed
+ * entry, and that entry is immutable, so the runtime reads the envelope it
+ * actually admitted instead of re-deriving a scope from a caller. This never
+ * guesses and never answers "nothing": a missing row, a failed read, a
+ * non-input submission, one with no placed entry or an unusable record all
+ * throw, so a caller can tell "proven Home" (a readable entry without an app)
+ * from "unavailable" and refuse the latter.
+ */
+export function readSubmissionEntry(
+  sql: TaskSql,
+  submissionId: string,
+): StoredEntryData {
+  const unavailable = () =>
+    new Error(`Submission "${submissionId}" has no readable placed entry.`);
+  const id = Number(submissionId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw unavailable();
+  const submission = record(sql, "pi_submissions", id);
+  if (submission === null || submission.type !== "input") throw unavailable();
+  const entryId = submission.entry;
+  if (
+    typeof entryId !== "number" ||
+    !Number.isSafeInteger(entryId) ||
+    entryId <= 0
+  )
+    throw unavailable();
+  const entry = entryData(sql, entryId);
+  if (entry === null) throw unavailable();
+  return entry;
+}
+
+/** The engine's request id for a placed input, never a value inferred from its text. */
+export function readSubmissionRequestId(sql: TaskSql, submissionId: string): string {
+  const unavailable = () =>
+    new Error(`Submission "${submissionId}" has no readable request identity.`);
+  const id = Number(submissionId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw unavailable();
+  const submission = record(sql, "pi_submissions", id);
+  if (
+    submission === null ||
+    submission.type !== "input" ||
+    typeof submission.requestId !== "string"
+  )
+    throw unavailable();
+  return submission.requestId;
+}
+
+/**
+ * Whether the engine holds any submission — queued, placed or settled — for one
+ * operation id.
+ *
+ * The engine writes the id verbatim into the submission's own `record` (its
+ * `request_id` column stores the JSON-encoded index form), so this reads the
+ * authoritative record. A database without the engine's submissions table
+ * provably holds no submissions: pi's own migrations create that table before
+ * anything can be stored in it. Anything else — a failed read, an unreadable
+ * schema — propagates, so a caller that cannot prove the id is unused refuses
+ * it instead of assuming.
+ */
+export function submissionHeld(sql: TaskSql, operationId: string): boolean {
+  if (!hasSubmissions(sql)) return false;
+  const held = sql
+    .exec(
+      "SELECT 1 AS held FROM pi_submissions WHERE json_extract(record,'$.requestId')=? LIMIT 1",
+      operationId,
+    )
+    .toArray()[0];
+  return held !== undefined;
+}
+
+/** One submission the engine holds for an operation id, as its own records say. */
+export interface HeldSubmission {
+  /** The engine's own submission id. */
+  readonly id: number;
+  /** The submission type the engine stored. */
+  readonly type: "input" | "write";
+  /** The lifecycle status the engine stored. */
+  readonly status: "queued" | "placed" | "done" | "unanswered";
+  /**
+   * The exact text the input was submitted with, when the engine stored it as
+   * one plain user message: the message a submission appends for its input.
+   * `null` when the engine placed no entry yet, or stored a content shape that
+   * cannot be read back as that text.
+   */
+  readonly text: string | null;
+  /** The entry the input was placed as, when the engine placed one. */
+  readonly entry: StoredEntryData | null;
+}
+
+/**
+ * The submission the engine holds for one operation id, or `null` when its
+ * records prove it holds none.
+ *
+ * A runtime build that predates the admission guard submits without one, so the
+ * engine can hold an operation id this session's SQLite never bound. Recovering
+ * what such a submission actually was is the only way to tell an identical
+ * retry from a different operation reusing the id, and the engine's own records
+ * are the only authority for it: the submission's type, the entry it was placed
+ * as, and the user message that entry carries.
+ *
+ * The lookup is the engine's own deduplication key — the conversation and the
+ * JSON-encoded request id it indexes — so this answers for exactly the
+ * submission the engine would replay, and not one another conversation holds
+ * under the same id.
+ *
+ * Unlike the rest of this adapter, an unreadable or ambiguous record throws.
+ * Its caller acts on "the engine holds nothing", so that answer must be a proof
+ * rather than a failed read: two rows for one request id, a record that is not
+ * a submission, or an entry the record names but the engine cannot produce are
+ * states no correct engine writes, and a caller that cannot tell which row is
+ * the operation refuses instead of guessing.
+ */
+export function readHeldSubmission(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+): HeldSubmission | null {
+  if (!hasSubmissions(sql)) return null;
+  const rows = sql
+    .exec(
+      `SELECT id, record FROM pi_submissions
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
+      conversationId,
+      JSON.stringify(operationId),
+    )
+    .toArray();
+  if (rows.length === 0) return null;
+  if (rows.length > 1)
+    throw new Error(
+      `Operation "${operationId}" names more than one engine submission.`,
+    );
+  const row = rows[0];
+  if (row === undefined) return null;
+  const id = Number(row.id);
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  const submission = parseRecord(row.record);
+  if (submission === null)
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  const { type, status } = submission;
+  if (type !== "input" && type !== "write")
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  if (
+    status !== "queued" &&
+    status !== "placed" &&
+    status !== "done" &&
+    status !== "unanswered"
+  )
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  const entryId = submission.entry;
+  if (entryId === undefined || entryId === null)
+    return { id, type, status, text: null, entry: null };
+  if (
+    typeof entryId !== "number" ||
+    !Number.isSafeInteger(entryId) ||
+    entryId <= 0
+  )
+    throw new Error(
+      `Operation "${operationId}" has an unreadable engine submission.`,
+    );
+  const entry = entryData(sql, entryId);
+  if (entry === null)
+    throw new Error(
+      `Operation "${operationId}" has an engine submission whose entry is unavailable.`,
+    );
+  return { id, type, status, text: entryText(entry.model), entry };
+}
+
+type SubmissionSettlement =
+  | { readonly state: "settled"; readonly submission: number; readonly status: "done" | "unanswered" }
+  | { readonly state: "absent" | "unknown" };
+
+function isEntryId(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function terminalOutcome(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const outcome = value as Record<string, unknown>;
+  switch (outcome.status) {
+    case "completed":
+      return Object.hasOwn(outcome, "result") && outcome.error === undefined && outcome.reason === undefined;
+    case "failed":
+    case "faulted": {
+      const error = outcome.error;
+      return typeof error === "object" && error !== null && !Array.isArray(error) &&
+        typeof (error as Record<string, unknown>).message === "string" &&
+        outcome.reason === undefined && (outcome.status === "failed" || outcome.result === undefined);
+    }
+    case "aborted":
+      return outcome.error === undefined && (outcome.reason === undefined || typeof outcome.reason === "string");
+    case "orphaned":
+      return typeof outcome.reason === "string" && outcome.result === undefined && outcome.error === undefined;
+    default:
+      return false;
+  }
+}
+
+/** Only Pi's conversation-owned, tool-free threshold summary can overlap chat admission. */
+function passiveSummary(task: Record<string, unknown>, state: Record<string, unknown>): boolean {
+  if (task.kind !== "pi.compaction" || task.version !== 1 || task.owner !== undefined ||
+      task.background !== true || task.abortRequested !== false || state.outcome !== undefined)
+    return false;
+  const input = task.input;
+  if (typeof input !== "object" || input === null || Array.isArray(input) ||
+      !("reason" in input) || input.reason !== "threshold" || "instructions" in input)
+    return false;
+  const checkpoint = state.checkpoint;
+  if (typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
+    return false;
+  const request = checkpoint as Record<string, unknown>;
+  const active = state.status === "pending" || state.status === "running";
+  if (request.phase === "select") return active;
+  const model = request.model;
+  if (!isEntryId(request.attempt) || !isEntryId(request.tail) ||
+      !isEntryId(request.firstKept) || request.firstKept > request.tail ||
+      typeof request.maxTokens !== "number" || !Number.isSafeInteger(request.maxTokens) ||
+      request.maxTokens < 0 || typeof request.thinkingLevel !== "string" ||
+      typeof request.streamOptions !== "object" || request.streamOptions === null ||
+      Array.isArray(request.streamOptions) || typeof model !== "object" || model === null ||
+      Array.isArray(model) || !("provider" in model) || typeof model.provider !== "string" ||
+      !model.provider || !("modelId" in model) || typeof model.modelId !== "string" || !model.modelId)
+    return false;
+  if (request.phase === "summarize") return active;
+  return request.phase === "retry" && typeof request.until === "number" &&
+    Number.isFinite(request.until) && (active || (state.status === "sleeping" && state.until === request.until));
+}
+
+function entryHasRole(sql: TaskSql, id: number, conversationId: number, role: string): boolean {
+  const rows = sql.exec(
+    "SELECT id, conversation_id, record FROM pi_entries WHERE id=?",
+    id,
+  ).toArray();
+  if (rows.length !== 1) return false;
+  const row = rows[0]!;
+  const entry = parseRecord(row.record);
+  return Number(row.id) === id && Number(row.conversation_id) === conversationId &&
+    entry !== null && entry.id === id && entry.conversationId === conversationId &&
+    Array.isArray(entry.model) && entry.model.some((message: unknown) =>
+      typeof message === "object" && message !== null && !Array.isArray(message) &&
+      (message as Record<string, unknown>).role === role);
+}
+
+/**
+ * Prove one submission's terminal state without opening the engine. Chat
+ * admission may overlap a passive summary in the target conversation. It
+ * still requires every other task and every submission to be terminal.
+ * Inconsistent indexes or records cannot prove either result.
+ */
+export function readSubmissionSettlement(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+  allowPassiveSummary = false,
+): SubmissionSettlement {
+  const schema = sql.exec(
+    `SELECT name, type FROM sqlite_master
+      WHERE name IN ('pi_submissions','pi_tasks','pi_entries','pi_submissions_by_request')
+         OR (type='table' AND name GLOB 'pi_*')`,
+  ).toArray();
+  const submissions = schema.find((row) => row.name === "pi_submissions");
+  const tasks = schema.find((row) => row.name === "pi_tasks");
+  const entries = schema.find((row) => row.name === "pi_entries");
+  const requestIndex = schema.find((row) => row.name === "pi_submissions_by_request");
+  if (submissions === undefined && tasks === undefined)
+    return { state: schema.length === 0 ? "absent" : "unknown" };
+  if (submissions?.type !== "table" || tasks?.type !== "table" ||
+      entries?.type !== "table" || requestIndex?.type !== "index")
+    return { state: "unknown" };
+
+  // Check every task, including nested conversations and background work.
+  // Indexed fields and terminal outcomes must agree with their stored bodies.
+  const taskColumns = "SELECT id, conversation_id, kind, status, background, abort_requested, record FROM pi_tasks";
+  let taskAfter: number | undefined;
+  for (;;) {
+    const rows = taskAfter === undefined
+      ? sql.exec(`${taskColumns} ORDER BY id LIMIT 500`).toArray()
+      : sql.exec(`${taskColumns} WHERE id>? ORDER BY id LIMIT 500`, taskAfter).toArray();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const conversation = Number(row.conversation_id);
+      const record = parseRecord(row.record);
+      if (
+        !isEntryId(id) || !isEntryId(conversation) || record === null ||
+        record.id !== id || record.conversationId !== conversation ||
+        typeof record.kind !== "string" || JSON.stringify(record.kind) !== row.kind ||
+        typeof record.version !== "number" ||
+        !Object.hasOwn(record, "input") ||
+        typeof record.background !== "boolean" || Number(record.background) !== row.background ||
+        typeof record.abortRequested !== "boolean" || Number(record.abortRequested) !== row.abort_requested
+      )
+        return { state: "unknown" };
+      const state = record.state;
+      if (typeof state !== "object" || state === null || Array.isArray(state))
+        return { state: "unknown" };
+      const taskState = state as Record<string, unknown>;
+      if (taskState.status !== row.status) return { state: "unknown" };
+      if (taskState.status === "terminal") {
+        if (taskState.checkpoint !== undefined || !terminalOutcome(taskState.outcome))
+          return { state: "unknown" };
+      } else if (!allowPassiveSummary || conversation !== conversationId || !passiveSummary(record, taskState))
+        return { state: "unknown" };
+      taskAfter = id;
+    }
+    if (rows.length < 500) break;
+  }
+
+  // The indexed request id and its JSON body must agree, even on other rows:
+  // an inconsistent index must not turn a held id into apparent absence.
+  // Parse bounded pages in JavaScript so lone surrogates survive unchanged.
+  const columns = "SELECT id, conversation_id, request_id, status, record FROM pi_submissions";
+  let after: number | undefined;
+  let settled: Extract<SubmissionSettlement, { state: "settled" }> | undefined;
+  for (;;) {
+    const rows = after === undefined
+      ? sql.exec(`${columns} ORDER BY id LIMIT 500`).toArray()
+      : sql.exec(`${columns} WHERE id>? ORDER BY id LIMIT 500`, after).toArray();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const conversation = Number(row.conversation_id);
+      const record = parseRecord(row.record);
+      if (
+        !Number.isSafeInteger(id) || id <= 0 ||
+        !Number.isSafeInteger(conversation) || conversation <= 0 ||
+        record === null || record.id !== id ||
+        record.conversationId !== conversation ||
+        record.status !== row.status ||
+        (record.status !== "done" && record.status !== "unanswered") ||
+        (record.requestId === undefined
+          ? row.request_id !== null
+          : typeof record.requestId !== "string" ||
+            row.request_id !== JSON.stringify(record.requestId))
+      )
+        return { state: "unknown" };
+      if (conversation === conversationId && record.requestId === operationId) {
+        if (settled !== undefined || record.type !== "input") return { state: "unknown" };
+        if (record.status === "done") {
+          if (!isEntryId(record.entry) || !isEntryId(record.answer) ||
+              record.reason !== undefined || record.detail !== undefined)
+            return { state: "unknown" };
+        } else if (
+          (record.entry !== undefined && !isEntryId(record.entry)) ||
+          record.answer !== undefined || typeof record.reason !== "string"
+        )
+          return { state: "unknown" };
+        if (
+          (record.entry !== undefined && !entryHasRole(sql, record.entry as number, conversationId, "user")) ||
+          (record.status === "done" && !entryHasRole(sql, record.answer as number, conversationId, "assistant"))
+        )
+          return { state: "unknown" };
+        settled = { state: "settled", submission: id, status: record.status };
+      }
+      after = id;
+    }
+    if (rows.length < 500) break;
+  }
+  // Pi's own request lookup uses this index. It must agree with the table
+  // scan before either a terminal or an absent result is trusted.
+  const indexed = sql.exec(
+    `SELECT id FROM pi_submissions INDEXED BY pi_submissions_by_request
+      WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
+    conversationId,
+    JSON.stringify(operationId),
+  ).toArray();
+  if (settled === undefined)
+    return { state: indexed.length === 0 ? "absent" : "unknown" };
+  if (indexed.length !== 1 || Number(indexed[0]?.id) !== settled.submission)
+    return { state: "unknown" };
+  return settled;
+}
+
+/**
+ * Pi 1.5.2 flushes answer entries before settling input submissions in the
+ * same SQLite transaction. Capture the first terminal link in that commit,
+ * not when someone later reads the mutable submission. Set up only after
+ * the engine has created its schema and before this harness accepts work.
+ */
+export function configureOperationReplyCapture(sql: TaskSql, enabled: boolean): void {
+  if (!enabled) {
+    if (sql.exec(`SELECT 1 FROM sqlite_master
+      WHERE type='table' AND name='tenant_operation_replies'`).toArray().length === 0) return;
+    // An opt-out stops new capture without throwing away existing custody.
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_insert");
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_update");
+    sql.exec("DROP INDEX IF EXISTS tenant_operation_replies_body_request");
+    return;
+  }
+  sql.exec(`CREATE TABLE IF NOT EXISTS tenant_operation_replies (
+    submission_id INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    request_id TEXT,
+    status TEXT NOT NULL,
+    input_id INTEGER,
+    answer_id INTEGER
+  ) STRICT`);
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_answer
+    ON tenant_operation_replies (answer_id) WHERE answer_id IS NOT NULL`);
+  // The engine looks up request_id. Independently index the body so a
+  // disagreement on a different row cannot hide an ambiguous operation.
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_body_request
+    ON pi_submissions (conversation_id, json_extract(record, '$.requestId'))`);
+  for (const event of ["INSERT", "UPDATE"] as const) {
+    const transition = event === "UPDATE" ? "AND OLD.status IN ('queued', 'placed')" : "";
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS tenant_operation_replies_${event.toLowerCase()}
+      AFTER ${event} ON pi_submissions
+      WHEN NEW.status IN ('done', 'unanswered') AND json_extract(NEW.record, '$.type')='input' ${transition}
+      BEGIN
+        INSERT OR IGNORE INTO tenant_operation_replies
+          (submission_id, conversation_id, request_id, status, input_id, answer_id)
+        VALUES (NEW.id, NEW.conversation_id, NEW.request_id, NEW.status,
+          json_extract(NEW.record, '$.entry'), json_extract(NEW.record, '$.answer'));
+      END`);
+  }
+}
+
+/** Read from indexed, committed custody; never open the engine or scan other work. */
+export function readOperationReply(
+  sql: TaskSql,
+  conversationId: number,
+  operationId: string,
+): OperationReply {
+  const unconfirmed = { state: "unconfirmed", operationId } as const;
+  try {
+    const rows = sql.exec(
+      `SELECT id, status, record FROM pi_submissions INDEXED BY pi_submissions_by_request
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`,
+      conversationId,
+      JSON.stringify(operationId),
+    ).toArray();
+    const row = rows[0];
+    if (rows.length !== 1 || !row || !isEntryId(row.id)) return unconfirmed;
+    // Decode both values in SQLite. Binding the raw JavaScript string would
+    // replace a lone surrogate before SQLite could compare it to the body.
+    const bodies = sql.exec(`SELECT id FROM pi_submissions INDEXED BY tenant_operation_replies_body_request
+      WHERE conversation_id=? AND json_extract(record, '$.requestId')=json_extract(?, '$') LIMIT 2`,
+      conversationId, JSON.stringify(operationId)).toArray();
+    if (bodies.length !== 1 || bodies[0]?.id !== row.id) return unconfirmed;
+    const submission = parseRecord(row.record);
+    if (submission === null || submission.type !== "input" ||
+        submission.id !== row.id || submission.conversationId !== conversationId ||
+        submission.requestId !== operationId || submission.status !== row.status) return unconfirmed;
+    if (submission.entry !== undefined &&
+        (!isEntryId(submission.entry) || !entryHasRole(sql, submission.entry, conversationId, "user")))
+      return unconfirmed;
+    if (submission.status === "queued" || submission.status === "placed") {
+      if ((submission.status === "placed") !== (submission.entry !== undefined) ||
+          submission.answer !== undefined || submission.reason !== undefined ||
+          submission.detail !== undefined) return unconfirmed;
+      return { state: "pending", operationId };
+    }
+    const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
+      FROM tenant_operation_replies WHERE submission_id=?`, row.id).toArray()[0];
+    if (!receipt || receipt.conversation_id !== conversationId || receipt.request_id !== JSON.stringify(operationId) ||
+        receipt.status !== submission.status || receipt.input_id !== (submission.entry ?? null) ||
+        receipt.answer_id !== (submission.answer ?? null)) return unconfirmed;
+    if (submission.status === "unanswered" && submission.answer === undefined && typeof submission.reason === "string")
+      return { state: "unanswered", operationId };
+    const answerId = submission.answer;
+    if (submission.status !== "done" || !isEntryId(submission.entry) || !isEntryId(answerId) ||
+        submission.reason !== undefined || submission.detail !== undefined) return unconfirmed;
+    const owners = sql.exec(`SELECT submission_id FROM tenant_operation_replies
+      WHERE answer_id=? LIMIT 2`, answerId).toArray();
+    if (owners.length !== 1 || owners[0]?.submission_id !== row.id) return unconfirmed;
+    const answer = sql.exec(
+      "SELECT conversation_id, record FROM pi_entries WHERE id=?",
+      answerId,
+    ).toArray()[0];
+    if (answer?.conversation_id !== conversationId) return unconfirmed;
+    const entry = parseRecord(answer.record);
+    if (entry === null || entry.id !== answerId || entry.conversationId !== conversationId ||
+        !Array.isArray(entry.model)) return unconfirmed;
+    const message: unknown = entry.model[0];
+    if (typeof message !== "object" || message === null || !("role" in message) ||
+        message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
+      return unconfirmed;
+    // Settlement alone does not prove that the model supplied a complete answer.
+    if (!("stopReason" in message) || message.stopReason !== "stop") return unconfirmed;
+    let text = "";
+    for (const part of message.content as unknown[]) {
+      if (typeof part !== "object" || part === null || !("type" in part)) return unconfirmed;
+      if (part.type === "text") {
+        if (!("text" in part) || typeof part.text !== "string") return unconfirmed;
+        text += part.text;
+      } else if (part.type !== "thinking" && part.type !== "toolCall") return unconfirmed;
+    }
+    return text === "" ? unconfirmed : { state: "answered", operationId, text };
+  } catch {
+    return unconfirmed;
+  }
+}
+
+/** Whether the engine's submissions table exists; without it, none is held. */
+function hasSubmissions(sql: TaskSql): boolean {
+  const table = sql
+    .exec(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'",
+    )
+    .toArray()[0];
+  return table !== undefined;
+}
+
+/** One stored entry's pieces, or `null` when the row is absent or unreadable. */
+function entryData(sql: TaskSql, entryId: number): StoredEntryData | null {
+  const entry = record(sql, "pi_entries", entryId);
+  if (entry === null || !("kind" in entry)) return null;
+  return {
+    kind: entry.kind,
+    data: "data" in entry ? entry.data : undefined,
+    model: "model" in entry ? entry.model : undefined,
+  };
+}
+
+/**
+ * The text one input entry carries, when the engine stored exactly the user
+ * message a submission appends for its input: a single message of role `user`
+ * whose content is a plain string. A content list, no messages, or any other
+ * message shape is not that text, so this answers `null` and its caller refuses
+ * rather than reconstructing one.
+ */
+function entryText(model: unknown): string | null {
+  if (!Array.isArray(model) || model.length !== 1) return null;
+  const message: unknown = model[0];
+  if (typeof message !== "object" || message === null || Array.isArray(message))
+    return null;
+  if (!("role" in message) || !("content" in message)) return null;
+  if (message.role !== "user" || typeof message.content !== "string")
+    return null;
+  return message.content;
+}
+
+/**
+ * Whether a blocking compaction the run itself waited on ended in a terminal
+ * failure.
+ *
+ * Only a compaction the run waited on counts: the engine creates a blocking
+ * threshold compaction as a child of the generation that needs it, while a
+ * background one is conversation-owned and may fail while its concurrent
+ * generation still succeeds. The owning generation must also have settled —
+ * the child commits its outcome before the generation reads it and ends the
+ * run — so a read between those commits reports nothing yet.
+ *
+ * The message is the caller's own sentence: a failed compaction's stored error
+ * may carry provider prose, and this adapter never hands that out.
+ */
+/**
+ * CAD-2430: why a blocking compaction failed, read from the engine's own
+ * terminal outcome. A category only: the outcome's message can carry provider
+ * text, so it is matched against the engine's fixed sentences and never
+ * passed on.
+ */
+export type CompactionFailureReason =
+  | "output_limit"
+  | "interrupted"
+  | "no_model"
+  | "model_error"
+  | "unknown";
+
+function failureReason(outcome: Record<string, unknown>): CompactionFailureReason {
+  if (outcome.status !== "failed") return "unknown";
+  const error = outcome.error;
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return "unknown";
+  const { message, detail } = error as Record<string, unknown>;
+  const reason =
+    typeof detail === "object" && detail !== null && !Array.isArray(detail)
+      ? (detail as Record<string, unknown>).reason
+      : undefined;
+  if (reason === "restart_limit") return "interrupted";
+  if (reason === "no_model") return "no_model";
+  if (reason !== "model_error") return "unknown";
+  // The engine's own sentence for a summary that stopped at its output cap.
+  if (typeof message === "string" && message.startsWith("Summarization hit the token limit"))
+    return "output_limit";
+  return "model_error";
+}
+
+export function readCompactionFailure(
+  sql: TaskSql,
+  conversationId: number,
+): CompactionFailureReason | null {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return null;
+  try {
+    const rows = sql
+      .exec(
+        `SELECT id, record FROM pi_tasks
+          WHERE conversation_id = ? AND kind = '"pi.compaction"' AND status = 'terminal'
+          ORDER BY id DESC LIMIT 1`,
+        conversationId,
+      )
+      .toArray();
+    const row = rows[0];
+    if (row === undefined || !Number.isSafeInteger(row.id)) return null;
+    const id = Number(row.id);
+    // A record written after the failure — a placed summary, an answer, or the
+    // next input — means the failure belongs to history, not to the run on
+    // screen.
+    const latest = sql
+      .exec(`SELECT MAX(id) AS latest FROM pi_entries WHERE conversation_id = ?`, conversationId)
+      .toArray()[0]?.latest;
+    if (typeof latest === "number" && id <= latest) return null;
+    const record = parseRecord(row.record);
+    const owner = record?.owner;
+    if (!Number.isSafeInteger(owner)) return null;
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state)) return null;
+    const terminal = state as Record<string, unknown>;
+    if (terminal.status !== "terminal") return null;
+    const outcome = terminal.outcome;
+    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome)) return null;
+    const status = (outcome as Record<string, unknown>).status;
+    if (status !== "failed" && status !== "faulted" && status !== "orphaned") return null;
+    const parent = sql
+      .exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner as number)
+      .toArray()[0];
+    return parent === undefined || parent.status === "terminal"
+      ? failureReason(outcome as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** One stored `record` column's parsed JSON body, or `null` when it is not one. */
+function parseRecord(stored: unknown): Record<string, unknown> | null {
+  if (typeof stored !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+      return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One row's parsed `record`, or `null` when the row is absent or not a JSON
+ * object. A failed SQL read throws. The row's id is already known by the caller, so only the
+ * body is read.
+ */
+function record(
+  sql: TaskSql,
+  table: "pi_submissions" | "pi_entries",
+  id: number,
+): Record<string, unknown> | null {
+  // A failed read propagates: callers must not read it as an absent row.
+  const row = sql
+    .exec(`SELECT record FROM ${table} WHERE id=?`, id)
+    .toArray()[0];
+  if (row === undefined) return null;
+  return parseRecord(row.record);
+}

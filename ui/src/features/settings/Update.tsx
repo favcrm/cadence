@@ -163,11 +163,12 @@ export default function Update({
 
   const inactive =
     !!blocked || !status || !!readError || busy !== null || active || checking;
+  const report = status?.check ?? status?.check_with_unavailable_summary ?? null;
   const run = async (kind: "check" | "update") => {
     if (
       inactive ||
       action.current ||
-      (kind === "update" && (!status?.check || status.check.up_to_date))
+      (kind === "update" && (!report || report.up_to_date))
     )
       return;
     action.current = true;
@@ -201,7 +202,13 @@ export default function Update({
     }
   };
 
-  const report = status?.check;
+  const changes =
+    report?.changes_available === true &&
+    Array.isArray(report.changes) &&
+    typeof report.change_count === "number"
+      ? report.changes
+      : null;
+  const changeCount = changes === null ? null : (report?.change_count ?? null);
   const pending = status?.pending;
   const current = status?.current;
   const result =
@@ -253,9 +260,11 @@ export default function Update({
                   ? "No release check is available yet. Status refreshes automatically."
                   : report.up_to_date
                     ? "The latest approved release is installed."
-                    : report.change_count === 1
-                      ? "1 change since the installed release."
-                      : "{change_count} changes since the installed release.";
+                    : changeCount === null
+                      ? null
+                      : changeCount === 1
+                        ? "1 change since the installed release."
+                        : "{change_count} changes since the installed release.";
 
   return (
     <main className="update-workspace">
@@ -318,7 +327,7 @@ export default function Update({
           />
           <div>
             <h2>{t(stateTitle)}</h2>
-            <p>{t(stateText).replace("{phase}", () => String(phase ?? "")).replace("{change_count}", () => String(report?.change_count ?? ""))}</p>
+            {stateText !== null && <p>{t(stateText).replace("{phase}", () => String(phase ?? "")).replace("{change_count}", () => String(changeCount ?? ""))}</p>}
           </div>
         </div>
         <dl className="update-versions">
@@ -435,18 +444,20 @@ export default function Update({
           <summary>
             {t("What’s changed")}{" "}
             <span>
-              {report.change_count === 1 ? t("{change_count} change").replace("{change_count}", String(report.change_count)) : t("{change_count} changes").replace("{change_count}", String(report.change_count))}
+              {changeCount === null ? t("Unavailable") : changeCount === 1 ? t("{change_count} change").replace("{change_count}", String(changeCount)) : t("{change_count} changes").replace("{change_count}", String(changeCount))}
             </span>
           </summary>
           <div className="update-disclosure-body">
-            {report.changes.length ? (
+            {changes === null ? (
+              <p>{t("No change summary was provided by this check.")}</p>
+            ) : changes.length ? (
               <ul className="update-changes">
-                {report.changes.map((c, i) => (
+                {changes.map((c, i) => (
                   <li key={i}>{c}</li>
                 ))}
               </ul>
             ) : (
-              <p>{t("No change summary was provided by this check.")}</p>
+              <p>{t("No pull-request titles were recorded between these releases.")}</p>
             )}
           </div>
         </details>

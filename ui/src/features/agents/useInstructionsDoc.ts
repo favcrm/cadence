@@ -1,0 +1,464 @@
+import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
+import { api } from "../../lib/api";
+import { useTranslate } from "../../lib/localeText";
+import type { StoredAgentProfile } from "../../lib/types";
+import type { ToastMsg } from "../../ui/Toast";
+import {
+  checkHosted,
+  checkNative,
+  checkOwn,
+  classifyFailure,
+  isOwnKind,
+  ownUnsupported,
+  profileBody,
+  saveHosted,
+  saveNative,
+  saveOwn,
+  savedText,
+  stored,
+  type DocDeps,
+  type DocKind,
+  type DocOutcome,
+  type OwnDeps,
+  type OwnKind,
+  type OwnDoc,
+} from "./instructionsDoc";
+
+export const liveDeps: DocDeps = {
+  readProfile: async (id) => (await api.agentProfile(id)).profile,
+  writeProfile: async (id, body) => (await api.saveAgentProfile(id, body)).profile,
+  readNative: async (alias) => (await api.agent(alias)).agent.instructions ?? null,
+  writeNative: (alias, text) => api.setAgentInstructions(alias, text),
+};
+
+/** Both routes fence their own instructions. A Master write omits other
+ *  identity fields so separately edited name, tone and look are preserved. */
+export const liveOwnDeps: OwnDeps = {
+  read: async (kind) => {
+    const r = kind === "personal" ? await api.memberAssistInstructions() : await api.masterInstructions();
+    const tokens = r.built_in_instruction_tokens;
+    return {
+      text: r.instructions ?? "",
+      revision: r.revision,
+      ...(Number.isSafeInteger(tokens) && tokens! >= 0 ? { builtInInstructionTokens: tokens } : {}),
+    };
+  },
+  write: async (kind, base, text) => {
+    if (kind === "personal") {
+      const r = await api.memberAssistProfileUpdate({ expected_revision: Number(base.revision), action: "update", instructions: text });
+      // No revision in the answer means the save is not confirmed; a check reads it.
+      const revision = r.assistant?.identity?.revision;
+      if (typeof revision !== "number") throw new Error("The saved revision was not returned.");
+      return { text: stored(kind, text), revision };
+    }
+    const r = await api.masterIdentityUpdate({ expected_revision: String(base.revision), instructions: text });
+    return { text: stored(kind, text), revision: r.identity.revision };
+  },
+};
+
+export type DocPhase = "idle" | "saving" | "conflict" | "unconfirmed";
+
+/** What saving the profile's `skills` came to. Only "saved" changed the page. */
+export type SkillsOutcome =
+  | { kind: "saved" | "conflict" | "unconfirmed" | "busy" }
+  | { kind: "refused"; message: string };
+
+/** Where the caret was when the textarea last lost it, so Preview and a tab
+ *  trip give it back. */
+export interface DocSelection {
+  start: number;
+  end: number;
+  top: number;
+}
+
+/** Everything the Instructions section needs. It lives on the agent page so a
+ *  tab trip keeps the draft, the revision it started from and the caret. */
+export interface InstructionsDoc {
+  /** null: this agent's text is not edited through this document. */
+  kind: DocKind | null;
+  /** `unsupported`: the board predates the routes behind the Master's and the member's text. */
+  read: "idle" | "reading" | "failed" | "ready" | "unsupported";
+  /** The text the board holds, as of the last read or save. */
+  served: string | null;
+  builtInInstructionTokens?: number;
+  draft: string | null;
+  setDraft: (text: string | null) => void;
+  phase: DocPhase;
+  /** Hosted only: when and at which revision the stored text last changed. */
+  profile: StoredAgentProfile | null;
+  /** Native: what the last save said about when the agent reads it. */
+  applies: string | null;
+  /** What the busy phase is doing, so a read is not labelled "Saving". */
+  working: "save" | "check" | null;
+  selection: MutableRefObject<DocSelection>;
+  retry: () => void;
+  save: () => void;
+  saveMine: () => void;
+  useTheirs: () => void;
+  check: () => void;
+  discard: () => void;
+  /** Hosted: save the profile's `skills` at the revision this page holds,
+   *  keeping its stored text. A stale revision is never retried. */
+  saveSkills: (skills: string[]) => Promise<SkillsOutcome>;
+  /** Hosted: save the profile's opt-in `enabled_tools` the same way. */
+  saveEnabledTools: (enabledTools: string[]) => Promise<SkillsOutcome>;
+}
+
+export function useInstructionsDoc(opts: {
+  alias: string;
+  kind: DocKind | null;
+  /** Hosted: the profile id. */
+  profileId: string | null;
+  /** Native: what the agent detail served. */
+  nativeServed: string | null;
+  writable: boolean;
+  onSaved: () => void;
+  toast: (kind: ToastMsg["kind"], text: string) => void;
+  /** Substituted by tests. */
+  deps?: DocDeps;
+  ownDeps?: OwnDeps;
+}): InstructionsDoc {
+  const { alias, kind, profileId, nativeServed, writable, onSaved } = opts;
+  const deps = opts.deps ?? liveDeps;
+  const ownDeps = opts.ownDeps ?? liveOwnDeps;
+  const t = useTranslate();
+  const toast = useCallback((k: ToastMsg["kind"], text: string) => opts.toast(k, t(text)), [opts.toast, t]);
+  const [draft, setDraftState] = useState<string | null>(null);
+  const [phase, setPhase] = useState<DocPhase>("idle");
+  const [profile, setProfile] = useState<StoredAgentProfile | null>(null);
+  /** The board's profile as of the last 409: "Save mine" writes at its revision. */
+  const [theirs, setTheirs] = useState<StoredAgentProfile | null>(null);
+  /** CAD-2354: the Master's or the member's document, and the board's as of the last 409. */
+  const [own, setOwn] = useState<OwnDoc | null>(null);
+  const [theirsOwn, setTheirsOwn] = useState<OwnDoc | null>(null);
+  const [read, setRead] = useState<InstructionsDoc["read"]>("idle");
+  const [nativeSaved, setNativeSaved] = useState<string | null>(null);
+  const [applies, setApplies] = useState<string | null>(null);
+  const [retries, setRetries] = useState(0);
+  const [working, setWorking] = useState<"save" | "check" | null>(null);
+  const selection = useRef<DocSelection>({ start: 0, end: 0, top: 0 });
+  const busy = useRef(false);
+  /** The exact text a save sent, and the profile it was sent from. A check
+   *  judges THIS, never the draft as it stands now. */
+  const sent = useRef<{ text: string; base: StoredAgentProfile | null; own: OwnDoc | null } | null>(null);
+
+  useEffect(() => {
+    if (kind !== "hosted" || profileId === null) return;
+    let live = true;
+    setRead("reading");
+    deps
+      .readProfile(profileId)
+      .then((p) => {
+        if (!live) return;
+        setProfile(p);
+        setRead("ready");
+      })
+      .catch(() => live && setRead("failed"));
+    return () => {
+      live = false;
+    };
+  }, [kind, profileId, retries, deps]);
+
+  useEffect(() => {
+    if (!isOwnKind(kind)) return;
+    let live = true;
+    setRead("reading");
+    ownDeps
+      .read(kind)
+      .then((doc) => {
+        if (!live) return;
+        setOwn(doc);
+        setRead("ready");
+      })
+      .catch((error) => live && setRead(ownUnsupported(error) ? "unsupported" : "failed"));
+    return () => {
+      live = false;
+    };
+  }, [kind, retries, ownDeps]);
+
+  // A reload that shows our text means the override has done its job.
+  useEffect(() => {
+    if (nativeSaved !== null && nativeServed === nativeSaved) setNativeSaved(null);
+  }, [nativeServed, nativeSaved]);
+
+  const served = isOwnKind(kind)
+    ? (own?.text ?? null)
+    : kind === "hosted"
+      ? (profile?.responsibilities ?? null)
+      : (nativeSaved ?? nativeServed);
+  const state = kind === null ? "idle" : kind === "hosted" || isOwnKind(kind) ? read : served === null ? "idle" : "ready";
+
+  // A draft equal to the stored text is not a draft. Whitespace the board will
+  // trim stays: dropping it would eat a newline the person just typed.
+  useEffect(() => {
+    if (served !== null && draft === served && phase === "idle") setDraftState(null);
+  }, [served, draft, phase]);
+
+  const setDraft = useCallback((text: string | null) => setDraftState(text), []);
+
+  /** The board's text is ours now: clear the draft and the pending state. */
+  const adopt = useCallback(
+    (out: Extract<DocOutcome, { kind: "saved" }>) => {
+      if (out.own) {
+        setOwn(out.own);
+        setRead("ready");
+      } else if (out.profile) {
+        setProfile(out.profile);
+        setRead("ready");
+      } else setNativeSaved(out.text);
+      if (out.applies) setApplies(out.applies);
+      setTheirs(null);
+      setTheirsOwn(null);
+      setDraftState(null);
+      setPhase("idle");
+    },
+    [],
+  );
+
+  const settle = useCallback(
+    (out: DocOutcome, text: string, wasCheck: boolean) => {
+      if (kind === null) return;
+      switch (out.kind) {
+        case "saved":
+          adopt(out);
+          toast("ok", savedText(kind, out.applies, wasCheck, t));
+          if (!out.profile && !out.own) onSaved();
+          return;
+        case "conflict":
+          setTheirs(out.profile);
+          setTheirsOwn(out.own ?? null);
+          setPhase("conflict");
+          return;
+        case "unconfirmed":
+          setPhase("unconfirmed");
+          toast("warn", wasCheck ? "Still can’t reach the board. Your draft is kept." : "Not confirmed: the connection dropped. Check before saving again.");
+          return;
+        case "not_saved":
+          if (out.own) setOwn(out.own);
+          if (out.profile) setProfile(out.profile);
+          setPhase("idle");
+          setDraftState(text);
+          // A native read that found other text than the page holds: show it.
+          if (out.text != null && out.text !== served) {
+            setNativeSaved(out.text);
+            onSaved();
+            toast("warn", "The board holds a different version. Your draft is kept. Discard shows theirs; Save replaces it.");
+          } else toast("warn", "It did not save. Your draft is kept.");
+          return;
+        case "refused":
+          setPhase(phase === "conflict" ? "conflict" : "idle");
+          toast("err", out.message);
+      }
+    },
+    [kind, adopt, toast, t, onSaved, phase, served],
+  );
+
+  const run = useCallback(
+    async (job: () => Promise<DocOutcome>, text: string, base: StoredAgentProfile | null, baseOwn: OwnDoc | null, wasCheck = false) => {
+      if (busy.current) return;
+      busy.current = true;
+      if (!wasCheck) sent.current = { text, base, own: baseOwn };
+      setPhase("saving");
+      setWorking(wasCheck ? "check" : "save");
+      try {
+        settle(await job().catch((): DocOutcome => ({ kind: "unconfirmed" })), text, wasCheck);
+      } finally {
+        busy.current = false;
+        setWorking(null);
+      }
+    },
+    [settle],
+  );
+
+  /** Write one profile field at the revision this page holds. A stale
+   *  revision is never retried; a dropped answer is taken as saved only when a
+   *  read shows exactly this change on top of the page's revision. */
+  const saveProfileField = async (
+    body: (base: StoredAgentProfile) => object,
+    landed: (latest: StoredAgentProfile) => boolean,
+  ): Promise<SkillsOutcome> => {
+    if (!ready || kind !== "hosted" || !profile || busy.current) return { kind: "busy" };
+    busy.current = true;
+    const base = profile;
+    try {
+      setProfile(await deps.writeProfile(base.id, body(base)));
+      return { kind: "saved" };
+    } catch (error) {
+      const out = classifyFailure(error, "hosted");
+      if (out === "refused") return { kind: out, message: error instanceof Error ? error.message : String(error) };
+      if (out === "unconfirmed") {
+        const latest = await deps.readProfile(base.id).catch(() => null);
+        if (latest && latest.revision === base.revision + 1 && latest.responsibilities === base.responsibilities && landed(latest)) {
+          setProfile(latest);
+          return { kind: "saved" };
+        }
+      }
+      return { kind: out };
+    } finally {
+      busy.current = false;
+    }
+  };
+
+  const text = draft ?? served ?? "";
+  const ready = writable && kind !== null && state === "ready";
+
+  async function readOwnConflict(scope: OwnKind, adoptRead: (doc: OwnDoc) => void, error: string) {
+    if (busy.current) return;
+    busy.current = true;
+    setWorking("check");
+    try {
+      adoptRead(await ownDeps.read(scope));
+    } catch {
+      toast("err", error);
+    } finally {
+      busy.current = false;
+      setWorking(null);
+    }
+  }
+
+  const checkJob = (): (() => Promise<DocOutcome>) | null => {
+    const s = sent.current;
+    if (!s) return null;
+    if (isOwnKind(kind)) return s.own ? () => checkOwn(ownDeps, kind, s.own!, s.text) : null;
+    if (kind === "hosted") return s.base ? () => checkHosted(deps, s.base!, s.text) : null;
+    return () => checkNative(deps, alias, s.text);
+  };
+
+  return {
+    kind,
+    read: state,
+    served,
+    builtInInstructionTokens: isOwnKind(kind)
+      ? (phase === "conflict" && theirsOwn ? theirsOwn : own)?.builtInInstructionTokens
+      : undefined,
+    draft,
+    setDraft,
+    phase,
+    profile,
+    applies,
+    working,
+    selection,
+    retry: () => setRetries((n) => n + 1),
+    save: () => {
+      if (!ready || draft === null || phase !== "idle") return;
+      if (isOwnKind(kind)) {
+        if (own) void run(() => saveOwn(ownDeps, kind, own, draft), draft, null, own);
+      } else if (kind === "hosted") {
+        if (profile) void run(() => saveHosted(deps, profile, draft), draft, profile, null);
+      } else void run(() => saveNative(deps, alias, draft), draft, null, null);
+    },
+    saveMine: () => {
+      if (!ready || phase !== "conflict") return;
+      if (isOwnKind(kind)) {
+        if (theirsOwn) {
+          void run(() => saveOwn(ownDeps, kind, theirsOwn, text), text, null, theirsOwn);
+          return;
+        }
+        void readOwnConflict(kind, (doc) => {
+          setTheirsOwn(doc);
+          toast("warn", "Their version was read. Save mine again to write over it.");
+        }, "Could not read their version, so nothing was saved.");
+        return;
+      }
+      if (kind !== "hosted" || profileId === null) return;
+      if (theirs) {
+        void run(() => saveHosted(deps, theirs, text), text, theirs, null);
+        return;
+      }
+      // Their version was never read: read it now and let the person look
+      // before anything is written.
+      deps
+        .readProfile(profileId)
+        .then((p) => {
+          setTheirs(p);
+          toast("warn", "Their version was read. Save mine again to write over it.");
+        })
+        .catch(() => toast("err", "Could not read their version, so nothing was saved."));
+    },
+    useTheirs: () => {
+      if (isOwnKind(kind)) {
+        void readOwnConflict(kind, (doc) => {
+          setOwn(doc);
+          setTheirsOwn(null);
+          setDraftState(null);
+          setPhase("idle");
+          toast("ok", "Loaded their version. Your draft is discarded.");
+        }, "Could not read their version. Your draft is kept.");
+        return;
+      }
+      if (kind !== "hosted" || profileId === null || busy.current) return;
+      deps
+        .readProfile(profileId)
+        .then((p) => {
+          setProfile(p);
+          setTheirs(null);
+          setDraftState(null);
+          setPhase("idle");
+          toast("ok", "Loaded their version. Your draft is discarded.");
+        })
+        .catch(() => toast("err", "Could not read their version. Your draft is kept."));
+    },
+    check: () => {
+      const job = ready ? checkJob() : null;
+      if (job && sent.current) void run(job, sent.current.text, sent.current.base, sent.current.own, true);
+    },
+    saveSkills: (skills) =>
+      saveProfileField(
+        (base) => profileBody(base, base.responsibilities, base.revision, skills),
+        (latest) => latest.skills.join("\n") === skills.join("\n"),
+      ),
+    saveEnabledTools: (enabledTools) =>
+      saveProfileField(
+        (base) => profileBody(base, base.responsibilities, base.revision, base.skills, enabledTools),
+        (latest) => [...(latest.enabled_tools ?? [])].sort().join("\n") === [...enabledTools].sort().join("\n"),
+      ),
+    discard: () => {
+      if (phase !== "unconfirmed") {
+        setDraftState(null);
+        setTheirs(null);
+        setTheirsOwn(null);
+        setPhase("idle");
+        return;
+      }
+      // The last save may have landed: read before throwing the text away, and
+      // say what the board holds.
+      const job = ready ? checkJob() : null;
+      if (!job || busy.current) return;
+      busy.current = true;
+      setPhase("saving");
+      setWorking("check");
+      void job()
+        .catch((): DocOutcome => ({ kind: "unconfirmed" }))
+        .then((out) => {
+          if (out.kind === "saved") {
+            adopt(out);
+            toast("ok", "It did save, so the board holds your text.");
+            if (!out.profile && !out.own) onSaved();
+          } else if (out.kind === "unconfirmed") {
+            setPhase("unconfirmed");
+            toast("warn", "Still can’t reach the board, so nothing was discarded.");
+          } else {
+            if (out.kind !== "refused" && out.profile) setProfile(out.profile);
+            if (out.kind !== "refused" && out.own) setOwn(out.own);
+            const other = out.kind === "not_saved" && out.text != null && out.text !== served;
+            if (other) {
+              setNativeSaved(out.text as string);
+              onSaved();
+            }
+            setDraftState(null);
+            setPhase("idle");
+            toast(
+              "ok",
+              out.kind === "conflict" || other
+                ? "The board holds a different version, now shown. Your draft is discarded."
+                : "It did not save. The board’s current text is shown.",
+            );
+          }
+        })
+        .finally(() => {
+          busy.current = false;
+          setWorking(null);
+        });
+    },
+  };
+}

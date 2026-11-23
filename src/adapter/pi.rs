@@ -145,7 +145,7 @@ pub use pi_confine::{
     refuse_confined_devin_agent, worker_confined, CONFINE_WORKER_EXTRA_READ_ENV,
     CONFINE_WORKER_EXTRA_WRITE_ENV,
 };
-pub use pi_launch::{copy_pi_auth, pi_agent_home, pi_config_dir};
+pub use pi_launch::{copy_pi_auth, pi_config_dir};
 pub(crate) use pi_launch::{pi_master_env_scrub, pi_worker_env_scrub, resolve_pi_launch_command};
 
 /// Pi's display form of a provider HTTP error (`formatProviderError`):
@@ -372,6 +372,10 @@ pub struct PiAdapter {
     agent_uid: Option<u32>,
     /// CAD-1098: the tool profile the next `open` launches with.
     profile: Mutex<crate::master::Profile>,
+    /// CAD-1085: the closed caller identity of the attached owned console.
+    protected_caller: Mutex<Option<Arc<crate::protected_runtime::RuntimeCaller>>>,
+    /// CAD-1085: the stable agent uid whose owned runtime is attached.
+    protected_agent_uid: Mutex<Option<String>>,
     /// OMP mints its session path before creating the file on its first turn.
     pending_session_file: Mutex<Option<(String, String)>>,
 }
@@ -404,20 +408,20 @@ fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
 fn selected_model_admits_image(state: &Value) -> Result<()> {
     let Some((provider, id)) = pi_model_identity(state) else {
         return Err(Error::pre_write(
-            "Pi did not identify its selected model, so the attached library image was not sent. The model was left unchanged.",
+            "Pi did not identify its selected model, so the attached image was not sent. The model was left unchanged.",
         ));
     };
     let model = &state["model"];
     let Some(input) = model.get("input").and_then(Value::as_array) else {
         return Err(Error::pre_write(
-            "Pi did not report input modalities for the selected model, so the attached library image was not sent. The model was left unchanged.",
+            "Pi did not report input modalities for the selected model, so the attached image was not sent. The model was left unchanged.",
         ));
     };
     if input.iter().any(|item| item.as_str() == Some("image")) {
         return Ok(());
     }
     Err(Error::pre_write(format!(
-        "selected model {provider}/{id} admits no image input, so the attached library image was not sent. Choose a model whose reported input modalities include image; this model was left unchanged."
+        "selected model {provider}/{id} admits no image input, so the attached image was not sent. Choose a model whose reported input modalities include image; this model was left unchanged."
     )))
 }
 
@@ -472,6 +476,8 @@ impl PiAdapter {
                 .unwrap_or_else(|| PathBuf::from(".")),
             agent_uid,
             profile: Mutex::new(crate::master::Profile::Home),
+            protected_caller: Mutex::new(None),
+            protected_agent_uid: Mutex::new(None),
             pending_session_file: Mutex::new(None),
         }
     }
@@ -1113,18 +1119,23 @@ impl ProviderAdapter for PiAdapter {
     /// Pi silently falls back on an unsupported level.
     fn open(&self, agent: &Agent) -> Result<Identity> {
         refuse_confined_devin_agent(agent)?;
-        // CAD-1012: a split daemon (`agent_uid.is_some()`) launches Pi through
-        // the protected seam. The external prerequisites — sealed-helper pin,
-        // namespace policy, pre-start restore lineage — are unavailable this
-        // batch, so this refuses closed before any spawn is constructed. No
-        // guest boolean, restored marker, or refreshed flag satisfies it.
-        #[cfg(not(all(unix, target_os = "linux")))]
-        if self.agent_uid.is_some() {
+        // CAD-1085: when the reviewed root profile is active there is exactly
+        // one native launch path — the owner's measured OCI console. A missing
+        // coordinator/owner refuses; a host same-UID process is never a
+        // fallback. The older split seam (`agent_uid`) keeps its own refusal
+        // only for deployments without the reviewed profile.
+        let protected_profile = crate::protected_runtime::protected_profile_active();
+        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
+        if self.agent_uid.is_some() || protected_profile {
             super::pi_guest::protected_prereqs_satisfied()?;
-            return Err(Error::rejected("protected managed-Pi launch is Linux-only"));
+            return Err(Error::rejected(
+                "protected managed-Pi launch requires Linux x86_64",
+            ));
         }
-        #[cfg(all(unix, target_os = "linux"))]
-        let protected = if let Some(uid) = self.agent_uid {
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+        let protected = if protected_profile {
+            None
+        } else if let Some(uid) = self.agent_uid {
             let generation = Uuid::new_v4().simple().to_string();
             Some(super::pi_guest::GuestCtx::establish(
                 agent,
@@ -1160,12 +1171,25 @@ impl ProviderAdapter for PiAdapter {
             if master { "master" } else { "worker" },
             want,
         )?;
+        // CAD-1085: open the owned console before the transport exists so the
+        // adapter's generation tag is the measured runtime's, and so a failed
+        // bootstrap refuses before any prompt state is touched.
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+        let mut protected_console = if protected_profile {
+            let provider = crate::daemon::protected_runtime::console_provider()?;
+            Some(provider.open_console(
+                crate::daemon::protected_runtime::ConsoleSubject {
+                    alias: &agent.alias,
+                    agent_uid: &agent.uid,
+                    created: agent.created,
+                },
+                &self.log_path,
+            )?)
+        } else {
+            None
+        };
         self.shared.master.store(master, Ordering::SeqCst);
-        self.shared
-            .omp
-            .store(agent.provider == "omp", Ordering::SeqCst);
-        *self.shared.omp_prompt.lock().unwrap() = None;
-        if master && self.agent_uid.is_none() {
+        if master && self.agent_uid.is_none() && !protected_profile {
             let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
             write_pi_guard(
                 &self.state_dir,
@@ -1174,12 +1198,12 @@ impl ProviderAdapter for PiAdapter {
             )?;
         }
         self.shared.guard_ready.store(false, Ordering::SeqCst);
-        let guard_path = if self.agent_uid.is_none() {
+        let guard_path = if self.agent_uid.is_none() && !protected_profile {
             Some(write_pi_turn_guard(&self.state_dir, &agent.alias)?.canonicalize()?)
         } else {
             None
         }; // Immutable protected guard/graph policy is not elected here.
-        let (command, confinement) = if self.agent_uid.is_none() {
+        let (command, confinement) = if self.agent_uid.is_none() && !protected_profile {
             launch_command(&self.env, &self.state_dir, agent)?
         } else {
             (vec!["cadence-protected-fd-exec-only".into()], None)
@@ -1188,15 +1212,22 @@ impl ProviderAdapter for PiAdapter {
             let role = if master { "master" } else { "worker" };
             self.log_confinement(role, policy)?;
         }
-        #[cfg(all(unix, target_os = "linux"))]
-        let generation = protected
-            .as_ref()
-            .map(|ctx| ctx.segments().generation_hex())
-            .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string());
-        #[cfg(not(all(unix, target_os = "linux")))]
+        #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+        let generation = if let Some(console) = protected_console.as_ref() {
+            console.generation_tag.clone()
+        } else {
+            protected
+                .as_ref()
+                .map(|ctx| ctx.segments().generation_hex())
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string()[..12].to_string())
+        };
+        #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
+        // A master carries no role pin (an empty role is never a review); the
+        // worker branch below replaces this with the role's environment.
+        let mut role_env = super::reviewer_gh_env(&self.env, "", &self.state_dir)?;
         let mut env = if self.agent_uid.is_none() {
             let mut env = vec![
                 ("CADENCE_ALIAS".to_string(), agent.alias.clone()),
@@ -1301,6 +1332,16 @@ impl ProviderAdapter for PiAdapter {
                     config.to_string_lossy().to_string(),
                 ));
                 env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+                // CAD-844: a reviewer keeps HOME, so without this `gh` would
+                // read the operator's saved login and could post with their
+                // account. Pin a private, empty gh config instead; a read-only
+                // token, when the operator provisions one, is a separate input.
+                role_env = pi_launch::reviewer_gh_env(
+                    &self.env,
+                    &agent.role,
+                    &self.state_dir,
+                    &agent.alias,
+                )?;
                 if confinement.is_some() {
                     // CAD-556: under Landlock the daemon's TMPDIR may be a
                     // shared root — the worker gets its own so `mktemp`
@@ -1347,17 +1388,23 @@ impl ProviderAdapter for PiAdapter {
         *self.transport.write().unwrap() = Arc::clone(&transport);
         let workdir = launch_workdir(agent).to_string_lossy().into_owned();
         let initialized = (|| {
-            #[cfg(all(unix, target_os = "linux"))]
-            let pid = match protected {
-                Some(ctx) => {
-                    let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
-                        .map_err(Error::rejected)?;
-                    transport.launch_protected(ctx, &routing, &self.log_path)?
+            #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+            let pid = if let Some(console) = protected_console.take() {
+                *self.protected_caller.lock().unwrap() = Some(Arc::new(console.caller));
+                *self.protected_agent_uid.lock().unwrap() = Some(agent.uid.clone());
+                transport.adopt_console(console.console)?
+            } else {
+                match protected {
+                    Some(ctx) => {
+                        let routing = crate::protected_pi_profile::Routing::for_agent(master, want)
+                            .map_err(Error::rejected)?;
+                        transport.launch_protected(ctx, &routing, &self.log_path)?
+                    }
+                    None => transport.launch(&workdir, &self.log_path, &env, &role_env)?,
                 }
-                None => transport.launch(&workdir, &self.log_path, &env)?,
             };
-            #[cfg(not(all(unix, target_os = "linux")))]
-            let pid = transport.launch(&workdir, &self.log_path, &env)?;
+            #[cfg(not(all(unix, target_os = "linux", target_arch = "x86_64")))]
+            let pid = transport.launch(&workdir, &self.log_path, &env, &role_env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.
             if let Some(effort) = params.get("effort").and_then(Value::as_str) {
@@ -1391,36 +1438,54 @@ impl ProviderAdapter for PiAdapter {
             }
             // An old/mocked runtime may not support the extension commands.
             // Ordinary queued turns remain compatible; native input is disabled.
+            let commands_data = self.checked("get_commands", json!({})).ok();
             let guard_ready = guard_path.is_some()
-                && self
-                    .checked("get_commands", json!({}))
-                    .ok()
-                    .is_some_and(|data| {
-                        data.get("commands")
-                            .and_then(Value::as_array)
-                            .is_some_and(|commands| {
-                                [
-                                    "cadence-bind-turn",
-                                    "cadence-steer-turn",
-                                    "cadence-abandon-turn",
-                                ]
-                                .iter()
-                                .all(|name| {
-                                    commands.iter().any(|command| {
-                                        command.get("name").and_then(Value::as_str) == Some(*name)
-                                            && command.get("source").and_then(Value::as_str)
-                                                == Some("extension")
-                                            && command
-                                                .pointer("/sourceInfo/path")
-                                                .and_then(Value::as_str)
-                                                == guard_path
-                                                    .as_ref()
-                                                    .and_then(|path| path.to_str())
-                                    })
+                && commands_data.as_ref().is_some_and(|data| {
+                    data.get("commands")
+                        .and_then(Value::as_array)
+                        .is_some_and(|commands| {
+                            [
+                                "cadence-bind-turn",
+                                "cadence-steer-turn",
+                                "cadence-abandon-turn",
+                            ]
+                            .iter()
+                            .all(|name| {
+                                commands.iter().any(|command| {
+                                    command.get("name").and_then(Value::as_str) == Some(*name)
+                                        && command.get("source").and_then(Value::as_str)
+                                            == Some("extension")
+                                        && command
+                                            .pointer("/sourceInfo/path")
+                                            .and_then(Value::as_str)
+                                            == guard_path.as_ref().and_then(|path| path.to_str())
                                 })
                             })
-                    });
+                        })
+                });
             self.shared.guard_ready.store(guard_ready, Ordering::SeqCst);
+            // CAD-2092: loaded skill evidence comes strictly from what the
+            // runtime reports in `get_commands`, never from installed files.
+            if let Some(commands) = commands_data
+                .as_ref()
+                .and_then(|data| data.get("commands"))
+                .and_then(Value::as_array)
+            {
+                let mut loaded: Vec<String> = Vec::new();
+                for command in commands {
+                    if command.get("source").and_then(Value::as_str) != Some("skill") {
+                        continue;
+                    }
+                    if let Some(raw) = command.get("name").and_then(Value::as_str) {
+                        let name = raw.strip_prefix("skill:").unwrap_or(raw).to_string();
+                        if !name.is_empty() && !loaded.contains(&name) {
+                            loaded.push(name);
+                        }
+                    }
+                }
+                self.shared
+                    .emit("cadence/skills_loaded", &json!({ "skills": loaded }));
+            }
             let state = self.request("get_state", json!({}))?;
             if state.get("success").and_then(Value::as_bool) != Some(true) {
                 return Err(self.command_error("get_state", &state));
@@ -1527,8 +1592,8 @@ impl ProviderAdapter for PiAdapter {
         }
         let mut encoded = Vec::with_capacity(images.len());
         for image in images {
-            if image.bytes.len() > 4 * 1024 * 1024
-                || !matches!(image.media_type, "image/png" | "image/jpeg" | "image/webp")
+            if image.bytes.len() > crate::attachment_image::IMAGE_MAX_BYTES
+                || !crate::attachment_image::raster_mime(image.media_type)
             {
                 return Err(Error::pre_write(
                     "retained image is outside the native prompt bound, so it was not sent",
@@ -1545,6 +1610,15 @@ impl ProviderAdapter for PiAdapter {
         }
         *self.shared.turn_images.lock().unwrap() = encoded;
         Ok(())
+    }
+
+    fn preflight_turn_images(&self) -> Result<()> {
+        let state = self.checked("get_state", json!({})).map_err(|e| {
+            Error::rejected(format!(
+                "the selected model's image input support cannot be verified before send: {e}"
+            ))
+        })?;
+        selected_model_admits_image(&state).map_err(|e| Error::rejected(e.to_string()))
     }
 
     /// One durable message → one `prompt` command → provider settlement.
@@ -1565,7 +1639,7 @@ impl ProviderAdapter for PiAdapter {
         &self,
         prompt: &str,
         slot: Option<&str>,
-        _client_message_id: &str,
+        client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         if !self.shared.turn_images.lock().unwrap().is_empty() {
@@ -1583,6 +1657,10 @@ impl ProviderAdapter for PiAdapter {
         }
         let generation = self.shared.generation.lock().unwrap().clone();
         let turn_id = registry::PI_MANAGED_TURN_TOKENS.mint(&generation);
+        // CAD-1085 r7: bind the durable server-owned model task BEFORE any
+        // prompt frame. No authority comes from prompt text or task args; the
+        // guard is held for the turn and fences on drop/settle/interrupt.
+        let _native_task = self.bind_native_task(client_message_id, &turn_id)?;
         let prompt = &super::with_turn_token(prompt, slot, &turn_id);
         *self.shared.interrupt_at.lock().unwrap() = None;
         // A settled-but-unconsumed turn is stale — it belongs to a
@@ -1902,16 +1980,45 @@ impl ProviderAdapter for PiAdapter {
     fn close(&self) {
         let transport = self.transport.read().unwrap().clone();
         transport.close_stdin();
+        // A console attachment has no local child; its reader thread observes
+        // EOF once the owner closes the console.
         transport.wait_exit(Duration::from_secs(3));
         transport.close();
         self.persist_pending_session_file();
         self.shared.on_disconnect();
+        // CAD-1085: detach first, then stop exactly this agent's owned runtime.
+        let attached = self.protected_caller.lock().unwrap().take();
+        let uid = self.protected_agent_uid.lock().unwrap().take();
+        if attached.is_some() {
+            if let (Some(uid), Ok(provider)) =
+                (uid, crate::daemon::protected_runtime::console_provider())
+            {
+                provider.stop_agent(&uid, "agent closed");
+            }
+        }
     }
 }
 
-#[cfg(test)]
-#[path = "pi/cad1195_acceptance.rs"]
-mod cad1195_acceptance;
+impl PiAdapter {
+    /// Bind the durable model task before a protected turn's prompt.
+    fn bind_native_task(
+        &self,
+        client_message_id: &str,
+        turn_token: &str,
+    ) -> Result<Option<Box<dyn crate::daemon::protected_runtime::NativeTaskGuard>>> {
+        let Some(caller) = self.protected_caller.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let provider = crate::daemon::protected_runtime::console_provider()?;
+        Ok(Some(provider.bind_native_task(
+            &caller,
+            client_message_id,
+            client_message_id,
+            turn_token,
+        )?))
+    }
+}
+
 #[cfg(all(test, debug_assertions, unix))]
 mod cad1553_company_authority_acceptance {
     use super::*;
@@ -2421,6 +2528,7 @@ for raw in sys.stdin:
                         commands.to_string_lossy().to_string(),
                     ),
                 ],
+                &crate::adapter::reviewer_gh_env(&env, "worker", dir.path()).unwrap(),
             )
             .unwrap();
         *adapter.transport.write().unwrap() = transport;
@@ -2656,8 +2764,66 @@ mod cad1814_tests {
         event(shared, "session_settled", json!({}));
         assert!(shared.outcomes.lock().unwrap().is_empty());
     }
-}
 
-#[cfg(test)]
-#[path = "pi_omp_acceptance.rs"]
-mod cad1814_independent_acceptance;
+    #[test]
+    fn cad2092_pi_worker_command_exposes_only_selected_skills_and_filters_disabled_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("s");
+        std::fs::create_dir_all(&state).unwrap();
+        let env = ProviderEnv::refusing_providers();
+        env.set("HOME", root.path().to_str().unwrap());
+        env.set("CADENCE_PI_COMMAND", "/bin/false");
+        let agent = Agent {
+            alias: "worker-skills".into(),
+            uid: "agt-cad2092".into(),
+            provider: "pi".into(),
+            endpoint_kind: "managed".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: root.path().to_string_lossy().to_string(),
+            sandbox: "workspace-write".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            pid_start: None,
+            endpoint: None,
+            params: Some(json!({
+                "skills": ["cadence", "deliverable-qa"],
+                "disabled_tools": ["write", "edit"],
+            })),
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "idle".into(),
+            enabled: true,
+            gc_keep: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
+            lifecycle_rev: 0,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let cmd = build_command(&env, &agent, &state).unwrap();
+        assert!(cmd.iter().any(|a| a == "--no-skills"));
+        let skills: Vec<&str> = cmd
+            .windows(2)
+            .filter(|w| w[0] == "--skill")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(skills.len(), 2, "only selected skills passed: {skills:?}");
+        assert!(skills[0].ends_with("agents/worker-skills/skills/cadence"));
+        assert!(skills[1].ends_with("agents/worker-skills/skills/deliverable-qa"));
+        let tools = cmd
+            .windows(2)
+            .find(|w| w[0] == "--tools")
+            .map(|w| w[1].as_str())
+            .expect("--tools present");
+        assert!(tools.contains("read") && tools.contains("bash"));
+        assert!(!tools.contains("write") && !tools.contains("edit"));
+    }
+}

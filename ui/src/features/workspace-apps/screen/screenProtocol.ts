@@ -46,11 +46,20 @@ export interface ScreenInit {
 
 /** The only messages the child may ever send over the port. Anything
  *  else closes the port. `state` is the child's opaque draft snapshot
- *  (≤ 32 KiB string), held host-side in memory only; `asset` is screen.v2. */
+ *  (≤ 32 KiB string), held host-side in memory only; `leave` and `asset`
+ *  are screen.v2. */
+export type WhatsAppComposeProvider = "linked" | "official";
 export type ChildToHost =
   | { v: 1; op: "ready"; accepts?: Accept[] | [typeof CHAT_DIRECTIVE_V1] }
   | { v: 1; op: "state"; data: string }
+  | { v: 2; op: "leave"; unsaved: boolean }
   | { v: 2; op: "asset"; ref: string }
+  | { v: 2; op: "whatsapp-compose"; conversation_id: string | null; provider?: WhatsAppComposeProvider }
+  | { v: 2; op: "whatsapp-reply-layout"; nomination: number; bounds: WhatsAppReplyBounds | null }
+  | { v: 2; op: "whatsapp-reply-inset-ready"; nomination: number; seq: number; px: number }
+  | WhatsAppMediaRequest
+  | AudioRequest
+  | AudioSessionRequest
   | CallRequest
   | SlotRequest
   | ToolRequest;
@@ -70,42 +79,124 @@ export type ScreenPresentation = { v: 1; op: "presentation"; mode: ScreenPresent
  *  frame: a ready opt-in and call arguments cannot choose it. `modal` is
  *  the frame's own overlay state — a primary is modal while its child
  *  drawer is open; a drawer hosts no further overlay. */
-export type ScreenSurfaceRole = "primary" | "drawer";
-export type ScreenSurface = { v: 1; op: "surface"; role: ScreenSurfaceRole; modal: boolean };
+export type ScreenSurfaceRole = "primary" | "drawer" | "canvas";
+/** CAD-2525 — `canvas` (the chat canvas's app view) and `readOnly: true` (the
+ *  mount may only read) are sent only to a frame that advertised
+ *  `screen-canvas.v1`; any other frame is told `primary` with no `readOnly`,
+ *  exactly as before. */
+export type ScreenSurface = { v: 1; op: "surface"; role: ScreenSurfaceRole; modal: boolean; surface?: string; readOnly?: true };
 
 /** CAD-1777 — the two host-local presentation verbs. They are UI
- *  capabilities of the shell (which surface this frame's geometry shows
- *  in), never records operations or authority grants: a records frame is
- *  admitted to them only when it negotiated `screen-presentation.v1`, the
- *  live shell lends a drawer callback, and the frame has an action host. */
+ *  in), never records operations or authority grants: a screen.v2 frame
+ *  (CAD-1932: records or not) is admitted to them only when it negotiated
+ *  `screen-presentation.v1` or `screen-surfaces.v1`, the live shell lends a
+ *  drawer callback, and the frame has an action host. */
 export const SCREEN_DRAWER_OPEN = "screen.drawer.open" as const;
 export const SCREEN_DRAWER_CLOSE = "screen.drawer.close" as const;
+/** SOC-55 — the drawer child's host-local read of the bounded context the
+ *  primary passed to its open. It is never a backend/capability verb. */
+export const SCREEN_DRAWER_CONTEXT = "screen.drawer.context" as const;
 export const SCREEN_DRAWER_VERBS = [SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE] as const;
-export type ScreenDrawerVerb = (typeof SCREEN_DRAWER_VERBS)[number];
+/** A drawer child may close itself and read its own open context, never
+ *  open another drawer. */
+export const SCREEN_DRAWER_CHILD_VERBS = [SCREEN_DRAWER_CLOSE, SCREEN_DRAWER_CONTEXT] as const;
+export type ScreenDrawerVerb = (typeof SCREEN_DRAWER_OPEN) | (typeof SCREEN_DRAWER_CLOSE) | (typeof SCREEN_DRAWER_CONTEXT);
 export const isScreenDrawerVerb = (verb: string): verb is ScreenDrawerVerb =>
-  (SCREEN_DRAWER_VERBS as readonly string[]).includes(verb);
+  verb === SCREEN_DRAWER_OPEN || verb === SCREEN_DRAWER_CLOSE || verb === SCREEN_DRAWER_CONTEXT;
 /** The closed surface idiom a drawer request may name. */
 export const DRAWER_SURFACE = /^[a-z0-9_-]{1,64}$/;
+/** A host-owned, data-free hint to the PRIMARY app frame: a social source save
+ *  it did not see left its source settings stale. It carries no id, value or
+ *  authority — the frame re-reads through its own normal authorized verbs — and
+ *  a frame (or app version) that does not know it ignores it. */
+export const SOCIAL_SOURCES_INVALIDATED = "cadence-social-sources-invalidated";
+/** SOC-55 — the bounded, non-authoritative context a primary may hand to its
+ *  own host-created drawer child. It is plain JSON and never a capability. */
+export const DRAWER_CONTEXT_BYTES = 1024;
+export function drawerContextBytes(value: unknown): number | null {
+  // MessagePort accepts structured-clone values that JSON.stringify silently
+  // drops or converts. Reject them before measuring or retaining the context.
+  const ancestors = new Set<object>();
+  let remaining = DRAWER_CONTEXT_BYTES;
+  const plainJson = (item: unknown): boolean => {
+    if (--remaining < 0) return false;
+    if (item === null || typeof item === "boolean") return true;
+    if (typeof item === "string") return item.length <= DRAWER_CONTEXT_BYTES;
+    if (typeof item === "number") return Number.isFinite(item);
+    if (typeof item !== "object" || ancestors.has(item)) return false;
+    const array = Array.isArray(item);
+    const prototype = Object.getPrototypeOf(item);
+    if (!array && prototype !== Object.prototype && prototype !== null) return false;
+    if (array && item.length > DRAWER_CONTEXT_BYTES) return false;
+    ancestors.add(item);
+    let valid = true;
+    if (array) {
+      for (const child of item) if (!plainJson(child)) { valid = false; break; }
+    } else {
+      for (const key in item) {
+        if (Object.hasOwn(item, key) && (key.length > DRAWER_CONTEXT_BYTES || !plainJson((item as Record<string, unknown>)[key]))) {
+          valid = false;
+          break;
+        }
+      }
+    }
+    ancestors.delete(item);
+    return valid;
+  };
+  try {
+    if (!plainJson(value)) return null;
+    const text = JSON.stringify(value);
+    return typeof text === "string" ? new TextEncoder().encode(text).byteLength : null;
+  } catch { return null; }
+}
+/** CAD-1932 — the closed panel widths an open may ask for. `narrow` is the
+ *  default; `wide` fits a draft editor. The shell owns the pixels. */
+export type ScreenDrawerSize = "narrow" | "wide";
 /** What a validated drawer request asks the shell to do. */
-export type ScreenDrawerRequest = { mode: "drawer"; surface: string } | { mode: "outlet" };
+export type ScreenDrawerRequest =
+  | { mode: "drawer"; surface: string; size?: ScreenDrawerSize; context?: unknown }
+  | { mode: "context" }
+  | { mode: "outlet" };
 /** Parse one drawer request's EXACT arguments, or `null` when they are not
- *  the closed shape (`{surface}` for open, `{}` for close). The host's
- *  argument guard and the records dispatch share this one parser, so a
- *  malformed request can never change geometry on either path. */
+ *  the closed shape (`{surface, size?, context?}` for open, `{}` for close or
+ *  the child's context read). The host's argument guard and the records
+ *  dispatch share this one parser, so a malformed request — an unknown size
+ *  or an unbounded context included — can never change geometry. */
 export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs): ScreenDrawerRequest | null {
   if (verb === SCREEN_DRAWER_OPEN) {
-    if (Object.keys(args).sort().join() !== "surface" || typeof args.surface !== "string" || !DRAWER_SURFACE.test(args.surface)) return null;
-    return { mode: "drawer", surface: args.surface };
+    const keys = Object.keys(args).sort().join();
+    if (!["surface", "size,surface", "context,surface", "context,size,surface"].includes(keys) ||
+        typeof args.surface !== "string" || !DRAWER_SURFACE.test(args.surface)) return null;
+    let context: unknown;
+    if ("context" in args) {
+      const bytes = drawerContextBytes(args.context);
+      if (bytes === null || bytes > DRAWER_CONTEXT_BYTES) return null;
+      // Retain only the measured JSON, detached from the incoming message.
+      try { context = JSON.parse(JSON.stringify(args.context)); } catch { return null; }
+    }
+    if (!("size" in args)) return context === undefined
+      ? { mode: "drawer", surface: args.surface }
+      : { mode: "drawer", surface: args.surface, context };
+    if (args.size !== "narrow" && args.size !== "wide") return null;
+    return context === undefined
+      ? { mode: "drawer", surface: args.surface, size: args.size }
+      : { mode: "drawer", surface: args.surface, size: args.size, context };
   }
+  if (verb === SCREEN_DRAWER_CONTEXT) return Object.keys(args).length === 0 ? { mode: "context" } : null;
   return Object.keys(args).length === 0 ? { mode: "outlet" } : null;
 }
 
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
- *  port. `call` verbs never spend or publish; every spend or publish verb is a
- *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
- *  verbs arrive with HP4: add them here and in the host's dispatch table. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "media.read", "media.publish", "media.chat.attach"] as const;
-export const SLOT_VERBS = ["run.start", "publish.destination.use", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "publish.settings.save", "media.original.download", "social.image.pick"] as const;
+ *  port. `call` verbs run directly: the install's own config and drafts, and
+ *  (CAD-1918, operator decision) the app's own publish confirmation and
+ *  schedule — the human's press inside the app is the one approval, bound by
+ *  the operator session, the host-held action token and the install-bound
+ *  stored effect. `slot` verbs wait for a tap on a host-drawn button: a run
+ *  start, the original download and the image picker. Confirm and schedule
+ *  also stay slot verbs until every installed app sends them as calls
+ *  (Social Content 0.12.10 still sends slots). */
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "screen.drawer.context", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.page", "social.sources.get", "social.sources.save", "social.destinations.list", "publish.consent.status", "publish.destination.use", "publish.destination.remove", "publish.settings.save", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "media.read", "media.publish", "media.import", "media.chat.attach"] as const;
+export const SLOT_VERBS = ["run.start", "publish.draft.confirm", "publish.draft.schedule", "publish.consent.allow", "media.original.download", "social.image.pick"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
 export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;
@@ -113,31 +204,258 @@ export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;
  *  envelope but are NEVER in the generic advertised set: they are
  *  appended per-mount, only to a media-opted-in child whose minted
  *  receipt declares them. */
-export const MEDIA_VERBS = ["media.read", "media.publish", "media.chat.attach"] as const;
+export const MEDIA_VERBS = ["media.read", "media.publish", "media.import", "media.chat.attach"] as const;
 export type MediaVerb = (typeof MEDIA_VERBS)[number];
 export const isMediaVerb = (verb: string): verb is MediaVerb =>
   (MEDIA_VERBS as readonly string[]).includes(verb);
 /** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
  *  deliberately absent; the channel appends a mount's declared media
  *  rights itself. */
-export const ACTION_VERBS: string[] = [...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v)), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)];
-export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "smtp.show", "origin.show", "campaign-work.show", "campaign-work.save", "screen.preview.show", "screen.preview.clear", "screen.route.patch", "whatsapp.status", "whatsapp.connect_session", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.prepare", "whatsapp.reply.status", "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.prepare", "whatsapp.template.status", "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate", "whatsapp.broadcast.results", "whatsapp.broadcast.draft", "whatsapp.broadcast.test.prepare", "whatsapp.broadcast.prepare", "whatsapp.handoff.set", "chat.whatsapp.open", "whatsapp.draft.show", "whatsapp.draft.discard", "works.query", "works.get", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review"] as const;
-export const RECORD_SLOT_VERBS = ["records.csv.import", "records.csv.confirm", "content.approve", "smtp.manage", "smtp.bind", "smtp.rebind", "smtp.revoke", "smtp.test-send", "sends.approve", "sends.resolve", "origin.manage", "chat.campaign.open", "chat.campaign.brief", "whatsapp.reply.send", "whatsapp.template.send", "whatsapp.broadcast.test.send", "whatsapp.broadcast.send", "whatsapp.broadcast.stop", "whatsapp.handoff.release", "chat.whatsapp.brief", "works.review", "works.export"] as const;
+export const ACTION_VERBS: string[] = [...new Set([...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v) && v !== SCREEN_DRAWER_CONTEXT), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)])];
+export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "records.batch", "records.aggregate", "records.merge", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "sends.cancel", "smtp.show", "origin.show", "campaign-work.show", "campaign-work.save", "screen.preview.show", "screen.preview.clear", "screen.route.patch", "whatsapp.status", "whatsapp.connect_session", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.prepare", "whatsapp.reply.status", "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.prepare", "whatsapp.template.status", "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate", "whatsapp.broadcast.results", "whatsapp.broadcast.draft", "whatsapp.broadcast.test.prepare", "whatsapp.broadcast.prepare", "whatsapp.handoff.set", "chat.whatsapp.open", "whatsapp.draft.show", "whatsapp.draft.discard", "works.query", "works.get", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review", "calendar.query", "routines.list", "connections.assets", "catalog.call", "catalog.status"] as const;
+export const RECORD_SLOT_VERBS = ["records.csv.import", "records.csv.confirm", "content.approve", "smtp.manage", "smtp.bind", "smtp.rebind", "smtp.revoke", "smtp.test-send", "sends.approve", "sends.resolve", "origin.manage", "chat.campaign.open", "chat.campaign.brief", "whatsapp.reply.send", "whatsapp.template.send", "whatsapp.broadcast.test.send", "whatsapp.broadcast.send", "whatsapp.broadcast.stop", "whatsapp.handoff.release", "chat.whatsapp.brief", "works.review", "works.export", "catalog.confirm"] as const;
 export const RECORD_OPERATIONS: readonly string[] = [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
 export type RecordCallVerb = (typeof RECORD_CALL_VERBS)[number];
 export type RecordSlotVerb = (typeof RECORD_SLOT_VERBS)[number];
 export type CallVerb = (typeof CALL_VERBS)[number] | RecordCallVerb;
 export type SlotVerb = (typeof SLOT_VERBS)[number] | RecordSlotVerb;
-export interface ScreenNavigation { section_query: string; default_section: string; sections: { id: string; label: string }[] }
-export interface ScreenRoute { section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null }
+export interface ScreenSectionI18n { label: string }
+export interface ScreenSection { id: string; label: string; i18n?: Record<string, ScreenSectionI18n> }
+export interface ScreenNavigation { section_query: string; default_section: string; sections: ScreenSection[] }
+export interface ScreenRoute {
+  section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null;
+  /** CAD-2555 — a declared view's params (name → plain text). Sent only to a frame that opted into `screen-route-params.v1`; absent when none. */
+  params?: Record<string, string>;
+}
 export interface ReadObservation { operation: string; args: ActionArgs; data: unknown }
 export const SCREEN_RECORDS_V1 = "screen-records.v1";
-/** CRM presentation data only; never an operation or permission. */
-export const CRM_LOCALE_V1 = "crm-locale.v1";
+/** Host-selected presentation locale only (`"en" | "zh-TW"`); never an operation or permission. */
+export const SCREEN_LOCALE_V1 = "screen-locale.v1";
+/** Selects an existing thread for a board-owned composer, not a service verb. */
+export const SCREEN_WHATSAPP_COMPOSE_V1 = "screen-whatsapp-compose.v1";
+export const WHATSAPP_COMPOSE_HASH = "#cadence-whatsapp-compose-v1";
+/** Presentation-only feedback. The original selector and dirty/refresh messages are unchanged. */
+export const SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 = "screen-whatsapp-reply-availability.v1";
+export type WhatsAppReplyAvailability = "checking" | "blocked" | "verified";
+/** Presentation-only: physical left/right edges in basis points of the iframe width. */
+export const SCREEN_WHATSAPP_REPLY_LAYOUT_V1 = "screen-whatsapp-reply-layout.v1";
+/** Same bounds, with the host dock over the pane and a measured bottom inset returned to the frame. */
+export const SCREEN_WHATSAPP_REPLY_LAYOUT_V2 = "screen-whatsapp-reply-layout.v2";
+export const WHATSAPP_REPLY_INSET_MAX = 512;
+export type WhatsAppReplyBounds = [left: number, right: number];
+const LINKED_WHATSAPP_CHAT = /^[A-Za-z0-9._:-]{1,128}@(s\.whatsapp\.net|lid|g\.us)$/;
+const OFFICIAL_WHATSAPP_CHAT = /^[A-Za-z0-9._:@-]{1,128}$/;
+/** Bounded inbound WhatsApp media download bridge (`screen-whatsapp-media.v1`). */
+export const SCREEN_WHATSAPP_MEDIA_V1 = "screen-whatsapp-media.v1";
+export const LINKED_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+export const LINKED_MEDIA_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export type WhatsAppMediaDisposition = "inline" | "download";
+export interface WhatsAppMediaRequest {
+  v: 2;
+  op: "whatsapp-media";
+  id: string;
+  conversation_id: string;
+  message_id: string;
+  disposition?: WhatsAppMediaDisposition;
+}
+export type WhatsAppMediaReply =
+  | {
+      v: 2;
+      op: "whatsapp-media-reply";
+      id: string;
+      ok: true;
+      bytes: ArrayBuffer;
+      mime_type: string;
+      file_name: string | null;
+      sha256: string;
+    }
+  | {
+      v: 2;
+      op: "whatsapp-media-reply";
+      id: string;
+      ok: true;
+      saved: true;
+      mime_type: string;
+      file_name: string;
+      sha256: string;
+    }
+  | { v: 2; op: "whatsapp-media-reply"; id: string; ok: false; refusal: ActionRefusal };
+export function validLinkedMediaId(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) return false;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 32 || code === 127) return false;
+  }
+  return true;
+}
+/** Generic host-mediated microphone recording and audio file upload (`screen-audio.v1`). */
+export const SCREEN_AUDIO_V1 = "screen-audio.v1";
+/** Headless inline host-mediated audio capture/upload session streaming (`screen-audio.v2`). */
+export const SCREEN_AUDIO_V2 = "screen-audio.v2";
+export type ScreenAudioMode = "record" | "upload";
+export type ScreenAudioSource = "recording" | "upload";
+export type ScreenAudioLanguage = "" | "en" | "zh";
+export type ScreenAudioSessionPhase =
+  | "idle"
+  | "starting"
+  | "recording"
+  | "paused"
+  | "stopping"
+  | "transcribing"
+  | "ready"
+  | "error";
+export interface AudioRequest { v: 2; op: "audio"; id: string; mode: ScreenAudioMode }
+export type AudioSessionRequest =
+  | { v: 2; op: "audio-session"; id: string; action: "start"; language?: ScreenAudioLanguage }
+  | { v: 2; op: "audio-session"; id: string; action: "pause" | "resume" | "stop" | "retry" | "cancel" }
+  | {
+      v: 2;
+      op: "audio-session";
+      id: string;
+      action: "upload";
+      bytes: ArrayBuffer;
+      mime_type: string;
+      file_name?: string;
+      last_modified?: number;
+      language?: ScreenAudioLanguage;
+    };
+export interface ScreenAudioCapture {
+  transcript: string;
+  duration_seconds: number;
+  held_at: string;
+  source: ScreenAudioSource;
+}
+export interface ScreenAudioSessionSnapshot {
+  session_id: string;
+  mode: ScreenAudioMode;
+  phase: ScreenAudioSessionPhase;
+  held_at: string;
+  elapsed_seconds: number;
+  level: number;
+  peak: number;
+  segments_total: number;
+  segments_done: number;
+  segments_in_flight: number;
+  segments_failed: number;
+  no_speech_segments: number;
+  transcript: string;
+  error: ActionRefusal | null;
+}
+export interface AudioSessionEvent {
+  v: 2;
+  op: "audio-session-event";
+  state: ScreenAudioSessionSnapshot;
+}
+export const AUDIO_TRANSCRIPT_CHARS_MAX = 200_000;
+export const AUDIO_UPLOAD_BYTES_MAX = 50 * 1024 * 1024;
+const AUDIO_SESSION_PHASES: readonly ScreenAudioSessionPhase[] = [
+  "idle",
+  "starting",
+  "recording",
+  "paused",
+  "stopping",
+  "transcribing",
+  "ready",
+  "error",
+];
+const AUDIO_SESSION_KEYS =
+  "elapsed_seconds,error,held_at,level,mode,no_speech_segments,peak,phase,segments_done,segments_failed,segments_in_flight,segments_total,session_id,transcript";
+const REFUSAL_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const ARRAY_BUFFER_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)?.get;
+
+function isBoundedSafeInt(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+function readArrayBufferByteLength(value: unknown): number | null {
+  if (typeof value !== "object" || value === null || typeof ARRAY_BUFFER_BYTE_LENGTH !== "function") {
+    return null;
+  }
+  try {
+    const len = ARRAY_BUFFER_BYTE_LENGTH.call(value);
+    return typeof len === "number" && Number.isSafeInteger(len) && len >= 0 ? len : null;
+  } catch {
+    return null;
+  }
+}
+export function parseActionRefusal(value: unknown): ActionRefusal | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const errRec = value as Record<string, unknown>;
+  if (
+    Object.keys(errRec).sort().join() !== "code,text" ||
+    typeof errRec.code !== "string" ||
+    !REFUSAL_CODE.test(errRec.code) ||
+    typeof errRec.text !== "string" ||
+    errRec.text.length === 0 ||
+    errRec.text.length > 512
+  ) {
+    return null;
+  }
+  return { code: errRec.code, text: errRec.text };
+}
+export function parseScreenAudioSessionSnapshot(value: unknown): ScreenAudioSessionSnapshot | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const r = value as Record<string, unknown>;
+  if (Object.keys(r).sort().join() !== AUDIO_SESSION_KEYS) return null;
+  if (typeof r.session_id !== "string" || !/^[A-Za-z0-9_-]{0,64}$/.test(r.session_id)) return null;
+  if (r.mode !== "record" && r.mode !== "upload") return null;
+  if (typeof r.phase !== "string" || !(AUDIO_SESSION_PHASES as readonly string[]).includes(r.phase)) return null;
+  if (typeof r.held_at !== "string" || r.held_at.length > 64 || (r.phase !== "idle" && r.held_at.length === 0)) return null;
+  if (!isBoundedSafeInt(r.elapsed_seconds, 0, 86_400)) return null;
+  if (!isBoundedSafeInt(r.level, 0, 100) || !isBoundedSafeInt(r.peak, 0, 100)) return null;
+  if (
+    !isBoundedSafeInt(r.segments_total, 0, 10_000) ||
+    !isBoundedSafeInt(r.segments_done, 0, 10_000) ||
+    !isBoundedSafeInt(r.segments_in_flight, 0, 10_000) ||
+    !isBoundedSafeInt(r.segments_failed, 0, 10_000) ||
+    !isBoundedSafeInt(r.no_speech_segments, 0, 10_000)
+  ) {
+    return null;
+  }
+  if (typeof r.transcript !== "string" || r.transcript.length > AUDIO_TRANSCRIPT_CHARS_MAX) return null;
+  let error: ActionRefusal | null = null;
+  if (r.error !== null) {
+    error = parseActionRefusal(r.error);
+    if (!error) return null;
+  }
+  return {
+    session_id: r.session_id,
+    mode: r.mode,
+    phase: r.phase as ScreenAudioSessionPhase,
+    held_at: r.held_at,
+    elapsed_seconds: r.elapsed_seconds,
+    level: r.level,
+    peak: r.peak,
+    segments_total: r.segments_total,
+    segments_done: r.segments_done,
+    segments_in_flight: r.segments_in_flight,
+    segments_failed: r.segments_failed,
+    no_speech_segments: r.no_speech_segments,
+    transcript: r.transcript,
+    error,
+  };
+}
+export function parseScreenAudioCapture(value: unknown): ScreenAudioCapture | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const r = value as Record<string, unknown>;
+  if (Object.keys(r).sort().join() !== "duration_seconds,held_at,source,transcript") return null;
+  if (typeof r.transcript !== "string" || r.transcript.length > AUDIO_TRANSCRIPT_CHARS_MAX) return null;
+  if (typeof r.duration_seconds !== "number" || !Number.isSafeInteger(r.duration_seconds) || r.duration_seconds < 0 || r.duration_seconds > 86_400) return null;
+  if (typeof r.held_at !== "string" || r.held_at.length === 0 || r.held_at.length > 64) return null;
+  if (r.source !== "recording" && r.source !== "upload") return null;
+  return {
+    transcript: r.transcript,
+    duration_seconds: r.duration_seconds,
+    held_at: r.held_at,
+    source: r.source,
+  };
+}
 /** Larger envelopes are admitted only after verified records negotiation and rights. */
 export function recordArgsLimit(verb: string): number {
   return ["records.csv.preview", "records.csv.import", "records.csv.confirm"].includes(verb) ? 327680
-    : ["records.create", "records.update", "content.save", "screen.preview.show", "whatsapp.reply.prepare", "whatsapp.reply.send", "whatsapp.template.prepare", "whatsapp.template.send"].includes(verb) ? 49152
+    : ["records.create", "records.update", "records.batch", "content.save", "screen.preview.show", "whatsapp.reply.prepare", "whatsapp.reply.send", "whatsapp.template.prepare", "whatsapp.template.send"].includes(verb) ? 49152
     : ["works.create", "works.patch"].includes(verb) ? 81920
     : verb === "whatsapp.broadcast.draft" ? 196608 : ACTION_ARGS_BYTES;
 }
@@ -194,10 +512,14 @@ export function parseRunSlotReceipt(value: unknown): RunSlotReceipt | null {
   return { run_id: r.run_id, request_id: r.request_id, state: r.state as RunSlotReceipt["state"] };
 }
 export type ReplyMessage =
-  | { v: 2; op: "reply"; id: string; ok: true; data: unknown }
+  | { v: 2; op: "reply"; id: string; ok: true; data: unknown; asset_refs?: string[] }
   | { v: 2; op: "reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "tool-reply"; id: string; ok: true; data: unknown }
   | { v: 2; op: "tool-reply"; id: string; ok: false; refusal: ActionRefusal }
+  | { v: 2; op: "audio-reply"; id: string; ok: true; data: ScreenAudioCapture }
+  | { v: 2; op: "audio-reply"; id: string; ok: false; refusal: ActionRefusal }
+  | { v: 2; op: "audio-session-reply"; id: string; ok: true; data: ScreenAudioSessionSnapshot }
+  | { v: 2; op: "audio-session-reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "slot-state"; id: string; state: "done"; receipt?: RunSlotReceipt; data?: never }
   | { v: 2; op: "slot-state"; id: string; state: "done"; data: unknown; receipt?: never }
   | { v: 2; op: "slot-state"; id: string; state: "pending" | "refused"; refusal?: ActionRefusal };
@@ -221,12 +543,20 @@ export const SCREEN_PRESENTATION_V1 = "screen-presentation.v1";
  *  draw as a primary or a drawer. A frame that does not advertise it never
  *  receives a surface message. */
 export const SCREEN_SURFACES_V1 = "screen-surfaces.v1";
+/** CAD-2525 — the child opts in to being told it is mounted in the chat
+ *  canvas (role `canvas`) and that the mount is read-only (`readOnly`). It
+ *  rides on `screen-surfaces.v1`; a frame without it is told `primary`. */
+export const SCREEN_CANVAS_V1 = "screen-canvas.v1";
+/** CAD-2555 — the child opts in to `params` on the route it is pushed and on
+ *  its `screen.route.patch` calls (a declared app view's params). A frame
+ *  without it is pushed the route exactly as before and may not send `params`. */
+export const SCREEN_ROUTE_PARAMS_V1 = "screen-route-params.v1";
 /** CAD-1365 — the media catalog/curation channel a media-contract
  *  screen's child opts into alongside `screen.v2`. Opting in grants
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof CRM_LOCALE_V1 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2 | typeof SCREEN_WHATSAPP_MEDIA_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -249,19 +579,27 @@ export function wantsMedia(accepts: readonly string[] | undefined): boolean {
   return !!accepts && accepts.includes(SCREEN_MEDIA_V1);
 }
 
-/** CAD-1365 — closed media.call arg parsers. `kind:"asset"` detail and
- *  `media.generate` are recognized-but-unadmitted: they refuse here, so
- *  nothing strips or forwards them. Any extra field — including a
- *  forged authority/scope selector — refuses outright, never silently
- *  strips. Exported so the dispatcher re-validates a direct call.
+/** CAD-1365 — closed media.call arg parsers. `media.generate` is
+ *  recognized-but-unadmitted: it refuses here, so nothing strips or
+ *  forwards it. Any extra field — including a forged authority/scope
+ *  selector — refuses outright, never silently strips. Exported so the
+ *  dispatcher re-validates a direct call.
  *  `kind:"catalog"` only: `{kind}` or `{kind,limit,cursor}` with
- *  `limit` a safe integer 1..20 and `cursor` a string <= 160 chars. */
+ *  `limit` a safe integer 1..20 and `cursor` a string <= 160 chars.
+ *  CAD-1962: `kind:"asset"` detail is admitted as exactly
+ *  `{kind,asset_id}` with a canonical id — without it the frame would be
+ *  closed before the daemon's own detail read ever ran. */
 export function mediaReadArgs(args: ActionArgs): ActionArgs | null {
   const keys = Object.keys(args).sort().join();
   if (args.kind === "preview") {
     if (Object.keys(args).sort().join() !== "asset_id,expected_revision,kind") return null;
     if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
     if (typeof args.expected_revision !== "number" || !Number.isSafeInteger(args.expected_revision) || args.expected_revision < 1) return null;
+    return args;
+  }
+  if (args.kind === "asset") {
+    if (keys !== "asset_id,kind") return null;
+    if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
     return args;
   }
   if (keys !== "kind" && keys !== "kind,limit" && keys !== "cursor,kind" && keys !== "cursor,kind,limit") return null;
@@ -272,6 +610,17 @@ export function mediaReadArgs(args: ActionArgs): ActionArgs | null {
 }
 const MEDIA_ASSET_ID = /^med-[0-9a-f]{32}$/;
 const MEDIA_REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** CAD-1962 — `media.import` args are EXACTLY `{receipt_id, request_id}`,
+ *  both bounded identifiers. The receipt names a retained image the
+ *  mounting installation owns; the daemon re-proves the mount, the
+ *  declared `media.import` permission and the custody before copying. */
+export function mediaImportArgs(args: ActionArgs): ActionArgs | null {
+  if (Object.keys(args).sort().join() !== "receipt_id,request_id") return null;
+  if (typeof args.receipt_id !== "string" || !MEDIA_REQUEST_ID.test(args.receipt_id)) return null;
+  if (typeof args.request_id !== "string" || !MEDIA_REQUEST_ID.test(args.request_id)) return null;
+  return args;
+}
+
 /** `media.original.download` args are EXACTLY `{asset_id}`, a canonical id. */
 export function mediaChatAttachArgs(args: ActionArgs): ActionArgs | null {
   if (Object.keys(args).sort().join() !== "asset_id,expected_revision") return null;
@@ -395,6 +744,21 @@ export interface ScreenSourcePost {
   /** https URL on the Instagram CDN. Only a screen whose declaration opts
    *  into `remote_images: ["instagram-cdn"]` may load it (frame CSP). */
   thumb_url?: string;
+  /** SOC-54: the retained read receipt that returned this post. A library
+   *  keeps posts from earlier reads, so provenance is a per-post fact; the
+   *  collection's `tool_receipt_id` only names the read behind `sources`
+   *  itself. Omitted when the host cannot state it. */
+  receipt_id?: string;
+}
+/** SOC-54: the retained reads of one handle, merged newest-first (an entry can
+ *  therefore span several reads). `sources`
+ *  stays the single newest read (what an older app renders); `collections`
+ *  carries every retained standalone read, so a reload shows the library the
+ *  owner built instead of only the last page. Run-bound reads are not listed
+ *  here: a draft from them is a `run` source, which `sources` already names. */
+export interface ScreenSourceCollection {
+  handle: string; fetched_at?: number; tool_receipt_id?: string;
+  posts: ScreenSourcePost[];
 }
 export interface ScreenSources {
   handle: string; fetched_at?: number;
@@ -405,6 +769,17 @@ export interface ScreenSources {
    *  invocation (CAD-1177) — the retained app_tool receipt id, distinct
    *  from any run id. A screen keys refresh/edit to this, never a run. */
   tool_receipt_id?: string;
+  /** SOC-54: the retained standalone reads of this install, newest first and
+   *  bounded (handles, posts and bytes). Partial by design; absent when the
+   *  host cannot enumerate them. */
+  collections?: ScreenSourceCollection[];
+}
+export interface ScreenPublishSettings {
+  revision: number;
+  destination_id?: string;
+  destination_label?: string;
+  toolkit?: "instagram" | "facebook";
+  timezone?: string;
 }
 export interface ScreenDefaults {
   context_id: string; revision: number;
@@ -481,6 +856,10 @@ export interface ScreenPush {
   sources?: ScreenSources;
   /** screen.v2 only: effective `context_default` values for this scope. */
   defaults?: ScreenDefaults;
+  /** screen.v2 only (CAD-1902): the bound publication target, read-only.
+   *  `revision` is the binding revision; every other field is omitted when
+   *  it does not pass the app's grammar. A grant is never pushed. */
+  publish_settings?: ScreenPublishSettings;
   /** screen.v2 only: plain blocker codes; `ok` when there are none. */
   readiness?: { ok: boolean; blockers: string[] };
   /** screen.v2 only: verbs this host lets this viewer's frame use (none for a non-operator). */
@@ -498,6 +877,8 @@ export interface ScreenPush {
   media_previews?: 1;
   /** Host marker. 1 only when this mount may media.chat.attach. */
   media_chat_references?: 1;
+  /** Host marker. 1 only when this mount opted into screen-audio.v1 and has a live audio host + action token. */
+  audio_capture?: 1;
   /** Server epoch seconds for day-row alignment. */
   now: number;
   /** The child's own last `state` snapshot, replayed on remount. */
@@ -505,11 +886,11 @@ export interface ScreenPush {
   /** Records-negotiated display only, never authority. */
   route?: ScreenRoute;
   read_observations?: ReadObservation[];
-  /** Host-selected presentation only, for CRM records peers opting into crm-locale.v1. */
+  /** Host-selected presentation locale, for screen.v2 peers opting into screen-locale.v1. */
   presentation_locale?: "en" | "zh-TW";
 }
 
-export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface;
+export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface | AudioSessionEvent | WhatsAppMediaReply;
 
 /** Parse a window message into a `ScreenInit`, or `null`. The port is a
  *  `MessagePort` in `event.ports[0]` — the caller checks `event.origin`
@@ -583,11 +964,131 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
-    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 4 &&
+    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 8 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === CRM_LOCALE_V1 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
+    !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
+    !(d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1) && d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2)) &&
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2 || a === SCREEN_WHATSAPP_MEDIA_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
+  }
+  if (
+    Object.keys(d).sort().join() === "id,mode,op,v" &&
+    d.v === 2 &&
+    d.op === "audio" &&
+    typeof d.id === "string" &&
+    ACTION_ID.test(d.id) &&
+    (d.mode === "record" || d.mode === "upload")
+  ) {
+    return { v: 2, op: "audio", id: d.id, mode: d.mode };
+  }
+  if (d.v === 2 && d.op === "audio-session" && typeof d.id === "string" && ACTION_ID.test(d.id)) {
+    const keys = Object.keys(d).sort().join();
+    const validLanguage = (lang: unknown): lang is ScreenAudioLanguage =>
+      lang === "" || lang === "en" || lang === "zh";
+    if (d.action === "start" && (keys === "action,id,op,v" || (keys === "action,id,language,op,v" && validLanguage(d.language)))) {
+      return d.language !== undefined
+        ? { v: 2, op: "audio-session", id: d.id, action: "start", language: d.language as ScreenAudioLanguage }
+        : { v: 2, op: "audio-session", id: d.id, action: "start" };
+    }
+    if (
+      (d.action === "pause" || d.action === "resume" || d.action === "stop" || d.action === "retry" || d.action === "cancel") &&
+      keys === "action,id,op,v"
+    ) {
+      return { v: 2, op: "audio-session", id: d.id, action: d.action };
+    }
+    if (d.action === "upload") {
+      const allowedUploadKeys = new Set([
+        "v",
+        "op",
+        "id",
+        "action",
+        "bytes",
+        "mime_type",
+        "file_name",
+        "last_modified",
+        "language",
+      ]);
+      const byteLen = readArrayBufferByteLength(d.bytes);
+      if (
+        !Object.keys(d).every(k => allowedUploadKeys.has(k)) ||
+        byteLen === null ||
+        !isBoundedSafeInt(byteLen, 1, AUDIO_UPLOAD_BYTES_MAX) ||
+        typeof d.mime_type !== "string" ||
+        d.mime_type.length > 128 ||
+        (d.file_name !== undefined && (typeof d.file_name !== "string" || d.file_name.length > 255)) ||
+        (d.last_modified !== undefined && !isBoundedSafeInt(d.last_modified, 0, 8_640_000_000_000_000)) ||
+        (d.language !== undefined && !validLanguage(d.language))
+      ) {
+        return null;
+      }
+      return {
+        v: 2,
+        op: "audio-session",
+        id: d.id,
+        action: "upload",
+        bytes: d.bytes as ArrayBuffer,
+        mime_type: d.mime_type,
+        ...(d.file_name !== undefined ? { file_name: d.file_name } : {}),
+        ...(d.last_modified !== undefined ? { last_modified: d.last_modified } : {}),
+        ...(d.language !== undefined ? { language: d.language } : {}),
+      };
+    }
+    return null;
+  }
+  if (Object.keys(d).sort().join() === "op,unsaved,v" && d.v === 2 && d.op === "leave" &&
+      typeof d.unsaved === "boolean") {
+    return { v: 2, op: "leave", unsaved: d.unsaved };
+  }
+  const keys = Object.keys(d).sort().join();
+  if (d.v === 2 && d.op === "whatsapp-compose" && (keys === "conversation_id,op,v" || keys === "conversation_id,op,provider,v")) {
+    const provider = d.provider === undefined ? undefined : (d.provider === "linked" || d.provider === "official" ? d.provider : null);
+    if (provider === null) return null;
+    const validId =
+      d.conversation_id === null ||
+      (typeof d.conversation_id === "string" &&
+        ((provider ?? "linked") === "official"
+          ? OFFICIAL_WHATSAPP_CHAT.test(d.conversation_id)
+          : LINKED_WHATSAPP_CHAT.test(d.conversation_id)));
+    if (!validId) return null;
+    return provider !== undefined
+      ? { v: 2, op: "whatsapp-compose", conversation_id: d.conversation_id as string | null, provider }
+      : { v: 2, op: "whatsapp-compose", conversation_id: d.conversation_id as string | null };
+  }
+  if (d.v === 2 && d.op === "whatsapp-reply-layout" && Object.keys(d).sort().join() === "bounds,nomination,op,v" &&
+      isBoundedSafeInt(d.nomination, 1, Number.MAX_SAFE_INTEGER)) {
+    const bounds = d.bounds;
+    if (bounds === null) return { v: 2, op: "whatsapp-reply-layout", nomination: d.nomination, bounds };
+    if (Array.isArray(bounds) && bounds.length === 2 && isBoundedSafeInt(bounds[0], 0, 9999) &&
+        isBoundedSafeInt(bounds[1], bounds[0] + 1, 10000)) {
+      return { v: 2, op: "whatsapp-reply-layout", nomination: d.nomination, bounds: [bounds[0], bounds[1]] };
+    }
+    return null;
+  }
+  if (d.v === 2 && d.op === "whatsapp-reply-inset-ready" && Object.keys(d).sort().join() === "nomination,op,px,seq,v" &&
+      isBoundedSafeInt(d.nomination, 1, Number.MAX_SAFE_INTEGER) && isBoundedSafeInt(d.seq, 1, Number.MAX_SAFE_INTEGER) &&
+      isBoundedSafeInt(d.px, 0, WHATSAPP_REPLY_INSET_MAX)) {
+    return { v: 2, op: "whatsapp-reply-inset-ready", nomination: d.nomination, seq: d.seq, px: d.px };
+  }
+  if (
+    d.v === 2 &&
+    d.op === "whatsapp-media" &&
+    (Object.keys(d).sort().join() === "conversation_id,id,message_id,op,v" ||
+      (Object.keys(d).sort().join() === "conversation_id,disposition,id,message_id,op,v" &&
+        (d.disposition === "inline" || d.disposition === "download"))) &&
+    typeof d.id === "string" &&
+    ACTION_ID.test(d.id) &&
+    validLinkedMediaId(d.conversation_id) &&
+    validLinkedMediaId(d.message_id)
+  ) {
+    return {
+      v: 2,
+      op: "whatsapp-media",
+      id: d.id,
+      conversation_id: d.conversation_id,
+      message_id: d.message_id,
+      ...(d.disposition !== undefined ? { disposition: d.disposition as WhatsAppMediaDisposition } : {}),
+    };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&
       typeof d.ref === "string" && ASSET_REF.test(d.ref)) {
@@ -623,6 +1124,10 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     if (d.verb === "media.chat.attach") {
       const checked = mediaChatAttachArgs(args);
       return checked ? { v: 2, op: "call", id: d.id, verb: "media.chat.attach", args: checked } : null;
+    }
+    if (d.verb === "media.import") {
+      const checked = mediaImportArgs(args);
+      return checked ? { v: 2, op: "call", id: d.id, verb: "media.import", args: checked } : null;
     }
     if (d.verb === "media.publish") {
       const checked = mediaPublishArgs(args);
@@ -668,7 +1173,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads", "media_previews", "media_chat_references", "route", "read_observations", "presentation_locale"] as const;
+const V2_TOP = ["sources", "defaults", "publish_settings", "readiness", "actions", "run_receipts", "original_downloads", "media_previews", "media_chat_references", "audio_capture", "route", "read_observations", "presentation_locale"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
   "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */
@@ -703,6 +1208,11 @@ const omit = (key: string) => (p: ScreenPush): ScreenPush => ({ ...p, runs: p.ru
   const row: Record<string, unknown> = { ...r }; delete row[key]; return row as ScreenPush["runs"][number]; }) });
 const DEGRADE: ((push: ScreenPush) => ScreenPush)[] = [
   omit("caption_excerpt"),
+  // SOC-54: the enumerated history is additive — give it up before the newest
+  // page the app already had. A fixed allowance inside the projection cannot
+  // know the rest of this PUSH, so the guarantee lives here, where the whole
+  // message is measured.
+  p => ({ ...p, sources: p.sources && { ...p.sources, collections: undefined } }),
   ({ sources: _s, ...p }) => p,
   omit("inputs_used"),
   p => ({ ...p, publish_intents: { status: "unavailable", withheld: 0, rows: [] } }),

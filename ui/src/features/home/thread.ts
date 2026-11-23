@@ -1,4 +1,5 @@
 import type { SseEvent } from "../../lib/sse";
+import { answeredData, parse, walk } from "./formModel";
 
 /**
  * The master's thread as the Home screen holds it (CAD-328): the stored
@@ -16,7 +17,7 @@ import type { SseEvent } from "../../lib/sse";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "hire_proposal";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "image_job" | "video_job" | "hire_proposal" | "ticket_proposal" | "surface" | "connect_ref" | "record_ref" | "view_ref" | "share_request";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -28,6 +29,13 @@ export interface ThreadEntry {
   /** The queued message this entry belongs to. */
   message?: string | null;
   created?: string | null;
+}
+
+export interface PendingAttachment {
+  id: string;
+  name?: string;
+  size?: number;
+  mime?: string;
 }
 
 export interface PendingMessage {
@@ -48,10 +56,10 @@ export interface PendingMessage {
   /** CAD-574: the cited needs subjects the send carried — a retry must
    *  resend the same refs or the daemon's idempotency check conflicts. */
   refs?: { kind: string; id: string }[];
-  /** CAD-1168: the retained-file ids the send carried. A retry resends
-   *  exactly these — sending text without them under the same message
-   *  id is the daemon's content-conflict refusal. */
-  attachments?: { id: string }[];
+  /** CAD-1168: the retained-file ids the send carried (plus display metadata
+   *  while pending). A retry resends `{id}` — sending text without them under
+   *  the same message id is the daemon's content-conflict refusal. */
+  attachments?: PendingAttachment[];
   /** CAD-1168: the verified app binding the send carried. A retry
    *  resends to this original destination, never the route's current
    *  installation/context. */
@@ -75,6 +83,24 @@ export interface ThreadState {
    *  window. Absent on a daemon that predates it; entries never advance
    *  it, and a page never lowers it. */
   replySeq?: number;
+  /** CAD-1853: the highest `seq` the daemon has SCANNED for this thread.
+   *  A projection filters another source's cloud entries out of a page, so
+   *  the scanned cursor can be ahead of every held entry; resuming the
+   *  catch-up from it is what keeps a fully filtered page from being read
+   *  again forever. Absent on a daemon that predates the page cursor. */
+  cursor?: number;
+  /** CAD-1853: the lowest `seq` the daemon has SCANNED BACKWARDS for this
+   *  thread (`scanned_before` of the oldest page read). The oldest HELD entry
+   *  is not a continuation point once a projection can hide a whole page —
+   *  it may not move at all — so "earlier" continues below this boundary
+   *  instead. Absent on a daemon that predates it. */
+  older?: number;
+  /** A server code means cloud history is incomplete, even with no entries. */
+  cloudWithheld?: string | null;
+  /** Orders availability observations independently of entry sequence. */
+  cloudRevision?: number;
+  /** Restoration needs a fresh tail, not catch-up past the evicted rows. */
+  cloudRefreshNeeded?: boolean;
   entries: ThreadEntry[];
   pending: PendingMessage[];
 }
@@ -105,10 +131,45 @@ export function asEntry(value: unknown): ThreadEntry | null {
   };
 }
 
+/** Only server provenance marks a cloud row, including routed local copies. */
+export function isCloudEntry(entry: ThreadEntry): boolean {
+  return entry.payload != null &&
+    (Object.prototype.hasOwnProperty.call(entry.payload, "cloud_agent") ||
+      entry.payload.source === "cloud_agent");
+}
+
+/** Absent page metadata is clean; a present malformed/unknown code is not. */
+export function pageCloudWithheld(page: { cloud_withheld?: unknown }): string | null {
+  if (!Object.prototype.hasOwnProperty.call(page, "cloud_withheld")) return null;
+  return typeof page.cloud_withheld === "string" && page.cloud_withheld.trim() !== ""
+    ? page.cloud_withheld
+    : "unknown";
+}
+
+function withCloudWithheld(state: ThreadState, code: string | null): ThreadState {
+  const entries = code === null ? state.entries : state.entries.filter((e) => !isCloudEntry(e));
+  return {
+    ...state,
+    cloudWithheld: code,
+    cloudRevision: (state.cloudRevision ?? 0) + 1,
+    cloudRefreshNeeded: code === null
+      ? state.cloudRefreshNeeded || state.cloudWithheld != null
+      : false,
+    entries,
+  };
+}
+
 /** The highest stored `seq` — the resume cursor; null with none. */
 export function lastSeq(state: ThreadState | null): number | null {
   const entries = state?.entries ?? [];
   return entries.length ? entries[entries.length - 1].seq : null;
+}
+
+/** The forward resume cursor: every stored row at or below it has been
+ *  scanned, including rows a projection filtered out. */
+export function resumeSeq(state: ThreadState | null): number | null {
+  const seq = Math.max(state?.cursor ?? 0, lastSeq(state) ?? 0);
+  return seq > 0 ? seq : null;
 }
 
 /** A visible agent reply — the same rule as the daemon's complete
@@ -139,7 +200,8 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   const previousReply = base.replySeq ?? 0;
   let replySeq = previousReply;
   for (const e of incoming) {
-    if (!bySeq.has(e.seq)) changed = true;
+    if (base.cloudWithheld != null && isCloudEntry(e)) continue;
+    if (bySeq.get(e.seq) !== e) changed = true;
     bySeq.set(e.seq, e);
     if (isReplyEntry(e) && e.seq > replySeq) replySeq = e.seq;
   }
@@ -162,9 +224,30 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   };
 }
 
-/** `streamInto`'s reducer: an `entry` frame merges; anything else is ignored. */
-export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadState {
+/** Fold entries and independent cloud-availability frames from the stream.
+ *  `onEntry` sees each well-formed `entry` frame once, before it is merged —
+ *  the engine's turn-boundary hook (a committed `turn_result` retires the
+ *  live preview), so the parsed entry is not read twice. */
+export function reduceFrame(
+  state: ThreadState | null,
+  event: SseEvent,
+  onEntry?: (entry: ThreadEntry) => void,
+): ThreadState {
   const base = state ?? EMPTY_THREAD;
+  if (event.type === "cloud_withheld") {
+    let status: unknown;
+    try {
+      status = JSON.parse(event.data);
+    } catch {
+      return withCloudWithheld(base, "unknown");
+    }
+    const wire = status !== null && typeof status === "object"
+      ? status as { cloud_withheld?: unknown }
+      : { cloud_withheld: undefined };
+    return withCloudWithheld(base, wire.cloud_withheld === null
+      ? null
+      : pageCloudWithheld({ cloud_withheld: wire.cloud_withheld }));
+  }
   if (event.type !== "entry") return base;
   let parsed: unknown;
   try {
@@ -173,16 +256,18 @@ export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadS
     return base;
   }
   const entry = asEntry(parsed);
-  return entry ? mergeEntries(base, [entry]) : base;
+  if (!entry) return base;
+  onEntry?.(entry);
+  return mergeEntries(base, [entry]);
 }
 
 /** A page from `GET /api/threads/<alias>` folded into the state. */
 export function mergePage(
   state: ThreadState | null,
-  page: { thread?: unknown; entries?: unknown[]; reply_seq?: unknown },
+  page: { thread?: unknown; entries?: unknown[]; reply_seq?: unknown; cloud_withheld?: unknown },
 ): ThreadState {
   const entries = (page.entries ?? []).map(asEntry).filter((e): e is ThreadEntry => e !== null);
-  const merged = mergeEntries(state, entries);
+  const merged = mergeEntries(withCloudWithheld(state ?? EMPTY_THREAD, pageCloudWithheld(page)), entries);
   // The page reports the COMPLETE thread's reply watermark, so keep the
   // maximum: a bounded, forward or older page (and a live frame that
   // carries only an entry) can never erase a reply it does not hold.
@@ -214,7 +299,7 @@ export function addPending(
   text: string,
   at: number,
   refs?: { kind: string; id: string }[],
-  attachments?: { id: string }[],
+  attachments?: PendingAttachment[],
   app?: { install_id: string; context_id?: string },
   conversation?: string,
 ): ThreadState {
@@ -250,19 +335,91 @@ export function discardPending(state: ThreadState | null, message: string): Thre
   return { ...base, pending: base.pending.filter((p) => p.message !== message) };
 }
 
+/** CAD-2362: whether an operator message answers a form whose card reads
+ *  the answer (`answeredData(...).known`) — the one condition under which
+ *  the card shows the values the message would otherwise repeat. */
+function formAnswerShown(entry: ThreadEntry, surfaces: Map<string, ThreadEntry>): boolean {
+  const refs = entry.payload?.refs;
+  if (!Array.isArray(refs)) return false;
+  for (const ref of refs) {
+    if (!ref || typeof ref !== "object" || (ref as { kind?: unknown }).kind !== "surface") continue;
+    const form = surfaces.get(String((ref as { id?: unknown }).id));
+    const surface = form ? parse(form) : null;
+    if (surface && answeredData(walk(surface.comps), surface.data, entry.text).known) return true;
+  }
+  return false;
+}
+
 /** What the thread view renders, in order. */
 export type ThreadItem =
-  | { type: "operator"; key: string; entry: ThreadEntry }
+  /** `formShown` (CAD-2362): this message answers a form whose card can show
+   *  the answered values, so the message reads as a one-line receipt. */
+  | { type: "operator"; key: string; entry: ThreadEntry; formShown?: boolean }
   | { type: "system"; key: string; entry: ThreadEntry }
   | { type: "thinking"; key: string; entry: ThreadEntry }
   | { type: "commentary"; key: string; entry: ThreadEntry }
   | { type: "tools"; key: string; entries: ThreadEntry[] }
   | { type: "answer"; key: string; entry: ThreadEntry }
   | { type: "artifact"; key: string; entry: ThreadEntry }
+  | { type: "connect"; key: string; entry: ThreadEntry }
+  | { type: "record"; key: string; entry: ThreadEntry }
+  | { type: "view"; key: string; entry: ThreadEntry }
+  | { type: "share"; key: string; entry: ThreadEntry }
+  | { type: "image"; key: string; entry: ThreadEntry }
+  | { type: "video"; key: string; entry: ThreadEntry }
   | { type: "hire"; key: string; entry: ThreadEntry; reason: string | null }
+  | { type: "ticket"; key: string; entry: ThreadEntry }
+  | { type: "form"; key: string; entry: ThreadEntry; status: FormStatus }
   | { type: "pending"; key: string; pending: PendingMessage };
 
+/** CAD-2285: where the master's form stands, read from the thread itself.
+ *  Its answer is the operator message that cites it (`refs` kind
+ *  `surface`, id the entry seq); any other later operator message closes
+ *  it, so a late answer can never be sent. */
+export type FormStatus =
+  | { state: "open" }
+  | { state: "sending" }
+  | { state: "failed"; pending: PendingMessage }
+  /** `answer` is the citing message's text, which carries the A2UI action. */
+  | { state: "sent"; at: string | null; answer: string }
+  | { state: "closed" };
+
+const answers = (refs: unknown, seq: number): boolean =>
+  Array.isArray(refs) &&
+  refs.some((r) => !!r && typeof r === "object" && (r as { kind?: unknown }).kind === "surface" && (r as { id?: unknown }).id === String(seq));
+
+export function formStatus(seq: number, entries: ThreadEntry[], pending: PendingMessage[]): FormStatus {
+  let closed = false;
+  for (const e of entries) {
+    if (e.seq <= seq || e.role !== "operator") continue;
+    if (answers(e.payload?.refs, seq)) return { state: "sent", at: e.created ?? null, answer: e.text };
+    closed = true;
+  }
+  const own = pending.find((p) => answers(p.refs, seq));
+  if (closed || pending.some((p) => !answers(p.refs, seq))) return { state: "closed" };
+  if (own) return own.state === "failed" ? { state: "failed", pending: own } : { state: "sending" };
+  return { state: "open" };
+}
+
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
+
+/** The item type of an entry kind that is a card in a turn; null otherwise. */
+const cardType = (kind: string): "artifact" | "image" | "video" | "connect" | "record" | "view" | "share" | null =>
+  kind === "artifact"
+    ? "artifact"
+    : kind === "image_job"
+      ? "image"
+      : kind === "video_job"
+        ? "video"
+        : kind === "connect_ref"
+          ? "connect"
+          : kind === "record_ref"
+            ? "record"
+            : kind === "view_ref"
+              ? "view"
+              : kind === "share_request"
+                ? "share"
+                : null;
 
 /**
  * Entries by kind: the operator's message, `assistant_text` as
@@ -280,10 +437,19 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
     items.push(...held);
     held = [];
   };
+  const surfaces = new Map<string, ThreadEntry>();
   for (const entry of state?.entries ?? []) {
     const key = `e${entry.seq}`;
-    if (entry.kind === "artifact" && items[items.length - 1]?.type === "tools") {
-      held.push({ type: "artifact", key, entry });
+    const card = cardType(entry.kind);
+    if (entry.kind === "surface") surfaces.set(String(entry.seq), entry);
+    // CAD-2285: the form is written inside its `ask-form` tool call, so it
+    // waits for the run to end like any other card.
+    const form: ThreadItem | null =
+      entry.kind === "surface"
+        ? { type: "form", key, entry, status: formStatus(entry.seq, state?.entries ?? [], state?.pending ?? []) }
+        : null;
+    if ((card || form) && items[items.length - 1]?.type === "tools") {
+      held.push(form ?? { type: card!, key, entry });
       continue;
     }
     if (!TOOL_KINDS.has(entry.kind)) flush();
@@ -306,11 +472,35 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
         last?.type === "commentary" && last.entry.message === entry.message ? items.pop() : null;
       const reason = lead?.type === "commentary" ? lead.entry.text.trim() || null : null;
       items.push({ type: "hire", key, entry, reason });
+    } else if (entry.kind === "ticket_proposal") {
+      // AOS-517: Master's inert ticket proposal. Its own payload carries the
+      // card; nothing is created or assigned until the person clicks.
+      items.push({ type: "ticket", key, entry });
+    } else if (form) {
+      items.push(form);
     } else if (entry.kind === "artifact") {
       // CAD-1726: a card for a canvas artifact — metadata, never content.
       items.push({ type: "artifact", key, entry });
+    } else if (entry.kind === "connect_ref") {
+      // CAD-2443: the host's connect card — a toolkit, never a URL.
+      items.push({ type: "connect", key, entry });
+    } else if (entry.kind === "record_ref") {
+      // CAD-2443: the host's record card — capped, untrusted-marked values.
+      items.push({ type: "record", key, entry });
+    } else if (entry.kind === "view_ref") {
+      // CAD-2475: the host's canvas view card — a reference to an app screen, never its content.
+      items.push({ type: "view", key, entry });
+    } else if (entry.kind === "share_request") {
+      // AOS-711 (CAD-2705): the member's request for an owner-only report — the host's card.
+      items.push({ type: "share", key, entry });
+    } else if (entry.kind === "image_job") {
+      // A generated image's block: a job id and a shape, never the picture.
+      items.push({ type: "image", key, entry });
+    } else if (entry.kind === "video_job") {
+      // A generated video's block: a job id and a shape, never the video.
+      items.push({ type: "video", key, entry });
     } else if (entry.role === "operator") {
-      items.push({ type: "operator", key, entry });
+      items.push(formAnswerShown(entry, surfaces) ? { type: "operator", key, entry, formShown: true } : { type: "operator", key, entry });
     } else {
       items.push({ type: "system", key, entry });
     }
@@ -323,14 +513,18 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 }
 
 /** Item types that belong to an assistant turn. */
-const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "hire"]);
+const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "image", "video", "hire", "form", "connect", "record", "view", "share"]);
+
+/** A card that follows its turn's answer without ending or starting a turn. */
+export const isCardItem = (item: { type: string }): boolean =>
+  item.type === "artifact" || item.type === "image" || item.type === "video" || item.type === "form" || item.type === "connect" || item.type === "record" || item.type === "view" || item.type === "share";
 
 /** One render run: an assistant turn (its flat items), or one item that is
  *  not part of a turn. The items themselves stay flat — `threadItems` is
  *  still the one contract for the canvas feed, the working state and the
  *  window; a turn is only how a contiguous run of them paints. */
 export type ThreadRun =
-  | { turn: true; key: string; items: ThreadItem[] }
+  | { turn: true; key: string; items: ThreadItem[]; message: string | null }
   | { turn: false; key: string; item: ThreadItem };
 
 /**
@@ -338,7 +532,8 @@ export type ThreadRun =
  * the answer and its artifact cards are one turn while they stay contiguous.
  * A terminal `answer` closes the turn: a further reasoning/commentary/tool
  * item starts the next one, while artifact cards may still follow it. A run
- * of artifact cards with no agent text is not a turn (no head, no trace).
+ * of cards with no agent text is a turn too (CAD-2552), so its data cards wait
+ * for the turn to finish and fade in like any other turn's.
  */
 export function threadRuns(items: ThreadItem[]): ThreadRun[] {
   const runs: ThreadRun[] = [];
@@ -346,11 +541,7 @@ export function threadRuns(items: ThreadItem[]): ThreadRun[] {
   let runMessage: string | null = null;
   const flush = () => {
     if (run.length === 0) return;
-    if (run.some((item) => item.type !== "artifact")) {
-      runs.push({ turn: true, key: run[0].key, items: run });
-    } else {
-      for (const item of run) runs.push({ turn: false, key: item.key, item });
-    }
+    runs.push({ turn: true, key: run[0].key, items: run, message: runMessage });
     run = [];
     runMessage = null;
   };
@@ -367,7 +558,7 @@ export function threadRuns(items: ThreadItem[]): ThreadRun[] {
     if (run.length > 0 && message !== null && runMessage !== null && message !== runMessage) {
       flush();
     }
-    if (item.type !== "artifact" && run.some((i) => i.type === "answer")) flush();
+    if (!isCardItem(item) && run.some((i) => i.type === "answer")) flush();
     run.push(item);
     if (message !== null) runMessage = message;
   }
@@ -380,6 +571,186 @@ export function itemMessage(item: ThreadItem): string | null {
   if (item.type === "pending") return item.pending.message;
   if (item.type === "tools") return item.entries.find((e) => e.message)?.message ?? null;
   return item.entry.message ?? null;
+}
+
+/**
+ * CAD-2363: when a turn started (epoch ms) — the time of its own send, the
+ * operator or pending row whose message id the turn's rows carry. A queued
+ * row between the send and the turn, or inside it, is never the start, and a
+ * turn whose rows carry no message id (or whose send is out of the window)
+ * has none: its head then counts from its own first entry.
+ */
+export function turnStartMs(items: ThreadItem[], runItems: ThreadItem[]): number | null {
+  const message = runItems.map(itemMessage).find((m) => m !== null) ?? null;
+  if (message === null) return null;
+  for (let i = items.indexOf(runItems[0]) - 1; i >= 0; i--) {
+    const item = items[i];
+    if ((item.type !== "operator" && item.type !== "pending") || itemMessage(item) !== message) continue;
+    if (item.type === "pending") return Number.isFinite(item.pending.at) ? item.pending.at : null;
+    const ms = item.entry.created ? Date.parse(item.entry.created) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+/**
+ * CAD-2363: the turn runs that carry a send's clock — the first run of each
+ * message. A queued row can split one turn into segments; only its first
+ * shows the live clock, so a turn never shows two. A run with no message id
+ * is its own first.
+ */
+export function clockRuns(runs: ThreadRun[]): Set<string> {
+  const seen = new Set<string>();
+  const out = new Set<string>();
+  for (const run of runs) {
+    if (!run.turn) continue;
+    const message = run.items.map(itemMessage).find((m) => m !== null) ?? null;
+    if (message !== null && seen.has(message)) continue;
+    if (message !== null) seen.add(message);
+    out.add(run.key);
+  }
+  return out;
+}
+
+/** React key for a user row. The optimistic pending row and the stored
+ *  operator entry share one message id; one key keeps that row (and the
+ *  typing block under it) from unmounting and rising in again when the
+ *  send is acknowledged. */
+export function rowPaintKey(item: ThreadItem): string {
+  const message = itemMessage(item);
+  if ((item.type === "operator" || item.type === "pending") && message) return `user:${message}`;
+  return item.key;
+}
+
+const OPEN_TURN = new Set(["thinking", "commentary", "tools", "hire"]);
+
+/** The send named by the working id: the user row whose message matches
+ *  it. Null when the daemon reports an id no user row carries — callers
+ *  then fall back to the user row before the run. */
+export function activeSendId(items: ThreadItem[], runningMessage: string | null): string | null {
+  if (runningMessage === null || runningMessage === "") return null;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if ((item.type === "operator" || item.type === "pending") && itemMessage(item) === runningMessage) {
+      return runningMessage;
+    }
+  }
+  return null;
+}
+
+/** The send a run belongs to: the nearest user row before it, skipping
+ *  messages still queued behind the running turn. A queued row can sit
+ *  between the working send and its first assistant rows. */
+export function sendBefore(items: ThreadItem[], runItems: ThreadItem[], queued: ReadonlySet<string>, skip: string | null = null): string | null {
+  const idx = items.indexOf(runItems[0]);
+  if (idx < 0) return null;
+  for (let i = idx - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.type !== "operator" && item.type !== "pending") continue;
+    if (item.type === "pending" && item.pending.state === "failed") continue;
+    const id = itemMessage(item);
+    if (id !== null && (queued.has(id) || id === skip)) continue;
+    return id;
+  }
+  return null;
+}
+
+/** An unnamed turn whose answer has landed: the thread ends on an answer, so
+ *  no send is waiting on it. The host's working flag is just about to clear,
+ *  and a placeholder now would paint a second head under the answer. */
+export function unnamedTurnAnswered(items: ThreadItem[]): boolean {
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (isCardItem(items[i])) continue;
+    return items[i].type === "answer";
+  }
+  return false;
+}
+
+/** Stopping a hosted turn withdraws what was queued behind it. Those rows have
+ *  no stored entry to retire them, so they would say "sending" forever: they
+ *  become failed rows, which keep the text and offer Retry and Discard. Each
+ *  gets a fresh id, because the engine answers a repeated id with the withdrawn
+ *  submission, so a Retry under the old one would run nothing. */
+export function failWithdrawn(
+  state: ThreadState,
+  withdrawn: readonly string[],
+  error: string,
+  newId: () => string,
+): ThreadState {
+  if (withdrawn.length === 0) return state;
+  return {
+    ...state,
+    pending: state.pending.map((row) =>
+      withdrawn.includes(row.message) ? { ...row, message: newId(), state: "failed" as const, error } : row,
+    ),
+  };
+}
+
+/** The assistant item that opens the run still in flight for `message`.
+ *  Null when that send has no assistant rows yet, or the run already has
+ *  an answer. Hosted transcripts often omit the message id on agent rows,
+ *  so the run is the contiguous assistant items after the user row. A
+ *  working id that matches no user row still adopts that open run when
+ *  every tagged row in it names that id — otherwise the real turn paints
+ *  as finished and a second assistant head is appended under it.
+ *
+ *  The run is adopted only when no row in it belongs to another send: a
+ *  queued or interleaved turn must not be marked busy, and must not have
+ *  the placeholder of the send actually running suppressed. A queued user
+ *  row can sit between the running send and its first assistant rows, so
+ *  an empty matching run falls through to the tail run.
+ *
+ *  `unnamed` says a turn is verified working with no id. Without it a null
+ *  id is a send still in flight, which must not claim an older run. */
+export function inFlightTurnKey(items: ThreadItem[], message: string | null, unnamed = false): string | null {
+  if ((message === null || message === "") && !unnamed) return null;
+  // A failed pending row stays visible for Retry/Discard but is not a live
+  // send: it neither bounds nor names the running turn.
+  const isUser = (item: ThreadItem) =>
+    (item.type === "operator" || item.type === "pending")
+    && !(item.type === "pending" && item.pending.state === "failed");
+  // `present` distinguishes "no assistant rows yet" (fall through) from a
+  // run that answered or names another send (refuse, never fall through).
+  const isTurn = (item: ThreadItem) =>
+    OPEN_TURN.has(item.type) || item.type === "answer" || isCardItem(item);
+  const runAfter = (start: number): { key: string | null; present: boolean } => {
+    let first: string | null = null;
+    let present = false;
+    for (let i = start; i < items.length; i++) {
+      const item = items[i];
+      if (isUser(item)) break;
+      // A system or other non-turn row is transparent: it neither proves a
+      // run exists nor carries a send's provenance.
+      if (!isTurn(item)) continue;
+      present = true;
+      if (item.type === "answer") return { key: null, present };
+      const tagged = itemMessage(item);
+      if (tagged !== null && tagged !== message) return { key: null, present };
+      if (first === null && OPEN_TURN.has(item.type)) first = item.key;
+    }
+    return { key: first, present };
+  };
+  // A turn the host reports as working without naming it (hosted boards send
+  // `message: null`) is the newest stored send's. A pending row has no stored
+  // entry yet, so it has not started and cannot be what is running.
+  if (message === null || message === "") {
+    let lastOperator = -1;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type === "operator") lastOperator = i;
+    }
+    return runAfter(lastOperator + 1).key;
+  }
+  const idx = items.findIndex((item) => isUser(item) && itemMessage(item) === message);
+  if (idx >= 0) {
+    const run = runAfter(idx + 1);
+    if (run.present) return run.key;
+  }
+  let lastUser = -1;
+  for (let i = 0; i < items.length; i++) {
+    if (isUser(items[i])) lastUser = i;
+  }
+  if (lastUser < 0) return null;
+  return runAfter(lastUser + 1).key;
 }
 
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----
@@ -575,6 +946,17 @@ export interface ThreadPageLike {
    *  (0 when none), independent of the page cursor. Absent on a daemon
    *  that predates it. */
   reply_seq?: number;
+  /** CAD-1853: the last `seq` this page scanned, past every row the
+   *  projection filtered out. Absent on a daemon that predates it. */
+  cursor?: number;
+  /** CAD-1853: backward reads only — the LOWEST `seq` this page scanned, the
+   *  `before` continuation past every row the projection filtered out. */
+  scanned_before?: number;
+  /** CAD-1853: forward reads only — the scan filled the page, so raw rows may
+   *  remain beyond it. `false` is exhaustion; absent on a daemon that
+   *  predates it. */
+  more_after?: boolean;
+  cloud_withheld?: string;
 }
 
 /** How the store reads pages: forward after a seq, the newest page, or
@@ -610,25 +992,70 @@ export async function loadThread(
   limit = PAGE,
 ): Promise<ThreadState> {
   const held = current ?? EMPTY_THREAD;
+  let state = held;
   try {
-    let after = lastSeq(held);
-    if (after !== null) {
-      let state = held;
+    const resume = held.cloudRefreshNeeded ? null : resumeSeq(held);
+    if (resume !== null) {
+      let after: number = resume;
       for (let i = 0; i < CATCH_UP_PAGES; i++) {
         const page = await read.after(after, limit);
+        const visible = (page.entries ?? []).length;
         state = mergePage(state, page);
-        if ((page.entries ?? []).length < limit) return state;
-        after = lastSeq(state) ?? after;
+        if (state.cloudRefreshNeeded) break;
+        // CAD-1853: resume past every row the daemon scanned, not just the
+        // ones it kept. A page of another source's cloud entries is filtered
+        // out of the projection, shows nothing, and still carries the cursor
+        // beyond them; ignoring it would read the same hidden page forever.
+        const next: number =
+          typeof page.cursor === "number" &&
+          Number.isSafeInteger(page.cursor) &&
+          page.cursor > after
+            ? page.cursor
+            : (lastSeq(state) ?? after);
+        if (next > after) state = { ...state, cursor: next };
+        // Exhaustion is a property of the RAW scan, not of the kept rows: a
+        // projection can hide every row of a FULL page, so a small visible
+        // count no longer proves the thread's end. Prefer the daemon's own
+        // raw-page answer; a daemon that predates it keeps the visible-count
+        // rule.
+        const exhausted =
+          typeof page.more_after === "boolean"
+            ? !page.more_after
+            : visible > 0 && visible < limit;
+        if (exhausted) return state;
+        if (next <= after) return state;
+        after = next;
       }
       // Too far behind to replay: reopen on the newest page.
     }
     const page = await read.tail(limit);
     const fresh = mergePage(
-      { ...EMPTY_THREAD, pending: held.pending, replySeq: held.replySeq },
+      state.cloudRefreshNeeded || state.cloudWithheld != null
+        ? state
+        : { ...EMPTY_THREAD, pending: held.pending, replySeq: state.replySeq },
       page,
     );
+    const scanned = Math.max(
+      typeof page.cursor === "number" && Number.isSafeInteger(page.cursor)
+        ? page.cursor
+        : 0,
+      resumeSeq(fresh) ?? 0,
+    );
+    // The tail is a BACKWARD read too. Its lowest scanned seq is where
+    // "earlier" continues, even when the projection kept none of the page —
+    // without it a fully filtered tail leaves older history unreachable,
+    // because there is no held entry to page below.
+    const older =
+      typeof page.scanned_before === "number" &&
+      Number.isSafeInteger(page.scanned_before) &&
+      page.scanned_before > 0
+        ? page.scanned_before
+        : null;
     return {
       ...fresh,
+      cloudRefreshNeeded: false,
+      ...(scanned > 0 ? { cursor: scanned } : {}),
+      ...(older !== null ? { older } : {}),
       moreBefore: typeof page.more_before === "boolean" ? page.more_before : null,
     };
   } catch (e) {
@@ -643,9 +1070,20 @@ export function fetchEarlier(
   state: ThreadState,
   limit = PAGE,
 ): Promise<ThreadPageLike> | null {
+  // Continue below the last BACKWARD SCAN, not below the oldest held entry:
+  // a projection can hide a whole page, so the oldest held seq does not move
+  // and paging from it would re-read the same hidden page forever. The
+  // daemon's `scanned_before` is that boundary; without it (an older daemon)
+  // the first held entry is all we have.
   const first = state.entries[0]?.seq;
-  if (first === undefined || first <= 1) return null;
-  return read.before(first, limit);
+  const before =
+    first === undefined
+      ? state.older
+      : state.older === undefined
+        ? first
+        : Math.min(first, state.older);
+  if (before === undefined || before <= 1) return null;
+  return read.before(before, limit);
 }
 
 /**
@@ -655,7 +1093,26 @@ export function fetchEarlier(
  */
 export function applyEarlier(state: ThreadState | null, page: ThreadPageLike): ThreadState {
   const merged = mergePage(state, page);
-  return { ...merged, moreBefore: page.more_before === true };
+  // The backward boundary only moves DOWN as pages fold in; keeping the
+  // smallest boundary read so far is what makes repeated "earlier" presses
+  // cross hidden pages instead of asking for the same one again.
+  const scanned =
+    typeof page.scanned_before === "number" &&
+    Number.isSafeInteger(page.scanned_before) &&
+    page.scanned_before > 0
+      ? page.scanned_before
+      : undefined;
+  const older =
+    scanned === undefined
+      ? state?.older
+      : state?.older === undefined
+        ? scanned
+        : Math.min(state.older, scanned);
+  return {
+    ...merged,
+    moreBefore: page.more_before === true,
+    ...(older !== undefined ? { older } : {}),
+  };
 }
 
 /** Items rendered at most, until the operator asks for earlier ones. */

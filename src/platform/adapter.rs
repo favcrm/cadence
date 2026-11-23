@@ -64,19 +64,25 @@ impl std::error::Error for AppArtifactError {}
 pub enum AppCapabilityError {
     Refused(String),
     Uncertain(String),
+    /// A refusal known not to have executed: the provider answered 402
+    /// `insufficient_funds` and charged nothing (CAD-1868). Typed so callers
+    /// never classify out-of-credit from text.
+    InsufficientFunds(String),
 }
 
 impl AppCapabilityError {
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Refused(_) => "refused",
+            Self::Refused(_) | Self::InsufficientFunds(_) => "refused",
             Self::Uncertain(_) => "uncertain",
         }
     }
 
     pub fn reason(&self) -> &str {
         match self {
-            Self::Refused(reason) | Self::Uncertain(reason) => reason,
+            Self::Refused(reason) | Self::Uncertain(reason) | Self::InsufficientFunds(reason) => {
+                reason
+            }
         }
     }
 }
@@ -209,12 +215,25 @@ impl ImageFailure {
 
 impl From<ImageFailure> for AppCapabilityError {
     fn from(failure: ImageFailure) -> Self {
-        if failure.not_executed {
+        if failure.not_executed && failure.reason == ImageReason::InsufficientFunds {
+            Self::InsufficientFunds(failure.detail)
+        } else if failure.not_executed {
             Self::Refused(failure.detail)
         } else {
             Self::Uncertain(failure.detail)
         }
     }
+}
+
+/// One connected read, as the gate admitted it: the reviewed tool, the
+/// caller's arguments, the connection it reads and the charge the caller
+/// already accepted.
+pub struct ConnectedRead<'a> {
+    pub tool: &'a str,
+    pub input: &'a Value,
+    pub connection: &'a str,
+    pub max_charge_minor: u64,
+    pub idempotency_key: &'a str,
 }
 
 /// One platform's adapter — the proxy's outward leg.
@@ -250,6 +269,42 @@ pub trait PlatformAdapter: Send + Sync {
         expected_hash: Option<&str>,
     ) -> std::result::Result<Value, String> {
         self.execute(credential, tool, input, idempotency_key, expected_hash)
+    }
+
+    /// A connected read distinguishes a proven refusal from an outcome that
+    /// may have reached the provider and must be reconciled with the same key.
+    /// Only a tool declared as `connected_read` reaches this method.
+    fn execute_connected_read(
+        &self,
+        _account: &str,
+        _credential: &[u8],
+        _call: &ConnectedRead<'_>,
+    ) -> std::result::Result<Value, AppCapabilityError> {
+        Err(AppCapabilityError::Refused(
+            "this platform has no connected-read door".into(),
+        ))
+    }
+
+    /// Preserve a protocol's typed outcome where its adapter can establish one.
+    /// Existing adapters retain their string-error contract.
+    fn execute_for_account_with_outcome(
+        &self,
+        account: &str,
+        credential: &[u8],
+        tool: &str,
+        input: &Value,
+        idempotency_key: &str,
+        expected_hash: Option<&str>,
+    ) -> crate::error::Result<Value> {
+        self.execute_for_account(
+            account,
+            credential,
+            tool,
+            input,
+            idempotency_key,
+            expected_hash,
+        )
+        .map_err(crate::error::Error::internal)
     }
 
     /// Reviewed discovery metadata. Legacy adapters default unavailable.
@@ -333,6 +388,9 @@ pub trait PlatformAdapter: Send + Sync {
             .map_err(|error| match error {
                 AppCapabilityError::Refused(m) => {
                     ImageFailure::refused(ImageReason::SubmitRefused, m)
+                }
+                AppCapabilityError::InsufficientFunds(m) => {
+                    ImageFailure::refused(ImageReason::InsufficientFunds, m)
                 }
                 AppCapabilityError::Uncertain(m) => {
                     ImageFailure::uncertain(ImageReason::ProviderUncertain, m)

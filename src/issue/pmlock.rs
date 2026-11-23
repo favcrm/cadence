@@ -65,7 +65,7 @@
 //! (`--separate-git-dir`, a worktree) keeps its coordination files in
 //! the git dir `git rev-parse --git-dir` names.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -79,6 +79,13 @@ use std::time::{Duration, Instant};
 
 use super::{Pm, MARKER_LOCK_FILE};
 use crate::error::{Error, Result};
+
+mod snapshot;
+
+use snapshot::{
+    classify, files_since, read_snapshot, snapshot_protects, snapshot_time, sweep_tmp,
+    write_snapshot,
+};
 
 /// Content of `.write.lock` while a new-protocol writer holds it:
 /// [`MARKER`] plus an optional diagnostic trailer, one `key=value`
@@ -346,8 +353,8 @@ const FLOCK_FILE: &str = "cadence-write.flock";
 /// untracked directory is one `dir/` entry) lives in `.v2` so neither
 /// side ever classifies against the other's format (CAD-1208). Never
 /// read, rewrite or delete the old name: an older binary still owns it.
-const DIRTY_FILE: &str = "cadence-write.dirty.v2";
-const TMP_PREFIX: &str = "cadence-write.tmp-";
+pub(super) const DIRTY_FILE: &str = "cadence-write.dirty.v2";
+pub(super) const TMP_PREFIX: &str = "cadence-write.tmp-";
 const WAIT: Duration = Duration::from_secs(15);
 /// A waiter parked in a blocking `flock` re-checks the lease and actor
 /// fences this often.
@@ -700,7 +707,7 @@ enum GitDirError {
     Io(std::io::Error),
 }
 
-fn io_unknown(path: &Path, what: &str, e: impl std::fmt::Display) -> Error {
+pub(super) fn io_unknown(path: &Path, what: &str, e: impl std::fmt::Display) -> Error {
     Error::internal(format!(
         "tracker lock state unknown (I/O): {what} ({}): {e}; refusing to write",
         path.display()
@@ -708,11 +715,11 @@ fn io_unknown(path: &Path, what: &str, e: impl std::fmt::Display) -> Error {
 }
 
 /// The tracker's git state as the lock cares about it.
-struct Tree {
-    git_state: Vec<String>,
-    staged: Vec<String>,
+pub(super) struct Tree {
+    pub(super) git_state: Vec<String>,
+    pub(super) staged: Vec<String>,
     /// Untracked or modified (unstaged) paths, as `(kind, path)`.
-    loose: Vec<(&'static str, String)>,
+    pub(super) loose: Vec<(&'static str, String)>,
 }
 
 /// What an interrupted write left, split from what was already there.
@@ -720,25 +727,25 @@ struct Tree {
 /// checks; `global` is true when git-level markers (`index.lock`,
 /// merge/rebase heads) are present — those refuse every write,
 /// disjoint or not.
-struct Interruption {
-    named: Vec<String>,
-    foreign: Vec<String>,
+pub(super) struct Interruption {
+    pub(super) named: Vec<String>,
+    pub(super) foreign: Vec<String>,
     /// The protected paths themselves, without the `kind` prefix that
     /// `foreign` carries for display (CAD-1601: a recovery compares a
     /// selected path against these).
-    foreign_paths: Vec<String>,
-    paths: Vec<String>,
-    global: bool,
+    pub(super) foreign_paths: Vec<String>,
+    pub(super) paths: Vec<String>,
+    pub(super) global: bool,
     /// The Git-global hazards that make the interruption unresolvable by
     /// a path-local recovery: `index.lock`, a merge/rebase/cherry-pick
     /// state. Kept apart from `named` so a caller can name them
     /// exactly (CAD-1601).
-    hazards: Vec<String>,
+    pub(super) hazards: Vec<String>,
     /// The file scan stopped at its cap: the names are a SAMPLE.
-    sampled: bool,
+    pub(super) sampled: bool,
     /// The acquisition snapshot was present and trustworthy. Without
     /// it, no path can be attributed to the crash (CAD-1601).
-    snapshot_known: bool,
+    pub(super) snapshot_known: bool,
 }
 
 fn open_coordination(path: &Path, create: bool) -> std::io::Result<Option<File>> {
@@ -775,7 +782,7 @@ fn flock(file: &File, op: i32) -> std::io::Result<bool> {
 }
 
 /// Create `path` exclusively without following a link at it.
-fn create_exclusive(path: &Path, content: &str) -> std::io::Result<File> {
+pub(super) fn create_exclusive(path: &Path, content: &str) -> std::io::Result<File> {
     use std::io::Write;
     let mut f = OpenOptions::new()
         .write(true)
@@ -785,251 +792,6 @@ fn create_exclusive(path: &Path, content: &str) -> std::io::Result<File> {
         .open(path)?;
     f.write_all(content.as_bytes())?;
     Ok(f)
-}
-
-/// `None` when this version's snapshot does not exist (a crash by an
-/// older build, which wrote another format under another name).
-fn read_snapshot(git_dir: &Path) -> Result<Option<HashSet<String>>> {
-    let path = git_dir.join(DIRTY_FILE);
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io_unknown(&path, "the dirty-path snapshot", e)),
-    };
-    let mut buf = Vec::new();
-    // One byte past the cap: a snapshot larger than this build reads is
-    // truncated, so its protected set is unknown and it is not trusted.
-    file.take((16 << 20) + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| io_unknown(&path, "the dirty-path snapshot", e))?;
-    if buf.len() > (16 << 20) {
-        return Ok(None);
-    }
-    let mut names: Vec<String> = String::from_utf8_lossy(&buf)
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect();
-    // The tag proves THIS version wrote the file, including the staged
-    // set. An older build's snapshot has no tag, so its staged set is
-    // unknown and no provenance can be derived from it.
-    if names.first().map(String::as_str) != Some("cadence-snapshot v3") {
-        return Ok(None);
-    }
-    names.remove(0);
-    Ok(Some(names.into_iter().collect()))
-}
-
-/// When the dirty-path snapshot was written: the moment the last
-/// writer that rewrote it took the lock. `None` without a snapshot.
-/// A file older than it is treated as pre-existing — a tie is read as
-/// new, the refusing side. This only ever excludes a path from the
-/// diagnostic name list; it never authorizes a recovery action.
-fn snapshot_time(git_dir: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(git_dir.join(DIRTY_FILE))
-        .and_then(|m| m.modified())
-        .ok()
-}
-
-/// Files under `root/rel` modified at or after `since`. Symlinks are
-/// not followed.
-///
-/// Returns true when the scan stopped early: the names are then only
-/// a sample, and the caller must block the whole directory.
-fn files_since(
-    root: &Path,
-    rel: &str,
-    since: std::time::SystemTime,
-    out: &mut Vec<String>,
-) -> bool {
-    const CAP: usize = 64;
-    let mut stack = vec![rel.trim_end_matches('/').to_string()];
-    let mut visited = 0usize;
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(root.join(&dir)) else {
-            // A directory that cannot be read makes the scan incomplete.
-            return true;
-        };
-        for e in rd {
-            let e = match e {
-                Ok(e) => e,
-                // An entry the iterator could not produce makes the scan
-                // incomplete, never silently shorter.
-                Err(_) => return true,
-            };
-            visited += 1;
-            if out.len() >= CAP || visited > 500_000 {
-                return true;
-            }
-            let Ok(m) = e.metadata() else { return true };
-            let name = format!("{dir}/{}", e.file_name().to_string_lossy());
-            if m.is_dir() {
-                stack.push(name);
-            } else if m.modified().map(|t| t >= since).unwrap_or(true) {
-                out.push(name);
-            }
-        }
-    }
-    false
-}
-
-fn write_snapshot(git_dir: &Path, tree: &Tree) -> Result<()> {
-    let tmp = git_dir.join(format!("{TMP_PREFIX}dirty-{}", std::process::id()));
-    let path = git_dir.join(DIRTY_FILE);
-    let mut content = String::from("cadence-snapshot v3\0");
-    for (_, p) in &tree.loose {
-        content.push_str(p);
-        content.push('\0');
-    }
-    // The STAGED set too (CAD-1601): a path staged when the crash took
-    // the lock is positive evidence that the crash did not stage it.
-    // Without it, a path staged before the acquisition could be blamed
-    // on the crash by a timestamp alone.
-    for p in &tree.staged {
-        content.push_str(p);
-        content.push('\0');
-    }
-    let _ = std::fs::remove_file(&tmp);
-    create_exclusive(&tmp, &content).map_err(|e| io_unknown(&tmp, "the dirty-path snapshot", e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        io_unknown(&path, "the dirty-path snapshot", e)
-    })
-}
-
-/// Remove temp markers a crashed writer leaked. Only called with the
-/// kernel lock held, so none belongs to a live writer.
-fn sweep_tmp(git_dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(git_dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        if e.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
-}
-
-/// True when the snapshot recorded `p`, or a directory that contains
-/// it. Git lists an untracked directory as one `dir/` entry, so its
-/// children are protected by that entry even when they are not named
-/// individually.
-fn snapshot_protects(snapshot: &HashSet<String>, p: &str) -> bool {
-    if snapshot.contains(p) {
-        return true;
-    }
-    let mut end = 0;
-    while let Some(i) = p[end..].find('/') {
-        end += i;
-        if snapshot.contains(&format!("{}/", &p[..end])) {
-            return true;
-        }
-        end += 1;
-    }
-    false
-}
-
-fn classify(
-    tree: &Tree,
-    snapshot: Option<&HashSet<String>>,
-    inside: &[String],
-    ambiguous: &[String],
-    whole: &[String],
-    sampled: bool,
-) -> Option<Interruption> {
-    let mut named: Vec<String> = Vec::new();
-    let mut foreign: Vec<String> = Vec::new();
-    let mut foreign_paths: Vec<String> = Vec::new();
-    let mut paths: Vec<String> = Vec::new();
-    for s in &tree.git_state {
-        named.push(format!("git state {s}"));
-    }
-    for p in &tree.staged {
-        // Positive provenance, not a timestamp: a path already dirty
-        // when the crash took the lock is in the snapshot, so the crash
-        // did not create it. Without a snapshot (an older build's
-        // crash) nothing is proven, and the path is protected.
-        if snapshot.is_some_and(|s| !snapshot_protects(s, p)) {
-            named.push(format!("staged {p}"));
-            paths.push(p.clone());
-        } else {
-            // Staged before the crash took the lock (or with no
-            // snapshot): it blocks and is named, but no provenance
-            // proves the crash staged it, so it is protected too.
-            named.push(format!("staged {p}"));
-            foreign.push(format!("staged {p}"));
-            foreign_paths.push(p.clone());
-            paths.push(p.clone());
-        }
-    }
-    for (kind, p) in &tree.loose {
-        if snapshot.is_none() {
-            if *kind == "untracked" {
-                // CAD-1208: present untracked paths cannot be told from
-                // leftovers, so none is blamed.
-                foreign.push(format!("{kind} {p}"));
-                foreign_paths.push(p.clone());
-            } else {
-                // A modified tracked file: it blocks, but with no
-                // snapshot nothing proves the crash modified it, so it
-                // is protected too.
-                named.push(format!("{kind} {p}"));
-                foreign.push(format!("{kind} {p}"));
-                foreign_paths.push(p.clone());
-                paths.push(p.clone());
-            }
-        } else if snapshot.is_some_and(|s| snapshot_protects(s, p)) {
-            foreign.push(format!("{kind} {p}"));
-            foreign_paths.push(p.clone());
-        } else if p.ends_with('/') && inside.iter().any(|f| f.starts_with(p.as_str())) {
-            // Named by the files found inside it, below.
-        } else {
-            named.push(format!("{kind} {p}"));
-            paths.push(p.trim_end_matches('/').to_string());
-        }
-    }
-    for p in inside {
-        if snapshot.is_some_and(|s| !snapshot_protects(s, p)) {
-            named.push(format!("untracked {p}"));
-            paths.push(p.clone());
-        } else {
-            foreign.push(format!("untracked {p}"));
-            foreign_paths.push(p.clone());
-        }
-    }
-    // Files under a directory that was ALREADY dirty when the crash
-    // took the lock: they block and they are named, but no timestamp
-    // proves the crash wrote them, so they are also protected — a
-    // recovery may not act on one.
-    for p in ambiguous {
-        named.push(format!("untracked {p}"));
-        foreign.push(format!("untracked {p}"));
-        foreign_paths.push(p.clone());
-        paths.push(p.clone());
-    }
-    // Names are a capped sample; a directory scanned in part blocks
-    // everything under it, so the bound never shrinks the blocked set.
-    for d in whole {
-        paths.push(d.trim_end_matches('/').to_string());
-    }
-    if named.is_empty() {
-        None
-    } else {
-        Some(Interruption {
-            global: !tree.git_state.is_empty(),
-            named,
-            foreign,
-            foreign_paths,
-            paths,
-            hazards: tree.git_state.clone(),
-            sampled,
-            snapshot_known: snapshot.is_some(),
-        })
-    }
 }
 
 impl Pm {
@@ -1846,7 +1608,12 @@ impl Pm {
     fn interrupted_error(&self, i: &Interruption, meta: Option<&MarkerMeta>) -> Error {
         const SHOW: usize = 8;
         let more = i.named.len().saturating_sub(SHOW);
-        let named: Vec<&str> = i.named.iter().take(SHOW).map(String::as_str).collect();
+        let named: Vec<String> = i
+            .named
+            .iter()
+            .take(SHOW)
+            .map(|name| interrupted_entry(name))
+            .collect();
         let tail = if more > 0 {
             format!(" (+{more} more)")
         } else {
@@ -1862,26 +1629,43 @@ impl Pm {
         };
         let trailer = match meta {
             Some(m) => format!(
-                " The crashed writer's marker said: {}.",
+                " The marker from the crashed writer said: {}.",
                 describe_holder(&HolderScan::NoneFound, Some(m))
             ),
             None => String::new(),
         };
-        Error::rejected(format!(
-            "the tracker has an interrupted write: a writer exited without \
-             finishing, leaving {}{tail}. Nothing was replayed or committed and \
-             the lock itself is free.{foreign} The write's outcome is uncertain — check \
-             `git -C {} status` and `cadence issue lint`, then commit or discard \
-             those paths yourself; writes touching them resume once they are resolved, \
-             while writes to disjoint paths (via lock_for_paths) proceed.{trailer}",
-            named.join(", "),
-            self.dir.display()
+        Error::rejected(interrupted_text(
+            &self.dir,
+            &named.join(", "),
+            &tail,
+            &foreign,
+            &trailer,
         ))
     }
 }
 
-#[cfg(test)]
-mod cad1190_acceptance;
+/// One `"{kind} {path}"` entry for the refusal, each word sanitized on its own so
+/// the label still reads and a checker can still look for it.
+fn interrupted_entry(name: &str) -> String {
+    name.split(' ')
+        .map(crate::printed_command::sanitized)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The refusal for an interrupted write. A person may paste the whole line, so it has
+/// no apostrophe in its fixed words: one would flip the quoting around the path.
+fn interrupted_text(dir: &Path, named: &str, tail: &str, foreign: &str, trailer: &str) -> String {
+    format!(
+        "the tracker has an interrupted write: a writer exited without \
+         finishing, leaving {named}{tail}. Nothing was replayed or committed and \
+         the lock itself is free.{foreign} The outcome of the write is uncertain — check \
+         {} and `cadence issue lint`, then commit or discard \
+         those paths yourself; writes touching them resume once they are resolved, \
+         while writes to disjoint paths (via lock_for_paths) proceed.{trailer}",
+        crate::printed_command::with_path("git -C", dir, " status")
+    )
+}
 
 const LEGACY_GENERATION_FILE: &str = "cadence-legacy-generation";
 
@@ -1916,9 +1700,6 @@ impl Drop for LegacyWrite {
         }
     }
 }
-
-#[cfg(test)]
-mod cad1208_acceptance;
 
 #[cfg(test)]
 mod tests {
@@ -2059,5 +1840,45 @@ mod tests {
         let got = pm.lock().expect("an untracked file is not blamed");
         drop(got);
         assert_eq!(std::fs::read(&old).unwrap(), b"foreign/old.txt\0");
+    }
+}
+
+#[cfg(test)]
+mod printed_text_tests {
+    use super::*;
+    use crate::printed_command::tests::{assert_inert_when_pasted, CRAFTED};
+
+    #[test]
+    fn an_interrupted_write_message_is_inert_when_the_whole_line_is_pasted() {
+        for name in CRAFTED {
+            let dir = Path::new("/repo").join(name);
+            let named = interrupted_entry(&format!("untracked {name}/issue.md"));
+            let text = interrupted_text(&dir, &named, "", " extra", " marker");
+            assert_inert_when_pasted(&text);
+            // Without the fixed `(`, which stops a shell before it reads the rest.
+            assert_inert_when_pasted(&text.replace(['(', ')'], ""));
+        }
+    }
+
+    /// An apostrophe in the fixed words would flip the quoting around the path. The
+    /// only two here are the ones quoting the path.
+    #[test]
+    fn the_interrupted_write_message_has_no_apostrophe_of_its_own() {
+        let text = interrupted_text(Path::new("/repo"), "staged a.md", "", "", "");
+        assert_eq!(text.matches('\'').count(), 2, "{text}");
+    }
+
+    /// Labels stay readable, and a check for a blamed path can still fail.
+    #[test]
+    fn an_interrupted_entry_keeps_its_label_and_sanitizes_each_word() {
+        assert_eq!(
+            interrupted_entry("staged crashed/issue.md"),
+            "staged crashed/issue.md"
+        );
+        assert_eq!(
+            interrupted_entry("git state MERGE_HEAD"),
+            "git state MERGE_HEAD"
+        );
+        assert_eq!(interrupted_entry("untracked x;y"), "untracked x?y");
     }
 }

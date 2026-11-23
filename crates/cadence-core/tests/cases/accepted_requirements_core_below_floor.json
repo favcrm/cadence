@@ -1,0 +1,38 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.requirements.evaluate",
+    "input": {
+      "manifest": "---\nname: demo\nneeds:\n  requires:\n    core: \">=0.4.0\"\n---\nbody\n",
+      "target": {
+        "core": "0.3.0",
+        "contracts": {}
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "app.requirements.evaluate",
+    "value": {
+      "schema": 1,
+      "ok": false,
+      "compatible": false,
+      "unmet": "app requires core >=0.4.0 — this host is 0.3.0",
+      "declared": true,
+      "core": ">=0.4.0",
+      "contracts": {},
+      "host": {
+        "core": "0.3.0",
+        "contracts": {}
+      },
+      "checks": [
+        {
+          "kind": "core",
+          "required": ">=0.4.0",
+          "host": "0.3.0",
+          "ok": false
+        }
+      ]
+    }
+  }
+}

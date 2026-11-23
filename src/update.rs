@@ -496,8 +496,8 @@ pub struct CheckReport {
     pub target: String,
     pub target_version: Option<String>,
     pub up_to_date: bool,
-    /// Merged PR titles between the linked release and the target.
-    pub changes: Vec<String>,
+    /// Merged PR titles, or `None` when the source cannot provide them.
+    pub changes: Option<Vec<String>>,
     /// The store's schema, when a database exists.
     pub schema_current: Option<i64>,
     /// The target build's `SCHEMA_VERSION`, read from the repository at
@@ -539,13 +539,19 @@ impl CheckReport {
         }
         if self.older {
             out.push("changes: the target is older than current — no changes list".to_string());
-        } else if !self.changes.is_empty() {
-            out.push(format!("changes: {} merged PR(s)", self.changes.len()));
-            for change in &self.changes {
-                out.push(format!("  - {change}"));
+        } else if let Some(changes) = &self.changes {
+            if !changes.is_empty() {
+                out.push(format!("changes: {} merged PR(s)", changes.len()));
+                for change in changes {
+                    out.push(format!("  - {change}"));
+                }
+            } else if !self.up_to_date {
+                out.push(
+                    "changes: no merged PR titles recorded between the two builds".to_string(),
+                );
             }
         } else if !self.up_to_date {
-            out.push("changes: none recorded between the two builds".to_string());
+            out.push("changes: unavailable from this release source".to_string());
         }
         out.push(match (self.schema_current, self.schema_target) {
             (Some(from), Some(to)) if to > from => format!(
@@ -586,8 +592,9 @@ impl CheckReport {
             "target": self.target,
             "target_version": self.target_version,
             "up_to_date": self.up_to_date,
+            "changes_available": self.changes.is_some(),
             "changes": self.changes,
-            "change_count": self.changes.len(),
+            "change_count": self.changes.as_ref().map(Vec::len),
             "schema": {"current": self.schema_current, "target": self.schema_target,
                        "migration": self.migration},
             "lease": self.lease,
@@ -737,25 +744,20 @@ fn fmt_epoch(secs: f64) -> String {
     crate::issue::time::basic(secs as i64)
 }
 
-/// The linked release's version string: the running process's own when
-/// the link points at it, else reconstructed from a verified CI
-/// manifest, else `None` (the caller prints the sha alone).
+/// A release's version string, known only when `sha` is this running
+/// process: a manifest records no version, and the running build's version
+/// says nothing about another commit (CAD-2007). `None`: the caller prints
+/// the sha alone.
 fn version_of(layout: &Layout, sha: &str) -> Option<String> {
     let binary = layout.binary(sha);
-    if let (Ok(me), Ok(target)) = (std::env::current_exe(), std::fs::canonicalize(&binary)) {
-        if std::fs::canonicalize(&me).is_ok_and(|me| me == target) {
-            return Some(format!(
-                "{}+{}",
-                env!("CARGO_PKG_VERSION"),
-                crate::overview::BUILD_COMMIT
-            ));
-        }
-    }
-    let manifest = layout.release_dir(sha).join(upgrade::MANIFEST);
-    let text = std::fs::read_to_string(manifest).ok()?;
-    let manifest: Value = serde_json::from_str(&text).ok()?;
-    (manifest["source_sha"].as_str() == Some(sha))
-        .then(|| format!("{}+{sha}", env!("CARGO_PKG_VERSION")))
+    let me = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+    (std::fs::canonicalize(&binary).ok()? == me).then(|| {
+        format!(
+            "{}+{}",
+            env!("CARGO_PKG_VERSION"),
+            crate::overview::BUILD_COMMIT
+        )
+    })
 }
 
 /// `cadence update --check`: resolve the newest green main build, the
@@ -878,8 +880,8 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
                  or use `cadence update --rollback` for an intended rollback"
             )),
             Ok(None) | Err(_) => refusals.push(format!(
-                "{builds}: cannot prove target is newer than current: GitHub gave no ancestry \
-                 answer. Refusing rather than guessing — retry or approve a newer staging \
+                "{builds}: cannot prove target is newer than current: the release source gave no \
+                 ancestry answer. Refusing rather than guessing — retry or approve a newer staging \
                  candidate, or use `cadence update --rollback` for an intended rollback"
             )),
         }
@@ -896,8 +898,9 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
         }
     }
     let changes = match (&current_sha, up_to_date, older) {
-        (Some(from), false, false) => src.merged_titles(from, &target).unwrap_or_default(),
-        _ => Vec::new(),
+        (Some(_), true, _) => Some(Vec::new()),
+        (Some(from), false, false) => src.merged_titles(from, &target).unwrap_or(None),
+        _ => None,
     };
     let migration = matches!((schema_current, schema_target), (Some(from), Some(to)) if to > from);
     let lease = rollout::status(state_dir)?;
@@ -1500,9 +1503,10 @@ fn run_inner(
             })?;
             restore_board(host, &binary, &previous, board_before)?;
             let restore = backup["backup"]["manifest"].as_str().map(|manifest| {
+                use crate::printed_command::{command, Part};
                 format!(
-                    "if the schema changed, restore the pre-update backup: \
-                     `cadence restore {manifest}`"
+                    "if the schema changed, restore the pre-update backup: {}",
+                    command(&[Part::Fixed("cadence restore "), Part::Value(manifest)])
                 )
             });
             progress(
@@ -1531,7 +1535,12 @@ fn run_inner(
             });
         }
     };
-    progress(host, format!("health: daemon and board answer on {target}"));
+    let healthy = if board_before {
+        "local daemon and board answer"
+    } else {
+        "local daemon answers"
+    };
+    progress(host, format!("health: {healthy} on {target}"));
     host.set_pending(Some(&pending("verifying")))?;
     let pruned = prune_releases(host, opts.keep)?;
     if !pruned.is_empty() {
@@ -1751,7 +1760,7 @@ fn check_after_rollback(host: &dyn UpdateHost, sha: &str) -> CheckReport {
         target: sha.to_string(),
         target_version: None,
         up_to_date: true,
-        changes: Vec::new(),
+        changes: Some(Vec::new()),
         schema_current: None,
         schema_target: None,
         migration: false,
@@ -1829,8 +1838,8 @@ mod tests {
         fn verify_attestation(&self, _: &Path, _: &str) -> Result<String> {
             Err(Error::internal("no network in tests"))
         }
-        fn merged_titles(&self, _: &str, _: &str) -> Result<Vec<String>> {
-            Ok(Vec::new())
+        fn merged_titles(&self, _: &str, _: &str) -> Result<Option<Vec<String>>> {
+            Ok(Some(Vec::new()))
         }
         fn schema_version(&self, _: &str) -> Result<Option<i64>> {
             Ok(self.schema)
@@ -1991,6 +2000,56 @@ mod tests {
         let err = run(&host, &Options::default()).unwrap_err().to_string();
         assert!(err.contains("schema"), "{err}");
         assert!(!host.installed(NEW));
+    }
+
+    /// CAD-2007: a retained manifest proves which commit a binary came
+    /// from, not its version. The running build's own version must never
+    /// be attached to another commit: v0.3.12 printed `0.3.12+059448e7`
+    /// for a commit whose binary reports 0.3.11.
+    #[test]
+    fn a_target_version_is_never_borrowed_from_the_running_build() {
+        let borrowed = format!("{}+{NEW}", env!("CARGO_PKG_VERSION"));
+        let retained = |manifest: Option<&str>| {
+            let host = Host::new(src(NEW, "behind", 33), 33);
+            let dir = host.layout.release_dir(NEW);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(body) = manifest {
+                std::fs::write(dir.join(upgrade::MANIFEST), body).unwrap();
+            }
+            host
+        };
+        let matching = format!(r#"{{"source_sha":"{NEW}"}}"#);
+        let other = format!(r#"{{"source_sha":"{OLD}"}}"#);
+        for manifest in [
+            Some(matching.as_str()),
+            Some(other.as_str()),
+            Some("not json"),
+            None,
+        ] {
+            let report = check(&retained(manifest)).unwrap();
+            assert_eq!(report.target_version, None, "manifest {manifest:?}");
+            let text = report.lines().join("\n");
+            assert!(!text.contains(&borrowed), "{text}");
+            assert!(
+                report
+                    .lines()
+                    .iter()
+                    .any(|line| line == &format!("available: {NEW}")),
+                "the target must print as its sha alone: {text}"
+            );
+        }
+    }
+
+    /// CAD-2007: the default source is the owned catalogue, which never asks
+    /// GitHub, so a refusal must not name GitHub as the one that failed. A
+    /// build outside the candidate's recorded history reaches this arm.
+    #[test]
+    fn an_unproven_ancestry_refusal_does_not_blame_github() {
+        let mut source = src(NEW, "behind", 33);
+        source.compare = Ok(None);
+        let text = check(&Host::new(source, 33)).unwrap().lines().join("\n");
+        assert!(text.contains("cannot prove target is newer"), "{text}");
+        assert!(!text.contains("GitHub"), "{text}");
     }
 
     #[test]

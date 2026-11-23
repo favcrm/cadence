@@ -2,22 +2,63 @@
 
 # Cadence
 
-[![ci](https://github.com/favcrm/cadence/actions/workflows/ci.yml/badge.svg)](https://github.com/favcrm/cadence/actions/workflows/ci.yml)
+Run work with agents and people on one board, from a written goal to approved
+delivery.
 
-Coordinate coding agents across terminals, from planning through verified delivery.
+Cadence is for any team: software, design, business or marketing. Every issue
+follows one lifecycle: **draft, start, review, delivery**. Agents do the work and
+the checks, a human approves at review, and delivery follows the approval. Each
+project owns its own delivery policy, so the same product fits a code
+repository and a quotation. The reference is [Delivery](docs/guides/delivery.md).
 
-Cadence is an early Rust implementation of a local development-agent controller.
-It is designed for a Codex or Claude PM coordinating Codex, Claude, Cursor and
-Devin workers on one host, including terminals accessed over SSH.
+Cadence runs as a **hosted workspace** (a board at `<slug>.cadencecloud.app`) or
+as a **native install** on your own machine. Start hosted unless you need your
+work to stay local.
 
 **Development stage:** implementation in progress. Provider support is an
 acceptance-tested capability, not a promise of universal session attachment.
 
+## Start hosted
+
+Teammates do not need to install anything. Open the invitation, sign in with the
+address that received it, choose **Join company**, then **Open app**.
+
+To create a workspace or connect a computer, install the CLI (below), then:
+
+```sh
+cadence register                 # create a workspace in the browser
+cadence login <slug>             # sign in to an existing workspace
+cadence --org <slug> doctor      # check the connection
+cadence --org <slug> issue ls --project <key> --open   # read the board
+```
+
+Every hosted command names its workspace with `--org`. Joining, connecting a
+computer and the shared agent flow are in the
+[hosted workspace guide](docs/guides/hosted-workspace.md); first-run choices are
+in [First run](docs/FIRST-RUN.md).
+
 ## Install
 
-To build from source with the board used in the quick start, install a recent
-stable Rust toolchain via [rustup](https://rustup.rs), Node 22 and Bun 1.4.4
-(pinned in `ui/package.json`). Build the UI before installing Cadence:
+The installer checks archive and binary digests and the version. Releases are
+built for Linux x86_64/ARM64 and Apple Silicon macOS, with build-provenance
+attestations:
+
+```sh
+curl -fsSL https://github.com/favcrm/cadence/releases/latest/download/install.sh -o install.sh
+sh install.sh
+"$HOME/.local/bin/cadence" --version
+```
+
+Linux supports the daemon and board. macOS supports the CLI install and version
+checks only; setup, daemon and board are unsupported there. Installing needs no
+Rust, Node or login. See [native installation](docs/INSTALL-AGENT.md) for
+platforms, pinned versions and provenance verification, and the
+[release record](docs/RELEASING.md) for what each release carries.
+`cadence update` upgrades an installed CLI.
+
+To build from source with the board, install a recent stable Rust toolchain via
+[rustup](https://rustup.rs), Node 22 and Bun 1.4.4 (pinned in `ui/package.json`),
+and build the UI first:
 
 ```bash
 bun install --cwd ui --frozen-lockfile
@@ -29,29 +70,11 @@ For a CLI-only source build, `cargo install --path . --locked` needs just Rust.
 That binary does not embed the board; serving it also requires a built UI and
 `cadence ui start --dist /path/to/ui/dist`.
 
-[Cadence 0.2.0](https://github.com/favcrm/cadence/releases/tag/v0.2.0)
-is published as the stable local CLI release for Linux x86_64/ARM64 and Apple
-Silicon macOS. The installer checks archive/binary digests and version; the release
-includes build-provenance attestations:
+## Run it on your own machine
 
-```sh
-curl -fsSL https://github.com/favcrm/cadence/releases/latest/download/install.sh -o install.sh
-sh install.sh
-"$HOME/.local/bin/cadence" --version
-```
-
-Linux daemon/board evaluation uses fresh, separate state. macOS supports CLI
-installation/version checks only; setup, daemon and board are unsupported pending
-CAD-315. Full clean-platform setup/backup acceptance remains open under CAD-317.
-
-See [native installation](docs/INSTALL-AGENT.md) for supported platforms,
-explicit pilot versions and provenance verification. The
-[release record](docs/RELEASING.md) records the exact source, publication gates
-and three-target anonymous installation evidence. New CLI builds default
-`cadence update` to `https://api-v2.agenticos.hk`, without GitHub API access;
-see the release record for advanced source overrides and verification requirements.
-
-## Quick start
+A native install keeps the tracker, daemon and board on one host, including
+terminals reached over SSH. A Codex or Claude PM coordinates Codex, Claude,
+Cursor and Devin workers.
 
 ```bash
 cadence setup                  # idempotent first run: state dir, tracker,
@@ -63,7 +86,7 @@ cadence skill status           # per-skill files/content and provider-link statu
 
 cadence claude --alias pm --role pm       # named headless PM
 cadence join pm devin --alias w1 --detach # named worker; keep this shell free
-cadence dispatch CAD-1 --to w1 --reply-to pm # use an existing issue ID
+cadence dispatch <ISSUE-ID> --to w1 --reply-to pm # an existing issue
 
 cadence status                 # one-screen fleet overview
 cadence ui status              # check the board started by setup
@@ -83,8 +106,7 @@ details; installed apps keep local Open and operator Manage links even when
 the public catalogue is unavailable. **Choose favorites** keeps quick links
 on the Apps page and in the sidebar.
 
-Standalone boards use `https://api-v2.agenticos.hk` for the public catalogue
-by default. Set `AGENTICOS_BOARD_CATALOG_ORIGIN` only for a custom catalogue;
+Standalone boards read the hosted public catalogue by default. Set `AGENTICOS_BOARD_CATALOG_ORIGIN` only for a custom catalogue;
 invalid explicit values are refused, not replaced with the default. Hosted
 boards retain their internal catalogue route. These reads do not grant
 installation, connection or execution approval.
@@ -125,7 +147,7 @@ history before explicitly retrying an uncertain send.
 sends it automatically, and does not resolve the item.
 
 An issue's **Overview** brings its current result, next action, output links
-and verification together. A worker report is not independent review,
+and verification together. A worker report is not a fresh-session review,
 merge or deployment evidence. Activity, Conversation, Pull request and
 Evidence remain the detailed views; feedback uses the existing conversation.
 
@@ -158,9 +180,11 @@ of this flow.
   stream-json, Pi rpc via `join <pm> pi`); sessions resume by their
   native ids.
 - **A git-backed tracker** — issues are Markdown files in a private repo
-  (`~/pm`); every write is one commit, `issue log`/`blame` work from git alone.
+  (`~/.cadence/tracker` on a fresh install, `~/pm` on an existing one);
+  every write is one commit, `issue log`/`blame` work from git alone.
 - **Verified delivery** — workers report with `sha:`; reviewers bind a verdict
-  to that exact head; `cadence audit` flags merges with no passing verdict.
+  to that exact head; the owner approves that head. See
+  [Delivery](docs/guides/delivery.md).
 - **A board** — read/write SPA + JSON API on loopback; one writer
   implementation behind CLI and API alike.
 - **A sandbox** — `cadence dev up` (alias `sandbox`) runs a disposable second
@@ -188,15 +212,17 @@ docs/       working docs — the context-manifest set stays tracked
 
 For proposals, quotations, reports and letters, give the drafting agent
 [`skills/company-outputs/SKILL.md`](skills/company-outputs/SKILL.md).
-It confirms the proposed solution before authoring, then applies one exact
-Cadence template version: guidelines and reference files for an authoring
-pack, or the existing quotation/invoice DOCX, calculation and export path.
+It finds the company's standard, asks only for what it cannot look up, confirms
+a plan when the stakes need it, and applies one exact Cadence template version:
+guidelines and reference files for an authoring pack, or the quotation/invoice
+calculation and export path. It also covers saving a good result as a template.
 There is no parallel company-profile registry. When a deliverable has a
 visual standard, the skill conditionally loads shared document-design
 guidance: inspect an authoring pack's actual references, keep a short style
-guide in that pack's guidelines, and compare the authored output. A
-quotation or invoice keeps the approved DOCX as its presentation
-standard; a reference pack may inform review only. That guidance
+guide in that pack's guidelines, and compare the authored output. An
+issuable quotation or invoice keeps its approved template as the presentation
+standard, with an HTML view allowed for drafts; a reference pack may inform
+review only. That guidance
 adds no renderer and no PDF service. An authoring pack has no
 DOCX source, prices or PDF export; the user prints or exports the final PDF.
 `cadence skill install` installs

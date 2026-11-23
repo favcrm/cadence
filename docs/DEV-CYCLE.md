@@ -1,8 +1,9 @@
-# A shorter, honest development loop (CAD-1088)
+# The development loop
 
-## The loop today
+## The loop
 
-The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
+The day-to-day loop for one ticket. AGENTS.md holds the rules; this page is the
+order of work and the mechanics.
 
 1. Requirement and plan: state the user outcome, observable acceptance,
    non-goals and material unknowns in the ticket. Resolve consequential
@@ -16,65 +17,52 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    remove dead code, duplication and unnecessary abstractions. The
    `code-simplifier` skill can help; it is not another approval stage.
    Adjacent refactors and polish go to a follow-up ticket.
-3. Run `scripts/pre-push` before every push and show the ticket's outcome.
-   For a bug fix, show the failing case once, then fixed. Add checks only
-   under AGENTS.md's behavior-first and gates/security rules; do not restore
-   retired tests or routinely repeat suites. `--tests` is a focused local
-   diagnostic, not a blanket pre-review prerequisite; required CI and full
-   merge-group regression remain unchanged.
-4. Under strict requirements, one independent reviewer; two for auth, identity,
-   secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
-   lists what gets one).
-5. The version-one delivery tiers apply to clean default-equivalent policies
-   by default after the reviewed implementation is installed; the introducing
-   PR must still satisfy the current trusted-base gates. Routine changes need
-   green exact-head CI and genuine
-   ticket-outcome evidence, with no mandatory review; consequential changes
-   need one independent combined standards/spec review. Sensitive changes
-   keep the existing strict review, operator, Browser QA and full-check
-   requirements. Unknown, incomplete, protected-mode, deletion and mixed
-   sensitive cases retain strict legacy floors. Explicitly approved custom
-   policies remain in force and strict; malformed or unapproved policy changes
-   fail closed. Approved version-one profiles remain readable for compatibility.
-   Mandatory protection checks, full merge-group regression, credential
-   isolation and operator-owned deployment remain unchanged. No fabricated
-   verdict/readiness counts as review or outcome evidence; dry-run is read-only
-   and requirements must be freshly bound before queueing.
-6. Required read-only code review may overlap CI on a stable head; pending
-   CI is not readiness and all required exact-head checks must be green
-   before enqueue. Rebase onto current main before requesting review, as
-   AGENTS.md requires; after approval, rebase only for conflicts. Review
-   correctness, security and ticket acceptance. Preserve independent refusal
-   acceptance for enforced rules and desktop/narrow Browser QA for `ui/**`.
-   REVISE only for correctness, security or ticket-requirement gaps. Other
-   findings are notes: one follow-up ticket or a recorded reason to drop them,
-   not another polish round on the reviewed head.
-7. Operator approval: for a `human`-class PR the operator may record one scope
+3. The worktree hook runs `scripts/pre-push` on Boat before every push; show
+   the ticket's outcome. For a bug fix, show the failing case once, then fixed.
+   Add checks only under AGENTS.md's behaviour-first and gates/security rules;
+   do not restore retired tests or routinely repeat suites. `--tests` is a
+   focused diagnostic, not a blanket pre-review prerequisite.
+4. Review: the evaluator computes the class and the count, and AGENTS.md
+   "Review" is the one description of the reviews, Browser QA and the hosted
+   route. Open the PR as a draft and iterate there: a draft starts no review
+   workflows.
+5. Required read-only code review may overlap CI on a stable head; pending CI is
+   not readiness and all required exact-head checks must be green before the
+   operator enqueues. Rebase onto current main before requesting review; after
+   approval, rebase only for conflicts. Review correctness, security and ticket
+   acceptance. Preserve independent refusal acceptance for enforced rules and
+   desktop and narrow Browser QA for `ui/**`. REVISE only for correctness,
+   security or ticket-requirement gaps. Other findings are notes: one follow-up
+   ticket or a recorded reason to drop them, not another polish round on the
+   reviewed head.
+6. Operator approval: for a `human`-class PR the operator may record one scope
    approval per ticket with
    `cadence audit approve --issue <ID> --action scope`. It covers the ticket
    only while it is ready, doing or review, and its body declares its risk
    triggers on exactly one `Risk:` line. It is bound to the ticket body, so
    editing the body voids it, and verdict notes state `Scope: in-scope <ID>`.
-   Scope approval is optional and valid only when every AGENTS.md condition
-   holds. Triggers 1/3, two-review paths, uncovered scope or invalid bindings
-   require per-head approval; conversation text is never approval evidence.
-8. Post the required exact-head ticket evidence and enqueue with
-   `scripts/enqueue-reviewed <n> --head <full-sha>`. Use the merge queue, not
-   routine `--admin` merges or duplicate local integration trains. Disable
-   auto-merge before editing an enqueued PR; a new head voids old verdicts.
-9. Follow the [artifact-specific rollout checklist](guides/rollout-checklist.md)
+   Scope approval is optional. A diff on a trigger 1 or 3 path, a
+   one-review-excluded or operator-only path, an uncovered scope or an invalid
+   binding requires the per-head approval; conversation text
+   is never approval evidence.
+7. Hand off: run `cadence --org <org> delivery check`, post the exact-head ticket
+   evidence and give the operator the PR. The operator approves and enqueues;
+   agents never do either (AGENTS.md "Review"). Use the merge queue, not routine
+   `--admin` merges or duplicate local integration trains. Disable auto-merge
+   before editing an enqueued PR; a new head voids old verdicts.
+8. Follow the [artifact-specific rollout checklist](guides/rollout-checklist.md)
    and [host release cycle](RELEASING.md). For a native host:
    merged → attested main CI artifact → staged → manually promoted with GitHub
-   `production` approval → operator-installed → operationally verified.
+   `production` approval → published (`promotion-completion`) →
+   operator-installed → operationally verified.
    **Automatic staging is not production promotion.** Check the successful
-   manual `staging.yml` run and its `production-candidate` receipt before
-   handing over the default update commands; a green CI/staging run alone
-   cannot advance the updater's candidate. Public version tags use the
-   separate numbered-release path, not a tag on every merge.
-   Production deployment is operator-owned; agents never restart the live
-   daemon. After merge, reconcile the ticket, leave the worktree to the sweep,
-   and clean up only your own scratch and processes. Record installation and
-   verification separately; reconciliation is merge evidence, not deployment.
+   manual `staging.yml` run, its `production-candidate` receipt and the
+   successful `promotion-completion` run before handing over the default update
+   commands. Public version tags use the separate numbered-release path, not a
+   tag on every merge. Production deployment is operator-owned; agents never
+   restart the live daemon. After merge, finish as AGENTS.md "Finish" says and
+   record installation and verification separately; reconciliation is merge
+   evidence, not deployment.
 
 ## Pragmatic design and cycle time
 
@@ -89,7 +77,7 @@ One bounded author simplification pass precedes review. Stop when acceptance
 and required verification are complete; do not add planning documents,
 reviewers, repeated checks or handoffs merely to make the process look thorough.
 Reuse unchanged-head evidence and reviewer context as described below. Never
-trade away approval, independent review required by the effective policy,
+trade away approval, fresh-session review required by the effective policy,
 isolation or fail-closed guards to save time.
 
 For a slow cycle, inspect existing `cadence issue retro <ID> --json` evidence
@@ -172,36 +160,6 @@ This applies the convergence lessons from
 [How the Claude Code team does code review](https://claude.dev/blog/solving-code-review-at-anthropic/):
 reduce repeated review and human waiting, not the safeguards.
 
-## What #738 taught us
-
-PR #738 took more than four hours to deliver. It was not just a small update:
-it retired roughly 180,000 lines of legacy test/fixture coverage, including
-originally protected controls. That deserved a human scope decision. But
-much of the elapsed time was avoidable coordination and author error.
-
-Evidence: PR CI runs 37098191418 and 37103055285, staging rehearsals
-37098191451 and 37103055272, queue run 37103466054; final merge
-`c4f55f8ec899dd9f431a4cc4884da9bd3b72bfc7`. Required PR jobs on the reconciled
-head took fmt 18s, clippy 1m31s, build 3m21s, test 2m21s, UI 3m45s. Jobs overlap;
-do not add their durations and call that PR latency. These are baseline
-observations, not a controlled performance comparison.
-
-| Friction | Cause | Correction |
-| --- | --- | --- |
-| Repeated failed CI | Author sent child-wrapper, fixture and format-placeholder bugs to CI without a working local floor run | Make `pre-push --tests` actually execute the floor for every explicit request; run before review |
-| False expanded-scope approval | `duplicate: true` returned the approval for the original prohibitive ticket body | Amend scope text first; compute its digest; check the returned digest, not only exit 0 |
-| Repeated full reviews | Fresh reviewer contexts and failure to reuse unchanged-head assessments | Keep the same reviewer handles and ask only for delta/evidence revalidation |
-| Moving-main conflicts | Retirement PR overlapped newly merged test edits | Resolve only approved-scope conflicts; preserve main production changes; show delta and recheck it |
-| Failed paste commands | Interactive `read` in a noninteractive runner; source over 200 characters | Provide direct noninteractive commands, short source text and pinned SHA |
-| Confusing green checks | Retired shard/installer journeys retained old tooling descriptions | Label reduced/dormant consumers explicitly; keep required names but never imply restored coverage |
-| Tracker contention | Shared PM writer was busy | Treat exit 75 as bounded retry; do not invent an approval/comment or bypass the lock |
-
-The author owns these mistakes. Deleting reviews or approvals would hide the
-failure, not fix it. One correctly bound scope approval, the exact-head
-verdicts AGENTS.md "Review" requires (one by default, two for triggers 1/3),
-one correctly bound merge approval and a queue enqueue
-should be the normal path—not repeated requests for the same decision.
-
 ## Change-dependent PR feedback
 
 A classifier read from the **base revision** selects cheap PR feedback:
@@ -226,32 +184,81 @@ Required contexts explicitly report not-applicable commands, never 'built' or
 'passed tests' when they did not execute. Merge groups do not take the fast
 path: this keeps final integration coverage even when docs are read indirectly
 by source/tests. Fast-path timings measure PR feedback, not total landing
-latency. #758 bootstraps the policy with a full run because its base lacks it.
-
-## One local entry point
+latency.
+## One entry point, executed on Boat
 
 ```sh
 scripts/pre-push --list --tests  # inspect what will run, no builds
-scripts/pre-push --tests        # execute; stop at the first nonzero exit
+scripts/boat-build --tests       # execute on Boat; stop at the first nonzero exit
+scripts/boat-build -- cargo build --locked --bin cadence
+scripts/boat-build -- cargo test --locked --lib FILTER -- --test-threads=1
+scripts/boat-build --artifact target/debug/cadence --output /tmp/cadence-build -- cargo build --locked --bin cadence
+scripts/boat-build --type large -- cargo test --locked --features test-seam --lib FILTER -- --test-threads=1
+scripts/boat-build --down            # delete this worktree's sandbox now
 ```
+
+The worktree hook uses `scripts/boat-build` by default, so the shared host does
+not compile. A missing Boat CLI refuses the push. Without `scripts/boat-build`
+the hook runs a repository's own `scripts/pre-push` on the host (CAD-2403, for
+repositories that have no helper); this repository's script refuses in that mode,
+so it never falls back to a local build. `CADENCE_PRE_PUSH_LOCAL=1` is the
+explicit emergency path and runs the same plan on this host.
 
 The diff selects Rust/UI/active script checks. The live doctor source
 inventory always runs. `--tests` always executes the safety floor (two test
 threads), even if its source is unchanged or diff discovery is uncertain.
 Show the behavior you changed; add a focused check only when AGENTS.md requires
 it or the ticket's outcome cannot be shown without one. The floor is not
-that proof.
-Host Rust builds use four jobs and normal build-slot admission. If admission
-is unavailable, report that limitation rather than claiming local validation.
+that proof. Remote Rust builds use one Cargo job. If Boat is unavailable,
+report that limitation rather than claiming validation.
 
-The CAD-811 public-owner fixture uses the board's typed startup receipt, not a
-health probe. Its `Native::try_new_with_roles` refuses a lost bind; only native
-`AddrInUse` starts a fresh state/realm on the next candidate from
-`test_ports::reserve_board_port`. That helper's saturating per-process cursor
-bounds attempts but is not a cross-process lease. Other startup errors and
-missing receipts remain blocked. CAD-1838's competing-listener check proves the
-original listener stays owned while a fresh real board preserves Native owner
-attribution over HTTP; the retired-reviewer refusal is unchanged.
+The helper keeps one Boat sandbox per worktree. A later command reuses it
+while it is running, then leaves it up for 30 minutes. `--down` deletes it,
+`--fresh` replaces it, and `--once` deletes it when the command exits. Idle
+sandboxes were created with snapshots off, so that stop erases the disk and
+the next command starts cold.
+
+The sandbox is `default` (4 vCPU, 8 GB) unless `--type {small,default,large,xlarge}`
+says otherwise. A `cargo test` (or `t`) or `cargo nextest run|archive|list` that
+turns on `test-seam` (`--features`/`-F` in any spelling, `--all-features`, or
+`cli-runtime-test`) and builds this package's lib tests (`--lib`, `--tests`,
+`--all-targets`, or no target selector) compiles the whole agent crate in one
+rustc and does not fit 8 GB. With no `--type` the helper picks `large` (8 vCPU,
+16 GB, twice the rate) for it, and for the default `scripts/boat-build --tests`
+plan, and prints one `Boat type:` line saying why. `--test X`, `--bin X` or
+`-p <other>` alone keep `default`. The rule reads argv only: `env`, `sh -c` and
+wrappers such as `scripts/cadence-nextest` are not interpreted, so pass
+`--type large` for those. Types rank small < default < large < xlarge: a warm
+sandbox is replaced only when it is smaller than the run needs, and a larger
+one is reused as is. If available memory in the sandbox falls below 768 MiB the
+helper kills the job and exits 75; its last stdout line says it was stopped by
+the memory guard and that no test result exists. Do not pipe the helper into
+`tail` or `head`: the pipe hides that exit status, so read the status itself.
+
+The copy is a shallow git snapshot of the candidate and the base, from their
+merge-base forward, plus a binary patch of tracked edits. It is not an rsync
+of the worktree and it does not pull from GitHub. The full history pack is
+not uploaded. Untracked files are refused. Ignored files, including
+`target/`, stay out of the snapshot; a reused sandbox keeps `target/` and the
+cargo registry, so only the changed crates compile. The first command of a
+session is a cold compile and costs one Boat start. Later commands in the
+same 30 minutes do not. Start limits (`boat limits`) are the scarce quota.
+
+It does not copy account environment secrets (`--no-env`). For UI-related
+pre-push checks and commands starting with `bun`, it installs the exact Bun
+version pinned by `ui/package.json` and the locked UI dependencies. The
+create ceiling is one hour, which covers the run; the idle timer after the
+command is 30 minutes. It reports memory, time and Boat usage. A failed or
+interrupted creation can have an unknown outcome; do not retry or delete
+another sandbox by name. The helper moves preinstalled provider CLI entry
+points out of the test runner's fixed search path **inside the sandbox
+only**; it does not change the host or relax the test isolation guard. Only
+an explicitly requested artifact is copied back, without overwriting an
+existing destination.
+
+The hook's result gates the push, but required CI, review and operator
+approval remain authoritative. Commands and their output may be retained in
+Boat's command history; never put secrets in command arguments or output.
 
 ### Queueing without a pane (subagents, operator shells)
 
@@ -282,13 +289,13 @@ PR description. Write explicit deletions/exceptions into the issue body
 through `cadence issue` before requesting approval. Verify the current digest:
 
 ```sh
-cadence issue show CAD-1088 --json | python3 -c 'import hashlib,json,sys; d=json.load(sys.stdin); print(hashlib.sha256(d["body"].strip().encode()).hexdigest())'
+cadence issue show <ID> --json | python3 -c 'import hashlib,json,sys; d=json.load(sys.stdin); print(hashlib.sha256(d["body"].strip().encode()).hexdigest())'
 ```
 
 If scope approval is required, the operator runs from their own connection:
 
 ```sh
-cadence audit approve --issue CAD-1088 --action scope --source "Operator in chat: approves CAD-1088 scope as currently written."
+cadence audit approve --issue <ID> --action scope --source "<who approved, where>"
 ```
 
 Compare the response's digest to the computed digest. A duplicate record is
@@ -315,53 +322,21 @@ zero unintended production delta against new main. Never rebase merely
 because main moved: the merge queue already tests the integration tree.
 Do not force-push a branch with auto-merge enabled; disable it first.
 
-## One final operator handoff
+## The operator handoff
 
-Finish independent review and CI, post the ticket evidence, then request a
-merge approval on the **literal full SHA** just reviewed. Example syntax
-(the example SHA must be replaced with the actual reviewed head before use):
-
-```sh
-cadence audit approve --repo favcrm/cadence --pr <PR> --head <FULL_REVIEWED_SHA> --source "Operator in chat: approves the reviewed green PR head."
-```
-
-Provide the operator a concrete paste-ready version with no placeholders,
-`read`, guessed SHA, or source over 200 characters. The agent never executes
-the approval itself. Record the returned approval id on the ticket, then:
-
-```sh
-scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA> --dry-run
-scripts/enqueue-reviewed <PR> --head <FULL_REVIEWED_SHA>
-```
+Finish fresh-session review and CI, post the ticket evidence for the exact head,
+run `cadence --org <org> delivery check --project <key> --issue <ID> --pr <n>
+--head <full-sha>` and hand the PR to the operator with a message the operator
+can paste with no placeholders, no interactive `read`, no guessed SHA and no
+source over 200 characters. The operator's approval and enqueue, the Browser QA
+route and the native-only exception are AGENTS.md "Review". The agent never runs
+the approval or the enqueue itself. Record the approval id the operator returns on
+the ticket.
 
 The helper enforces exact-head checks, verdicts, evidence and approval. Queue
-position is not merge evidence: watch the merge-group run and verify the
-merged commit on `origin/main`. No `--admin`. Prioritization must not strand
-other PRs or cancel another entry until this PR itself can enqueue.
-
-## Targets and follow-up decisions
-
-Immediate targets: one local feedback command, no skipped explicit floor,
-no ghost contract discovery, no interactive approval prompts, no false scope
-digest, no fresh full review for unchanged code, and no duplicate Node setup
-for cargo-only retired journeys. Measure failure-before-review rate and
-number of operator/reviewer handoffs as well as CI elapsed/runner minutes.
-
-Review count follows AGENTS.md "Review" and the effective delivery policy:
-eligible routine changes need no mandatory review, consequential changes one
-combined review, and sensitive/unknown cases retain strict floors. Under the
-strict path, use one independent review by default, two for excluded paths in
-`docs/roles/one-review-paths.toml` (subject to the documented solo-operator
-rule), and operator approval for human risk. Automating evidence collection,
-reviewer state, head-drift notifications or an operator decision UI is a separate reviewed
-implementation—not a license to self-approve. Likewise, consolidating required
-build/UI checks or changing branch protection requires baseline measurements
-and an operator decision. Do not change names in YAML before migrating the
-required-check policy safely.
-
-CAD-1102 ended the reduced window: the current gate is permanent and releases
-are no longer frozen. New behavior checks follow AGENTS.md (CAD-1099), one
-acceptance check per enforced rule, not restoration of the retired suites.
+position is not merge evidence: watch the merge-group run and verify the merged
+commit on `origin/main`. No `--admin`. Prioritization must not strand other PRs
+or cancel another entry until this PR itself can enqueue.
 
 ## Emergency clean-slate transition
 

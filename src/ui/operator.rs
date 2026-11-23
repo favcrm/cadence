@@ -51,6 +51,7 @@ use super::{
     UI_ACTOR,
 };
 use crate::client;
+use crate::error::{Error, Result as CadenceResult};
 use crate::operator_auth::Origin;
 
 /// What a write route requires (ADR 0004 §5.9).
@@ -113,7 +114,35 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/templates/revise", RouteClass::OperatorOnly),
     route("POST", "/api/templates/approve", RouteClass::OperatorOnly),
     route("POST", "/api/documents/create", RouteClass::OperatorOnly),
+    route("POST", "/api/documents/export", RouteClass::OperatorOnly),
     route("POST", "/api/templates/intake", RouteClass::OperatorOnly),
+    route("POST", "/api/routines", RouteClass::OperatorOnly),
+    route("POST", "/api/routines/*/update", RouteClass::OperatorOnly),
+    route("POST", "/api/routines/*/approve", RouteClass::OperatorOnly),
+    route("POST", "/api/routines/*/run", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/routine-runs/*/decide",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/routine-proposals/*/decide",
+        RouteClass::OperatorOnly,
+    ),
+    route("POST", "/api/routines/*/pause", RouteClass::OperatorOnly),
+    route("POST", "/api/routines/*/resume", RouteClass::OperatorOnly),
+    route("POST", "/api/routines/*/remove", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/connections/*/policy",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/connection-requests/*/continue",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/approvals/*/revoke", RouteClass::OperatorOnly),
     route(
         "POST",
@@ -192,6 +221,13 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/connections", RouteClass::OperatorOnly),
+    // CAD-1085: board-origin human Continue mints one purpose/RID-bound
+    // entry nonce; the secret routes remain entry-origin only.
+    route(
+        "POST",
+        "/api/credential-entry/prepare",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/connections/*/rotate",
@@ -354,12 +390,42 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     ),
     route(
         "POST",
+        "/api/app-social-drafts/sources/page",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/sources/get",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
         "/api/app-social-drafts/sources/save",
         RouteClass::OperatorOnly,
     ),
     route(
         "POST",
         "/api/app-social-drafts/effect-stage",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/confirm",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/schedule",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/reschedule",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/cancel",
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/issues", RouteClass::AgentAllowed),
@@ -374,7 +440,7 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route(
         "POST",
         "/api/monitors/*/alerts/*/ack",
-        RouteClass::AgentAllowed,
+        RouteClass::OperatorOnly,
     ),
     route("POST", "/api/issues/*/answers", RouteClass::OperatorOnly),
     // CAD-606: board Kick off — operator-only, same gate as `issue_kickoff`.
@@ -385,6 +451,18 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/delivery/*/merge", RouteClass::OperatorOnly),
     route("POST", "/api/delivery/*/decline", RouteClass::OperatorOnly),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    // CAD-1853: cloud-agent writes mirror the daemon's own operator gate;
+    // a browser request cannot relay a peer identity or remote id.
+    route(
+        "POST",
+        "/api/cloud-agents/*/messages",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/cloud-agents/*/operations/*/read",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-810 / CAD-821: every topic write is the operator's. Listed so the
     // classification is reviewed, and unlisted writes fail closed to the same class.
     route("POST", "/api/topics", RouteClass::OperatorOnly),
@@ -409,6 +487,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // CAD-551: the composer's slash commands and Stop — the daemon's
     // `master_command` is operator-only, so the relay is too.
     route("POST", "/api/master/command", RouteClass::OperatorOnly),
+    // CAD-1817: the workspace coordinator's bounded identity write. The
+    // daemon's `master_identity_set` proves the operator connection again.
+    route("POST", "/api/master/identity", RouteClass::OperatorOnly),
     // CAD-574: the rail's needs-row snooze/dismiss and agent
     // resume/unfence — the relays cross the daemon's operator gate, so
     // the board routes are the operator's alone (unlisted writes would
@@ -439,6 +520,8 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // Setup: create one agent row through the daemon's `agent_register`
     // (`rpc_register`). Operator-only; the daemon's own gate still applies.
     route("POST", "/api/agents", RouteClass::OperatorOnly),
+    // CAD-1989: a hire saves a profile; no runtime row is written.
+    route("POST", "/api/agent-profiles", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
     route(
@@ -446,6 +529,8 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/agents/*/instructions",
         RouteClass::OperatorOnly,
     ),
+    route("POST", "/api/agents/*/skills", RouteClass::OperatorOnly),
+    route("POST", "/api/agents/*/tools", RouteClass::OperatorOnly),
     // CAD-608: the issue page's lane. Unlisted writes would fail closed
     // the same way; listed so a reader sees they are the operator's.
     route("POST", "/api/issues/*/lane/ask", RouteClass::OperatorOnly),
@@ -626,43 +711,65 @@ pub(super) fn admit(
         return admit_screen_caller(request, state_dir, opts, caller, &what).map(Some);
     }
     if class == RouteClass::OperatorOnly {
-        match &caller {
-            Caller::Agent(alias) => {
-                return Err(guard_fail(
-                    "operator_only",
-                    &format!(
-                        "{method} {path} is the operator's decision — this request comes \
-                         from agent '{alias}'; decide from the operator's browser"
-                    ),
-                ))
-            }
-            // A member reads/participates/requests but never decides:
-            // approvals, grants and operator methods are the owner's
-            // role (contract §2, CAD-526).
-            Caller::Named(named) if !named.operator => {
-                return Err(guard_fail(
-                    "member_role",
-                    &format!(
-                        "{method} {path} needs the board owner's role — this session is \
-                         {}'s, mapped `member`",
-                        named.actor
-                    ),
-                ))
-            }
-            // The verified `owner` role is the operator claim on the
-            // public surface — no loopback process proof applies to a
-            // request the platform relay delivered.
-            Caller::Named(_) => {}
-            Caller::Operator(_) => super::home::prove_operator_peer(
-                request,
-                state_dir,
-                opts,
-                &format!("{method} {path}"),
-                None,
-            )?,
-        }
+        admit_operator_class(
+            request,
+            state_dir,
+            opts,
+            &caller,
+            &format!("{method} {path}"),
+        )?;
     }
     Ok(Some(caller))
+}
+
+/// May this resolved caller perform an `OperatorOnly` route?
+///
+/// Extracted so the decision is directly callable (CAD-1950): reaching it
+/// through `admit` otherwise needs a board session and, for a member, the
+/// daemon that verifies one — a socket in the way of the rule being checked.
+/// `what` is the request line (`POST /api/projects/pay/policy`), so a refusal
+/// names the route the caller tried.
+fn admit_operator_class(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    caller: &Caller,
+    what: &str,
+) -> Result<(), HttpResp> {
+    match caller {
+        Caller::Agent(alias) => Err(guard_fail(
+            "operator_only",
+            &format!(
+                "{what} is the operator's decision — this request comes \
+                 from agent '{alias}'; decide from the operator's browser"
+            ),
+        )),
+        // A member reads/participates/requests but never decides:
+        // approvals, grants and operator methods are the owner's
+        // role (contract §2, CAD-526).
+        Caller::Named(named) if !named.operator => Err(guard_fail(
+            "member_role",
+            &format!(
+                "{what} needs the board owner's role — this session is \
+                 {}'s, mapped `member`",
+                named.actor
+            ),
+        )),
+        // The verified `owner` role is the operator claim on the
+        // public surface — no loopback process proof applies to a
+        // request the platform relay delivered.
+        Caller::Named(_) => Ok(()),
+        // Only these scoped HTTPS routes already proved current board owner
+        // authority and rejected agent attribution in `board_caller`.
+        Caller::Operator(_)
+            if super::credential_entry::public_scoped_owner_route(request, opts) =>
+        {
+            Ok(())
+        }
+        Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, what, None)
+        }
+    }
 }
 
 /// Operator-only read of `/api/master/permissions`. The board relays
@@ -708,6 +815,11 @@ pub(super) fn admit_operator_read_caller(
             ),
         )),
         Caller::Named(_) => Ok(caller),
+        Caller::Operator(_)
+            if super::credential_entry::public_scoped_owner_route(request, opts) =>
+        {
+            Ok(caller)
+        }
         Caller::Operator(_) => {
             super::home::prove_operator_peer(request, state_dir, opts, &what, None)?;
             Ok(caller)
@@ -836,6 +948,31 @@ pub(super) fn public_relay(request: &Request, opts: &ServeOpts) -> PublicRelay {
     }
 }
 
+/// The local or tailnet operator session on this request, read from the
+/// cookie the board already checked. Never taken from a JSON body. Public
+/// hosts use [`public_relay`] instead.
+pub(super) struct LocalOperatorProof {
+    pub token: String,
+    pub key: String,
+    pub origin: String,
+}
+
+pub(super) fn local_operator_proof(
+    request: &Request,
+    opts: &ServeOpts,
+) -> Option<LocalOperatorProof> {
+    let origin = request_origin_kind(request, opts)?;
+    if origin == Origin::Public {
+        return None;
+    }
+    let token = session_cookie(request, opts, origin)?;
+    Some(LocalOperatorProof {
+        token,
+        key: session_key(request),
+        origin: origin.as_str().to_string(),
+    })
+}
+
 /// A board write's caller, once [`board_caller`] has decided.
 pub(super) enum Caller {
     /// Holds a live operator session: `actor` is `operator (ui)` or a
@@ -874,13 +1011,16 @@ impl Caller {
 /// name is never sent to another board, an agent's dev server or any
 /// other service on `127.0.0.1`/`localhost`/`cadence.localhost`, whatever
 /// its port. Loopback sessions are opened and honoured on this Host only.
-pub(crate) fn board_host(port: u16) -> String {
-    format!("cadence-{port}.localhost:{port}")
-}
+pub(crate) use super::board_host;
 
-/// Where a request came from, for session binding.
+/// Where a request came from, for session binding. `Entry` is the
+/// deployment-pinned credential-entry origin: a distinct browser origin and
+/// a distinct, daemon-issued entry session scope — never the loopback
+/// operator session and never inferred from a `Host` value alone.
+#[derive(Clone, Debug)]
 enum ReqOrigin {
     Known(Origin),
+    Entry(super::credential_entry::EntryOrigin),
     /// No session can be used or opened on this request: the Host is not
     /// this board's own name, or names the tailnet without the proof.
     NoSession(String),
@@ -900,6 +1040,18 @@ fn request_origin(request: &Request, opts: &ServeOpts) -> ReqOrigin {
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase();
+            // CAD-1085: the root-pinned credential-entry origin is a
+            // distinct browser origin with its own daemon-issued entry
+            // session scope. It is NOT folded into `Origin::Loopback`:
+            // the entry cookie is separate, the daemon verifies that
+            // `entry_origin` was persisted at sign-in, and a board-origin
+            // session cannot satisfy it. The `Host` only routes the
+            // request to that scope; it is not the authentication.
+            if let Some(entry) = super::credential_entry::EntryOrigin::from_opts(opts) {
+                if entry.matches_host(&host) {
+                    return ReqOrigin::Entry(entry);
+                }
+            }
             // CAD-526: this instance's configured public name — the
             // `aud` assertions are minted for — is its own origin, as
             // distinct from the local login surface as tailnet is.
@@ -924,7 +1076,7 @@ fn request_origin(request: &Request, opts: &ServeOpts) -> ReqOrigin {
 /// The public session cookie (contract §7): `__Host-` pins `Secure`,
 /// `Path=/` and no `Domain`, so a sibling host under `*.BOARD_DOMAIN`
 /// can neither toss nor overwrite it.
-pub(crate) const PUBLIC_COOKIE: &str = "__Host-aos-board-session";
+pub(crate) use super::PUBLIC_COOKIE;
 /// The unprefixed spelling the platform worker accepts inbound as a
 /// local-dev allowance — the board reads it too; it always mints the
 /// `__Host-` name.
@@ -943,6 +1095,93 @@ fn cookie_name(opts: &ServeOpts, origin: Origin) -> String {
     }
 }
 
+/// The ordinary board's browser Origin (public, tailnet or loopback). Used
+/// for the entry page's selector-only "continue on the board" link; the
+/// auth-only POST accepts any configured board Origin, not a caller-chosen
+/// one.
+pub(super) fn board_origin(opts: &ServeOpts) -> String {
+    if let Some(public) = &opts.public {
+        format!("{}://{}", public_scheme(&public.host), public.host)
+    } else if let Some((dns, port)) = &opts.tailnet {
+        super::tailnet_url(dns, *port)
+    } else {
+        format!("http://{}", board_host(opts.port))
+    }
+}
+
+/// Is `origin` a configured ordinary board Origin (never the entry origin)?
+/// The auth-only POST's single cross-origin exception admits exactly this
+/// set; the nonce/human Continue is still the authority.
+pub(super) fn is_board_origin(opts: &ServeOpts, origin: &str) -> bool {
+    let origin = origin.trim();
+    if opts.board_public_only {
+        return opts.public.as_ref().is_some_and(|public| {
+            origin.split_once("://").is_some_and(|(scheme, host)| {
+                scheme.eq_ignore_ascii_case(public_scheme(&public.host))
+                    && host.eq_ignore_ascii_case(&public.host)
+            })
+        });
+    }
+    let origin = origin.to_ascii_lowercase();
+    if let Some(entry) = super::credential_entry::EntryOrigin::from_opts(opts) {
+        if origin == entry.origin().to_ascii_lowercase() {
+            return false;
+        }
+    }
+    super::write_path::origin_allowed(&origin, opts.port, &opts.allow_hosts, &opts.allow_origins)
+}
+
+/// The browser peer of the auth-only POST must not be tied to an agent or
+/// be unattributable. A proxy/foreign socket or an unowned local browser is
+/// fine; the nonce and the daemon's positive UI-peer proof are the
+/// authority. No session is consulted here.
+pub(super) fn authenticate_peer(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<(), HttpResp> {
+    let origin = ReqOrigin::NoSession("credential-entry authentication peer".to_string());
+    match attribute(request, state_dir, opts, &origin, None) {
+        Attribution::Agent(alias) => Err(guard_fail(
+            "session_from_agent",
+            &format!("credential entry sign-in refused: this connection is agent '{alias}'"),
+        )),
+        Attribution::AgentUid => Err(guard_fail(
+            "session_from_agent",
+            "credential entry sign-in refused: this connection is the agent UID",
+        )),
+        Attribution::Unknown(why) | Attribution::Unavailable(why) => Err(guard_fail(
+            "caller_identity",
+            &format!("credential entry sign-in refused: the caller is unattributable — {why}"),
+        )),
+        Attribution::NoAgent | Attribution::Foreign(_) | Attribution::Proxy(_) => Ok(()),
+    }
+}
+
+/// The credential-entry session cookie: a distinct name on a distinct
+/// origin, issued only by the entry-origin device poll for a session the
+/// daemon persisted with `entry_origin`. It is never the loopback cookie,
+/// so a board-origin session cannot be replayed into the form.
+pub(super) fn entry_cookie_name(opts: &ServeOpts) -> String {
+    format!("__Host-cadence_entry_{}", opts.port)
+}
+
+fn entry_session_cookie(request: &Request, opts: &ServeOpts) -> Option<String> {
+    cookie_value(request, &[entry_cookie_name(opts)])
+}
+
+fn cookie_value(request: &Request, names: &[String]) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .filter(|h| h.field.equiv("Cookie"))
+        .flat_map(|h| h.value.as_str().split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(k, _)| names.iter().any(|n| n == *k))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// CAD-1006: the request's session origin for the screen credential
 /// relay — the `Origin` `request_origin` resolves to, or `None` when the
 /// request names no session-bearing host. Read-only; the daemon re-verifies
@@ -950,7 +1189,10 @@ fn cookie_name(opts: &ServeOpts, origin: Origin) -> String {
 pub(super) fn request_origin_kind(request: &Request, opts: &ServeOpts) -> Option<Origin> {
     match request_origin(request, opts) {
         ReqOrigin::Known(o) => Some(o),
-        ReqOrigin::NoSession(_) => None,
+        // The entry origin is a distinct session scope, not one of the
+        // board's `Origin` kinds; relays that need a board session must
+        // not treat it as loopback.
+        ReqOrigin::Entry(_) | ReqOrigin::NoSession(_) => None,
     }
 }
 
@@ -992,15 +1234,7 @@ fn session_cookie(request: &Request, opts: &ServeOpts, origin: Origin) -> Option
         ],
         _ => vec![cookie_name(opts, origin)],
     };
-    request
-        .headers()
-        .iter()
-        .filter(|h| h.field.equiv("Cookie"))
-        .flat_map(|h| h.value.as_str().split(';'))
-        .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(k, _)| names.iter().any(|n| n == *k))
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    cookie_value(request, &names)
 }
 
 /// This request's own origin, as a browser on it would send `Origin`.
@@ -1021,14 +1255,7 @@ fn own_origin(request: &Request, origin: Origin) -> String {
 /// The scheme a public board host speaks (contract §1): `*.localhost`
 /// is a trustworthy context where plain http applies; every real board
 /// host is https — `cadencecloud.app` sits on an HSTS-preloaded TLD.
-pub(crate) fn public_scheme(host: &str) -> &'static str {
-    let name = host.split(':').next().unwrap_or_default();
-    if name == "localhost" || name.ends_with(".localhost") {
-        "http"
-    } else {
-        "https"
-    }
-}
+pub(crate) use super::public_scheme;
 
 /// A cookie-bearing write must say where it comes from, and it must be
 /// here: `Origin` present and equal to this request's scheme + Host.
@@ -1118,6 +1345,53 @@ fn check_session(
     }
 }
 
+/// Ask the daemon whether `token` is a live session **scoped to the
+/// trusted entry origin**. A board/normal-loopback session is not one:
+/// the daemon stored `entry_origin` at sign-in and compares it here.
+fn check_entry_session(
+    state_dir: &std::path::Path,
+    token: &str,
+    key: &str,
+    entry: &super::credential_entry::EntryOrigin,
+    budget: Option<&client::MetaBudget>,
+) -> Result<Option<Value>, HttpResp> {
+    let params = json!({
+        "token": token, "key": key, "entry_origin": entry.origin(), "public_only": entry.public_only,
+    });
+    let answered = match budget {
+        Some(b) => b.read(state_dir, "credential_entry_session_check", params),
+        None => client::rpc(state_dir, "credential_entry_session_check", params),
+    };
+    match answered {
+        Ok(v) if v["valid"] == true && v["session"].is_object() => Ok(Some(v["session"].clone())),
+        Ok(v) if v["valid"] == false => Ok(None),
+        Ok(_) => Err(coded_response(
+            503,
+            "session_unavailable",
+            "the daemon did not answer whether this entry session is valid",
+            None,
+        )),
+        Err(e) if e.to_string().contains("Unknown method") => Err(coded_response(
+            501,
+            "unsupported_daemon",
+            "this daemon does not support trusted credential entry — upgrade it",
+            None,
+        )),
+        Err(e) => Err(coded_response(
+            503,
+            "daemon_unavailable",
+            &format!("credential-entry sessions are checked by the daemon: {e}"),
+            None,
+        )),
+    }
+}
+
+/// The fixed `entry_session_required` refusal a credential form gets
+/// without a live entry-origin session.
+pub(super) const ENTRY_SESSION_REQUIRED: &str =
+    "The credential form needs the signed-in operator's session on this trusted entry \
+     origin — sign in on that origin (device sign-in), then reopen the entry link";
+
 /// The live public session this request's `__Host-` cookie names — the
 /// read gate for the board's public surface (CAD-526): on that host a
 /// request either carries a valid session or gets bounced to the
@@ -1143,50 +1417,83 @@ pub(super) fn public_session(
 /// the daemon's live cookie + tab key (public sessions use only their
 /// cookie), with no inferred privilege from the peer's process.
 /// Credentials stay in this request/stream and are never serialized.
-pub(super) struct ReadAdmission {
-    proof: Option<(String, String, Origin)>,
-    checked_at: std::time::Instant,
+/// The session scope a read proved. `Entry` is the daemon-issued,
+/// entry-origin-scoped session; `Origin` is one of the board's own.
+#[derive(Clone, Debug)]
+enum SessionScope {
+    Origin(Origin),
+    Entry(super::credential_entry::EntryOrigin),
 }
 
-impl ReadAdmission {
-    /// True when `admit_read` admitted the request without a session — the
-    /// local bootstrap case, where the caller is the operator.
-    pub(super) fn is_anonymous(&self) -> bool {
-        self.proof.is_none()
+pub(super) struct ReadAdmission {
+    proof: Option<(String, String, SessionScope)>,
+    checked_at: std::time::Instant,
+    held: Option<Held>,
+}
+
+/// Reader proof sent only over the board-to-daemon connection.
+pub(super) enum ReadRelayProof {
+    Operator,
+    Public(String),
+    Cli(String),
+    Anonymous,
+}
+
+impl ReadRelayProof {
+    pub(super) fn attach(&self, params: &mut Value) {
+        match self {
+            Self::Operator => {}
+            Self::Public(token) => params["public_session"] = json!(token),
+            Self::Cli(envelope) => params["cli_envelope"] = json!(envelope),
+            Self::Anonymous => params["read_as"] = json!("service/anonymous"),
+        }
     }
 }
 
 /// The caller spelling for a read `admit_read` already admitted.
 ///
-/// `operator` for an anonymous local read; otherwise the public session's
-/// `users/<handle>` via [`board_caller`]. A failure to resolve refuses —
-/// a project-scoped read is never served unfiltered.
+/// A verified owner is `operator`. A member uses its exact verified subject
+/// only when it fits the grant grammar; anonymous reads are not operator proof.
 pub(super) fn read_actor(
-    admission: &ReadAdmission,
+    _admission: &ReadAdmission,
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<String, HttpResp> {
-    if admission.is_anonymous() {
-        return Ok("operator".to_string());
+    board_caller(request, state_dir, opts, false, None).map(|caller| policy_caller(&caller))
+}
+
+/// A project policy must use the verified subject, not a lossy display handle.
+pub(super) fn policy_caller(caller: &Caller) -> String {
+    match caller {
+        Caller::Named(named) if !named.operator => {
+            crate::project_policy::policy_user_actor(&named.sub)
+        }
+        _ => caller_spelling(caller),
     }
-    // `Caller::actor()` is display text (it can read "<name> via board"),
-    // so the policy spelling is built from the variant: the public
-    // session's attribution handle is the platform subject, which is what
-    // `users/<handle>` keys on everywhere else.
-    board_caller(request, state_dir, opts, false, None).map(|caller| caller_spelling(&caller))
 }
 
 /// The project-policy spelling for a resolved board caller.
 pub(super) fn caller_spelling(caller: &Caller) -> String {
     match caller {
         Caller::Operator(_) => "operator".to_string(),
+        Caller::Named(named) if named.operator => "operator".to_string(),
         Caller::Named(named) => format!("users/{}", named.author),
         Caller::Agent(alias) => format!("agents/{alias}"),
     }
 }
 
 impl ReadAdmission {
+    pub(super) fn relay_proof(&self) -> ReadRelayProof {
+        match &self.proof {
+            Some((token, _, SessionScope::Origin(Origin::Public))) => {
+                ReadRelayProof::Public(token.clone())
+            }
+            Some(_) => ReadRelayProof::Operator,
+            None => ReadRelayProof::Anonymous,
+        }
+    }
+
     pub(super) const RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(super) fn wait_timeout(&self) -> std::time::Duration {
@@ -1197,23 +1504,43 @@ impl ReadAdmission {
         }
     }
 
-    /// Revalidate before new frames once the five-second window ends.
-    /// Idle board streams wait only until that deadline; thread streams
-    /// can additionally spend at most two seconds in their bounded poll.
-    /// Validation itself has a two-second absolute deadline. Unknown or
-    /// invalid closes the stream without revoking or clearing credentials.
-    /// Bytes already handed to the blocking HTTP writer are not retractable.
+    /// Revalidate a stream's session and the identity/role it admitted.
+    /// Bytes already handed to the blocking writer are not retractable.
     pub(super) fn still_live(&mut self, state_dir: &std::path::Path) -> bool {
+        self.revalidate(state_dir, false)
+    }
+
+    /// Check again immediately before forwarding a data frame.
+    pub(super) fn still_live_before_frame(&mut self, state_dir: &std::path::Path) -> bool {
+        self.revalidate(state_dir, true)
+    }
+
+    fn revalidate(&mut self, state_dir: &std::path::Path, force: bool) -> bool {
         let Some((token, key, origin)) = &self.proof else {
             return true;
         };
-        if self.checked_at.elapsed() < Self::RECHECK {
+        if !force && self.checked_at.elapsed() < Self::RECHECK {
             return true;
         }
         let checked_at = std::time::Instant::now();
         let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-        match check_session(state_dir, token, key, *origin, Some(&budget)) {
-            Ok(Some(_)) => {
+        let live = match origin {
+            SessionScope::Origin(origin) => {
+                check_session(state_dir, token, key, *origin, Some(&budget))
+            }
+            SessionScope::Entry(entry) => {
+                check_entry_session(state_dir, token, key, entry, Some(&budget))
+            }
+        };
+        match live {
+            Ok(Some(session)) => {
+                let held = match origin {
+                    SessionScope::Origin(origin) => held_of(*origin, &session),
+                    SessionScope::Entry(_) => Some(Held::Operator),
+                };
+                if held.is_none() || held != self.held {
+                    return false;
+                }
                 self.checked_at = checked_at;
                 true
             }
@@ -1239,35 +1566,64 @@ pub(super) fn admit_read(
     opts: &ServeOpts,
 ) -> Result<ReadAdmission, HttpResp> {
     let checked_at = std::time::Instant::now();
-    let admission = |proof| ReadAdmission { proof, checked_at };
-    let origin = match request_origin(request, opts) {
-        ReqOrigin::Known(origin) => Some(origin),
+    let admission = |proof, held| ReadAdmission {
+        proof,
+        checked_at,
+        held,
+    };
+    let scope = match request_origin(request, opts) {
+        ReqOrigin::Known(origin) => Some(SessionScope::Origin(origin)),
+        ReqOrigin::Entry(entry) => Some(SessionScope::Entry(entry)),
         ReqOrigin::NoSession(_) => None,
     };
-    // Only the loopback origin can use the local bootstrap allowance; a
-    // tailnet proxy or any other Host still needs a session.
-    if anonymous_reads_on(opts, origin) {
-        return Ok(admission(None));
-    }
-    if let Some(origin) = origin {
-        if let Some(token) = session_cookie(request, opts, origin) {
-            let key = session_key(request);
-            let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-            if check_session(state_dir, &token, &key, origin, Some(&budget))?.is_some() {
-                return Ok(admission(Some((token, key, origin))));
+    match &scope {
+        Some(SessionScope::Origin(origin)) => {
+            if let Some(token) = session_cookie(request, opts, *origin) {
+                let key = session_key(request);
+                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+                if let Some(session) =
+                    check_session(state_dir, &token, &key, *origin, Some(&budget))?
+                {
+                    if let Some(held) = held_of(*origin, &session) {
+                        return Ok(admission(
+                            Some((token, key, SessionScope::Origin(*origin))),
+                            Some(held),
+                        ));
+                    }
+                }
             }
         }
+        Some(SessionScope::Entry(entry)) => {
+            if let Some(token) = entry_session_cookie(request, opts) {
+                let key = session_key(request);
+                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+                if check_entry_session(state_dir, &token, &key, entry, Some(&budget))?.is_some() {
+                    return Ok(admission(
+                        Some((token, key, SessionScope::Entry(entry.clone()))),
+                        Some(Held::Operator),
+                    ));
+                }
+            }
+        }
+        None => {}
     }
-    let (code, message) = if origin == Some(Origin::Public) {
-        (
+    // A session, when presented, is checked before the loopback bootstrap
+    // fallback so a stream retains its real identity and role.
+    if let Some(SessionScope::Origin(origin)) = &scope {
+        if anonymous_reads_on(opts, Some(*origin)) {
+            return Ok(admission(None, None));
+        }
+    }
+    let (code, message) = match &scope {
+        Some(SessionScope::Origin(Origin::Public)) => (
             "board_session_required",
             "a board session is required — sign in through your company's workspace",
-        )
-    } else {
-        (
+        ),
+        Some(SessionScope::Entry(_)) => ("entry_session_required", ENTRY_SESSION_REQUIRED),
+        _ => (
             "operator_session_required",
             "a local board session is required — sign in with cadence ui login",
-        )
+        ),
     };
     Err(coded_response(401, code, message, None))
 }
@@ -1421,17 +1777,24 @@ fn pinned_agent_uid(configured: Option<u32>, active: Option<u32>) -> Result<Opti
     }
 }
 
-fn concrete_board_server(opts: &ServeOpts) -> Result<std::net::SocketAddr, String> {
+/// The board's concrete bound address — the destination half of every
+/// connection's four-tuple (CAD-760). It is the configured bind the
+/// listener took (`Server::http(host:port)`), never the HTTP Host or any
+/// other request field. A host name or a wildcard (`0.0.0.0`, `::`,
+/// `::ffff:0.0.0.0`) has no single destination: refused, so every
+/// caller fails closed.
+pub(super) fn concrete_board_server(opts: &ServeOpts) -> Result<std::net::SocketAddr, String> {
     let ip = opts
         .host
         .parse::<std::net::IpAddr>()
         .map_err(|_| "board bind address is not a concrete IP".to_string())?;
-    if ip.is_unspecified() {
+    let server = crate::peer::canonical(std::net::SocketAddr::new(ip, opts.port));
+    if server.ip().is_unspecified() {
         return Err(
             "board bind address is wildcard; client destination cannot be proved".to_string(),
         );
     }
-    Ok(std::net::SocketAddr::new(ip, opts.port))
+    Ok(server)
 }
 
 pub(super) fn active_agent_uid(state_dir: &std::path::Path) -> Result<Option<u32>, String> {
@@ -1535,7 +1898,7 @@ fn attribute(
         Err(why) => {
             let why = match origin {
                 ReqOrigin::NoSession(p) => format!("{why}. {p}"),
-                ReqOrigin::Known(_) => why,
+                ReqOrigin::Known(_) | ReqOrigin::Entry(_) => why,
             };
             return match foreign_socket(request, opts) {
                 Some(uid) => Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)")),
@@ -1544,6 +1907,7 @@ fn attribute(
         }
     };
     let found = Ok::<crate::peer::AgentRoots, String>(roots).and_then(|roots| {
+        let server = concrete_board_server(opts)?;
         let peer = request
             .remote_addr()
             .ok_or_else(|| "the request has no peer address".to_string())?;
@@ -1553,15 +1917,15 @@ fn attribute(
             // gone (an early-closed replay by an agent that then exited)
             // is unattributable, never "tied to no agent" (review round 2).
             let peer = crate::peer::canonical(*peer);
-            if peer.ip().is_loopback() && crate::peer::client_socket(opts.port, peer)?.is_none() {
+            if peer.ip().is_loopback() && crate::peer::client_socket_exact(server, peer)?.is_none()
+            {
                 return Err(format!(
-                    "no local socket is the client end of {peer} → port {}",
-                    opts.port
+                    "no local socket is the client end of {peer} → {server}"
                 ));
             }
             return Ok(None);
         }
-        crate::peer::tcp_peer_agent(opts.port, *peer, &roots)
+        crate::peer::tcp_peer_agent(server, *peer, &roots)
     });
     match found {
         Ok(Some(alias)) => Attribution::Agent(alias),
@@ -1569,7 +1933,7 @@ fn attribute(
         Err(why) => {
             let why = match origin {
                 ReqOrigin::NoSession(p) => format!("{why}. {p}"),
-                ReqOrigin::Known(_) => why,
+                ReqOrigin::Known(_) | ReqOrigin::Entry(_) => why,
             };
             // Only a live client socket of another uid excuses it.
             match foreign_socket(request, opts) {
@@ -1582,12 +1946,19 @@ fn attribute(
 
 /// The uid owning the peer's still-open client socket when it is not
 /// this process's — a privilege-separated proxy (tailscaled, sshd).
+/// Matched on the full four-tuple (CAD-760); no concrete bound address,
+/// no excuse.
 fn foreign_socket(request: &Request, opts: &ServeOpts) -> Option<u32> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
+    let server = concrete_board_server(opts).ok()?;
     request
         .remote_addr()
-        .and_then(|peer| crate::peer::client_socket(opts.port, *peer).ok().flatten())
+        .and_then(|peer| {
+            crate::peer::client_socket_exact(server, *peer)
+                .ok()
+                .flatten()
+        })
         .map(|(_, uid)| uid)
         .filter(|uid| *uid != euid)
 }
@@ -1642,10 +2013,24 @@ pub(super) fn board_caller(
             }
             None => (None, None),
         },
+        ReqOrigin::Entry(entry) => match entry_session_cookie(request, opts) {
+            Some(token) => {
+                if write {
+                    require_entry_origin(request, entry)?;
+                }
+                match check_entry_session(state_dir, &token, &session_key(request), entry, budget)?
+                {
+                    Some(_) => (Some(Held::Operator), Some(token)),
+                    None => (None, None),
+                }
+            }
+            None => (None, None),
+        },
         ReqOrigin::NoSession(_) => (None, None),
     };
     let required = match &origin {
         ReqOrigin::Known(Origin::Public) => ("board_session_required", BOARD_SESSION_REQUIRED),
+        ReqOrigin::Entry(_) => ("entry_session_required", ENTRY_SESSION_REQUIRED),
         _ => ("operator_session_required", SESSION_REQUIRED),
     };
     let attribution = attribute(request, state_dir, opts, &origin, budget);
@@ -1743,6 +2128,24 @@ pub(super) fn meta(
             });
             (hint, token.is_some(), session)
         }
+        ReqOrigin::Entry(entry) => {
+            let token = entry_session_cookie(request, opts);
+            let session = token.as_deref().and_then(|token| {
+                check_entry_session(
+                    state_dir,
+                    token,
+                    &session_key(request),
+                    &entry,
+                    Some(budget),
+                )
+                .ok()
+            });
+            (
+                "sign in on this trusted credential origin",
+                token.is_some(),
+                session,
+            )
+        }
         ReqOrigin::NoSession(_) => ("cadence ui login", false, None),
     };
     // CAD-777/CAD-841: device sign-in is advertised on the operator
@@ -1751,7 +2154,7 @@ pub(super) fn meta(
     // an unanswerable check it stays silent rather than mislead.
     let device_login = matches!(
         request_origin(request, opts),
-        ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
+        ReqOrigin::Known(Origin::Loopback | Origin::Tailnet) | ReqOrigin::Entry(_)
     ) && device_config(state_dir, Some(budget)).is_some();
     // `None` with a cookie (a check that could not answer) reports
     // `signed_in: null`; `Some(None)` (proven not valid) and a request
@@ -1809,6 +2212,51 @@ fn cookie_attrs(origin: Origin, max_age: i64) -> String {
     }
 }
 
+fn cookie_attrs_entry(max_age: i64) -> String {
+    format!("Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age={max_age}")
+}
+
+/// A write on the entry origin must name exactly that origin. The board's
+/// Host routing is not the authentication; this is the same-origin guard
+/// for the daemon-issued entry session.
+fn require_entry_origin(
+    request: &Request,
+    entry: &super::credential_entry::EntryOrigin,
+) -> Result<(), HttpResp> {
+    match header_value(request, "Origin") {
+        Some(got) if entry.matches_origin(&got) => Ok(()),
+        Some(got) => Err(guard_fail(
+            "origin",
+            &format!(
+                "the trusted credential origin only accepts its own Origin ({}); \
+                 this request says '{got}'",
+                entry.origin()
+            ),
+        )),
+        None => Err(guard_fail(
+            "origin",
+            "a request carrying a credential-entry session must send Origin",
+        )),
+    }
+}
+
+/// The entry-origin session proof for a secret-bearing relay. Only an
+/// entry-scoped cookie on the pinned origin produces one; it names the
+/// pinned origin so the daemon can verify the server-issued scope.
+pub(super) fn credential_entry_session_proof(request: &Request, opts: &ServeOpts) -> Option<Value> {
+    let ReqOrigin::Entry(entry) = request_origin(request, opts) else {
+        return None;
+    };
+    let token = entry_session_cookie(request, opts)?;
+    Some(json!({
+        "token": token,
+        "key": session_key(request),
+        "origin": Origin::Loopback.as_str(),
+        "entry_origin": entry.origin(),
+        "public_only": entry.public_only,
+    }))
+}
+
 /// `POST /api/session {"nonce"}` — exchange a login link for a session:
 /// the cookie (`Set-Cookie`) plus `{"session_key"}` for the page, both
 /// required on later private reads and writes. The write guards apply, and the Host must be this board's own
@@ -1828,6 +2276,17 @@ pub(super) fn open(
     }
     let origin = match request_origin(request, opts) {
         ReqOrigin::Known(o) => o,
+        ReqOrigin::Entry(_) => {
+            // HELD until the reviewed local board-continue transport lands:
+            // no nonce is accepted in an entry URL/fragment. The entry
+            // origin uses the existing device sign-in (if configured) for
+            // now; board link exchange stays on the ordinary board origin.
+            return guard_fail(
+                "session_origin",
+                "local link sign-in is not enabled on the trusted credential origin — \
+                 do not put a sign-in nonce in this URL; use the configured device sign-in",
+            );
+        }
         ReqOrigin::NoSession(why) => {
             return guard_fail("session_origin", &format!("sign-in refused: {why}"))
         }
@@ -1938,8 +2397,31 @@ pub(super) fn logout(request: &Request, state_dir: &std::path::Path, opts: &Serv
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
-    let ReqOrigin::Known(origin) = request_origin(request, opts) else {
-        return guard_fail("session_origin", "logout: no session lives on this Host");
+    let origin = match request_origin(request, opts) {
+        ReqOrigin::Known(origin) => origin,
+        ReqOrigin::Entry(entry) => {
+            if let Some(token) = entry_session_cookie(request, opts) {
+                if let Err(resp) = require_entry_origin(request, &entry) {
+                    return resp;
+                }
+                if let Err(e) = client::rpc(
+                    state_dir,
+                    "operator_session_logout",
+                    json!({"token": token}),
+                ) {
+                    return coded_response(503, "daemon_unavailable", &e.to_string(), None);
+                }
+            }
+            let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(204));
+            set_cookie(
+                &mut resp,
+                &format!("{}=; {}", entry_cookie_name(opts), cookie_attrs_entry(0)),
+            );
+            return no_store(resp);
+        }
+        ReqOrigin::NoSession(_) => {
+            return guard_fail("session_origin", "logout: no session lives on this Host")
+        }
     };
     if let Some(token) = session_cookie(request, opts, origin) {
         if let Err(resp) = require_own_origin(request, origin) {
@@ -1995,25 +2477,36 @@ fn device_off() -> HttpResp {
     super::err_response(404, "no such write route")
 }
 
-fn device_origin(request: &Request, opts: &ServeOpts) -> std::result::Result<Origin, HttpResp> {
-    let origin = match request_origin(request, opts) {
-        ReqOrigin::Known(o) => o,
-        ReqOrigin::NoSession(why) => {
-            return Err(guard_fail(
-                "session_origin",
-                &format!("sign-in refused: {why}"),
-            ));
+/// The device sign-in surface for this request: a board origin (loopback/
+/// tailnet) with its normal session scope, or the pinned credential-entry
+/// origin with the distinct entry scope the daemon will persist.
+fn device_origin(
+    request: &Request,
+    opts: &ServeOpts,
+) -> std::result::Result<(Origin, Option<super::credential_entry::EntryOrigin>), HttpResp> {
+    match request_origin(request, opts) {
+        ReqOrigin::Known(origin) => {
+            if origin == Origin::Public {
+                return Err(guard_fail(
+                    "session_origin",
+                    "sign-in on this board is the platform's — device login applies \
+                     to the loopback/tailnet surface only",
+                ));
+            }
+            require_own_origin(request, origin)?;
+            Ok((origin, None))
         }
-    };
-    if origin == Origin::Public {
-        return Err(guard_fail(
+        ReqOrigin::Entry(entry) => {
+            require_entry_origin(request, &entry)?;
+            // The daemon records the entry scope; the response is consumed
+            // by the entry document's memory-only key reader, never storage.
+            Ok((Origin::Loopback, Some(entry)))
+        }
+        ReqOrigin::NoSession(why) => Err(guard_fail(
             "session_origin",
-            "sign-in on this board is the platform's — device login applies \
-             to the loopback/tailnet surface only",
-        ));
+            &format!("sign-in refused: {why}"),
+        )),
     }
-    require_own_origin(request, origin)?;
-    Ok(origin)
 }
 
 /// Refuse agent peers on the device routes. Unlike the link exchange
@@ -2066,7 +2559,7 @@ pub(super) fn device_code(
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
-    let origin = match device_origin(request, opts) {
+    let (origin, _entry) = match device_origin(request, opts) {
         Ok(o) => o,
         Err(resp) => return resp,
     };
@@ -2157,7 +2650,7 @@ pub(super) fn device_poll(
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
-    let origin = match device_origin(request, opts) {
+    let (origin, entry) = match device_origin(request, opts) {
         Ok(o) => o,
         Err(resp) => return resp,
     };
@@ -2210,18 +2703,21 @@ pub(super) fn device_poll(
             // browser reads as a sign-in refusal (403), never a
             // retryable outage. A failed live verification is the
             // issuer's answer, not a refusal — 502.
-            let opened = client::rpc_answer(
-                state_dir,
-                "operator_session_open_device",
-                json!({
-                    // The daemon verifies this bearer live against its
-                    // pinned trust root and derives subject/workspace
-                    // itself — no identity field crosses this call.
-                    "token": token,
-                    "origin": origin.as_str(),
-                    "user_agent": user_agent,
-                }),
-            );
+            let mut open_params = json!({
+                // The daemon verifies this bearer live against its
+                // pinned trust root and derives subject/workspace
+                // itself — no identity field crosses this call.
+                "token": token,
+                "origin": origin.as_str(),
+                "user_agent": user_agent,
+            });
+            if let Some(entry) = &entry {
+                // Server-issued entry scope: the daemon requires this to
+                // equal the live root profile origin and persists it on
+                // the session row. A board-origin sign-in never has one.
+                open_params["entry_origin"] = json!(entry.origin());
+            }
+            let opened = client::rpc_answer(state_dir, "operator_session_open_device", open_params);
             let opened = match opened {
                 Err(e) => {
                     return coded_response(503, "daemon_unavailable", &e.to_string(), None);
@@ -2243,14 +2739,17 @@ pub(super) fn device_poll(
             let body = serde_json::to_vec(&json!({ "session_key": key })).unwrap_or_default();
             let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
             resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
-            set_cookie(
-                &mut resp,
-                &format!(
-                    "{}={token}; {}",
-                    cookie_name(opts, origin),
-                    cookie_attrs(origin, (expires - now).max(0))
+            let (name, attrs) = match &entry {
+                Some(_) => (
+                    entry_cookie_name(opts),
+                    cookie_attrs_entry((expires - now).max(0)),
                 ),
-            );
+                None => (
+                    cookie_name(opts, origin),
+                    cookie_attrs(origin, (expires - now).max(0)),
+                ),
+            };
+            set_cookie(&mut resp, &format!("{name}={token}; {attrs}"));
             no_store(resp)
         }
         Err(_) => {
@@ -2283,6 +2782,125 @@ fn repend(login: &DeviceLogin, pending_id: String, code: String, expires_at: i64
     );
 }
 
+const INTENT_COOKIE: &str = "__Host-aos-board-intent";
+const CLEAR_INTENT: &str =
+    "__Host-aos-board-intent=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0";
+
+/// Resolve the dedicated mode once, before the server starts accepting requests.
+pub(super) fn dedicated_config(opts: &ServeOpts) -> CadenceResult<Option<String>> {
+    #[cfg(test)]
+    if let Some(value) = &opts.dedicated_deployment_for_test {
+        return validate_dedicated_config(opts, value.clone());
+    }
+    let value = match std::env::var("AGENTICOS_DEDICATED_BOARD_DEPLOYMENT") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => return Err(Error::rejected("invalid dedicated board deployment")),
+    };
+    validate_dedicated_config(opts, value)
+}
+
+fn validate_dedicated_config(opts: &ServeOpts, value: String) -> CadenceResult<Option<String>> {
+    if !opts.board_public_only {
+        return Err(Error::rejected("dedicated board requires public-only mode"));
+    }
+    if !crate::board_identity::dedicated_deployment_ok(&value) {
+        return Err(Error::rejected("invalid dedicated board deployment"));
+    }
+    let public = opts
+        .public
+        .as_ref()
+        .ok_or_else(|| Error::rejected("dedicated board requires public identity"))?;
+    let authorize = public
+        .authorize_url
+        .parse::<ureq::http::Uri>()
+        .map_err(|_| Error::rejected("invalid dedicated authorize URL"))?;
+    let authorize_authority = authorize
+        .authority()
+        .ok_or_else(|| Error::rejected("invalid dedicated authorize URL"))?;
+    if !crate::board_identity::dedicated_issuer_ok(&public.issuer)
+        || authorize.scheme_str() != Some("https")
+        || authorize_authority.as_str().contains('@')
+        || authorize.path() != "/v2/board/authorize"
+        || authorize.query().is_some()
+        || public.authorize_url
+            != format!(
+                "https://{}/v2/board/authorize",
+                authorize_authority.as_str()
+            )
+        || public_scheme(&public.host) != "https"
+        || !crate::board_identity::valid_aud(&public.host)
+        || public.company.is_empty()
+    {
+        return Err(Error::rejected(
+            "invalid dedicated public HTTPS configuration",
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn intent_redirect(to: &str, opts: &ServeOpts, deployment: &str) -> HttpResp {
+    let Some(public) = opts.public.as_ref() else {
+        return platform_fail(503, "capability_unavailable", "public identity unavailable");
+    };
+    let Ok(state) = crate::operator_auth::random_credential() else {
+        return platform_fail(503, "capability_unavailable", "sign-in unavailable");
+    };
+    let location = format!(
+        "{}?deployment={}&to={}&state={}",
+        public.authorize_url,
+        pct_encode(deployment),
+        pct_encode(to),
+        state
+    );
+    let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(302));
+    resp.add_header(Header::from_bytes("Location", location.as_bytes()).unwrap());
+    set_cookie(
+        &mut resp,
+        &format!("{INTENT_COOKIE}={state}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=300"),
+    );
+    no_store(resp)
+}
+
+fn safe_dedicated_to(raw: &str, opts: &ServeOpts) -> Option<String> {
+    let public = opts.public.as_ref()?;
+    let origin = format!("https://{}", public.host);
+    let tail = raw.strip_prefix(&origin)?;
+    if !tail.starts_with('/')
+        || tail.starts_with("//")
+        || tail.starts_with("/__platform/")
+        || tail.contains('#')
+        || tail.bytes().any(|b| b == b'\\' || b.is_ascii_control())
+    {
+        return None;
+    }
+    let decoded = pct_decode(tail)?;
+    if decoded.bytes().any(|b| b == b'\\' || b.is_ascii_control()) {
+        return None;
+    }
+    Some(format!("{origin}{tail}"))
+}
+
+const CALLBACK_JS: &str = r#"(() => {
+  const fragment = location.hash.slice(1);
+  history.replaceState(null, '', location.pathname);
+  const fail = () => { document.getElementById('status').textContent = 'Sign-in failed. Please try again.'; };
+  const p = new URLSearchParams(fragment);
+  if ([...p.keys()].some(k => !['assertion','state','next'].includes(k)) ||
+      ['assertion','state','next'].some(k => p.getAll(k).length !== 1 || !p.get(k))) { fail(); return; }
+  const assertion = p.get('assertion'), state = p.get('state'), next = p.get('next');
+  let decoded;
+  try { decoded = decodeURIComponent(next); } catch (_) { fail(); return; }
+  if (!next.startsWith('/') || next.startsWith('//') || /[\\\x00-\x1f\x7f]/.test(next) ||
+      /[\\\x00-\x1f\x7f]/.test(decoded)) { fail(); return; }
+  let target;
+  try { target = new URL(next, location.origin); } catch (_) { fail(); return; }
+  if (target.origin !== location.origin || target.hash || target.pathname.startsWith('/__platform/')) { fail(); return; }
+  fetch('/__platform/session', {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body:JSON.stringify({assertion,state})})
+    .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+    .then(r => { if (!r.ok) throw new Error(); location.replace(target.href); })
+    .catch(fail);
+})();"#;
 // ---------- `/__platform/*` — the AgenticOS sign-in contract (CAD-526) ----------
 //
 // What the board itself answers on its public name
@@ -2383,12 +3001,29 @@ fn request_url(request: &Request) -> String {
 /// `GET /__platform/login` — the container-side bounce (contract §3):
 /// `?to=<absolute board URL>` is honoured when it names this host;
 /// anything else sends the user to the board root.
-pub(super) fn platform_login(opts: &ServeOpts, query: &str) -> HttpResp {
+pub(super) fn platform_login(opts: &ServeOpts, query: &str, dedicated: Option<&str>) -> HttpResp {
     let fallback = opts
         .public
         .as_ref()
         .map(|public| format!("{}://{}/", public_scheme(&public.host), public.host))
         .unwrap_or_else(|| "/".to_string());
+    if let Some(deployment) = dedicated {
+        let values: Vec<_> = query
+            .split('&')
+            .filter_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                (pct_decode(key).as_deref() == Some("to")).then_some(value)
+            })
+            .collect();
+        let to = if values.len() == 1 {
+            pct_decode(values[0])
+                .and_then(|raw| safe_dedicated_to(&raw, opts))
+                .unwrap_or(fallback)
+        } else {
+            fallback
+        };
+        return intent_redirect(&to, opts, deployment);
+    }
     let to = query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
@@ -2403,7 +3038,19 @@ pub(super) fn platform_login(opts: &ServeOpts, query: &str) -> HttpResp {
 /// `/__platform/callback` is the worker's own static page — a request
 /// that still reached the container is bounced to `/`, everything else
 /// is a plain 404 (contract §5/§8).
-pub(super) fn platform_read(path: &str) -> HttpResp {
+pub(super) fn platform_read(path: &str, dedicated: Option<&str>) -> HttpResp {
+    if dedicated.is_some() && (path == "/__platform/callback" || path == "/__platform/callback.js")
+    {
+        let (body, content_type) = if path.ends_with(".js") {
+            (CALLBACK_JS, "application/javascript")
+        } else {
+            ("<!doctype html><html><head><meta charset=\"utf-8\"><title>Signing in</title><script defer src=\"/__platform/callback.js\"></script></head><body><p id=\"status\">Signing in…</p><a href=\"/__platform/login\">Try again</a></body></html>", "text/html; charset=utf-8")
+        };
+        let mut resp = Response::from_data(body.as_bytes().to_vec());
+        resp.add_header(Header::from_bytes("Content-Type", content_type).unwrap());
+        resp.add_header(Header::from_bytes("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'").unwrap());
+        return no_store(resp);
+    }
     if path == "/__platform/callback" {
         let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(302));
         if let Ok(h) = Header::from_bytes("Location", "/") {
@@ -2425,13 +3072,24 @@ pub(super) fn platform_unknown() -> HttpResp {
 /// current URL as `to`; an API/fetch read gets `401` —
 /// `board_session_required` — so no SPA request is mistaken for a
 /// navigation.
-pub(super) fn session_bounce(request: &Request, path: &str, opts: &ServeOpts) -> HttpResp {
+pub(super) fn session_bounce(
+    request: &Request,
+    path: &str,
+    opts: &ServeOpts,
+    dedicated: Option<&str>,
+) -> HttpResp {
     let navigation = !path.starts_with("/api/")
         && header_value(request, "Accept")
             .unwrap_or_default()
             .contains("text/html");
     if navigation {
-        redirect_to_authorize(&request_url(request), opts)
+        if let Some(deployment) = dedicated {
+            let fallback = format!("https://{}/", opts.public.as_ref().unwrap().host);
+            let to = safe_dedicated_to(&request_url(request), opts).unwrap_or(fallback);
+            intent_redirect(&to, opts, deployment)
+        } else {
+            redirect_to_authorize(&request_url(request), opts)
+        }
     } else {
         platform_fail(
             401,
@@ -2452,6 +3110,20 @@ pub(super) fn platform_session(
     request: &mut Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
+    dedicated: Option<&str>,
+) -> HttpResp {
+    let mut response = platform_session_inner(request, state_dir, opts, dedicated);
+    if dedicated.is_some() {
+        set_cookie(&mut response, CLEAR_INTENT);
+    }
+    response
+}
+
+fn platform_session_inner(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    dedicated: Option<&str>,
 ) -> HttpResp {
     if opts.public.is_none() {
         return platform_fail(404, "not_found", "Unknown route.");
@@ -2471,6 +3143,17 @@ pub(super) fn platform_session(
             return platform_fail(403, "assertion_invalid", "cross-site request rejected");
         }
     }
+    if dedicated.is_some() {
+        let expected = format!("https://{}", opts.public.as_ref().unwrap().host);
+        let origins: Vec<_> = request
+            .headers()
+            .iter()
+            .filter(|h| h.field.equiv("Origin"))
+            .collect();
+        if origins.len() != 1 || origins[0].value.as_str() != expected {
+            return platform_fail(403, "assertion_invalid", "origin is not this board's");
+        }
+    }
     if let Some(origin) = header_value(request, "Origin") {
         let host = header_value(request, "Host").unwrap_or_default();
         let own = format!("{}://{}", public_scheme(&host), host.to_ascii_lowercase());
@@ -2484,29 +3167,58 @@ pub(super) fn platform_session(
     };
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct PlatformSessionReq {
+    struct LegacySession {
         assertion: String,
     }
-    let req: PlatformSessionReq = match parse_json(&bytes) {
-        Ok(r) => r,
-        Err(_) => return platform_fail(400, "assertion_invalid", "request body is not valid JSON"),
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DedicatedSession {
+        assertion: String,
+        state: Option<String>,
+    }
+    let parsed = if dedicated.is_some() {
+        parse_json::<DedicatedSession>(&bytes).map(|req| (req.assertion, req.state))
+    } else {
+        parse_json::<LegacySession>(&bytes).map(|req| (req.assertion, None))
     };
-    if req.assertion.is_empty() {
+    let Ok((assertion, state)) = parsed else {
         return platform_fail(400, "assertion_invalid", "request body is not valid JSON");
+    };
+    if assertion.is_empty() {
+        return platform_fail(400, "assertion_invalid", "request body is not valid JSON");
+    }
+    if dedicated.is_some() {
+        let mut cookies = request
+            .headers()
+            .iter()
+            .filter(|h| h.field.equiv("Cookie"))
+            .flat_map(|h| h.value.as_str().split(';'))
+            .filter_map(|part| part.trim().split_once('='))
+            .filter(|(name, _)| *name == INTENT_COOKIE)
+            .map(|(_, value)| value);
+        let state = state.as_deref().unwrap_or("");
+        if !crate::operator_auth::well_formed(state)
+            || !cookies
+                .next()
+                .is_some_and(|cookie| crate::operator_auth::same_credential(state, cookie))
+            || cookies.next().is_some()
+        {
+            return platform_fail(403, "assertion_invalid", "sign-in intent invalid");
+        }
     }
     let user_agent = header_value(request, "User-Agent").unwrap_or_default();
     // Only relay a prior session the browser actually presented. The daemon
     // verifies this opaque proof before allowing it to affect consent state.
     let prior_session = session_cookie(request, opts, Origin::Public);
-    match client::rpc(
-        state_dir,
-        "board_session_open",
-        json!({
-            "assertion": req.assertion,
-            "user_agent": user_agent,
-            "prior_session": prior_session,
-        }),
-    ) {
+    let mut proof = json!({
+        "assertion": assertion,
+        "user_agent": user_agent,
+        "prior_session": prior_session,
+    });
+    if let Some(deployment) = dedicated {
+        proof["dedicated_deployment"] = json!(deployment);
+    }
+    match client::rpc(state_dir, "board_session_open", proof) {
         Ok(opened) => {
             let token = opened["token"].as_str().unwrap_or_default();
             // The server's own session expiry rides the success body so
@@ -2574,6 +3286,108 @@ mod tests {
         );
     }
     use super::*;
+
+    fn dedicated_fixture() -> ServeOpts {
+        ServeOpts {
+            board_public_only: true,
+            public: Some(super::super::PublicBoard {
+                host: "board.example.test".into(),
+                issuer: "https://api.example.test".into(),
+                company: "workspace".into(),
+                authorize_url: "https://app.example.test/v2/board/authorize".into(),
+            }),
+            ..ServeOpts::default()
+        }
+    }
+
+    #[test]
+    fn dedicated_login_uses_portal_and_intent_cookie() {
+        let opts = dedicated_fixture();
+        let mut not_public_only = opts.clone();
+        not_public_only.board_public_only = false;
+        assert!(validate_dedicated_config(&not_public_only, "fixture-board".into()).is_err());
+        assert_eq!(
+            validate_dedicated_config(&opts, "fixture-board".into())
+                .unwrap()
+                .as_deref(),
+            Some("fixture-board")
+        );
+        let response = platform_login(
+            &opts,
+            "to=https%3A%2F%2Fboard.example.test%2Fprojects",
+            Some("fixture-board"),
+        );
+        assert_eq!(response.status_code().0, 302);
+        let header = |name: &'static str| {
+            response
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(name))
+                .unwrap()
+                .value
+                .as_str()
+                .to_owned()
+        };
+        let location = header("Location");
+        let cookie = header("Set-Cookie");
+        assert!(location.starts_with(
+            "https://app.example.test/v2/board/authorize?deployment=fixture-board&to="
+        ));
+        let state = location.split("&state=").nth(1).unwrap();
+        assert_eq!(state.len(), 64);
+        assert!(cookie.starts_with(&format!("{INTENT_COOKIE}={state};")));
+        assert!(cookie.contains("Secure; HttpOnly; SameSite=Lax; Max-Age=300"));
+        assert_eq!(
+            platform_read("/__platform/callback", Some("fixture-board"))
+                .status_code()
+                .0,
+            200
+        );
+        assert_eq!(
+            platform_read("/__platform/callback", None).status_code().0,
+            302
+        );
+        assert!(safe_dedicated_to("https://board.example.test/%5cevil", &opts).is_none());
+    }
+
+    #[test]
+    fn dedicated_session_refuses_missing_and_mismatched_intent() {
+        let opts = dedicated_fixture();
+        let state_dir = tempfile::tempdir().unwrap();
+        for (body, cookie) in [
+            (r#"{"assertion":"x"}"#, "__Host-aos-board-intent=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (r#"{"assertion":"x","state":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#, "__Host-aos-board-intent=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (r#"{"assertion":"x","state":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#, ""),
+        ] {
+            let mut request: Request = tiny_http::TestRequest::new()
+                .with_method(tiny_http::Method::Post)
+                .with_body(body)
+                .with_header(Header::from_bytes("Host", "board.example.test").unwrap())
+                .with_header(Header::from_bytes("Origin", "https://board.example.test").unwrap())
+                .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+                .with_header(Header::from_bytes("Cookie", cookie).unwrap())
+                .into();
+            let response = platform_session(&mut request, state_dir.path(), &opts, Some("fixture-board"));
+            assert_eq!(response.status_code().0, 403);
+            assert!(response.headers().iter().any(|h| h.field.equiv("Set-Cookie") && h.value.as_str() == CLEAR_INTENT));
+        }
+        let mut request: Request = tiny_http::TestRequest::new()
+            .with_method(tiny_http::Method::Post)
+            .with_body(r#"{"assertion":"x","state":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#)
+            .with_header(Header::from_bytes("Host", "board.example.test").unwrap())
+            .with_header(Header::from_bytes("Origin", "https://board.example.test").unwrap())
+            .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+            .with_header(Header::from_bytes("Cookie", "__Host-aos-board-intent=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap())
+            .into();
+        // A matching intent reaches the existing daemon RPC; this fixture has no daemon.
+        let response =
+            platform_session(&mut request, state_dir.path(), &opts, Some("fixture-board"));
+        assert_ne!(response.status_code().0, 403);
+        assert!(response
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("Set-Cookie") && h.value.as_str() == CLEAR_INTENT));
+    }
 
     #[test]
     fn agent_uid_socket_never_becomes_operator_on_either_fallback_arm() {
@@ -2654,6 +3468,7 @@ mod tests {
             "/api/app-favorites/default",
             "/api/app-requests/dismiss",
             "/api/app-installations/inst-1/update-check",
+            "/api/app-installations/inst-1/automatic-updates",
             "/api/app-installations/inst-1/remove-preview",
             "/api/app-installations/inst-1/remove",
             "/api/app-installations/inst-1/restore",
@@ -2953,5 +3768,238 @@ mod tests {
         assert!(p.contains("Secure") && p.contains("Path=/") && p.contains("HttpOnly"));
         assert!(p.contains("SameSite=Lax") && !p.contains("Domain"));
         assert!(p.contains("Max-Age=3600"), "{p}");
+    }
+
+    /// CAD-1950 acceptance.
+    ///
+    /// Changing a project's policy is the board owner's decision. The route is
+    /// declared operator-only in the endpoint table, and the rule `admit` runs
+    /// for that class refuses a signed-in `member` — while the owner's own role
+    /// passes the same call, so the refusal is the member rule and not a rule
+    /// that refuses everyone.
+    ///
+    /// Authored independently of the implementation: a separate agent was given
+    /// the requirement and the production seam (`admit_operator_class`), not the
+    /// diff. It was shown to bite by flipping the endpoint row's class to
+    /// `AgentAllowed`, observing this test fail on the class assertion, then
+    /// restoring it. That is not the merge verdict — reviews and the operator's
+    /// approval still decide this PR.
+    #[test]
+    fn a_member_cannot_change_a_project_policy() {
+        use crate::ui::endpoints;
+        use std::io::Read;
+
+        const METHOD: &str = "POST";
+        const PATH: &str = "/api/projects/pay/policy";
+        let what = format!("{METHOD} {PATH}");
+
+        // 1. The table declares the route operator-only — the class whose
+        //    rule the second half of this test drives.
+        assert_eq!(
+            endpoints::class_of(METHOD, PATH),
+            Some(RouteClass::OperatorOnly),
+            "{what} must be declared OperatorOnly: a member must not decide a project's policy"
+        );
+
+        // A member refusal returns before the request or the state dir are
+        // read, so an empty request and any path stand in for a real one.
+        let request: Request = tiny_http::TestRequest::new().into();
+        let state_dir = std::path::Path::new("/nonexistent/cad-1950");
+        let opts = ServeOpts::default();
+        let signed_in = |operator: bool| {
+            Caller::Named(Named {
+                actor: "Fable Chen <fable@example.com> (board)".into(),
+                author: "usr_fable".into(),
+                sub: "sub_fable".into(),
+                operator,
+            })
+        };
+
+        // 2. A signed-in member is refused on the member-role rule.
+        let refused = admit_operator_class(&request, state_dir, &opts, &signed_in(false), &what)
+            .expect_err("a member must not be admitted to an operator-only route");
+        assert_eq!(
+            refused.status_code().0,
+            403,
+            "{what} must refuse a member with 403"
+        );
+        let mut body = String::new();
+        refused
+            .into_reader()
+            .read_to_string(&mut body)
+            .expect("the refusal carries a readable body");
+        let refusal: Value = serde_json::from_str(&body).expect("the refusal is JSON");
+        assert_eq!(
+            refusal["check"], "member_role",
+            "{what} must refuse a member on the member-role rule, got {body}"
+        );
+
+        // 3. Control: the owner's role passes the same call.
+        match admit_operator_class(&request, state_dir, &opts, &signed_in(true), &what) {
+            Ok(()) => {}
+            Err(refusal) => panic!(
+                "{what} must admit the board owner's role, refused {}",
+                refusal.status_code().0
+            ),
+        }
+    }
+
+    /// CAD-2092 independent HTTP peer acceptance. Authored from the ticket, not
+    /// the implementation (AGENTS.md "Gates and security work"): the HTTP peer
+    /// must be at least as strict as the daemon RPCs (`agent_skills_set` and
+    /// `agent_tools_set`). Both routes are explicitly declared `OperatorOnly`
+    /// alongside `/api/agents/*/instructions`, refuse an agent caller and a
+    /// non-operator member at `admit_operator_class`, admit the owner positive
+    /// control, and reject extra/malformed body fields before relaying to the
+    /// daemon.
+    #[test]
+    fn agent_skills_and_tools_routes_are_operator_only_and_reject_extra_fields() {
+        use std::io::Read;
+
+        let read_json = |resp: HttpResp| -> (u16, Value) {
+            let status = resp.status_code().0;
+            let mut body = String::new();
+            resp.into_reader()
+                .read_to_string(&mut body)
+                .expect("HTTP response carries a readable body");
+            let parsed: Value = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("expected JSON response, got {body:?}: {e}"));
+            (status, parsed)
+        };
+
+        let request: Request = tiny_http::TestRequest::new().into();
+        let state_dir = std::path::Path::new("/nonexistent/cad-2092");
+        let opts = ServeOpts::default();
+        let signed_in = |operator: bool| {
+            Caller::Named(Named {
+                actor: "Fable Chen <fable@example.com> (board)".into(),
+                author: "usr_fable".into(),
+                sub: "sub_fable".into(),
+                operator,
+            })
+        };
+
+        // 1. Explicit OperatorOnly classification matching `/instructions`, and
+        //    admission refuses agent and non-operator member callers while
+        //    admitting the owner positive control.
+        for path in [
+            "/api/agents/worker/instructions",
+            "/api/agents/worker/skills",
+            "/api/agents/worker/tools",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "POST {path} must be OperatorOnly"
+            );
+            assert!(
+                WRITE_ROUTES.iter().any(|r| r.method == "POST"
+                    && r.class == RouteClass::OperatorOnly
+                    && matches(r.pattern, path)),
+                "POST {path} must be explicitly listed in WRITE_ROUTES as OperatorOnly"
+            );
+            for method in ["PUT", "PATCH", "DELETE"] {
+                assert_eq!(
+                    route_class(method, path),
+                    RouteClass::OperatorOnly,
+                    "{method} {path} must stay OperatorOnly"
+                );
+            }
+
+            let what = format!("POST {path}");
+
+            let agent_refused = admit_operator_class(
+                &request,
+                state_dir,
+                &opts,
+                &Caller::Agent("worker".into()),
+                &what,
+            )
+            .expect_err("an agent caller must be refused on operator-only agent config routes");
+            let (status, body) = read_json(agent_refused);
+            assert_eq!(status, 403, "{what} must refuse an agent caller with 403");
+            assert_eq!(
+                body["check"], "operator_only",
+                "{what} must refuse an agent caller on operator_only, got {body}"
+            );
+
+            let member_refused =
+                admit_operator_class(&request, state_dir, &opts, &signed_in(false), &what)
+                    .expect_err("a non-operator member must be refused on agent config routes");
+            let (status, body) = read_json(member_refused);
+            assert_eq!(status, 403, "{what} must refuse a member caller with 403");
+            assert_eq!(
+                body["check"], "member_role",
+                "{what} must refuse a member caller on member_role, got {body}"
+            );
+
+            // Positive control: the board owner passes the same gate.
+            match admit_operator_class(&request, state_dir, &opts, &signed_in(true), &what) {
+                Ok(()) => {}
+                Err(refusal) => panic!(
+                    "{what} must admit the board owner's role, refused {}",
+                    refusal.status_code().0
+                ),
+            }
+        }
+
+        // 2. Route matching and strict body rejection before the daemon relay:
+        //    unknown/forged extra fields and non-string/missing arrays return
+        //    400 directly from `agent_action`.
+        assert_eq!(
+            crate::ui::home::agent_action_route("/api/agents/worker/skills"),
+            Some(("worker", "skills"))
+        );
+        assert_eq!(
+            crate::ui::home::agent_action_route("/api/agents/worker/tools"),
+            Some(("worker", "tools"))
+        );
+
+        let post_action = |path: &'static str, verb: &str, raw: &'static str| -> (u16, Value) {
+            let mut req: Request = tiny_http::TestRequest::new()
+                .with_method(tiny_http::Method::Post)
+                .with_path(path)
+                .with_body(raw)
+                .into();
+            read_json(crate::ui::home::agent_action(
+                &mut req, state_dir, "worker", verb,
+            ))
+        };
+
+        for (raw, expected_fragment) in [
+            (r#"{"skills":["cadence"],"by":"operator"}"#, "by"),
+            (r#"{"skills":["cadence"],"extra":true}"#, "extra"),
+            (r#"{}"#, "skills"),
+            (r#"{"skills":["cadence",42]}"#, "strings"),
+        ] {
+            let (status, body) = post_action("/api/agents/worker/skills", "skills", raw);
+            assert_eq!(
+                status, 400,
+                "skills body {raw} must be rejected with 400, got {status} {body}"
+            );
+            let err = body["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains(expected_fragment),
+                "skills error for {raw} should mention {expected_fragment:?}, got {err:?}"
+            );
+        }
+
+        for (raw, expected_fragment) in [
+            (r#"{"disabled_tools":["bash"],"actor":"operator"}"#, "actor"),
+            (r#"{"disabled_tools":["bash"],"extra":1}"#, "extra"),
+            (r#"{}"#, "tools"),
+            (r#"{"disabled_tools":["bash",1]}"#, "strings"),
+        ] {
+            let (status, body) = post_action("/api/agents/worker/tools", "tools", raw);
+            assert_eq!(
+                status, 400,
+                "tools body {raw} must be rejected with 400, got {status} {body}"
+            );
+            let err = body["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains(expected_fragment),
+                "tools error for {raw} should mention {expected_fragment:?}, got {err:?}"
+            );
+        }
     }
 }

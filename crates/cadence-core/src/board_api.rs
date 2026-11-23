@@ -324,6 +324,37 @@ pub struct AgentsPayload {
     pub totals: Option<AgentTotals>,
     /// Issue id to its bound agent strip.
     pub by_issue: BTreeMap<String, Vec<CardAgent>>,
+    /// CAD-1989: the settings profiles, each with the runtime aliases
+    /// registered against it.
+    #[schemars(with = "Vec<AgentProfile>")]
+    pub profiles: Vec<Value>,
+}
+
+/// One agent profile of `GET /api/agents` (CAD-1989).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct AgentProfile {
+    pub id: String,
+    pub alias: String,
+    pub role: String,
+    pub team_role: String,
+    pub catalogue: Option<String>,
+    pub look: Option<String>,
+    /// The operator's to read: absent from the board's shared payload.
+    pub job: Option<String>,
+    /// `inherit` or a model id.
+    pub model: String,
+    pub runtimes: Vec<String>,
+    /// The newest claim under this profile (CAD-1990). Hosted boards only, and
+    /// absent when it never claimed or the board could not read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_claim: Option<ProfileClaim>,
+}
+
+/// A profile's newest claim: the issue and the claim's own state.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ProfileClaim {
+    pub issue_id: String,
+    pub state: String,
 }
 
 /// `GET /api/agents`: the roster beside its snapshot's freshness.
@@ -520,11 +551,106 @@ pub struct MasterSession {
     pub compacting: Value,
 }
 
+/// A canonical avatar look (the board's eleven `AgentAvatar` palettes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AvatarLook {
+    Builder,
+    Guard,
+    Bookkeeper,
+    Content,
+    Designer,
+    Reception,
+    Operations,
+    Support,
+    Tester,
+    Robot,
+    Custom,
+}
+
+impl AvatarLook {
+    /// The canonical slug, as the board's catalogue spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AvatarLook::Builder => "builder",
+            AvatarLook::Guard => "guard",
+            AvatarLook::Bookkeeper => "bookkeeper",
+            AvatarLook::Content => "content",
+            AvatarLook::Designer => "designer",
+            AvatarLook::Reception => "reception",
+            AvatarLook::Operations => "operations",
+            AvatarLook::Support => "support",
+            AvatarLook::Tester => "tester",
+            AvatarLook::Robot => "robot",
+            AvatarLook::Custom => "custom",
+        }
+    }
+
+    /// Parse one catalogued slug; anything else is not a look.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "builder" => AvatarLook::Builder,
+            "guard" => AvatarLook::Guard,
+            "bookkeeper" => AvatarLook::Bookkeeper,
+            "content" => AvatarLook::Content,
+            "designer" => AvatarLook::Designer,
+            "reception" => AvatarLook::Reception,
+            "operations" => AvatarLook::Operations,
+            "support" => AvatarLook::Support,
+            "tester" => AvatarLook::Tester,
+            "robot" => AvatarLook::Robot,
+            "custom" => AvatarLook::Custom,
+            _ => return None,
+        })
+    }
+}
+
+/// The workspace coordinator's effective identity (`master_state.identity`).
+///
+/// `name`/`tone` are the operator-owned protected files' agreed values (`null`
+/// = unset); `look` is the pinned `params.look` (the existing robot when
+/// unpinned); `revision` fences the next protected update.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct MasterIdentity {
+    pub name: Option<String>,
+    pub tone: Option<String>,
+    pub look: AvatarLook,
+    pub revision: String,
+}
+
+/// A member's committed identity. Private address/preferences are never a UI projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct PersonalAssistantIdentity {
+    pub name: Option<String>,
+    pub tone: Option<String>,
+    pub look: AvatarLook,
+    pub revision: u64,
+}
+
+/// The actor actually serving a conversation, independent of its transport alias.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "lowercase")]
+pub enum ActorIdentity {
+    Personal {
+        conversation_id: String,
+        identity: PersonalAssistantIdentity,
+    },
+    Workspace {
+        conversation_id: String,
+        identity: MasterIdentity,
+    },
+}
+
 /// `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
 /// master header shows. A member's copy drops the turn's `summary`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct MasterState {
     pub alias: String,
+    pub identity: MasterIdentity,
+    /// Hosted conversations may be personal even when the transport alias is `master`.
+    /// An absent projection retains the native workspace-coordinator contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_identity: Option<ActorIdentity>,
     pub provider: String,
     pub endpoint_kind: String,
     pub live: bool,
@@ -540,6 +666,91 @@ pub struct MasterState {
     pub queue: Vec<MasterQueued>,
     pub queued: i64,
 }
+
+/// CAD-2215: the field any relayed, reader-scoped reply carries. It is not
+/// part of the document/page proper (underscore-prefixed), never appears in a
+/// client's copy, and is the board's only proof that the daemon that answered
+/// is one that applies the reader boundary — a relay must treat its absence
+/// as "unavailable", never as an empty success.
+pub const READER_SCOPE_FIELD: &str = "_reader_scope";
+
+/// The field a reader-scoped `master_state` reply carries (the shared
+/// [`READER_SCOPE_FIELD`]).
+pub const MASTER_STATE_SCOPE_FIELD: &str = READER_SCOPE_FIELD;
+
+/// The exact value of [`READER_SCOPE_FIELD`] on a `master_state` reply: the
+/// daemon understood the relayed reader proof and applied the reader boundary
+/// to this answer — the full document for the operator it re-proved, the
+/// project-policy + member-private-job projection with explicitly granted app
+/// conversations for every other reader. Bump the suffix when this changes.
+pub const MASTER_STATE_SCOPE_ACK: &str = "cad2215.project.v2";
+
+/// The exact value of [`READER_SCOPE_FIELD`] on a `thread_read` page: the
+/// daemon understood the relayed reader proof and scoped THIS page (the same
+/// project-policy + member-private-job filter and explicit app-conversation
+/// grants, applied before pagination). Every polled page carries its own ack.
+pub const THREAD_SCOPE_ACK: &str = "cad2215.thread.v2";
+
+/// Native scoped thread pages require opaque positions; operators keep
+/// numeric pages but acknowledge the protocol when explicitly requested.
+pub const THREAD_CURSOR_FORMAT: &str = "opaque-v1";
+pub const THREAD_OPAQUE_SCOPE_ACK: &str = "cad2215.thread.opaque.v1";
+pub const THREAD_OPERATOR_SCOPE_ACK: &str = "cad2215.thread.operator.v1";
+
+/// Per-response acknowledgements for the agent reads relayed by the board.
+/// A list, detail and event page each prove their own reader scope; a board
+/// must not infer one from another or cache it across daemon replacements.
+pub const AGENT_LIST_SCOPE_ACK: &str = "cad2215.agent-list.v2";
+pub const AGENT_SHOW_SCOPE_ACK: &str = "cad2215.agent-show.v1";
+pub const AGENT_EVENTS_SCOPE_ACK: &str = "cad2215.agent-events.v1";
+/// A scoped agent-events reader must explicitly request opaque positions.
+pub const AGENT_EVENTS_CURSOR_FORMAT: &str = "opaque-v1";
+/// A proven operator requested the format but received legacy numeric positions.
+pub const AGENT_EVENTS_OPERATOR_SCOPE_ACK: &str = "cad2215.agent-events.operator.v1";
+
+/// A signed member job list with current ownership/project scope and private
+/// completion health. The board refuses the whole list without this ack.
+pub const MEMBER_JOB_SCOPE_ACK: &str = "cad2215.member-job-list.v2";
+
+/// The signed member's assistant history uses opaque positions in both
+/// directions. The board requires this per-page acknowledgement before relay.
+pub const MEMBER_ASSIST_HISTORY_CURSOR_FORMAT: &str = "opaque-v1";
+pub const MEMBER_ASSIST_HISTORY_SCOPE_ACK: &str = "cad2215.member-assist-history.opaque.v1";
+
+/// Human-room history, post receipts and read markers use scoped positions.
+pub const HUMAN_ROOM_CURSOR_FORMAT: &str = "opaque-v1";
+pub const HUMAN_ROOM_SCOPE_ACK: &str = "cad2215.human-room.opaque.v1";
+
+/// The `cursor_format` value that asks a job-event read for opaque positions.
+/// A scoped reader must send exactly this; it is never a way to downgrade to
+/// numeric positions, and a proven operator that sends it is answered with
+/// the unchanged numeric document plus [`JOB_EVENTS_OPERATOR_SCOPE_ACK`].
+pub const JOB_EVENTS_CURSOR_FORMAT: &str = "opaque-v1";
+
+/// The `cursor_format` value required for a scoped monitor-alert page.
+pub const MONITOR_CURSOR_FORMAT: &str = "opaque-v1";
+/// A proven operator requested that format but retains numeric alert positions.
+pub const MONITOR_OPERATOR_SCOPE_ACK: &str = "cad2215.monitor-read.operator.v1";
+
+/// Opaque topic-page cursors for a proven non-operator subscriber.
+pub const TOPIC_CURSOR_FORMAT: &str = "opaque-v1";
+pub const TOPIC_SCOPE_ACK: &str = "cad2215.topic.opaque.v1";
+/// A proven operator requested the format but retains numeric positions.
+pub const TOPIC_OPERATOR_SCOPE_ACK: &str = "cad2215.topic.operator.v1";
+
+/// The exact value of [`READER_SCOPE_FIELD`] on a scoped `job_events` (native)
+/// or `member_job_events` (signed) page: every visible event carries a stable
+/// keyed `id` and a purpose-bound forward `cursor`, no global `seq` is
+/// disclosed, and the page `cursor` continues the same feed. The ack is a
+/// protocol confirmation for a reply the daemon produced after re-proving the
+/// reader and the job — it is never authority.
+pub const JOB_EVENTS_SCOPE_ACK: &str = "cad2215.job-events.opaque.v1";
+
+/// The exact value of [`READER_SCOPE_FIELD`] when a PROVEN operator asked for
+/// [`JOB_EVENTS_CURSOR_FORMAT`]: the answer is the legacy numeric document
+/// (numeric `seq`, numeric `cursor`), and the ack says so, so no client ever
+/// mistakes numeric positions for opaque ones.
+pub const JOB_EVENTS_OPERATOR_SCOPE_ACK: &str = "cad2215.job-events.operator.v1";
 
 /// A conversation (thread) row.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -573,7 +784,19 @@ pub struct ThreadEntryRow {
 }
 
 /// `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
-/// A forward read carries `cursor`; a backward one also `more_before`.
+///
+/// `cursor` is the last row the page scanned in the direction it was read —
+/// the forward resume point, and the newest scanned row of a `tail` page. A
+/// projection can filter another source's rows out of a page, so a consumer
+/// must move by what was SCANNED and never by what was kept. Project-scoped
+/// reads first exclude entries without a readable issue binding; only that
+/// scoped stream contributes to these page boundaries:
+///
+/// - `more_before` (backward) says raw rows remain below the page;
+/// - `scanned_before` (backward) is the lowest seq scanned, the `before`
+///   continuation — present even when the page kept nothing;
+/// - `more_after` (forward) says the scan filled the page, so raw rows may
+///   remain beyond it.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ThreadPage {
     pub alias: String,
@@ -582,6 +805,13 @@ pub struct ThreadPage {
     pub cursor: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub more_before: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanned_before: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more_after: Option<bool>,
+    /// Cloud history is incomplete for this read; ordinary rows remain usable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_withheld: Option<String>,
     pub reply_seq: i64,
 }
 
@@ -817,7 +1047,7 @@ pub struct CommentReq {
 #[serde(deny_unknown_fields)]
 pub struct AgentRegisterReq {
     pub alias: String,
-    /// Start blank only; a `catalogue` hire takes the runtime from the install.
+    /// Start blank only.
     pub location: Option<String>,
     pub provider: Option<String>,
     pub endpoint_kind: Option<String>,
@@ -828,9 +1058,17 @@ pub struct AgentRegisterReq {
     pub sandbox: Option<String>,
     pub instructions: Option<String>,
     pub params: Option<String>,
-    /// CAD-1752: hire from this role of `GET /api/agent-roles`.
-    pub catalogue: Option<String>,
-    pub look: Option<String>,
+}
+
+/// `POST /api/agent-profiles` (CAD-1989): hire a catalogue role as a profile.
+/// `job` is sent only when edited; `model` is absent or `inherit` unless picked.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileReq {
+    pub alias: String,
+    pub catalogue: String,
+    pub job: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

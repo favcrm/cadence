@@ -36,3 +36,21 @@ fast". This is a recorded scope amendment, not a claim that an unrun check passe
 Independent review, operator approval for human-class triggers, merge-queue flow and
 all production-safety rules apply as normal. No release, deployment or activation is
 authorized or claimed by this document.
+
+## CAD-1817 identity follow-on — candidate, not operational delivery
+
+The follow-on adds explicit assistant-name/user-address semantics, later profile
+edits, a committed identity projection and stable existing avatar selection.
+Private ACK/lifecycle and workspace native/HTTP refusal checks have been exercised
+in isolated fixtures, including stale avatar revisions and revoked authority.
+The real compiled board was exercised at desktop/narrow widths in English and
+Traditional Chinese: workspace name/personality/avatar save, later rename,
+literal-name persistence and unchanged routing alias/avatar across reload and
+daemon/board restart.
+
+That workspace UI smoke is not a private-assistant provider conversation.
+CAD-1603/CAD-1606 still track the isolated membership/custody/provider prerequisites;
+genuine private onboarding, subsequent model replies and the full private/app
+browser matrix remain unverified. The historical CAD-1420 amendment above does
+not waive CAD-1817's acceptance. CAD-1818 routing/Master-query work remains blocked,
+and no merge, production installation or deployment is claimed here.

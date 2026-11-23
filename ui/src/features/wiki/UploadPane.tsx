@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import { fmtBytes } from "../../lib/fmt";
 import { IconCheck, IconUpload, IconWarning } from "../../ui/icons";
-import { clearTransferResume, importFile, readResume, forgetResume, type ImportResult, type ResumeEntry } from "./transfer";
+import { clearTransferResume, importFile, uploadMultipart, readResume, forgetResume, type ImportResult, type ResumeEntry } from "./transfer";
 import {
   capLabel,
   counts,
@@ -18,6 +18,7 @@ import {
 } from "./upload";
 import Button from "../../ui/Button";
 import { KindIcon, Note, WikiToolbar } from "./shared";
+import { HOSTED_UPLOAD_MAX_BYTES } from "./hosted";
 import { useTranslate } from "../../lib/locale";
 import { beginPrivateOperation, onPrivateReadsPaused, onPrivateSessionReset, type PrivateOperation } from "../../lib/privateSession";
 
@@ -32,15 +33,22 @@ export default function UploadPane({
   dir,
   navHref,
   readOnly,
+  readOnlyReason,
   onToast,
   onUploaded,
+  multipart = false,
 }: {
   dir: string;
   navHref: (route: Route) => string;
   readOnly: boolean;
+  /** Why writes are blocked, when the board knows it. */
+  readOnlyReason?: string | null;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onUploaded: () => void;
+  /** Hosted boards upload with one multipart POST; local boards use transfer jobs. */
+  multipart?: boolean;
 }) {
+  const t = useTranslate();
   const [items, setItems] = useState<UploadItem[]>([]);
   const [drag, setDrag] = useState(0);
   const [held, setHeld] = useState(false);
@@ -82,6 +90,8 @@ export default function UploadPane({
     const fresh = queued(
       picked.map((f) => ({ name: f.name, size: f.size })),
       nextId.current,
+      multipart ? HOSTED_UPLOAD_MAX_BYTES : undefined,
+      multipart,
     );
     nextId.current += fresh.length;
     picked.forEach((file, i) => files.current.set(fresh[i].id, file));
@@ -166,7 +176,7 @@ export default function UploadPane({
       if (operationRef.current === operation) operationRef.current = null;
       running.current = false;
     };
-    importFile(dir, file, updateRef.current, (percent) => {
+    (multipart ? uploadMultipart : importFile)(dir, file, updateRef.current, (percent) => {
       if (!currentAttempt()) return;
       setItems((current) => {
         const next = uploadProgress(current, id, percent);
@@ -178,15 +188,17 @@ export default function UploadPane({
         if (!currentAttempt()) return;
         const abandonedTransfer = operation.signal.aborted || heldRef.current;
         releaseTransport();
-        const detail = `${result.outcome} · extraction ${result.extraction} · index ${result.index}`;
+        const detail = result.detail
+          ? `${t(result.detail)}${result.error ? ` — ${result.error}` : ""}`
+          : `${result.outcome} · extraction ${result.extraction} · index ${result.index}`;
         setItems((current) => {
           const next = uploadDone(current, id).map((item) => item.id === id ? { ...item, detail } : item);
           itemsRef.current = next;
           return next;
         });
         if (abandonedTransfer) return;
-        const blocked = result.index !== "covered" || result.extraction === "failed" || result.extraction === "empty" || result.extraction === "unsupported" || result.extraction === "conflict";
-        if (blocked) onToast("warn", `${file.name} was saved; extraction ${result.extraction}; index ${result.index}${result.error ? `: ${result.error}` : ""}`);
+        const blocked = result.warn ?? (result.index !== "covered" || result.extraction === "failed" || result.extraction === "empty" || result.extraction === "unsupported" || result.extraction === "conflict");
+        if (blocked) onToast("warn", result.detail ? `${file.name}: ${detail}` : `${file.name} was saved; extraction ${result.extraction}; index ${result.index}${result.error ? `: ${result.error}` : ""}`);
         onUploaded();
       })
       .catch((error: unknown) => {
@@ -209,7 +221,6 @@ export default function UploadPane({
   const tally = counts(items);
   const active = items.some((item) => item.state === "queued" || item.state === "uploading");
   const browseHref = navHref({ screen: "wiki", mode: "browse", path: dir || null, query: null });
-  const t = useTranslate();
 
   return (
     <>
@@ -218,7 +229,7 @@ export default function UploadPane({
       </>} />
 
       {readOnly && (
-        <Note warn>{t("writes are disabled on this board — sign in as the operator to upload.")}</Note>
+        <Note warn>{readOnlyReason ?? t("Writes are disabled on this board.")}</Note>
       )}
 
       <div
@@ -242,7 +253,7 @@ export default function UploadPane({
           <IconUpload />
           <div className="wk-etitle">{t("Drop files to upload")}</div>
           <div className="kicker">
-            {t("Up to")} {capLabel()} {t("per file")}
+            {t("Up to")} {capLabel(multipart ? HOSTED_UPLOAD_MAX_BYTES : undefined)} {t("per file")}
           </div>
           <label className="kicker">
             <input type="checkbox" checked={updateExisting} disabled={readOnly} onChange={(event) => setUpdateExisting(event.target.checked)} /> {t("Update changed files")}
@@ -299,7 +310,7 @@ export default function UploadPane({
                 ) : item.state === "error" ? (
                   <>
                     <IconWarning size={13} />
-                    {item.error ?? "rejected"}
+                    {item.error ? t(item.error) : "rejected"}
                   </>
                 ) : item.state === "uploading" ? (
                   <>

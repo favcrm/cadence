@@ -24,6 +24,44 @@ export interface ActivityEntry {
   title?: string | null;
 }
 
+/** The actor actually serving a conversation, independent of its transport alias. */
+export type ActorIdentity = {
+  conversation_id: string;
+  identity: PersonalAssistantIdentity;
+  scope: "personal";
+} | {
+  conversation_id: string;
+  identity: MasterIdentity;
+  scope: "workspace";
+};
+
+/** One agent profile of `GET /api/agents` (CAD-1989). */
+export interface AgentProfile {
+  alias: string;
+  catalogue?: string | null;
+  id: string;
+  /** The operator's to read: absent from the board's shared payload. */
+  job?: string | null;
+  /** The newest claim under this profile (CAD-1990). Hosted boards only, and
+   * absent when it never claimed or the board could not read it. */
+  latest_claim?: ProfileClaim | null;
+  look?: string | null;
+  /** `inherit` or a model id. */
+  model: string;
+  role: string;
+  runtimes: string[];
+  team_role: string;
+}
+
+/** `POST /api/agent-profiles` (CAD-1989): hire a catalogue role as a profile.
+ * `job` is sent only when edited; `model` is absent or `inherit` unless picked. */
+export interface AgentProfileReq {
+  alias: string;
+  catalogue: string;
+  job?: string | null;
+  model?: string | null;
+}
+
 /** A provider allowance record as the store keeps it. The envelope is fixed;
  * `data` is the provider's own report (for Codex, its rate-limit buckets). */
 export interface AgentQuota {
@@ -47,14 +85,11 @@ export interface AgentQuota {
  * not a daemon field: `cloud` pins provider and endpoint kind to `sandbox`. */
 export interface AgentRegisterReq {
   alias: string;
-  /** CAD-1752: hire from this role of `GET /api/agent-roles`. */
-  catalogue?: string | null;
   cwd?: string | null;
   endpoint_kind?: string | null;
   instructions?: string | null;
-  /** Start blank only; a `catalogue` hire takes the runtime from the install. */
+  /** Start blank only. */
   location?: string | null;
-  look?: string | null;
   model_policy?: string | null;
   params?: string | null;
   provider?: string | null;
@@ -151,6 +186,9 @@ export interface AgentsResponse {
   /** Issue id to its bound agent strip. */
   by_issue: Record<string, CardAgent[]>;
   daemon: DaemonReach;
+  /** CAD-1989: the settings profiles, each with the runtime aliases
+   * registered against it. */
+  profiles: AgentProfile[];
   refresh_error: boolean;
   snapshot_age_secs: number;
   stale: boolean;
@@ -169,6 +207,9 @@ export interface ArtifactRow {
   name: string;
   size: number;
 }
+
+/** A canonical avatar look (the board's eleven `AgentAvatar` palettes). */
+export type AvatarLook = "builder" | "guard" | "bookkeeper" | "content" | "designer" | "reception" | "operations" | "support" | "tester" | "robot" | "custom";
 
 /** One bound agent on an issue card or drawer — from the job binding. */
 export interface CardAgent {
@@ -374,6 +415,18 @@ export interface MasterContext {
   window?: number | null;
 }
 
+/** The workspace coordinator's effective identity (`master_state.identity`).
+ * 
+ * `name`/`tone` are the operator-owned protected files' agreed values (`null`
+ * = unset); `look` is the pinned `params.look` (the existing robot when
+ * unpinned); `revision` fences the next protected update. */
+export interface MasterIdentity {
+  look: AvatarLook;
+  name?: string | null;
+  revision: string;
+  tone?: string | null;
+}
+
 /** One queued turn's routing metadata; never its body. */
 export interface MasterQueued {
   conversation?: string | null;
@@ -391,12 +444,16 @@ export interface MasterSession {
 /** `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
  * master header shows. A member's copy drops the turn's `summary`. */
 export interface MasterState {
+  /** Hosted conversations may be personal even when the transport alias is `master`.
+   * An absent projection retains the native workspace-coordinator contract. */
+  actor_identity?: ActorIdentity | null;
   alias: string;
   /** The session verbs the live provider accepts. */
   commands: string[];
   context?: MasterContext | null;
   effort?: string | null;
   endpoint_kind: string;
+  identity: MasterIdentity;
   live: boolean;
   model?: string | null;
   model_label?: string | null;
@@ -494,6 +551,20 @@ export interface PatchReq {
   /** Replaces the tag list; `[]` clears it. */
   tags?: string[] | null;
   title?: string | null;
+}
+
+/** A member's committed identity. Private address/preferences are never a UI projection. */
+export interface PersonalAssistantIdentity {
+  look: AvatarLook;
+  name?: string | null;
+  revision: number;
+  tone?: string | null;
+}
+
+/** A profile's newest claim: the issue and the claim's own state. */
+export interface ProfileClaim {
+  issue_id: string;
+  state: string;
 }
 
 /** Work-item counts by status bucket. */
@@ -687,13 +758,29 @@ export interface ThreadMessageReq {
 }
 
 /** `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
- * A forward read carries `cursor`; a backward one also `more_before`. */
+ * 
+ * `cursor` is the last row the page scanned in the direction it was read —
+ * the forward resume point, and the newest scanned row of a `tail` page. A
+ * projection can filter another source's rows out of a page, so a consumer
+ * must move by what was SCANNED and never by what was kept. Project-scoped
+ * reads first exclude entries without a readable issue binding; only that
+ * scoped stream contributes to these page boundaries:
+ * 
+ * - `more_before` (backward) says raw rows remain below the page;
+ * - `scanned_before` (backward) is the lowest seq scanned, the `before`
+ *   continuation — present even when the page kept nothing;
+ * - `more_after` (forward) says the scan filled the page, so raw rows may
+ *   remain beyond it. */
 export interface ThreadPage {
   alias: string;
+  /** Cloud history is incomplete for this read; ordinary rows remain usable. */
+  cloud_withheld?: string | null;
   cursor: number;
   entries: ThreadEntryRow[];
+  more_after?: boolean | null;
   more_before?: boolean | null;
   reply_seq: number;
+  scanned_before?: number | null;
   thread?: ThreadInfo | null;
 }
 

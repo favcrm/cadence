@@ -51,7 +51,7 @@ fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
     // inventory the MCP server lists, so a generated platform tool cannot be
     // discoverable but undispatchable (or vice versa). Managed Codex runs
     // with approvalPolicy=never, so every reviewed tool is approved here;
-    // the server still returns only the static five plus direct-callable
+    // the server still returns only `static_tool_names()` plus direct-callable
     // adapter tools.
     let generated = crate::mcp_agent::generated_tool_names(
         crate::platform::inventory()
@@ -103,15 +103,9 @@ fn check_agent_mcp(transport: &Transport, thread_id: &str, alias: &str) -> Resul
         })?;
         if let Some(server) = servers.iter().find(|server| server["name"] == "cadence") {
             if server["runtimeStatus"] != "connected"
-                || ![
-                    "self",
-                    "wiki_search",
-                    "wiki_read",
-                    "issue_show",
-                    "app_run_artifact",
-                ]
-                .iter()
-                .all(|name| server["tools"].get(*name).is_some())
+                || !crate::mcp_agent::static_tool_names()
+                    .iter()
+                    .all(|name| server["tools"].get(*name).is_some())
             {
                 return Err(Error::provider(format!(
                     "Codex Cadence MCP readiness failed: status {}, tools {}",
@@ -540,14 +534,16 @@ pub struct Launched {
 }
 
 impl Transport {
-    fn launch(&self, cwd: &str, log: &Path) -> Result<Launched> {
+    /// Both transports spawn a local child, so the role's launch environment
+    /// reaches either one, applied last (CAD-2239).
+    fn launch(&self, cwd: &str, log: &Path, role: &super::RoleEnv) -> Result<Launched> {
         match self {
             Transport::Stdio(adapter) => Ok(Launched {
-                pid: adapter.launch(cwd, log, &[])?,
+                pid: adapter.launch(cwd, log, &[], role)?,
                 endpoint: None,
             }),
             Transport::Ws(adapter) => {
-                let launched = adapter.launch(cwd, log)?;
+                let launched = adapter.launch(cwd, log, role)?;
                 Ok(Launched {
                     pid: launched.pid,
                     endpoint: Some(launched.endpoint),
@@ -619,6 +615,19 @@ pub struct CodexAdapter {
     shared: Arc<Shared>,
     log_path: PathBuf,
     sandbox_command: Vec<String>,
+    env: ProviderEnv,
+    /// The daemon state dir, derived from the provider log path the same way
+    /// the Claude adapter does (`<state>/logs/<agent>.log`).
+    state_dir: PathBuf,
+}
+
+/// The state dir a provider log path belongs to: `<state>/logs/<agent>.log`.
+fn adapter_state_dir(log_path: &Path) -> PathBuf {
+    log_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// `turnId → itemId → agentMessage item`, collected while a turn runs.
@@ -743,6 +752,8 @@ impl CodexAdapter {
             shared,
             log_path: log_path.to_path_buf(),
             sandbox_command: codex_sandbox_command(env),
+            env: env.clone(),
+            state_dir: adapter_state_dir(log_path),
         }
     }
 
@@ -755,6 +766,8 @@ impl CodexAdapter {
             shared,
             log_path: log_path.to_path_buf(),
             sandbox_command: codex_sandbox_command(env),
+            env: env.clone(),
+            state_dir: adapter_state_dir(log_path),
         }
     }
 
@@ -1048,7 +1061,15 @@ impl ProviderAdapter for CodexAdapter {
         // doing it before launch means a bad row spawns nothing.
         registry::codex_sandbox(&agent.sandbox)?;
         sandbox_probe(&self.sandbox_command, &agent.cwd, &agent.sandbox)?;
-        let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
+        // CAD-844: a reviewer must not use the operator's saved `gh` login.
+        let reviewer_env = super::reviewer_gh_env(
+            &self.env,
+            &agent.role,
+            &self.state_dir.join("agents").join(&agent.alias),
+        )?;
+        let launched = self
+            .transport
+            .launch(&agent.cwd, &self.log_path, &reviewer_env)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
         let opened = (|| -> Result<Identity> {
@@ -1112,16 +1133,21 @@ impl ProviderAdapter for CodexAdapter {
             }
             instructions.push_str(
                 "Use the cadence MCP tools for Cadence identity, wiki search/read, issue reads, \
-                 and an assigned app dependency artifact. wiki_search is lexical AND over at most \
-                 12 tokens: send scoped keywords (vendor, operation or field, exact version or \
-                 identifier) in the collection the question is authorized for, at most 3 variants \
-                 and 20 merged candidates per question, then wiki_read at most 8 sources and cite \
-                 path and revision. Stop and state the evidence limit when nothing authoritative \
-                 is found. The command sandbox cannot reach Cadence's RPC socket. For an app \
-                 dependency, call self and then app_run_artifact with the kickoff artifact_id and \
-                 that turn's id and turn_id; do not pass an alias or fetch it from a shell. Your \
-                 final answer is the managed turn result; do not call cadence message result from \
-                 a shell.",
+                 project lessons, assigned app dependency artifacts, and staged private app updates. wiki_search is \
+                 lexical AND over at most 12 tokens: send scoped keywords (vendor, operation or \
+                 field, exact version or identifier) in the collection the question is authorized \
+                 for, at most 3 variants and 20 merged candidates per question, then wiki_read at \
+                 most 8 sources and cite path and revision. Stop and state the evidence limit when \
+                 nothing authoritative is found. Call memory_match for the project lessons that \
+                 apply to your task at its start, whenever the scope changes, and before you repeat \
+                 an approach that already failed; call memory_propose when you resolve something a \
+                 later task would otherwise rediscover. The command sandbox cannot reach Cadence's RPC \
+                 socket. For an app dependency, call self and then app_run_artifact with the \
+                 kickoff artifact_id and that turn's id and turn_id; do not pass an alias or fetch \
+                 it from a shell. For a private app install/update turn, use private_app_prepare, \
+                 private_app_status, private_app_apply, and private_app_reconcile. Your final \
+                 answer is the managed turn result; do not call cadence message result from a \
+                 shell.",
             );
             params["developerInstructions"] = json!(instructions);
             if let Some(thread) = &agent.thread_id {
@@ -1441,6 +1467,90 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// CAD-2239: every local transport hands its child the role's `gh`
+    /// environment after its own scrub — the managed-WS child included. The
+    /// child is `env`, so the assertion is on what the process really got.
+    #[test]
+    fn a_pinned_role_child_gets_the_role_gh_env_on_both_transports() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        let env = ProviderEnv::default();
+        env.set("CADENCE_REVIEWER_GH_TOKEN", "synthetic-read-only");
+        let role =
+            super::super::reviewer_gh_env(&env, "reviewer", &state.join("agents/r")).unwrap();
+        // The codex scrub plus the very names the role sets: the role
+        // environment must win, so it is applied after the scrub.
+        let mut scrub: Vec<&str> = scrub_names().to_vec();
+        scrub.extend([
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ]);
+        let dump = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "env >&2; echo END-OF-ENV >&2".to_string(),
+            "sh".to_string(),
+        ];
+        let launch = |transport: Transport, log: PathBuf| {
+            let _ = transport.launch(dir.path().to_str().unwrap(), &log, &role);
+            // A stdio launch returns at spawn: wait for the child's end
+            // marker, and fail loudly if it never comes.
+            let started = Instant::now();
+            loop {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                if text.contains("END-OF-ENV") {
+                    transport.close();
+                    return text;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "the child never finished dumping its environment: {text}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let stdio = launch(
+            Transport::Stdio(StdioAdapter::new(
+                &dump,
+                EnvScrub::names(&scrub),
+                Box::new(|_| {}),
+                Box::new(|| {}),
+            )),
+            dir.path().join("stdio.log"),
+        );
+        let ws = launch(
+            Transport::Ws(WsAdapter::new(
+                &dump,
+                &scrub,
+                Box::new(|_| {}),
+                Box::new(|| {}),
+            )),
+            dir.path().join("ws.log"),
+        );
+        for (name, log) in [("stdio", stdio), ("ws", ws)] {
+            let lines: Vec<&str> = log.lines().collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("GH_CONFIG_DIR=") && l.contains("gh-review")),
+                "{name}: {log}"
+            );
+            assert!(
+                lines.contains(&"GH_TOKEN=synthetic-read-only"),
+                "{name}: {log}"
+            );
+            for empty in [
+                "GITHUB_TOKEN=",
+                "GH_ENTERPRISE_TOKEN=",
+                "GITHUB_ENTERPRISE_TOKEN=",
+            ] {
+                assert!(lines.contains(&empty), "{name} missing {empty}: {log}");
+            }
+        }
+    }
+
     #[test]
     fn steering_requires_the_verified_initialize_version() {
         for version in ["0.160.0", "0.161.0"] {
@@ -1514,13 +1624,26 @@ mod tests {
                 Box::new(|| {}),
             )),
             shared,
-            log_path: log,
+            log_path: log.clone(),
             sandbox_command: vec![],
+            env: ProviderEnv::default(),
+            state_dir: adapter_state_dir(&log),
         };
         // Launch the peer by hand — `open` is a full provider
         // handshake; the steer seam needs only the transport.
         if let Transport::Stdio(a) = &adapter.transport {
-            a.launch("/tmp", &adapter.log_path, &[]).unwrap();
+            a.launch(
+                "/tmp",
+                &adapter.log_path,
+                &[],
+                &super::super::reviewer_gh_env(
+                    &ProviderEnv::default(),
+                    "worker",
+                    &dir.path().join("a"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         }
         (adapter, dir)
     }
@@ -1623,5 +1746,69 @@ mod tests {
         let outcome = adapter.steer_turn("turn-stale", "text", "msg").unwrap();
         assert_eq!(outcome, SteerOutcome::NotRunning);
         adapter.transport.close();
+    }
+
+    #[test]
+    fn agent_mcp_config_enables_all_static_private_app_tools_and_excludes_owner_tools() {
+        let agent = Agent {
+            alias: "updater".into(),
+            uid: "uid-updater".into(),
+            provider: "codex".into(),
+            endpoint_kind: "exec".into(),
+            role: "developer".into(),
+            team_role: None,
+            cwd: "/tmp".into(),
+            sandbox: "workspace-write".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            pid_start: None,
+            endpoint: None,
+            params: None,
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "idle".into(),
+            enabled: true,
+            gc_keep: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
+            lifecycle_rev: 0,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log_path = logs.join("stderr.log");
+        let config = agent_mcp_config(&agent, &log_path).unwrap();
+        let enabled: Vec<&str> = config["enabled_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for required in crate::mcp_agent::static_tool_names() {
+            assert!(
+                enabled.contains(required),
+                "missing static tool {required} in {enabled:?}"
+            );
+            assert_eq!(
+                config["tools"][*required]["approval_mode"].as_str(),
+                Some("approve"),
+                "expected approve mode for {required}"
+            );
+        }
+        assert!(enabled.contains(&"private_app_prepare"));
+        assert!(enabled.contains(&"private_app_status"));
+        assert!(enabled.contains(&"private_app_apply"));
+        assert!(enabled.contains(&"private_app_reconcile"));
+        assert!(!enabled.contains(&"private_app_review_authorize"));
+        assert!(!enabled.contains(&"private_app_update_policy"));
     }
 }

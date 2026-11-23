@@ -1,0 +1,39 @@
+{
+  "role": "agent",
+  "kind": "record_ref",
+  "text": "1 of 1 orders from Synthetic Shop.",
+  "payload": {
+    "v": 1,
+    "toolkit": "synthetic_shop",
+    "tool": "synthetic_shop_get_order",
+    "items": [
+      {
+        "order_id": "o_501",
+        "total": 42,
+        "paid": true
+      }
+    ],
+    "fields": [
+      {
+        "key": "order_id",
+        "label": "Order",
+        "type": "string",
+        "untrusted": false
+      },
+      {
+        "key": "total",
+        "label": "Total",
+        "type": "number",
+        "untrusted": false
+      },
+      {
+        "key": "paid",
+        "label": "Paid",
+        "type": "boolean",
+        "untrusted": false
+      }
+    ],
+    "view": "table",
+    "truncated": false
+  }
+}

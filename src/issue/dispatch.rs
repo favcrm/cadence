@@ -13,14 +13,35 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+#[cfg(test)]
 use crate::adapter::pty;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::Front;
 use crate::issue::parse::AcceptanceItem;
 use crate::issue::{board, claim, parse, start, write, Pm};
-use crate::memory;
-use crate::store;
+
+mod context;
+mod early_kickoff;
+mod job_spec;
+mod kickoff;
+
+use self::context::{
+    content_digest, lessons, redacted_fact, Lessons, LESSON_KIND, LESSON_OMITTED_ID, LESSON_PATH,
+};
+pub(crate) use self::context::{context_guard, ContextTarget, JobContext, PreparedContext};
+use self::early_kickoff::{
+    early_kickoff, message_refs, message_row, row_mode, same_path, spec_locator, DispatchMode,
+    EarlyDispatch, EarlyKickoff,
+};
+pub(crate) use self::job_spec::{canonical_issue_spec_digest, job_context};
+pub use self::kickoff::parse_acceptance_listing;
+pub(crate) use self::kickoff::{acceptance_listing, inline_listing, outstanding_items};
+use self::kickoff::{
+    acceptance_warning, check_body, check_job_kickoff, job_prototype, plain_body, plain_kickoff,
+};
+#[cfg(test)]
+use self::kickoff::{kickoff_body, with_acceptance};
 
 /// Message states that mean a dispatch is still in flight — a second
 /// dispatch must not queue a duplicate while one is live.
@@ -54,330 +75,6 @@ pub struct DispatchArgs {
     /// CAD-383 `--take-over <reason>` — dispatch an issue another PM or
     /// lane holds in doing/review; recorded on the issue.
     pub take_over: Option<String>,
-}
-
-/// The fixed single-line kickoff body — note path, issue id, summary
-/// or title, the worktree/branch/base, the trailer and the return
-/// address. Built verbatim: a title or `--summary` carrying control
-/// chars produces a violating body and `check_body` refuses rather
-/// than laundering it into something the operator didn't write.
-///
-/// CAD-468: an explicitly-reported endpoint's kickoff also carries the
-/// exact `cadence message result` command — the worker that missed or
-/// never read its briefing still has the contract in the message that
-/// opened its turn. Turn-result endpoints finish by their result text
-/// and never run it, so theirs is omitted.
-#[allow(clippy::too_many_arguments)]
-fn kickoff_body(
-    issue: &str,
-    title: &str,
-    note: &Path,
-    wt_dir: &Path,
-    branch: &str,
-    base_sha: &str,
-    reply_to: &str,
-    provider: &str,
-    endpoint_kind: &str,
-) -> String {
-    let sha7: String = base_sha.chars().take(7).collect();
-    let report = if crate::adapter::registry::report_hint(provider, endpoint_kind)
-        == crate::adapter::registry::Reporting::Explicit
-    {
-        " Report: `cadence message result <id> --token <turn_id> --text '<summary>'` \
-         (`cadence self` prints both)."
-    } else {
-        ""
-    };
-    format!(
-        "read {} — {issue}: {title}. Your worktree exists: {} (branch \
-         {branch}, base {sha7}). Commit trailer: Issue: {issue}. PR to \
-         main; reply to {reply_to}. Company questions: read the \
-         \"Business knowledge\" section of \
-         $HOME/.agents/skills/cadence/SKILL.md.{report} For implementation completion, \
-         file `cadence report file --task {issue} --kind done --file <f>` with frontmatter \
-         `sha: <full committed head>` and `pr: <PR URL>`. End your returned result \
-         (or explicit message result text) with a final `SHA: <same full head>` line.",
-        note.display(),
-        wt_dir.display()
-    )
-}
-
-/// CAD-159: an issue's acceptance items on one line; `None` when there
-/// are none. Always the whole list — CAD-160 removed the "N items, too
-/// long to inline" pointer, since criteria are never dropped.
-///
-/// CAD-300: each item is numbered and its text is a JSON string
-/// literal — `1) [ ] "a"; 2) [x] "b"` — so text that looks like the
-/// listing's own syntax (`; `, `[x]`, `2)`) stays inside its quotes
-/// and cannot read as another item or a checked box.
-/// [`parse_acceptance_listing`] reads it back exactly. Quoting escapes
-/// every control character and U+2028/U+2029, so the result can ride a
-/// single-line pty kickoff without losing them.
-pub(crate) fn acceptance_listing(items: &[AcceptanceItem]) -> Option<String> {
-    (!items.is_empty()).then(|| inline_listing(items))
-}
-
-/// The CAD-300 listing of `items` at any length —
-/// `1) [ ] "a"; 2) [x] "b"`, numbered from 1.
-pub(crate) fn inline_listing(items: &[AcceptanceItem]) -> String {
-    items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let mark = if item.checked { 'x' } else { ' ' };
-            format!("{}) [{mark}] {}", i + 1, quote_item(&item.text))
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-/// CAD-160: the still-unchecked criteria in a task's stored
-/// acceptance. A whole CAD-300 listing yields its `[ ]` items; any
-/// other non-blank text (a free-form `--accept`) is one unchecked item.
-pub(crate) fn outstanding_items(acceptance: Option<&str>) -> Vec<AcceptanceItem> {
-    let Some(text) = acceptance.map(str::trim).filter(|t| !t.is_empty()) else {
-        return vec![];
-    };
-    match parse_acceptance_listing(text) {
-        Some((items, "")) => items.into_iter().filter(|i| !i.checked).collect(),
-        _ => vec![AcceptanceItem {
-            text: text.to_string(),
-            checked: false,
-        }],
-    }
-}
-
-/// `text` as a JSON string literal that is also safe on one pty line:
-/// `"` and `\` are escaped as JSON requires, tab as `\t`, and every
-/// other control character (C0, DEL, C1) and the line/paragraph
-/// separators U+2028/U+2029 as `\uXXXX`. All of those are in the BMP,
-/// so four hex digits always suffice.
-fn quote_item(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => {
-                out.push_str(&format!("\\u{:04x}", u32::from(c)));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// CAD-300: read an [`acceptance_listing`] back — the numbered,
-/// JSON-quoted items at the start of `s` — returning them and the rest
-/// of `s` (the kickoff's `.` onwards). `None` when `s` does not start
-/// with item `1)`, or an item is malformed: a numbering gap, a checkbox
-/// other than `[ ]`/`[x]`, or text that is not a JSON string literal.
-pub fn parse_acceptance_listing(s: &str) -> Option<(Vec<AcceptanceItem>, &str)> {
-    let mut items = vec![];
-    let mut rest = s;
-    loop {
-        rest = rest.strip_prefix(&format!("{}) ", items.len() + 1))?;
-        let checked = match rest.get(..4)? {
-            "[x] " => true,
-            "[ ] " => false,
-            _ => return None,
-        };
-        rest = &rest[4..];
-        if !rest.starts_with('"') {
-            return None;
-        }
-        let mut quoted = serde_json::Deserializer::from_str(rest).into_iter::<String>();
-        let text = quoted.next()?.ok()?;
-        rest = &rest[quoted.byte_offset()..];
-        items.push(AcceptanceItem { text, checked });
-        match rest.strip_prefix("; ") {
-            Some(next) if next.starts_with(&format!("{}) ", items.len() + 1)) => rest = next,
-            _ => return Some((items, rest)),
-        }
-    }
-}
-
-/// CAD-159: the warning for an issue with no acceptance items. The PM
-/// decided (2026-09-23, ADR-0002 §8.3) to warn and still dispatch
-/// until live issues are backfilled; refusal is a later ticket.
-fn acceptance_warning(issue: &str, dispatched: bool) -> String {
-    let outcome = if dispatched {
-        "Dispatched anyway."
-    } else {
-        "Not re-sent: this issue's kickoff is already in flight."
-    };
-    format!(
-        "{issue} has no acceptance criteria (its ## Acceptance section has no \
-         checklist items; a bare `- [ ]` does not count) — add them with \
-         `cadence issue acceptance {issue} --from <file>`. {outcome}"
-    )
-}
-
-/// The plain-path kickoff with every one of the issue's acceptance
-/// items appended as ` Acceptance: <listing>.` — never a pointer, never
-/// cut (CAD-160). [`plain_kickoff`] fits the result to the pty ceiling.
-fn with_acceptance(body: String, items: &[AcceptanceItem]) -> String {
-    match acceptance_listing(items) {
-        Some(listing) => format!("{body} Acceptance: {listing}."),
-        None => body,
-    }
-}
-
-/// CAD-160: the plain kickoff fitted to the pty ceiling. Prose gives
-/// way — the title (or `--summary`) is shortened and ends in `…` — and
-/// the acceptance items never do. When they cannot fit even with the
-/// title cut to nothing, the dispatch refuses naming the ceiling and
-/// the note; it runs before `issue start`, so nothing is created.
-#[allow(clippy::too_many_arguments)]
-fn plain_kickoff(
-    issue: &str,
-    title: &str,
-    note: &Path,
-    wt_dir: &Path,
-    branch: &str,
-    base_sha: &str,
-    reply_to: &str,
-    items: &[AcceptanceItem],
-    provider: &str,
-    endpoint_kind: &str,
-) -> Result<String> {
-    const CUT: &str = "…";
-    let build = |title: &str| {
-        with_acceptance(
-            kickoff_body(
-                issue,
-                title,
-                note,
-                wt_dir,
-                branch,
-                base_sha,
-                reply_to,
-                provider,
-                endpoint_kind,
-            ),
-            items,
-        )
-    };
-    let full = build(title);
-    let over = full.len().saturating_sub(pty::MAX_BODY);
-    if over == 0 {
-        return Ok(full);
-    }
-    if let Some(keep) = title.len().checked_sub(over + CUT.len()) {
-        let mut end = keep;
-        while !title.is_char_boundary(end) {
-            end -= 1;
-        }
-        return Ok(build(&format!("{}{CUT}", &title[..end])));
-    }
-    let criteria = acceptance_listing(items).unwrap_or_default();
-    Err(Error::rejected(format!(
-        "{issue}'s acceptance criteria ({} bytes) do not fit the {}-char pty kickoff \
-         ceiling even with the title cut — criteria are never truncated or dropped \
-         (CAD-160). Shorten them (`cadence issue acceptance {issue} --from <file>`) \
-         and keep the detail in the note {}. Nothing was created or queued.",
-        criteria.len(),
-        pty::MAX_BODY,
-        note.display()
-    )))
-}
-
-/// CAD-160: a `--job` dispatch whose kickoff cannot carry its
-/// acceptance items whole is refused before `issue start` creates a
-/// worktree, branch or job. The check builds the kickoff `job dispatch`
-/// will send — same spec path, scope, criteria and report contract, for
-/// the assignee's own endpoint and ceiling (48000 for a Devin cloud
-/// session) — with placeholders the length of what the daemon mints
-/// (`job-` + 8 hex, a 32-hex message id). `agent` is the assignee's
-/// `agent_show` row.
-fn check_job_kickoff(
-    issue: &str,
-    items: &[AcceptanceItem],
-    spec: &Path,
-    wt_name: &str,
-    branch: &str,
-    base_sha: &str,
-    agent: &Value,
-) -> Result<()> {
-    // `issue start --job` records the canonical spec path on the job.
-    let spec = spec.canonicalize().unwrap_or_else(|_| spec.to_path_buf());
-    let spec = spec.to_string_lossy().into_owned();
-    let job_id = "job-00000000";
-    let job = store::Job {
-        id: job_id.to_string(),
-        title: None,
-        spec_path: spec.clone(),
-        spec_sha256: None,
-        pm_alias: String::new(),
-        issue_id: Some(issue.to_string()),
-        repo: None,
-        base_ref: None,
-        state: "open".to_string(),
-        max_revisions: 0,
-        stall_secs: None,
-        error: None,
-        created: 0.0,
-        updated: 0.0,
-    };
-    let task = store::Task {
-        id: format!("{job_id}-t1"),
-        job_id: job_id.to_string(),
-        title: None,
-        role: "worker".to_string(),
-        assignee: None,
-        spec_path: None,
-        acceptance: acceptance_listing(items),
-        worktree: Some(wt_name.to_string()),
-        branch: Some(branch.to_string()),
-        base_sha: Some(base_sha.to_string()),
-        head_sha: None,
-        state: "draft".to_string(),
-        revision: 0,
-        dispatch_message: None,
-        error: None,
-        created: 0.0,
-        updated: 0.0,
-    };
-    let provider = agent["provider"].as_str().unwrap_or_default();
-    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
-    let Err(_) = store::job_kickoff(&job, &task, 1, &"0".repeat(32), provider, kind) else {
-        return Ok(());
-    };
-    Err(Error::rejected(format!(
-        "{issue}'s acceptance criteria ({} bytes) do not fit the {}-char kickoff ceiling \
-         beside its fixed fields — criteria are never truncated or dropped (CAD-160). \
-         Shorten them (`cadence issue acceptance {issue} --from <file>`) and keep the \
-         detail in the spec file {spec}. Nothing was created or queued.",
-        acceptance_listing(items).unwrap_or_default().len(),
-        store::kickoff_ceiling(provider, kind),
-    )))
-}
-
-/// The same rules the pty endpoint enforces pre-write: 1–4000 chars,
-/// no control characters (single line), and no leading character the
-/// provider's TUI treats as a command. Checked here so a bad body
-/// refuses before `issue start` creates anything.
-fn check_body(body: &str, provider: &str) -> Result<()> {
-    if body.is_empty() || body.len() > pty::MAX_BODY {
-        return Err(Error::rejected("Dispatch body must be 1–4000 characters"));
-    }
-    if pty::has_control_chars(body) {
-        return Err(Error::rejected(
-            "Dispatch body must be a single line without control characters",
-        ));
-    }
-    if let Some(prefix) = body.trim_start().chars().next() {
-        if pty::forbidden_prefixes(provider).contains(&prefix) {
-            return Err(Error::rejected(format!(
-                "Dispatch body starts with '{prefix}', which {provider} \
-                 treats as a command or mode switch — refusing to send it"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// CAD-202: a pty worker's live pane cwd must be a directory that
@@ -458,6 +155,71 @@ fn lane_head(worktree: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Lesson facts the pinned context carries, read back from the manifest it
+/// produced. The legacy `<message>-lessons.md` sidecar is not written when
+/// context is active, so the dispatch comment and its JSON report the same
+/// selection from the pinned record instead of a second memory match.
+struct ContextFacts {
+    lessons: Vec<String>,
+    lessons_withheld: Vec<(String, String)>,
+    lessons_omitted: Vec<(String, String)>,
+    lessons_error: Option<String>,
+}
+
+impl ContextFacts {
+    fn from_manifest(manifest: &crate::context_pack::Manifest) -> Self {
+        let mut lessons = Vec::new();
+        for document in &manifest.documents {
+            if document.kind == LESSON_KIND {
+                lessons.extend(document.lesson_ids.iter().cloned());
+            }
+        }
+        let mut lessons_withheld = Vec::new();
+        let mut lessons_omitted = Vec::new();
+        let mut lessons_error = None;
+        for gap in &manifest.withheld {
+            if gap.path != LESSON_PATH {
+                continue;
+            }
+            // The aggregate gap reason keeps the complete count; bounded
+            // detail names the exact lessons with their own reasons. A pin
+            // written before detail existed still reports its aggregate fact.
+            let detail = |notes: &[crate::context_pack::LessonNote]| {
+                notes
+                    .iter()
+                    .map(|note| (note.id.clone(), note.reason.clone()))
+                    .collect::<Vec<_>>()
+            };
+            match gap.state.as_str() {
+                "withheld" => {
+                    // The aggregate fact keeps the complete count and the
+                    // truncation disclosure; bounded detail names the
+                    // individual lessons after it. A pre-detail pin has an
+                    // empty list, so the extend is a no-op there.
+                    lessons_withheld.push((gap.id.clone(), gap.reason.clone()));
+                    lessons_withheld.extend(detail(&gap.lessons));
+                }
+                "overflow" if gap.id == LESSON_OMITTED_ID => {
+                    lessons_omitted.push((gap.id.clone(), gap.reason.clone()));
+                    lessons_omitted.extend(detail(&gap.lessons));
+                }
+                "unreadable" | "unavailable" => {
+                    // A pin written before the redaction boundary can still
+                    // carry a raw load-error line; redact before reporting.
+                    lessons_error = Some(redacted_fact(&gap.reason));
+                }
+                _ => {}
+            }
+        }
+        ContextFacts {
+            lessons,
+            lessons_withheld,
+            lessons_omitted,
+            lessons_error,
+        }
+    }
+}
+
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
 ///
 /// `dispatch_pm`: `Some(alias)` when the daemon itself dispatches
@@ -483,15 +245,28 @@ struct Preflight {
     body: Option<String>,
     /// CAD-1822: this plain dispatch's assigned project is opted in to task
     /// context delivery. Only then may a changed kickoff body supersede a
-    /// reported duplicate; `--job` and non-opted projects keep the legacy
-    /// duplicate behavior.
+    /// reported duplicate; non-opted projects keep the legacy duplicate
+    /// behavior.
     context_active: bool,
+    /// Stable actionable plain contract, excluding tracker bookkeeping.
+    context_contract_digest: Option<String>,
+    /// CAD-1846: the lesson facts the pinned context carries for the plain
+    /// kickoff. Present exactly when this dispatch's own plain context was
+    /// prepared, so the legacy lesson sidecar is skipped instead of injected
+    /// twice; a `--job` kickoff carries its selection in the task pin.
+    context_lessons: Option<ContextFacts>,
+    /// CAD-1846: the issue's open native job whose default task was created
+    /// but never accepted, verified against every material scope/spec input.
+    /// `start` reuses this binding instead of minting another job; the store's
+    /// own idempotency and one-open-job guard still decide.
+    reuse_job: Option<String>,
 }
 
 /// The one pre-dispatch gate every caller shares: resolve the issue, read
 /// it, require acceptance when the caller does, and apply the plan gate.
 /// Authority, claim and target checks stay with the caller — this only
 /// removes the duplicated load/acceptance/plan sequence.
+#[derive(Clone)]
 pub(crate) struct GatedIssue {
     pub project: crate::issue::project::Project,
     pub dir: PathBuf,
@@ -499,27 +274,110 @@ pub(crate) struct GatedIssue {
     pub items: Vec<AcceptanceItem>,
     /// Exact source from which `front` and `items` were parsed.
     pub source: String,
+    /// Complete canonical prose from that same parse, without criteria copies.
+    pub request: String,
 }
 
-pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
-    let (project, dir) = write::issue_dir(pm, id)?;
-    let source = std::fs::read_to_string(dir.join("issue.md"))?;
-    let (front, body) = parse::parse_issue(&source)?;
-    let items = parse::acceptance_items(&body);
-    if require_acceptance && items.is_empty() {
-        return Err(Error::rejected(format!(
-            "{id} has no acceptance criteria — add them with \
-             `cadence issue acceptance {id} --from <file>` before kickoff"
-        )));
+/// One issue read: the project and folder that hold it, its frontmatter, its
+/// complete body and the exact `issue.md` source. Callers apply their own
+/// policy to this one snapshot, so a gate and a context capture never
+/// disagree about what the issue said.
+struct IssueSnapshot {
+    project: crate::issue::project::Project,
+    dir: PathBuf,
+    front: Front,
+    body: String,
+    source: String,
+}
+
+impl IssueSnapshot {
+    /// The same lookup rule as `write::issue_dir`: `None` only when no
+    /// project holds a real folder with a real `issue.md` for `id`. A
+    /// tracker that cannot be listed, or a held issue that cannot be read or
+    /// parsed, is an error — never "not ours".
+    fn read(pm: &Pm, id: &str) -> Result<Option<Self>> {
+        crate::issue::model::check_id(id)?;
+        for project in crate::issue::project::list(&pm.dir)? {
+            let dir = pm.dir.join(&project.key).join(id);
+            if !board::is_real_dir(&dir) || !board::is_real_file(&dir.join("issue.md")) {
+                continue;
+            }
+            let source = std::fs::read_to_string(dir.join("issue.md"))?;
+            let (front, body) = parse::parse_issue(&source)?;
+            return Ok(Some(IssueSnapshot {
+                project,
+                dir,
+                front,
+                body,
+                source,
+            }));
+        }
+        Ok(None)
     }
-    crate::issue::plan::gate(&pm.dir, &front, &body)?;
-    Ok(GatedIssue {
-        project,
-        dir,
-        front,
-        items,
-        source,
-    })
+
+    /// The dispatch snapshot from this one read. `gate` adds the plain
+    /// dispatch plan policy; `require_acceptance` adds the plain kickoff's
+    /// acceptance requirement. A context capture opts out of both.
+    fn into_gated(
+        self,
+        pm_dir: &Path,
+        id: &str,
+        gate: bool,
+        require_acceptance: bool,
+    ) -> Result<GatedIssue> {
+        let IssueSnapshot {
+            project,
+            dir,
+            front,
+            body,
+            source,
+        } = self;
+        if gate {
+            crate::issue::plan::gate(pm_dir, &front, &body)?;
+        }
+        let (request, items) = parse::task_request(body);
+        if require_acceptance && items.is_empty() {
+            return Err(Error::rejected(format!(
+                "{id} has no acceptance criteria — add them with \
+                 `cadence issue acceptance {id} --from <file>` before kickoff"
+            )));
+        }
+        Ok(GatedIssue {
+            project,
+            dir,
+            front,
+            items,
+            source,
+            request,
+        })
+    }
+}
+
+/// CAD-1846: the one-read parent capture a native job's context needs, with
+/// no plain-dispatch policy of its own. `None` means no project holds an
+/// issue of that id — a job may legitimately name one (`plan_gate_task`
+/// allows it: jobs need not name a tracker issue), and such a job keeps its
+/// legacy kickoff instead of gaining a new refusal merely because context
+/// capture was attempted. A held issue that cannot be read, and a tracker
+/// that cannot be listed, still fail closed.
+pub(crate) fn capture_issue(pm: &Pm, id: &str) -> Result<Option<GatedIssue>> {
+    let Some(snapshot) = IssueSnapshot::read(pm, id)? else {
+        return Ok(None);
+    };
+    snapshot.into_gated(&pm.dir, id, false, false).map(Some)
+}
+
+/// The one plain pre-dispatch gate every caller shares: resolve the issue,
+/// read it, apply the plan gate and require acceptance when the caller does.
+/// Authority, claim and target checks stay with the caller — this only
+/// removes the duplicated load/acceptance/plan sequence.
+pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
+    let Some(snapshot) = IssueSnapshot::read(pm, id)? else {
+        return Err(Error::rejected(format!(
+            "Unknown issue '{id}' — `cadence issue ls` lists what exists"
+        )));
+    };
+    snapshot.into_gated(&pm.dir, id, true, require_acceptance)
 }
 
 /// The worker-only checks every dispatch runs before it creates a lane:
@@ -577,74 +435,46 @@ pub(crate) fn check_seat(
     })
 }
 
-/// CAD-1822: pin and validate the assigned project's task context before a
-/// kickoff exists. Shared by [`preflight`] (CLI and `issue_kickoff` HTTP/RPC,
-/// before any lane is created) and the daemon's `dispatch_send` (the last gate
-/// before enqueue). Returns the manifest the send must record, or `None` when
-/// the project does not participate in context delivery.
-///
-/// Selection is daemon-side: the issue's own project, its declared local
-/// repository and its tracked manifest at HEAD. No request field can name a
-/// source, revision or path. A required source that cannot be read, an
-/// unusable manifest, a combined mandatory payload over the local cap and a
-/// non-managed endpoint that cannot receive required prompt context all refuse
-/// with [`crate::context_pack::Refusal`] before anything is created.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn context_guard(
+/// The repository this dispatch selects — `resolve_repo`'s own rule
+/// (explicit `--repo`, then the cwd's declared repo, then the project's
+/// only repo), answered without its refusal so the app guard can run
+/// before any daemon call. `None` when the selection is ambiguous: the
+/// dispatch refuses that itself, and no git source is claimed either.
+fn selected_repo_root(
     project: &crate::issue::project::Project,
-    source: &[u8],
-    front: &Front,
-    items: &[AcceptanceItem],
-    team_role: Option<&str>,
-    provider: &str,
-    endpoint_kind: &str,
-    body: &str,
-) -> Result<Option<crate::context_pack::Manifest>> {
-    let contract = crate::context_pack::TaskContract::new(&front.id, &front.title, source, items);
-    let (role, assigned) = crate::context_pack::selection_role(team_role);
-    let pinned = crate::issue::context::pin(project, Some(role));
-    let manifest =
-        crate::context_pack::build(contract, &project.key, &pinned, role, assigned.as_deref())
-            .map_err(|refusal| refusal.error())?;
-    let Some(manifest) = manifest else {
-        return Ok(None);
-    };
-    if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
-        return Err(crate::context_pack::Refusal::UnsupportedEndpoint {
-            endpoint: endpoint_kind.to_string(),
-        }
-        .error());
+    flag: Option<&Path>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    let candidates = start::declared_repos(project);
+    if let Some(dir) = flag {
+        return crate::worktree::main_root(dir)
+            .ok()
+            .filter(|root| candidates.contains(root));
     }
-    let root = crate::issue::context::repository_root(project).map_err(|(state, detail)| {
-        crate::context_pack::Refusal::UnavailableProject { state, detail }.error()
-    })?;
-    let mut reader = |document: &crate::context_pack::Source| {
-        crate::issue::context::read_pinned_blob(
-            &root,
-            &document.revision,
-            &document.path,
-            &document.digest,
-        )
-    };
-    crate::context_pack::plan(
-        &manifest,
-        None,
-        false,
-        body,
-        crate::context_pack::adapter_reserved_bytes(provider),
-        &mut reader,
-    )
-    .map_err(|refusal| refusal.error())?;
-    Ok(Some(manifest))
+    if let Some((root, _)) = crate::issue::project::repo_identity(cwd) {
+        if candidates.contains(&root) {
+            return Some(root);
+        }
+    }
+    if candidates.len() == 1 {
+        return crate::worktree::main_root(&candidates[0]).ok();
+    }
+    None
 }
 
-fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result<Preflight> {
+fn preflight(
+    pm: &Pm,
+    id: &str,
+    args: &DispatchArgs,
+    state_dir: &Path,
+) -> Result<std::ops::ControlFlow<Value, Preflight>> {
     let GatedIssue {
         project,
         dir,
         front,
         items,
         source,
+        request,
     } = gate_issue(pm, id, false)?;
     // CAD-159: the CAD-238 section-scoped readback. No items warns;
     // it never refuses (PM decision, ADR-0002 §8.3).
@@ -664,6 +494,36 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         .ok_or_else(|| {
             Error::rejected("Dispatch needs a return address — pass --reply-to <alias>")
         })?;
+    // CAD-622: an app's own team agents never author changes to that
+    // app's source. The ticket's planned paths are the earliest place a
+    // change is named, and this runs before anything is created — the
+    // worker and the PM asking for the work are both authors. The saved
+    // team is read here (no store on this side); the run's role inputs
+    // are applied by the daemon's plan and review seams. The repository
+    // is the one this dispatch selects, resolved by `resolve_repo`'s own
+    // rule below without its refusal, so the guard can run before any
+    // daemon call.
+    let app_paths = crate::issue::app_guard::apps_in_paths(front.paths.iter().map(String::as_str));
+    let guard = crate::issue::app_guard::Ctx {
+        pm_dir: &pm.dir,
+        state_dir: Some(state_dir),
+        store: None,
+    };
+    let selected_root = selected_repo_root(
+        &project,
+        args.repo.as_deref(),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
+    if let Some(why) = crate::issue::app_guard::refusals(
+        guard,
+        &app_paths,
+        &[reply_to.as_str(), args.to.as_str()],
+        &selected_root
+            .map(|root| crate::issue::app_guard::selected_remotes(&project, &root))
+            .unwrap_or_default(),
+    )? {
+        return Err(Error::rejected(why));
+    }
     let note_arg = args.note.clone().unwrap_or_else(|| dir.join("issue.md"));
     let note = note_arg
         .canonicalize()
@@ -722,29 +582,140 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
     // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let base_sha = start::resolve_base(
+    let base = start::resolve_base(
         &root,
         args.base.as_deref(),
-        start::configured_integration(&project, &root),
-    )?
-    .sha;
+        start::configured_integration(&project, &root)?,
+    )?;
+    let base_sha = base.sha.clone();
     let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;
+    // CAD-1846: an accepted kickoff is answered from the daemon's own rows
+    // before any source capture, contract render, lane setup or job creation.
+    // Only a fresh dispatch pays for sources, and only the native guards
+    // decide whether it is admitted.
+    let mode = if args.job_spec.is_some() {
+        DispatchMode::Job
+    } else {
+        DispatchMode::Plain
+    };
+    let job_locator = args.job_spec.as_deref().map(spec_locator);
+    let mut reuse_job: Option<String> = None;
+    match early_kickoff(&EarlyDispatch {
+        state_dir,
+        front: &front,
+        mode,
+        worker: &args.to,
+        reply_to: &reply_to,
+        show: &show,
+        repo_root: &root,
+        lane: &wt_dir,
+        branch: &branch,
+        job_locator: job_locator.as_deref(),
+        acceptance: &items,
+    })? {
+        EarlyKickoff::None => {}
+        EarlyKickoff::Duplicate {
+            row,
+            job,
+            task,
+            kind,
+        } => {
+            let mut out = json!({
+                "issue": front.id,
+                "worker": args.to,
+                "reply_to": reply_to,
+                "note": note,
+                "worktree": wt_dir,
+                "branch": branch,
+                "base": {"ref": base.name, "sha": base.sha},
+                "acceptance": acceptance,
+                "claim": claim::json(&front, crate::issue::time::now_epoch()),
+                "dispatched": false,
+                "duplicate": true,
+                "duplicate_kind": kind,
+                "message": row["id"],
+                "message_state": row["state"],
+            });
+            if let Some(job) = job {
+                out["job"] = job["id"].clone();
+            }
+            if let Some(task) = task {
+                out["task"] = task["id"].clone();
+                out["task_revision"] = task["revision"].clone();
+                out["base"]["sha"] = task["base_sha"].clone();
+            }
+            if items.is_empty() {
+                out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
+            }
+            return Ok(std::ops::ControlFlow::Break(out));
+        }
+        EarlyKickoff::ReuseJob { job } => {
+            reuse_job = job["id"].as_str().map(str::to_string);
+        }
+    }
+    // CAD-1822/CAD-1846: both entry points run the same mandatory pipeline.
+    // The task contract and the project's required sources are validated
+    // before `issue start`, so a refusal leaves no lane, branch, job or
+    // queued message behind. The guard pins first, so its factory — the only
+    // place a contract, spec or body is captured — never runs on opt-out.
+    let mut context_active = false;
+    let mut context_contract_digest = None;
+    let mut context_lessons: Option<ContextFacts> = None;
     let body = if args.job_spec.is_none() {
         let summary = args.summary.as_deref().unwrap_or(&front.title);
-        let body = plain_kickoff(
-            &front.id,
-            summary,
-            &note,
-            &wt_dir,
-            &branch,
-            &base_sha,
-            &reply_to,
-            &items,
-            &provider,
-            &endpoint_kind,
+        let prepared = context_guard(
+            pm,
+            &project,
+            &front,
+            ContextTarget {
+                team_role: agent["team_role"].as_str(),
+                provider: &provider,
+                endpoint_kind: &endpoint_kind,
+            },
+            args.no_lessons,
+            || {
+                let body = plain_body(
+                    &front,
+                    summary,
+                    &note,
+                    &wt_dir,
+                    &branch,
+                    &base_sha,
+                    &reply_to,
+                    &items,
+                    &provider,
+                    &endpoint_kind,
+                )?;
+                let contract = crate::context_pack::TaskContract::new(
+                    &front.id,
+                    &front.title,
+                    source.as_bytes(),
+                    &items,
+                    request,
+                );
+                Ok((contract, std::borrow::Cow::Owned(body)))
+            },
         )?;
-        check_body(&body, &provider)?;
-        Some(body)
+        match prepared {
+            Some(prepared) => {
+                context_active = true;
+                context_contract_digest = Some(prepared.manifest.task.semantic_digest());
+                context_lessons = Some(ContextFacts::from_manifest(&prepared.manifest));
+                Some(prepared.body.into_owned())
+            }
+            None => Some(plain_body(
+                &front,
+                summary,
+                &note,
+                &wt_dir,
+                &branch,
+                &base_sha,
+                &reply_to,
+                &items,
+                &provider,
+                &endpoint_kind,
+            )?),
+        }
     } else {
         if let Some(spec) = &args.job_spec {
             // `issue start --job` scopes the task to the lane's dir name.
@@ -752,34 +723,52 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            check_job_kickoff(
-                &front.id, &items, spec, &wt_name, &branch, &base_sha, &agent,
+            let (prototype_job, prototype_task) =
+                job_prototype(&front.id, &items, spec, &wt_name, &branch, &base_sha);
+            let placeholder = "0".repeat(32);
+            let prepared = job_context(
+                pm,
+                GatedIssue {
+                    project: project.clone(),
+                    dir: dir.clone(),
+                    front: front.clone(),
+                    items: items.clone(),
+                    source: source.clone(),
+                    request: request.clone(),
+                },
+                JobContext {
+                    job: &prototype_job,
+                    task: &prototype_task,
+                    revision: 1,
+                    message: &placeholder,
+                    target: ContextTarget {
+                        team_role: agent["team_role"].as_str(),
+                        provider: &provider,
+                        endpoint_kind: &endpoint_kind,
+                    },
+                    // Preview only: `issue start` has not created this lane
+                    // yet, so there is no admission proof to make.
+                    admission_scope: None,
+                },
+                args.no_lessons,
             )?;
+            if prepared.is_some() {
+                // The daemon re-selects and pins the same mandatory contract
+                // for the real task and message; the combined cap was checked
+                // here against exact-length placeholders.
+                context_active = true;
+            } else {
+                check_job_kickoff(
+                    &front.id, &items, spec, &wt_name, &branch, &base_sha, &agent,
+                )?;
+            }
         }
         None
     };
-    // CAD-1822: the task contract and the project's required sources are
-    // validated before `issue start`, so a refusal leaves no lane, branch or
-    // queued message behind. `--job` kickoffs are daemon-templated and keep
-    // their existing path.
-    let mut context_active = false;
-    if let Some(body) = body.as_deref() {
-        context_active = context_guard(
-            &project,
-            source.as_bytes(),
-            &front,
-            &items,
-            agent["team_role"].as_str(),
-            &provider,
-            &endpoint_kind,
-            body,
-        )?
-        .is_some();
-    }
 
     // `issue start` — idempotent; --owner <worker>, and for --job the
     // PM is the return address and the worker the assignee.
-    Ok(Preflight {
+    Ok(std::ops::ControlFlow::Continue(Preflight {
         project,
         dir,
         front,
@@ -794,113 +783,10 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         cwd_override,
         body,
         context_active,
-    })
-}
-
-struct Lessons {
-    mid: String,
-    lessons: Vec<String>,
-    lessons_file: Option<PathBuf>,
-    lessons_error: Option<String>,
-    lessons_withheld: Vec<(String, String)>,
-    body: Option<String>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lessons(
-    pm: &Pm,
-    project: &crate::issue::project::Project,
-    dir: &Path,
-    front: &Front,
-    args: &DispatchArgs,
-    state_dir: &Path,
-    provider: &str,
-    body: Option<String>,
-) -> Lessons {
-    let mut lessons: Vec<String> = vec![];
-    let mut lessons_file: Option<PathBuf> = None;
-    let mut lessons_error: Option<String> = None;
-    // CAD-203: in-scope lessons withheld for stale evidence, with the
-    // reason — recorded on the dispatch comment and in the output so
-    // "why did I not get this?" is answerable.
-    let mut lessons_withheld: Vec<(String, String)> = vec![];
-    // The message id is minted up front so the `message` ref commits
-    // BEFORE the send: a finish racing the dispatch sees the binding
-    // the moment the ref lands. The old send→add_ref order left the
-    // kickoff live but unbound for a window (CAD-107).
-    let mid = Uuid::new_v4().simple().to_string();
-    let mut body = body;
-    if !args.no_lessons {
-        if let Some(b) = body.as_mut() {
-            let issue_obj = board::Issue {
-                project: project.key.clone(),
-                dir: dir.to_path_buf(),
-                front: front.clone(),
-                body: String::new(),
-                comments: vec![],
-                artifacts: vec![],
-            };
-            match memory::match_for_issue(pm, &issue_obj, Some(provider)) {
-                Err(e) => lessons_error = Some(format!("memory match failed: {e}")),
-                Ok((matched, mem_errors)) => {
-                    // Valid records still reach the worker; every file
-                    // that failed to load is named on the issue.
-                    if let Some(line) = memory::load_errors_line(&mem_errors) {
-                        lessons_error = Some(line);
-                    }
-                    lessons_withheld = matched
-                        .withheld
-                        .iter()
-                        .map(|(m, reason)| (m.front.id.clone(), reason.clone()))
-                        .collect();
-                    // Written whenever it has content: a dispatch whose
-                    // every match was withheld still gets the file with
-                    // only its Withheld section.
-                    let (text, slugs) = memory::render_lessons(&matched);
-                    if !text.is_empty() {
-                        let ddir = state_dir.join("dispatch");
-                        let file = ddir.join(format!("{mid}-lessons.md"));
-                        // tmp + rename: a failed write never leaves a
-                        // partial or empty lessons artifact behind.
-                        let tmp = ddir.join(format!("{mid}-lessons.tmp"));
-                        let prior = b.clone();
-                        *b = format!("{prior} Lessons: {}.", file.display());
-                        if let Err(e) = check_body(b, provider) {
-                            *b = prior;
-                            let why =
-                                format!("lessons path pushed the kickoff over the body limit: {e}");
-                            lessons_error = Some(match lessons_error {
-                                Some(prev) => format!("{prev}; {why}"),
-                                None => why,
-                            });
-                        } else if let Err(e) = std::fs::create_dir_all(&ddir)
-                            .and_then(|_| std::fs::write(&tmp, &text))
-                            .and_then(|_| std::fs::rename(&tmp, &file))
-                        {
-                            let _ = std::fs::remove_file(&tmp);
-                            *b = prior;
-                            let why = format!("lessons file unwritable: {e}");
-                            lessons_error = Some(match lessons_error {
-                                Some(prev) => format!("{prev}; {why}"),
-                                None => why,
-                            });
-                        } else {
-                            lessons = slugs;
-                            lessons_file = Some(file);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Lessons {
-        mid,
-        lessons,
-        lessons_file,
-        lessons_error,
-        lessons_withheld,
-        body,
-    }
+        context_contract_digest,
+        context_lessons,
+        reuse_job,
+    }))
 }
 
 struct RecordCtx<'a> {
@@ -919,6 +805,7 @@ struct RecordCtx<'a> {
     lessons_file: Option<PathBuf>,
     lessons_error: Option<String>,
     lessons_withheld: Vec<(String, String)>,
+    lessons_omitted: Vec<(String, String)>,
     acceptance_warning: Option<String>,
     cwd_override: Option<String>,
     agent: &'a Value,
@@ -945,6 +832,7 @@ fn record(ctx: RecordCtx<'_>) -> Result<Value> {
         lessons_file,
         lessons_error,
         lessons_withheld,
+        lessons_omitted,
         acceptance_warning,
         cwd_override,
         agent,
@@ -992,9 +880,16 @@ fn record(ctx: RecordCtx<'_>) -> Result<Value> {
     if !lessons_withheld.is_empty() {
         let items: Vec<String> = lessons_withheld
             .iter()
-            .map(|(slug, reason)| format!("{slug} ({reason})"))
+            .map(|(slug, reason)| format!("{slug} ({})", redacted_fact(reason)))
             .collect();
         comment_text.push_str(&format!("\nLessons withheld: {}", items.join("; ")));
+    }
+    if !lessons_omitted.is_empty() {
+        let items: Vec<String> = lessons_omitted
+            .iter()
+            .map(|(slug, reason)| format!("{slug} ({})", redacted_fact(reason)))
+            .collect();
+        comment_text.push_str(&format!("\nLessons omitted: {}", items.join("; ")));
     }
     // A `--job` dispatch's override is already recorded by `issue
     // start`, which re-checks the assignee; the plain path records it
@@ -1060,11 +955,18 @@ fn record(ctx: RecordCtx<'_>) -> Result<Value> {
         .unwrap_or(Value::Null);
     out["lessons_withheld"] = json!(lessons_withheld
         .iter()
-        .map(|(slug, reason)| json!({"slug": slug, "reason": reason}))
+        .map(|(slug, reason)| json!({"slug": slug, "reason": redacted_fact(reason)}))
+        .collect::<Vec<_>>());
+    out["lessons_omitted"] = json!(lessons_omitted
+        .iter()
+        .map(|(slug, reason)| json!({"slug": slug, "reason": redacted_fact(reason)}))
         .collect::<Vec<_>>());
     out["lessons_error"] = lessons_error
         .as_ref()
-        .map(|e| json!(e))
+        // The common construction already redacts; this covers a pin written
+        // before that boundary and any legacy variant. Redaction failure
+        // yields the marker, never the raw value.
+        .map(|e| json!(redacted_fact(e)))
         .unwrap_or(Value::Null);
     out["comment"] = comment["comment"].clone();
     // CAD-467: `folded` when the queued bootstrap was cancelled into
@@ -1092,55 +994,58 @@ fn duplicate(
     items: &[AcceptanceItem],
     next_body: Option<&str>,
     context_active: bool,
+    next_contract_digest: Option<&str>,
     out: &mut Value,
 ) -> Result<bool> {
+    let mode = if args.job_spec.is_some() {
+        DispatchMode::Job
+    } else {
+        DispatchMode::Plain
+    };
+    let started_task = started["task"].as_str();
     let mut live: Option<Value> = None;
     let mut reported: Option<Value> = None;
-    for r in front
-        .refs
-        .iter()
-        .filter(|r| r.kind == "message" && r.closed != Some(true))
-    {
-        let Some(mid) = r.path.as_deref() else {
+    for (mid, owner) in message_refs(front, &args.to) {
+        let Some(found) = message_row(state_dir, &owner, &args.to, show_now, &mid) else {
             continue;
         };
-        let owner = r
-            .agent
-            .as_deref()
-            .or_else(|| {
-                r.label
-                    .as_deref()
-                    .and_then(|l| l.strip_prefix("dispatch → "))
-            })
-            .unwrap_or(&args.to);
-        let messages = if owner == args.to {
-            Some(show_now.clone())
-        } else {
-            client::rpc(state_dir, "agent_show", json!({"alias": owner})).ok()
-        };
-        let Some(found) = messages.and_then(|s| {
-            s["messages"]
-                .as_array()
-                .and_then(|ms| ms.iter().find(|m| m["id"].as_str() == Some(mid)).cloned())
-        }) else {
+        // An arbitrary user-authored row is never a kickoff of either mode.
+        let Some(found_mode) = row_mode(&found) else {
             continue;
         };
         let state = found["state"].as_str().unwrap_or_default();
         if LIVE_MESSAGE_STATES.contains(&state) {
+            if found_mode != mode {
+                // Another kind of kickoff already holds this lane; a second
+                // one would run two tasks against it. Nothing more is queued.
+                return Err(Error::rejected(format!(
+                    "{}'s lane {} already has a live {} kickoff {} ({}) — wait for it \
+                     to finish or reconcile it; no kickoff was queued",
+                    front.id,
+                    Path::new(started["worktree"].as_str().unwrap_or_default()).display(),
+                    found_mode.label(),
+                    found["id"].as_str().unwrap_or("?"),
+                    state,
+                )));
+            }
             live = Some(found);
             break;
         }
         // The proof is the daemon-recorded row: this issue's kickoff,
         // delivered to THIS worker (the row's `alias` is the send's
         // target — a kickoff reported by another worker is their
-        // history, not this dispatch's), on THIS lane's worktree.
+        // history, not this dispatch's), on THIS lane's worktree, of THIS
+        // dispatch's kind — and for a job, this exact native task, so a
+        // sibling task can never suppress another.
         let reported_here = state == "completed"
             && found["alias"].as_str() == Some(args.to.as_str())
             && found["issue"].as_str() == Some(front.id.as_str())
             && match (found["worktree"].as_str(), started["worktree"].as_str()) {
-                (Some(m), Some(lane)) => m == lane,
+                (Some(recorded), Some(lane)) => same_path(Path::new(recorded), Path::new(lane)),
                 _ => false,
-            };
+            }
+            && found_mode == mode
+            && (mode == DispatchMode::Plain || found["task_id"].as_str() == started_task);
         if reported_here {
             reported = Some(found);
         }
@@ -1159,8 +1064,8 @@ fn duplicate(
         return Ok(true);
     }
     if let Some(msg) = reported {
-        // An opted-in task's changed kickoff body is an explicit revision, not
-        // a duplicate. History is preserved: the old message and its ref stay,
+        // An opted-in task's changed actionable contract/body is a revision,
+        // not a duplicate. History is preserved: the old message and its ref stay,
         // and the new kickoff is added beside them. A live duplicate above
         // still suppresses, so an in-flight task is never silently retargeted,
         // and a non-opted project keeps the legacy reported-duplicate outcome
@@ -1172,7 +1077,22 @@ fn duplicate(
                         .strip_prefix(next)
                         .is_some_and(|suffix| suffix.starts_with(" Lessons:"))
             });
-            if context_active && !same {
+            let same_contract = match next_contract_digest {
+                Some(next) => {
+                    let previous = client::rpc(
+                        state_dir,
+                        "agent_show",
+                        json!({
+                            "alias": args.to,
+                            "limit": 0,
+                            "context_message": msg["id"],
+                        }),
+                    )?;
+                    previous["context_contract_digest"].as_str() == Some(next)
+                }
+                None => true,
+            };
+            if context_active && (!same || !same_contract) {
                 out["revised"] = json!(true);
                 out["previous_message"] = msg["id"].clone();
                 let _ = write::add_comment(
@@ -1252,6 +1172,10 @@ pub fn run(
     dispatch_pm: Option<&str>,
     origin: DispatchOrigin,
 ) -> Result<Value> {
+    let preflight = match preflight(pm, id, args, state_dir)? {
+        std::ops::ControlFlow::Break(accepted) => return Ok(accepted),
+        std::ops::ControlFlow::Continue(preflight) => preflight,
+    };
     let Preflight {
         project,
         dir,
@@ -1267,7 +1191,10 @@ pub fn run(
         cwd_override,
         body,
         context_active,
-    } = preflight(pm, id, args, state_dir)?;
+        context_contract_digest,
+        context_lessons,
+        reuse_job,
+    } = preflight;
     let agent = &show["agent"];
     let start_args = start::StartArgs {
         repo: args.repo.clone(),
@@ -1275,6 +1202,7 @@ pub fn run(
         base: args.base.clone(),
         owner: Some(args.to.clone()),
         job: args.job_spec.as_ref().map(|spec| start::JobArgs {
+            id: reuse_job,
             pm: reply_to.clone(),
             spec: spec.clone(),
             assignee: Some(args.to.clone()),
@@ -1355,28 +1283,56 @@ pub fn run(
         &items,
         body.as_deref(),
         context_active,
+        context_contract_digest.as_deref(),
         &mut out,
     )? {
         return Ok(out);
     }
 
+    // The message id is minted up front so the `message` ref commits BEFORE
+    // the send: a finish racing the dispatch sees the binding the moment the
+    // ref lands (CAD-107).
+    let mid = Uuid::new_v4().simple().to_string();
     // Project-memory lessons: accepted memories matching the issue's
-    // component/tags/recorded-commit paths and the worker's provider
-    // render into `<state>/dispatch/<message>-lessons.md`, written
-    // before the send so the kickoff can name it. `--job`'s kickoff
-    // is daemon-templated and cannot carry the path — it is skipped.
-    // Memory failures never sink the dispatch — the worktree already
-    // exists by now. A malformed file, an unwritable lessons file or a
-    // suffix that pushes the body over the cap degrades to no lessons
-    // with `lessons_error` naming the reason.
+    // component/tags/recorded-commit paths and the worker's provider render
+    // into `<state>/dispatch/<message>-lessons.md`, written before the send
+    // so the kickoff can name it. An opted-in dispatch already carries that
+    // same selection inside its pinned context, so the legacy sidecar and
+    // its `Lessons:` suffix are skipped there — never injected twice — and
+    // `--job`'s kickoff likewise carries it in the pinned task context.
+    // Memory failures never sink the dispatch — the worktree already exists
+    // by now. A malformed file, an unwritable lessons file or a suffix that
+    // pushes the body over the cap degrades to no lessons with
+    // `lessons_error` naming the reason.
     let Lessons {
-        mid,
         lessons,
         lessons_file,
         lessons_error,
         lessons_withheld,
+        lessons_omitted,
         body,
-    } = lessons(pm, &project, &dir, &front, args, state_dir, &provider, body);
+    } = match context_lessons {
+        Some(facts) => Lessons {
+            lessons: facts.lessons,
+            lessons_file: None,
+            lessons_error: facts.lessons_error,
+            lessons_withheld: facts.lessons_withheld,
+            lessons_omitted: facts.lessons_omitted,
+            body,
+        },
+        None => lessons(
+            &mid,
+            pm,
+            &project,
+            &dir,
+            &front,
+            args,
+            state_dir,
+            &provider,
+            agent["team_role"].as_str(),
+            body,
+        ),
+    };
 
     // CAD-467: a freshly joined worker's `bootstrap-<alias>` still
     // `queued` would deliver as a bare onboarding turn AHEAD of this
@@ -1497,8 +1453,10 @@ pub fn run(
     // later re-dispatch can prove this kickoff's report belongs to
     // THIS issue and lane (CAD-467).
     let (message, sent_state) = if let Some(body) = send_body {
+        // `no_lessons` is the caller's existing opt-out, carried to the
+        // daemon so its own context selection honors it too.
         let mut send = json!({"alias": args.to, "text": body, "reply_to": reply_to,
-                              "message": mid,
+                              "message": mid, "no_lessons": args.no_lessons,
                               "issue": front.id, "worktree": started["worktree"]});
         if matches!(origin, DispatchOrigin::Automatic) {
             send["unattended"] = json!(true);
@@ -1513,7 +1471,8 @@ pub fn run(
         let sent = client::rpc(
             state_dir,
             "task_dispatch",
-            json!({"task": task, "by": reply_to, "message": mid}),
+            json!({"task": task, "by": reply_to, "message": mid,
+                   "no_lessons": args.no_lessons}),
         )
         .map_err(send_failed)?;
         (
@@ -1593,6 +1552,7 @@ pub fn run(
         lessons_file,
         lessons_error,
         lessons_withheld,
+        lessons_omitted,
         acceptance_warning,
         cwd_override,
         agent,

@@ -77,6 +77,40 @@ fn board_caller(
     operator::board_caller(request, state_dir, opts, false, None)
 }
 
+/// `GET /api/app-installations/{id}/automatic-updates`. Absence is off.
+pub(super) fn automatic_updates_get(state_dir: &Path, install: &str) -> HttpResp {
+    relay(
+        state_dir,
+        "app_automatic_updates_get",
+        json!({"install_id": install}),
+        None,
+    )
+}
+
+/// `GET /api/app-installations/{id}/member-access` — CAD-2215. The exact
+/// conversations of one installation, the grants on them, and the live
+/// roster a grant may name. The row is `OperatorOnly`, so this handler only
+/// ever relays the operator's read; the live roster proof is the public
+/// session cookie the board already verified, never a body field. A local
+/// operator relays no proof and the daemon names no roster, which the panel
+/// reads as "cannot grant".
+pub(super) fn member_access_get(
+    request: &Request,
+    install: &str,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    match read_proof(operator::public_relay(request, opts)) {
+        Ok(proof) => relay_session(
+            state_dir,
+            "app_member_access_list",
+            json!({"install_id": install}),
+            proof.as_deref(),
+        ),
+        Err(resp) => resp,
+    }
+}
+
 /// GET reads: `/api/app-catalog`, `/api/app-catalog/<id>`,
 /// `/api/app-home`, `/api/app-favorites`, `/api/app-requests`.
 pub(super) fn read(
@@ -139,9 +173,12 @@ pub(super) enum WriteAction {
     FavoriteOpened,
     RequestDismiss,
     UpdateCheck,
+    AutomaticUpdatesSet,
     RemovePreview,
     Remove,
     Restore,
+    MemberAccessGrant,
+    MemberAccessRevoke,
 }
 
 /// POST writes admitted by `RouteClass`. `caller` is the admitted board
@@ -154,6 +191,7 @@ pub(super) fn write(
     caller: Option<&operator::Caller>,
     proof_relay: operator::PublicRelay,
     state_dir: &Path,
+    opts: &ServeOpts,
 ) -> HttpResp {
     // No admitted caller, or an agent, never reaches a relay: the member
     // verbs below would otherwise run as the operator.
@@ -189,6 +227,34 @@ pub(super) fn write(
             json!({"install_id": install}),
             None,
         ),
+        WriteAction::AutomaticUpdatesSet => match public_proof(proof_relay) {
+            Ok(proof) => {
+                // A public host already named the person. A local or
+                // tailnet board puts the operator cookie it checked into
+                // the same base object. The cookie is not a body field.
+                let mut base = json!({ "install_id": install });
+                let local = if proof.is_none() {
+                    operator::local_operator_proof(request, opts)
+                } else {
+                    None
+                };
+                if let Some(local) = local {
+                    base["session_token"] = json!(local.token);
+                    base["session_key"] = json!(local.key);
+                    base["session_origin"] = json!(local.origin);
+                }
+                relay_body(
+                    request,
+                    state_dir,
+                    "app_automatic_updates_set",
+                    base,
+                    &["automatic"],
+                    None,
+                    proof.as_deref(),
+                )
+            }
+            Err(resp) => resp,
+        },
         WriteAction::RemovePreview => relay(
             state_dir,
             "app_workspace_remove_preview",
@@ -213,6 +279,27 @@ pub(super) fn write(
                 json!({"install_id": install}),
                 proof.as_deref(),
             ),
+            Err(resp) => resp,
+        },
+        // CAD-2215: one exact member and one exact conversation. The body may
+        // name only those three fields — the install comes from the path, and
+        // the daemon reads the member's identity, the organization and the
+        // live roster from its own verified session, never from this relaying
+        // caller.
+        WriteAction::MemberAccessGrant => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_member_access_grant",
+                json!({"install_id": install}),
+                &["member_sub", "conversation_id", "expected_digest"],
+                None,
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::MemberAccessRevoke => match public_proof(proof_relay) {
+            Ok(proof) => member_access_revoke(request, state_dir, install, proof.as_deref()),
             Err(resp) => resp,
         },
         WriteAction::FavoriteSet => match public_proof(proof_relay) {
@@ -286,7 +373,62 @@ fn public_proof(relay: operator::PublicRelay) -> Result<Option<String>, HttpResp
     }
 }
 
-/// Read a bounded JSON body, forward its allow-listed fields onto `base`
+/// [`public_proof`] for a read route: the same bearer, the read's own refusal
+/// wording. A public board read has no anonymous fallback either — the daemon
+/// cannot name a live roster without the session it must re-prove (CAD-2215).
+fn read_proof(relay: operator::PublicRelay) -> Result<Option<String>, HttpResp> {
+    match relay {
+        operator::PublicRelay::NotPublic => Ok(None),
+        operator::PublicRelay::Proven(proof) => Ok(Some(proof.token().to_string())),
+        operator::PublicRelay::Missing => {
+            Err(err_response(401, "board session required for this read"))
+        }
+    }
+}
+
+/// One exact member/conversation revoke (CAD-2215). The board refuses a body
+/// that does not name both, so the daemon's install-wide revoke can never be
+/// reached from this route: the Manage panel removes one pair at a time, and
+/// the install-wide form stays the operator's CLI verb. A revoke needs no
+/// live roster, so a member who is no longer on it can still be cleaned up.
+fn member_access_revoke(
+    request: &mut Request,
+    state_dir: &Path,
+    install: &str,
+    proof: Option<&str>,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return err_response(400, "body must be a JSON object"),
+    };
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let (Some(member_sub), Some(conversation_id)) = (field("member_sub"), field("conversation_id"))
+    else {
+        return err_response(400, "a revoke names one member and one conversation");
+    };
+    relay_session(
+        state_dir,
+        "app_member_access_revoke",
+        json!({
+            "install_id": install,
+            "member_sub": member_sub,
+            "conversation_id": conversation_id,
+        }),
+        proof,
+    )
+}
+
+/// Read a bounded JSON body, forward its allow-listed fields onto `params`
 /// (a path-derived id, or empty), plus the caller's `member_as` when the
 /// route admits a member and the attributed verb's `public_session` proof.
 /// Unknown body fields are dropped.
@@ -294,7 +436,7 @@ fn relay_body(
     request: &mut Request,
     state_dir: &Path,
     method: &str,
-    base: Value,
+    mut params: Value,
     fields: &[&str],
     member: Option<&str>,
     proof: Option<&str>,
@@ -307,7 +449,6 @@ fn relay_body(
         Ok(v) => v,
         Err(_) => return err_response(400, "body must be a JSON object"),
     };
-    let mut params = base;
     if let Some(obj) = value.as_object() {
         for f in fields {
             if let Some(v) = obj.get(*f) {

@@ -14,7 +14,7 @@ const ROLES_MAX: usize = 8;
 static LOCK: StdMutex<()> = StdMutex::new(());
 
 #[derive(Clone, Debug)]
-pub(super) struct Team {
+pub(crate) struct Team {
     pub owner_pm: String,
     pub roles: BTreeMap<String, String>,
     pub revision: u64,
@@ -51,7 +51,7 @@ fn parse(value: &Value) -> Result<Team> {
     })
 }
 
-pub(super) fn team_of(state: &Path, install: &str) -> Result<Option<Team>> {
+pub(crate) fn team_of(state: &Path, install: &str) -> Result<Option<Team>> {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     load(state)?.get(install).map(parse).transpose()
 }

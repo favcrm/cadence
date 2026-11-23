@@ -12,16 +12,22 @@ pub mod app_assistant;
 pub mod app_campaign_work;
 pub mod app_catalog;
 pub mod app_chat;
+pub mod app_guard;
 pub mod app_listing;
-pub mod app_screen_decl;
+// CAD-2008: the screen declaration/integrity rules live in `cadence-core`, so
+// the native install/mount guard (`validate_map`) and the hosted
+// `app.screen.integrity` operation run one implementation. CAD-2118 keeps
+// `validate_map` strict and adds `app.screen.asset-integrity`
+// (`validate_facts_asset_integrity`) for hosts that own the operation
+// vocabulary themselves. This re-export keeps every existing
+// `crate::issue::app_screen_decl` path working unchanged.
+pub use cadence_core::app_screen_decl;
 pub mod app_screen_pkg;
 pub mod app_source;
 pub mod app_view;
 pub mod areas;
 pub mod blocked;
 pub mod board;
-#[cfg(test)]
-mod cad811_screen_startup_acceptance;
 pub mod claim;
 pub mod cli;
 pub mod cloud;
@@ -236,7 +242,8 @@ impl Pm {
     /// CAD-1374: attach the server-prepared human context for this handle's
     /// commits. Only the allowlisted canonical fields are stored; a malformed
     /// context is refused here, before any write.
-    pub(crate) fn with_activity_receipt(mut self, receipt: &serde_json::Value) -> Result<Self> {
+    #[doc(hidden)]
+    pub fn with_activity_receipt(mut self, receipt: &serde_json::Value) -> Result<Self> {
         self.activity_receipt = Some(canonical_receipt(receipt)?);
         Ok(self)
     }
@@ -1031,7 +1038,8 @@ fn git_cancellable(
 }
 
 /// Run a git subcommand in `dir`; rejected error carries stderr.
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
+#[doc(hidden)]
+pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
         .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
     if !out.status.success() {
@@ -1169,27 +1177,10 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
   `.git/cadence-write.flock` (`.write.lock` fences older binaries).\n";
 
 #[cfg(test)]
+mod app_screen_bound_acceptance;
+
+#[cfg(test)]
 mod lock_tests;
-
-#[cfg(test)]
-#[path = "cad1177_tools_acceptance.rs"]
-mod cad1177_tools_acceptance;
-
-#[cfg(test)]
-mod cad1298_acceptance;
-
-#[cfg(test)]
-mod cad1298_readiness_acceptance;
-
-#[cfg(test)]
-mod cad1314_acceptance;
-
-#[cfg(test)]
-mod cad1793_acceptance;
-
-#[cfg(test)]
-#[path = "cad1270_screen_decl_acceptance.rs"]
-mod cad1270_screen_decl_acceptance;
 
 #[cfg(test)]
 mod tests {

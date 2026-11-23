@@ -1,5 +1,7 @@
 //! CAD-1290: connect Instagram through AgenticOS and choose the publishing
-//! account, from the board, with no CLI.
+//! account, from the board, with no CLI. CAD-1939: Facebook Pages too, and a
+//! binding per destination — choosing a destination adds (or updates) that
+//! destination's own binding instead of replacing the slot's only one.
 //!
 //! Three operator-only methods (the company comes from the resolver's own
 //! credential or lease, so a destination of another company never lists). None adds authority: the connect link is a
@@ -18,8 +20,26 @@ use super::social_publish_start::PublishTarget;
 use super::*;
 use crate::issue::{app, app_catalog::workspace};
 use crate::platform::agenticos_external::PLATFORM;
+use crate::store::app_bindings::BindingProof;
 
-const TOOLKIT: &str = "instagram";
+/// The publishable toolkits, allowlisted. The first is the default for a
+/// request that names none (the CAD-1290 Instagram-only callers).
+const TOOLKITS: [&str; 2] = ["instagram", "facebook"];
+
+/// An optional request `toolkit`: absent is Instagram, anything else must be
+/// one of [`TOOLKITS`].
+fn requested_toolkit(params: &Value) -> Result<Option<&'static str>> {
+    match params.get("toolkit") {
+        None => Ok(None),
+        Some(Value::String(toolkit)) => TOOLKITS
+            .iter()
+            .find(|known| **known == toolkit)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| Error::rejected("toolkit must be instagram or facebook")),
+        Some(_) => Err(Error::rejected("toolkit must be instagram or facebook")),
+    }
+}
 const TIMEZONE: &str = "Asia/Hong_Kong";
 
 /// Percent-encode everything but RFC 3986 unreserved bytes.
@@ -51,7 +71,11 @@ pub(super) fn compose_connect_url(
     company: &str,
     board_host: &str,
     return_to: &str,
+    toolkit: &str,
 ) -> Result<String> {
+    if !TOOLKITS.contains(&toolkit) {
+        return Err(Error::rejected("toolkit must be instagram or facebook"));
+    }
     let refuse = || Error::rejected("return_to must be a page on this board");
     let rest = return_to.strip_prefix("https://").ok_or_else(refuse)?;
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
@@ -73,7 +97,7 @@ pub(super) fn compose_connect_url(
         return Err(Error::rejected("the AgenticOS connect link is unavailable"));
     }
     Ok(format!(
-        "{origin}/v2/account/{company}/connections/connect?toolkit={TOOLKIT}&allow_publish=1&return_to={}",
+        "{origin}/v2/account/{company}/connections/connect?toolkit={toolkit}&allow_publish=1&return_to={}",
         pct(return_to)
     ))
 }
@@ -99,7 +123,8 @@ impl Shared {
         self.operator_connection("social publishing setup", params, pid)?;
         match method {
             "social_connect_link" => {
-                strict_fields(params, &["return_to"])?;
+                strict_fields(params, &["return_to", "toolkit"])?;
+                let toolkit = requested_toolkit(params)?.unwrap_or(TOOLKITS[0]);
                 if !self.hosted_publish() {
                     return Ok(json!({"hosted": false}));
                 }
@@ -120,6 +145,7 @@ impl Shared {
                     &board.company,
                     &board.host,
                     required_str(params, "return_to")?,
+                    toolkit,
                 )?;
                 Ok(json!({"hosted": true, "url": url}))
             }
@@ -128,7 +154,7 @@ impl Shared {
                 let listed = self
                     .social_media_resolver
                     .as_ref()
-                    .and_then(|resolver| resolver.list_active(TOOLKIT));
+                    .and_then(|resolver| resolver.list_active_in(&TOOLKITS));
                 Ok(match listed {
                     None => json!({"unavailable": true, "destinations": []}),
                     Some(rows) => json!({"unavailable": false,
@@ -144,10 +170,14 @@ impl Shared {
         }
     }
 
-    /// Create or replace the install's publication binding for the active
-    /// context so it publishes to one of this company's destinations. The
-    /// destination must be in the company-scoped list the door returns now;
-    /// the label comes from that list, never from the request.
+    /// Add (or update) the binding of one of this company's destinations in
+    /// the install's send slot for the active context. The destination must
+    /// be in the company-scoped list the door returns now; the label and
+    /// toolkit come from that list, never from the request (a request
+    /// `toolkit` only picks between rows and must match). An existing
+    /// binding for that destination is updated at its expected revision;
+    /// otherwise a new binding is created for it, leaving any other
+    /// destination's binding untouched (CAD-1939).
     fn use_destination(self: &Arc<Self>, params: &Value) -> Result<Value> {
         strict_fields(
             params,
@@ -158,8 +188,10 @@ impl Shared {
                 "request_id",
                 "expected_revision",
                 "timezone",
+                "toolkit",
             ],
         )?;
+        let wanted_toolkit = requested_toolkit(params)?;
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation id")?;
         let context = match params.get("context_id") {
@@ -186,26 +218,38 @@ impl Shared {
             .social_media_resolver
             .clone()
             .ok_or_else(|| Error::rejected("capability_unavailable: no publish resolver"))?;
-        let row = resolver
-            .list_active(TOOLKIT)
+        let mut rows = resolver
+            .list_active_in(&TOOLKITS)
             .ok_or_else(|| Error::rejected("capability_unavailable: destinations unavailable"))?
             .into_iter()
-            .find(|row| row.destination_id == destination)
-            .ok_or_else(|| {
-                Error::rejected(
-                    "grant_binding_mismatch: that is not one of this company's connected Instagram accounts",
-                )
-            })?;
+            .filter(|row| {
+                row.destination_id == destination
+                    && wanted_toolkit.is_none_or(|toolkit| row.toolkit == toolkit)
+            });
+        let row = match (rows.next(), rows.next()) {
+            (Some(row), None) => row,
+            (None, _) => {
+                return Err(Error::rejected(
+                    "grant_binding_mismatch: that is not one of this company's connected publishing accounts",
+                ))
+            }
+            _ => {
+                return Err(Error::rejected(
+                    "that destination is listed for several toolkits; name the toolkit",
+                ))
+            }
+        };
+        let toolkit = row.toolkit.as_str();
         // Exactly one publishable row must carry it (the send path's rule).
         resolver
-            .resolve(TOOLKIT, destination)
+            .resolve(toolkit, destination)
             .into_result()
             .map_err(|e| Error::rejected(e.to_string()))?;
         let label = row.display_name.trim();
         let publish = json!({
             "destination_id": destination,
             "destination_label": if label.is_empty() { destination } else { label },
-            "toolkit": TOOLKIT,
+            "toolkit": toolkit,
             "timezone": timezone,
         });
         PublishTarget::parse_hosted(&publish)?;
@@ -237,12 +281,34 @@ impl Shared {
                     "social publish requires exactly one declared send slot",
                 ));
             }
-            let current = self.store.app_binding_for_slot(
+            // This destination's own binding in this scope; failing that, the
+            // slot's binding that has no destination yet (it takes this one,
+            // as before CAD-1939). Another destination's binding is never it.
+            let live = self.store.app_bindings_for_slot_destinations(
                 install,
                 context,
                 slot,
                 required_str(bundle, "digest")?,
             )?;
+            let own = |proof: &&BindingProof| {
+                proof.config["publish"]["toolkit"] == toolkit
+                    && proof.config["publish"]["destination_id"] == destination
+            };
+            let bare = |proof: &&BindingProof| proof.config.get("publish").is_none();
+            let mut current = if live.iter().any(|proof| own(&proof)) {
+                live.iter().filter(own).collect::<Vec<_>>().into_iter()
+            } else {
+                live.iter().filter(bare).collect::<Vec<_>>().into_iter()
+            }
+            .cloned();
+            let current = match (current.next(), current.next()) {
+                (one, None) => one,
+                _ => {
+                    return Err(Error::rejected(
+                        "several publication bindings publish to that destination",
+                    ))
+                }
+            };
             let mut config;
             let saved = match (current, expected) {
                 (Some(proof), Some(rev)) if rev.as_i64() == Some(proof.revision) => {
@@ -267,7 +333,7 @@ impl Shared {
                         self.app_binding_config(install, context, slot, &local, bundle, files)?;
                     config["publish"] = publish;
                     self.store
-                        .app_binding_create(install, context, slot, &config, request)
+                        .app_binding_create_destination(install, context, slot, &config, request)
                 }
             }?;
             // CAD-1328: the operator's own choice also re-pins the context's
@@ -292,7 +358,7 @@ mod tests {
     const HOST: &str = "essential-foods.cadencecloud.app";
 
     fn link(return_to: &str) -> crate::error::Result<String> {
-        compose_connect_url(ISSUER, "ws_abc-123", HOST, return_to)
+        compose_connect_url(ISSUER, "ws_abc-123", HOST, return_to, "instagram")
     }
 
     #[test]
@@ -327,11 +393,15 @@ mod tests {
     #[test]
     fn a_non_https_platform_origin_or_odd_company_is_refused() {
         let ok = "https://essential-foods.cadencecloud.app/x";
-        assert!(compose_connect_url("http://api.agenticos.hk", "ws1", HOST, ok).is_err());
+        assert!(
+            compose_connect_url("http://api.agenticos.hk", "ws1", HOST, ok, "instagram").is_err()
+        );
         // The hosted issuer is container-internal, never a browser address.
-        assert!(compose_connect_url("http://api.internal", "ws1", HOST, ok).is_err());
-        assert!(compose_connect_url("https://api.example/extra", "ws1", HOST, ok).is_err());
-        assert!(compose_connect_url(ISSUER, "ws1/../x", HOST, ok).is_err());
-        assert!(compose_connect_url(ISSUER, "", HOST, ok).is_err());
+        assert!(compose_connect_url("http://api.internal", "ws1", HOST, ok, "instagram").is_err());
+        assert!(
+            compose_connect_url("https://api.example/extra", "ws1", HOST, ok, "instagram").is_err()
+        );
+        assert!(compose_connect_url(ISSUER, "ws1/../x", HOST, ok, "instagram").is_err());
+        assert!(compose_connect_url(ISSUER, "", HOST, ok, "instagram").is_err());
     }
 }

@@ -19,8 +19,14 @@ pub(super) fn route(path: &str) -> Option<&'static str> {
         "/api/app-social-drafts/image" => Some("app_social_image_upload"),
         "/api/app-social-drafts/uploaded" => Some("app_social_upload_asset"),
         "/api/app-social-drafts/sources/show" => Some("app_social_sources_show"),
+        "/api/app-social-drafts/sources/page" => Some("app_social_sources_page"),
+        "/api/app-social-drafts/sources/get" => Some("app_social_sources_get"),
         "/api/app-social-drafts/sources/save" => Some("app_social_sources_save"),
         "/api/app-social-drafts/effect-stage" => Some("app_effect_stage"),
+        "/api/app-social-drafts/confirm" => Some("app_social_effect_confirm"),
+        "/api/app-social-drafts/schedule" => Some("app_social_effect_schedule"),
+        "/api/app-social-drafts/reschedule" => Some("app_social_effect_reschedule"),
+        "/api/app-social-drafts/cancel" => Some("app_social_effect_cancel"),
         _ => None,
     }
 }

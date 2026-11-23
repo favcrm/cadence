@@ -30,6 +30,16 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: RemoteAction,
     },
+    /// Start a GitHub App connection for the hosted org (CAD-1946).
+    /// The CLI asks the issuer for a device code, shows the URL, and polls
+    /// until the owner finishes in a browser. It never receives a GitHub
+    /// token and cannot authorize on the owner's behalf.
+    /// Hosted only: a local org has no GitHub connection, and this verb never
+    /// falls back to one. `--issuer` names a self-hosted AgenticOS instead.
+    Connect {
+        #[command(subcommand)]
+        action: ConnectAction,
+    },
     /// Sign in through the hosted AgenticOS portal and map the approved
     /// workspace to a remote org (CAD-1019, CAD-1329). Bare `login` opens
     /// the portal's workspace picker at the hosted issuer; an optional
@@ -85,6 +95,24 @@ pub(crate) enum Commands {
         /// grants no settings authority.
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         settings: bool,
+        /// CAD-1853: also request the cloud-agent scopes (`bridge.enroll`,
+        /// `cloud_agent.read`, `cloud_agent.write`) on this same login.
+        /// Combines with `--web` and `--settings`. Without it the login is
+        /// unchanged and cannot spend a cloud agent.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        cloud_agent: bool,
+        /// CAD-1946: also request `audit.approve`, which a hosted org needs
+        /// before the owner's `audit approve` (a merge approval) or
+        /// `issue project delivery` can run. Never part of a default login.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        audit_approve: bool,
+        /// CAD-2213: request every opt-in scope this consent can carry —
+        /// `--web`, `--settings`, `--cloud-agent` and `--audit-approve` — in
+        /// one login, and print the granted set. A default login stays
+        /// narrow; this is the one flag an operator needs before spending,
+        /// approving or changing settings.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        full_access: bool,
     },
     /// Create a hosted workspace in the browser and approve this CLI. Opens
     /// the AgenticOS registration page, waits for email OTP, workspace
@@ -131,15 +159,30 @@ pub(crate) enum Commands {
     /// WAL growth, per-user pipe pressure, orphaned processes from
     /// deleted worktrees, leaked temp dirs and stale worktrees, and the
     /// tailnet sign-in proof with its whole remedy chain — with exit
-    /// 0 ok, 1 warn, 2 fail.
+    /// 0 ok, 1 warn, 2 fail. With a hosted org selected, plain doctor
+    /// instead checks that connection from this machine, on any
+    /// installation: saved login, live sign-in, a read, the wiki and what
+    /// this login can do, with the same exit codes. It renews a login that
+    /// is due, as any hosted command does, and changes nothing else.
     Doctor {
         /// Run the host watchdog checks instead of the environment probe.
         #[arg(long)]
         host: bool,
-        /// With --host, print the JSON report instead of text lines
-        /// (plain doctor already prints JSON, so this is a no-op there).
+        /// With --host or a hosted org, print the JSON report instead of
+        /// text lines (the local environment probe already prints JSON, so
+        /// this is a no-op there).
         #[arg(long)]
         json: bool,
+        /// On a hosted org, run only the local checks and send nothing. The
+        /// local environment probe is already offline.
+        #[arg(long, conflicts_with = "host")]
+        offline: bool,
+        /// Inspect guidance reachability for a native agent alias or hosted profile ID.
+        #[arg(long, conflicts_with = "host")]
+        agent: Option<String>,
+        /// Scope the target diagnostic to one skill (default: cadence).
+        #[arg(long, requires = "agent", conflicts_with = "host")]
+        skill: Option<String>,
         /// With --host, list what could be freed — stale worktrees,
         /// per-lane target dirs, the shared cargo cache — with sizes
         /// and the command. Never deletes anything.
@@ -158,21 +201,55 @@ pub(crate) enum Commands {
     /// tracker, skill, daemon, board — and report provider CLIs (version
     /// and sign-in), the master agent (CAD-339) and the operator login
     /// (CAD-313). Anything already present is reported `ok` and left
-    /// untouched. Exit 1 when any check failed.
+    /// untouched. Exit 1 when any check failed, and when a requested
+    /// browser approval did not complete.
+    ///
+    /// On a real first run it first asks where the work lives — from a
+    /// terminal or a pipe: Enter signs in to hosted AgenticOS, `1` stays
+    /// on this machine, `2` creates a hosted workspace — at most one
+    /// browser approval, never a second device grant. That one approval
+    /// also requests the optional owner-only `billing.read` (never
+    /// `billing.cancel`); declining it, or a member who cannot consent it,
+    /// still completes the sign-in with the narrowed grant. A verified
+    /// hosted sign-in shows the server-authored plan, price, trial and
+    /// Checkout state; this terminal never opens a Checkout, cancels one
+    /// or takes a card, and the paid action stays an explicit browser
+    /// action. A hosted run, and a run whose approval did not complete,
+    /// reports the daemon and board without starting either. The run ends
+    /// with four facts — scope, sign-in, plan and board URL — and exactly
+    /// one next command.
     Setup {
         /// One JSON object per check, one per line:
         /// `{check, status, detail, fix}`; status is ok, created,
-        /// missing, failed or unknown; fix is a copy-paste command.
+        /// missing, failed or unknown; fix is a copy-paste command. The
+        /// last line is the `scope` record, which also carries the
+        /// `handover` facts. Never prompts, never signs in and never
+        /// calls the billing API; `--hosted`/`--register` are refused
+        /// with it.
         #[arg(long)]
         json: bool,
         /// Board port [default: the persisted `ui.json` port, else 3010].
         #[arg(long)]
         port: Option<u16>,
-        /// Do not open a browser. Setup never opens one yet — it prints
-        /// the board URL; accepted so `install.sh` and INSTALL-AGENT can
-        /// pass it today.
+        /// Do not open a browser: a hosted sign-in prints its URL and
+        /// code instead.
         #[arg(long)]
         no_open: bool,
+        /// Stay on this machine: no hosted sign-in, no browser and no
+        /// checkout. Also the answer for a pipe that sends no line, and
+        /// the one value that never waits on stdin.
+        #[arg(long, conflicts_with_all = ["hosted", "register"])]
+        local: bool,
+        /// Sign in to an existing hosted workspace with one browser
+        /// approval — the same device grant as `cadence login`. A hosted
+        /// run starts no local daemon or board. Refused with `--json`.
+        #[arg(long, conflicts_with_all = ["register", "json"])]
+        hosted: bool,
+        /// Create a hosted workspace in the browser, then approve this
+        /// CLI with the same single device grant as `cadence register`.
+        /// Refused with `--json`.
+        #[arg(long, conflicts_with = "json")]
+        register: bool,
     },
     /// Manage the persistent controller.
     Daemon {
@@ -249,6 +326,13 @@ pub(crate) enum Commands {
         /// all other fields and the sanitized copy still face normal scanning.
         #[arg(long, requires = "portable")]
         redact_history_secrets: bool,
+        /// With `--portable`: state for this source that no unidentified
+        /// chat-attachment custody root holds private bytes. The exporter
+        /// cannot prove that from the store, so an otherwise-clean source
+        /// refuses without it. A source holding a classifiable private record
+        /// still refuses, and the package records the assertion.
+        #[arg(long, requires = "portable")]
+        attest_chat_custody_absent: bool,
         /// Repeatable, with `--portable`: an app whose data to include. No
         /// app schema is supported yet, so any selection is refused before
         /// the store or tracker is read or the output is created.
@@ -724,7 +808,8 @@ pub(crate) enum Commands {
     },
     /// Enqueue a durable message to an agent — the hot-path alias for
     /// `message send`. Returns once the message is durable; delivery and
-    /// reporting continue asynchronously.
+    /// reporting continue asynchronously. Off the default help;
+    /// `message send` is the canonical path.
     ///
     /// `cadence send <ALIAS> --text <body>`: the recipient is the
     /// positional alias (or `--to <ALIAS>`, exactly one of the two) and
@@ -789,13 +874,6 @@ pub(crate) enum Commands {
               conflicts_with_all = ["nudge", "priority", "supersedes"])]
         wait: Option<u64>,
     },
-    /// Hosted coordination for this user's local agent (CAD-1460).
-    /// Requires a selected remote org. It does not run in the container.
-    #[command(hide = true)]
-    LocalAgent {
-        #[command(subcommand)]
-        action: local_agent::LocalAgentAction,
-    },
     /// Administer people on the selected hosted workspace.
     /// Owner and member can list the directory. Invitations, role
     /// changes and removal are owner-only and use the hosted CLI call.
@@ -808,7 +886,8 @@ pub(crate) enum Commands {
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
     /// tracker comment and a `message` ref on the issue. With `--job`
-    /// the kickoff goes through `job dispatch` instead.
+    /// the kickoff goes through `job dispatch` instead. Off the
+    /// default help; the root spelling stays callable.
     Dispatch {
         /// Issue id (e.g. CAD-55).
         issue: String,
@@ -871,7 +950,8 @@ pub(crate) enum Commands {
     /// session; `--cloud-params` is the same semicolon-separated
     /// `key=value` list as `cadence devin --cloud-params`. From inside
     /// an agent's pane only a group root (no upstream) may join, and
-    /// only into its own group (CAD-149).
+    /// only into its own group (CAD-149). Off the default help;
+    /// `agent join` is the canonical path and this spelling still parses.
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
@@ -1167,6 +1247,14 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// A hosted workspace's own skills (CAD-2396): list, show, check and draft
+    /// a SKILL.md package; a workspace owner approves or revokes one exact
+    /// revision. Needs `--org`. Not `cadence skill`, which installs this
+    /// build's bundled guidance on this machine.
+    WorkspaceSkill {
+        #[command(subcommand)]
+        action: super::workspace_skill::WorkspaceSkillAction,
+    },
     /// Read the durable event log for an agent.
     Events {
         /// Agent alias or provider-native id (Devin slug, Codex thread).
@@ -1177,9 +1265,11 @@ pub(crate) enum Commands {
         job: Option<String>,
         /// Return events after this cursor. Omit for the newest page —
         /// the default shows the latest 50 events, oldest first, with
-        /// the cursor to continue forward from.
+        /// the cursor to continue forward from. Continue with the
+        /// opaque `cursor` a previous page returned; a numeric sequence
+        /// is accepted only for a proven operator's agent log.
         #[arg(long)]
-        after: Option<i64>,
+        after: Option<String>,
         /// Seconds to wait for new events per request (0-30).
         #[arg(long, default_value_t = 0)]
         wait: u64,
@@ -1231,6 +1321,18 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: MonitorAction,
     },
+    /// Agent ingress endpoints: configure email/webhook/schedule that bind
+    /// one agent to one workflow. Created disabled; verify then enable.
+    Endpoint {
+        #[command(subcommand)]
+        action: EndpointAction,
+    },
+    /// Recurring schedules and verified event triggers targeting Context
+    /// Markdown (`wiki:` / `workflows/`) or SHA-256-pinned scripts.
+    Routine {
+        #[command(subcommand)]
+        action: super::RoutineAction,
+    },
     /// The issue board: folders under the PM dir (`~/pm` or
     /// `CADENCE_PM_DIR`); this CLI is the only writer.
     Issue {
@@ -1255,17 +1357,19 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: PlatformAction,
     },
-    /// Plans (CAD-359/360): a proposed epic with its tickets. `propose`
-    /// writes it from a Markdown file; the operator `approve`s or
-    /// `reject`s it (operator connection only); until approved none of
-    /// its tickets dispatch. `show` prints state, tickets and
-    /// size-weighted progress.
     /// Idea pipeline (CAD-139): research and a plan can run, then the
     /// operator decides. Nothing is created until that decision.
     Idea {
         #[command(subcommand)]
         action: IdeaAction,
     },
+    /// Plans (CAD-359/360): a proposed epic with its tickets. `propose`
+    /// writes it from a Markdown file; the operator `approve`s or
+    /// `reject`s it (operator connection only); until approved none of
+    /// its tickets dispatch. `show` prints plan state, tickets and
+    /// size-weighted progress. Off the default help. Propose, approve
+    /// and reject are `issue epic`; `plan ls` and `plan show` stay
+    /// until they match `issue epic ls` and `issue epic show`.
     Plan {
         #[command(subcommand)]
         action: PlanAction,
@@ -1429,7 +1533,7 @@ pub(crate) enum Commands {
     /// The read-only board UI + JSON API on loopback.
     Ui {
         #[command(subcommand)]
-        action: cadence_agent::ui::UiAction,
+        action: cadence_ui::UiAction,
     },
     /// One-screen fleet overview: one row per agent with state, the
     /// running message's age and head, queued/unknown counts, pane
@@ -1848,5 +1952,21 @@ pub(crate) enum TeamAction {
     Remove {
         /// Member user id from `team list`.
         user_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConnectAction {
+    /// Connect GitHub to the saved hosted org.
+    Github {
+        /// AgenticOS HTTPS issuer origin. Defaults to the hosted issuer.
+        #[arg(long)]
+        issuer: Option<String>,
+        /// Print the URL and code without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Seconds to keep polling before giving up (default 600).
+        #[arg(long, value_name = "SECS", default_value_t = 600)]
+        wait: u64,
     },
 }

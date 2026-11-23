@@ -186,6 +186,8 @@ pub struct PtyAdapter {
     /// The daemon's tracker and profile, exported into the pane
     /// ([`crate::adapter::DAEMON_CONTEXT_ENV`]).
     context_env: Vec<(String, String)>,
+    /// The daemon's provider environment (CAD-844 pins a reviewer's `gh`).
+    env: ProviderEnv,
     /// `params.auto_ready == "verified"`: the daemon probes the pane
     /// itself instead of requiring a human `agent ready` claim.
     /// Mutable — `agent set` refreshes it on the live adapter.
@@ -888,6 +890,7 @@ impl PtyAdapter {
             agent_uid,
             agent_exec,
             context_env,
+            env: env.clone(),
             auto_ready: AtomicBool::new(
                 agent
                     .params
@@ -1251,7 +1254,8 @@ impl PtyAdapter {
 }
 
 impl ProviderAdapter for PtyAdapter {
-    fn open(&self, _agent: &Agent) -> Result<Identity> {
+    fn open(&self, agent: &Agent) -> Result<Identity> {
+        super::registry::refuse_reviewer_pane(&agent.provider, &agent.endpoint_kind, &agent.role)?;
         let (session, desired) = {
             let s = self.state.lock().unwrap();
             (s.session.clone(), self.desired_session.clone())
@@ -1379,12 +1383,22 @@ impl ProviderAdapter for PtyAdapter {
             // Pane env identifies the agent to `cadence self` and carries
             // the daemon's tracker and profile; -e args are tmux options,
             // never shell-interpreted.
-            let pane_env = pane_env(
+            let mut pane_env = pane_env(
                 &session,
                 &self.state_dir,
                 &self.context_env,
                 self.agent_uid.is_some(),
             );
+            // CAD-844: a reviewer must not use the operator's saved `gh` login.
+            for (key, value) in super::reviewer_gh_env(
+                &self.env,
+                &agent.role,
+                &self.state_dir.join("agents").join(&agent.alias),
+            )?
+            .pairs()
+            {
+                pane_env.push(format!("{key}={value}"));
+            }
             let command = if self.agent_uid.is_some() {
                 split_pane_command(&self.agent_exec, &pane_env, &command)
             } else {
@@ -1494,11 +1508,8 @@ impl ProviderAdapter for PtyAdapter {
     /// missing proof means the endpoint genuinely changed, not that it
     /// is still coming up. The recorded generation is reused, which is
     /// what keeps the in-flight token valid for `message_report`.
-    fn open_adopted(
-        &self,
-        _agent: &Agent,
-        adoption: &crate::store::AdoptEntry,
-    ) -> Result<Identity> {
+    fn open_adopted(&self, agent: &Agent, adoption: &crate::store::AdoptEntry) -> Result<Identity> {
+        super::registry::refuse_reviewer_pane(&agent.provider, &agent.endpoint_kind, &agent.role)?;
         let session = self.session();
         if !self.has_session(&session) {
             return Err(Error::provider("pane is gone"));

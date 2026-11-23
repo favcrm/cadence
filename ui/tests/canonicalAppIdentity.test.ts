@@ -107,6 +107,7 @@ async function main() {
     if (path.startsWith("/api/threads/master")) return json({ thread: null, entries: [], more_before: false });
     if (url.pathname === "/api/master/state") return json({
       alias: "master", provider: "fixture", endpoint_kind: "fixture",
+      identity: { name: null, tone: null, look: "robot", revision: "fixture" },
       live: false, turn: null, queued: 0,
     } satisfies MasterState);
     if (url.pathname === "/api/overview") return json({

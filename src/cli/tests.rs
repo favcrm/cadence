@@ -442,13 +442,47 @@ fn audit_approval_readback_parses() {
     let cli =
         Cli::try_parse_from(["cadence", "audit", "approval", "--pr", "7", "--head", head]).unwrap();
     let Commands::Audit {
-        action: Some(AuditAction::Approval { pr, repo, .. }),
+        action:
+            Some(AuditAction::Approval {
+                pr,
+                repo,
+                issue,
+                project,
+                ..
+            }),
         ..
     } = cli.command
     else {
         panic!("audit approval must parse to AuditAction::Approval");
     };
-    assert_eq!((pr, repo), (7, None));
+    assert_eq!((pr, repo, issue, project), (7, None, None, None));
+    // CAD-2001: the project and the issue it authorizes are explicit inputs of
+    // the hosted read — never derived from the repo or the cwd.
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "approval",
+        "--pr",
+        "7",
+        "--head",
+        head,
+        "--project",
+        "cadence",
+        "--issue",
+        "CAD-1",
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Approval { issue, project, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit approval must parse to AuditAction::Approval");
+    };
+    assert_eq!(
+        (issue.as_deref(), project.as_deref()),
+        (Some("CAD-1"), Some("cadence"))
+    );
     assert!(Cli::try_parse_from(["cadence", "audit", "approval", "--pr", "7"]).is_err());
 }
 
@@ -456,14 +490,69 @@ fn audit_approval_readback_parses() {
 fn audit_scope_readback_parses() {
     let cli = Cli::try_parse_from(["cadence", "audit", "scope", "--issue", "CAD-9"]).unwrap();
     let Commands::Audit {
-        action: Some(AuditAction::Scope { issue }),
+        action: Some(AuditAction::Scope { issue, project }),
         ..
     } = cli.command
     else {
         panic!("audit scope must parse to AuditAction::Scope");
     };
-    assert_eq!(issue, "CAD-9");
+    assert_eq!((issue.as_str(), project.as_deref()), ("CAD-9", None));
     assert!(Cli::try_parse_from(["cadence", "audit", "scope"]).is_err());
+
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "delivery",
+        "check",
+        "--repo",
+        "favcrm/cadence",
+        "--pr",
+        "12",
+        "--head",
+        head,
+        "--issue",
+        "CAD-1",
+        "--project",
+        "cadence",
+        "--browser-qa"
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "delivery",
+        "enqueue",
+        "--repo",
+        "favcrm/cadence",
+        "--pr",
+        "12",
+        "--head",
+        head
+    ])
+    .is_ok());
+    assert!(
+        Cli::try_parse_from(["cadence", "audit", "designations", "--project", "cadence"]).is_ok()
+    );
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "digest",
+        "--project",
+        "cadence",
+        "--since",
+        "7d"
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "revoke",
+        "ap-1",
+        "--project",
+        "cadence",
+        "--reason",
+        "superseded"
+    ])
+    .is_ok());
 }
 
 #[test]
@@ -491,6 +580,47 @@ fn audit_approve_and_revoke_parse() {
         (pr, action.as_str(), id, repo),
         (Some(84), "merge", None, None)
     );
+    // CAD-2001: a hosted merge approval names its project and the ticket it
+    // authorizes beside the exact PR and head.
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "approve",
+        "--pr",
+        "84",
+        "--head",
+        head,
+        "--issue",
+        "CAD-1",
+        "--project",
+        "cadence",
+        "--source",
+        "op",
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Approve { issue, project, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit approve must parse to AuditAction::Approve");
+    };
+    assert_eq!(
+        (issue.as_deref(), project.as_deref()),
+        (Some("CAD-1"), Some("cadence"))
+    );
+    // The ticket alone is the scope pre-approval, which names no PR.
+    let cli = Cli::try_parse_from([
+        "cadence", "audit", "approve", "--issue", "CAD-1", "--action", "scope", "--source", "op",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Audit {
+            action: Some(AuditAction::Approve { pr: None, .. }),
+            ..
+        }
+    ));
     assert!(Cli::try_parse_from(["cadence", "audit", "revoke", "ap-1", "--source", "op"]).is_err());
     assert!(matches!(
         Cli::try_parse_from(["cadence", "audit", "--json"])
@@ -507,6 +637,243 @@ fn audit_approve_and_revoke_parse() {
         "cadence", "audit", "--json", "approve", "--pr", "1", "--head", head, "--source", "op",
     ])
     .is_err());
+}
+
+#[test]
+fn audit_reviewers_read_and_set_parse() {
+    // CAD-2001: the eligibility map is project-scoped. `--project` is
+    // required — a repo never selects a project — and the write names bare
+    // principals, because the login is a separate workspace attestation.
+    let cli =
+        Cli::try_parse_from(["cadence", "audit", "reviewers", "--project", "cadence"]).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Reviewers { project, action }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit reviewers must parse to AuditAction::Reviewers");
+    };
+    assert_eq!(
+        (project.as_deref(), action.is_none()),
+        (Some("cadence"), true)
+    );
+    // No project, and the retired repo selector, both refuse.
+    assert!(Cli::try_parse_from(["cadence", "audit", "reviewers"]).is_err());
+    assert!(
+        Cli::try_parse_from(["cadence", "audit", "reviewers", "--repo", "favcrm/cadence"]).is_err()
+    );
+
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "reviewers",
+        "set",
+        "--project",
+        "cadence",
+        "--reviewer",
+        "user_a",
+        "--reviewer",
+        "user_b",
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action:
+            Some(AuditAction::Reviewers {
+                project,
+                action:
+                    Some(super::audit::ReviewersAction::Set {
+                        project: set_project,
+                        reviewer,
+                    }),
+            }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit reviewers set must parse to ReviewersAction::Set");
+    };
+    assert_eq!(project, None);
+    assert_eq!(set_project, "cadence");
+    assert_eq!(reviewer, vec!["user_a", "user_b"]);
+    // Omitting every `--reviewer` clears the map: a real replacement.
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "reviewers",
+        "set",
+        "--project",
+        "cadence"
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "reviewers",
+        "set",
+        "--reviewer",
+        "user_a"
+    ])
+    .is_err());
+
+    let subjects = super::audit::reviewer_subjects(&[" user_a ".into(), "user_b".into()]).unwrap();
+    assert_eq!(subjects, vec!["user_a".to_string(), "user_b".to_string()]);
+    assert!(super::audit::reviewer_subjects(&[]).unwrap().is_empty());
+    for rows in [
+        vec!["user_a=alice".to_string()],
+        vec!["".to_string()],
+        vec!["user a".to_string()],
+        vec!["user_a".to_string(), "user_a".to_string()],
+        (0..33).map(|i| format!("user_{i}")).collect(),
+    ] {
+        assert!(super::audit::reviewer_subjects(&rows).is_err(), "{rows:?}");
+    }
+
+    let pairs =
+        super::audit::identity_pairs(&[" user_a = alice ".into(), "user_b=Bob".into()]).unwrap();
+    assert_eq!(
+        pairs,
+        vec![
+            ("user_a".to_string(), "alice".to_string()),
+            ("user_b".to_string(), "Bob".to_string())
+        ]
+    );
+    for rows in [
+        vec!["alice".to_string()],
+        vec!["=alice".to_string()],
+        vec!["user_a=".to_string()],
+        vec!["user_a=alice=bob".to_string()],
+        vec!["user_a=alice".to_string(), "user_a=bob".to_string()],
+        vec!["user_a=alice".to_string(), "user_b=ALICE".to_string()],
+        (0..33).map(|i| format!("user_{i}=login{i}")).collect(),
+    ] {
+        assert!(super::audit::identity_pairs(&rows).is_err(), "{rows:?}");
+    }
+}
+
+#[test]
+fn audit_identities_read_and_set_parse() {
+    // CAD-2001: the workspace identity attestation is its own verb — the login
+    // is bound once for the workspace, and project eligibility names only the
+    // principal.
+    let cli = Cli::try_parse_from(["cadence", "audit", "identities"]).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Identities { action }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit identities must parse to AuditAction::Identities");
+    };
+    assert!(action.is_none());
+
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "identities",
+        "set",
+        "--identity",
+        "user_a=alice",
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action:
+            Some(AuditAction::Identities {
+                action: Some(super::audit::IdentitiesAction::Set { identity }),
+            }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit identities set must parse to IdentitiesAction::Set");
+    };
+    assert_eq!(identity, vec!["user_a=alice"]);
+    // An omitted `--identity` clears the map.
+    assert!(Cli::try_parse_from(["cadence", "audit", "identities", "set"]).is_ok());
+}
+
+#[test]
+fn audit_verdicts_binds_repo_only_when_given() {
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let cli = Cli::try_parse_from([
+        "cadence", "audit", "verdicts", "--issue", "CAD-1", "--pr", "7", "--head", head,
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Verdicts { repo, project, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit verdicts must parse to AuditAction::Verdicts");
+    };
+    assert_eq!(repo, None);
+    // CAD-2001: the project is a separate explicit input, never derived from
+    // the repo.
+    assert_eq!(project, None);
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "audit",
+        "verdicts",
+        "--issue",
+        "CAD-1",
+        "--pr",
+        "7",
+        "--head",
+        head,
+        "--repo",
+        "favcrm/cadence",
+        "--project",
+        "cadence",
+    ])
+    .unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Verdicts { repo, project, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit verdicts must parse to AuditAction::Verdicts");
+    };
+    assert_eq!(repo.as_deref(), Some("favcrm/cadence"));
+    assert_eq!(project.as_deref(), Some("cadence"));
+}
+
+#[test]
+fn audit_verdict_takes_its_repo() {
+    // AOS-473: the write names the repository, resolved like `audit verdicts`
+    // (cwd github.com origin) when the flag is absent.
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let base = [
+        "cadence",
+        "audit",
+        "verdict",
+        "--issue",
+        "CAD-1",
+        "--pr",
+        "7",
+        "--head",
+        head,
+        "--kind",
+        "spec-security",
+        "--outcome",
+        "pass",
+        "--text",
+        "findings",
+    ];
+    let cli = Cli::try_parse_from(base).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Verdict { repo, kind, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit verdict must parse to AuditAction::Verdict");
+    };
+    assert_eq!((repo, kind.as_str()), (None, "spec-security"));
+    let cli =
+        Cli::try_parse_from(base.iter().copied().chain(["--repo", "favcrm/cadence"])).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Verdict { repo, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit verdict must parse to AuditAction::Verdict");
+    };
+    assert_eq!(repo.as_deref(), Some("favcrm/cadence"));
 }
 
 #[test]
@@ -602,6 +969,56 @@ fn codex_shortcut_parses() {
 fn codex_detach_parses() {
     let cli = Cli::try_parse_from(["cadence", "codex", "--detach"]).unwrap();
     assert!(matches!(cli.command, Commands::Codex { detach: true, .. }));
+}
+
+#[test]
+fn agent_join_parses_the_same_group_and_provider() {
+    let cli = Cli::try_parse_from(["cadence", "agent", "join", "pm-alias", "devin"]).unwrap();
+    match cli.command {
+        Commands::Agent {
+            action: AgentAction::Join { args },
+        } => {
+            assert_eq!(args.group, "pm-alias");
+            assert_eq!(args.provider, "devin");
+            assert!(!args.detach);
+            assert_eq!(args.role, "worker");
+        }
+        _ => panic!("expected agent join"),
+    }
+}
+
+#[test]
+fn issue_epic_propose_parses_file_and_workflow() {
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "issue",
+        "epic",
+        "propose",
+        "--project",
+        "cadence",
+        "--file",
+        "plan.md",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Issue {
+            action: cadence_agent::issue::cli::IssueAction::Epic {
+                action: cadence_agent::issue::cli::EpicAction::Propose {
+                    ref project,
+                    file: Some(_),
+                    workflow: None,
+                    ..
+                },
+            },
+        } if project == "cadence"
+    ));
+    assert!(Cli::try_parse_from(["cadence", "issue", "epic", "approve", "CAD-1",]).is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence", "issue", "epic", "reject", "CAD-1", "--reason", "no",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from(["cadence", "plan", "propose", "--project", "cadence"]).is_ok());
 }
 
 #[test]
@@ -1748,7 +2165,7 @@ fn payload_keys(value: &serde_json::Value) -> Vec<String> {
 fn documented_self_payload_keys_match_the_builders() {
     let doc = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/skills/cadence/SKILL.md"
+        "/../../skills/cadence/SKILL.md"
     ))
     .expect("skills/cadence/SKILL.md");
 
@@ -1813,4 +2230,341 @@ fn duplicate_dispatch_names_the_existing_message_and_state() {
     );
     let fresh = json!({"duplicate": false, "message": "cadence-dispatch:t1:r1"});
     assert_eq!(super::job::duplicate_dispatch_line(&fresh), None);
+}
+
+/// CAD-1894: the cloud connection is `agent cloud`, not a top-level command.
+#[test]
+fn cloud_connection_lives_under_agent() {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    assert!(
+        cmd.find_subcommand("cloud-agent").is_none(),
+        "cloud-agent is not a top-level command"
+    );
+    assert!(
+        cmd.find_subcommand("cloud").is_none(),
+        "cloud is not a top-level command"
+    );
+    let help = cmd
+        .find_subcommand_mut("agent")
+        .expect("agent")
+        .find_subcommand_mut("cloud")
+        .expect("agent cloud")
+        .render_help()
+        .to_string();
+    for verb in [
+        "ls",
+        "show",
+        "send",
+        "enroll-peer",
+        "read",
+        "cancel",
+        "disconnect",
+    ] {
+        assert!(
+            help.contains(verb),
+            "agent cloud help omits {verb}:\n{help}"
+        );
+    }
+    assert!(
+        cmd.find_subcommand_mut("agent")
+            .expect("agent")
+            .find_subcommand_mut("cloud")
+            .expect("agent cloud")
+            .find_subcommand("connect")
+            .is_none(),
+        "connecting is agent connect --cloud"
+    );
+    let connect = Cli::command()
+        .find_subcommand_mut("agent")
+        .expect("agent")
+        .find_subcommand_mut("connect")
+        .expect("agent connect")
+        .render_help()
+        .to_string();
+    assert!(connect.contains("--cloud"), "{connect}");
+    assert!(connect.contains("--local"), "{connect}");
+    assert!(!connect.contains("accept-assistant-consent"), "{connect}");
+}
+
+/// CAD-2213: one flag requests every opt-in scope, and the flag itself is
+/// not a hidden alias for one of them.
+#[test]
+fn full_access_requests_every_opt_in_scope_in_one_login() {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let login = cmd.find_subcommand_mut("login").expect("login");
+    let help = login.render_help().to_string();
+    assert!(help.contains("--full-access"), "{help}");
+
+    // A fresh command: rendering help mutates the one above.
+    let fresh = Cli::command();
+    let matches = fresh
+        .try_get_matches_from(["cadence", "login", "--full-access"])
+        .unwrap();
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+    match cli.command {
+        Commands::Login {
+            full_access,
+            web,
+            settings,
+            cloud_agent,
+            audit_approve,
+            ..
+        } => {
+            assert!(full_access);
+            assert!(!web && !settings && !cloud_agent && !audit_approve);
+        }
+        _ => panic!("expected login"),
+    }
+
+    assert_eq!(
+        action_dispatch::login_scopes(false, false, false, false, true),
+        (true, true, true, true)
+    );
+    assert_eq!(
+        action_dispatch::login_scopes(false, false, false, false, false),
+        (false, false, false, false)
+    );
+    assert_eq!(
+        action_dispatch::login_scopes(true, false, false, false, false),
+        (true, false, false, false)
+    );
+    assert_eq!(
+        action_dispatch::missing_full_access(&["cli.read".into(), "audit.approve".into()]),
+        vec![
+            "web.read",
+            "web.prepare",
+            "settings.read",
+            "settings.write",
+            "bridge.enroll",
+            "cloud_agent.read",
+            "cloud_agent.write",
+        ]
+    );
+    assert!(action_dispatch::missing_full_access(
+        &action_dispatch::FULL_ACCESS_SCOPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    )
+    .is_empty());
+    assert_eq!(
+        action_dispatch::requested_scopes(true, false, false, true),
+        vec!["web.read", "web.prepare", "audit.approve"]
+    );
+    assert!(action_dispatch::requested_scopes(false, false, false, false).is_empty());
+    assert_eq!(action_dispatch::login_granted_line(&[]), "none recorded");
+    assert_eq!(
+        action_dispatch::login_granted_line(&["cli.read".to_string(), "audit.approve".to_string()]),
+        "cli.read, audit.approve"
+    );
+}
+
+/// CAD-1885: `cadence login --help` names the grant the code requests.
+#[test]
+fn cloud_agent_login_help_names_all_three_scopes() {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let help = cmd
+        .find_subcommand_mut("login")
+        .expect("login")
+        .render_help()
+        .to_string();
+    for scope in ["bridge.enroll", "cloud_agent.read", "cloud_agent.write"] {
+        assert!(help.contains(scope), "login help omits {scope}:\n{help}");
+    }
+}
+
+/// CAD-1524: the master's command guard refuses quotes, so a multi-word
+/// wiki query must work as separate plain words. They join into the same
+/// space-separated query a quoted argument sends, the guard accepts that
+/// argv as it accepts a one-word search, and a quoted or piped query is
+/// still refused.
+#[test]
+fn wiki_search_takes_separate_words_the_master_guard_allows() {
+    use cadence_agent::master_perm::{classify, Class};
+    use cadence_agent::wiki::cli::WikiAction;
+
+    let query = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+        Commands::Wiki {
+            action: WikiAction::Search { q, json, .. },
+        } => (q.join(" "), json),
+        _ => panic!("not a wiki search"),
+    };
+    let words = [
+        "cadence",
+        "wiki",
+        "search",
+        "synthetic",
+        "verification",
+        "marker",
+        "--json",
+    ];
+    assert_eq!(
+        query(&words),
+        ("synthetic verification marker".to_string(), true)
+    );
+    assert_eq!(
+        query(&[
+            "cadence",
+            "wiki",
+            "search",
+            "synthetic verification marker",
+            "--json"
+        ]),
+        ("synthetic verification marker".to_string(), true)
+    );
+    assert!(Cli::try_parse_from(["cadence", "wiki", "search", "--json"]).is_err());
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let one = classify(
+        &argv(&["cadence", "wiki", "search", "marker", "--json"]),
+        dir.path(),
+        &[],
+        &[],
+    );
+    let many = classify(&argv(&words), dir.path(), &[], &[]);
+    assert_eq!(
+        many, one,
+        "a multi-word search is classed like a one-word search"
+    );
+    assert!(
+        !matches!(many, Class::IllFormed { .. } | Class::Never { .. }),
+        "{many:?}"
+    );
+    for refused in [
+        &["cadence", "wiki", "search", "\"synthetic", "marker\""][..],
+        &["cadence", "wiki", "search", "marker", "|", "head"][..],
+        &["cadence", "wiki", "search", "marker;", "rm"][..],
+        &["cadence", "wiki", "search", "marker", ">", "out"][..],
+    ] {
+        assert!(
+            matches!(
+                classify(&argv(refused), dir.path(), &[], &[]),
+                Class::IllFormed { .. }
+            ),
+            "{refused:?} must stay refused"
+        );
+    }
+}
+
+/// CAD-2662: a shell harness looks up its own task's lessons with
+/// `memory match --turn`. The project, issue, provider and role come from
+/// its turn, so naming any of them alongside `--turn` is a usage error, and
+/// the axes it may add travel in the same request the MCP tool sends. A
+/// native agent may also propose without `--project`.
+#[test]
+fn memory_match_turn_refuses_named_scope_and_propose_takes_no_project() {
+    use cadence_agent::memory::cli::{turn_match_params, MemoryAction};
+
+    let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+    for extra in [
+        ["--project", "beta"],
+        ["--issue", "CAD-1"],
+        ["--provider", "codex"],
+        ["--role", "pm"],
+    ] {
+        let mut args = vec!["cadence", "memory", "match", "--turn"];
+        args.extend(extra);
+        assert!(
+            parse(&args).is_err(),
+            "--turn with {extra:?} must not parse"
+        );
+    }
+    let Ok(Commands::Memory {
+        action:
+            MemoryAction::Match {
+                turn: true,
+                component,
+                path,
+                tag,
+                ..
+            },
+    }) = parse(&[
+        "cadence",
+        "memory",
+        "match",
+        "--turn",
+        "--path",
+        "src/adapter/codex.rs",
+        "--tag",
+        "memory",
+    ])
+    else {
+        panic!("memory match --turn must parse");
+    };
+    assert_eq!(
+        turn_match_params(&component, &path, &tag),
+        json!({"components": [], "paths": ["src/adapter/codex.rs"], "tags": ["memory"]})
+    );
+    let Ok(Commands::Memory {
+        action: MemoryAction::Propose { project, .. },
+    }) = parse(&[
+        "cadence",
+        "memory",
+        "propose",
+        "--type",
+        "gotcha",
+        "--source",
+        "CAD-2662",
+        "--scope-path",
+        "src/**",
+        "-m",
+        "fact",
+    ])
+    else {
+        panic!("memory propose without --project must parse");
+    };
+    assert_eq!(project, None);
+}
+
+/// CAD-2663: `thread search` takes a query or a hit handle and its bounds;
+/// it has no flag that names an agent, thread or conversation. (Window
+/// bounds without `--around` are refused by the daemon.)
+#[test]
+fn thread_search_parses_a_query_or_a_hit_and_names_no_agent() {
+    let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+    let Ok(Commands::Thread {
+        action:
+            ThreadAction::Search {
+                query: Some(query),
+                limit: Some(3),
+                around: None,
+                ..
+            },
+    }) = parse(&[
+        "cadence",
+        "thread",
+        "search",
+        "retry budget 42",
+        "--limit",
+        "3",
+    ])
+    else {
+        panic!("a query search must parse");
+    };
+    assert_eq!(query, "retry budget 42");
+    assert!(matches!(
+        parse(&["cadence", "thread", "search", "--around", "csc1_x", "--before", "1"]),
+        Ok(Commands::Thread {
+            action: ThreadAction::Search {
+                around: Some(_),
+                before: Some(1),
+                ..
+            }
+        })
+    ));
+    for args in [
+        &["cadence", "thread", "search"][..],
+        &["cadence", "thread", "search", "x", "--around", "csc1_x"],
+        &[
+            "cadence", "thread", "search", "--around", "h", "--limit", "2",
+        ],
+        &["cadence", "thread", "search", "x", "--alias", "w2"],
+        &["cadence", "thread", "search", "x", "--conversation", "c1"],
+    ] {
+        assert!(parse(args).is_err(), "{args:?} must not parse");
+    }
 }

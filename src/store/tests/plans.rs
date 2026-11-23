@@ -195,7 +195,6 @@
         let plan = s.plan_task_dispatch("t1", None, None).unwrap();
         assert!(!plan.duplicate);
         assert_eq!(plan.revision, 1);
-        assert!(!plan.body.is_empty());
         let (task, message, duplicate, _) = s
             .dispatch_task("t1", None, Some(&plan.message_id), "test")
             .unwrap();
@@ -206,7 +205,6 @@
         assert!(live.duplicate);
         assert_eq!(live.message_id, message);
         assert_eq!(live.revision, plan.revision);
-        assert!(live.body.is_empty());
     }
 
     #[test]

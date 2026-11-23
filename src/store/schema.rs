@@ -73,7 +73,8 @@ fn validate_chat_file_owner_shape(conn: &Connection) -> Result<()> {
 
 /// Read-only open of the daemon store from another process, with the
 /// shared busy timeout — never creates or migrates the file.
-pub(crate) fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
+#[doc(hidden)]
+pub fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(conn)
@@ -166,9 +167,9 @@ impl Store {
         Self::open_mode(path, super::seal::OpenMode::Legacy)
     }
 
-    /// `open` with an explicit deployment mode. `Protected` is a startup
-    /// *request* (agent_uid/hosted.lease provenance) that forces strict
-    /// refusals — never external restore/init authority.
+    /// `open` with an explicit deployment mode. `Protected` is a refusal-only
+    /// selector, never authority derived from agent_uid or a hosted lease.
+    /// Authentic protected startup uses `open_owned`.
     pub fn open_mode(path: &Path, mode: super::seal::OpenMode) -> Result<Self> {
         Self::open_adopting_mode(path, None, mode).map(|(store, _)| store)
     }
@@ -207,6 +208,60 @@ impl Store {
         Ok((store, RecoveryOutcome::default()))
     }
 
+    /// The protected-profile open: same gate, preflight, seal and schema
+    /// guards as `open_adopting`, but NO recovery sweep. The daemon installs
+    /// the external checkpoint transport and validates the external floor
+    /// before it runs [`Self::run_guarded_recover`] explicitly.
+    pub(crate) fn open_unrecovered_mode(
+        path: &Path,
+        mode: super::seal::OpenMode,
+    ) -> Result<(Self, RecoveryOutcome)> {
+        let (store, _) = Self::open_inner(path, None, true, false, mode)?;
+        Ok((store, RecoveryOutcome::default()))
+    }
+
+    /// Run the existing recovery sweep under the installed protected journal,
+    /// then require the external checkpoint acknowledgement for its actual
+    /// head BEFORE reporting success. A missing/lost acknowledgement fences
+    /// further protected admission and answers `outcome_unknown`; the sweep is
+    /// never rerun.
+    pub(crate) fn run_guarded_recover(
+        &self,
+        marker: Option<&ConsumedMarker>,
+        owner_epoch: cadence_core::connection_dispatch::primitives::Revision,
+    ) -> Result<RecoveryOutcome> {
+        let outcome = self.recover(marker)?;
+        let authority = self.protected_authority()?;
+        let binding = cadence_core::connection_dispatch::primitives::Digest::try_from(
+            cadence_core::connection_dispatch::material_digest_for_domain(
+                "cadence-protected-recover-v1",
+                &json!({
+                    "workspace_id": authority.workspace_id,
+                    "owner_epoch": owner_epoch.get(),
+                    "ledger_sequence": authority.ledger_head.sequence.get(),
+                    "ledger_digest": authority.ledger_head.digest.as_str(),
+                }),
+            ),
+        )
+        .map_err(|_| Error::internal("the recovery binding is malformed"))?;
+        if let Err(error) =
+            self.protected_checkpoint_head(&authority.workspace_id, owner_epoch, binding)
+        {
+            let _ = self.write_tx(|tx| {
+                tx.execute_raw(
+                    "UPDATE connection_dispatch_config SET fenced=1 WHERE singleton=1",
+                    [],
+                )?;
+                Ok(())
+            });
+            return Err(Error::OutcomeUnknown(format!(
+                "recovery was applied but its external checkpoint is unacknowledged: {}",
+                error.code().unwrap_or("storage_unavailable")
+            )));
+        }
+        Ok(outcome)
+    }
+
     /// Open a live database for a side write that must not run restart
     /// recovery. `app remove` uses this to revoke derived grants while
     /// the daemon still holds the store — recovery would fence the
@@ -216,7 +271,11 @@ impl Store {
     }
 
     /// `open_side` with a mode — under `Protected` a second writer
-    /// connection to `cadence.sqlite3` refuses outright (CAD-1011).
+    /// connection to `cadence.sqlite3` refuses outright (CAD-1011). A
+    /// durably protected deployment (the authenticated boot path selected
+    /// protected authority journaling) likewise has NO unauthenticated side
+    /// writer: this instance cannot carry the external checkpoint transport,
+    /// so an authorizing side write could never move the restore floor.
     pub fn open_side_mode(path: &Path, mode: super::seal::OpenMode) -> Result<Self> {
         if mode == super::seal::OpenMode::Protected {
             return Err(Error::rejected(
@@ -224,7 +283,14 @@ impl Store {
                  cadence.sqlite3 is not permitted",
             ));
         }
-        Self::open_inner(path, None, true, false, mode).map(|(store, _)| store)
+        let store = Self::open_inner(path, None, true, false, mode)?.0;
+        if store.protection_required()? {
+            return Err(Error::rejected(
+                "open_side refused: this database is a protected deployment and \
+                 has no unauthenticated side writer",
+            ));
+        }
+        Ok(store)
     }
 
     /// Migrate an older database without the rollout lease gate.
@@ -237,22 +303,48 @@ impl Store {
             .map(|(store, _)| store)
     }
 
-    fn open_inner(
+    /// The stored schema version.
+    fn schema_version(conn: &Connection) -> Result<i64> {
+        Ok(conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?)
+    }
+
+    /// CAD-2120: the v62 backfill's resume cursor, or `None` when a concurrent
+    /// opener already completed v62 (it deletes the progress row and sets the
+    /// version in one transaction). A missing row on a store below v62 is a
+    /// real fault and stays an error.
+    pub(super) fn source_scope_progress(conn: &Connection) -> Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        let cursor: Option<i64> = conn
+            .query_row(
+                "SELECT cursor FROM app_schema_progress WHERE name='cad2042-source-scope'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if cursor.is_none() && Self::schema_version(conn)? < 62 {
+            return Err(Error::rejected(
+                "v62 backfill progress is missing on a store below v62",
+            ));
+        }
+        Ok(cursor)
+    }
+
+    pub(super) fn open_inner(
         path: &Path,
         marker: Option<ConsumedMarker>,
         gate: bool,
         recover: bool,
         mode: super::seal::OpenMode,
     ) -> Result<(Self, Option<RecoveryOutcome>)> {
+        // Refuse fixed protected-enclave raw/side paths before even migration
+        // admission reads. Authenticated startup uses open_owned, never this
+        // selector-only constructor or a Legacy fallback.
+        let decision = Self::preflight(path, mode)?;
         let permit = if gate {
             crate::rollout::authorize_migration(path)?
         } else {
             crate::rollout::MigrationPermit { crossing: None }
         };
-        // CAD-1011: durable-closure preflight BEFORE any write or WAL
-        // mutation — read-only, so a sealed/protected file is never
-        // touched. Decides whether legacy WAL conversion may run.
-        let decision = Self::preflight(path, mode)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Fail-closed authorizer: disarmed until a guarded tx arms it.
@@ -750,6 +842,10 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=20", [])?;
                 tx.commit()?;
             }
+            // migration-lint: allow 21 -- CAD-1085: name the insert's two
+            // columns so a store that already carries the v59 dispatch
+            // additions re-migrates; the inserted values and meaning are
+            // unchanged.
             if version < 21 {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 let mut statement = tx.prepare("PRAGMA table_info(platform_credentials)")?;
@@ -763,7 +859,7 @@ impl Store {
                 if !columns.iter().any(|c| c == "credential_revision") {
                     tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 1;")?;
                 }
-                tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata VALUES(1,lower(hex(randomblob(16))));")?;
+                tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata(singleton, workspace_id) VALUES(1,lower(hex(randomblob(16))));")?;
                 tx.execute("UPDATE schema_version SET version=21", [])?;
                 tx.commit()?;
             }
@@ -1460,6 +1556,316 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=56", [])?;
                 tx.commit()?;
             }
+            if version < 57 {
+                // CAD-1853: one durable cloud-agent connection, its
+                // per-work-conversation remote session bindings, the
+                // explicit local consent grant and one operation row per
+                // local request. New tables only; Threads remains the
+                // canonical conversation history.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::cloud_agent::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=57", [])?;
+                tx.commit()?;
+            }
+            if version < 58 {
+                // The operator's automatic-update preference. New table only;
+                // absence means off. No existing row is read or rewritten.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS app_update_preferences(
+ install_id TEXT PRIMARY KEY,
+ automatic INTEGER NOT NULL CHECK(automatic IN (0,1)));",
+                )?;
+                tx.execute("UPDATE schema_version SET version=58", [])?;
+                tx.commit()?;
+            }
+            if version < 59 {
+                // CAD-1887: one operator disposition per run, and at most
+                // one selected ticket. New tables only. v20 already shipped
+                // `app_runs::SCHEMA`, so these tables are not added there.
+                // This block is the create, for a fresh open and for a store
+                // that already passed v20.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_runs::OPERATOR_DECISION_SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=59", [])?;
+                tx.commit()?;
+            }
+            if version < 60 {
+                // CAD-1085: the native protected Connection authority and the
+                // metadata-only human credential-entry tables. One forward
+                // step: the dispatch/journal schema and `credential_requests`
+                // commit together, so no store can have one without the
+                // other. Column-checked and idempotent so a half-applied
+                // store converges.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                super::connection_dispatch::migrate_v60(&tx)?;
+                tx.execute("UPDATE schema_version SET version=60", [])?;
+                tx.commit()?;
+            }
+            if version < 61 {
+                // CAD-1962: workspace custody for an image an installation
+                // imported into the shared library, plus its accepted-intent
+                // ledger. New tables only; no existing row is read or
+                // rewritten, and the catalog itself is unchanged.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_media::SCHEMA_V61)?;
+                tx.execute("UPDATE schema_version SET version=61", [])?;
+                tx.commit()?;
+            }
+            // CAD-2120: a concurrent opener may have finished v62 since `version` was read.
+            let version = if version < 62 {
+                Self::schema_version(&conn)?
+            } else {
+                version
+            };
+            // migration-lint: allow 62 -- CAD-2120: control flow only. The v62 SQL stays in this block byte for byte; the one changed statement reads the backfill cursor through Store::source_scope_progress, so an opener that lost the race to a finished migration stops instead of failing.
+            if version < 62 {
+                // CAD-2042: the retained-source page must be an ordered scoped
+                // index range, not a join plus temp-B-tree sort over the whole
+                // scoped history. Denormalize the owning run's identity and the
+                // source marker onto the receipt, then index the exact page
+                // order. On a large history the backfill is O(rows), so it runs
+                // in bounded batches with a durable cursor: a reader/writer is
+                // blocked only for one batch, and an interrupted upgrade keeps
+                // its progress instead of rescanning from the start. The
+                // version bump and the index commit only once every row has
+                // been considered, so no page can see a half-built index.
+                const BATCH: i64 = 50_000;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                for (column, definition) in [
+                    ("install_id", "install_id TEXT"),
+                    ("context_id", "context_id TEXT"),
+                    (
+                        "source_post_read",
+                        "source_post_read INTEGER NOT NULL DEFAULT 0",
+                    ),
+                ] {
+                    let columns = tx
+                        .prepare("PRAGMA table_info(app_capability_results)")?
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if !columns.iter().any(|name| name == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE app_capability_results ADD COLUMN {definition};"
+                        ))?;
+                    }
+                }
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS app_schema_progress(
+                        name TEXT PRIMARY KEY, cursor INTEGER NOT NULL);
+                     INSERT OR IGNORE INTO app_schema_progress(name,cursor)
+                       VALUES('cad2042-source-scope',0);",
+                )?;
+                tx.commit()?;
+                loop {
+                    let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                    let Some(start) = Self::source_scope_progress(&tx)? else {
+                        break;
+                    };
+                    let bound: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(rowid),0) FROM app_capability_results",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if start >= bound {
+                        tx.execute_batch(
+                            "CREATE INDEX IF NOT EXISTS app_capability_results_source
+                               ON app_capability_results(install_id,context_id,created,id)
+                               WHERE source_post_read=1;
+                             -- CAD-2042: a connection from an older binary may
+                             -- still insert through its old column list. Mark
+                             -- that row from its own run so no later writer can
+                             -- create a receipt the page cannot see.
+                             CREATE TRIGGER IF NOT EXISTS app_capability_results_source_scope
+                             AFTER INSERT ON app_capability_results
+                             WHEN NEW.source_post_read=0
+                              AND json_extract(NEW.result,'$.kind')='social.source.posts'
+                             BEGIN
+                               UPDATE app_capability_results
+                                  SET source_post_read=1,
+                                      install_id=(SELECT a.install_id FROM app_runs a
+                                                   WHERE a.id=NEW.run_id),
+                                      context_id=(SELECT a.context_id FROM app_runs a
+                                                   WHERE a.id=NEW.run_id)
+                                WHERE id=NEW.id;
+                             END;
+                             DELETE FROM app_schema_progress
+                               WHERE name='cad2042-source-scope';
+                             UPDATE schema_version SET version=62;",
+                        )?;
+                        tx.commit()?;
+                        break;
+                    }
+                    let end = (start + BATCH).min(bound);
+                    tx.execute(
+                        "UPDATE app_capability_results AS r
+                            SET source_post_read=1,
+                                install_id=a.install_id,
+                                context_id=a.context_id
+                           FROM app_runs a
+                          WHERE a.id=r.run_id
+                            AND r.rowid>?1 AND r.rowid<=?2
+                            AND r.source_post_read=0
+                            AND json_extract(r.result,'$.kind')='social.source.posts'",
+                        [start, end],
+                    )?;
+                    tx.execute(
+                        "UPDATE app_schema_progress SET cursor=?1
+                          WHERE name='cad2042-source-scope'",
+                        [end],
+                    )?;
+                    tx.commit()?;
+                }
+            }
+            if version < 63 {
+                // CAD-1857: agent ingress endpoints. New table only; an
+                // endpoint is created disabled and binds one workflow.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::endpoint::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=63", [])?;
+                tx.commit()?;
+            }
+            if version < 64 {
+                // CAD-2215: a member job request is accepted DURABLY before
+                // any job publication, so an issue already held by another
+                // nonterminal job yields a pending request instead of an
+                // occupancy-dependent refusal. New table only; no existing
+                // row is read or rewritten, and the canonical
+                // `assist_requests` promotion ledger is unchanged. The
+                // primary key is the same `(org, sub, request_key)`
+                // idempotency triple, so a replay can never retarget an
+                // accepted request.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS assist_request_queue(
+                        org TEXT NOT NULL, sub TEXT NOT NULL,
+                        request_key TEXT NOT NULL, issue TEXT NOT NULL,
+                        title TEXT NOT NULL, body TEXT NOT NULL,
+                        acceptance TEXT NOT NULL, credential_id TEXT NOT NULL,
+                        created REAL NOT NULL,
+                        last_attempt REAL NOT NULL DEFAULT 0,
+                        last_outcome TEXT,
+                        completed INTEGER NOT NULL DEFAULT 0,
+                        job_id TEXT NOT NULL,
+                        PRIMARY KEY (org, sub, request_key));
+                     CREATE INDEX IF NOT EXISTS assist_request_queue_owner
+                        ON assist_request_queue(org, sub, created);
+                     -- The canonical job id is persisted at acceptance, so a
+                     -- delivery reader can prove member provenance even in
+                     -- the crash window before assist_requests is bound.
+                     CREATE INDEX IF NOT EXISTS assist_request_queue_job
+                        ON assist_request_queue(job_id);
+                     CREATE INDEX IF NOT EXISTS assist_requests_job
+                        ON assist_requests(job);
+                     UPDATE schema_version SET version=64;",
+                )?;
+                tx.commit()?;
+            }
+            if version < 65 {
+                // CAD-2215: explicit per-member app grants (exact
+                // conversation/context bindings). New table only; no
+                // existing row is read or rewritten. `(org, sub)` is the
+                // platform's exact person; `install_digest` pins the
+                // reviewed bundle; revoked rows are retained tombstones.
+                // The authoritative DDL lives in
+                // `store::app_member_grants::SCHEMA`.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_member_grants::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=65", [])?;
+                tx.commit()?;
+            }
+            if version < 66 {
+                // CAD-2215: the one nullable scoped-cursor keyring bind.
+                // NULL means "never explicitly initialized": the migration
+                // only creates the column and never writes a value, so no
+                // store can gain cursor-key authority without the explicit
+                // operator RPC. Column-checked so a half-applied store
+                // converges on reopen.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                let columns = tx
+                    .prepare("PRAGMA table_info(connection_metadata)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !columns
+                    .iter()
+                    .any(|name| name == super::scoped_cursor_keys::COLUMN)
+                {
+                    tx.execute_batch(
+                        "ALTER TABLE connection_metadata \
+                           ADD COLUMN cursor_keyring_fingerprint TEXT;",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=66", [])?;
+                tx.commit()?;
+            }
+            if version < 67 {
+                // Give every existing grant a stable incarnation without
+                // changing its authority. A later explicit grant receives a
+                // new one, so revoke/re-grant cannot masquerade as the same
+                // access snapshot to an in-flight reader.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                let columns = tx
+                    .prepare("PRAGMA table_info(app_member_grants)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !columns.iter().any(|name| name == "authorization_epoch") {
+                    tx.execute_batch(
+                        "ALTER TABLE app_member_grants ADD COLUMN authorization_epoch TEXT;",
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE app_member_grants
+                     SET authorization_epoch=lower(hex(randomblob(16)))
+                     WHERE authorization_epoch IS NULL",
+                    [],
+                )?;
+                tx.execute("UPDATE schema_version SET version=67", [])?;
+                tx.commit()?;
+            }
+            if version < 68 {
+                // CAD-2317: routines, routine_runs, connection_policies, and
+                // staged_routine_proposals. Additive tables only.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::routines::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=68", [])?;
+                tx.commit()?;
+            }
+            if version < 69 {
+                // CAD-2378: workspace settings (the company time zone). New
+                // table only; absence means no owner choice.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::workspace_settings::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=69", [])?;
+                tx.commit()?;
+            }
+            if version < 70 {
+                // CAD-2019 / CAD-2316 / CAD-2022: additive template source format and
+                // partial-pricing indicator. Column-checked so a half-applied
+                // store converges on reopen without touching approved rows.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                let tpl_cols = tx
+                    .prepare("PRAGMA table_info(business_template_versions)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !tpl_cols.iter().any(|name| name == "source_format") {
+                    tx.execute_batch(
+                        "ALTER TABLE business_template_versions \
+                           ADD COLUMN source_format TEXT NOT NULL DEFAULT 'docx';",
+                    )?;
+                }
+                let doc_cols = tx
+                    .prepare("PRAGMA table_info(business_documents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !doc_cols.iter().any(|name| name == "has_unresolved_pricing") {
+                    tx.execute_batch(
+                        "ALTER TABLE business_documents \
+                           ADD COLUMN has_unresolved_pricing INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=70", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
@@ -1498,12 +1904,156 @@ impl Store {
                 .unwrap_or_else(|_| path.to_path_buf())
                 .to_string_lossy()
                 .into_owned(),
+            protected_checkpoint: std::sync::OnceLock::new(),
+            admission_fence: std::sync::atomic::AtomicBool::new(false),
         };
         let outcome = if recover {
             Some(store.recover(marker.as_ref())?)
         } else {
             None
         };
+        Ok((store, outcome))
+    }
+
+    /// Authentic opening is separate from the refusal-only mode selector.
+    /// No SQLite connection, journal recovery or writable open occurs before
+    /// the external owner consumes the exact one-use permit.
+    pub(super) fn open_protected(
+        permit: &super::seal::owner::StoreOpenPermit,
+    ) -> Result<(Self, RecoveryOutcome)> {
+        use super::seal::{self, owner};
+        use rusqlite::{OpenFlags, Transaction, TransactionBehavior};
+        let binding = permit.binding();
+        let path = Path::new(&binding.path);
+        owner::check_path(path)?;
+        permit.recheck()?;
+        permit.take()?;
+        permit.recheck()?;
+        // Root created/pinned this exact file only after durable consumption.
+        // Authenticate its once-only FD delivery before even memory SQLite;
+        // a lost/malformed delivery leaves the obligation spent/UNKNOWN.
+        let init_file = if binding.purpose == owner::Purpose::Init {
+            Some(permit.init_file()?)
+        } else {
+            None
+        };
+
+        // Build fresh schema privately in memory. The externally visible file
+        // never has a migration window without a closure/incarnation latch.
+        let (mut store, _) = Self::open_inner(
+            Path::new(":memory:"),
+            None,
+            false,
+            false,
+            seal::OpenMode::Legacy,
+        )?;
+        let mut destination;
+        if binding.purpose == owner::Purpose::Init {
+            permit.recheck()?;
+            // Never create/adopt a path locally: use Root's original held file.
+            // Failure leaves the external obligation spent; never erase/retry.
+            let file = init_file.ok_or_else(|| Error::rejected("Root Init file is absent"))?;
+            owner::check_path(path)?;
+            {
+                let conn = store.conn();
+                seal::with_owner_tx_control(&store.seal_state, || -> Result<()> {
+                    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+                    tx.execute_batch(seal::SEAL_SCHEMA)?;
+                    tx.execute_batch(owner::IDENTITY_SCHEMA)?;
+                    owner::insert_identity(&tx, binding)?;
+                    tx.execute(
+                        "INSERT INTO closure_state(id,closed,challenge,attempt,artifact,epoch,witness_done)
+                         VALUES(1,0,X'', '', '',?1,0)", [binding.database_epoch as i64],
+                    )?;
+                    permit.recheck()?;
+                    tx.commit()?;
+                    Ok(())
+                })?;
+                destination = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+                destination.busy_timeout(BUSY_TIMEOUT)?;
+                permit.recheck()?;
+                // A failed backup must leave a sealed refusal, not a latch-
+                // absent file a legacy writer could elect as fresh. SQLite's
+                // backup destination transaction replaces this only on success.
+                let seed =
+                    Transaction::new_unchecked(&destination, TransactionBehavior::Immediate)?;
+                seed.execute_batch(seal::SEAL_SCHEMA)?;
+                seed.execute(
+                    "INSERT INTO closure_state(id,closed,reason,challenge,attempt,artifact,epoch,witness_done)
+                     VALUES(1,1,'owner initialization incomplete',?1,?2,?3,?4,0)",
+                    rusqlite::params![binding.challenge, binding.attempt, binding.artifact, binding.database_epoch as i64],
+                )?;
+                permit.recheck()?;
+                seed.commit()?;
+                rusqlite::backup::Backup::new(&conn, &mut destination)?.run_to_completion(
+                    128,
+                    Duration::from_millis(10),
+                    None,
+                )?;
+            }
+            file.sync_all()?;
+            permit.recheck()?;
+        } else {
+            if !matches!(
+                binding.purpose,
+                owner::Purpose::Open | owner::Purpose::Restore
+            ) {
+                return Err(Error::rejected("wrong Store opening purpose"));
+            }
+            // Immutable read forbids SQLite recovery or SHM creation before
+            // validation. Restore digest covers a standalone image, no WAL.
+            owner::preflight_existing(path, binding)?;
+            permit.recheck()?;
+            owner::check_path(path)?;
+            destination = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            destination.busy_timeout(BUSY_TIMEOUT)?;
+        }
+        let state = std::sync::Arc::new(seal::GuardState::default());
+        seal::install_authorizer(&destination, state.clone());
+        seal::with_owner_tx_control(&state, || -> Result<()> {
+            permit.recheck()?;
+            // Fresh init or a validated standalone restored artifact may
+            // switch journal format ONLY after owner consumption/provenance.
+            let mode: String =
+                destination.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+            if mode != "wal" {
+                return Err(Error::rejected(
+                    "authenticated protected open could not establish WAL",
+                ));
+            }
+            permit.recheck()?;
+            let tx = Transaction::new_unchecked(&destination, TransactionBehavior::Immediate)?;
+            owner::validate_open_tx(&tx, binding)?;
+            if binding.purpose == owner::Purpose::Restore {
+                // Externally validated artifact and strictly newer incarnation
+                // authorize this transition, never the restored tombstone.
+                tx.execute(
+                    "UPDATE store_incarnation SET incarnation=?1,epoch=?2,operation=?3,artifact=?4 WHERE id=1",
+                    rusqlite::params![binding.incarnation, binding.database_epoch as i64,
+                        binding.operation, binding.artifact],
+                )?;
+                tx.execute(
+                    "UPDATE closure_state SET closed=0,reason=NULL,challenge=X'',attempt='',artifact='',
+                     epoch=?1,witness_done=0,closed_at=NULL WHERE id=1",
+                    [binding.database_epoch as i64],
+                )?;
+            }
+            permit.recheck()?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        *state
+            .owner
+            .lock()
+            .map_err(|_| Error::rejected("Store owner binding poisoned"))? = Some(permit.current());
+        store.conn = Mutex::new(destination);
+        store.seal_state = state;
+        store.protected_open = true;
+        store.db_identity = binding.path.clone();
+        // Restored shutdown.json cannot adopt a process. All outstanding
+        // submitting/running obligations retain UNKNOWN after crash/ACK loss.
+        let outcome = store.recover(None)?;
+        permit.recheck()?;
         Ok((store, outcome))
     }
 
@@ -1884,6 +2434,39 @@ impl Store {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(alias, pid, start)| {
+                Some((
+                    alias,
+                    u32::try_from(pid).ok()?,
+                    start.and_then(|s| u64::try_from(s).ok()),
+                ))
+            })
+            .collect())
+    }
+
+    /// The registered pty panes on an already-open connection or write
+    /// transaction — the same rows [`Self::pty_pane_pids`] reads — so a scoped
+    /// acknowledgement's identity re-proof reads the same registration rows as
+    /// the transaction that mutates the alert.
+    pub(crate) fn pty_pane_pids_in(
+        &self,
+        conn: &impl StoreConn,
+    ) -> Result<Vec<(String, u32, Option<u64>)>> {
+        let rows = conn.query_vec(
+            "SELECT alias, pid, pid_start FROM agents
+             WHERE endpoint_kind='pty'
+               AND generation IS NOT NULL AND pid IS NOT NULL",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )?;
         Ok(rows
             .into_iter()
             .filter_map(|(alias, pid, start)| {

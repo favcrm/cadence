@@ -1,6 +1,7 @@
-import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates } from "../src/features/home/agentUpdateModel";
+import { agentThreadHref, detailTasksNotOnRoster, partitionActiveTasks } from "../src/features/agents/AgentBlocks";
+import { activeAssignedGroups, agentWorkHref, recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, updatesNotices } from "../src/features/home/agentUpdateModel";
 import { activityTimeMs } from "../src/lib/fmt";
-import type { Agent, AgentDetail } from "../src/lib/types";
+import type { Agent, AgentDetail, AgentTask } from "../src/lib/types";
 function check(value: boolean, why: string) { if (!value) throw new Error(why); }
 const detail = { events: [
   { seq: 1, kind: "turn_finished", at: "2026-09-26T10:00:00Z" },
@@ -38,3 +39,30 @@ const reports = reportedAgentUpdates([
 check(reports.get("cur-607")?.[0].text === "CAD-607 — The layout stays consistent.", "delivered worker report supplies a readable summary");
 check(reports.get("cur-607")?.[0].label === "Work reported", "a done report is not a verified task completion");
 check(!reports.has("worker"), "operator text never impersonates a delivered report");
+
+function task(id: string, state: string, title: string): AgentTask {
+  return { task: id, task_state: state, title, issue: "", job: "job-1", job_state: "running" };
+}
+function worker(alias: string, tasks: AgentTask[]): Agent {
+  return { ...agents[0], alias, tasks, running: tasks.some((item) => item.task_state === "running") ? 1 : 0 };
+}
+const grouped = activeAssignedGroups([
+  worker("ada", [task("run-1", "running", "Draw the states"), task("done-1", "done", "Write the spec")]),
+  worker("master", [task("run-2", "running", "Hidden")]),
+]);
+check(grouped.length === 1 && grouped[0].alias === "ada", "active work is grouped by the assigned agent");
+check(grouped[0].tasks.length === 1 && grouped[0].tasks[0].task === "run-1", "a done task leaves the active group");
+check(agentWorkHref("ada") === "/agents/ada?tab=work", "the agent opens the existing Work tab");
+check(agentThreadHref("ada") === "/threads?dm=ada", "the task opens the existing conversation");
+const failed = updatesNotices({ hasData: true, daemon: "unreachable", refreshError: false, recentCount: 0 });
+check(failed.unavailable && !failed.empty, "a failed read is not an empty success");
+const partial = updatesNotices({ hasData: true, daemon: "ok", refreshError: true, recentCount: 2 });
+check(partial.partial && !partial.empty && !partial.unavailable, "a partial roster stays partial");
+const staleEmpty = updatesNotices({ hasData: true, daemon: "ok", refreshError: false, recentCount: 0, resourceStatus: "stale" });
+check(staleEmpty.unavailable && !staleEmpty.empty, "a failed refresh of an empty roster is not an empty success");
+const staleRows = updatesNotices({ hasData: true, daemon: "ok", refreshError: false, recentCount: 2, resourceStatus: "stale" });
+check(staleRows.partial && !staleRows.empty && !staleRows.unavailable, "a failed refresh keeps the last rows and says the read is partial");
+check(JSON.stringify(detailTasksNotOnRoster(null, ["a", "b"])) === JSON.stringify(["a", "b"]), "a missing roster keeps every detail task id");
+check(JSON.stringify(detailTasksNotOnRoster(partitionActiveTasks(worker("ada", [task("run-1", "running", "Draw the states")])), ["run-1", "detail-only"])) === JSON.stringify(["detail-only"]), "a roster task is not listed twice");
+check(JSON.stringify(detailTasksNotOnRoster(partitionActiveTasks(worker("ada", [])), ["detail-only"])) === JSON.stringify(["detail-only"]), "an empty roster row still shows detail task ids");
+check(JSON.stringify(detailTasksNotOnRoster(partitionActiveTasks(worker("ada", [])), undefined)) === JSON.stringify([]), "missing detail ids stay empty");

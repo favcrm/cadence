@@ -10,6 +10,7 @@
 
 use std::path::Path;
 
+use cadence_core::board_api::{HUMAN_ROOM_CURSOR_FORMAT, HUMAN_ROOM_SCOPE_ACK, READER_SCOPE_FIELD};
 use serde_json::{json, Map, Value};
 use tiny_http::{Method, Request};
 
@@ -69,33 +70,188 @@ fn whitelist(body: &Value, allowed: &[&str]) -> Result<Map<String, Value>, HttpR
 fn page_params(query: &str) -> Result<Map<String, Value>, HttpResp> {
     let mut out = Map::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        match k {
-            "before" | "limit" => {
-                let n: i64 = v.parse().map_err(|_| {
-                    bad_request("invalid_request", &format!("{k} must be an integer"))
-                })?;
-                if k == "limit" && !(1..=HISTORY_MAX).contains(&n) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = super::pct_decode(key)
+            .ok_or_else(|| bad_request("invalid_request", "invalid history query"))?;
+        let value = super::pct_decode(value)
+            .ok_or_else(|| bad_request("invalid_request", "invalid history query"))?;
+        if out.contains_key(&key) {
+            return Err(bad_request(
+                "invalid_request",
+                "duplicate history parameter",
+            ));
+        }
+        match key.as_str() {
+            "before" if opaque_token(&value) => {
+                out.insert(key, json!(value));
+            }
+            "before" => {
+                return Err(bad_request(
+                    "invalid_request",
+                    "before must be an opaque cursor",
+                ))
+            }
+            "limit" => {
+                let limit: i64 = value
+                    .parse()
+                    .map_err(|_| bad_request("invalid_request", "limit must be an integer"))?;
+                if !(1..=HISTORY_MAX).contains(&limit) {
                     return Err(bad_request(
                         "invalid_request",
                         &format!("limit must be 1-{HISTORY_MAX}"),
                     ));
                 }
-                if k == "before" && n < 0 {
-                    return Err(bad_request("invalid_request", "before must be >= 0"));
-                }
-                out.insert(k.to_string(), json!(n));
+                out.insert(key, json!(limit));
             }
-            // A query may not carry identity or any other field.
             _ => {
                 return Err(bad_request(
                     "invalid_request",
-                    &format!("'{k}' is not a query parameter of this request"),
+                    &format!("'{key}' is not a query parameter of this request"),
                 ))
             }
         }
     }
     Ok(out)
+}
+
+fn opaque_token(token: &str) -> bool {
+    token.starts_with("csc1_") && token.len() > "csc1_".len()
+}
+
+fn exact_keys(object: &Map<String, Value>, keys: &[&str]) -> bool {
+    object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+}
+
+fn valid_room_post(value: &Value) -> bool {
+    let Some(post) = value.as_object() else {
+        return false;
+    };
+    if !exact_keys(post, &["id", "sender", "body", "created", "read_cursor"])
+        || !post
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        || !post.get("body").is_some_and(Value::is_string)
+        || !post.get("created").is_some_and(Value::is_number)
+        || !post
+            .get("read_cursor")
+            .and_then(Value::as_str)
+            .is_some_and(opaque_token)
+    {
+        return false;
+    }
+    let Some(sender) = post.get("sender").and_then(Value::as_object) else {
+        return false;
+    };
+    exact_keys(sender, &["id", "label"])
+        && sender
+            .get("id")
+            .is_some_and(|id| id.is_null() || id.is_string())
+        && sender.get("label").is_some_and(Value::is_string)
+}
+
+/// The ack and the shape both belong to this response, not a cached health
+/// capability. An old or malformed daemon result is never relayed.
+fn room_relay_gate(
+    value: &mut Value,
+    rpc: &str,
+    room: Option<&str>,
+    supplied_before: Option<&str>,
+) -> bool {
+    let Some(body) = value.as_object_mut() else {
+        return false;
+    };
+    if body
+        .remove(READER_SCOPE_FIELD)
+        .as_ref()
+        .and_then(Value::as_str)
+        != Some(HUMAN_ROOM_SCOPE_ACK)
+    {
+        return false;
+    }
+    match rpc {
+        "human_room_read" => {
+            if !exact_keys(
+                body,
+                &[
+                    "room",
+                    "scope_id",
+                    "members",
+                    "posts",
+                    "can_ask",
+                    "before",
+                    "more_before",
+                ],
+            ) || body.get("room").and_then(Value::as_str) != room
+                || !body
+                    .get("scope_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("csrid_") && id.len() > "csrid_".len())
+                || !body.get("can_ask").is_some_and(Value::is_boolean)
+                || !body.get("more_before").is_some_and(Value::is_boolean)
+            {
+                return false;
+            }
+            let Some(members) = body.get("members").and_then(Value::as_array) else {
+                return false;
+            };
+            if !members.iter().all(|member| {
+                member.as_object().is_some_and(|m| {
+                    exact_keys(m, &["kind", "id", "label"]) && m.values().all(Value::is_string)
+                })
+            }) {
+                return false;
+            }
+            let Some(posts) = body.get("posts").and_then(Value::as_array) else {
+                return false;
+            };
+            if !posts.iter().all(valid_room_post) {
+                return false;
+            }
+            let before = match body.get("before") {
+                Some(Value::Null) => None,
+                Some(Value::String(token)) if opaque_token(token) => Some(token.as_str()),
+                _ => return false,
+            };
+            if posts.is_empty() {
+                before == supplied_before && body["more_before"] == json!(false)
+            } else {
+                before.is_some()
+            }
+        }
+        "human_room_post" => {
+            exact_keys(body, &["post", "created"])
+                && body.get("post").is_some_and(valid_room_post)
+                && body.get("created").is_some_and(Value::is_boolean)
+        }
+        "human_room_ask" => {
+            let target = body.get("target").and_then(Value::as_object);
+            exact_keys(body, &["request", "post", "target", "duplicate"])
+                && body.get("request").is_some_and(Value::is_string)
+                && body.get("post").is_some_and(valid_room_post)
+                && body.get("duplicate").is_some_and(Value::is_boolean)
+                && target.is_some_and(|target| {
+                    exact_keys(target, &["uid", "alias"]) && target.values().all(Value::is_string)
+                })
+        }
+        "human_room_mark_read" => {
+            exact_keys(body, &["unread"])
+                && body
+                    .get("unread")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|n| n >= 0)
+        }
+        _ => false,
+    }
+}
+
+fn room_unavailable() -> HttpResp {
+    coded_response(
+        503,
+        "human_room_unavailable",
+        "human room cursor protocol unavailable",
+        None,
+    )
 }
 
 /// The member picker accepts only a search string, never identity selectors.
@@ -289,7 +445,7 @@ fn route(method: &Method, rest: &str) -> Result<(Route, bool), HttpResp> {
                 false,
             )),
             Some((room, "/read")) => {
-                Ok((room_route("human_room_mark_read", room, &["seq"]), false))
+                Ok((room_route("human_room_mark_read", room, &["cursor"]), false))
             }
             Some((room, "/mute")) => Ok((room_route("human_room_mute", room, &["muted"]), false)),
             Some((room, "/members")) => Ok((
@@ -381,10 +537,60 @@ pub(crate) fn dispatch(
     } else if !query.is_empty() {
         return bad_request("invalid_request", "this route takes no query parameters");
     }
+    let scoped = matches!(
+        route.rpc,
+        "human_room_read" | "human_room_post" | "human_room_ask" | "human_room_mark_read"
+    );
+    let room = route
+        .server
+        .get("room")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let before = params
+        .get("before")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if scoped {
+        params.insert("cursor_format".to_string(), json!(HUMAN_ROOM_CURSOR_FORMAT));
+    }
     params.extend(route.server);
     params.insert("token".to_string(), json!(cookie));
-    match client::rpc(state_dir, route.rpc, Value::Object(params)) {
-        Ok(v) => json_response(v),
+    let answer = if scoped {
+        // Capability discovery and the call share one connection: a daemon
+        // replacement cannot redirect a checked mutation to an old daemon.
+        let timeout = std::time::Duration::from_secs(5);
+        let Ok(mut session) = client::RpcSession::connect_timeout(state_dir, timeout) else {
+            return room_unavailable();
+        };
+        let supported = session
+            .answer_timeout("health", json!({}), timeout)
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|health| {
+                health["capabilities"].as_array().is_some_and(|caps| {
+                    caps.iter().any(|cap| {
+                        cap.as_str() == Some(crate::adapter::registry::HUMAN_ROOM_OPAQUE_CAPABILITY)
+                    })
+                })
+            });
+        if !supported {
+            return room_unavailable();
+        }
+        match session.answer(route.rpc, Value::Object(params)) {
+            Ok(answer) => answer,
+            Err(_) => return room_unavailable(),
+        }
+    } else {
+        client::rpc(state_dir, route.rpc, Value::Object(params))
+    };
+    match answer {
+        Ok(mut value) => {
+            if scoped && !room_relay_gate(&mut value, route.rpc, room.as_deref(), before.as_deref())
+            {
+                return room_unavailable();
+            }
+            json_response(value)
+        }
         Err(e) => daemon_failure(&e),
     }
 }
@@ -410,6 +616,17 @@ fn push_keys(keys: &Value) -> Result<(String, String), HttpResp> {
 /// Map a daemon refusal to the HTTP contract. Codes come from the daemon's
 /// own `code` where it set one.
 fn daemon_failure(error: &crate::error::Error) -> HttpResp {
+    if let Some(
+        code @ ("human_room_cursor_format"
+        | "human_room_cursor_numeric"
+        | "human_room_cursor_invalid"),
+    ) = error.code()
+    {
+        return coded_response(400, code, "human room cursor is invalid", None);
+    }
+    if error.code() == Some("scoped_cursor_unavailable") {
+        return room_unavailable();
+    }
     if error.code() == Some("human_session_required") {
         return coded_response(
             401,

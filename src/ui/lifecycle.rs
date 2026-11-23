@@ -10,11 +10,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::operator;
-use super::tailscale::{ensure_mapping, is_ts_offline, prepare_mapping, remove_mapping};
+use super::tailscale::{is_ts_offline, prepare_mapping, remove_mapping};
 use super::{
-    clear_persisted_share, load_opts, load_opts_strict, push_device_login_config,
-    refuse_share_port_change, resolve_device_login, resolve_opts, save_opts, serve,
+    clear_persisted_share, load_opts, load_opts_strict, public_scheme, push_device_login_config,
+    refuse_share_port_change, resolve_device_login, resolve_ui_opts, save_opts,
     validate_share_target, UiFlags, UiOpts,
 };
 use crate::error::{Error, Result};
@@ -31,14 +30,16 @@ pub(crate) fn pid_file(state_dir: &Path) -> PathBuf {
 /// environment and this file, never over HTTP: any HTTP 200 a foreign
 /// listener answers can no longer stand in for this board's readiness
 /// (CAD-817).
-pub(crate) fn ready_file(state_dir: &Path) -> PathBuf {
+#[doc(hidden)]
+pub fn ready_file(state_dir: &Path) -> PathBuf {
     state_dir.join("ui.ready")
 }
 
 /// `ui start`'s env channel for the readiness nonce. The child writes
 /// it to `ui.ready` after binding; `serve` removes it from the child's
 /// own environment before serving so nothing downstream inherits it.
-pub(crate) const READY_NONCE_ENV: &str = "CADENCE_UI_READY_NONCE";
+#[doc(hidden)]
+pub const READY_NONCE_ENV: &str = "CADENCE_UI_READY_NONCE";
 
 /// The frame a spawned `ui run` writes when its bind fails with a real
 /// `AddrInUse` — `{pid, nonce, kind}` for the `ui start` that is
@@ -50,7 +51,8 @@ pub(crate) const READY_NONCE_ENV: &str = "CADENCE_UI_READY_NONCE";
 /// never classify an unrelated exit as a bind collision. It carries no
 /// role the nonce did not already have — the child's provenance for
 /// its own start result.
-pub(crate) fn startup_failed_file(state_dir: &Path, pid: u32) -> PathBuf {
+#[doc(hidden)]
+pub fn startup_failed_file(state_dir: &Path, pid: u32) -> PathBuf {
     state_dir.join(format!("ui.startup-failed-{pid}"))
 }
 
@@ -243,7 +245,8 @@ fn dir_of(proc_root: &Path, pid: i32) -> PathBuf {
 /// One list for the board identity check and for `dev up|reload
 /// --build`, so a build is refused up front rather than started as a
 /// board `ui stop` could never find again (CAD-1206).
-pub(crate) fn is_cadence_exe_name(name: &str) -> bool {
+#[doc(hidden)]
+pub fn is_cadence_exe_name(name: &str) -> bool {
     name == "cadence" || name.strip_prefix("cadence-").is_some_and(|s| !s.is_empty())
 }
 
@@ -279,7 +282,8 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// dependency. `headers` are extra request lines (`Tailscale-User-Login`
 /// for the identity probe). Returns `(status, body)`.
 /// `pub(crate)` for `doctor --host`'s tailnet probe (CAD-509).
-pub(crate) fn http_get(
+#[doc(hidden)]
+pub fn http_get(
     host: &str,
     port: u16,
     path: &str,
@@ -312,53 +316,14 @@ pub(crate) fn http_get(
     Ok((status, body))
 }
 
-/// `ui run` — foreground. Flags merge over the persisted options but
-/// never rewrite them: `ui start` owns persistence.
-pub(crate) fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
-    if flags.tailscale.is_some() {
-        // Foreground sandbox runs have no durable sharing custody. Only
-        // the recorded start paths may publish a host-wide mapping.
-        crate::sandbox::refuse_global(
-            "foreground `ui run --tailscale`; use `ui start --tailscale` for recorded sandbox sharing",
-        )?;
-    }
-    let persisted = load_opts_strict(state_dir)?;
-    let (eff, mut so) = resolve_opts(flags, &persisted)?;
-    // CAD-841: `--device-login-*` is a thin client — resolve now so a
-    // partial triple still fails before any bind, but push only once
-    // `serve` owns the port: a failed start must not have already
-    // replaced the live config on this state dir's boards (r1). A
-    // detached `ui start` child resolves no flags and a scrubbed env,
-    // so it never re-pushes.
-    so.device_login_push = resolve_device_login(flags)?;
-    // `ui run --tailscale` is the foreground opt-in path. Resolution
-    // above validates all configuration first; preserve its historical
-    // explicit-sharing behavior without moving map effects back into
-    // the shared resolver.
-    let created = if flags.tailscale.is_some() {
-        let ts = eff.tailscale.as_ref().expect("resolved above");
-        ensure_mapping(&ts.dns_name, ts.https_port, &ts.target)?
-    } else {
-        false
-    };
-    if let Err(e) = serve(state_dir, &crate::issue::default_dir()?, &so) {
-        if created {
-            if let Some(ts) = &eff.tailscale {
-                let _ = remove_mapping(&ts.dns_name, ts.https_port, &ts.target);
-            }
-        }
-        return Err(e);
-    }
-    Ok(0)
-}
-
 /// `ui start` — merge flags over `ui.json`, persist the effective
 /// options, spawn a detached `ui run` that reads them back. A
 /// persisted tailscale block re-ensures its mapping (idempotent; a
 /// foreign mapping on the port is still a hard refusal, an
 /// unreachable tailscaled a warning — the board still serves
 /// loopback).
-pub(crate) fn start(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
+#[doc(hidden)]
+pub fn start(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
     start_inner(state_dir, flags, reset, false)
 }
 
@@ -367,7 +332,8 @@ pub(crate) fn start(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i3
 /// `start_inner` clamps its start budget to min(existing, remaining)
 /// and clears the var. A start cannot grant itself more than the outer
 /// retry still has, and no other caller is affected.
-pub(crate) const START_REMAINING_ENV: &str = "CADENCE_DEV_UP_START_REMAINING_SECS";
+#[doc(hidden)]
+pub const START_REMAINING_ENV: &str = "CADENCE_DEV_UP_START_REMAINING_SECS";
 
 /// CAD-1251: the board's start proof (bind, readiness report, health)
 /// defaults to 10 s for an interactive `ui start`.
@@ -391,7 +357,8 @@ fn start_budget() -> Duration {
 
 /// `ui start` with no stdout — for composed callers (session's
 /// `--fix`) whose own output must stay a single document.
-pub(crate) fn start_quiet(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
+#[doc(hidden)]
+pub fn start_quiet(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
     start_inner(state_dir, flags, reset, true)
 }
 
@@ -411,7 +378,7 @@ pub(crate) fn start_inner(
     } else {
         recorded.clone()
     };
-    let (eff, so) = resolve_opts(flags, &persisted)?;
+    let (eff, so) = resolve_ui_opts(flags, &persisted)?;
     if let Some(existing) = recorded.tailscale.as_ref() {
         let mut recorded_bind = UiOpts {
             host: eff.host.clone(),
@@ -541,6 +508,10 @@ pub(crate) fn start_inner(
     // leak into the child (a `daemon restart --ui` under it would
     // blanket-assert every board→daemon RPC).
     command.env_remove(crate::test_seam::AS_ENV);
+    // CAD-2059: the board's own daemon calls must not read as an agent's.
+    for marker in crate::peer::AGENT_RUNTIME_MARKERS {
+        command.env_remove(marker);
+    }
     // CAD-841: the child must never push a device-login config — the
     // parent already did (or nobody did). Its argv carries none of the
     // flags; strip the env fallbacks so an inherited
@@ -736,7 +707,8 @@ pub(crate) fn kill_detached(state_dir: &Path) -> Option<i32> {
     Some(pid)
 }
 
-pub(crate) fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
+#[doc(hidden)]
+pub fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
     let recorded = if tailscale_off {
         let opts = load_opts_strict(state_dir)?;
         if let Some(share) = opts.tailscale.as_ref() {
@@ -792,7 +764,8 @@ pub(crate) fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
     Ok(0)
 }
 
-pub(crate) fn status(state_dir: &Path) -> Result<i32> {
+#[doc(hidden)]
+pub fn status(state_dir: &Path) -> Result<i32> {
     let pid = read_pid(state_dir);
     let opts = load_opts(state_dir);
     let port = opts.port.unwrap_or(3010);
@@ -825,7 +798,7 @@ pub(crate) fn status(state_dir: &Path) -> Result<i32> {
             "tailnet_url": opts.tailscale.as_ref().map(|t| t.url()),
             // CAD-526: the public sign-in surface, when configured.
             "board_url": opts.board.as_ref().map(|b| format!(
-                "{}://{}", operator::public_scheme(&b.host), b.host)),
+                "{}://{}", public_scheme(&b.host), b.host)),
             "board_issuer": opts.board.as_ref().map(|b| b.issuer.clone()),
             "board_company": opts.board.as_ref().map(|b| b.company.clone()),
             // CAD-841: device login is daemon-owned — report the

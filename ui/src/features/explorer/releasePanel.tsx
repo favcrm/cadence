@@ -4,7 +4,6 @@ import Button from "../../ui/Button";
 import { useModal } from "./shared";
 import { useTranslate } from "../../lib/locale";
 import { ApiError } from "../../lib/api";
-import { sessionHeaders } from "../../lib/sessionKey";
 import {
   onPrivateReadsPaused,
   onPrivateSessionReset,
@@ -38,7 +37,9 @@ import "./publicDirectory.css";
  * check → review → confirm → apply flow for fresh installs and
  * catalogue updates. A Check is read-only (`upload/check` or
  * `upgrade/check`); only an explicit confirmation sends the same
- * `files` map with the checked digest, catalogue locator and CAS pins.
+ * catalogue locator with the checked digest and CAS pins. The board
+ * fetches the named release itself (CAD-1942); no package bytes pass
+ * through the browser.
  * An uncertain apply locks the panel until the installation list is
  * read back — it is never guessed or retried.
  */
@@ -55,7 +56,6 @@ export type Receipt = {
   /** A review cannot be carried into a different signed-in session. */
   sessionGeneration: number;
   release: PublicRelease;
-  files: Record<string, string>;
   /** The install this check ran against (null = fresh install). */
   install: InstallRef | null;
   expectedDigest: string | null;
@@ -254,58 +254,6 @@ function completeReview(value: unknown): boolean {
   return strings(value.files);
 }
 
-/** The release document the closed proxy serves: `files` + `expected_digest`,
- * both matching the selected release or the check never happens. */
-export async function loadReleaseFiles(
-  appId: string,
-  release: PublicRelease,
-  signal: AbortSignal,
-): Promise<Record<string, string>> {
-  const query = new URLSearchParams({
-    version: release.version,
-    digest: release.digest,
-  });
-  let response: Response;
-  try {
-    response = await fetch(
-      `/api/public-apps/${encodeURIComponent(appId)}/release?${query}`,
-      {
-        credentials: "same-origin",
-        cache: "no-store",
-        signal,
-        headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
-      },
-    );
-  } catch (error) {
-    if (signal.aborted) throw error;
-    throw new ApiError("The release could not be read.", 502);
-  }
-  if (response.status === 404 || response.status === 409) {
-    throw new ApiError("catalogue release is not installable", response.status);
-  }
-  if (!response.ok)
-    throw new ApiError("The release could not be read.", response.status);
-  const body = (await response.json().catch(() => null)) as {
-    files?: unknown;
-    expected_digest?: unknown;
-  } | null;
-  if (
-    !body ||
-    body.expected_digest !== release.digest ||
-    !body.files ||
-    typeof body.files !== "object" ||
-    Array.isArray(body.files)
-  ) {
-    throw new CheckedMismatch();
-  }
-  if (
-    Object.keys(body.files).length === 0 ||
-    !Object.values(body.files).every((text) => typeof text === "string")
-  )
-    throw new CheckedMismatch();
-  return body.files as Record<string, string>;
-}
-
 /** One checked apply: upload or upgrade with the exact pins, then refuse
  * unless the committed row and an explicit readback both name the selected
  * release and its catalogue provenance. Throws `CheckedMismatch` when the
@@ -327,7 +275,6 @@ export function applyCheckedRelease(
     if (receipt.kind === "install") {
       row = await appExplorer.upload(
         {
-          files: receipt.files,
           expected_digest: release.digest,
           catalogue: locator,
         },
@@ -337,7 +284,6 @@ export function applyCheckedRelease(
       row = await workspaceApps.upgrade(
         receipt.install?.install_id as string,
         {
-          files: receipt.files,
           expected_digest: receipt.expectedDigest as string,
           expected_generation: receipt.expectedGeneration as string,
           expected_new_digest: release.digest,
@@ -706,14 +652,12 @@ export default function ReleasePanel({
     setFlow({ kind: "none" });
     setNote(null);
     void (async () => {
-      const files = await loadReleaseFiles(app.id, release, controller.signal);
-      if (!live()) return;
       let proposal: InstallCheck | UpgradeProposal;
       let kind: Receipt["kind"];
       if (!checkedInstall) {
         kind = "install";
         proposal = await appExplorer.uploadCheck(
-          { files, expected_digest: release.digest, catalogue: locator },
+          { expected_digest: release.digest, catalogue: locator },
           controller.signal,
         );
       } else {
@@ -721,7 +665,6 @@ export default function ReleasePanel({
         proposal = await workspaceApps.upgradeCheck(
           checkedInstall.install_id,
           {
-            files,
             expected_digest: checkedInstall.digest as string,
             expected_generation: checkedInstall.catalog_generation as string,
             catalogue: locator,
@@ -758,7 +701,6 @@ export default function ReleasePanel({
           kind,
           sessionGeneration: epoch,
           release,
-          files,
           install: checkedInstall,
           expectedDigest: checkedInstall?.digest ?? null,
           expectedGeneration: checkedInstall?.catalog_generation ?? null,

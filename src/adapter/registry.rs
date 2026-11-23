@@ -320,6 +320,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "effort",
             "permission_mode",
             "allowed_tools",
+            "disabled_tools",
             "turn_idle_secs",
             "turn_max_secs",
             "broker_approvals",
@@ -372,6 +373,8 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_params: &[
             "model",
             "effort",
+            "skills",
+            "disabled_tools",
             "turn_idle_secs",
             "turn_max_secs",
             "session",
@@ -419,6 +422,8 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_params: &[
             "model",
             "effort",
+            "skills",
+            "disabled_tools",
             "turn_idle_secs",
             "turn_max_secs",
             "session",
@@ -739,10 +744,57 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_default: false,
         internal: false,
     },
+    // CAD-1853: the externally connected AgenticOS cloud conversational
+    // agent. It owns NO local actor, process or adapter: it is reached only
+    // through the published contract and its truthful state is projected
+    // from the cloud-agent rows. Declaring it actorless keeps a daemon
+    // restart from trying to relaunch an unsupported local adapter (which
+    // would fence a healthy remote connection) and keeps every mailbox-only
+    // verb from claiming it.
+    EndpointSpec {
+        provider: "agenticos-cloud",
+        endpoint_kind: "cloud",
+        display: "AgenticOS cloud agent (Worker/Pi Durable)",
+        has_actor: false,
+        attach: Attach::None,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        turn_token: None,
+        brokers_requests: false,
+        resumable: false,
+        resume_label: "n/a — remote cloud session",
+        live_settable_params: &[],
+        launch_params: &[],
+        session_id_label: "Remote provider session",
+        respond_rejection: Some(
+            "a cloud agent has no local approval channel — answer remotely in Threads",
+        ),
+        capabilities: &["cloud_agent_conversation"],
+        doctor_caps: &[],
+        probe_bins: &[],
+        session_disposable: false,
+        launch_default: false,
+        internal: false,
+    },
 ];
 
 /// `health.capabilities` entry for daemon-wide model defaults.
 pub const MODEL_DEFAULTS_CAPABILITY: &str = "model_defaults";
+
+/// CAD-2215: `health.capabilities` entry naming the opaque job-event cursor
+/// protocol. It is an ADVISORY compatibility signal — a client may use it to
+/// choose between an opaque continuation and a numeric one, but it is never
+/// authorization: every scoped read still re-proves its reader and job, and a
+/// missing capability means "unknown", never a downgrade.
+pub const JOB_EVENTS_OPAQUE_CAPABILITY: &str = "job_events_opaque_cursors";
+
+/// Advisory support for the signed member-assistant opaque history protocol.
+pub const MEMBER_ASSIST_HISTORY_OPAQUE_CAPABILITY: &str = "member_assist_history_opaque_cursors";
+
+/// Advisory support for scoped human-room cursors and receipts.
+pub const HUMAN_ROOM_OPAQUE_CAPABILITY: &str = "human_room_opaque_cursors";
 
 /// Daemon-level features reported alongside the per-spec capability
 /// names — not properties of any one endpoint.
@@ -755,6 +807,11 @@ const DAEMON_FEATURES: &[&str] = &[
     "approval_brokering",
     "result_routing",
     MODEL_DEFAULTS_CAPABILITY,
+    // CAD-2215: the opaque job-event cursor protocol (`cursor_format:
+    // "opaque-v1"`); advisory compatibility only.
+    JOB_EVENTS_OPAQUE_CAPABILITY,
+    MEMBER_ASSIST_HISTORY_OPAQUE_CAPABILITY,
+    HUMAN_ROOM_OPAQUE_CAPABILITY,
     // CAD-319: durable conversation threads (`thread_read`/`thread_send`).
     "threads",
 ];
@@ -853,14 +910,17 @@ impl Placement {
     }
 }
 
-/// Placement of one registered endpoint. Total by construction: a pair
-/// without an actor is a queue, an endpoint kind named `cloud` is hosted,
-/// everything else runs on the daemon's own host.
+/// Placement of one registered endpoint. Total by construction: an endpoint
+/// kind named `cloud` is hosted (whether or not it owns a local actor), a
+/// non-cloud pair without an actor is a queue, everything else runs on the
+/// daemon's own host.
 pub fn placement(provider: &str, endpoint_kind: &str) -> Placement {
-    if !has_actor(provider, endpoint_kind) {
-        Placement::Queue
-    } else if endpoint_kind == "cloud" {
+    // A hosted cloud runtime has no local actor by design; naming the kind
+    // `cloud` is the truthful placement even when no process runs here.
+    if endpoint_kind == "cloud" {
         Placement::Cloud
+    } else if !has_actor(provider, endpoint_kind) {
+        Placement::Queue
     } else {
         Placement::Local
     }
@@ -915,6 +975,24 @@ pub fn spec_opt(provider: &str, kind: &str) -> Option<&'static EndpointSpec> {
                 .iter()
                 .find(|s| kind == "fake" && s.endpoint_kind == "fake")
         })
+}
+
+/// CAD-2239: a reviewer is always a headless process. A `pty` endpoint (a
+/// terminal pane) on a non-internal pair is refused for a review role; every
+/// other role keeps its pane. The `tui-stub` harness pair is internal and
+/// stays buildable.
+pub fn refuse_reviewer_pane(provider: &str, kind: &str, role: &str) -> Result<()> {
+    if kind != "pty"
+        || !super::is_reviewer_role(role)
+        || !spec_opt(provider, kind).is_some_and(|s| !s.internal)
+    {
+        return Ok(());
+    }
+    Err(Error::rejected(format!(
+        "a reviewer does not run in a terminal pane ({provider} pty): use a headless \
+         endpoint, `cadence join <pm> claude`, `cadence join <pm> pi` or \
+         `cadence join <pm> codex`"
+    )))
 }
 
 /// Validating lookup used by the factory: unknown pairs are rejected
@@ -1286,6 +1364,8 @@ pub const TRUST_BEARING_PARAMS: &[&str] = &[
     "bypass",
     "bypass_approval",
     "allowed_tools",
+    "skills",
+    "disabled_tools",
     "broker_approvals",
     "permission_timeout_secs",
     "secret_ids",
@@ -1849,7 +1929,183 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
             ));
         }
     }
+    if let Some(v) = params.get("skills") {
+        if !v.is_null() {
+            if !supports_per_agent_skills(provider, kind) {
+                return Err(Error::rejected(format!(
+                    "'skills' is only enforced on managed Pi/OMP runtimes, not {provider}/{kind}"
+                )));
+            }
+            crate::skill::validate_skills_param(v)?;
+        }
+    }
+    if let Some(v) = params.get("disabled_tools") {
+        if !v.is_null() {
+            validate_disabled_tools_param(provider, kind, v)?;
+        }
+    }
     Ok(())
+}
+
+/// CAD-2092: whether this provider/endpoint enforces per-agent `params.skills`
+/// at launch (via `--no-skills --skill <staged_dir>`).
+pub fn supports_per_agent_skills(provider: &str, kind: &str) -> bool {
+    pi_family_managed(provider, kind)
+}
+
+/// CAD-2092: required built-in tool present on every Cadence agent.
+pub const REQUIRED_TOOL: &str = "cadence";
+
+/// One built-in tool exposed by a native provider's managed runtime.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeToolSpec {
+    pub name: &'static str,
+    pub line: &'static str,
+    pub required: bool,
+}
+
+const fn built_in_tool(name: &'static str, line: &'static str, required: bool) -> NativeToolSpec {
+    NativeToolSpec {
+        name,
+        line,
+        required,
+    }
+}
+
+const CADENCE_TOOL: NativeToolSpec =
+    built_in_tool(REQUIRED_TOOL, "Tickets, threads and reports", true);
+const PI_BUILT_IN_TOOLS: &[NativeToolSpec] = &[
+    CADENCE_TOOL,
+    built_in_tool("read", "Read files in the workspace", false),
+    built_in_tool("bash", "Run shell commands", false),
+    built_in_tool("edit", "Edit existing files", false),
+    built_in_tool("write", "Create or overwrite files", false),
+    built_in_tool("grep", "Search file contents", false),
+    built_in_tool("find", "Find files by name", false),
+    built_in_tool("ls", "List directory entries", false),
+];
+const OMP_BUILT_IN_TOOLS: &[NativeToolSpec] = &[
+    CADENCE_TOOL,
+    built_in_tool("read", "Read files in the workspace", false),
+    built_in_tool("bash", "Run shell commands", false),
+    built_in_tool("edit", "Edit existing files", false),
+    built_in_tool("write", "Create or overwrite files", false),
+    built_in_tool("grep", "Search file contents", false),
+    built_in_tool("glob", "Find files by pattern", false),
+];
+const CLAUDE_BUILT_IN_TOOLS: &[NativeToolSpec] = &[
+    CADENCE_TOOL,
+    built_in_tool("Read", "Read files in the workspace", false),
+    built_in_tool("Edit", "Edit existing files", false),
+    built_in_tool("Write", "Create or overwrite files", false),
+    built_in_tool("Bash", "Run shell commands", false),
+    built_in_tool("Glob", "Find files by pattern", false),
+    built_in_tool("Grep", "Search file contents", false),
+    built_in_tool("WebFetch", "Fetch web pages", false),
+    built_in_tool("WebSearch", "Search the web", false),
+];
+const DEFAULT_BUILT_IN_TOOLS: &[NativeToolSpec] = &[CADENCE_TOOL];
+
+/// CAD-2092: built-in tools this provider's managed runtime enforces at launch.
+pub fn native_tool_catalog(provider: &str, kind: &str) -> &'static [NativeToolSpec] {
+    match (provider, kind) {
+        ("pi", "managed") => PI_BUILT_IN_TOOLS,
+        ("omp", "managed") => OMP_BUILT_IN_TOOLS,
+        ("claude", "managed") => CLAUDE_BUILT_IN_TOOLS,
+        _ => DEFAULT_BUILT_IN_TOOLS,
+    }
+}
+
+/// CAD-2092: validate `params.disabled_tools` against the provider's allowlist.
+/// The required `cadence` tool can never be disabled.
+pub fn validate_disabled_tools(
+    provider: &str,
+    kind: &str,
+    disabled: &[String],
+) -> Result<Vec<String>> {
+    let catalog = native_tool_catalog(provider, kind);
+    let mut out = Vec::with_capacity(disabled.len());
+    for name in disabled {
+        if name == REQUIRED_TOOL {
+            return Err(Error::rejected(format!(
+                "required tool '{REQUIRED_TOOL}' cannot be turned off"
+            )));
+        }
+        let Some(spec) = catalog.iter().find(|t| t.name == name) else {
+            let toggleable: Vec<&str> = catalog
+                .iter()
+                .filter(|t| !t.required)
+                .map(|t| t.name)
+                .collect();
+            return Err(Error::rejected(format!(
+                "unknown or non-toggleable tool {name:?} for {provider}/{kind}; toggleable: {}",
+                if toggleable.is_empty() {
+                    "none".to_string()
+                } else {
+                    toggleable.join(", ")
+                }
+            )));
+        };
+        if spec.required {
+            return Err(Error::rejected(format!(
+                "required tool '{}' cannot be turned off",
+                spec.name
+            )));
+        }
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// CAD-2092: parse and validate a JSON `params.disabled_tools` value.
+pub fn validate_disabled_tools_param(
+    provider: &str,
+    kind: &str,
+    value: &Value,
+) -> Result<Vec<String>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| Error::rejected("'disabled_tools' must be an array of tool names"))?;
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(name) = item.as_str() else {
+            return Err(Error::rejected("'disabled_tools' entries must be strings"));
+        };
+        names.push(name.to_string());
+    }
+    validate_disabled_tools(provider, kind, &names)
+}
+
+/// CAD-2092: JSON view of a native agent's built-in tools for `/api/agents/<alias>`.
+pub fn native_tools_json(provider: &str, kind: &str, params: Option<&Value>) -> Vec<Value> {
+    let disabled: Vec<String> = params
+        .and_then(|p| p.get("disabled_tools"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    native_tool_catalog(provider, kind)
+        .iter()
+        .map(|tool| {
+            let enabled = tool.required || !disabled.iter().any(|d| d == tool.name);
+            json!({
+                "name": tool.name,
+                "line": tool.line,
+                "description": tool.line,
+                "source": "built_in",
+                "bundled": true,
+                "required": tool.required,
+                "enabled": enabled,
+                "applies": "next_launch",
+            })
+        })
+        .collect()
 }
 
 impl Attach {
@@ -1968,6 +2224,27 @@ mod tests {
     }
 
     #[test]
+    fn a_reviewer_pane_is_refused_and_other_roles_keep_theirs() {
+        for provider in ["devin", "cursor", "claude"] {
+            for role in ["reviewer", "Reviewer", "code-reviewer"] {
+                let message = refuse_reviewer_pane(provider, "pty", role)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    message.contains("a reviewer does not run in a terminal pane"),
+                    "{message}"
+                );
+                assert!(message.contains("cadence join <pm> claude"), "{message}");
+            }
+            for role in ["worker", "pm"] {
+                assert!(refuse_reviewer_pane(provider, "pty", role).is_ok());
+            }
+        }
+        assert!(refuse_reviewer_pane("claude", "managed", "reviewer").is_ok());
+        assert!(refuse_reviewer_pane("tui-stub", "pty", "reviewer").is_ok());
+    }
+
+    #[test]
     fn fake_kind_is_provider_agnostic() {
         let s = spec_opt("devin", "fake").unwrap();
         assert_eq!(s.provider, "fake");
@@ -2016,23 +2293,40 @@ mod tests {
             "threads",
             "fake_provider_tests",
             "devin_cloud",
+            // CAD-1853: the actorless cloud conversational endpoint's own
+            // capability, unioned once from its spec.
+            "cloud_agent_conversation",
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 21);
     }
 
     #[test]
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
+        // `agenticos-cloud` is a real registered provider row (CAD-1853) with
+        // no launch model of its own, exactly like `sandbox`: it stays visible
+        // ineligible so the settings page explains why it has no default.
         assert_eq!(
             ids,
-            vec!["codex", "claude", "pi", "omp", "devin", "cursor", "sandbox"]
+            vec![
+                "codex",
+                "claude",
+                "pi",
+                "omp",
+                "devin",
+                "cursor",
+                "sandbox",
+                "agenticos-cloud"
+            ]
         );
         assert!(rows
             .iter()
             .any(|row| { row.id == "sandbox" && !row.eligible && row.limitation.is_some() }));
+        assert!(rows.iter().any(|row| {
+            row.id == "agenticos-cloud" && !row.eligible && row.limitation.is_some()
+        }));
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
         assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows

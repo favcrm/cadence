@@ -153,7 +153,16 @@ impl WsAdapter {
     /// `close` can kill a provider stuck in setup; every post-spawn
     /// failure kills it. The pre-bind/drop leaves a small reclaim race,
     /// bounded to loopback and detected by the connect loop.
-    pub fn launch(self: &Arc<Self>, cwd: &str, stderr_log: &std::path::Path) -> Result<Launch> {
+    ///
+    /// `role` is the role's launch environment (CAD-2239). The child is a
+    /// local process, so it is applied last, after the scrub, exactly as
+    /// `StdioAdapter::launch` does.
+    pub fn launch(
+        self: &Arc<Self>,
+        cwd: &str,
+        stderr_log: &std::path::Path,
+        role: &super::RoleEnv,
+    ) -> Result<Launch> {
         let port = {
             let listener = TcpListener::bind(("127.0.0.1", 0))?;
             listener.local_addr()?.port()
@@ -171,6 +180,7 @@ impl WsAdapter {
         for name in &self.env_scrub {
             command.env_remove(name);
         }
+        role.apply(&mut command);
         // Own process group: signals reach only this provider.
         unsafe {
             command.pre_exec(|| {

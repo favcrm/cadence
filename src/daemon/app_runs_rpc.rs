@@ -79,10 +79,10 @@ fn freeze_content_inputs(
     (effective, origins)
 }
 
-/// The installed bundle checks an installation approval rests on: a
-/// typed manifest with no legacy untyped connection slots and at least one
-/// supported local workflow. Shared by the explicit operator approval and
-/// the consent an operator install or update records (CAD-1119).
+/// The installed bundle checks an installation approval rests on: supported
+/// host requirements, paired storage declarations, no legacy untyped connection
+/// slots and at least one supported local workflow. Shared by explicit approval
+/// and the consent an operator install or update records (CAD-1119).
 pub(super) fn local_execution_contract(
     files: &BTreeMap<String, String>,
 ) -> Result<crate::issue::app::Manifest> {
@@ -91,6 +91,10 @@ pub(super) fn local_execution_contract(
             .get("app.md")
             .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
     )?;
+    crate::issue::app::validate_storage_members(&manifest, files.keys().map(String::as_str))?;
+    manifest
+        .requires
+        .check(&cadence_core::app_compat::host(env!("CARGO_PKG_VERSION"))?)?;
     if !manifest.connections.is_empty() {
         return Err(Error::rejected(
             "local text execution does not support connection capabilities",
@@ -164,7 +168,8 @@ impl Shared {
         }) {
             return Err(Error::rejected("inputs must be a string map"));
         }
-        let created = self.create_app_run_as(params, team.as_ref(), Some(expected), human)?;
+        let created =
+            self.create_app_run_as(params, team.as_ref(), Some(expected), human, false)?;
         let id = created["id"]
             .as_str()
             .ok_or_else(|| Error::internal("created run has no id"))?
@@ -285,6 +290,58 @@ impl Shared {
         })
     }
 
+    /// CAD-1868: who a run acts as. Without `sealed_grant` it is the relayed
+    /// browser credential (`run_creator`, `account_image_actor`). With it, the
+    /// run belongs to a refine standing grant and acts as the grant's sealed
+    /// owner `human`: re-proven fresh (`fresh_run_human`), its live public
+    /// row read by session reference, the account actor taken from that row's
+    /// current hash (`account_image_actor_for_session`) and required to be
+    /// that same owner. Any refusal refuses the run; there is no operator
+    /// fallback, and a relayed credential cannot ride along.
+    fn run_actors(
+        &self,
+        params: &Value,
+        human: Option<&Value>,
+        sealed_grant: bool,
+    ) -> Result<(Value, Value)> {
+        if !sealed_grant {
+            return Ok((self.run_creator(params)?, self.account_image_actor(params)?));
+        }
+        if ["token", "key", "origin", "public_session"]
+            .iter()
+            .any(|field| params.get(field).is_some())
+        {
+            return Err(Error::rejected(
+                "a standing-grant run carries no session credential",
+            ));
+        }
+        let lapsed = || {
+            Error::gate_coded(
+                "human_authority_revoked",
+                "the board session that allowed this is no longer current; the run is refused",
+            )
+        };
+        let human = human.ok_or_else(lapsed)?;
+        self.fresh_run_human(human)?;
+        let (Some(sub), Some(company), Some(session)) = (
+            human["sub"].as_str(),
+            human["company"].as_str(),
+            human["session"].as_str(),
+        ) else {
+            return Err(lapsed());
+        };
+        let hash = self
+            .operator_auth()
+            .public_snapshot_by_session_id(session, self.operator_now())
+            .map(|snapshot| snapshot.hash)
+            .ok_or_else(lapsed)?;
+        let actor = self.account_image_actor_for_session(&hash)?;
+        if actor["kind"] != "user" || actor["id"] != sub || actor["workspace_id"] != company {
+            return Err(lapsed());
+        }
+        Ok((json!({"kind": "user", "id": sub}), actor))
+    }
+
     /// The one run-creation path: `app_run_create` (owner and workers named by
     /// the caller) and `app_run_start` (owner and workers from the install's
     /// default team, quotes checked against `expected`). Operator proof is the
@@ -295,6 +352,7 @@ impl Shared {
         team: Option<&super::app_teams_rpc::Team>,
         expected: Option<&Value>,
         human: Option<&Value>,
+        sealed_grant: bool,
     ) -> Result<Value> {
         // CAD-1171: a host-execution run names no owner PM — the operator's
         // own click executes its capability steps. An agent run still needs
@@ -305,8 +363,7 @@ impl Shared {
         // `{kind:"operator"}`; a relayed credential must fully verify
         // through `tool_session` — partial or invalid proofs refuse,
         // never an operator fallback.
-        let creator = self.run_creator(params)?;
-        let account_actor = self.account_image_actor(params)?;
+        let (creator, account_actor) = self.run_actors(params, human, sealed_grant)?;
         // Owner resolution needs the installed template's declared
         // execution, so it happens inside the runtime snapshot below.
         if params.get("source_receipt_id").is_some() != params.get("selected_post_id").is_some() {
@@ -336,6 +393,7 @@ impl Shared {
             workflow,
             inputs,
             input_origins,
+            team_roles,
             owner_pm,
             context,
             binding,
@@ -391,6 +449,7 @@ impl Shared {
                 Some(team) => Some(team.owner_pm.clone()),
                 None => optional_str(params, "owner_pm").map(str::to_string),
             };
+            let mut team_roles: BTreeMap<String, String> = BTreeMap::new();
             if let Some(team) = effective_team {
                 // The team is the only source of worker aliases: a
                 // caller-supplied value for a team role is a forgery.
@@ -404,6 +463,10 @@ impl Shared {
                         ));
                     }
                     inputs.insert(role.clone(), alias.clone());
+                    // CAD-622: the same pair is frozen as team-role
+                    // provenance, so the app-team guard never has to
+                    // infer role names from the merged input map.
+                    team_roles.insert(role.clone(), alias.clone());
                 }
             }
             let context = optional_str(params, "context_id")
@@ -460,7 +523,15 @@ impl Shared {
                 )
                 .map_err(Error::rejected)?;
             }
-            let workflow = LocalWorkflow::parse(text, &inputs).map_err(|error| {
+            // CAD-1867: a step's `skill: <tag>` is resolved from THIS
+            // installed bundle's own file map — the same validator install
+            // ran — and frozen into the step, so the snapshot digest covers
+            // it. Nothing is written to disk and the live bundle is never
+            // consulted again.
+            let workflow = LocalWorkflow::parse_installed(text, &inputs, &|tag: &str| {
+                crate::issue::app::skill_package(files, tag)
+            })
+            .map_err(|error| {
                 if context.is_some() {
                     Error::rejected("contextual workflow inputs refused")
                 } else {
@@ -530,6 +601,7 @@ impl Shared {
                 workflow,
                 inputs,
                 input_origins,
+                team_roles,
                 owner_pm,
                 context,
                 binding,
@@ -541,9 +613,8 @@ impl Shared {
             .into_iter()
             .map(|(slot, request)| Ok((slot, request.fetch()?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        if self.run_creator(params)? != creator
-            || self.account_image_actor(params)? != account_actor
-        {
+        let (creator_now, actor_now) = self.run_actors(params, human, sealed_grant)?;
+        if creator_now != creator || actor_now != account_actor {
             return Err(Error::rejected(
                 "native run creator changed during price discovery",
             ));
@@ -607,6 +678,7 @@ impl Shared {
                     selected_source: optional_str(params, "source_receipt_id")
                         .zip(optional_str(params, "selected_post_id")),
                     input_origins: &input_origins,
+                    team_roles: &team_roles,
                     human,
                 },
                 Some(&creator),
@@ -706,6 +778,54 @@ impl Shared {
         Ok(outcome.map(|changed| changed.is_some()))
     }
 
+    /// The consent and the switch an automatic apply observed. The client
+    /// re-reads both before the Git fetch, which runs without the PM lock, so
+    /// this reads them again under the caller's lock immediately before the
+    /// upgrade commits. Revoke takes that same lock, so a revocation that
+    /// landed during the fetch is visible here and the bundle is not replaced.
+    pub(super) fn automatic_update_still_observed(
+        &self,
+        install_id: &str,
+        observed_digest: &str,
+    ) -> Result<()> {
+        let preference = self.store.app_automatic_updates_get(install_id)?;
+        if preference["automatic"] != true {
+            return Err(Error::rejected(
+                "automatic updates are off; the checked update was not applied",
+            ));
+        }
+        let current = self.store.app_install_consent_current(install_id)?;
+        if current["state"] != "approved" || current["digest"].as_str() != Some(observed_digest) {
+            return Err(Error::rejected(
+                "install consent changed before the automatic update",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record approval of the new digest only while the observed consent still
+    /// holds. A retry of a request that already approved this digest is a
+    /// no-op. A revoke or a switch turned off after the fetch refuses, and
+    /// does not write a fresh approval over that decision.
+    pub(super) fn record_automatic_upgrade_consent(
+        &self,
+        pm: &crate::issue::Pm,
+        install: &str,
+        new_digest: &str,
+        observed_digest: &str,
+    ) -> Result<Value> {
+        let (value, _) =
+            self.record_install_consent_guarded(pm, install, new_digest, "upgrade", &|| {
+                let current = self.store.app_install_consent_current(install)?;
+                if current["state"] == "approved" && current["digest"].as_str() == Some(new_digest)
+                {
+                    return Ok(());
+                }
+                self.automatic_update_still_observed(install, observed_digest)
+            })?;
+        Ok(value)
+    }
+
     pub(super) fn rpc_app_local(
         self: &Arc<Self>,
         method: &str,
@@ -756,10 +876,29 @@ impl Shared {
                 "origin",
             ],
             "app_run_approve" => &["run_id", "digest", "public_session"],
-            "app_run_cancel" | "app_run_dispatch" => &["run_id", "public_session"],
+            "app_run_cancel" | "app_run_dispatch" | "app_run_retire_legacy" => {
+                &["run_id", "public_session"]
+            }
             "app_run_show" => &["run_id"],
             "app_run_list" => &["install_id", "context_id"],
             "app_run_artifact" => &["artifact_id", "message", "token"],
+            "app_run_disposition" => &[
+                "run_id",
+                "request_id",
+                "artifact_id",
+                "digest",
+                "decision",
+                "public_session",
+            ],
+            "app_run_ticket_reserve" => &[
+                "run_id",
+                "request_id",
+                "artifact_id",
+                "digest",
+                "index",
+                "public_session",
+            ],
+            "app_run_ticket_bind" => &["run_id", "request_id", "issue_id", "public_session"],
             _ => return Err(Error::rejected("unknown app lifecycle method")),
         };
         let fields = params
@@ -811,9 +950,13 @@ impl Shared {
                 | "app_local_install_revoke"
                 | "app_run_approve"
                 | "app_run_cancel"
+                | "app_run_retire_legacy"
                 | "app_run_dispatch"
                 | "app_run_start"
-                | "app_run_create",
+                | "app_run_create"
+                | "app_run_disposition"
+                | "app_run_ticket_reserve"
+                | "app_run_ticket_bind",
                 Some(_),
             ) => {
                 // An agent (registered pane or managed endpoint) never carries
@@ -901,7 +1044,7 @@ impl Shared {
                     "revoke",
                 )
             }
-            "app_run_create" => self.create_app_run_as(params, None, None, human),
+            "app_run_create" => self.create_app_run_as(params, None, None, human, false),
             "app_run_start" => self.start_app_run(params, human),
             "app_run_approve" => {
                 let id = required_str(params, "run_id")?;
@@ -928,6 +1071,9 @@ impl Shared {
                     human,
                 )
             }
+            "app_run_retire_legacy" => self
+                .store
+                .app_run_retire_legacy(required_str(params, "run_id")?, human),
             "app_run_dispatch" => {
                 let run = self.dispatch_app_run_as(required_str(params, "run_id")?, human)?;
                 // CAD-1120: a kickoff queued for a worker the idle timer
@@ -949,9 +1095,94 @@ impl Shared {
                 self.store
                     .app_artifact_for_operator(required_str(params, "artifact_id")?)
             }
+            "app_run_disposition" => self.store.app_run_disposition(
+                required_str(params, "run_id")?,
+                required_str(params, "request_id")?,
+                required_str(params, "artifact_id")?,
+                required_str(params, "digest")?,
+                required_str(params, "decision")?,
+                human,
+            ),
+            "app_run_ticket_reserve" => {
+                let index = params.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    Error::rejected("suggestion index must be a positive integer")
+                })?;
+                if index == 0 || index > 64 {
+                    return Err(Error::rejected(
+                        "suggestion index is outside the proposal list",
+                    ));
+                }
+                self.store.app_run_ticket_reserve(
+                    required_str(params, "run_id")?,
+                    required_str(params, "request_id")?,
+                    required_str(params, "artifact_id")?,
+                    required_str(params, "digest")?,
+                    index as u32,
+                    human,
+                )
+            }
+            "app_run_ticket_bind" => self.bind_app_run_ticket(params, human),
             _ => Err(Error::rejected("unknown app lifecycle method")),
         }
     }
+
+    /// CAD-1887: record an issue only when it is this reservation's
+    /// committed selected ticket. The tracker lock is held across the
+    /// check and the SQLite update. A missing id, a different issue, or
+    /// an uncommitted match never binds, and this path does not commit,
+    /// allocate, or clear crash leftovers.
+    fn bind_app_run_ticket(&self, params: &Value, human: Option<&Value>) -> Result<Value> {
+        let run_id = required_str(params, "run_id")?;
+        let request_id = required_str(params, "request_id")?;
+        let issue_id = required_str(params, "issue_id")?;
+        if let Some(reserved) = self.unbound_selected_ticket(run_id, request_id)? {
+            let pm = self.pm()?;
+            // Scope the lock to the claimed issue when it exists so an
+            // unrelated crash does not block a clean ticket, and an
+            // overlapping crash refuses before SQLite. A missing issue
+            // has nothing to lock; the confirm below refuses it.
+            let _lock = match crate::issue::write::issue_dir(&pm, issue_id) {
+                Ok((_, dir)) => Some(pm.lock_for_paths(&[dir.join("issue.md")])?),
+                Err(_) => None,
+            };
+            crate::issue::write::confirm_committed_selected_issue(&pm, issue_id, &reserved)?;
+            let bound = self
+                .store
+                .app_run_ticket_bind(run_id, request_id, issue_id, human)?;
+            drop(_lock);
+            return Ok(bound);
+        }
+        self.store
+            .app_run_ticket_bind(run_id, request_id, issue_id, human)
+    }
+
+    /// The reservation still waiting for its issue, shaped for the
+    /// ticket body check. `None` leaves the store bind to answer
+    /// (missing reservation, mismatched request, or an already-bound
+    /// replay) without a tracker read.
+    fn unbound_selected_ticket(&self, run_id: &str, request_id: &str) -> Result<Option<Value>> {
+        let shown = match self.store.app_run_show(run_id) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        let ticket = &shown["ticket"];
+        if !ticket.is_object()
+            || ticket.get("request_id").and_then(Value::as_str) != Some(request_id)
+            || !ticket.get("issue_id").is_some_and(Value::is_null)
+        {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "run_id": run_id,
+            "request_id": request_id,
+            "artifact_id": ticket["artifact_id"],
+            "artifact_digest": ticket["artifact_digest"],
+            "index": ticket["index"],
+            "count": ticket["count"],
+            "suggestion": ticket["suggestion"],
+        })))
+    }
+
     /// Capture only local receipts under the established lock order. The
     /// caller performs price I/O unlocked, then rechecks these same receipts.
     pub(super) fn prepare_app_run_quotes(
@@ -1514,14 +1745,9 @@ impl Shared {
                             error.kind(),
                             &message,
                         )?;
-                        return Err(match error {
-                            crate::platform::AppCapabilityError::Refused(_) => {
-                                Error::provider(message)
-                            }
-                            crate::platform::AppCapabilityError::Uncertain(_) => {
-                                Error::unknown(message)
-                            }
-                        });
+                        return Err(super::app_capabilities_rpc::run_capability_error(
+                            &error, message,
+                        ));
                     }
                 };
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.
@@ -1878,14 +2104,7 @@ mod cad1156_tests;
 #[cfg(test)]
 mod cad1120_tests;
 #[cfg(test)]
-mod cad1123_acceptance;
-#[cfg(test)]
 mod cad1123_tests;
-#[cfg(test)]
-mod cad1230_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad792_acceptance;
-
 #[cfg(test)]
 mod cad742_tests {
     use super::*;

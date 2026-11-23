@@ -7,6 +7,7 @@ import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import { prRef } from "./model";
 import { type IssuePageProps as Props } from "./issuePageProps";
+import { HostedPrGateSection } from "../home/HostedMergeGate";
 
 export function PrPanel({
   detail,
@@ -98,6 +99,13 @@ export function PrPanel({
           </>
         )}
       </section>
+      {pr && (pr.href || pr.label) && (
+        <HostedPrGateSection
+          detail={detail}
+          prRef={pr.href ?? pr.label}
+          readOnly={readOnly}
+        />
+      )}
       <section className="grid gap-3">
         <h2 className="text-cardtitle font-semibold text-ink-100 m-0">
           Review reports

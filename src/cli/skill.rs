@@ -13,6 +13,15 @@ pub(crate) enum SkillAction {
     /// Inspect every bundled guidance file and each provider's discovery link.
     /// This does not write, and it does not claim a live session reloaded.
     Status,
+    /// Read a bundled skill without writing anything: a JSON manifest of
+    /// its files and byte counts, or with `--file` that file's exact bytes.
+    Show {
+        #[arg(value_parser = cadence_agent::skill::SKILL_NAMES)]
+        name: String,
+        /// A bundled file path, for example `scripts/next.py`.
+        #[arg(long)]
+        file: Option<String>,
+    },
     /// Non-force refresh used by native `cadence update` so the activated
     /// binary writes its own embedded bytes. Not a second installer:
     /// `cadence skill install` remains the manual repair. Matching files
@@ -21,15 +30,26 @@ pub(crate) enum SkillAction {
     Sync,
 }
 
+/// Read the copy bundled in this executable, without consulting home or state.
+pub(super) fn show(name: &str, file: Option<&str>) -> Result<i32> {
+    match cadence_agent::skill::show(name, file)? {
+        cadence_agent::skill::ShowOutput::Manifest(manifest) => print_json(&manifest),
+        cadence_agent::skill::ShowOutput::File(text) => cadence_agent::output::print_text(text),
+    }
+    Ok(0)
+}
+
 pub(super) fn run(_state_dir: PathBuf, action: SkillAction) -> Result<i32> {
-    let home = home_dir()?;
     match action {
         SkillAction::Install { name } => {
+            let home = home_dir()?;
             let report = cadence_agent::skill::sync(&home, true, name.as_deref())?;
             print_json(&report);
         }
-        SkillAction::Status => print_json(&cadence_agent::skill::status(&home)),
+        SkillAction::Status => print_json(&cadence_agent::skill::status(&home_dir()?)),
+        SkillAction::Show { name, file } => return show(&name, file.as_deref()),
         SkillAction::Sync => {
+            let home = home_dir()?;
             if cadence_agent::sandbox::profile().is_some() {
                 print_json(&json!({
                     "skipped": true,

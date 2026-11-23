@@ -148,8 +148,6 @@ pub(super) struct ToolCall<'a> {
     pub request_id: &'a str,
     pub input: &'a Value,
     pub generation_scope: Option<&'a Value>,
-    /// The price the operator confirmed; a higher live quote is refused.
-    pub ceiling_micros: Option<u64>,
 }
 
 /// Bounded action-context map: ≤256 live mounts' contexts process-wide.
@@ -213,13 +211,25 @@ enum GenerationSettlement {
 
 fn generation_settlement(error: &AppCapabilityError) -> GenerationSettlement {
     match error {
-        AppCapabilityError::Refused(_) => GenerationSettlement::Refused,
+        AppCapabilityError::Refused(_) | AppCapabilityError::InsufficientFunds(_) => {
+            GenerationSettlement::Refused
+        }
         // `idempotency_in_progress` is the provider's own typed code, carried
         // in the uncertain reason; it only picks the pending sub-state.
         AppCapabilityError::Uncertain(reason) if reason.contains("idempotency_in_progress") => {
             GenerationSettlement::Pending
         }
         AppCapabilityError::Uncertain(_) => GenerationSettlement::Uncertain,
+    }
+}
+
+/// A tool-call refusal for the assistant: a 402 keeps its typed code.
+fn tool_refusal(error: &AppCapabilityError) -> Error {
+    match error {
+        AppCapabilityError::InsufficientFunds(_) => {
+            Error::invalid("insufficient_funds", error.to_string())
+        }
+        _ => Error::rejected(error.to_string()),
     }
 }
 
@@ -649,7 +659,6 @@ impl Shared {
                 request_id,
                 input: &input,
                 generation_scope: params.get("generation_scope"),
-                ceiling_micros: None,
             },
         )
     }
@@ -657,9 +666,8 @@ impl Shared {
     /// The guarded execution core shared by the screen entry above and the
     /// operator-approved assistant action (CAD-1327): digest pin, approval,
     /// declared-slot effect, request-id replay, live binding, re-quote,
-    /// exactly-once claim and receipt. `ceiling_micros`, when set, is the
-    /// price the operator confirmed: a live quote above it is refused before
-    /// any claim or provider I/O.
+    /// exactly-once claim and receipt. The live quote is the provider's
+    /// `max_charge_minor` ceiling (CAD-1141); no confirmed price is compared.
     pub(super) fn app_tool_execute(
         self: &Arc<Self>,
         ctx: &ToolContext,
@@ -671,7 +679,6 @@ impl Shared {
             request_id,
             input,
             generation_scope,
-            ceiling_micros,
         } = call;
         let input = input.clone();
         let pm_dir = self.pm_dir()?;
@@ -807,7 +814,12 @@ impl Shared {
                         &self.state_dir,
                         &ctx.install_id,
                     )?;
-                    scoped.app_social_tool_receipt_attach(context, receipt_id, completed)?;
+                    scoped.app_social_tool_receipt_attach(
+                        context,
+                        receipt_id,
+                        completed,
+                        existing["result"]["kind"].as_str().unwrap_or(""),
+                    )?;
                     scoped.app_social_generation_complete_request(request_id, receipt_id)?;
                     if existing["result"]["kind"] == "social.source.posts" {
                         let handle = existing["result"]["handle"]
@@ -904,13 +916,6 @@ impl Shared {
                     })
             {
                 return Err(Error::rejected("tool mount changed during price discovery"));
-            }
-            if ceiling_micros.is_some_and(|ceiling| quote.total_price_micros > ceiling) {
-                return Err(Error::rejected(format!(
-                    "price_changed: the live price {} micros is above the confirmed {} micros",
-                    quote.total_price_micros,
-                    ceiling_micros.unwrap_or(0)
-                )));
             }
             let config = &proof.config;
             let provider = required_str(config, "provider")?;
@@ -1257,7 +1262,7 @@ impl Shared {
                                 None,
                                 Some("verified_provider_refusal"),
                             )?;
-                            return Err(Error::rejected(error.to_string()));
+                            return Err(tool_refusal(&error));
                         }
                         let pending = settlement == GenerationSettlement::Pending;
                         let state = if pending { "pending" } else { "uncertain" };
@@ -1278,7 +1283,7 @@ impl Shared {
                             json!({"generation_intent":{"request_id":request_id,"operation":scope["operation"],"draft_id":scope["draft_id"],"revision":scope["revision"],"input_digest":app_runs::material_digest(plan),"input":plan,"state":state,"updated_at":crate::issue::time::now_epoch()},"replayed":true}),
                         );
                     }
-                    return Err(Error::rejected(error.to_string()));
+                    return Err(tool_refusal(&error));
                 }
             };
             crate::platform::refuse_leak(
@@ -1327,6 +1332,7 @@ impl Shared {
                             context,
                             required_str(&receipt, "id")?,
                             created,
+                            receipt["result"]["kind"].as_str().unwrap_or(""),
                         )?;
                 }
             }
@@ -1422,16 +1428,18 @@ impl Shared {
                 self.store.app_context_proof(install, context)?;
                 let records =
                     crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
-                let visible = records.app_social_freshness_receipts(context)?;
-                let mut results = self.store.app_tool_results(install)?;
-                if let Some(rows) = results["results"].as_array_mut() {
-                    rows.retain(|row| {
-                        row["id"]
-                            .as_str()
-                            .is_some_and(|id| visible.iter().any(|allowed| allowed == id))
-                    });
-                }
-                Ok(results)
+                // SOC-54: the screen's library is the retained source reads OF
+                // THIS CONTEXT, bounded. The candidate set is this context's
+                // own newest attachments, so a read never walks another
+                // context's history and cannot be slowed or starved by it; the
+                // store then keeps source reads only, newest first, up to 100.
+                const CANDIDATES: usize = 500;
+                const LIMIT: usize = 100;
+                let candidates = records.app_social_tool_receipt_ids(context, CANDIDATES)?;
+                let rows = self
+                    .store
+                    .app_tool_source_results_for(install, &candidates, LIMIT)?;
+                Ok(json!({ "results": rows }))
             }
             _ => Err(Error::rejected(
                 "app tool result takes exactly receipt_id or install_id",

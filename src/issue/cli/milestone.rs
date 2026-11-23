@@ -71,8 +71,8 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
         }
     }
     let issues = board::load_all(&pm.dir, None)?;
-    let jobs = board::fetch_job_outcomes(state_dir);
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let jobs = board::fetch_job_state(state_dir);
+    let views = board::views_with_job_state(&pm.config.notes_dir(), issues, &jobs);
     let by_id: std::collections::HashMap<String, &board::View> = views
         .iter()
         .map(|v| (v.issue.front.id.clone(), v))

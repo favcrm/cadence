@@ -2,6 +2,7 @@ import { createSha256 } from "../app-shell/csvDigest";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { notifyPrivateSessionRequired, privateFetch, type PrivateOperation } from "../../lib/privateSession";
 import { wikiErrorFrom, WikiError, wiki } from "./api";
+import { HOSTED_UPLOAD_MAX_BYTES, statusText } from "./hosted";
 
 export const CHUNK_BYTES = 16384;
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
@@ -27,6 +28,10 @@ export interface ImportResult {
   index: string;
   rev?: string;
   error?: string;
+  /** Hosted only: a plain sentence for the Worker's status (an English locale key). */
+  detail?: string;
+  /** Hosted only: the saved file needs attention (empty, failed or unsupported). */
+  warn?: boolean;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -230,6 +235,76 @@ export async function importFile(
   forgetResume(root, sha256);
   if (outcome !== "applied" && outcome !== "skipped") throw new WikiError(error ?? `The import was not applied (${outcome})`, 502);
   return { outcome, extraction, index: text(status.index) ?? "pending", ...(rev ? { rev } : {}), ...(error ? { error } : {}) };
+}
+
+/**
+ * Hosted boards (whose Worker advertises `wiki: true`) serve no transfer-job
+ * protocol: one multipart `POST /api/wiki/upload` carries the file (`file`)
+ * and its destination (`path`, plus `if_rev`) — the same shape
+ * the local board accepts. Progress is all-or-nothing.
+ */
+export async function uploadMultipart(
+  root: string,
+  file: File,
+  update: boolean,
+  onProgress: (percent: number) => void,
+  operation: PrivateOperation,
+): Promise<ImportResult> {
+  if (file.name.includes("/") || file.name.includes("\\") || file.name === "." || file.name === "..") {
+    throw new WikiError("Use a file name inside this folder", 400);
+  }
+  if (file.size === 0) throw new WikiError("empty file — rejected", 400);
+  if (file.size > HOSTED_UPLOAD_MAX_BYTES) throw new WikiError(`over ${Math.round(HOSTED_UPLOAD_MAX_BYTES / (1024 * 1024))} MB — rejected`, 400);
+  const ifRev = await destinationRev(root, file.name, update);
+  operation.assertCurrent();
+  const form = new FormData();
+  form.append("path", root ? `${root}/${file.name}` : file.name);
+  form.append("if_rev", ifRev); // "none" = create only, never clobber
+  form.append("file", file, file.name);
+  onProgress(0);
+  const resp = await privateFetch("/api/wiki/upload", {
+    method: "POST",
+    headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
+    body: form,
+  }, operation);
+  const body: unknown = await resp.json().catch(() => null);
+  operation.assertCurrent();
+  if (resp.status === 401) notifyPrivateSessionRequired(resp.status, body, operation);
+  const row = record(body);
+  if (!resp.ok) {
+    // Hosted refusals nest as {error:{code,message}}; local ones are {error:"…"}.
+    const nested = record(row?.error);
+    throw wikiErrorFrom(resp.status, nested ? { ...row, error: text(nested.message), code: text(row?.code) ?? text(nested.code) } : body);
+  }
+  // A 2xx RPC envelope can still be a refused write: a native board answers an
+  // occupied create-only destination, or a stale update, with
+  // `{conflict:"if_rev"}` and stores nothing. Reporting those bytes as saved
+  // would claim an upload that never happened.
+  if (row?.conflict === "if_rev")
+    throw wikiErrorFrom(409, { ...row, error: "This file changed since it was chosen", code: "conflict" });
+  onProgress(100);
+  const rev = text(row?.rev) ?? undefined;
+  const kind = text(row?.kind);
+  const status = text(row?.status);
+  const mapped = statusText(status);
+  const reason = text(row?.status_reason);
+  // A text upload is written as a page inside the board's index, so it is
+  // searchable at once. An attachment carries the Worker's own extraction
+  // status; when the board does not report one, say so instead of guessing at
+  // a background job.
+  const page = kind === "text";
+  const indexed = page || status === "indexed";
+  return {
+    outcome: text(row?.outcome) ?? "applied",
+    extraction: status ?? (page ? "indexed" : "unknown"),
+    index: indexed ? "covered" : status ?? "unknown",
+    ...(rev ? { rev } : {}),
+    detail: mapped?.text ?? (page
+      ? "saved — this page is searchable"
+      : "saved — this board did not report its extraction state"),
+    warn: mapped?.warn ?? false,
+    ...(reason ? { error: reason } : {}),
+  };
 }
 
 export async function exportOriginal(path: string, at: string, operation: PrivateOperation): Promise<Blob> {

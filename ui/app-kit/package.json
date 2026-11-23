@@ -1,6 +1,6 @@
 {
   "name": "@cadence/app-kit",
-  "version": "0.1.2",
+  "version": "0.8.1",
   "private": true,
   "type": "module",
   "description": "The app side of the Cadence screen bridge, once.",
@@ -8,6 +8,10 @@
     ".": {
       "types": "./types/index.d.ts",
       "import": "./src/index.mjs"
+    },
+    "./react": {
+      "types": "./types/react.d.ts",
+      "import": "./src/react.mjs"
     }
   },
   "files": [
@@ -15,6 +19,14 @@
     "types",
     "README.md"
   ],
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
   "scripts": {
     "test": "node --test tests/*.test.mjs"
   },

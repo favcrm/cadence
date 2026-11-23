@@ -78,7 +78,7 @@ export interface ConversationRow {
   id: string;
   kind: ConversationKind;
   participants: Participant[];
-  last?: { preview: string; at: number } | null;
+  last?: { preview: string; at: number; cloud_withheld?: string | null } | null;
   counts?: ConversationCounts;
   last_activity: number;
   /** Group rows: the topic type, its source and its post count. */
@@ -124,6 +124,10 @@ export interface ThreadMessage {
   routed?: RoutedCopy[];
   /** The daemon's stored refusal/failure text, when one was recorded. */
   error?: string | null;
+  /** Set when this row's cloud content was withheld: the body and result are
+   *  empty on purpose, and the row says why instead of looking like an empty
+   *  completed message. */
+  cloud_withheld?: string | null;
   body: string;
   state: DeliveryState;
   issue: string | null;
@@ -239,6 +243,41 @@ function pageQuery(at: ReadPageOptions): string {
   else q.set("tail", "1");
   q.set("limit", String(at.limit ?? 50));
   return q.toString();
+}
+
+/** What a backward page says about its own scan: its continuation boundary
+ *  and whether raw rows remain below it. */
+export interface BackwardPage {
+  /** The LOWEST seq the page scanned — older history continues below it. */
+  scanned_before?: number | null;
+  /** Raw rows remain below the boundary (a page can keep nothing). */
+  more_before?: boolean | null;
+}
+
+/**
+ * Where a backward window continues, and whether more history exists below.
+ *
+ * The continuation is the boundary the page SCANNED — `scanned_before` — and
+ * never the oldest row it KEPT: a projection (or a redaction) can filter
+ * every row of a page, and a kept-row cursor would then re-fetch that same
+ * hidden page forever, so "Load earlier" would never reach the history below
+ * it. `more_before` is the daemon's exhaustion answer and is only withheld
+ * when the boundary cannot advance (a daemon that predates `scanned_before`,
+ * or a page that scanned nothing) — an end-of-history verdict is never
+ * inferred from visible rows alone.
+ */
+export function earlierBoundary(
+  page: BackwardPage,
+  oldestKept: number | null,
+): { before: number | null; more: boolean } {
+  const scanned =
+    typeof page.scanned_before === "number" &&
+    Number.isSafeInteger(page.scanned_before) &&
+    page.scanned_before > 0
+      ? page.scanned_before
+      : null;
+  const before = scanned ?? oldestKept;
+  return { before, more: page.more_before === true && before !== null };
 }
 
 /** `GET /api/work-conversations` — read-only. */

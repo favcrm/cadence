@@ -45,9 +45,14 @@ pub(super) enum RouteId {
     AgentDetail,
     AgentRoles,
     ExplorerUpdateCheck,
+    AutomaticUpdatesGet,
+    AutomaticUpdatesSet,
     ExplorerRemovePreview,
     ExplorerRemove,
     ExplorerRestore,
+    MemberAccessGet,
+    MemberAccessGrant,
+    MemberAccessRevoke,
     Mount,
     UpdateStart,
     UpdateCheck,
@@ -57,8 +62,10 @@ pub(super) enum RouteId {
     SettingsAgentsPreview,
     ModelDefaults,
     Locale,
+    TimeZone,
     Reports,
     AgentRegister,
+    AgentProfileCreate,
     CatalogInstall,
     CatalogGitCheck,
     CatalogRequest,
@@ -68,6 +75,7 @@ pub(super) enum RouteId {
     RequestDismiss,
     ArtifactRead,
     ArtifactVersions,
+    ProjectPolicy,
 }
 
 /// How one bound parameter is validated, and what a failure answers.
@@ -153,6 +161,15 @@ fn valid_alias(value: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
+
+/// The project key on a policy write: the same grammar the tracker's own
+/// `check_key` enforces, answered as the read arms answer it.
+const PROJECT_KEY: &[Binding] = &[Binding {
+    name: "key",
+    allow_empty: false,
+    validate: crate::issue::model::valid_key,
+    invalid: (400, "bad project key"),
+}];
 
 const MOUNT_BINDINGS: &[Binding] = &[
     Binding {
@@ -329,6 +346,18 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
         OperatorOnly,
         EXPLORER_ID
     ),
+    get!(
+        AutomaticUpdatesGet,
+        "/api/app-installations/{id}/automatic-updates",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    row!(
+        AutomaticUpdatesSet,
+        "/api/app-installations/{id}/automatic-updates",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
     row!(
         ExplorerRemovePreview,
         "/api/app-installations/{id}/remove-preview",
@@ -344,6 +373,27 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     row!(
         ExplorerRestore,
         "/api/app-installations/{id}/restore",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    // CAD-2215: member access is the operator's decision, read and written on
+    // one exact installation. The path's id is the only install the route
+    // names; the live roster proof rides the board's verified public session.
+    get!(
+        MemberAccessGet,
+        "/api/app-installations/{id}/member-access",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    row!(
+        MemberAccessGrant,
+        "/api/app-installations/{id}/member-access",
+        OperatorOnly,
+        EXPLORER_ID
+    ),
+    row!(
+        MemberAccessRevoke,
+        "/api/app-installations/{id}/member-access/revoke",
         OperatorOnly,
         EXPLORER_ID
     ),
@@ -393,8 +443,16 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
         &[]
     ),
     row!(Locale, "/api/locale", CallerScoped, &[]),
+    row!(TimeZone, "/api/time-zone", CallerScoped, &[]),
+    row!(
+        ProjectPolicy,
+        "/api/projects/{key}/policy",
+        OperatorOnly,
+        PROJECT_KEY
+    ),
     row!(Reports, "/api/reports", AgentAllowed, &[]),
     row!(AgentRegister, "/api/agents", OperatorOnly, &[]),
+    row!(AgentProfileCreate, "/api/agent-profiles", OperatorOnly, &[]),
     row!(
         CatalogInstall,
         "/api/app-catalog/install",
@@ -566,7 +624,8 @@ mod tests {
                 .replace("{tag}", "screen")
                 .replace("{alias}", "swe-1")
                 .replace("{artifact}", "art-1")
-                .replace("{version}", "1");
+                .replace("{version}", "1")
+                .replace("{key}", "cadence");
             let bound = resolve(row.method, &probe).expect("a declared pattern resolves");
             if bound.endpoint.id != row.id {
                 // `GET /api/app-installations/{id}` and the POST rows share a
@@ -666,6 +725,25 @@ mod tests {
         // the GET row, or a bare POST would answer 405 instead of the
         // admitted `404 no such write route`.
         assert!(resolve_or_path("POST", "/api/app-installations/inst-1").is_none());
+    }
+
+    /// CAD-1950: the policy write owns one project key and answers the read
+    /// arms' grammar for it — a key outside the tracker's spelling never
+    /// reaches the writer.
+    #[test]
+    fn the_policy_write_binds_one_project_key() {
+        let bound = resolve("POST", "/api/projects/cadence/policy").expect("the row binds");
+        assert_eq!(bound.endpoint.id, RouteId::ProjectPolicy);
+        assert_eq!(bound.endpoint.class, RouteClass::OperatorOnly);
+        assert_eq!(bound.get("key"), Some("cadence"));
+        assert!(bound.invalid().is_none());
+
+        let bound = resolve("POST", "/api/projects/Bad_Key/policy").expect("the row binds");
+        assert_eq!(bound.invalid().expect("invalid key").status_code().0, 400);
+        // The path is owned, so a GET reaches the dispatcher's 405 rather
+        // than falling through to a legacy route.
+        let bound = resolve_or_path("GET", "/api/projects/cadence/policy").expect("owned");
+        assert_eq!(bound.endpoint.method, "POST");
     }
 
     #[test]

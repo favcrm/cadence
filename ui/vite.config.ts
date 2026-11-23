@@ -1,9 +1,10 @@
 import { execSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { createReadStream, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
@@ -107,10 +108,40 @@ function precompress() {
   };
 }
 
+// PDF.js asks for these support files by name while rendering a page.
+// Serve only the installed package's known files; never resolve a request path on disk.
+function pdfPageAssets(): Plugin {
+  const root = dirname(createRequire(import.meta.url).resolve("pdfjs-dist/package.json"));
+  const assets = new Map([["assets/pdfjs/LICENSE", join(root, "LICENSE")]]);
+  for (const directory of ["cmaps", "standard_fonts", "wasm", "iccs"]) {
+    for (const file of readdirSync(join(root, directory))) {
+      assets.set(`assets/pdfjs/${directory}/${file}`, join(root, directory, file));
+    }
+  }
+  return {
+    name: "pdf-page-assets",
+    configureServer(server) {
+      server.middlewares.use((request, response, next) => {
+        const http = request as typeof request & { url?: string; method?: string };
+        const path = http.url?.slice(1).split("?", 1)[0];
+        const source = path === undefined ? undefined : assets.get(path);
+        if (!source || http.method !== "GET") return next();
+        if (source.endsWith(".wasm")) response.setHeader("Content-Type", "application/wasm");
+        createReadStream(source).pipe(response);
+      });
+    },
+    generateBundle() {
+      for (const [fileName, path] of assets) {
+        this.emitFile({ type: "asset", fileName, source: readFileSync(path) });
+      }
+    },
+  };
+}
+
 // Build emits fixed asset names — index.js/index.css plus the latin
 // woff2 files — so the Rust binary can embed them behind `--features ui`.
 export default defineConfig(({ command, isPreview }) => ({
-  plugins: [react(), tailwindcss(), precompress()],
+  plugins: [react(), tailwindcss(), pdfPageAssets(), precompress()],
   define: {
     __CADENCE_BUILD__: JSON.stringify(uiBuild()),
     __SHELL_VERSION__: JSON.stringify(shellVersion()),

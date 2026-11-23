@@ -1,7 +1,11 @@
 import { chatContext } from "../chatScreen";
 import { useCanvasFeed } from "../../canvas/feed";
+import { ViewScopeContext } from "../../home/ViewCard";
+import { ImageConversation } from "../../canvas/imageConversation";
 import {
   Fragment,
+  cloneElement,
+  isValidElement,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -11,14 +15,18 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { AttachmentNamesContext } from "../../home/TurnRichCards";
+import { attachmentNames } from "../../home/turnCards";
 import { api, ApiError } from "../../../lib/api";
 import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../../lib/privateSession";
 import { resources, threadReader } from "../../../lib/resources";
-import type { SseErrorState } from "../../../lib/sse";
 import { useQuery, useResource } from "../../../lib/useResource";
-import Link from "../../../ui/Link";
+import { IconClose } from "../../../ui/icons";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
+import { appendRejectReplyDraft, PermissionEnabledContext, PermissionReplyContext } from "../../home/PermissionCard";
+import { appendComposerDraft, ComposerFillContext } from "../../home/composerFill";
+import { PdfPageTarget } from "../../home/PdfPageAction";
 import { atTail, jumpLabel, tailTop } from "../../home/dock";
 import {
   initialFollow,
@@ -34,21 +42,32 @@ import {
   type ScrollKind,
 } from "../../home/scrollFollow";
 import { ThreadTurn, ThreadItemView, type Density } from "../../home/ThreadView";
+import { DayDivider, dayKey, itemCreated } from "../../home/DayDivider";
 import CorrectionReport from "../../wiki/CorrectionReport";
 import {
   addPending,
+  activeSendId,
   discardPending,
+  sendBefore,
+  failWithdrawn,
+  inFlightTurnKey,
+  unnamedTurnAnswered,
   itemMessage,
   newMessageId,
+  rowPaintKey,
   settlePending,
   stepSummary,
+  clockRuns,
   threadItems,
   threadRuns,
+  turnStartMs,
   visibleWindow,
+  type PendingAttachment,
   type ThreadItem,
 } from "../../home/thread";
 import type { Viewer } from "../../projects/work";
 import { useLocale } from "../../../lib/locale";
+import { isEnglishLocale } from "../../workspace-apps/appLocale";
 import { displayUiNotice, type UiNotice } from "../../../lib/uiNotice";
 import {
   conversationLabel,
@@ -72,6 +91,7 @@ import {
 } from "../conversationClient";
 import {
   carryEarlyDraft,
+  composerDraftState,
   composerHasIntent,
   composerScope,
   moveComposerScope,
@@ -90,18 +110,27 @@ import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
-import { hideIds, matchDirective, type Directive } from "./directive";
+import ConversationDecisions from "./ConversationDecisions";
+import { conversationDecisions, type DecisionsStore } from "../../decisions/useDecisions";
+import { StagedSourceContext } from "../../../ui/StagedChip";
+import {
+  AssistantActorProvider,
+  AssistantFace,
+  useConversationActor,
+} from "../../assistant/AssistantIdentity";
+import { displayName, messageLabel, messagePlaceholder, scopeDescriptor } from "../../assistant/identity";
+import { carriesSecret, hideIds, matchDirective, type Directive } from "./directive";
 import { planFrames, type FrameRow } from "./frames";
 import type { FileUploadProjection } from "./descriptorClient";
 import type { AttachDestination } from "./attach";
 import type { ChatBinding, MediaComposerTarget } from "./types";
-import { usePendingPermission } from "./usePendingApproval";
+import { usePendingPermissionRequest } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
-import { TurnBar } from "./TurnBar";
-import { isUnread, onSeenChanged, writeSeen, type SeenMap } from "./unreadSeen";
+import { focusApprovalBar as focusApprovalBarIn, focusComposerById, TurnBar } from "./TurnBar";
+import { writeSeen } from "./unreadSeen";
 import { setVisibleConversation, useDocumentVisible } from "./chatVisibility";
 import { useConversationDestination } from "./conversationNavigation";
-import { earlierStep, useThreadStream } from "./conversationThread";
+import { earlierStep, useThreadStream, type StreamLink } from "./conversationThread";
 
 /**
  * The host's ONE Conversation (CAD-1108): Home and every installed app render
@@ -141,6 +170,10 @@ export type ConversationMode =
       /** The verified installation's canonical `/apps/<key>` path — shareable
        *  links emit it. Null (ambiguous/unresolved) means no link renders. */
       appPath?: string | null;
+      /** The installed screen's tag: an assistant resource link can open it in the canvas. */
+      screenTag?: string | null;
+      /** The installed app's display name: a canvas tab names the app from it when the install cannot be read. */
+      appLabel?: string | null;
       /** Separate live native capability projection, not app-chat schema data. */
       fileUpload: FileUploadProjection;
       fileUploadLoading: boolean;
@@ -155,12 +188,20 @@ const COMPOSER_ID = "app-shell-chat-box";
 
 export interface HomeListProps {
   mode: { kind: "home" };
+  highlightSkillCommand?: boolean;
   items: ThreadItem[];
+  /** The Home conversation this list shows; its live preview text (CAD-2228)
+   *  is painted on the turn that is generating. */
+  conversation?: string | null;
   readOnly: boolean;
   liveAfter: number;
   /** The running turn's message id, when a turn runs: a grouped turn uses it
    *  to show typing instead of a finished-looking answer. */
   running?: string | null;
+  /** A turn is verified working but the host gave no id for it (hosted boards). */
+  runningUnnamed?: boolean;
+  /** Messages still queued behind the running turn: a run's send skips them. */
+  queued?: string[];
   /** Whether the whole thread has no `turn_result`. Every host passes its
    *  full list, not the rendered window. */
   legacyTranscript: boolean;
@@ -169,7 +210,7 @@ export interface HomeListProps {
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
   ) => void;
   onDiscard: (message: string) => void;
   /** Extra content under a row (Home's plan cards). */
@@ -201,11 +242,14 @@ export interface AppPaneProps {
   /** Refresh the live projection after the native endpoint refuses upload. */
   onFileUploadUnavailable: () => void;
   collapsed: boolean;
-  /** A decision is waiting for this person; the shell keeps the rail visible. */
+  /** A decision is waiting for this person; the shell can reveal the assistant. */
   onPendingDecision?: (pending: boolean) => void;
+  onWaitingChange?: (waiting: boolean) => void;
   onCollapsed: (next: boolean) => void;
   /** The shell's own navigation for the `open-view` card action. */
   onOpenView: (view: string) => void;
+  /** CAD-2512: moves the live app page to a section/record (a same-app view card). */
+  onShowRoute?: (route: { section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null }) => void;
   onMediaTarget?: (target: MediaComposerTarget) => () => void;
 }
 
@@ -222,9 +266,13 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
  */
 function HomeList({
   items,
+  highlightSkillCommand,
+  conversation = null,
   readOnly,
   liveAfter,
   running = null,
+  runningUnnamed = false,
+  queued = [],
   legacyTranscript,
   onOpenIssue,
   onRetry,
@@ -234,53 +282,193 @@ function HomeList({
 }: HomeListProps) {
   const { t } = useLocale();
   const runs = useMemo(() => threadRuns(items), [items]);
+  const clocks = useMemo(() => clockRuns(runs), [runs]);
   // Only a transcript with no answer kind anywhere predates the mapper. A
   // current transcript may legitimately have answer-less runs (tool turns,
   // errors); those notes must stay in the trace, never become older answers.
   const allowLegacy = legacyTranscript;
+  const flightKey = inFlightTurnKey(items, running, runningUnnamed);
+  const queuedSet = useMemo(() => new Set(queued), [queued]);
+  // The tail send: the newest user row that is not still queued. With the
+  // daemon's id naming no user, this is the placeholder's only evidence.
+  const tailSend = (() => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item.type !== "operator" && item.type !== "pending") continue;
+      if (item.type === "pending" && item.pending.state === "failed") continue;
+      const id = itemMessage(item);
+      if (id !== null && !queuedSet.has(id)) return id;
+    }
+    return null;
+  })();
+  // A run keeps the send it was first seen with. Queue membership changes
+  // when a queued message starts or is cancelled; re-deriving the send then
+  // would rename the stored run and steal the new send's placeholder.
+  const stickySends = useRef(new Map<string, string>());
+  // One key for the send, from the empty typing row through the finished
+  // answer, so the assistant head does not unmount and splash when the
+  // first step lands. Computed before the rows, so a turn that already
+  // owns the message does not also grow a second typing row.
+  const turnKey = new Map<string, string>();
+  const claimedTurns = new Set<string>();
+  // The run the daemon is working: the opener's run, else the newest run
+  // without an answer. Its send is the evidence for the placeholder and for
+  // every segment that continues it.
+  const workingSend = activeSendId(items, running);
+  const workingRunKey = (() => {
+    if (flightKey !== null) {
+      for (const run of runs) {
+        if (run.turn && run.items.some((item) => item.key === flightKey)) return run.key;
+      }
+    }
+    if (running === null) return null;
+    // Without an opener, only a run whose send the working id names can be
+    // the working one; a newer send with no rows yet is the placeholder's.
+    if (workingSend === null) return null;
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const run = runs[i];
+      if (!run.turn) continue;
+      if (run.items.some((item) => item.type === "answer")) continue;
+      // A run explicitly tagged to another send is not the working one,
+      // whatever user row physically precedes it.
+      if (run.items.some((item) => { const t = itemMessage(item); return t !== null && t !== workingSend; })) continue;
+      if (sendBefore(items, run.items, queuedSet) === workingSend) return run.key;
+    }
+    return null;
+  })();
+  const workingIndex = workingRunKey === null ? -1 : runs.findIndex((run) => run.key === workingRunKey);
+  // A split turn's later segments continue the send the opening run proved;
+  // a run before the working one must not take that send from it.
+  let carry: string | null = null;
+  runs.forEach((run, index) => {
+    if (!run.turn) {
+      if (run.item.type === "operator" || run.item.type === "pending") carry = null;
+      return;
+    }
+    const isWorking = index === workingIndex;
+    const remembered = stickySends.current.get(run.key);
+    const certain = run.message ?? (isWorking ? workingSend : null) ?? carry;
+    const send: string | null = run.message
+      ?? remembered
+      ?? (isWorking ? workingSend ?? carry : null)
+      ?? carry
+      ?? sendBefore(items, run.items, queuedSet, index < workingIndex ? workingSend : null);
+    // Remember the send the transcript, the working move, or a continued
+    // segment names. A value guessed from the queue could be wrong.
+    // Retain a positional correction for a run before the working one: it
+    // must not be reattributed to the working send once that turn clears.
+    if (remembered === undefined && send !== null && (certain !== null || isWorking || index < workingIndex)) {
+      stickySends.current.set(run.key, send);
+    }
+    if (send && !claimedTurns.has(send)) {
+      claimedTurns.add(send);
+      turnKey.set(run.key, `turn:${send}`);
+    }
+    carry = run.items.some((item) => item.type === "answer") ? null : send ?? carry;
+  });
+  const typingTail: { current: { key: string; node: ReactNode } | null } = { current: null };
   const row = (item: ThreadItem) => {
     // Live items (or the operator's pending ones) enter with the rise
     // animation; anything at or below the mount seq is history.
     const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
     const act = activity?.(item) ?? null;
+    // A fallback row belongs to no carrier: hoist it into the stable list
+    // whatever row it rides, including a system row, so the first step can
+    // replace it in place instead of remounting the head.
+    const hoist =
+      act?.kind === "row" &&
+      (act.fallback === true ||
+        (act.position === "after" && (item.type === "operator" || item.type === "pending")));
+    if (hoist) {
+      const msg = itemMessage(item);
+      // Only a live user row can name the send; a system carrier's message
+      // id belongs to some other identity (a briefing, a notice).
+      const live = (item.type === "operator" || item.type === "pending")
+        && !(item.type === "pending" && item.pending.state === "failed")
+        && msg !== null
+        && !queuedSet.has(msg)
+        ? msg
+        : null;
+      const send = activeSendId(items, running) ?? live ?? tailSend;
+      if (!send || !claimedTurns.has(send)) {
+        typingTail.current = { key: send ? `turn:${send}` : "typing-tail", node: act.node };
+      }
+    }
     return (
-      <li key={item.key} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
-        {act?.kind === "row" && act.position === "before" ? act.node : null}
-        <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
+      <li key={rowPaintKey(item)} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
+        {act?.kind === "row" && act.position === "before" && !hoist ? act.node : null}
+        <ThreadItemView item={item} readOnly={readOnly} highlightSkillCommand={highlightSkillCommand} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
         {item.type === "answer" && <CorrectionReport question={visibleQuestion(items, items.indexOf(item))} answer={item.entry.text} />}
-        {act?.kind === "row" && act.position === "after" ? act.node : null}
+        {act?.kind === "row" && act.position === "after" && !hoist ? act.node : null}
         {after?.(item)}
       </li>
     );
   };
   return (
-    <ol className="space-y-3 min-w-0" role="log" aria-live="polite" aria-relevant="additions" aria-label={t("messages")} data-rendered={items.length}>
-      {runs.map((run) => {
-        if (!run.turn) return row(run.item);
-        const acts = run.items.map((item) => activity?.(item) ?? null);
-        // The unnamed-turn fallback rides an EARLIER item's row. Folding
-        // that item's run would hide the working row, so the run keeps the
-        // flat rendering it has today. A hire proposal is its own card;
-        // keep the existing flat row instead of folding it into a trace.
-        if (
-          acts.some((act) => act?.kind === "row" && act.fallback === true) ||
-          run.items.some((item) => item.type === "hire")
-        ) {
-          return <Fragment key={run.key}>{run.items.map(row)}</Fragment>;
+    <ol className="space-y-6 min-w-0" role="log" aria-live="polite" aria-relevant="additions" aria-label={t("messages")} data-rendered={items.length}>
+      {(() => {
+        const rows: ReactNode[] = [];
+        let prevDay: string | null = null;
+        for (const run of runs) {
+        const first = run.turn ? run.items[0] : run.item;
+        const created = itemCreated(first);
+        const day = created === null ? null : dayKey(created);
+        const dayMs = day !== null && day !== prevDay && created !== null ? created : null;
+        if (day !== null) prevDay = day;
+        // The day rule is its own keyed sibling, not the row fragment's
+        // first child: a null-then-present first child remounts the row,
+        // and the assistant head splashes when the first step lands.
+        // The key includes the row, because a transcript can return to a
+        // calendar day it already showed.
+        const pushRow = (node: ReactNode, key: string) => {
+          if (dayMs !== null) rows.push(<DayDivider key={`${key}-day`} ms={dayMs} />);
+          // The row carries the key, not a keyed Fragment around it: a day
+          // divider appearing as its sibling must not remount the row.
+          rows.push(isValidElement(node) ? cloneElement(node, { key }) : <Fragment key={key}>{node}</Fragment>);
+        };
+        if (!run.turn) {
+          pushRow(row(run.item), rowPaintKey(run.item));
+          continue;
         }
-        // The turn's own live rows fold into the head and the typing dots.
+        const acts = run.items.map((item) => activity?.(item) ?? null);
+        // A hire proposal is its own card; keep the existing flat row
+        // instead of folding it into a trace.
+        if (run.items.some((item) => item.type === "hire")) {
+          pushRow(<>{run.items.map(row)}</>, run.key);
+          continue;
+        }
+        const hasFallback = acts.some((act) => act?.kind === "row" && act.fallback === true);
+        // The turn's own live rows fold into the head and the typing dots;
+        // an unnamed-turn fallback rides after a completed turn without
+        // unfolding that earlier turn's answer. `flightKey` covers a run
+        // whose agent rows never received the send's message id.
+        const ownsFlight = flightKey !== null && run.items.some((item) => item.key === flightKey);
+        // The run's adopted send is the same evidence the placeholder used:
+        // a working id that names this run's send makes it the live turn,
+        // even when an earlier answered run sits between the two.
+        const adoptedRunning =
+          run.key === workingRunKey || (running !== null && turnKey.get(run.key) === `turn:${running}`);
         const busy =
-          acts.some((act) => act !== null) ||
+          ownsFlight ||
+          adoptedRunning ||
+          (!hasFallback && acts.some((act) => act !== null)) ||
           (running !== null && run.items.some((item) => itemMessage(item) === running));
         const live = Number(run.key.slice(1)) > liveAfter;
         const answer = run.items.find((item) => item.type === "answer");
-        return (
-          <li key={run.key} className={`min-w-0${live ? " msg-in" : ""}`}>
+        if (hasFallback) {
+          const fallback = acts.find((act) => act?.kind === "row" && act.fallback === true);
+          if (fallback?.kind === "row") typingTail.current = { key: "typing-tail", node: fallback.node };
+        }
+        pushRow(
+          <li className={`min-w-0 space-y-4${live && !turnKey.has(run.key) ? " msg-in" : ""}`}>
             <ThreadTurn
               items={run.items}
+              startedAt={turnStartMs(items, run.items)}
+              clock={clocks.has(run.key)}
               running={busy}
               allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
+              previewConversation={conversation}
               after={
                 <>
                   {answer && (
@@ -292,9 +480,20 @@ function HomeList({
                 </>
               }
             />
-          </li>
+          </li>,
+          turnKey.get(run.key) ?? run.key,
         );
-      })}
+        }
+        // Same list as the runs, so a `turn:<send>` placeholder and the
+        // run that adopts that send are one keyed row. A sibling after
+        // the array remounts the head when the first step lands.
+        if (typingTail.current) {
+          rows.push(
+            <li key={typingTail.current.key} className="min-w-0 space-y-4">{typingTail.current.node}</li>,
+          );
+        }
+        return rows;
+      })()}
     </ol>
   );
 }
@@ -320,6 +519,9 @@ const itemText = (item: ThreadItem): string | null =>
       : null;
 
 /** The same item with every internal id rewritten (host constant, D4). */
+/** Alias for the grouped path: AppPane has its own `hidden` count. */
+const hideItem = (item: ThreadItem): ThreadItem => hidden(item);
+
 function hidden(item: ThreadItem): ThreadItem {
   switch (item.type) {
     case "operator":
@@ -334,6 +536,18 @@ function hidden(item: ThreadItem): ThreadItem {
     default:
       return item;
   }
+}
+
+/**
+ * The live preview goes through the same `hideIds` rewrite as committed app
+ * text (CAD-2228). A trailing `ctx-` that has no identifier character yet is
+ * held back: the next frame completes it and the whole identifier is
+ * rewritten, so a chunk boundary can never paint a partial id in place of a
+ * later raw one.
+ */
+function redactPreview(text: string): string {
+  const redacted = hideIds(text);
+  return /\bctx-$/.test(redacted) ? redacted.slice(0, -"ctx-".length) : redacted;
 }
 
 /** The reader's anchor: the first list row still visible at the scroller's
@@ -366,6 +580,41 @@ function restoreAnchor(el: HTMLElement, anchor: { key: string; top: number } | n
   if (now !== anchor.top) el.scrollTop += now - anchor.top;
 }
 
+/** The pane header's copy action: the newest answer's Markdown source, with
+ *  a one-shot confirmation in the same icon slot. */
+function CopyAnswerButton({ text, label, copiedLabel }: { text: string; label: string; copiedLabel: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="app-chat-iconbtn"
+      data-chat-header-copy
+      aria-label={copied ? copiedLabel : label}
+      title={copied ? copiedLabel : label}
+      onClick={() => {
+        void navigator.clipboard
+          ?.writeText(text)
+          .then(() => {
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1600);
+          })
+          .catch(() => undefined);
+      }}
+    >
+      {copied ? (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m5 12.5 4.5 4.5L19 7.5" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="8" y="8" width="11" height="11" rx="2" />
+          <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 function AppRow({
   item,
   directive,
@@ -391,7 +640,7 @@ function AppRow({
     message: string,
     text: string,
     refs?: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
   ) => void;
   onDiscard: (message: string) => void;
   question?: string;
@@ -438,8 +687,9 @@ function AppRow({
  * carry the route's installation and context; the daemon proves both and
  * stamps the verified binding on the entry.
  */
-function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision }: AppPaneProps) {
-  const { t, formatNumber } = useLocale();
+function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onShowRoute, onMediaTarget, onPendingDecision: reportPendingDecision, onWaitingChange }: AppPaneProps) {
+  const { locale, t, formatNumber } = useLocale();
+  const paneRef = useRef<HTMLDivElement>(null);
   const { installId, descriptor } = mode;
   const documentVisible = useDocumentVisible();
   const fileUpload = mode.fileUpload ?? { declared: false, available: false };
@@ -448,7 +698,21 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const store = active.store ?? idleThread;
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
-  const masterState = useQuery(resources.masterState);
+  const homeMasterState = useQuery(resources.masterState);
+  const hosted = homeMasterState.data !== null && Object.hasOwn(homeMasterState.data, "actor_identity");
+  const entries = thread.data?.entries ?? [];
+  // CAD-2463: a Sources chip names an attachment by the file the user sent.
+  const paneAttachmentNames = useMemo(() => attachmentNames(entries), [entries]);
+  const pendingPermission = usePendingPermissionRequest(entries, homeMasterState.data !== null && !hosted);
+  const permissionPending = pendingPermission !== null;
+  const onPendingDecision = useCallback(
+    (pending: boolean) => reportPendingDecision?.(pending || permissionPending),
+    [reportPendingDecision, permissionPending],
+  );
+  // Hosted turn state belongs to the selected session, just like identity.
+  // Native retains the install-wide coordinator queue.
+  const masterSource = hosted && convId !== null ? resources.masterConversation(convId) : resources.masterState;
+  const masterState = useQuery(masterSource);
   const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
@@ -460,57 +724,46 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const [composerNotice, setComposerNotice] = useState<UiNotice | null>(null);
   const [creating, setCreating] = useState(false);
   // The thread stream's link: down means the turn bar shows its last known state.
-  const [streamLink, setStreamLink] = useState<"live" | SseErrorState>("reconnecting");
+  const [streamLink, setStreamLink] = useState<StreamLink>("reconnecting");
   const [streamRevision, setStreamRevision] = useState(0);
   const onSnapshot = useCallback(() => setStreamRevision((revision) => revision + 1), []);
   const operationScope = `${installId}\u0000${mode.contextId}`;
   const [operationState, setOperationState] = useState<{ scope: string; revision: number | null; pending: boolean } | null>(null);
+  const [stagedState, setStagedState] = useState<{ conversation: string; pending: boolean } | null>(null);
   const onOperationState = useCallback((pending: boolean, revision: number | null) => {
     setOperationState({ scope: operationScope, revision, pending });
-    onPendingDecision?.(pending);
-  }, [operationScope, onPendingDecision]);
+  }, [operationScope]);
+  const onStagedState = useCallback((conversation: string, pending: boolean) => {
+    setStagedState({ conversation, pending });
+  }, []);
   const operationsCurrent = operationState?.scope === operationScope && operationState.revision === streamRevision;
+  const operationPending = operationState?.scope === operationScope && operationState.pending;
+  const decisionsOn = hosted && viewer.operator === true && !viewer.readOnly && convId !== null;
+  // CAD-2364: one store for this conversation's decisions and its answers' chips.
+  // Held in state, not a memo React may drop: a new conversation gets a new store, a re-render never does.
+  const [decisionHold, setDecisionHold] = useState<{ conversation: string; store: DecisionsStore } | null>(null);
+  const decisionStore = !decisionsOn || convId === null
+    ? null
+    : decisionHold?.conversation === convId
+      ? decisionHold.store
+      : null;
+  useEffect(() => {
+    if (decisionsOn && convId !== null && decisionHold?.conversation !== convId)
+      setDecisionHold({ conversation: convId, store: conversationDecisions(convId) });
+  }, [decisionsOn, convId, decisionHold]);
+  const stagedPending = decisionsOn && stagedState?.conversation === convId && stagedState.pending;
+  useEffect(() => {
+    onPendingDecision?.(operationPending || stagedPending);
+  }, [onPendingDecision, operationPending, stagedPending]);
   const streamDown = streamLink !== "live" || !operationsCurrent;
-  const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
   // records its newest reply sequence; other tabs observe the seen write.
-  const [seenState, setSeenState] = useState<{ installId: string; seen: SeenMap } | null>(null);
-  const unreadSeen = seenState?.installId === installId ? seenState.seen : null;
-  useEffect(() => onSeenChanged(installId, (seen) => setSeenState({ installId, seen })), [installId]);
   const selectedId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const selectedReply = active.state === "ready" ? (active.selected?.replySeq ?? null) : null;
   useEffect(() => {
     if (!documentVisible || collapsed || selectedId === null || selectedReply === null || selectedReply <= 0) return;
     void writeSeen(installId, selectedId, selectedReply);
   }, [selectedId, selectedReply, installId, collapsed, documentVisible]);
-  // A real assistant reply elsewhere lights the Conversations button.
-  const hasUnreadOther =
-    unreadSeen !== null && active.state === "ready" && active.conversations.some((c) => c.id !== convId && isUnread(unreadSeen, c.id, c.replySeq));
-  const historyButtonRef = useRef<HTMLButtonElement | null>(null);
-  const historyMenuRef = useRef<HTMLDivElement | null>(null);
-  // Escape and an outside press close the Conversations menu; focus goes
-  // back to its button so keyboard users keep their place.
-  const closeHistory = useCallback(() => {
-    setHistoryOpen(false);
-    historyButtonRef.current?.focus();
-  }, []);
-  useEffect(() => {
-    if (!historyOpen) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeHistory();
-    };
-    const onPress = (event: PointerEvent) => {
-      const target = event.target as Node | null;
-      if (target && (historyMenuRef.current?.contains(target) || historyButtonRef.current?.contains(target))) return;
-      setHistoryOpen(false);
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("pointerdown", onPress);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("pointerdown", onPress);
-    };
-  }, [historyOpen, closeHistory]);
   // CAD-1431: the CSV importer mounts only when the operator first opens it
   // from the composer's More actions menu. Once mounted it is hidden, not
   // unmounted, on Close, so a confirm already in flight still hands its
@@ -683,10 +936,31 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     usable && loaded && thread.data?.missing !== true && draftSubject === null,
     setStreamLink,
     onSnapshot,
+    undefined,
+    // CAD-2228: preview frames on this stream belong to the selected
+    // conversation; with no selected id (legacy chat) none are painted.
+    convId,
   );
 
   const items = threadItems(thread.data);
   const { shown, hidden } = visibleWindow(items, limit);
+  // CAD-1865: Home copies an answer from its turn head. The pane renders flat
+  // rows instead, and a per-row button would collide with the CAD-1108
+  // acceptance check (a plain answer row must carry no actionable control), so
+  // the pane's one copy action lives in its header and targets the newest
+  // answer in this conversation.
+  const lastAnswer = useMemo(() => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item.type !== "answer" || item.entry.text.trim() === "") continue;
+      // A directive answer paints as a card and a token-bearing body is
+      // withheld by the row renderer; neither has text to copy.
+      if (matchDirective(item.entry.text, descriptor) !== null) return null;
+      if (carriesSecret(item.entry.text)) return null;
+      return hideIds(item.entry.text);
+    }
+    return null;
+  }, [items, descriptor]);
   // A prepend (widened window or a fetched page) keeps the reader's row
   // at the same viewport offset, measured after the DOM updated.
   useLayoutEffect(() => {
@@ -807,7 +1081,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     ro.observe(el);
     for (const child of Array.from(el.children)) ro.observe(child);
     return () => ro.disconnect();
-  }, [scrollPanel, items.length]);
+  }, [scrollPanel, items.length, masterState.data?.turn?.state]);
   // Older history does not change the tail identity and must not be
   // advertised as a new message. Reader-anchor restoration remains a
   // separate installed-app QA requirement.
@@ -862,6 +1136,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     applyFollow(next.state);
     if (next.scroll === "jump") scrollPanel("jump");
   }, [items, applyFollow, scrollPanel]);
+  // Same gap as Home: a pinned reader stays on the tail when the typing
+  // row paints. The resize observer's new baseline already includes it.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el || !follow.current.pinned || follow.current.programmatic) return;
+    const top = tailTop(el.scrollHeight, el.clientHeight);
+    if (Math.abs(el.scrollTop - top) > 1) el.scrollTop = top;
+  });
   const jumpToLatest = () => {
     const next = onPill(follow.current);
     applyFollow(next.state);
@@ -936,38 +1218,37 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   }
   const canAttach = attachEnabled && attachDestination !== undefined;
   const attachReason = fileUploadLoading
-    ? "Checking this app's file-upload capability…"
+    ? t("Checking this app's file-upload capability…")
     : !fileUpload.declared
-      ? "This app has not declared the approved text-file upload capability."
+      ? t("This app has not declared the approved text-file upload capability.")
       : !fileUpload.available
-        ? "This app's text-file upload capability is currently unavailable."
+        ? t("This app's text-file upload capability is currently unavailable.")
         : capturedBinding === null
-          ? "This saved draft has no app binding; start a new app-scoped draft before attaching."
+          ? t("This saved draft has no app binding; start a new app-scoped draft before attaching.")
           : binding.error !== null
-            ? binding.error
-            : "Attach is available only in a writable, resolved app conversation.";
+            ? t(binding.error)
+            : t("Attach is available only in a writable, resolved app conversation.");
   // Why the composer is disabled — always a plain reason, never a fake reply.
   const sendBlockedReason = viewer.operator === null
     ? viewer.access === "unavailable"
-      ? "Access could not be confirmed — retry the access check"
-      : "Checking access before messaging the assistant"
+      ? t("Access could not be confirmed — retry the access check")
+      : t("Checking access before messaging the assistant")
     : viewer.operator === false
-    ? "Sign in as the operator to message the assistant"
-    : viewer.readOnly
-      ? "Read-only · Sending is unavailable"
-      : active.state === "failed"
-        ? "The conversations could not be read — retry above"
-        : "No conversation yet — start one with + New";
-  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen);
-  // Waiting dot: the selected conversation grew while the rail was collapsed.
+      ? t("Sign in as the operator to message the assistant")
+      : viewer.readOnly
+        ? t("Read-only · Sending is unavailable")
+        : active.state === "failed"
+          ? t("The conversations could not be read — retry above")
+          : t("No conversation yet — start one with + New");
+  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen, t);
+  // Waiting dot: the selected conversation grew while chat was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;
   const waiting = collapsed && items.length > seen.current;
+  useEffect(() => { onWaitingChange?.(waiting); }, [onWaitingChange, waiting]);
   // The turn bar (turnBar.ts, shared with Home): Stop carries this
   // conversation's own running message; Cancel its own queued message.
-  const entries = thread.data?.entries ?? [];
   const pendingMessages = (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message);
-  const permissionPending = usePendingPermission(entries);
   // Results older than this pane's view of the conversation are history.
   const liveSince = useMemo(() => Date.now(), [convId, installId]);
   const turnState = turnBarState(
@@ -987,9 +1268,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     },
     convId,
   );
+  const viewScope = useMemo(() => ({ installId, contextId: mode.contextId, showHere: onShowRoute }), [installId, mode.contextId, onShowRoute]);
   useCanvasFeed({
     conversation: convId,
     surface: "app",
+    viewScope,
     composerKey,
     items,
     loaded: loaded && thread.data?.missing !== true,
@@ -1022,7 +1305,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           const refs = objects(listOf("refs"), (r) =>
             typeof r.kind === "string" && typeof r.id === "string" ? { kind: r.kind, id: r.id } : null,
           );
-          const attachments = objects(listOf("attachments"), (a) => (typeof a.id === "string" ? { id: a.id } : null));
+          const attachments = objects(listOf("attachments"), (a): PendingAttachment | null =>
+            typeof a.id === "string"
+              ? {
+                  id: a.id,
+                  ...(typeof a.name === "string" ? { name: a.name } : {}),
+                  ...(typeof a.size === "number" ? { size: a.size } : {}),
+                  ...(typeof a.mime === "string" ? { mime: a.mime } : {}),
+                }
+              : null,
+          );
           const mediaRefs = objects(listOf("media_refs"), (m) =>
             typeof m.asset_id === "string" && typeof m.revision === "number" && typeof m.sha256 === "string"
               ? { asset_id: m.asset_id, revision: m.revision, sha256: m.sha256 }
@@ -1040,16 +1332,29 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (!canControlTurns) return;
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
     void api
-      .masterCommand(command, undefined, undefined, message)
+      // A hosted board reaches a conversation only by naming it; unnamed means Home.
+      .masterCommand(command, undefined, undefined, message, hosted && convId !== null ? convId : undefined)
+      .then((r) => {
+        if (!r.withdrawn?.length) return;
+        const withdrawn = r.withdrawn;
+        const state = store.get().data;
+        if (state) {
+          store.write((current) =>
+            failWithdrawn(current ?? state, withdrawn, t("Withdrawn when the turn was stopped. Retry to send it again."), newMessageId),
+          );
+        }
+        if (!state || withdrawn.some((id) => !state.pending.some((row) => row.message === id))) {
+          setComposerNotice("A queued message was withdrawn too. Send it again if you still need it.");
+        }
+      })
       .catch((e: unknown) => {
         const current =
           composerKeyRef.current === origin.key && visitRef.current === origin.visit && frameRef.current === origin.frame;
         if (current) setSendError(e instanceof ApiError ? e.message : String(e));
       })
-      .finally(() => void resources.masterState.refresh());
+      .finally(() => void masterSource.refresh());
   };
   const turnActions = {
-    onStop: canControlTurns ? (message: string) => turnCommand("stop", message) : undefined,
     onCancel: canControlTurns ? (message: string) => turnCommand("cancel", message) : undefined,
     onRetry: canSend ? retryAction : undefined,
     onView:
@@ -1065,15 +1370,24 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       (card ?? listRef.current)?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
     },
   };
+  // CAD-1880: Stop in the composer's send slot while this conversation's
+  // own turn runs; the working row above the dock is gone.
+  const runningMessage =
+    turnState.kind === "working" || turnState.kind === "writing" ? turnState.stopMessage : null;
+  const canStop = canControlTurns && !streamDown && runningMessage !== null;
+  // Working with no usable id: a hosted turn, or the id withheld while the
+  // stream reconnects. The open run is still that turn.
+  const runningUnnamed =
+    (turnState.kind === "working" || turnState.kind === "writing") && runningMessage === null;
   // After a reload or navigation the selected conversation may still be
   // waiting on another conversation's turn: read the master's state once
   // (the `master` stream frame keeps it live while it is queued).
   const unanswered = hasUnansweredOperator(thread.data?.entries ?? []);
   useEffect(() => {
-    if (unanswered) void resources.masterState.refresh();
-  }, [unanswered, convId]);
+    if (unanswered) void masterSource.refresh();
+  }, [unanswered, masterSource]);
 
-  // "+ New", `/new` and `/clear` are one call: a fresh conversation.
+  // `/new` and `/clear` start a fresh conversation without sending a message.
   const startNew = () => {
     if (!canCreate || creating) return;
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
@@ -1105,7 +1419,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       message: string,
       body: string,
       refs?: ThreadRef[],
-      attachments?: { id: string }[],
+      attachments?: PendingAttachment[],
       app?: { install_id: string; context_id?: string },
       operation?: PrivateOperation,
       mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
@@ -1125,7 +1439,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           await api.threadSend(MASTER, body, message, refs, app, id ?? undefined, attachments, op, mediaRefs);
           op.assertCurrent();
           dest.write((s) => settlePending(s, message, { ok: true }));
-          void resources.masterState.refresh();
+          void (hosted && id !== null ? resources.masterConversation(id) : resources.masterState).refresh();
         } catch (e: unknown) {
           if (op.signal.aborted || op.generation !== privateSessionGeneration()) {
             releaseAbandoned();
@@ -1153,7 +1467,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         dest.write((s) => settlePending(s, message, { ok: false, error }));
       });
     },
-    [],
+    [hosted],
   );
 
   /** Adopt one immutable submitted envelope into its destination store:
@@ -1272,7 +1586,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const send = (
     body: string,
     refs: ThreadRef[],
-    attachments?: { id: string }[],
+    attachments?: PendingAttachment[],
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     originalApp?: OutboxEnvelope["app"] | null,
   ): Promise<void> => {
@@ -1342,6 +1656,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     void createAndAdopt(originKey, create, envelope, origin).catch(() => undefined);
     return Promise.resolve();
   };
+
+  const actor = useConversationActor(
+    masterState,
+    viewer.operator === true && !viewer.readOnly,
+    convId,
+    canSend && convId !== null ? (text) => send(text, []) : null,
+  );
+  const composerLabels = useMemo(
+    () => ({
+      placeholder: messagePlaceholder(actor.read, actor.scope, t),
+      ariaLabel: messageLabel(actor.read, actor.scope, t),
+    }),
+    [actor.read, actor.scope, t],
+  );
 
   /** Retry one failed submitted envelope: the same message id, body,
    *  refs, file ids and captured destination — never the current draft
@@ -1433,6 +1761,161 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     return { key: item.key, directive: text === null ? null : matchDirective(text, descriptor) };
   });
   const plan = planFrames(directives, failedFrames);
+  // CAD-1884: group the pane's rows into runs like Home, so a turn paints one
+  // head, one trace and one answer. A turn can be split by a system row into
+  // several runs that share its message id: the first paints the head, the
+  // last owns the typing dots, and only the segment carrying the answer says
+  // anything about completion.
+  const runs = useMemo(() => threadRuns(shown), [shown]);
+  const clocks = useMemo(() => clockRuns(runs), [runs]);
+  // A transcript with no answer kind anywhere predates the mapper: its last
+  // worker note is what the operator read as the reply (same rule as Home).
+  const legacyTranscript = useMemo(() => items.every((item) => item.type !== "answer"), [items]);
+  const directiveByKey = useMemo(
+    () => new Map(shown.map((item, i) => [item.key, directives[i]?.directive ?? null])),
+    [shown, directives],
+  );
+  const stickySends = useRef(new Map<string, string>());
+  const stickyScope = useRef<string | null>(null);
+  // Item keys restart per thread: a map kept across a conversation switch
+  // would give a new run the old thread's send.
+  if (stickyScope.current !== convId) {
+    stickyScope.current = convId;
+    stickySends.current = new Map();
+  }
+  const runViews = useMemo(() => {
+    const flightKey = inFlightTurnKey(shown, runningMessage, runningUnnamed);
+    const special = (item: ThreadItem) =>
+      directiveByKey.get(item.key) != null || plan.has(item.key) || item.type === "hire";
+    // The send each run belongs to, settled before anything is keyed: an
+    // untagged run adopts the user row before it, in flight or finished.
+    // Completion must not change that identity, or the answer remounts the
+    // head. Counting segments on the adopted id also keeps a split turn's
+    // untagged and tagged segments on distinct keys.
+    const effective = new Map<string, string | null>();
+    const queuedSet = new Set((masterState.data?.queue ?? []).map((q) => q.message));
+    // The run the daemon is working: the opener's run, else the newest run
+    // without an answer. Its send is evidence for its segments and for the
+    // placeholder, even when an earlier answered run sits between them.
+    const workingSend = activeSendId(shown, runningMessage);
+    const workingRunKey = (() => {
+      if (flightKey !== null) {
+        for (const run of runs) {
+          if (run.turn && run.items.some((item) => item.key === flightKey)) return run.key;
+        }
+      }
+      if (runningMessage === null) return null;
+      // Without an opener, only a run whose send the working id names can be
+      // the working one; a newer send with no rows yet is the placeholder's.
+      if (workingSend === null) return null;
+      for (let i = runs.length - 1; i >= 0; i--) {
+        const run = runs[i];
+        if (!run.turn) continue;
+        if (run.items.some((item) => item.type === "answer")) continue;
+        // A run explicitly tagged to another send is not the working one,
+        // whatever user row physically precedes it.
+        if (run.items.some((item) => { const t = itemMessage(item); return t !== null && t !== workingSend; })) continue;
+        if (sendBefore(shown, run.items, queuedSet) === workingSend) return run.key;
+      }
+      return null;
+    })();
+    const workingIndex = workingRunKey === null ? -1 : runs.findIndex((run) => run.key === workingRunKey);
+    // A split turn's later segments continue the send its opening run
+    // proved; a run before the working one must not take that send.
+    let carry: string | null = null;
+    runs.forEach((run, index) => {
+      if (!run.turn) {
+        if (run.item.type === "operator" || run.item.type === "pending") carry = null;
+        return;
+      }
+      const isWorking = index === workingIndex;
+      const remembered = stickySends.current.get(run.key);
+      const send: string | null = run.message
+        ?? remembered
+        ?? (isWorking ? workingSend ?? carry : null)
+        ?? carry
+        ?? sendBefore(shown, run.items, queuedSet, index < workingIndex ? workingSend : null);
+      const evidence = run.message
+        ?? (isWorking ? workingSend ?? send : null)
+        ?? carry;
+      // Retain a positional correction for a run before the working one: it
+      // must not be reattributed to the working send once that turn clears.
+      if (remembered === undefined && send !== null && (evidence !== null || index < workingIndex)) {
+        stickySends.current.set(run.key, send);
+      }
+      effective.set(run.key, send);
+      carry = run.items.some((item) => item.type === "answer") ? null : send ?? carry;
+    });
+    const perMessage = new Map<string, number>();
+    // Completion is the message's, not a segment's: an answer in any run of
+    // a split turn completes the whole turn.
+    const answeredByMessage = new Map<string, boolean>();
+    for (const run of runs) {
+      const message = run.turn ? effective.get(run.key) ?? null : null;
+      if (message === null) continue;
+      perMessage.set(message, (perMessage.get(message) ?? 0) + 1);
+      if (run.turn && run.items.some((item) => item.type === "answer")) {
+        answeredByMessage.set(message, true);
+      }
+    }
+    const seen = new Map<string, number>();
+    // The send the running turn belongs to, taken from the run that opened
+    // it: an untagged run's effective id is the send, even when the
+    // daemon's working id differs. Ownership follows that id across every
+    // segment of a split turn, so the last segment paints the dots and the
+    // first paints the one head.
+    const flightSend = (() => {
+      if (flightKey !== null) {
+        for (const run of runs) {
+          if (!run.turn) continue;
+          if (run.items.some((item) => item.key === flightKey)) return effective.get(run.key) ?? null;
+        }
+      }
+      if (runningMessage !== null) {
+        for (const run of runs) {
+          if (!run.turn) continue;
+          if ((effective.get(run.key) ?? null) === runningMessage) return runningMessage;
+        }
+      }
+      return null;
+    })();
+    return runs.map((run) => {
+      if (!run.turn) return { kind: "item" as const, run };
+      const message = effective.get(run.key) ?? null;
+      const ordinal = message === null ? 1 : (seen.get(message) ?? 0) + 1;
+      if (message !== null) seen.set(message, ordinal);
+      const total = message === null ? 1 : (perMessage.get(message) ?? 1);
+      const cards = run.items.filter(special);
+      const cardAnswer = cards.some((item) => item.type === "answer");
+      const answerItem = run.items.find((item) => item.type === "answer" && !special(item)) ?? null;
+      const owns =
+        run.key === workingRunKey ||
+        (flightKey !== null && run.items.some((item) => item.key === flightKey)) ||
+        (message !== null && message === flightSend);
+      return {
+        kind: "turn" as const,
+        run,
+        cards,
+        answerItem,
+        owns,
+        key: message === null ? run.key : ordinal === 1 ? message : `${message}#${ordinal}`,
+        head: ordinal === 1,
+        continued: ordinal < total,
+        // Dots only while the turn's last segment has no answer of either
+        // kind: a landed card answer completes the turn too.
+        running:
+          owns &&
+          ordinal === total &&
+          answerItem === null &&
+          !cardAnswer &&
+          !(message !== null && answeredByMessage.get(message) === true),
+      };
+    });
+  }, [runs, shown, directiveByKey, plan, runningMessage, runningUnnamed]);
+  // Only a run that will actually paint dots owns the indicator; a turn whose
+  // answer already landed keeps the pane's standalone row while master state
+  // still reports it working (the pre-CAD-1886 behaviour).
+  const typingOwned = runViews.some((view) => view.kind === "turn" && view.running);
   const onFrameFail = useCallback((tag: string) => setFailedFrames((s) => new Set(s).add(tag)), []);
   const readOnly = !viewer.operator || viewer.readOnly;
   // The CSV importer exists only when the descriptor declares it and the
@@ -1464,7 +1947,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const subjectOf = (subject: string | null) => subject?.split(":")[0] ?? null;
   const draftKind = subjectOf(draftSubject);
-  const draftLabel = subjects.find((s) => s.kind === draftKind)?.label.toLowerCase();
+  const rawDraftLabel = subjects.find((s) => s.kind === draftKind)?.label;
+  const draftLabel = rawDraftLabel ? (isEnglishLocale(locale) ? rawDraftLabel.toLowerCase() : rawDraftLabel) : undefined;
   // The removed picker was the only place naming the open conversation.
   const selectedIndex = active.state === "ready" ? active.conversations.findIndex((c) => c.id === convId) : -1;
   const convLabel =
@@ -1472,153 +1956,85 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       ? null
       : draftSubject !== null
         ? draftLabel
-          ? `New ${draftLabel} conversation (unsaved)`
-          : "New conversation (unsaved)"
+          ? t("New {label} conversation (unsaved)").replace("{label}", () => draftLabel)
+          : t("New conversation (unsaved)")
         : active.selected !== null
           ? conversationLabel(active.selected, selectedIndex, subjects, t)
           : null;
 
+  const canReplyDraft = canSend && binding.error === null;
+  const focusPaneComposer = useCallback(() => focusComposerById(paneRef.current, COMPOSER_ID), []);
+  const revealComposer = useCallback(() => onCollapsed(false), [onCollapsed]);
+  const focusApprovalBar = useCallback(() => focusApprovalBarIn(paneRef.current), []);
+  const rejectAndReplyDraft = useCallback(
+    (command: string) => {
+      if (!canReplyDraft) return;
+      const existing = composerDraftState(composerKey).text;
+      setComposerDraft(composerKey, appendRejectReplyDraft(existing, command));
+      focusPaneComposer();
+    },
+    [canReplyDraft, composerKey, focusPaneComposer],
+  );
+
+  const fillComposer = useCallback(
+    (text: string) => {
+      if (!canReplyDraft) return;
+      setComposerDraft(composerKey, appendComposerDraft(composerDraftState(composerKey).text, text));
+      focusPaneComposer();
+    },
+    [canReplyDraft, composerKey, focusPaneComposer],
+  );
+
   return (
-    <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
-      <button
-        type="button"
-        className="btn btn-ghost btn-sm app-chat-rail"
-        aria-label={t("Expand assistant chat")}
-        aria-expanded={!collapsed}
-        onClick={() => onCollapsed(false)}
-        data-waiting={waiting || undefined}
-      >
-        {waiting && <span className="app-chat-dot" role="status" aria-label={t("New reply waiting")} />}
-        <span className="app-chat-rail-label text-micro text-ink-400">{t("ASSISTANT")}</span>
-      </button>
+    <AssistantActorProvider actor={actor}>
+    <PermissionEnabledContext.Provider value={homeMasterState.data !== null && !hosted}>
+    <PermissionReplyContext.Provider value={canReplyDraft ? rejectAndReplyDraft : null}>
+    <ComposerFillContext.Provider value={canReplyDraft ? fillComposer : null}>
+    <ImageConversation.Provider value={convId}>
+    <PdfPageTarget.Provider value={hosted && canAttach && attachDestination
+      ? { key: composerKey, destination: attachDestination, isCurrent: isCurrentUploadOrigin }
+      : null}>
+    <div ref={paneRef} className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
       <div className="app-chat-head">
-        <div className="app-chat-title min-w-0">
-          <span className="app-chat-mark" aria-hidden>✳</span>
-          <strong>{t("Assistant")}</strong>
-          {(convLabel !== null || streamDown) && (
-            <span
-              className="app-chat-conv truncate text-ink-500 text-label"
-              data-chat-conv-label
-              data-state={streamDown ? "offline" : undefined}
-            >
-              · {streamDown ? t("Reconnecting…") : convLabel}
-            </span>
-          )}
+        <div
+          className="app-chat-title min-w-0"
+          data-assistant-identity={actor.scope ?? undefined}
+          data-identity-state={actor.read.state}
+        >
+          <AssistantFace size={20} />
+          <div className="assistant-heading-text">
+            <div className="flex min-w-0 items-baseline gap-2">
+              <strong className="truncate" title={`${displayName(actor.read, actor.scope, t)} — ${scopeDescriptor(actor.scope, t)}`} data-assistant-name>
+                {displayName(actor.read, actor.scope, t)}
+              </strong>
+              {(convLabel !== null || streamDown) && (
+                <span
+                  className="app-chat-conv truncate text-ink-500 text-label"
+                  data-chat-conv-label
+                  data-state={streamDown ? "offline" : undefined}
+                  data-stale={streamDown || undefined}
+                >
+                  · {streamDown ? t("Reconnecting…") : convLabel}
+                </span>
+              )}
+            </div>
+            <span className="assistant-scope truncate">{scopeDescriptor(actor.scope, t)}</span>
+          </div>
         </div>
-        <div className="app-chat-head-tools" role="toolbar" aria-label={t("Assistant tools")}>
-          {active.state !== "legacy" && (
-            <button
-              type="button"
-              className="app-chat-iconbtn"
-              data-chat-new
-              aria-label={t("New conversation")}
-              title={t("New conversation")}
-              disabled={!canCreate || creating}
-              onClick={startNew}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M20 14.5a2 2 0 0 1-2 2H8l-4 3.5V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z" />
-                <path d="M12 7.5v6M9 10.5h6" />
-              </svg>
-            </button>
+        <div className="app-chat-head-tools">
+          {lastAnswer !== null && (
+            <CopyAnswerButton text={lastAnswer} label={t("Copy last answer")} copiedLabel={t("Copied")} />
           )}
-          {active.state !== "legacy" && (
-            <button
-              ref={historyButtonRef}
-              type="button"
-              className="app-chat-iconbtn"
-              aria-label={t("Conversations")}
-              title={t("Conversations")}
-              aria-haspopup="menu"
-              aria-expanded={historyOpen}
-              disabled={active.state !== "ready" || active.conversations.length === 0}
-              onClick={() => setHistoryOpen((o) => !o)}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1L3.5 8.5" />
-                <path d="M3.5 3.5v5h5" />
-                <path d="M12 7.5V12l3 2" />
-              </svg>
-              {hasUnreadOther && <span className="app-chat-iconbtn-dot" aria-hidden />}
-            </button>
-          )}
-          <span className="app-chat-sep" aria-hidden />
           <button
             type="button"
-            className="app-chat-iconbtn app-chat-collapse"
+            className="app-chat-iconbtn app-chat-close"
             aria-label={t("Collapse assistant chat")}
             title={t("Collapse assistant chat")}
-            aria-expanded={!collapsed}
             onClick={() => onCollapsed(true)}
           >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="3.5" y="4" width="17" height="16" rx="2.5" />
-              <path d="M9.5 4v16" />
-              <path d="m16 15-3-3 3-3" />
-            </svg>
+            <IconClose size={14} />
           </button>
         </div>
-        {historyOpen && active.state === "ready" && (
-          <div
-            ref={historyMenuRef}
-            className="app-chat-history"
-            role="menu"
-            aria-label={t("Conversations")}
-            data-chat-history
-          >
-            {active.conversations.map((c, i) => {
-              const unread = unreadSeen !== null && isUnread(unreadSeen, c.id, c.replySeq) && c.id !== convId;
-              return (
-                <button
-                  key={c.id}
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={c.id === convId}
-                  className="app-chat-history-row"
-                  data-unread={unread || undefined}
-                  onClick={() => {
-                    selectConversation(installId, c.id);
-                    closeHistory();
-                  }}
-                >
-                  <span className="app-chat-history-mark" aria-hidden>
-                    {c.id === convId ? "✓" : ""}
-                  </span>
-                  <span className="app-chat-history-name">{conversationLabel(c, i, subjects, t)}</span>
-                  {unread && (
-                    <span className="app-chat-history-new" aria-label={t("New reply")}>
-                      {t("new")}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-            {active.selected !== null &&
-              !active.selected.isGeneral &&
-              binding.scope !== null &&
-              binding.error === null &&
-              binding.scope.install_id === installId &&
-              binding.scope.context_id !== "" &&
-              mode.contextProof?.status === "ready" &&
-              mode.contextProof.contextId === binding.scope.context_id &&
-              mode.appPath != null && (
-                <>
-                  <div className="app-chat-history-divider" role="separator" />
-                  <Link
-                    href={`${mode.appPath}?install=${encodeURIComponent(installId)}&ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
-                    className="app-chat-history-row"
-                    role="menuitem"
-                    aria-label={t("Link to this conversation")}
-                    title={t("Shareable link to this conversation")}
-                    data-chat-conversation-link
-                  >
-                    <span className="app-chat-history-mark" aria-hidden />
-                    <span className="app-chat-history-name">{t("Link to this conversation")}</span>
-                  </Link>
-                </>
-              )}
-          </div>
-        )}
       </div>
       {active.requestPending && (
         <p className="text-label text-ink-500" role="status" data-chat-link-pending>
@@ -1643,7 +2059,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           {t("No conversation yet. Start one with + New.")}
         </p>
       )}
-      <TurnBar state={turnState} since={masterState.data?.turn?.since ?? null} actions={turnActions} reconnecting={streamDown} />
       {thread.status === "failed" && (
         <p className="text-label text-fail" role="alert">
           {t("The thread could not be read")} — {thread.error}{" "}
@@ -1675,17 +2090,29 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </button>
         </div>
       )}
+      <StagedSourceContext.Provider value={decisionStore}>
+      <AttachmentNamesContext.Provider value={paneAttachmentNames}>
+      <ViewScopeContext.Provider value={viewScope}>
       <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
-        {shown.map((item, i) => (
-          <li
-            key={item.key}
-            className="text-secondary text-ink-300 break-words"
-            data-chat-item
-            data-item-key={item.key}
-          >
+        {(() => {
+          const rows: ReactNode[] = [];
+          let prevDay: string | null = null;
+          for (const view of runViews) {
+          const first = view.kind === "turn" ? view.run.items[0] : view.run.item;
+          const created = itemCreated(first);
+          const day = created === null ? null : dayKey(created);
+          const dayMs = day !== null && day !== prevDay && created !== null ? created : null;
+          if (day !== null) prevDay = day;
+          const pushRow = (node: ReactNode, key: string) => {
+            if (dayMs !== null) rows.push(<DayDivider key={`${key}-day`} ms={dayMs} />);
+            // The row carries the key, not a keyed Fragment around it: a day
+            // divider appearing as its sibling must not remount the row.
+            rows.push(isValidElement(node) ? cloneElement(node, { key }) : <Fragment key={key}>{node}</Fragment>);
+          };
+          const row = (item: ThreadItem, index: number) => (
             <AppRow
               item={item}
-              directive={directives[i].directive}
+              directive={directives[index]?.directive ?? null}
               frame={plan.get(item.key)}
               mode={mode}
               density={density}
@@ -1694,12 +2121,132 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
               onFail={onFrameFail}
               onRetry={retry}
               onDiscard={discard}
-              question={visibleQuestion(shown, i)}
+              question={visibleQuestion(shown, index)}
             />
-          </li>
-        ))}
+          );
+          if (view.kind === "item") {
+            const item = view.run.item;
+            const index = shown.indexOf(item);
+            pushRow(
+              <li
+                className="text-secondary text-ink-300 break-words"
+                data-chat-item
+                data-item-key={item.key}
+              >
+                {row(item, index)}
+              </li>,
+              rowPaintKey(item),
+            );
+            continue;
+          }
+          const key = view.key;
+          // Cards render through their guarded AppRow, never through the
+          // turn body: that path is what withholds tokens and frame bodies.
+          const safe = view.run.items.filter((item) => !view.cards.includes(item)).map(hideItem);
+          const hiddenAnswer = view.answerItem ? hideItem(view.answerItem) : null;
+          const answerText = hiddenAnswer?.type === "answer" ? hiddenAnswer.entry.text : null;
+          pushRow(
+            <li
+              className="text-secondary text-ink-300 break-words"
+              data-chat-item
+              data-chat-run
+                          >
+              <ThreadTurn
+                items={safe}
+                startedAt={turnStartMs(shown, view.run.items)}
+                clock={clocks.has(view.run.key)}
+                density={density}
+                head={view.head}
+                continued={view.continued}
+                allowLegacy={legacyTranscript}
+                copy={false}
+                running={view.running}
+                previewConversation={convId}
+                previewTransform={redactPreview}
+                after={
+                  <>
+                    {view.cards.map((item) => (
+                      <div key={item.key} data-chat-card-row data-item-key={item.key}>
+                        {row(item, shown.indexOf(item))}
+                      </div>
+                    ))}
+                    {answerText !== null && view.answerItem ? (
+                      <CorrectionReport
+                        question={hideIds(visibleQuestion(shown, shown.indexOf(view.answerItem)))}
+                        answer={answerText}
+                      />
+                    ) : null}
+                  </>
+                }
+              />
+            </li>,
+            key,
+          );
+          }
+          // In this array, not after it. The sending row's key is the
+          // send id, which the first untagged run adopts, so the face
+          // updates in place. A still-working turn that already answered
+          // keeps a separate tail and must not reuse the turn's key.
+          const reserveTyping =
+            turnState.kind === "sending" ||
+            ((turnState.kind === "working" || turnState.kind === "writing") && !typingOwned
+              && !(runningUnnamed && unnamedTurnAnswered(shown)));
+          // The send this turn belongs to, stable from the optimistic row
+          // through the stored operator row: the placeholder keeps that id
+          // while the turn is in flight, including the working state before
+          // the first step lands. The id comes from the run that owns the
+          // working turn (its declared message, else the user row before
+          // it) — not from the newest user, which may be a queued send
+          // behind it. Once a run claims the id, that run paints the head
+          // and dots; a still-working turn that already answered keeps a
+          // distinct tail key.
+          const flightKeyForTyping = inFlightTurnKey(shown, runningMessage, runningUnnamed);
+          const flightRun = flightKeyForTyping === null
+            ? null
+            : runs.find((run) => run.turn && run.items.some((item) => item.key === flightKeyForTyping)) ?? null;
+          // The send being worked: the run's declared message, else the open
+          // send (the working id's user row, else the earliest user row since
+          // the last answer). A message queued behind it must not take over.
+          const openSend = activeSendId(shown, runningMessage);
+          const flightSend = flightRun !== null && flightRun.turn
+            ? flightRun.message
+              ?? stickySends.current.get(flightRun.key)
+              ?? activeSendId(shown, runningMessage)
+              ?? sendBefore(shown, flightRun.items, new Set((masterState.data?.queue ?? []).map((q) => q.message)))
+            : null;
+          const queuedSet = new Set((masterState.data?.queue ?? []).map((q) => q.message));
+          const lastUser = [...shown].reverse().find((item) => {
+            if (item.type !== "operator" && item.type !== "pending") return false;
+            if (item.type === "pending" && item.pending.state === "failed") return false;
+            const id = itemMessage(item);
+            return id === null || !queuedSet.has(id);
+          });
+          const sendId = flightSend ?? openSend ?? (lastUser ? itemMessage(lastUser) : null) ?? pendingMessages.at(-1) ?? null;
+          const claimed = sendId !== null && runViews.some((view) => view.kind === "turn" && view.key === sendId);
+          const typingKey = sendId !== null && !claimed ? sendId : "typing-tail";
+          if (reserveTyping && !runViews.some((view) => view.kind === "turn" && view.key === typingKey)) {
+            rows.push(
+              <li key={typingKey} className="text-secondary text-ink-300 break-words" data-chat-typing>
+                <ThreadTurn
+                  items={[]}
+                  running
+                  density={density}
+                  previewConversation={convId}
+                  previewTransform={redactPreview}
+                />
+              </li>,
+            );
+          }
+          return rows;
+        })()}
       </ol>
-      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
+      </ViewScopeContext.Provider>
+      </AttachmentNamesContext.Provider>
+      </StagedSourceContext.Provider>
+      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} appLabel={mode.appLabel ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
+      {decisionsOn && convId !== null && decisionStore !== null && (
+        <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
+      )}
       {unseen > 0 && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
           ↓ {jumpLabel(unseen, t)}
@@ -1792,7 +2339,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                   );
                   op.assertCurrent();
                   void store.refresh();
-                  void resources.masterState.refresh();
+                  void masterSource.refresh();
                 });
                 return null;
               } catch (e: unknown) {
@@ -1831,28 +2378,60 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ))}
         </div>
       )}
+      <TurnBar
+        state={turnState}
+        actions={turnActions}
+        reconnecting={streamDown}
+        permission={
+          pendingPermission !== null
+            ? {
+                request: pendingPermission,
+                readOnly: !canControlTurns,
+                onRejectAndReply: canReplyDraft ? (req) => rejectAndReplyDraft(req.command) : undefined,
+                onFocusComposer: focusPaneComposer,
+              }
+            : null
+        }
+      />
       <Composer
         key={composerKey}
         density="compact"
         block={canSend && binding.error === null ? null : "read-only"}
+        stop={canStop ? { onStop: () => { if (runningMessage) turnCommand("stop", runningMessage); } } : null}
         blockedPlaceholder={binding.error ?? sendBlockedReason}
         storeKey={composerKey}
+        onReveal={revealComposer}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
         onSubmitted={engage}
-        onCommand={(name) => {
-          if (name === "new" || name === "clear") startNew();
-          else setComposerNotice({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name } });
+        onCommand={(name, arg) => {
+          if (name === "new" || name === "clear") {
+            if (arg) {
+              setComposerNotice({ key: 'Command "/{name}" takes nothing after its name — it was not sent', slots: { name } });
+              return false;
+            }
+            startNew();
+            return true;
+          }
+          setComposerNotice({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name } });
+          return false;
         }}
         onNotice={setComposerNotice}
+        onArrowUpEmpty={turnState.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
         attach={{ enabled: canAttach, reason: attachReason, destination: attachDestination }}
         originalUnresolved={originalUnresolved !== null}
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
         textareaId={COMPOSER_ID}
         actions={csvActions}
-        ariaLabel={t("Message to Assistant")}
-        placeholder={t("Message Assistant…")}
+        ariaLabel={composerLabels.ariaLabel}
+        placeholder={composerLabels.placeholder}
         className="app-chat-form"
       />
     </div>
+    </PdfPageTarget.Provider>
+    </ImageConversation.Provider>
+    </ComposerFillContext.Provider>
+    </PermissionReplyContext.Provider>
+    </PermissionEnabledContext.Provider>
+    </AssistantActorProvider>
   );
 }

@@ -8,6 +8,67 @@ Neither path authorizes an agent to approve or restart production. Follow
 [artifact checklist](guides/rollout-checklist.md); image-managed hosts use the runtime
 image path instead of self-update.
 
+## Stable v0.3.19 (published, immutable)
+
+[Cadence 0.3.19](https://github.com/favcrm/cadence/releases/tag/v0.3.19) was
+published as the stable GitHub Release on 2026-11-05 at 01:11:08 UTC
+(`prerelease=false`, `draft=false`, and the repository's latest release). Its
+annotated tag object is `348a2b88c12fdedfbae1267e98e49ddc9c90c3cb`, peeled to source
+`c11fc9668f7f42bc3e8383182c1525202e6668d8`. The producing
+[tag workflow run 41944358277, attempt 1](https://github.com/favcrm/cadence/actions/runs/41944358277)
+completed successfully: the four tag gates (`fmt`, `clippy`, `build`, `ui`),
+`release-gate`, three native release builds and three exact-candidate native
+installation legs passed before the release environment was approved. Tests run in
+their own workflow, not in the tag gates; the full suite passed on that source in
+[run 41942949656](https://github.com/favcrm/cadence/actions/runs/41942949656).
+
+All nine published HTTPS assets were anonymously downloaded, and the four archives'
+bytes matched their published `.sha256` files. The x86_64 archive's manifest names
+`v0.3.19`, target `x86_64-linux`, runner `ubuntu-22.04`, the source digest above,
+that run and attempt, features `["ui"]` and checks
+`["fmt","clippy","build","ui"]`. The installer is byte-identical to the v0.2.0 and
+v0.3.18 one, SHA-256
+`c335171994e89da9d8d86b3cece9a7de8899a52056b6c42904a5f63dfa33c7e5`.
+The public native clean-install workflow ran its three actual published-URL
+installation legs successfully in
+[run 41947040908](https://github.com/favcrm/cadence/actions/runs/41947040908). The
+owned `public-client` catalogue answers `v0.3.19`.
+
+This record covers the public client release only. It does not promote a native-host
+candidate, install or restart a daemon, or establish operational verification; those
+remain separate operator decisions. A real client-only `update --check` selecting
+this version was not exercised.
+
+## Stable v0.3.18 (published, immutable)
+
+[Cadence 0.3.18](https://github.com/favcrm/cadence/releases/tag/v0.3.18) was
+published as the stable GitHub Release on 2026-11-04 at 10:59:44 UTC
+(`prerelease=false`, `latest=true`, `draft=false`, immutable). Its annotated tag
+object is `e4fb136f738acafbd661d4cb9a3ccf9aefed82e4`, peeled to source
+`a294d88e78f6911b293a4e08b5f932564eeda2a8`. The producing
+[tag workflow run 41816256526, attempt 1](https://github.com/favcrm/cadence/actions/runs/41816256526)
+completed successfully: the four tag gates (`fmt`, `clippy`, `build`, `ui`),
+`release-gate`, three native release builds and three exact-candidate native
+installation legs passed before the release environment was approved. Tests run
+in their own scheduled workflow, not in the tag gates.
+
+All nine published HTTPS assets were anonymously downloaded and their bytes
+matched the published `.sha256` files. The x86_64 archive's manifest names
+`v0.3.18`, target `x86_64-linux`, runner `ubuntu-22.04`, the source digest above,
+that run and attempt, features `["ui"]` and checks
+`["fmt","clippy","build","ui"]`. The installer is byte-identical to the v0.2.0
+one, SHA-256
+`c335171994e89da9d8d86b3cece9a7de8899a52056b6c42904a5f63dfa33c7e5`.
+The public native clean-install workflow ran its three actual published-URL
+installation legs successfully in
+[run 41818596207](https://github.com/favcrm/cadence/actions/runs/41818596207);
+each leg acquires `install.sh`, one platform archive and that archive's
+checksum. The owned `public-client` catalogue answers `v0.3.18`.
+
+This record covers the public client release only. It does not promote a
+native-host candidate, install or restart a daemon, or establish operational
+verification; those remain separate operator decisions.
+
 ## Stable v0.2.0 (published, immutable)
 
 [Cadence 0.2.0](https://github.com/favcrm/cadence/releases/tag/v0.2.0) was
@@ -51,6 +112,7 @@ and operational verification; none follows implicitly from this release.
 | Artifact ready | Exact main `ci.yml` push run and attested `cadence-<sha>-x86_64-linux` artifact; verify source SHA/run attempt/digest, not just a green job name. |
 | Staged | Successful `stage` job and staging evidence for the selected artifact and installed baseline. |
 | Promoted | Successful manual `staging.yml` dispatch, successful `promote` job after GitHub `production` approval, and matching `production-candidate.json` in the `production-candidate` artifact. |
+| Published | Successful `promotion-completion` run for that promotion, its `publish-release` job included; the source's `releases/<product>/<profile>/<sha>` path answers 200. |
 | Installed | Operator update result and installed/running build match the intended SHA. |
 | Operationally verified | Read-only health/status and affected behavior checked on that build; fixture QA is not live verification. |
 
@@ -90,11 +152,11 @@ Report any remaining operator rollout work explicitly.
    intended target. Installation, drain, backup and health checks remain in
    the supported update flow, not a hand-built restart recipe.
    `promotion-completion` publishes the operator-host catalogue record only
-   after the promotion run completes, so an update relayed while `promote` is
-   still waiting refuses with `release detail (not_found)`. Confirm the record
-   exists first — the source's `releases/<product>/<profile>/<sha>` path
-   answers 200 — and read that refusal as "not published yet", never as a
-   wrong command.
+   after the promotion run completes. Until then the default update still
+   selects the previously published build, and a pinned `--to` refuses with
+   `release detail (not_found)`. Confirm the record exists first — the
+   source's `releases/<product>/<profile>/<sha>` path answers 200 — and read
+   either result as "not published yet", never as a wrong command.
 
 ### Bundled guidance on native update (CAD-1472)
 
@@ -230,6 +292,60 @@ public-client publication. The operator-host record never stands in for
 public-client authority. Publication, visibility, withdrawal, install
 and rollout stay separately gated operator actions; anonymous read opens
 none of them.
+
+### Linux protected runtime owner (CAD-2442)
+
+Protected Linux hosts need `cadence-runtime-owner` in addition to the
+operator-host `cadence` binary. New x86_64 candidates build both from the
+same locked checkout and publish `cadence-runtime-owner.tar.gz` as a
+separate asset under the **same exact-SHA operator-host release**. The
+regular archive, receipt format and `cadence update` path are unchanged.
+Historical releases do not acquire the new asset retroactively.
+
+**Before promotion:** After the reviewed commit reaches `main` and its
+`ci.yml` push run succeeds, use that commit and run ID to fetch the signed
+candidate pair as an unprivileged user. The output directory must not exist.
+
+```sh
+bash scripts/verify-runtime-owner-candidate.sh "$source_sha" "$ci_run_id" "$new_absolute_output_dir"
+```
+
+This requires read access to Actions artifacts, `gh`, Python 3, `jq` and GNU
+coreutils, not Cargo. It verifies the ordinary candidate first, then uses that
+candidate's run and attempt to verify the Linux owner. A failed run may leave
+downloaded files but does not write `verified-pair.json`. The command does not
+install, start, promote or publish anything.
+
+Use the verified pair to replay installation and qualify the full launch on a
+network-isolated VPS: the real installer and observer must bring the pinned
+guest to `ready`, using fresh state and no production credentials. For
+the first Tencent rollout, record the clean install and guest result for
+the exact signed source, CI run and attempt in
+[CAD-2454](https://fav-limited.cadencecloud.app/projects/cadence/issues/CAD-2454).
+Do not dispatch production promotion while either pre-promotion check is open;
+the release-store may publish immediately after an approved promotion.
+
+**After promotion:** Replay the download from the release catalogue to check
+the bytes actually served to operators.
+
+Download the companion named in the approved release's catalogue entry:
+`/v1/cadence/artifacts/cadence/operator-host/<source-sha>/cadence-runtime-owner.tar.gz`
+on the configured release origin. Check the archive against that entry's
+SHA-256, extract it as an unprivileged user into an empty directory, and run
+the verifier from the reviewed Cadence checkout on Linux:
+
+```sh
+bash scripts/verify-runtime-owner.sh "$owner_dir" "$source_sha" "$ci_run_id" "$ci_run_attempt"
+```
+
+Take the expected source, CI run and attempt from the independently verified
+ordinary release's production-candidate receipt, not from the owner download.
+The verifier needs `gh`, `jq` and GNU coreutils, not Cargo. It refuses absent
+members, modified bytes and provenance from a different build or attempt.
+Verification does not install the file or authorize a restart. Pin the
+verified owner digest in the live root-owned profile only after CAD-2454's
+isolated qualification and public-download checks pass. Obtain separate
+operator authorization for the live rollout.
 
 **Scheduled and `workflow_run` staging cannot promote.** Their successful
 runs may have `promote: skipped`; that means staged, not production-approved.
@@ -552,10 +668,32 @@ are not sufficient capability or compatibility notes.
 Release publication, installing a build, migrating organization state and
 rolling out a production daemon are separate operations with separate evidence.
 
+### Hosted review evidence: tenant first, then client (CAD-2001)
+
+A hosted workspace's merge gate reads and operator approval are
+project-scoped (`audit verdicts --project`, `audit approval --project
+--issue`, `audit approve --project --issue`, and the owner's `audit
+reviewers`/`audit identities` attestations). The tenant server serves those
+verbs; this client sends them and never falls back to the older repo-scoped
+reads when the project is known. So the order is fixed:
+
+1. Roll out the tenant server that serves the project-scoped verbs.
+2. Then install this Cadence client (and the matching
+   `scripts/enqueue-reviewed`).
+
+A client that predates the tenant's verbs keeps reading the repo-scoped
+evidence, which the tenant still serves for old clients. A client that is
+newer than its tenant is refused: the tenant answers `501 not_implemented`
+(or `400 invalid_request`, `409 container_required`, `503
+capability_unavailable`) and the client reports it as a release-order problem
+— "update the tenant server first, then this Cadence client" — and records
+nothing. That refusal is a refusal: never read it as "no verdicts were filed"
+and never work around it by pointing the gate at a repo-scoped read.
+
 ## Dev-to-release flow (CAD-1400)
 
 One ticket, one PR. The lane worktree passes `scripts/pre-push` locally, then
-exact-head CI and independent review on the PR; operator scope or per-head
+exact-head CI and fresh-session review on the PR; operator scope or per-head
 approval (recorded via `cadence audit approve`) precedes
 `scripts/enqueue-reviewed` into the merge queue, which retests on newest
 main. The merged head is the only release candidate: a `v*` tag matching
@@ -589,6 +727,11 @@ report on the ticket, and the report must bind the same attempt: `agent` equals
 the record's worker, `sha` is the full PR head, `pr` is the PR URL, it was filed
 no earlier than the record's dispatch, and branch protection's required checks
 are green on that head.
+
+A hosted org has no delivery record, so this section is for local orgs. A hosted
+routine PR takes a pass from both review workflows at its head, plus the operator
+approval a workflow row needs while `docs/roles/workflow-auto-paths.toml` does not
+list its paths, and the refusal names what to dispatch (CAD-2135).
 
 The daemon opens the record two ways. A master dispatch does it
 (`cadence dispatch --to <worker> <ID> --reply-to <alias> --note <path>`); or,

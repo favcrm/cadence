@@ -1,0 +1,19 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.requirements.evaluate",
+    "input": {
+      "manifest": "---\nname: demo\n---\nbody\n",
+      "target": {
+        "core": "0.3.0",
+        "contracts": {},
+        "native": true
+      }
+    }
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_command",
+    "message": "unknown field `native`, expected `core` or `contracts`"
+  }
+}

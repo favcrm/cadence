@@ -1,26 +1,11 @@
-//! `cadence ui` — the board: a small synchronous HTTP server
-//! (tiny_http, no async runtime — the daemon is plain threads too)
-//! serving the built SPA plus a JSON API on loopback.
+//! `cadence ui` — client, persisted options, process lifecycle, and tailnet seam.
 //!
-//! Private reads require a live session; unsigned local browsing is an
-//! explicit persisted policy. Operator authority is a session (CAD-313,
-//! ADR 0004): a `cadence ui login` link exchanged for an HttpOnly cookie
-//! plus a tab-held `X-Cadence-Session` key, checked by the daemon.
-//! [`operator`] defines the stronger caller proof used for writes.
-//! The rest is containment: loopback bind, no CORS headers, a
-//! Host allowlist against DNS rebinding, id grammar checked before any
-//! path is touched, and no file reads outside the PM dir or `--dist`.
-//! Writes are I2: POST/PATCH/DELETE routes must pass four cross-site
-//! guards (known write route, exact JSON/octet-stream content type,
-//! `X-Cadence-Board: 1`, same-origin Origin/Sec-Fetch-Site) before any
-//! work is done, then the caller rule, then the writer the route
-//! supports. Memory curation is deliberately refused here: an HTTP
-//! server peer is not the native agent endpoint proof required by the
-//! daemon, so the browser cannot become a curator by reaching this route.
+//! The HTTP board server (`serve` and all REST/SSE handlers) lives in the
+//! `cadence-ui` workspace crate (`crates/cadence-ui`). Keeping only config,
+//! lifecycle, and tailnet coordination here keeps `tiny_http` request routing
+//! out of the core `cadence-agent` compilation unit.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -28,98 +13,62 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
-mod app_assistant;
-mod app_audiences;
-mod app_chat;
-mod app_content;
-mod app_contexts;
-mod app_explorer;
-mod app_media;
-mod app_records;
-mod app_release;
-mod app_runs;
-mod app_screens;
-mod app_social_drafts;
-mod approvals;
-mod apps;
-mod artifacts;
-mod assist_route;
-#[cfg(test)]
-mod board_api_golden;
-mod business_templates;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1337_acceptance;
-mod cli_route;
-#[cfg(all(test, feature = "cli-runtime-test"))]
-pub(crate) use cli_route::prime_jwks_for_test as prime_cli_jwks_for_test;
-mod connections;
-mod crm_send;
-mod crm_smtp;
-pub mod delivery_sync;
-mod endpoints;
-mod home;
-mod human_threads;
-mod lane;
 mod lifecycle;
-mod locale;
-mod login;
-mod member_assist;
-mod member_view;
-mod my_work;
-mod notify_service;
-mod operator;
-mod platform_account;
-mod project_policy;
-pub(crate) mod public_directory;
-mod read_model;
-mod serve;
-mod setup;
-mod social_publish;
-mod stages;
-mod stream;
 mod tailscale;
 mod tailscale_serve;
-#[cfg(all(test, feature = "test-seam"))]
-mod team_assistants_http_refusal;
-mod threads;
-mod topics;
-mod updates;
-mod whatsapp;
-mod wiki;
-mod wiki_envelope;
-#[cfg(all(test, feature = "test-seam"))]
-pub(crate) use wiki_envelope::prime_jwks_for_test;
-mod work_conversations;
-mod workflows;
-mod write_path;
 
-pub(crate) use operator::{public_scheme, PUBLIC_COOKIE};
-pub use operator::{route_class, RouteClass, WriteRoute, WRITE_ROUTES};
-pub use serve::serve;
-pub use setup::{read_model_stats, setup_runs};
+pub use cadence_core::PublicBoard;
 
-// Re-export the moved sections' shared items so the sibling submodules'
-// `use super::{…}` and the tests' `super::` keep resolving — the public
-// surface of `crate::ui` is unchanged by the split.
+/// The actor an operator write commits as — visible in `git log`
+/// subjects. A pane's write commits as its alias.
+#[doc(hidden)]
+pub const UI_ACTOR: &str = "operator (ui)";
+
+/// The public session cookie (contract §7): `__Host-` pins `Secure`,
+/// `Path=/` and no `Domain`, so a sibling host under `*.BOARD_DOMAIN`
+/// can neither toss nor overwrite it.
+#[doc(hidden)]
+pub const PUBLIC_COOKIE: &str = "__Host-aos-board-session";
+
+/// This board's own loopback name: `cadence-<port>.localhost:<port>`.
+#[doc(hidden)]
+pub fn board_host(port: u16) -> String {
+    format!("cadence-{port}.localhost:{port}")
+}
+
+/// The scheme a public board host speaks (contract §1).
+#[doc(hidden)]
+pub fn public_scheme(host: &str) -> &'static str {
+    let name = host.split(':').next().unwrap_or_default();
+    if name == "localhost" || name.ends_with(".localhost") {
+        "http"
+    } else {
+        "https"
+    }
+}
+
 #[cfg(test)]
 pub(crate) use lifecycle::{
     board_argv_state_dir, pid_file, reap_unready_child, startup_bind_in_use,
 };
 pub use lifecycle::{detached_pid, START_BUDGET_ENV, START_BUDGET_RESTART};
-pub(crate) use lifecycle::{
-    http_get, is_cadence_exe_name, ready_file, start_quiet, startup_failed_file, READY_NONCE_ENV,
-    START_REMAINING_ENV,
+#[doc(hidden)]
+pub use lifecycle::{
+    http_get, is_cadence_exe_name, ready_file, start, start_quiet, startup_failed_file,
+    status as lifecycle_status, stop, READY_NONCE_ENV, START_REMAINING_ENV,
 };
-pub(crate) use serve::{
-    agents_payload_typed, board_job_list, err_response, json_response, pct_decode,
-};
-pub(crate) use stream::{dir_mtime, event_resources, projects_payload, value_fp};
-pub(crate) use tailscale::{ts, ts_self, ts_start_quiet};
-pub(crate) use write_path::{
-    agent_roots, busy_response, coded_response, guard_fail, header_value, issue_payloads,
-    parse_json, parse_multipart, proxied_actor, read_body, tailnet_proxy, write_err, write_guard,
-    write_reply, HttpResp, JSON_CAP, UI_ACTOR,
-};
+#[doc(hidden)]
+pub use tailscale::{ensure_mapping, remove_mapping, tailscale_cli, ts, ts_self, ts_start_quiet};
+
+/// Test-only bridge preserving `crate::ui::serve` and `crate::ui::ServeOpts`
+/// for integration/acceptance fixtures still hosted in `cadence-agent`.
+#[cfg(test)]
+pub use cadence_ui::ServeOpts;
+
+#[cfg(test)]
+pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    cadence_ui::serve(state_dir, pm_dir, opts).map_err(|e| Error::internal(e.to_string()))
+}
 
 /// The options `ui run` and `ui start` share. Every field is optional:
 /// a given flag overrides the persisted `ui.json`, an absent one
@@ -219,119 +168,6 @@ pub struct UiFlags {
 }
 
 #[derive(Subcommand)]
-pub enum UiAction {
-    /// Serve the board + JSON API in the foreground.
-    Run {
-        #[command(flatten)]
-        flags: UiFlags,
-    },
-    /// Detached `ui run`: pid + log under the state dir, mirrors
-    /// `daemon start`. Effective options persist to `ui.json`; a later
-    /// plain `ui start` reuses them.
-    Start {
-        #[command(flatten)]
-        flags: UiFlags,
-        /// Forget the persisted options before applying flags.
-        #[arg(long)]
-        reset: bool,
-        /// CAD-1024: `delegate:<alias>` — start the board under a staging
-        /// grant for `ui_start` on this state dir.
-        #[arg(long = "as")]
-        as_identity: Option<String>,
-    },
-    /// Stop the detached UI server.
-    Stop {
-        /// Also remove the tailscale serve mapping cadence created.
-        #[arg(long)]
-        tailscale_off: bool,
-        /// CAD-1024: `delegate:<alias>` — stop the board under a staging
-        /// grant for `ui_stop` on this state dir.
-        #[arg(long = "as")]
-        as_identity: Option<String>,
-    },
-    /// Report UI server health and the persisted options.
-    Status,
-    /// Print a single-use sign-in link for the board (CAD-313). Private
-    /// reads and operator writes need a session; this link opens one. Run it
-    /// from your own shell — agents are refused. The link is valid for
-    /// 2 minutes and one browser; the secret it proves never leaves the
-    /// state dir.
-    Login {
-        /// A link for the tailnet URL (`ui tailscale start`) instead of
-        /// this board's own `http://cadence-<port>.localhost:<port>`.
-        #[arg(long)]
-        tailnet: bool,
-        /// Replace the operator secret and revoke every session and
-        /// unused link first.
-        #[arg(long)]
-        rotate: bool,
-        /// The board's port [default: the persisted `ui start` port, else 3010].
-        #[arg(long)]
-        port: Option<u16>,
-        /// Print `{link, origin, expires_in}` as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the board's operator sessions, or revoke them (CAD-313).
-    Sessions {
-        /// Revoke the session with this display id.
-        #[arg(long)]
-        revoke: Option<String>,
-        /// Revoke every session and every unused link.
-        #[arg(long)]
-        revoke_all: bool,
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Manage remote sign-in through the AgenticOS device grant
-    /// (CAD-777/CAD-841): set or clear the daemon-owned issuer +
-    /// workspace + subject allowlist. Applies live to every board on
-    /// this state dir — no restart. Operator-only: needs positive
-    /// operator proof and the operator secret, like `ui login`.
-    DeviceLogin {
-        #[command(subcommand)]
-        action: DeviceLoginAction,
-    },
-    /// Share the board over the tailnet (`tailscale serve`, never
-    /// funnel). The primary UX for phone/laptop access.
-    Tailscale {
-        #[command(subcommand)]
-        action: TailscaleAction,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum DeviceLoginAction {
-    /// Point the device sign-in at an AgenticOS issuer + workspace and
-    /// name the subjects who may sign in. Replaces the whole triple —
-    /// a later `set` rotates it, `clear` removes it.
-    Set {
-        /// The issuer origin that mints the grant (https://…).
-        #[arg(long)]
-        issuer: String,
-        /// The exact workspace/org id the sign-in is for.
-        #[arg(long)]
-        org: String,
-        /// An issuer subject allowed to sign in — repeatable, once
-        /// per operator (`cadence auth status` prints yours under
-        /// `principal.subject_id`).
-        #[arg(long, required = true)]
-        subject: Vec<String>,
-    },
-    /// Turn remote sign-in off: the mint path and the board routes
-    /// fail closed until `set` runs again. Live sessions already
-    /// minted keep running — `ui sessions --revoke-all` ends those.
-    Clear,
-    /// Show the configured issuer, workspace and subject allowlist.
-    Show {
-        /// Print `{configured, issuer, org, subjects}` as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
 pub enum TailscaleAction {
     /// Publish the board on the tailnet: ensure the serve mapping,
     /// persist the options, (re)start the detached board so the Host
@@ -351,49 +187,14 @@ pub enum TailscaleAction {
     Status,
 }
 
-/// `cadence ui …`
-pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
-    match action {
-        UiAction::Run { flags } => lifecycle::run(state_dir, flags),
-        UiAction::Start {
-            flags,
-            reset,
-            as_identity,
-        } => {
-            delegate_ui_gate(state_dir, as_identity.as_deref(), "ui_start")?;
-            lifecycle::start(state_dir, flags, *reset)
-        }
-        UiAction::Stop {
-            tailscale_off,
-            as_identity,
-        } => {
-            delegate_ui_gate(state_dir, as_identity.as_deref(), "ui_stop")?;
-            lifecycle::stop(state_dir, *tailscale_off)
-        }
-        UiAction::Status => lifecycle::status(state_dir),
-        UiAction::Login {
-            tailnet,
-            rotate,
-            port,
-            json,
-        } => login::login(state_dir, *tailnet, *rotate, *port, *json),
-        UiAction::Sessions {
-            revoke,
-            revoke_all,
-            json,
-        } => login::sessions(state_dir, revoke.as_deref(), *revoke_all, *json),
-        UiAction::DeviceLogin { action } => login::device_login(state_dir, action),
-        UiAction::Tailscale { action } => tailscale::tailscale_cli(state_dir, action),
-    }
-}
-
 /// CAD-1024: the `delegate:<alias>` seam for `ui start`/`ui stop`. No `--as`
 /// (or one that is not `delegate:`) is the unchanged operator path — today
 /// these are local pidfile ops needing no identity. A `delegate:` `--as`
 /// requires a live grant for `op` on this state dir plus the I4 binding
 /// (`require_delegate_grant`), so a staging agent — not the operator — can
 /// bounce the board on a dir it is delegated for.
-fn delegate_ui_gate(state_dir: &Path, as_identity: Option<&str>, op: &str) -> Result<()> {
+#[doc(hidden)]
+pub fn delegate_ui_gate(state_dir: &Path, as_identity: Option<&str>, op: &str) -> Result<()> {
     let Some(as_identity) = as_identity else {
         return Ok(());
     };
@@ -401,8 +202,6 @@ fn delegate_ui_gate(state_dir: &Path, as_identity: Option<&str>, op: &str) -> Re
     if caller.source == "delegate" {
         crate::rollout::require_delegate_grant(state_dir, &caller, op)?;
     }
-    // A non-delegate `--as` is ignored for ui start/stop (no caller exists on
-    // this path); only `delegate:` grants admission, and only under a grant.
     Ok(())
 }
 
@@ -448,32 +247,13 @@ impl TailscaleOpts {
 }
 
 /// `https://<name>` for 443, else `https://<name>:<port>`.
-pub(crate) fn tailnet_url(dns_name: &str, https_port: u16) -> String {
+#[doc(hidden)]
+pub fn tailnet_url(dns_name: &str, https_port: u16) -> String {
     if https_port == 443 {
         format!("https://{dns_name}")
     } else {
         format!("https://{dns_name}:{https_port}")
     }
-}
-
-/// CAD-526: this board's AgenticOS public identity as `ui start`
-/// recorded it — all four fields together or none.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-#[serde(deny_unknown_fields)]
-pub struct PublicBoard {
-    /// The board's public host — `aud` must equal exactly this
-    /// (hostname plus port when present, e.g. `acme.board.localhost:3123`
-    /// locally or `acme.cadencecloud.app` in production).
-    pub host: String,
-    /// The platform issuer — the JWS `iss`, and the origin the JWKS is
-    /// fetched from (`{iss}/.well-known/agenticos-board-jwks.json`).
-    pub issuer: String,
-    /// The company/workspace id this instance serves — `company` must
-    /// equal it; one Cadence serves one company (contract §9).
-    pub company: String,
-    /// Where an absent or expired browser session redirects:
-    /// `{app}/v2/board/authorize` on the app origin.
-    pub authorize_url: String,
 }
 
 /// Remote operator sign-in through the AgenticOS device grant
@@ -490,42 +270,6 @@ pub struct DeviceLoginOpts {
     /// The verified issuer subjects allowed a board session.
     pub subjects: Vec<String>,
 }
-
-/// A device grant the board is waiting on: the server-side code plus
-/// its expiry. The browser holds only the pending id. Opaque outside
-/// this module tree: fields stay private, so only `ui` and its
-/// children construct or read rows.
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct DevicePending {
-    device_code: String,
-    expires_at: i64,
-}
-
-/// The board's device-login machinery (CAD-777/CAD-841): the live
-/// pending map plus the issuer transport. The issuer + workspace +
-/// allowlist are NOT here — they are the daemon's config, read
-/// per-request through `device_login_config`, so a `set`/`clear`
-/// takes effect on a running board without a restart.
-#[derive(Clone)]
-pub struct DeviceLogin {
-    pub pending: std::sync::Arc<std::sync::Mutex<HashMap<String, DevicePending>>>,
-    /// The issuer transport — live ureq unless a test injects a fake.
-    pub transport: std::sync::Arc<dyn crate::device_login::IssuerTransport>,
-}
-
-impl Default for DeviceLogin {
-    fn default() -> Self {
-        Self {
-            pending: Default::default(),
-            transport: std::sync::Arc::new(crate::device_login::UreqTransport::new()),
-        }
-    }
-}
-
-/// Live device grants awaiting approval are bounded: past this many,
-/// `/api/session/device/code` refuses with 429 until one settles.
-const DEVICE_PENDING_CAP: usize = 16;
 
 /// The effective options `ui start` persists — a later plain start
 /// reuses them, `ui status` prints them, `--reset` forgets them.
@@ -545,93 +289,20 @@ pub struct UiOpts {
     pub board: Option<PublicBoard>,
 }
 
-/// Everything the running server needs, resolved.
-#[derive(Clone, Default)]
-pub struct ServeOpts {
-    /// This board process's boot-pinned daemon agent UID. `serve` obtains
-    /// it once from the private daemon socket; tests can inject a pin.
-    pub agent_uid: Option<u32>,
+/// Resolved network bind and host/origin allowlist produced by
+/// [`resolve_ui_opts`] and [`resolve_ui_bind`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ResolvedUiBind {
     pub host: String,
     pub port: u16,
-    pub dist: Option<PathBuf>,
-    /// Operator `--allow-host` plus the tailnet-derived names.
     pub allow_hosts: Vec<String>,
-    /// Operator `--allow-origin` plus the tailnet https origin.
     pub allow_origins: Vec<String>,
-    pub read_only: bool,
-    pub allow_anonymous_reads: bool,
-    pub board_public_only: bool,
-    /// Tailscale sharing armed: `(dns_name, https_port)` — the trust
-    /// rule for `Tailscale-User-*` headers and the `/api/meta` URL.
     pub tailnet: Option<(String, u16)>,
-    /// tailscaled's LocalAPI socket the tailnet proof reads
-    /// ([`crate::tailnet_proof`]); `None` is tailscaled's default path.
-    /// Never set from the command line — tests inject a fixture.
-    pub tailscaled_socket: Option<PathBuf>,
-    /// This board process's operator-user latch. [`serve`] always
-    /// replaces it with a fresh startup read; the default is latched.
-    pub tailnet_latch: crate::tailnet_proof::OperatorLatch,
-    /// The `gh` the board's Merge runs (CAD-431) — the operator's own,
-    /// `gh` on PATH when `None`. Never set from the command line —
-    /// tests inject a fake.
-    pub gh: Option<PathBuf>,
-    /// The board's delivery-sync period (CAD-446), [`delivery_sync::EVERY`]
-    /// when `None`, clamped to its bounds. Never set from the command
-    /// line — tests shorten it.
-    pub delivery_sync_every: Option<Duration>,
-    /// This board process's delivery sync. [`serve`] always replaces it
-    /// (with `None` on a read-only board); never a caller's.
-    pub delivery_sync: Option<std::sync::Arc<delivery_sync::DeliverySync>>,
-    /// The in-process owner's stop (CAD-471): once set, [`serve`] stops
-    /// accepting and returns, closing its port. Never set from the
-    /// command line — a test's board on a thread of the runner stops
-    /// with its test instead of serving for the rest of the run.
-    pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// An in-process owner's startup notification: success follows binding
-    /// and initialization; a bind failure carries its I/O kind. Never set
-    /// from the command line. Other startup failures disconnect the channel.
-    pub startup: Option<std::sync::mpsc::Sender<std::result::Result<(), std::io::ErrorKind>>>,
-    /// The readiness nonce `ui start` handed this child through its
-    /// environment — see [`READY_NONCE_ENV`]. Written to `ui.ready` only
-    /// after the bind succeeds; never served over HTTP. [`serve`] reads
-    /// it once and removes it from this process's own environment.
-    pub ready_nonce: Option<String>,
-    /// CAD-526: this board's public AgenticOS name, when configured.
-    /// Requests that carry its Host are the platform sign-in surface —
-    /// `__platform/*` routes and `__Host-aos-board-session` reads —
-    /// never the local login flow.
-    pub public: Option<PublicBoard>,
-    /// CAD-777/CAD-841: the board's device-login machinery — pending
-    /// map + issuer transport. Whether the flow is ON is the daemon's
-    /// answer (`device_login_config` RPC), read per request; the
-    /// board never owns configuration. Never set from the command
-    /// line — tests inject a fake issuer transport.
-    pub device_login: DeviceLogin,
-    /// CAD-841: a resolved `--device-login-*` triple `serve` pushes to
-    /// the daemon — only AFTER the port is bound, so a failed start
-    /// never replaces live sign-in settings on other boards of this
-    /// state dir (review r1). `ui run` fills it from its flags;
-    /// `ui start`'s parent pushes itself post-spawn (the detached
-    /// child cannot prove operator), and tests leave it `None`.
-    pub device_login_push: Option<DeviceLoginOpts>,
-    /// CAD-482: arm the test-only caller seam — the board honors
-    /// `X-Cadence-Test-As`/`X-Cadence-Test-Token` request headers and
-    /// its daemon calls carry the asserted identity. Honored only in
-    /// `test-seam` builds and only against a seam-armed fixture
-    /// daemon; otherwise [`serve`] refuses to start.
-    pub test_seam: bool,
-    /// The credential [`serve`] resolved for `test_seam` — callers
-    /// never set this.
-    #[doc(hidden)]
-    pub seam: Option<crate::test_seam::Seam>,
-    /// The program the Update button spawns (CAD-561 r2): `cadence
-    /// update --as <ui actor> --progress <state>/update-progress.jsonl`.
-    /// `None` is this board's own binary. Never set from the command
-    /// line — tests inject a fake helper.
-    pub update_helper: Option<PathBuf>,
 }
 
-pub(crate) fn opts_file(state_dir: &Path) -> PathBuf {
+#[doc(hidden)]
+pub fn opts_file(state_dir: &Path) -> PathBuf {
     state_dir.join("ui.json")
 }
 
@@ -671,7 +342,77 @@ pub fn serve_has_target(target: &str) -> Option<bool> {
     Some(String::from_utf8_lossy(&out.stdout).contains(target))
 }
 
-pub(crate) fn load_opts(state_dir: &Path) -> UiOpts {
+/// CAD-1085: the server-selected base URL of this deployment's trusted
+/// credential entry page — the root-pinned `https://` origin, never the
+/// ordinary board, a caller-chosen origin, a CLI flag or `ui.json`.
+///
+/// `None` means this deployment has no separate trusted credential origin
+/// (no protected profile, or the daemon cannot prove one). Callers must
+/// report the entry as unsupported; they must never fall back to the board
+/// origin, where the form does not exist.
+pub fn credential_entry_base(state_dir: &Path) -> Option<String> {
+    credential_entry_origin(state_dir)
+}
+
+/// CAD-1085: the deployment-pinned credential-entry origin from the root
+/// profile, read through the daemon's operator-proven metadata RPC. The
+/// answer needs no agent or loaded guest: it is the profile's exact
+/// `https://host[:port]` plus live owner/core history evidence.
+pub fn credential_entry_origin(state_dir: &Path) -> Option<String> {
+    credential_entry_config(state_dir).1
+}
+
+/// `(root profile installed, pinned entry origin?)`. The daemon answers
+/// from the live root profile and owner/core history; no agent or loaded
+/// guest is required. `configured`/`protected` mean the profile is
+/// installed — not qualified or ready — so the legacy directly-typed
+/// transports are refused even while the owner is down.
+pub fn credential_entry_config(state_dir: &Path) -> (bool, Option<String>) {
+    // An unprovable answer fails CLOSED: an unknown/older daemon or a
+    // transport error is not evidence that this is an unprotected board,
+    // so the legacy secret paths stay refused until the daemon answers.
+    credential_entry_config_proven(state_dir).unwrap_or((true, None))
+}
+
+/// The same answer as a `Result`, for callers (the CLI) that must
+/// distinguish a positive operator-proven daemon reply from an unavailable
+/// one before auto-opening a human-browser URL.
+pub fn credential_entry_config_proven(state_dir: &Path) -> Result<(bool, Option<String>)> {
+    let value = crate::client::rpc(state_dir, "credential_entry_config", json!({}))?;
+    let entry = &value["entry"];
+    let installed =
+        entry["configured"].as_bool() == Some(true) && entry["protected"].as_bool() == Some(true);
+    if !installed {
+        return Ok((false, None));
+    }
+    let origin = entry["origin"].as_str().and_then(|origin| {
+        let rest = origin.strip_prefix("https://")?;
+        (rest.len() <= 200
+            && !rest.is_empty()
+            && !origin.bytes().any(|b| b.is_ascii_whitespace())
+            && !rest.contains(['/', '?', '#', '@']))
+        .then(|| origin.to_string())
+    });
+    Ok((true, origin))
+}
+
+/// Is a protected root profile installed, regardless of whether its pinned
+/// origin is usable right now? Legacy secret collection is refused on this
+/// answer alone.
+pub fn protected_profile_configured(state_dir: &Path) -> bool {
+    credential_entry_config(state_dir).0
+}
+
+/// The ordinary board origin — the metadata and management surface. Never
+/// The ordinary board origin — the metadata and management surface. Never
+/// the trusted credential origin.
+pub fn board_base(state_dir: &Path) -> String {
+    let port = load_opts(state_dir).port.unwrap_or(3010);
+    format!("http://{}", board_host(port))
+}
+
+#[doc(hidden)]
+pub fn load_opts(state_dir: &Path) -> UiOpts {
     try_load_opts(state_dir, false).unwrap_or_default()
 }
 
@@ -746,7 +487,8 @@ fn try_load_opts(state_dir: &Path, strict: bool) -> Result<UiOpts> {
     Ok(opts)
 }
 
-fn load_opts_strict(state_dir: &Path) -> Result<UiOpts> {
+#[doc(hidden)]
+pub fn load_opts_strict(state_dir: &Path) -> Result<UiOpts> {
     try_load_opts(state_dir, true)
 }
 
@@ -756,7 +498,8 @@ pub(crate) fn has_persisted_share(state_dir: &Path) -> Result<bool> {
     Ok(load_opts_strict(state_dir)?.tailscale.is_some())
 }
 
-pub(crate) fn save_opts(state_dir: &Path, opts: &UiOpts) -> Result<()> {
+#[doc(hidden)]
+pub fn save_opts(state_dir: &Path, opts: &UiOpts) -> Result<()> {
     let path = opts_file(state_dir);
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(opts)?)?;
@@ -787,7 +530,10 @@ fn clear_persisted_share(state_dir: &Path) -> Result<()> {
 /// absent one inherits. `--tailscale` resolves the tailnet identity
 /// but does not mutate the serve mapping; callers publish it only after
 /// their own remaining validation. A persisted tailscale block is kept.
-pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpts)> {
+/// but does not mutate the serve mapping; callers publish it only after
+/// their own remaining validation. A persisted tailscale block is kept.
+#[doc(hidden)]
+pub fn resolve_ui_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ResolvedUiBind)> {
     let env_public_only = match std::env::var("CADENCE_BOARD_PUBLIC_ONLY") {
         Ok(v) if v == "1" => true,
         Ok(v) if v == "0" => false,
@@ -824,9 +570,6 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
             || persisted.board_public_only
             || env_public_only,
         tailscale: persisted.tailscale.clone(),
-        // CAD-526: each field resolves flag → env → persisted; the block
-        // is all-or-nothing — any field present with another missing is
-        // an operator error, never a partial trust root.
         board: resolve_board(flags, persisted)?,
     };
     if eff.board_public_only && eff.board.is_none() {
@@ -856,8 +599,7 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
         let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
         if host != "127.0.0.1" {
             return Err(Error::rejected(format!(
-                "--tailscale shares the board through a proxy on this host, \
-                 but --host '{host}' is not the required literal IPv4 loopback bind — bind 127.0.0.1"
+                "--tailscale shares the board through a proxy on this host,                  but --host '{host}' is not the required literal IPv4 loopback bind — bind 127.0.0.1"
             )));
         }
         let ui_port = eff.port.unwrap_or(3010);
@@ -870,8 +612,8 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
             target,
         });
     }
-    let serve = serve_opts(&eff)?;
-    Ok((eff, serve))
+    let bind = resolve_ui_bind(&eff)?;
+    Ok((eff, bind))
 }
 
 /// Refuse every recorded sharing target that does not match the
@@ -913,7 +655,8 @@ fn validate_share_target(eff: &UiOpts) -> Result<()> {
 /// combination is an operator error naming the missing piece, never
 /// a silent half trust root. The daemon validates the resolved
 /// triple authoritatively in the RPC.
-pub(crate) fn resolve_device_login(flags: &UiFlags) -> Result<Option<DeviceLoginOpts>> {
+#[doc(hidden)]
+pub fn resolve_device_login(flags: &UiFlags) -> Result<Option<DeviceLoginOpts>> {
     let field = |flag: Option<&String>, env: &str| {
         flag.cloned()
             .or_else(|| std::env::var(env).ok())
@@ -981,7 +724,8 @@ pub(crate) fn resolve_device_login(flags: &UiFlags) -> Result<Option<DeviceLogin
 /// env, so it never re-pushes. Absent flags resolve to `None` and
 /// daemon state stays untouched — it no longer takes a board start to
 /// change it.
-pub(crate) fn push_device_login_config(state_dir: &Path, triple: &DeviceLoginOpts) -> Result<()> {
+#[doc(hidden)]
+pub fn push_device_login_config(state_dir: &Path, triple: &DeviceLoginOpts) -> Result<()> {
     let secret = crate::operator_auth::read_secret(state_dir)?;
     crate::client::rpc(
         state_dir,
@@ -1002,7 +746,8 @@ pub(crate) fn push_device_login_config(state_dir: &Path, triple: &DeviceLoginOpt
 /// When a block resolves, its trust root (`host`, `issuer`, `company`)
 /// is written to the daemon-owned `operator/board-identity.json` so the
 /// board RPC has the same root the session check enforces.
-pub(crate) fn resolve_board(flags: &UiFlags, persisted: &UiOpts) -> Result<Option<PublicBoard>> {
+#[doc(hidden)]
+pub fn resolve_board(flags: &UiFlags, persisted: &UiOpts) -> Result<Option<PublicBoard>> {
     let field = |flag: Option<&String>, env: &str, saved: Option<&String>| {
         flag.cloned()
             .or_else(|| std::env::var(env).ok())
@@ -1073,7 +818,8 @@ pub(crate) fn resolve_board(flags: &UiFlags, persisted: &UiOpts) -> Result<Optio
 /// Build the runtime view of effective options: tailnet- and
 /// public-board-derived Host/Origin entries unioned in (deduped,
 /// case-insensitive) and the loopback rule enforced.
-pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
+#[doc(hidden)]
+pub fn resolve_ui_bind(eff: &UiOpts) -> Result<ResolvedUiBind> {
     let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = eff.port.unwrap_or(3010);
     // A sandbox board never takes production's port (CAD-310).
@@ -1095,9 +841,6 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         }
         tailnet = Some((ts.dns_name.clone(), ts.https_port));
     }
-    // CAD-526: the public board name (and its write origin) enter the
-    // allowlists at resolve time, like the tailnet ones — never a
-    // caller-supplied header.
     if let Some(public) = &eff.board {
         if !allow_hosts
             .iter()
@@ -1105,11 +848,7 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         {
             allow_hosts.push(public.host.clone());
         }
-        let origin = format!(
-            "{}://{}",
-            operator::public_scheme(&public.host),
-            public.host
-        );
+        let origin = format!("{}://{}", public_scheme(&public.host), public.host);
         if !allow_origins
             .iter()
             .any(|x| x.eq_ignore_ascii_case(&origin))
@@ -1117,42 +856,12 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
             allow_origins.push(origin);
         }
     }
-    Ok(ServeOpts {
-        agent_uid: None,
+    Ok(ResolvedUiBind {
         host,
         port,
-        dist: eff.dist.clone(),
         allow_hosts,
         allow_origins,
-        read_only: eff.read_only,
-        allow_anonymous_reads: eff.allow_anonymous_reads,
-        board_public_only: eff.board_public_only,
         tailnet,
-        tailscaled_socket: None,
-        tailnet_latch: Default::default(),
-        gh: None,
-        delivery_sync_every: None,
-        delivery_sync: None,
-        stop: None,
-        startup: None,
-        // `ui run` reads `CADENCE_UI_READY_NONCE` itself; nothing here
-        // copies a caller's env into the field.
-        ready_nonce: None,
-        public: eff.board.clone(),
-        // CAD-841: the board's half of device login is only the
-        // pending map + issuer transport — configuration lives in the
-        // daemon store and is read per request, so a `device-login
-        // set`/`clear` applies to a running board at once. The
-        // flag-push payload is `run`'s business, not resolved options'.
-        device_login: DeviceLogin::default(),
-        device_login_push: None,
-        // CAD-482: `ui run`/`ui start`'s fixture child arms from its
-        // environment; in-process fixtures set the field directly.
-        test_seam: crate::test_seam::env_armed(),
-        seam: None,
-        // CAD-561 r2: a real board spawns its own binary as the update
-        // helper; only tests inject a fake.
-        update_helper: None,
     })
 }
 
@@ -1203,63 +912,20 @@ mod cad1283_pid_startup_refusal_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::serve::{
-        agents_payload_from, content_type, context_query, running_json, static_answer_for,
-        static_file, StaticAnswer,
-    };
-    use super::write_path::{health_supports_model_defaults, proxied_actor};
     use super::{resolve_device_login, UiFlags, UiOpts};
-    use serde_json::{json, Value};
-    use tiny_http::{Header, Response};
-
-    #[test]
-    fn board_csp_allows_only_reviewed_social_preview_image_hosts() {
-        let mut response = Response::from_string("<html></html>");
-        response.add_header(Header::from_bytes("Content-Type", "text/html").unwrap());
-        assert!(super::serve::add_security_headers(&mut response));
-        let policy = response
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv("Content-Security-Policy"))
-            .unwrap()
-            .value
-            .as_str();
-        let image_sources = policy
-            .split(';')
-            .map(str::trim)
-            .find_map(|directive| directive.strip_prefix("img-src "))
-            .unwrap();
-        assert_eq!(
-            image_sources.split_whitespace().collect::<Vec<_>>(),
-            [
-                "'self'",
-                "data:",
-                "https://cdninstagram.com",
-                "https://*.cdninstagram.com",
-                "https://fbcdn.net",
-                "https://*.fbcdn.net",
-            ]
-        );
-        assert!(policy.contains("default-src 'self'"));
-        assert!(policy.contains("base-uri 'none'"));
-        assert!(policy.contains("frame-ancestors 'none'"));
-        assert!(!policy
-            .split_whitespace()
-            .any(|source| source == "https:" || source == "*"));
-    }
 
     #[test]
     fn hosted_public_only_is_explicit_and_requires_public_identity() {
         let mut flags = super::UiFlags::default();
         let empty = super::UiOpts::default();
         assert!(
-            !super::resolve_opts(&flags, &empty)
+            !super::resolve_ui_opts(&flags, &empty)
                 .unwrap()
                 .0
                 .board_public_only
         );
         flags.board_public_only = true;
-        assert!(super::resolve_opts(&flags, &empty).is_err());
+        assert!(super::resolve_ui_opts(&flags, &empty).is_err());
 
         let board = super::PublicBoard {
             host: "acme.board.localhost:3111".to_string(),
@@ -1275,9 +941,9 @@ mod tests {
         let encoded = serde_json::to_vec(&persisted).unwrap();
         let restored: super::UiOpts = serde_json::from_slice(&encoded).unwrap();
         assert!(
-            super::resolve_opts(&super::UiFlags::default(), &restored)
+            super::resolve_ui_opts(&super::UiFlags::default(), &restored)
                 .unwrap()
-                .1
+                .0
                 .board_public_only
         );
     }
@@ -1289,17 +955,17 @@ mod tests {
             allow_anonymous_reads: true,
             ..Default::default()
         };
-        let (enabled, serve) = super::resolve_opts(&flags, &UiOpts::default()).unwrap();
-        assert!(serve.allow_anonymous_reads);
+        let (enabled, _serve) = super::resolve_ui_opts(&flags, &UiOpts::default()).unwrap();
+        assert!(enabled.allow_anonymous_reads);
         super::save_opts(state.path(), &enabled).unwrap();
         let restored = super::load_opts_strict(state.path()).unwrap();
         assert!(
-            super::resolve_opts(&UiFlags::default(), &restored)
+            super::resolve_ui_opts(&UiFlags::default(), &restored)
                 .unwrap()
-                .1
+                .0
                 .allow_anonymous_reads
         );
-        let (disabled, serve) = super::resolve_opts(
+        let (disabled, _serve) = super::resolve_ui_opts(
             &UiFlags {
                 no_allow_anonymous_reads: true,
                 ..Default::default()
@@ -1307,7 +973,7 @@ mod tests {
             &restored,
         )
         .unwrap();
-        assert!(!serve.allow_anonymous_reads);
+        assert!(!disabled.allow_anonymous_reads);
         super::save_opts(state.path(), &disabled).unwrap();
         assert!(
             !super::load_opts_strict(state.path())
@@ -1321,8 +987,8 @@ mod tests {
             company: "co_1".to_string(),
             authorize_url: "http://api.internal/v2/board/authorize".to_string(),
         });
-        assert!(super::resolve_opts(&UiFlags::default(), &hosted).is_err());
-        assert!(super::resolve_opts(
+        assert!(super::resolve_ui_opts(&UiFlags::default(), &hosted).is_err());
+        assert!(super::resolve_ui_opts(
             &UiFlags {
                 no_allow_anonymous_reads: true,
                 ..Default::default()
@@ -1344,7 +1010,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = super::resolve_opts(&super::UiFlags::default(), &persisted)
+        let err = super::resolve_ui_opts(&super::UiFlags::default(), &persisted)
             .err()
             .expect("anonymous reads with tailnet sharing must be refused");
         assert!(
@@ -1358,7 +1024,7 @@ mod tests {
             tailscale: Some(9450),
             ..Default::default()
         };
-        let err = super::resolve_opts(&flags, &super::UiOpts::default())
+        let err = super::resolve_ui_opts(&flags, &super::UiOpts::default())
             .err()
             .expect("anonymous reads with a new --tailscale must be refused");
         assert!(
@@ -1371,7 +1037,7 @@ mod tests {
             allow_anonymous_reads: true,
             ..Default::default()
         };
-        let err = super::resolve_opts(
+        let err = super::resolve_ui_opts(
             &super::UiFlags {
                 tailscale: Some(9450),
                 ..Default::default()
@@ -1384,484 +1050,6 @@ mod tests {
             err.to_string().contains("anonymous reads are local-only"),
             "unexpected refusal: {err}"
         );
-    }
-
-    #[test]
-    fn standalone_board_without_uid_record_does_not_need_daemon_health() {
-        let state = tempfile::TempDir::new().unwrap();
-        assert_eq!(
-            super::setup::board_boot_agent_uid(state.path(), None).unwrap(),
-            None
-        );
-        assert_eq!(
-            super::setup::board_boot_agent_uid(state.path(), Some(2200)).unwrap(),
-            Some(2200)
-        );
-    }
-
-    #[test]
-    fn historical_uid_mode_cannot_start_standalone_after_record_loss() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let state = tempfile::TempDir::new().unwrap();
-        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let marker = state.path().join(crate::agent_uid::config::MODE_MARKER);
-        std::fs::write(&marker, br#"{"uid":2200}"#).unwrap();
-        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let error = super::setup::board_boot_agent_uid(state.path(), None).unwrap_err();
-        assert!(
-            error.to_string().contains("no private daemon boot pin"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn first_uid_provisioning_requires_matching_private_daemon_boot() {
-        for health in [Ok(None), Ok(Some(3300))] {
-            assert!(
-                super::setup::reconcile_board_agent_uid(Some(2200), None, health).is_err(),
-                "configured UID must match private daemon boot before board startup"
-            );
-        }
-        assert_eq!(
-            super::setup::reconcile_board_agent_uid(Some(2200), None, Ok(Some(2200))).unwrap(),
-            Some(2200)
-        );
-    }
-
-    #[test]
-    fn agent_activity_uses_latest_valid_instant_across_timestamp_shapes() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let list = json!({"agents": [{
-            "alias": "worker", "provider": "fake", "endpoint_kind": "fake",
-            "state": "idle", "params": Value::Null,
-            "board": {"messages": [
-                {"created": "not-a-time"},
-                {"created": 1790562108.64},
-                {"created": "2026-09-29T03:00:00+02:00"},
-                {"created": "2026-02-31T04:00:00Z"}
-            ]}
-        }]});
-        let out = agents_payload_from(dir.path(), Some(list), None);
-        assert_eq!(
-            out["agents"][0]["last_activity"],
-            "2026-09-29T03:00:00+02:00"
-        );
-        assert_eq!(
-            super::serve::agent_activity_seconds(&json!("not-a-time")),
-            None
-        );
-        assert_eq!(
-            super::serve::agent_activity_seconds(&json!("2026-02-31T04:00:00Z")),
-            None
-        );
-        assert_eq!(
-            super::serve::agent_activity_seconds(&json!("2026-09-28T02:21:48.640Z")),
-            Some(1790562108.64)
-        );
-        assert_eq!(
-            super::serve::agent_activity_seconds(&json!("2026-09-28T04:21:48.640+02:00")),
-            Some(1790562108.64)
-        );
-    }
-
-    /// CAD-480: a mailbox row on the Agents screen carries its unread
-    /// backlog and oldest-unread age from `agent.inbox`, and the unread
-    /// count folds into the queued total.
-    #[test]
-    fn stream_hello_capability_is_opt_in() {
-        assert_eq!(
-            super::stream::stream_hello(false),
-            format!(
-                "event: hello\ndata: {}\n\n",
-                json!({"build": crate::overview::BUILD_ID})
-            ),
-            "legacy hello remains byte-compatible"
-        );
-        assert_eq!(
-            super::stream::stream_hello(true),
-            format!(
-                "event: hello\ndata: {}\n\n",
-                json!({"build": crate::overview::BUILD_ID, "entities": true})
-            ),
-            "only opted-in clients receive the entity capability"
-        );
-    }
-
-    #[test]
-    fn agents_payload_inbox_row_reports_unread_backlog() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let list = json!({"agents": [{
-            "alias": "obs", "provider": "inbox", "endpoint_kind": "inbox",
-            "role": Value::Null, "team_role": Value::Null,
-            "model_selection": Value::Null, "model_lookup_role": Value::Null,
-            "model": Value::Null, "model_reported": Value::Null,
-            "model_configured": Value::Null, "model_source": Value::Null,
-            "effort": Value::Null, "effort_reported": Value::Null,
-            "effort_source": Value::Null, "effort_applicable": Value::Null,
-            "quota": Value::Null, "usage_limit": Value::Null,
-            "thread_id": "", "session_id": "", "endpoint": "inbox://obs",
-            "params": Value::Null, "dead": false,
-            "inbox": {"queued": 3, "oldest_age_secs": 42.0},
-        }]});
-        let out = agents_payload_from(dir.path(), Some(list), None);
-        let row = &out["agents"][0];
-        assert_eq!(row["inbox"], true, "{row}");
-        assert_eq!(row["queued"], 3, "{row}");
-        assert_eq!(row["unread"], 3, "{row}");
-        assert_eq!(row["oldest_unread_age_secs"], 42.0, "{row}");
-        assert_eq!(out["totals"]["queued"], 3, "{out}");
-    }
-
-    #[test]
-    fn context_query_stores_devops_and_accepts_ops() {
-        for raw in ["role=devops", "role=ops"] {
-            let (role, _) = context_query(raw).unwrap();
-            assert_eq!(role.as_deref(), Some("devops"), "{raw}");
-        }
-        assert_eq!(context_query("role=pm").unwrap().0.as_deref(), Some("pm"));
-        assert_eq!(context_query("role=operations"), Err("bad context role"));
-        assert_eq!(context_query("role=OPS"), Err("bad context role"));
-    }
-
-    /// Brand files sit at the dist root (Vite copies `ui/public/`); they
-    /// must come back as themselves with an image type, never as the
-    /// SPA's HTML fallback.
-    #[test]
-    fn dist_root_brand_files_are_served_with_image_types() {
-        let dist = tempfile::TempDir::new().unwrap();
-        std::fs::write(dist.path().join("favicon.svg"), "<svg/>").unwrap();
-        std::fs::write(
-            dist.path().join("apple-touch-icon.png"),
-            [0x89, b'P', b'N', b'G'],
-        )
-        .unwrap();
-        let (name, bytes) = static_file(Some(dist.path()), "/favicon.svg").unwrap();
-        assert_eq!(bytes, b"<svg/>");
-        assert_eq!(content_type(&name), "image/svg+xml");
-        let (name, _) = static_file(Some(dist.path()), "/apple-touch-icon.png").unwrap();
-        assert_eq!(content_type(&name), "image/png");
-        assert!(static_file(Some(dist.path()), "/../favicon.svg").is_none());
-    }
-
-    /// Client routes get the SPA shell so deep links and refreshes work;
-    /// build files come back as themselves; a missing file is a 404, never
-    /// the shell under a script's name.
-    #[test]
-    fn client_routes_get_the_spa_shell_without_shadowing_files() {
-        let dist = tempfile::TempDir::new().unwrap();
-        std::fs::write(dist.path().join("index.html"), "<!doctype html>shell").unwrap();
-        std::fs::write(dist.path().join("favicon.svg"), "<svg/>").unwrap();
-        std::fs::create_dir(dist.path().join("assets")).unwrap();
-        std::fs::write(dist.path().join("assets/index.js"), "js").unwrap();
-        let answer = |path: &str| static_answer_for(Some(dist.path()), path, None, None);
-        for route in [
-            "/",
-            "/projects",
-            "/projects/cadence",
-            "/projects/cadence/context",
-            "/agents",
-            "/agents/cc-1",
-            "/setup",
-            "/settings",
-            "/settings/memory",
-            "/login",
-            "/unknown-page",
-            "/agents/cc.worker-1",
-        ] {
-            match answer(route) {
-                StaticAnswer::File(name, bytes, None) => {
-                    assert_eq!(name, "/index.html", "{route}");
-                    assert_eq!(content_type(&name), "text/html; charset=utf-8", "{route}");
-                    assert_eq!(bytes, b"<!doctype html>shell", "{route}");
-                }
-                _ => panic!("{route}: expected the SPA shell"),
-            }
-        }
-        match answer("/assets/index.js") {
-            StaticAnswer::File(name, bytes, None) => {
-                assert_eq!(name, "/assets/index.js");
-                assert_eq!(bytes, b"js");
-            }
-            _ => panic!("asset not served"),
-        }
-        match answer("/favicon.svg") {
-            StaticAnswer::File(_, bytes, None) => assert_eq!(bytes, b"<svg/>"),
-            _ => panic!("favicon not served"),
-        }
-        for missing in [
-            "/assets/gone.js",
-            "/assets/chunk",
-            "/gone.css",
-            "/projects/x/logo.png",
-            "/agents/a/b.js",
-        ] {
-            assert!(
-                matches!(answer(missing), StaticAnswer::Missing),
-                "{missing}"
-            );
-        }
-        // /api never falls through to the shell, even with a file of that name.
-        std::fs::create_dir(dist.path().join("api")).unwrap();
-        std::fs::write(dist.path().join("api/issues"), "x").unwrap();
-        assert!(matches!(answer("/api/issues"), StaticAnswer::Missing));
-        assert!(matches!(answer("/api"), StaticAnswer::Missing));
-        // No build: routes say so instead of serving nothing.
-        let empty = tempfile::TempDir::new().unwrap();
-        assert!(matches!(
-            static_answer_for(Some(empty.path()), "/projects", None, None),
-            StaticAnswer::NoBuild
-        ));
-    }
-
-    /// CAD-609: a wiki page and a dotted issue path are client routes.
-    /// The shell is HTML 200. A JSON Accept on `/wiki` stays the JSON
-    /// 404, and `/api/wiki/file` is never the shell — that route serves
-    /// the bytes.
-    #[test]
-    fn wiki_pages_and_dotted_issue_paths_serve_the_spa_shell() {
-        let dist = tempfile::TempDir::new().unwrap();
-        std::fs::write(dist.path().join("index.html"), "<!doctype html>shell").unwrap();
-        let shell = |path: &str, accept: Option<&str>| match static_answer_for(
-            Some(dist.path()),
-            path,
-            accept,
-            None,
-        ) {
-            StaticAnswer::File(name, bytes, _) => {
-                let resp = Response::from_data(bytes.clone());
-                assert_eq!(resp.status_code().0, 200, "{path}");
-                assert_eq!(name, "/index.html", "{path}");
-                assert_eq!(content_type(&name), "text/html; charset=utf-8", "{path}");
-                assert_eq!(bytes, b"<!doctype html>shell", "{path}");
-            }
-            other => panic!("{path}: expected the SPA shell, got {other:?}"),
-        };
-        for path in [
-            "/wiki",
-            "/wiki/global",
-            "/wiki/global/x.md",
-            "/wiki/global/hello.md",
-            "/wiki/edit/global/hello.md",
-            "/wiki/history/global/hello.md",
-            "/projects/cadence/issues/CAD-1",
-            "/projects/cadence/issues/CAD-1.2",
-            "/agents/cc.worker-1",
-        ] {
-            shell(path, None);
-            shell(path, Some("text/html,application/xhtml+xml"));
-        }
-        assert!(
-            matches!(
-                static_answer_for(
-                    Some(dist.path()),
-                    "/wiki/global/x.md",
-                    Some("application/json"),
-                    None,
-                ),
-                StaticAnswer::Missing
-            ),
-            "JSON Accept on a wiki page is not the shell"
-        );
-        assert!(
-            matches!(
-                static_answer_for(Some(dist.path()), "/api/wiki/file", None, None),
-                StaticAnswer::Missing
-            ),
-            "file bytes stay on the API route"
-        );
-        assert!(matches!(
-            static_answer_for(Some(dist.path()), "/projects/x/logo.png", None, None),
-            StaticAnswer::Missing
-        ));
-    }
-
-    /// Accept-Encoding picks the build's precompressed sibling when the
-    /// client names its coding, falls back to the raw bytes otherwise,
-    /// and honors refusals: an explicit `q=0` (or a malformed q) beats a
-    /// `*` offer, and `identity;q=0` with no acceptable coded answer is a
-    /// 406 rather than raw bytes the client ruled out.
-    #[test]
-    fn static_files_negotiate_precompressed_siblings() {
-        let dist = tempfile::TempDir::new().unwrap();
-        std::fs::write(dist.path().join("index.html"), "raw-html").unwrap();
-        std::fs::write(dist.path().join("index.html.br"), "coded-html").unwrap();
-        std::fs::write(dist.path().join("index.html.gz"), "gzip-html").unwrap();
-        std::fs::create_dir(dist.path().join("assets")).unwrap();
-        std::fs::write(dist.path().join("assets/index.js"), "raw-js").unwrap();
-        std::fs::write(dist.path().join("assets/index.js.br"), "coded-js").unwrap();
-
-        let file = |path: &str, ae: Option<&str>| -> (String, Vec<u8>, Option<&'static str>) {
-            match static_answer_for(Some(dist.path()), path, None, ae) {
-                StaticAnswer::File(name, bytes, encoding) => (name, bytes, encoding),
-                other => panic!("{path} {ae:?}: expected a file, got {other:?}"),
-            }
-        };
-        // An offered coding answers the sibling bytes under the plain name.
-        assert_eq!(
-            file("/assets/index.js", Some("gzip, deflate, br")),
-            (
-                "/assets/index.js".to_string(),
-                b"coded-js".to_vec(),
-                Some("br")
-            )
-        );
-        assert_eq!(
-            file("/assets/index.js", Some("gzip")),
-            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
-        );
-        assert_eq!(
-            file("/assets/index.js", None),
-            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
-        );
-        // q=0 refuses: explicit beats `*`, malformed q fails closed.
-        assert_eq!(
-            file("/assets/index.js", Some("br;q=0, *;q=0.5")),
-            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
-        );
-        assert_eq!(
-            file("/assets/index.js", Some("br ; q = 0 , gzip")),
-            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
-        );
-        assert_eq!(
-            file("/assets/index.js", Some("br;q=oops, gzip")),
-            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
-        );
-        // Refused identity with an acceptable coded answer serves the code.
-        assert_eq!(
-            file("/", Some("identity;q=0, br")),
-            (
-                "/index.html".to_string(),
-                b"coded-html".to_vec(),
-                Some("br")
-            )
-        );
-        assert!(matches!(
-            static_answer_for(
-                Some(dist.path()),
-                "/assets/index.js",
-                None,
-                Some("identity;q=0"),
-            ),
-            StaticAnswer::NotAcceptable
-        ));
-        // RFC 9110 §12.5.3: `*;q=0` without a more-specific identity
-        // entry excludes the raw file too — and a malformed `*` q
-        // fails closed the same way.
-        for ae in ["*;q=0", "*;q=oops"] {
-            assert!(
-                matches!(
-                    static_answer_for(Some(dist.path()), "/assets/index.js", None, Some(ae),),
-                    StaticAnswer::NotAcceptable
-                ),
-                "{ae} excludes identity"
-            );
-        }
-        // An explicit identity entry overrides `*`, both ways.
-        assert_eq!(
-            file("/assets/index.js", Some("*;q=0, identity;q=0.5")),
-            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
-        );
-        assert_eq!(
-            file("/assets/index.js", Some("*;q=1, identity;q=0")),
-            (
-                "/assets/index.js".to_string(),
-                b"coded-js".to_vec(),
-                Some("br")
-            )
-        );
-        // And with every coding refused, the explicit identity q=0
-        // leaves nothing acceptable.
-        assert!(matches!(
-            static_answer_for(
-                Some(dist.path()),
-                "/assets/index.js",
-                None,
-                Some("*;q=0.5, identity;q=0, br;q=0"),
-            ),
-            StaticAnswer::NotAcceptable
-        ));
-        // A trailing dot is grammatical: `1.` is full weight, `0.` is zero.
-        assert_eq!(
-            file("/assets/index.js", Some("br;q=1.")),
-            (
-                "/assets/index.js".to_string(),
-                b"coded-js".to_vec(),
-                Some("br")
-            )
-        );
-        assert_eq!(
-            file("/assets/index.js", Some("br;q=0.")),
-            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
-        );
-        // Out-of-range, non-finite and over-precise qvalues fail closed
-        // to refusal, never to a positive weight.
-        for ae in [
-            "br;q=nan, gzip",
-            "br;q=inf, gzip",
-            "br;q=-1, gzip",
-            "br;q=2, gzip",
-            "br;q=0.9999, gzip",
-        ] {
-            assert_eq!(
-                file("/assets/index.js", Some(ae)),
-                ("/assets/index.js".to_string(), b"raw-js".to_vec(), None),
-                "{ae} admits nothing"
-            );
-        }
-    }
-
-    #[test]
-    fn current_message_summary_is_bounded_and_redacted() {
-        let message = running_json(&json!({
-            "id": "m1",
-            "body": "investigate this issue password=super-secret and keep the useful context visible"
-        }));
-        let summary = message["summary"].as_str().unwrap();
-        assert!(summary.contains("investigate this issue"));
-        assert!(!summary.contains("super-secret"));
-        assert!(summary.chars().count() <= 181);
-    }
-
-    #[test]
-    fn model_defaults_capability_distinguishes_an_older_daemon() {
-        assert!(health_supports_model_defaults(&json!({
-            "capabilities": ["agent_registry", "model_defaults"]
-        })));
-        assert!(!health_supports_model_defaults(&json!({
-            "capabilities": ["agent_registry"]
-        })));
-        assert!(!health_supports_model_defaults(&json!({})));
-    }
-
-    /// The embedded build answers the same three paths.
-    #[cfg(feature = "ui")]
-    #[test]
-    fn embedded_brand_files_are_served() {
-        for path in ["/favicon.svg", "/icon.svg", "/apple-touch-icon.png"] {
-            let (name, bytes) = static_file(None, path).unwrap();
-            assert_eq!(name, path);
-            assert!(!bytes.is_empty());
-        }
-        let (_, svg) = static_file(None, "/favicon.svg").unwrap();
-        assert!(svg.starts_with(b"<svg"));
-    }
-
-    /// CAD-336: a proven serve-proxy request writes as its login, and
-    /// one without a usable login (Funnel, a tagged node) is refused —
-    /// never `operator (ui)`. Unit-level: a board test cannot be the
-    /// proxy (its socket is its own uid, never tailscaled's), so the
-    /// proven branch is reached only through this function.
-    #[test]
-    fn a_proven_proxy_request_without_a_login_names_nobody() {
-        assert_eq!(
-            proxied_actor(Some("fable@example.com")),
-            Ok("fable@example.com (tailscale)".to_string())
-        );
-        assert!(proxied_actor(None).is_err());
-        assert!(proxied_actor(Some("")).is_err());
-        assert!(proxied_actor(Some("   ")).is_err());
-        assert!(proxied_actor(Some("bad\u{1}login")).is_err());
     }
 
     /// CAD-841: the device-login triple resolves flag → env — issuer +

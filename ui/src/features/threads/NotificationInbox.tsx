@@ -3,6 +3,7 @@ import "./notifications.css";
 import Button from "../../ui/Button";
 import { IconCheck, IconClose, IconSettings, IconThreads } from "../../ui/icons";
 import { navigate, useHref } from "../../lib/useLocation";
+import { useTranslate } from "../../lib/locale";
 import { ApiError } from "../../lib/api";
 import {
   humanNotifications,
@@ -30,6 +31,7 @@ const announced = new Map<string, number>();
 
 /** Private inbox poll: authorized, private state only. Never shared SSE. */
 const INBOX_POLL_MS = 15000;
+const BROWSER_SYNC_ERROR = "Could not sync browser alerts. Your threads still load.";
 
 const DEVICE_KEY = "cadence.push.device";
 
@@ -54,12 +56,21 @@ export function activeRoom(): string | null {
  * toasts and dedupe, and drops responses from the previous generation.
  */
 export default function NotificationInbox({ authEpoch }: { authEpoch: string }) {
+  const t = useTranslate();
+  const tRef = useRef(t);
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
   const [inbox, setInbox] = useState<Inbox | null>(null);
   const [filter, setFilter] = useState<"unread" | "all">("unread");
   const [notice, setNotice] = useState<string | null>(null);
+  const [preferenceNotice, setPreferenceNotice] = useState<string | null>(null);
+  const [browserAlertNotice, setBrowserAlertNotice] = useState<string | null>(null);
+  const [popoverOpen, setPopoverOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deviceId, setDeviceId] = useState<string | null>(() => localStorage.getItem(DEVICE_KEY));
   const generation = useRef(0);
+  const latestPreferenceSave = useRef(0);
   // Last verified human. Kept across auth epochs so a switch to another account is caught on its first valid feed.
   const known = useRef<string | null>(null);
   const popover = useRef<HTMLDialogElement | null>(null);
@@ -71,7 +82,10 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
 
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {
-      if (event.storageArea === localStorage && event.key === DEVICE_KEY) setDeviceId(event.newValue);
+      if (event.storageArea === localStorage && event.key === DEVICE_KEY) {
+        setDeviceId(event.newValue);
+        setBrowserAlertNotice(null);
+      }
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
@@ -103,8 +117,12 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
     toast.clear();
     setInbox(null);
     setNotice(null);
+    setPreferenceNotice(null);
+    setBrowserAlertNotice(null);
     setSettingsOpen(false);
+    setPopoverOpen(false);
     popover.current?.close();
+    settings.current?.close();
 
     let latest = 0;
     let active = true;
@@ -120,6 +138,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             if (active && generation.current === epoch) {
               linked = true;
               setDeviceId(localStorage.getItem(DEVICE_KEY));
+              setBrowserAlertNotice((notice) => notice === BROWSER_SYNC_ERROR ? null : notice);
             }
           })
           .catch((e: unknown) => {
@@ -130,7 +149,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
               throw e;
             }
             if (active && generation.current === epoch) {
-              setNotice("Could not sync browser alerts. Your threads still load.");
+              setBrowserAlertNotice(BROWSER_SYNC_ERROR);
             }
           })
           .finally(() => {
@@ -163,6 +182,13 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             announced.clear();
             toast.clear();
             setInbox(null);
+            setNotice(null);
+            setPreferenceNotice(null);
+            setBrowserAlertNotice(null);
+            setSettingsOpen(false);
+            setPopoverOpen(false);
+            popover.current?.close();
+            settings.current?.close();
             releaseDevice();
             known.current = null;
             return;
@@ -171,7 +197,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
           if (!active || sent !== latest || generation.current !== started) return;
           known.current = next.human.id;
           setInbox(next);
-          surfaceNew(next, toast);
+          surfaceNew(next, toast, tRef.current);
         })
         .catch((e: unknown) => {
           if (!active || sent !== latest || generation.current !== started || e instanceof StaleEnableError) return;
@@ -180,6 +206,10 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             // threads at all (CAD-1704): clear everything and stop. The next
             // auth epoch retries.
             stop();
+            setSettingsOpen(false);
+            setPopoverOpen(false);
+            popover.current?.close();
+            settings.current?.close();
             if (known.current !== null) releaseDevice();
             known.current = null;
             setInbox(null);
@@ -223,17 +253,58 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
     };
   }, [authEpoch, deviceId, humanId, href]);
 
+  // Light-dismiss for the non-modal popover: browsers do not emit `cancel` on
+  // `show()` dialogs or dismiss them on outside clicks.
+  useEffect(() => {
+    if (!popoverOpen || settingsOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || settings.current?.open) return;
+      const openModal = document.querySelector("dialog:modal, [aria-modal='true']");
+      if (openModal && !popover.current?.contains(openModal)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      popover.current?.close();
+      setPopoverOpen(false);
+      bell.current?.focus();
+    };
+    const onPointerDown = (event: PointerEvent | MouseEvent) => {
+      if (settings.current?.open) return;
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (popover.current?.contains(target) || bell.current?.contains(target)) return;
+      popover.current?.close();
+      setPopoverOpen(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [popoverOpen, settingsOpen]);
+
   if (inbox === null) return null;
+  const browserAlertsAvailable = inbox.push.available && pushSupported();
   const total = inbox.unread_total;
   const groups = inbox.groups.filter((g) => filter === "all" || g.unread > 0);
 
   const open = () => {
     popover.current?.show();
+    setPopoverOpen(true);
     setNotice(null);
   };
-  const close = () => {
+  const close = (restoreFocus = true) => {
     popover.current?.close();
-    bell.current?.focus();
+    setPopoverOpen(false);
+    if (restoreFocus) bell.current?.focus();
+  };
+  const toggle = () => {
+    if (popoverOpen || popover.current?.open) close();
+    else open();
+  };
+  const closeSettings = () => {
+    settings.current?.close();
+    setSettingsOpen(false);
   };
 
   const markAll = () => {
@@ -250,16 +321,23 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   };
 
   const openGroup = (group: NotificationGroup) => {
-    popover.current?.close();
+    close(false);
     navigate(threadHref(group.room));
   };
 
   const savePrefs = (next: NotificationPreferences) => {
     const mine = generation.current;
+    const save = ++latestPreferenceSave.current;
+    const isCurrent = () => generation.current === mine && latestPreferenceSave.current === save;
     setInbox((cur) => (cur ? { ...cur, preferences: next } : cur));
-    void setNotificationPreferences(next).catch(() => {
-      if (generation.current === mine) setNotice("Could not save notification settings.");
-    });
+    void setNotificationPreferences(next).then(
+      () => {
+        if (isCurrent()) setPreferenceNotice(null);
+      },
+      () => {
+        if (isCurrent()) setPreferenceNotice("Could not save notification settings.");
+      },
+    );
   };
 
   const toggleMute = (group: NotificationGroup) => {
@@ -277,7 +355,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
 
   const enable = () => {
     if (inbox.push.public_key === null) {
-      setNotice("Browser alerts are not available on this board.");
+      setBrowserAlertNotice("Browser alerts are not available on this board.");
       return;
     }
     const mine = generation.current;
@@ -289,12 +367,12 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
       .then(() => enableBrowserAlerts(publicKey, isCurrent))
       .then((msg) => {
         if (!isCurrent()) return;
-        setNotice(msg);
+        setBrowserAlertNotice(msg);
         setDeviceId(localStorage.getItem(DEVICE_KEY));
       })
       .catch((e: unknown) => {
         if (e instanceof StaleEnableError) return;
-        if (isCurrent()) setNotice("Could not turn on browser alerts.");
+        if (isCurrent()) setBrowserAlertNotice("Could not turn on browser alerts.");
       });
   };
 
@@ -303,23 +381,26 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
     void disableBrowserAlerts(id)
       .then((msg) => {
         if (generation.current !== mine) return;
-        setNotice(msg);
+        setBrowserAlertNotice(msg);
         setDeviceId(null);
       })
       .catch(() => {
-        if (generation.current === mine) setNotice("Could not turn off browser alerts.");
+        if (generation.current === mine) setBrowserAlertNotice("Could not turn off browser alerts.");
       });
   };
 
   return (
-    <div className="relative">
+    <div className="notification-anchor">
       <button
         ref={bell}
         type="button"
         className="btn btn-ghost btn-sm icon-button bell-button"
         aria-haspopup="dialog"
-        aria-label={total > 0 ? `Open notifications, ${total} unread` : "Open notifications"}
-        onClick={open}
+        aria-expanded={popoverOpen}
+        aria-label={total > 0
+          ? t("Open notifications, {count} unread").replace("{count}", String(total))
+          : t("Open notifications")}
+        onClick={toggle}
       >
         <IconThreads size={16} />
         {total > 0 && <span className="notification-count num" aria-hidden="true">{total}</span>}
@@ -333,64 +414,76 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
           event.preventDefault();
           close();
         }}
+        onClose={() => setPopoverOpen(false)}
       >
         <div className="notification-heading">
-          <div>
-            <span className="kicker">Notifications</span>
-            <h2 id="notification-popover-title">Your conversations</h2>
-            <p className="muted">{total} unread messages</p>
-          </div>
+          <h2 id="notification-popover-title">{t("Notifications")}</h2>
           <div className="flex gap-1">
-            <Button variant="ghost" size="sm" aria-label="Notification settings" icon={<IconSettings />} onClick={() => { setSettingsOpen(true); settings.current?.showModal(); }} />
-            <Button variant="ghost" size="sm" aria-label="Close notifications" icon={<IconClose />} onClick={close} />
+            <Button variant="ghost" size="sm" aria-label={t("Notification settings")} icon={<IconSettings />} onClick={() => { setSettingsOpen(true); settings.current?.showModal(); }} />
+            <Button variant="ghost" size="sm" aria-label={t("Close notifications")} icon={<IconClose />} onClick={() => close()} />
           </div>
         </div>
         <div className="notification-tools">
-          <div className="filter-row" role="group" aria-label="Show">
-            <button type="button" className={`filter ${filter === "unread" ? "selected" : ""}`} aria-pressed={filter === "unread"} onClick={() => setFilter("unread")}>Unread</button>
-            <button type="button" className={`filter ${filter === "all" ? "selected" : ""}`} aria-pressed={filter === "all"} onClick={() => setFilter("all")}>All</button>
+          <div className="filter-row" role="group" aria-label={t("Show")}>
+            <button type="button" className={`filter ${filter === "unread" ? "selected" : ""}`} aria-pressed={filter === "unread"} onClick={() => setFilter("unread")}>{t("Unread")} <span className="notification-unread-count">{total}</span></button>
+            <button type="button" className={`filter ${filter === "all" ? "selected" : ""}`} aria-pressed={filter === "all"} onClick={() => setFilter("all")}>{t("All")}</button>
           </div>
-          <button type="button" className="lnk" disabled={total === 0} onClick={markAll}>Mark all read</button>
+          <button type="button" className="lnk" disabled={total === 0} onClick={markAll}>{t("Mark all read")}</button>
         </div>
-        {notice !== null && <p className="settings-note" role="status">{notice}</p>}
+        {notice !== null && <p className="settings-note" role="status">{t(notice)}</p>}
         <div className="notification-list">
           {groups.length === 0 && (
             <div className="notification-empty">
-              <IconCheck size={18} />
-              <strong>You're all caught up.</strong>
-              <p>No unread messages. Your history is under All.</p>
+              <span className="notification-empty-icon"><IconCheck size={18} /></span>
+              <div>
+                <strong>{filter === "unread" ? t("You're all caught up.") : t("No conversations yet.")}</strong>
+                <p>{filter === "unread" ? t("No unread messages. Your history is under All.") : t("Direct messages and mentions will appear here.")}</p>
+              </div>
             </div>
           )}
           {groups.map((g) => (
             <div key={g.room} className="notification-row">
-              <button type="button" className="notification-copy" onClick={() => openGroup(g)} aria-label={`Open ${g.title}, ${g.unread} unread`}>
-                <span className="chip">{g.kind === "dm" ? "Direct message" : "Group"}</span>
+              <button
+                type="button"
+                className="notification-copy"
+                onClick={() => openGroup(g)}
+                aria-label={t("Open {title}, {count} unread").replace("{title}", () => g.title).replace("{count}", String(g.unread))}
+              >
+                <span className="chip">{g.kind === "dm" ? t("Direct message") : t("Group")}</span>
                 <strong>{g.title}</strong>
-                <small>{g.unread} unread{g.muted ? " · muted" : ""}</small>
+                <small>{t("{count} unread").replace("{count}", String(g.unread))}{g.muted ? ` · ${t("muted")}` : ""}</small>
               </button>
-              <button type="button" className="lnk" onClick={() => toggleMute(g)}>{g.muted ? "Unmute" : "Mute"}</button>
+              <button type="button" className="lnk" onClick={() => toggleMute(g)}>{g.muted ? t("Unmute") : t("Mute")}</button>
             </div>
           ))}
         </div>
-        <div className="notification-footer">
-          <span>Notification links never grant access.</span>
-          {deviceId !== null && (
-            <button type="button" className="lnk" onClick={() => disable(deviceId)}>Turn off browser alerts</button>
-          )}
-          {inbox.push.available && pushSupported() ? (
-            <button type="button" className="lnk" onClick={enable}>Enable browser alerts</button>
-          ) : (
-            <span>Browser alerts unavailable</span>
-          )}
-        </div>
       </dialog>
 
-      <dialog ref={settings} className="notification-popover notification-settings" aria-labelledby="notification-settings-title" onCancel={(e) => { e.preventDefault(); settings.current?.close(); }}>
+      <dialog
+        ref={settings}
+        className="notification-popover notification-settings"
+        aria-labelledby="notification-settings-title"
+        onCancel={(e) => { e.preventDefault(); closeSettings(); }}
+        onClose={() => setSettingsOpen(false)}
+      >
         <div className="notification-heading">
-          <h2 id="notification-settings-title">Notification settings</h2>
-          <Button variant="ghost" size="sm" aria-label="Close notification settings" icon={<IconClose />} onClick={() => settings.current?.close()} />
+          <h2 id="notification-settings-title">{t("Notification settings")}</h2>
+          <Button variant="ghost" size="sm" aria-label={t("Close notification settings")} icon={<IconClose />} onClick={closeSettings} />
         </div>
+        <div className="notification-setting notification-browser-alerts">
+          <span>
+            <strong>{t("Browser alerts")}</strong>
+            {!browserAlertsAvailable && <small>{t("Browser alerts unavailable")}</small>}
+          </span>
+          {deviceId !== null ? (
+            <button type="button" className="lnk" onClick={() => disable(deviceId)}>{t("Turn off browser alerts")}</button>
+          ) : browserAlertsAvailable ? (
+            <button type="button" className="lnk" onClick={enable}>{t("Enable browser alerts")}</button>
+          ) : null}
+        </div>
+        {browserAlertNotice !== null && <p className="settings-note" role="status">{t(browserAlertNotice)}</p>}
         {settingsOpen && <PreferenceList prefs={inbox.preferences} onChange={savePrefs} />}
+        {preferenceNotice !== null && <p className="settings-note" role="status">{t(preferenceNotice)}</p>}
       </dialog>
 
     </div>
@@ -399,6 +492,7 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
 
 /** Approved A preference rows: real labelled controls only. Nothing is shown that does nothing. */
 function PreferenceList({ prefs, onChange }: { prefs: NotificationPreferences; onChange: (next: NotificationPreferences) => void }) {
+  const t = useTranslate();
   const rows: Array<{ key: "dm" | "mention" | "sound" | "preview"; title: string; hint: string }> = [
     { key: "dm", title: "Direct messages", hint: "Alert me for new direct messages." },
     { key: "mention", title: "Mentions and replies", hint: "Alert me when someone names me." },
@@ -410,20 +504,20 @@ function PreferenceList({ prefs, onChange }: { prefs: NotificationPreferences; o
       {rows.map((r) => (
         <label key={r.key} className="notification-setting">
           <span>
-            <strong>{r.title}</strong>
-            <small>{r.hint}</small>
+            <strong>{t(r.title)}</strong>
+            <small>{t(r.hint)}</small>
           </span>
           <input type="checkbox" checked={Boolean(prefs[r.key])} onChange={(e) => onChange({ ...prefs, [r.key]: e.target.checked })} />
         </label>
       ))}
       <label className="notification-setting">
         <span>
-          <strong>Quiet hours</strong>
-          <small>22:00 to 08:00 in your time zone. Unread counts still update.</small>
+          <strong>{t("Quiet hours")}</strong>
+          <small>{t("22:00 to 08:00 in your time zone. Unread counts still update.")}</small>
         </span>
         <select className="field" value={prefs.quiet} onChange={(e) => onChange({ ...prefs, quiet: e.target.value === "22-08" ? "22-08" : "off", zone: browserZone() })}>
-          <option value="off">Off</option>
-          <option value="22-08">22:00 to 08:00</option>
+          <option value="off">{t("Off")}</option>
+          <option value="22-08">{t("22:00 to 08:00")}</option>
         </select>
       </label>
     </div>
@@ -440,7 +534,7 @@ function browserZone(): string {
  * cursor before interruption preferences so quiet/muted/visible alerts do not
  * reappear later; ordinary group posts never inherit an old mention.
  */
-function surfaceNew(next: Inbox, toast: { show: (title: string, room: string) => void }): void {
+function surfaceNew(next: Inbox, toast: { show: (title: string, room: string) => void }, t: (english: string) => string): void {
   const active = activeRoom();
   for (const g of next.groups) {
     const seen = announced.get(g.room) ?? 0;
@@ -450,7 +544,7 @@ function surfaceNew(next: Inbox, toast: { show: (title: string, room: string) =>
     if (g.room === active || g.muted || (!isDm && !g.mention)) continue;
     if (isQuietNow(next.preferences)) continue;
     if (isDm ? !next.preferences.dm : !next.preferences.mention) continue;
-    toast.show(`New ${isDm ? "direct message" : "mention"} in ${g.title}`, g.room);
+    toast.show(t(isDm ? "New direct message in {title}" : "New mention in {title}").replace("{title}", () => g.title), g.room);
   }
 }
 

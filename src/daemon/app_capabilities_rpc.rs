@@ -58,13 +58,30 @@ fn refusal_code(code: &str) -> bool {
 }
 
 /// The board relays a quote refusal only in the exact [`price_refusal`] shape.
-pub(crate) fn operator_price_refusal(message: &str) -> Option<&str> {
+#[doc(hidden)]
+pub fn operator_price_refusal(message: &str) -> Option<&str> {
     let code = message.strip_prefix(PRICE_REFUSED)?;
     (code.is_empty() || code.strip_prefix(": ").is_some_and(refusal_code)).then_some(message)
 }
 
 #[cfg(test)]
 mod tests;
+
+/// A run-bound capability failure as a daemon error: an explicit refusal
+/// is `provider`, a typed 402 keeps the code `insufficient_funds`
+/// (CAD-1868), and anything that may have executed is `unknown`.
+pub(super) fn run_capability_error(
+    error: &crate::platform::AppCapabilityError,
+    reason: String,
+) -> Error {
+    match error {
+        crate::platform::AppCapabilityError::Refused(_) => Error::provider(reason),
+        crate::platform::AppCapabilityError::InsufficientFunds(_) => {
+            Error::provider_coded("insufficient_funds", reason)
+        }
+        crate::platform::AppCapabilityError::Uncertain(_) => Error::unknown(reason),
+    }
+}
 
 impl Shared {
     /// Called only under the broker's custody lock, never by the legacy
@@ -420,10 +437,7 @@ impl Shared {
             let reason = if crate::platform::refuse_leak("app capability failure", error.reason(), &prepared.credential).is_ok() {
                 error.reason().chars().take(250).collect::<String>()
             } else { "Provider failure details were withheld because they matched credential custody.".into() };
-            match error {
-                crate::platform::AppCapabilityError::Refused(_) => Error::provider(reason),
-                crate::platform::AppCapabilityError::Uncertain(_) => Error::unknown(reason),
-            }
+            run_capability_error(&error, reason)
         })?;
         let retain = || -> Result<Value> {
             if human.is_object() {
@@ -975,14 +989,7 @@ impl Shared {
                         let _ = self
                             .store
                             .app_run_call_failed(&run_id, &step, error.kind(), &reason);
-                        match error {
-                            crate::platform::AppCapabilityError::Refused(_) => {
-                                Error::provider(reason)
-                            }
-                            crate::platform::AppCapabilityError::Uncertain(_) => {
-                                Error::unknown(reason)
-                            }
-                        }
+                        run_capability_error(&error, reason)
                     })?;
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.
                 crate::issue::lockseam::outside_lock("app-capability-before-record");

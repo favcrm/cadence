@@ -2,6 +2,7 @@
 
 import { activityTimeMs, fmtTime } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
+import Link from "../../ui/Link";
 import { agentStatus } from "./agentView";
 import type { Agent, AgentTask } from "../../lib/types";
 
@@ -49,6 +50,53 @@ export function activeTasks(a: Agent): AgentTask[] {
   );
 }
 
+/** Task states that need a person. A live or running task is never one of
+ *  these: a running task is work, not a decision. */
+const ATTENTION_TASK_STATES = new Set(["blocked", "review", "unknown"]);
+
+/** Active tasks split the way the Work tab shows them. */
+export function partitionActiveTasks(agent: Agent): {
+  doing: AgentTask[];
+  queue: AgentTask[];
+  attention: AgentTask[];
+} {
+  const live = new Set(
+    (agent.running_messages ?? [])
+      .map((message) => message.task)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const doing: AgentTask[] = [];
+  const queue: AgentTask[] = [];
+  const attention: AgentTask[] = [];
+  for (const task of activeTasks(agent)) {
+    if (live.has(task.task) || task.task_state === "running") doing.push(task);
+    else if (ATTENTION_TASK_STATES.has(task.task_state)) attention.push(task);
+    else queue.push(task);
+  }
+  return { doing, queue, attention };
+}
+
+/** Detail task ids the roster partition does not already show. A null
+ *  partition means the roster row is absent, so every detail id stays.
+ *  An empty partition is not the same thing: the row loaded and its task
+ *  list was empty, and detail ids still have to be shown. */
+export function detailTasksNotOnRoster(
+  parts: { doing: AgentTask[]; queue: AgentTask[]; attention: AgentTask[] } | null,
+  detailTaskIds: string[] | undefined,
+): string[] {
+  const ids = detailTaskIds ?? [];
+  if (parts === null) return ids;
+  const shown = new Set(
+    [...parts.doing, ...parts.queue, ...parts.attention].map((task) => task.task),
+  );
+  return ids.filter((id) => !shown.has(id));
+}
+
+/** The existing direct conversation. Navigation only — nothing is created. */
+export function agentThreadHref(alias: string): string {
+  return `/threads?dm=${encodeURIComponent(alias)}`;
+}
+
 function taskLabel(task: AgentTask, t: (english: string) => string): string {
   const title = task.title ?? t("untitled task");
   const issue = task.issue ? `${task.issue} · ` : "";
@@ -57,15 +105,44 @@ function taskLabel(task: AgentTask, t: (english: string) => string): string {
   return `${issue}${title}${jobText}`;
 }
 
+/** One assigned task opens that agent's existing conversation. */
+export function AssignedTaskList({ alias, tasks }: { alias: string; tasks: AgentTask[] }) {
+  const t = useTranslate();
+  if (tasks.length === 0) return null;
+  return (
+    <div className="space-y-1.5 min-w-0 mt-2">
+      {tasks.map((task) => (
+        <div key={task.task} className="min-w-0">
+          <Link
+            className="lnk truncate"
+            href={agentThreadHref(alias)}
+            title={taskLabel(task, t)}
+            data-task={task.task}
+          >
+            {task.title ?? task.task}
+          </Link>
+          <div className="num text-micro text-ink-500">
+            {task.task_state}
+            {task.job_title ? ` · ${task.job_title}` : task.job ? ` · ${task.job}` : ""}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function WorkBlock({
   agent,
   onOpenIssue,
+  tasks: tasksProp,
 }: {
   agent: Agent;
   onOpenIssue?: (id: string) => void;
+  /** Restrict the rows. An empty list still falls through to a live message. */
+  tasks?: AgentTask[];
 }) {
   const t = useTranslate();
-  const tasks = activeTasks(agent);
+  const tasks = tasksProp ?? activeTasks(agent);
   const runningTaskIds = new Set(
     (agent.running_messages ?? [])
       .map((message) => message.task)
@@ -102,9 +179,14 @@ export function WorkBlock({
                   {task.issue}
                 </button>
               ) : null}
-              <span className="truncate text-ink-200" title={taskLabel(task, t)}>
+              <Link
+                className="truncate text-ink-200"
+                href={agentThreadHref(agent.alias)}
+                title={taskLabel(task, t)}
+                data-task={task.task}
+              >
                 {task.title ?? task.task}
-              </span>
+              </Link>
             </div>
             <div className="num text-micro text-ink-500 pl-3">
               {live ? t("running") : task.task_state}

@@ -4,6 +4,7 @@ import {
   hostActions,
 } from "../src/features/app-shell/hostActions";
 import { ApiError } from "../src/lib/api";
+import { isDev } from "../src/env";
 
 export {};
 /** CAD-802 corrections: grammar + single-pane shell + scoped links. */
@@ -113,7 +114,7 @@ await rejected(
 // ships no screen of its own.
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-shell" });
-for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
+for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage", "localStorage"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 for (const name of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
@@ -133,13 +134,21 @@ const AppShellModule = (require("../src/features/app-shell/AppShell") as typeof 
 const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
 const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const AppShellComponent = AppShellModule.default;
-const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
-  React.createElement(LocaleProvider, null,
-    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => {
+  const [breadcrumbs, setBreadcrumbs] = React.useState<HTMLElement | null>(null);
+  const [actions, setActions] = React.useState<HTMLElement | null>(null);
+  return React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children:
+      React.createElement(React.Fragment, null,
+        React.createElement("nav", { ref: setBreadcrumbs, "aria-label": "Breadcrumb" }),
+        React.createElement("div", { ref: setActions }),
+        React.createElement(AppShellComponent, { ...props, header: { breadcrumbs, actions } })) }));
+};
 const entryApp = AppShellModule.entryApp;
 // Context moves ride real URL writes — the same `navigate` the shell
 // uses, so tests exercise adoption exactly like a pasted link.
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+const { readChatCollapsedChoice } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
 // Only a daemon-stamped binding renders: browser claims never do.
 // The stamp trims to ids — revision/digest stay server-side.
 equal(
@@ -294,31 +303,68 @@ await React.act(async () => {
   root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } })));
 });
 await flush(); await flush(); await flush();
-assert(text().includes("All apps") && text().includes("Reports"), "← All apps back-link plus installed App title, deduped");
+assert(host.querySelector('nav[aria-label="Breadcrumb"]')?.textContent?.includes("Reports"), "verified app identity appears in the shared header");
+equal((text().match(/0\.1\.0/g) ?? []).length, 1, "the app version appears once, in the shared header");
 assert(text().includes("This app's screen is unavailable."), "an app without its own screen shows the one unavailable state");
 assert(!text().includes("No records yet") && !text().includes("CAD-781"), "core draws no records UI of its own");
-assert(text().includes("Master answer stays connected"), "the left pane shows the real master thread");
+assert(text().includes("Master answer stays connected"), "the assistant shows the real master thread");
 assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render in the chat");
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
 assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
+equal(
+  reads.filter((p) => p === "/api/app-installations/install-shell").length,
+  1,
+  "CAD-2534: cold shell mount fetches installation detail once without Round-2 re-fetch",
+);
+equal(
+  reads.filter((p) => p === "/api/app-installations/install-shell/contexts").length,
+  1,
+  "CAD-2534: cold shell mount fetches contexts once without Round-2 re-fetch",
+);
 
-// Narrow switch (approved mock): a full-width Assistant | Workspace
-// segmented control replaces the overlay drawer. The assistant is shown
-// by default; both panels stay mounted so the draft survives switching.
-const tabs = Array.from(host.querySelectorAll<HTMLButtonElement>(".app-shell-panel-tab"));
-equal(tabs.map((t) => t.textContent), ["Assistant", "Workspace"], "segmented Assistant | Workspace switch");
-assert(!host.querySelector(".app-shell-chat-toggle") && !host.querySelector(".app-shell-scrim"), "no overlay drawer toggle or scrim remains");
+// The header disclosure changes visibility without replacing either pane.
+const toggle = host.querySelector<HTMLButtonElement>(".app-header-assistant")!;
 const grid = host.querySelector(".app-shell-grid") as HTMLElement;
-equal(grid.getAttribute("data-shell-panel"), "chat", "the assistant is the default narrow panel");
-equal(tabs[0].getAttribute("aria-pressed"), "true", "Assistant tab is pressed by default");
+await click(toggle);
+const mountedPane = host.querySelector("[data-chat-pane]");
+const mountedBox = host.querySelector("#app-shell-chat-box");
 await fill("#app-shell-chat-box", "unsent shell draft");
-await click(tabs[1]);
-equal(grid.getAttribute("data-shell-panel"), "work", "Workspace tab shows the workspace");
-equal(tabs[1].getAttribute("aria-pressed"), "true", "Workspace tab pressed");
-await click(tabs[0]);
-equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across switching");
-equal(panes(), 1, "switching never mounts a second chat pane");
+await click(toggle);
+assert(grid.hasAttribute("data-chat-collapsed"), "the header control closes the assistant");
+assert(document.activeElement === toggle, "closing keeps focus on the visible header control");
+await click(toggle);
+assert(host.querySelector("[data-chat-pane]") === mountedPane, "the same conversation stays mounted");
+assert(host.querySelector("#app-shell-chat-box") === mountedBox, "the same composer stays mounted");
+equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "the header switch preserves the unsent draft");
+
+// Run with NODE_ENV=development to exercise the development-only action.
+// A retained installation is not a fresh receipt while access is checking
+// or after the next metadata read fails.
+if (isDev) {
+  const originalFetch = globalThis.fetch;
+  const show = async (operator: boolean | null) => {
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-shell", viewer: { operator, readOnly: false } })));
+    });
+  };
+  assert(host.querySelector("[data-contract-preview-toggle]"), "a verified development app offers its preview");
+  try {
+    await show(null);
+    assert(!host.querySelector("[data-contract-preview-toggle]"), "checking access withholds a stale preview");
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      if (String(input) === "/api/app-installations/install-shell") throw new Error("Simulated metadata outage");
+      return originalFetch(input as RequestInfo, init);
+    }) as typeof fetch;
+    await show(true);
+    assert(text().includes("Simulated metadata outage"), "the metadata error is visible");
+    assert(!host.querySelector("[data-contract-preview-toggle]"), "a failed current receipt cannot expose the retained app's preview");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await show(null);
+    await show(true);
+  }
+}
 
 // Chat sends carry the verified-scope request; refusal would surface.
 // Context is adopted from the URL — no selector needed.
@@ -570,7 +616,7 @@ async function mountColdCold(url: string, install: string, scope: string) {
 
 // CAD-1519: core bundles no app UI. A CRM install whose package ships no
 // screen gets the same one unavailable state as any other app — no
-// host-drawn Customers/Segments/Campaigns pages, and one Apps link only.
+// host-drawn Customers/Segments/Campaigns pages.
 {
   win.sessionStorage.clear();
   const hostEl = document.createElement("div");
@@ -583,7 +629,6 @@ async function mountColdCold(url: string, install: string, scope: string) {
   await settle(() => assert((hostEl.textContent ?? "").includes("This app's screen is unavailable."), "CRM without its own screen shows the unavailable state"));
   assert(!hostEl.querySelector("[data-outlet-heading]"), "no host-drawn CRM section pages");
   assert(!(hostEl.textContent ?? "").match(/No customers yet|No segments yet|No campaigns yet/), "no host-drawn CRM lists");
-  equal(Array.from(hostEl.querySelectorAll<HTMLAnchorElement>("a[href='/apps']")).length, 1, "exactly one Apps link — the shell row only");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }
@@ -626,10 +671,93 @@ async function mountColdCold(url: string, install: string, scope: string) {
   ambiguous.remove();
 }
 
+// Installation-declared sections remain navigable before any screen-ready
+// callback, including the native Social outlet, with the app's own labels.
+const declaredNavigation = {
+  section_query: "tab", default_section: "overview",
+  sections: [
+    { id: "overview", label: "Overview" },
+    { id: "insights", label: "Insights", i18n: { "zh-TW": { label: "專屬洞察" } } },
+  ],
+};
+const previousViewport = win.innerWidth;
+Object.defineProperty(win, "innerWidth", { value: 390, configurable: true, writable: true });
+for (const [fixture, installId] of [[crm, "install-crm"], [social, "install-social"]] as const) {
+  Object.assign(fixture, { navigation: declaredNavigation });
+  for (const locale of ["en", "zh-TW"]) {
+    win.localStorage.setItem("cadence-locale", locale);
+    const surface = document.createElement("div");
+    document.body.append(surface);
+    const cold = createRoot(surface);
+    history.pushState(null, "", `/app-installations/${installId}?tab=insights&record=rec-1&hr=leave&accounting=reports`);
+    await React.act(async () => {
+      cold.render(React.createElement(AppShell, { installId, viewer: { operator: true, readOnly: false } }));
+    });
+    const header = () => surface.querySelector('nav[aria-label="Breadcrumb"]')!;
+    const expected = locale === "zh-TW" ? "專屬洞察" : "Insights";
+    await settle(() => equal(header().querySelector('[aria-current="page"]')?.textContent, expected, `${installId} declares its ${locale} section without a frame`));
+    assert(!surface.querySelector("iframe"), "the breadcrumb needs no mounted frame receipt");
+    const parent = header().querySelector("a")!;
+    assert(parent, "a declared section gives its app a parent link");
+    const target = new URL(parent.getAttribute("href")!, "http://localhost");
+    assert(!target.searchParams.has("tab") && !target.searchParams.has("record"), "the app parent clears section and record selection");
+    equal([target.searchParams.get("hr"), target.searchParams.get("accounting")], ["leave", "reports"], "the parent preserves unrelated app queries");
+    const assistant = surface.querySelector<HTMLButtonElement>(".app-header-assistant")!;
+    if (assistant.getAttribute("aria-expanded") === "false") await click(assistant);
+    equal(assistant.getAttribute("aria-expanded"), "true", "the narrow section begins with Assistant open");
+    await React.act(async () => { navigate(`${location.pathname}${location.search}&unrelated=keep`); });
+    equal(assistant.getAttribute("aria-expanded"), "true", "unrelated query changes do not hide Assistant");
+    await click(parent);
+    await settle(() => assert(!header().querySelector(".app-header-section"), "the default section adds no duplicate leaf"));
+    equal(assistant.getAttribute("aria-expanded"), "false", "parent navigation reveals the narrow workspace");
+    equal(readChatCollapsedChoice(installId), false, "narrow navigation preserves the explicitly expanded preference");
+    await React.act(async () => {
+      Object.defineProperty(win, "innerWidth", { value: 1440, configurable: true, writable: true });
+      win.dispatchEvent(new Event("resize"));
+    });
+    equal(assistant.getAttribute("aria-expanded"), "true", "desktop restores the expanded preference after narrow navigation");
+    await React.act(async () => {
+      Object.defineProperty(win, "innerWidth", { value: 390, configurable: true, writable: true });
+      win.dispatchEvent(new Event("resize"));
+    });
+    equal(assistant.getAttribute("aria-expanded"), "true", "returning to narrow layout honors the expanded preference");
+    await React.act(async () => { navigate(`/app-installations/${installId}?tab=insights&hr=leave&accounting=reports`); });
+    await settle(() => equal(header().querySelector('[aria-current="page"]')?.textContent, expected, "section-only navigation reaches the selected page"));
+    equal(assistant.getAttribute("aria-expanded"), "false", "section-only navigation reveals the narrow workspace");
+    equal(readChatCollapsedChoice(installId), false, "section-only navigation does not persist a collapse");
+    await React.act(async () => { cold.unmount(); });
+    history.pushState(null, "", `/app-installations/${installId}?tab=insights&hr=leave&accounting=reports`);
+    const destination = createRoot(surface);
+    await React.act(async () => {
+      destination.render(React.createElement(AppShell, { installId, viewer: { operator: true, readOnly: false } }));
+    });
+    await settle(() => {
+      equal(header().querySelector('[aria-current="page"]')?.textContent, expected, "the new app shell resolves the requested section");
+      equal(surface.querySelector(".app-header-assistant")?.getAttribute("aria-expanded"), "false", "a section link reveals the workspace after the app shell remounts");
+    });
+    equal(readChatCollapsedChoice(installId), false, "opening a section leaves the expanded preference intact");
+    await React.act(async () => { destination.unmount(); });
+    surface.remove();
+  }
+}
+win.localStorage.removeItem("cadence-locale");
+Object.defineProperty(win, "innerWidth", { value: previousViewport, configurable: true, writable: true });
+
 // The assistant activity panel never asks before it has a context (an empty
 // context ID is a 400 on every poll).
 assert(reads.some((p) => p.includes("/assistant/")), "the assistant panel did read with a context");
 assert(!reads.some((p) => /\/assistant\/[a-z]+\?context_id=(&|$)/.test(p)), "no assistant read is sent with an empty context");
+
+// CAD-2534: prefetchAppScope and concurrent readAppScopeFresh coalesce into one in-flight pair.
+const { prefetchAppScope, readAppScopeFresh } = require("../src/features/workspace-apps/workspaceApps") as typeof import("../src/features/workspace-apps/workspaceApps");
+reads.length = 0;
+prefetchAppScope("install-second");
+const [prefetchedDetail, prefetchedContexts] = await readAppScopeFresh("install-second");
+equal(prefetchedDetail.install_id, "install-second", "coalesced scope read resolves installation");
+equal(prefetchedContexts.length, 1, "coalesced scope read resolves contexts");
+equal(reads.filter((p) => p === "/api/app-installations/install-second").length, 1, "prefetchAppScope + readAppScopeFresh issue 1 detail request");
+equal(reads.filter((p) => p === "/api/app-installations/install-second/contexts").length, 1, "prefetchAppScope + readAppScopeFresh issue 1 contexts request");
+
 console.log("app shell checks passed");
 }
 void main();

@@ -1,0 +1,13 @@
+{
+  "contract": "app-assistant/v1",
+  "descriptor_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "actions": [
+    {
+      "id": "customer.search",
+      "description": "Find customers by name",
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "available"
+    }
+  ]
+}

@@ -11,9 +11,9 @@ import { evidenceSuffix, quorumLabel, quorumView } from "./memoryView";
 import "./memory.css";
 import { useTranslate } from "../../lib/locale";
 
-const STATUSES = ["proposed", "accepted", "rejected", "superseded"];
+const STATUSES = ["proposed", "quarantined", "accepted", "pending-revalidation", "invalidated", "rejected", "superseded"];
 const TYPES = ["rule", "gotcha", "decision", "recipe"];
-const label = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
+const label = (value: string) => value.charAt(0).toUpperCase() + value.slice(1).replaceAll("-", " ");
 const options = (values: string[], all: string) => [
   { value: "", label: all },
   ...values.map((value) => ({ value, label: label(value) })),
@@ -29,6 +29,7 @@ function scopeLine(m: MemoryCard, t: (english: string) => string): string {
   if (m.scope.providers.length)
     bits.push(t("Providers: {values}").replace("{values}", () => m.scope.providers.join(", ")));
   if (m.scope.tags.length) bits.push(t("Tags: {values}").replace("{values}", () => m.scope.tags.join(", ")));
+  if (m.policy?.roles.length) bits.push(t("Roles: {values}").replace("{values}", () => m.policy!.roles.join(", ")));
   return bits.join(" · ") || t("No scope recorded");
 }
 
@@ -57,6 +58,7 @@ function matches(m: MemoryCard, query: string): boolean {
     ...m.scope.paths,
     ...m.scope.providers,
     ...m.scope.tags,
+    ...(m.policy?.roles ?? []),
   ]
     .join(" ")
     .toLowerCase();
@@ -147,12 +149,64 @@ function LessonDetail({ memory }: { memory: MemoryCard }) {
         {evidenceSuffix(detail, q) && (
           <p className="memory-freshness">{detail.evidence!.label}</p>
         )}
-        <p className="memory-readonly">{t("Read-only here. Authenticated native agents review lessons; a PM finalizes them.")}</p>
+        <p className="memory-readonly">{t("Read-only here. Native policy determines which independent reviews or operator approval are required.")}</p>
         <details className="memory-provenance">
           <summary>
             {t("Review evidence")} <IconChevron />
           </summary>
           <dl>
+            {detail.policy && (
+              <>
+                <div>
+                  <dt>{t("Policy")}</dt>
+                  <dd>
+                    v{detail.policy.revision} · {label(detail.policy.nature)} · {label(detail.policy.provenance)}
+                    {detail.policy.provenance === "agent-verified" && <p>{t("Source provenance is verified; this is not a passing logic check.")}</p>}
+                  </dd>
+                </div>
+                <div>
+                  <dt>{t("Audience")}</dt>
+                  <dd>
+                    {label(detail.policy.audience)}{detail.policy.roles.length ? ` · ${detail.policy.roles.join(", ")}` : ""}
+                    {detail.policy.audience === "company" && <p>{t("Company approval level; visibility stays within this project.")}</p>}
+                  </dd>
+                </div>
+                <div>
+                  <dt>{t("Requirements")}</dt>
+                  <dd><ul>{detail.policy.requirements.map((requirement) => <li key={requirement}>{requirement}</li>)}</ul></dd>
+                </div>
+                <div>
+                  <dt>{t("Author model vendor")}</dt>
+                  <dd>{detail.policy.author_vendor || t("Not confirmed")}</dd>
+                </div>
+                <div>
+                  <dt>{t("Immutable evidence references")}</dt>
+                  <dd className="num">{detail.policy.evidence_refs_count}</dd>
+                </div>
+                <div>
+                  <dt>{t("Usage reports")}</dt>
+                  <dd>
+                    {t("Used {used} · wrong {wrong} · reread {reread}")
+                      .replace("{used}", String(detail.policy.feedback.used_reports))
+                      .replace("{wrong}", String(detail.policy.feedback.wrong_reports))
+                      .replace("{reread}", String(detail.policy.feedback.reread_reports))}
+                    <p>{t("Authenticated reports, not proven benefit or unique uses.")}</p>
+                  </dd>
+                </div>
+                {detail.finalized_operations?.[0] && (
+                  <div>
+                    <dt>{t("Latest policy decision")}</dt>
+                    <dd>{label(detail.finalized_operations[0].operation)} · {createdLabel(detail.finalized_operations[0].finalized_at, t)}</dd>
+                  </div>
+                )}
+                {detail.policy.feedback.last_used_at && (
+                  <div>
+                    <dt>{t("Last reported use")}</dt>
+                    <dd>{createdLabel(detail.policy.feedback.last_used_at, t)}</dd>
+                  </div>
+                )}
+              </>
+            )}
             <div>
               <dt>{t("Lesson ID")}</dt>
               <dd className="num">{detail.slug}</dd>
@@ -183,8 +237,14 @@ function LessonDetail({ memory }: { memory: MemoryCard }) {
             </div>
             {typeof detail.review_count === "number" && (
               <div>
-                <dt>{t("Historical receipts")}</dt>
+                <dt>{t("Review receipts")}</dt>
                 <dd>{detail.review_count}</dd>
+              </div>
+            )}
+            {typeof detail.finalization_count === "number" && (
+              <div>
+                <dt>{t("Policy decisions")}</dt>
+                <dd>{detail.finalization_count}</dd>
               </div>
             )}
           </dl>
@@ -425,7 +485,7 @@ export default function Memory({
         <div className="memory-state">
           <h2>{filtered ? t("No matching lessons") : t("No lessons yet")}</h2>
           <p>
-            {filtered ? t("Try another search or clear the status and type filters.") : t("Native agents propose lessons, independent agents review them, and a PM finalizes them before use.")}
+            {filtered ? t("Try another search or clear the status and type filters.") : t("Native agents propose lessons. Each lesson’s policy determines the independent reviews or operator approval needed before use.")}
           </p>
           {filtered && <Button onClick={reset}>{t("Show all lessons")}</Button>}
         </div>

@@ -18,8 +18,14 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             id,
             file,
             status,
+            request_id,
         } => {
             crate::master::refuse_in_app_conversation("issue new")?;
+            if request_id.is_some() {
+                return Err(Error::rejected(
+                    "--request-id is supported only for hosted issue creation — nothing written",
+                ));
+            }
             let caller_is_master = crate::master::caller_is_master();
             write::master_issue_new_limits(
                 caller_is_master,
@@ -71,5 +77,32 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             Ok(0)
         }
         _ => unreachable!("new"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_issue_new_refuses_hosted_retry_id_before_writing() {
+        let action = IssueAction::New {
+            title: "Synthetic issue".into(),
+            project: Some("demo".into()),
+            priority: None,
+            parent: None,
+            epic: None,
+            tags: vec![],
+            blocked_by: vec![],
+            owner: None,
+            component: None,
+            id: None,
+            file: None,
+            status: None,
+            request_id: Some("retry-1".into()),
+        };
+        let error = run(&action, Path::new("/unused")).unwrap_err();
+        assert!(error.to_string().contains("--request-id"), "{error}");
+        assert!(error.to_string().contains("nothing written"), "{error}");
     }
 }

@@ -2,10 +2,10 @@ import { ApiError } from "../../../lib/api";
 import { withPrivateOperation } from "../../../lib/privateSession";
 import { navigate } from "../../../lib/useLocation";
 import { rememberContext } from "../contextSelection";
-import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
+import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type PublishDestination, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
-import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
-import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { accountLabel, connectReturnTo, destinationBindings, isPublishToolkit, sendSlot, bindingToUse, type ConnectReturnTarget, type PublishToolkit } from "../socialConnect";
+import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaImportArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type ScreenDrawerSize, type SlotVerb } from "./screenProtocol";
 import type { ScreenActions } from "./screenLifecycle";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -25,6 +25,9 @@ export interface ActionContext {
   onSavedContext?: (saved: AppContext) => void;
   /** Reload the board's data after a write. */
   onChanged: () => void | Promise<void>;
+  /** The board's own translator for host-authored slot text (never frame text);
+   *  absent in tests, where the English key is the answer. */
+  say?: (english: string) => string;
 }
 
 const NO: ActionRefusal = { code: "denied", text: "Only the operator can do that." };
@@ -75,6 +78,16 @@ export function plainRefusal(error: unknown): ActionRefusal {
   if (error.code === "draft_in_use") return { code: "draft_in_use", text: "This draft is approved or published, so it can't be discarded." };
   if (error.code === "stale_revision") return { code: "stale_revision", text: "That changed somewhere else. Reload and try again." };
   if (error.code === "draft_not_found") return { code: "draft_not_found", text: "That draft is no longer here." };
+  // SOC-54: the host keeps every retained read, so the remaining refusal is a
+  // profile that left Settings. `stale_source` stays mapped for an older daemon
+  // that still applies the latest-fetch-only rule.
+  if (error.code === "source_not_saved") return { code: "source_not_saved", text: "That profile is no longer a saved source. Re-add it in Settings." };
+  if (error.code === "stale_source") return { code: "stale_source", text: "That post was fetched again since; clone it as a new post." };
+  // SOC-55: a paged source scan is a snapshot. A cursor the host rejects (or
+  // one whose library moved) must reach the app as its own code so it can
+  // restart the scan without discarding cards it already showed.
+  if (error.code === "invalid_cursor" || error.code === "stale_cursor")
+    return { code: error.code, text: "The source list changed while loading. Reload it to continue." };
   const text = error.message.toLowerCase();
   if (text.includes("320 pixels")) return { code: "image_too_small", text: "Use a photo at least 320 pixels on each side." };
   if (text.includes("4:5 to 1.91:1")) return { code: "image_aspect", text: "Use a photo between 4:5 and 1.91:1." };
@@ -153,6 +166,26 @@ async function mediaPublish(args: Record<string, unknown>, ui: { actionToken?: s
   } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
 }
 
+/** CAD-1962 — `media.import`: promote ONE retained image this
+ *  installation owns into the shared workspace library, as a draft. The
+ *  daemon re-proves the mount, the declared `media.import` permission and
+ *  the custody before copying, so the frame only names the receipt and a
+ *  request id. */
+async function mediaImport(args: Record<string, unknown>, ui: { actionToken?: string }): Promise<ActionResult> {
+  const checked = mediaImportArgs(args);
+  const actionToken = ui.actionToken;
+  if (!checked || typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken))
+    return refuse("bad_args", "That request is not valid.");
+  try {
+    const out = await workspaceApps.mediaImport({
+      action_token: actionToken,
+      receipt_id: checked.receipt_id as string,
+      request_id: checked.request_id as string,
+    });
+    return { ok: true, data: out };
+  } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+}
+
 async function readRun(ctx: ActionContext, args: Record<string, unknown>): Promise<ActionResult> {
   if (!exact(args, ["run_id"]) || typeof args.run_id !== "string") return refuse("bad_args", "That request is not valid.");
   const run = ctx.runs.find(value => value.id === args.run_id && value.install_id === ctx.installId &&
@@ -225,7 +258,7 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
   const alias=verb==="social.drafts.discard"?"social.draft":args.alias;
   if(typeof actionToken!=="string" || !/^[a-f0-9]{64}$/.test(actionToken) || typeof alias!=="string") return refuse("denied","That draft action is unavailable.");
   const common={action_token:actionToken,alias};
-  let operation:"create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage";
+  let operation:"create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/page"|"sources/get"|"sources/save"|"effect-stage";
   let fields:Record<string,unknown>;
   switch(verb){
     case "social.drafts.list": operation="list"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
@@ -233,8 +266,15 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
     case "social.drafts.create": operation="create"; if(!exact(args,["alias","request_id","caption","source"])&&!exact(args,["alias","request_id","caption","source","asset_id"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,caption:args.caption,source:args.source,...("asset_id" in args?{asset_id:args.asset_id}:{})}; break;
     case "social.drafts.update": operation="update"; if(!exact(args,["alias","request_id","draft_id","expected_revision","caption"])&&!exact(args,["alias","request_id","draft_id","expected_revision","caption","asset_id"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,draft_id:args.draft_id,expected_revision:args.expected_revision,caption:args.caption,...("asset_id" in args?{asset_id:args.asset_id}:{})}; break;
     case "social.drafts.discard": operation="discard"; if(!exact(args,["draft_id","revision"])||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)) return refuse("bad_args","That request is not valid."); fields={draft_id:args.draft_id,revision:args.revision}; break;
-    case "social.drafts.publish.stage": operation="effect-stage"; if(!exact(args,["alias","draft_id","revision","request_id"])||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)||typeof args.request_id!=="string") return refuse("bad_args","That request is not valid."); fields={proof:{kind:"social_draft",draft_id:args.draft_id,revision:args.revision},request_id:args.request_id}; break;
+    // CAD-1939: `destination_id` optionally names which of the context's destinations this effect posts to.
+    case "social.drafts.publish.stage": operation="effect-stage"; if((!exact(args,["alias","draft_id","revision","request_id"])&&!exact(args,["alias","draft_id","revision","request_id","destination_id"]))||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)||typeof args.request_id!=="string"||("destination_id" in args&&(typeof args.destination_id!=="string"||args.destination_id.length===0))) return refuse("bad_args","That request is not valid."); fields={proof:{kind:"social_draft",draft_id:args.draft_id,revision:args.revision},request_id:args.request_id,...("destination_id" in args?{destination_id:args.destination_id}:{})}; break;
     case "social.sources.show": operation="sources/show"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
+    // SOC-55: one bounded page of the retained library, then its opaque
+    // cursor. A cursor that is not a string or is oversized never leaves the
+    // frame; the daemon re-validates it against the mounted scope anyway.
+    case "social.sources.page": operation="sources/page"; if(!exact(args,["alias"])&&!exact(args,["alias","cursor"])) return refuse("bad_args","That request is not valid."); if("cursor" in args&&(typeof args.cursor!=="string"||args.cursor.length===0||args.cursor.length>2048)) return refuse("bad_args","That request is not valid."); fields={...("cursor" in args?{cursor:args.cursor}:{})}; break;
+    // SOC-55: exact receipt/post resolution for an older draft — never a scan.
+    case "social.sources.get": operation="sources/get"; if(!exact(args,["alias","receipt_id","post_id"])||typeof args.receipt_id!=="string"||typeof args.post_id!=="string"||args.receipt_id.length===0||args.receipt_id.length>128||args.post_id.length===0||args.post_id.length>100) return refuse("bad_args","That request is not valid."); fields={receipt_id:args.receipt_id,post_id:args.post_id}; break;
     case "social.sources.save": operation="sources/save"; if(!exact(args,["alias","request_id","expected_revision","handles"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,expected_revision:args.expected_revision,handles:args.handles}; break;
     default: return refuse("bad_args","That request is not valid.");
   }
@@ -251,6 +291,7 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
 function openScreenDrawer(args: Record<string, unknown>, ui: Parameters<ScreenActions["call"]>[2]): ActionResult {
   const request = parseScreenDrawerCall(SCREEN_DRAWER_OPEN, args);
   if (!request || request.mode !== "drawer") return refuse("bad_args", "That request is not valid.");
+  if ("context" in request) return refuse("unavailable", "This app cannot pass context to a drawer here.");
   if (!ui.openScreenDrawer) return refuse("unavailable", "This app cannot open a board drawer here.");
   ui.openScreenDrawer(request.surface);
   return { ok: true, data: request };
@@ -267,55 +308,146 @@ export const BOARD_LINK_PATHS: readonly string[] = ["/settings/connections"];
 /** The visible target of an external link: its host plus path, which is what the confirm names. */
 export const linkTarget = (href: string): string => { const url = new URL(href); return url.host + url.pathname + url.search; };
 
+/** The owner-scoped publishing consent, exactly as the board reports it. Lines the board cannot
+ *  prove — an older board without the endpoint, a refusal, a malformed answer — are unavailable,
+ *  never "none": the app must be able to tell "no consent" from "unknown". `not_ready` names the
+ *  visible accounts whose provider connection has not resolved yet; they have no consent row and
+ *  the host offers no consent card for them. */
+type ConsentState = "allowed" | "none";
+interface ConsentStatus {
+  available: boolean;
+  consents: { destination_id: string; toolkit: PublishToolkit; state: ConsentState }[];
+  not_ready: string[];
+}
+const CONSENT_UNAVAILABLE: ConsentStatus = { available: false, consents: [], not_ready: [] };
+const CONSENT_DESTINATION = /^[A-Za-z0-9_.-]{1,128}$/;
+const CONSENT_ROWS_MAX = 100;
+
+function readConsentStatus(value: unknown): ConsentStatus | null {
+  if (!isObject(value) || typeof value.available !== "boolean") return null;
+  if (!value.available) return CONSENT_UNAVAILABLE;
+  if (!Array.isArray(value.consents) || value.consents.length > CONSENT_ROWS_MAX) return null;
+  const consents: ConsentStatus["consents"] = [];
+  const seenDestinations = new Set<string>();
+  for (const row of value.consents) {
+    if (!isObject(row) || typeof row.destination_id !== "string" || !CONSENT_DESTINATION.test(row.destination_id) ||
+        seenDestinations.has(row.destination_id) ||
+        !isPublishToolkit(row.toolkit) || (row.state !== "allowed" && row.state !== "none")) return null;
+    seenDestinations.add(row.destination_id);
+    consents.push({ destination_id: row.destination_id, toolkit: row.toolkit, state: row.state });
+  }
+  // Only an ABSENT field is an old host's default; an explicit null or any other shape is
+  // malformed authority and makes the whole answer unknown.
+  const rawNotReady = "not_ready" in value ? value.not_ready : [];
+  if (!Array.isArray(rawNotReady) || rawNotReady.length > CONSENT_ROWS_MAX) return null;
+  const notReady: string[] = [];
+  for (const id of rawNotReady) {
+    if (typeof id !== "string" || !CONSENT_DESTINATION.test(id) || notReady.includes(id)) return null;
+    notReady.push(id);
+  }
+  // A row and its not-ready marker are mutually exclusive; both at once is malformed authority.
+  if (notReady.some(id => consents.some(row => row.destination_id === id))) return null;
+  return { available: true, consents, not_ready: notReady };
+}
+
+/** The board's consent read, or unknown. Never throws: a missing capability degrades to the
+ *  legacy post-connect page instead of failing a connect. */
+async function readConsent(installId: string, signal?: AbortSignal): Promise<ConsentStatus> {
+  try { return readConsentStatus(await workspaceApps.consentStatus(installId, signal)) ?? CONSENT_UNAVAILABLE; }
+  catch { return CONSENT_UNAVAILABLE; }
+}
+
 /** CAD-1290: on a hosted workspace the app's "Manage connections" link opens the AgenticOS Instagram
  *  connect page top-level. The host composes that URL (the frame never builds it); a local board, or
  *  a failure while this continuation is still current, keeps the local connections page.
  *  Pause, reset, and frame close abort the continuation for good. A later response cannot assign,
- *  navigate, or show a link, and re-admission does not revive it. */
-async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; signal?: AbortSignal }): Promise<ActionResult> {
+ *  navigate, or show a link, and re-admission does not revive it.
+ *  The return goes to the app screen — or, when the frame is a drawer child, to that drawer surface —
+ *  never to another screen. `inline_consent` is the app's opt-in to the drawer consent step, honoured
+ *  only when the board independently proves the capability exists; otherwise the legacy page runs. */
+async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; signal?: AbortSignal; returnSurface?: string; returnSize?: ScreenDrawerSize }): Promise<ActionResult> {
+  // CAD-1939: the connections link may name which toolkit to connect (default Instagram). The
+  // opt-in may travel with or without that name — Manage/Reconnect send the bare link and keep
+  // the daemon's Instagram default — and neither is valid on any other link.
+  const inline = args.inline_consent === true;
+  const toolkit = isPublishToolkit(args.toolkit) ? args.toolkit : undefined;
+  const connectionKeys = [...(toolkit ? ["toolkit"] : []), ...(inline ? ["inline_consent"] : []), "url"];
+  if (args.url === "/settings/connections"
+    ? !exact(args, connectionKeys) || ("toolkit" in args && !toolkit) || ("inline_consent" in args && !inline)
+    : !exact(args, ["url"]))
+    return refuse("bad_args", "That link is not valid.");
   return withPrivateOperation(async (operation) => {
     if (args.url === "/settings/connections") {
       try {
         // CAD-1438: the screen only runs under `/apps/<key>` (uniqueness proven
         // at route level), so the installation's own key is its return path.
-        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId), operation.signal);
+        const target: ConnectReturnTarget = ui.returnSurface
+          ? { mode: "drawer", surface: ui.returnSurface, ...(ui.returnSize ? { size: ui.returnSize } : {}) }
+          : { mode: "screen" };
+        const inlineConsent = inline && (await readConsent(ctx.installId, operation.signal)).available;
+        operation.assertCurrent();
+        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId, target, ctx.contextId), operation.signal, toolkit, inlineConsent);
         operation.assertCurrent();
         if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
         // Hosted but no public AgenticOS address: say so, never send the owner to the local page.
-        if (reply.hosted) return refuse("unavailable", "Instagram connect isn't available for this workspace yet.");
+        if (reply.hosted) return refuse("unavailable", "Connecting accounts isn't available for this workspace yet.");
       } catch {
         operation.assertCurrent();
       }
     }
     operation.assertCurrent();
-    return openLink(args, ui);
+    return openLink({ url: args.url }, ui);
   }, ui.signal);
 }
 
-/** `social.destinations.list`: the company's connected Instagram accounts. Read only. */
+/** `social.destinations.list`: the company's connected Instagram accounts and Facebook Pages (any
+ *  number of each), with their toolkit and whether this context publishes to it now (`used`: it has
+ *  a live publication binding here). Read only. */
 async function listDestinations(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   if (!exact(args, [])) return refuse("bad_args", "That request is not valid.");
   const reply = await workspaceApps.destinations(ctx.installId);
-  return { ok: true, data: { unavailable: reply.unavailable, destinations: reply.destinations.map(value => ({ destination_id: value.destination_id, label: accountLabel(value.label || value.destination_id) })) } };
+  const slot = sendSlot(ctx.installation);
+  const live = slot ? destinationBindings(await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined), slot,
+    ctx.contextId || null, ctx.installation.digest) : [];
+  return { ok: true, data: { unavailable: reply.unavailable, destinations: reply.destinations.filter(value => isPublishToolkit(value.toolkit))
+    .map(value => ({ destination_id: value.destination_id, label: accountLabel(value.label || value.destination_id), toolkit: value.toolkit,
+      used: live.some(binding => binding.config.publish?.destination_id === value.destination_id && binding.config.publish?.toolkit === value.toolkit) })) } };
 }
 
-/** `publish.destination.use`: a host-drawn tap points the install's publication binding at one of the
- *  company's accounts. The label comes from the company's list, never from the frame. */
+/** The `destination_id` (and optional `toolkit`) a destination verb names, or null when malformed. */
+function namedDestination(args: Record<string, unknown>): { id: string; toolkit?: string } | null {
+  if (exact(args, ["destination_id"]) && typeof args.destination_id === "string") return { id: args.destination_id };
+  if (exact(args, ["destination_id", "toolkit"]) && typeof args.destination_id === "string" && isPublishToolkit(args.toolkit))
+    return { id: args.destination_id, toolkit: args.toolkit };
+  return null;
+}
+
+/** One listed account for a named destination: exactly one row must match. */
+function listedDestination(rows: PublishDestination[], named: { id: string; toolkit?: string }): PublishDestination | null {
+  const found = rows.filter(value => value.destination_id === named.id && (named.toolkit === undefined || value.toolkit === named.toolkit));
+  return found.length === 1 ? found[0] : null;
+}
+
+/** `publish.destination.use`: add (or update) the install's publication binding for one of the
+ *  company's accounts; another destination's binding is left as it is (CAD-1939). The account
+ *  comes from the company's list, never from the frame. */
 async function planUseDestination(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
-  if (!exact(args, ["destination_id"]) || typeof args.destination_id !== "string") return { code: "bad_args", text: "That request is not valid." };
+  const named = namedDestination(args);
+  if (!named) return { code: "bad_args", text: "That request is not valid." };
   const slot = sendSlot(ctx.installation);
   if (!slot) return { code: "unknown_slot", text: "That isn't available." };
-  const destination = args.destination_id;
+  const destination = named.id;
   try {
     const listed = await workspaceApps.destinations(ctx.installId);
-    const chosen = listed.destinations.find(value => value.destination_id === destination);
-    if (!chosen) return { code: "unknown_destination", text: "That Instagram account isn't connected." };
+    const chosen = listedDestination(listed.destinations, named);
+    if (!chosen) return { code: "unknown_destination", text: "That account isn't connected." };
     const contextId = ctx.contextId;
-    const binding = publicationBinding(await workspaceApps.bindings(ctx.installId, contextId || undefined), slot, contextId || null, ctx.installation.digest);
+    const binding = bindingToUse(await workspaceApps.bindings(ctx.installId, contextId || undefined), slot, contextId || null,
+      ctx.installation.digest, destination, chosen.toolkit);
     const request = randomRequest();
     return { label: `Use ${accountLabel(chosen.label || destination)} for publishing`, run: async (): Promise<ActionResult> => {
       try {
-        await workspaceApps.useDestination(ctx.installId, { destination_id: destination,
+        await workspaceApps.useDestination(ctx.installId, { destination_id: destination, toolkit: chosen.toolkit,
           ...(contextId ? { context_id: contextId } : {}),
           ...(binding ? { expected_revision: binding.revision } : { request_id: request }) });
         ctx.onChanged();
@@ -335,16 +467,42 @@ async function planSavePublishSettings(ctx: ActionContext, args: Record<string, 
   if (!slot) return { code: "unknown_slot", text: "That isn't available." };
   try {
     const listed = await workspaceApps.destinations(ctx.installId);
-    const chosen = listed.destinations.find(value => value.destination_id === args.destination_id);
+    const chosen = listedDestination(listed.destinations, { id: args.destination_id });
     if (!chosen || listed.unavailable) return { code: "unknown_destination", text: "That publishing account isn't available." };
-    const binding = publicationBinding(await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined), slot,
-      ctx.contextId || null, ctx.installation.digest);
-    const body = { destination_id: chosen.destination_id, timezone: args.timezone,
+    const binding = bindingToUse(await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined), slot,
+      ctx.contextId || null, ctx.installation.digest, chosen.destination_id, chosen.toolkit);
+    const body = { destination_id: chosen.destination_id, toolkit: chosen.toolkit, timezone: args.timezone,
       ...(ctx.contextId ? { context_id: ctx.contextId } : {}),
       ...(binding ? { expected_revision: binding.revision } : { request_id: randomRequest() }) };
     return { label: `Save time zone · ${accountLabel(chosen.label || chosen.destination_id)} · ${args.timezone}`, run: async (): Promise<ActionResult> => {
       try {
         await workspaceApps.useDestination(ctx.installId, body);
+        await ctx.onChanged();
+        return { ok: true, data: {} };
+      } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+    } };
+  } catch (error) { return plainRefusal(error); }
+}
+
+/** `publish.destination.remove` (CAD-1939): retire one destination's binding for the active context
+ *  at the revision the host read. The last destination is never removed here, so this cannot put the
+ *  app back into preview mode (the same rule as the Settings panel). */
+async function planRemoveDestination(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
+  const named = namedDestination(args);
+  if (!named) return { code: "bad_args", text: "That request is not valid." };
+  const slot = sendSlot(ctx.installation);
+  if (!slot) return { code: "unknown_slot", text: "That isn't available." };
+  try {
+    const bindings = await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined);
+    const live = destinationBindings(bindings, slot, ctx.contextId || null, ctx.installation.digest);
+    const found = live.filter(value => value.config.publish?.destination_id === named.id && (named.toolkit === undefined || value.config.publish?.toolkit === named.toolkit));
+    if (found.length !== 1) return { code: "unknown_destination", text: "This app doesn't publish to that account here." };
+    if (live.length < 2) return { code: "last_destination", text: "Choose another account first — publishing needs at least one." };
+    const binding = found[0];
+    const label = accountLabel(binding.config.publish?.destination_label || named.id);
+    return { label: `Stop publishing to ${label}`, run: async (): Promise<ActionResult> => {
+      try {
+        await workspaceApps.revokeBinding(ctx.installId, binding.id, binding.revision);
         await ctx.onChanged();
         return { ok: true, data: {} };
       } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
@@ -367,7 +525,7 @@ async function planConfirmPublish(ctx: ActionContext, args: Record<string, unkno
       const effect = (sent as { effect?: { state?: unknown } }).effect;
       const state = typeof effect?.state === "string" ? effect.state : "";
       if (state === "posted") return { ok: true, data: sent };
-      if (state === "failed") return { ok: false, refusal: { code: "refused", text: "Instagram didn't take that post." } };
+      if (state === "failed") return { ok: false, refusal: { code: "refused", text: "The account didn't take that post." } };
       return { ok: false, refusal: { code: "unconfirmed", text: "That isn't confirmed yet. Check before trying again." } };
     } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
   } };
@@ -384,6 +542,12 @@ function openLink(args: Record<string, unknown>, ui: { showLink(url: string): vo
   return { ok: true, data: {} };
 }
 
+/** Execute a planner as a direct call: the same validation and daemon write,
+ *  with no host-drawn tap. */
+async function runPlan(plan: SlotPlan | ActionRefusal): Promise<ActionResult> {
+  return "code" in plan ? { ok: false, refusal: plan } : plan.run();
+}
+
 /** The direct (non-spending) verbs. The set is closed in `screenProtocol`. */
 export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>,
   ui: Parameters<ScreenActions["call"]>[2] & { navigate?: (path: string) => void; assign?: (url: string) => void }): Promise<ActionResult> {
@@ -394,7 +558,9 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "open-link": () => connectOrOpen(ctx, args, ui),
     "screen.drawer.open": () => openScreenDrawer(args, ui),
     "screen.drawer.close": () => closeScreenDrawer(args, ui),
+    "screen.drawer.context": () => refuse("forbidden", "That drawer context is only readable by its drawer."),
     "social.destinations.list": () => listDestinations(args, ctx),
+    "publish.consent.status": async () => ({ ok: true, data: await readConsent(ctx.installId) }),
     "social.drafts.list": () => socialDraftCall(verb,args,ui),
     "social.drafts.show": () => socialDraftCall(verb,args,ui),
     "social.drafts.create": () => socialDraftCall(verb,args,ui),
@@ -402,10 +568,20 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.drafts.discard": () => socialDraftCall(verb,args,ui),
     "social.drafts.publish.stage": () => socialDraftCall(verb,args,ui),
     "social.sources.show": () => socialDraftCall(verb,args,ui),
+    "social.sources.page": () => socialDraftCall(verb,args,ui),
+    "social.sources.get": () => socialDraftCall(verb,args,ui),
     "social.sources.save": () => socialDraftCall(verb,args,ui),
+    "publish.destination.use": async () => runPlan(await planUseDestination(ctx, args)),
+    "publish.destination.remove": async () => runPlan(await planRemoveDestination(ctx, args)),
+    "publish.settings.save": async () => runPlan(await planSavePublishSettings(ctx, args)),
+    "publish.draft.confirm": async () => runPlan(await planConfirmPublish(ctx, args, ui.actionToken)),
+    "publish.draft.schedule": async () => runPlan(await planDraftEffectChange(ctx, verb, args, ui.actionToken)),
+    "publish.draft.reschedule": async () => runPlan(await planDraftEffectChange(ctx, verb, args, ui.actionToken)),
+    "publish.draft.cancel": async () => runPlan(await planDraftEffectChange(ctx, verb, args, ui.actionToken)),
     "media.read": () => mediaRead(args, ui),
     "media.chat.attach": () => mediaChatAttach(args, ui),
     "media.publish": () => mediaPublish(args, ui),
+    "media.import": () => mediaImport(args, ui),
   };
   return Promise.resolve().then(table[verb as (typeof CALL_VERBS)[number]]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));
 }
@@ -414,7 +590,7 @@ const MAX_DRAFT_SCHEDULE_SECONDS = 366 * 24 * 60 * 60;
 
 /** Schedule controls name a board draft effect and execute on the human's own action: the app's
  *  time picker already chose the time, so no second confirmation card is shown. */
-async function planDraftEffectChange(ctx: ActionContext, verb: SlotVerb, args: Record<string, unknown>, actionToken?: string): Promise<SlotPlan | ActionRefusal> {
+async function planDraftEffectChange(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>, actionToken?: string): Promise<SlotPlan | ActionRefusal> {
   if (typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken)) return { code: "denied", text: "That draft action is unavailable." };
   const hasDue = verb !== "publish.draft.cancel";
   const expectedKeys = hasDue ? ["alias", "due_epoch", "effect_id"] : ["alias", "effect_id"];
@@ -628,18 +804,75 @@ async function planImagePick(_args: Record<string, unknown>, ui?: { actionToken?
   } };
 }
 
+const CONSENT_TOOLKIT: Record<PublishToolkit, string> = { instagram: "Instagram", facebook: "Facebook Page" };
+
+/** `publish.consent.allow`: the owner's per-account publishing consent. The frame names one
+ *  destination; the host re-reads the current tenant list and requires exactly one match, so a
+ *  stale, forged or ambiguous id cannot pick another account. Every word on the card — the
+ *  account, what it may receive, billing and revocation — comes from the host and the verified
+ *  server read, never from the frame, and the write runs only from a tap on that host-drawn
+ *  card. A not-ready account is refused before any card. Success is the authoritative read after
+ *  the write, never the write's own answer; the reply then carries no receipt and the app
+ *  re-reads the status. */
+async function planConsentAllow(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
+  const toolkit = args.toolkit;
+  const destination = args.destination_id;
+  if (!exact(args, ["destination_id", "toolkit"]) || typeof destination !== "string" ||
+      !CONSENT_DESTINATION.test(destination) || !isPublishToolkit(toolkit))
+    return { code: "bad_args", text: "That request is not valid." };
+  const status = await readConsent(ctx.installId);
+  if (!status.available)
+    return { code: "unavailable", text: "Publishing consent can't be given here yet. Open the account's settings on AgenticOS." };
+  if (status.not_ready.includes(destination))
+    return { code: "not_ready", text: "That account is still connecting. Try again once it is ready." };
+  // The account must have exactly one authoritative status row for this destination AND toolkit.
+  // An available answer that does not attest this account is incomplete authority, never eligible.
+  if (status.consents.filter(row => row.destination_id === destination && row.toolkit === toolkit).length !== 1)
+    return { code: "unavailable", text: "Couldn't confirm this account's consent status. Try again." };
+  let listed: { unavailable: boolean; destinations: { destination_id: string; label: string; toolkit: string }[] };
+  try { listed = await workspaceApps.destinations(ctx.installId); }
+  catch { return { code: "unavailable", text: "Couldn't check your accounts right now. Try again." }; }
+  const matched = listed.destinations.filter(row => row.destination_id === destination && row.toolkit === toolkit);
+  if (listed.unavailable || matched.length !== 1)
+    return { code: "not_found", text: "That account is no longer connected. Check the accounts and try again." };
+  const account = accountLabel(matched[0].label || destination);
+  const say = ctx.say ?? ((english: string) => english);
+  return {
+    label: say("Authorize this account"),
+    card: {
+      title: say("Authorize linked-device publishing to {account}?").replace("{account}", () => account),
+      target: `${account} · ${say(CONSENT_TOOLKIT[toolkit])}`,
+      caption: "",
+      image: null,
+      disclosure: [
+        say("Standing authorization for linked-device publishing to the named account. Withdraw it any time in AgenticOS."),
+        say("Separately approved hosted posts still send without it. Each send uses your AgenticOS balance."),
+      ].join("\n"),
+    },
+    run: async (): Promise<ActionResult> => {
+      try {
+        await workspaceApps.consentAllow(ctx.installId, { destination_id: destination });
+      } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+      // A 2xx from the write is not the fact. The status read decides.
+      const after = await readConsent(ctx.installId);
+      const granted = after.available && after.consents.some(row =>
+        row.destination_id === destination && row.toolkit === toolkit && row.state === "allowed");
+      return granted
+        ? { ok: true, data: {} }
+        : { ok: false, refusal: { code: "unconfirmed", text: "Cadence couldn't confirm that consent. Check the account before trying again." } };
+    },
+  };
+}
+
 /** The spend/publish verbs. The set is closed in `screenProtocol`. */
 export function makePlanner(get: () => ActionContext): Planner {
   return (verb: SlotVerb, args, ui) => {
     if (!(SLOT_VERBS as readonly string[]).includes(verb)) return Promise.resolve({ code: "forbidden", text: "This operation requires the records service." });
     const table: Record<(typeof SLOT_VERBS)[number], () => Promise<SlotPlan | ActionRefusal>> = {
       "run.start": () => planRunStart(get(), args),
-      "publish.destination.use": () => planUseDestination(get(), args),
       "publish.draft.confirm": () => planConfirmPublish(get(), args, ui?.actionToken),
-      "publish.draft.schedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
-      "publish.draft.reschedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
-      "publish.draft.cancel": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
-      "publish.settings.save": () => planSavePublishSettings(get(), args),
+      "publish.draft.schedule": () => planDraftEffectChange(get(), "publish.draft.schedule", args, ui?.actionToken),
+      "publish.consent.allow": () => planConsentAllow(get(), args),
       "media.original.download": () => planOriginalDownload(get, args, ui),
       "social.image.pick": () => planImagePick(args, ui),
     };

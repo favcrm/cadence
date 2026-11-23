@@ -303,7 +303,7 @@ export async function readRevision(path: string, at: string, operation?: Private
     if (!type.includes("json")) {
       await resp.body?.cancel();
       op.assertCurrent();
-      if (!resp.ok) throw new WikiError("This revision is unavailable", resp.status);
+      if (!resp.ok) throw new WikiError(`${resp.status} response`, resp.status);
       throw new WikiError("This revision did not return page text", 502);
     }
     const body: unknown = await resp.json().catch(() => null);

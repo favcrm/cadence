@@ -13,6 +13,7 @@ pub(crate) use daemon::{
 };
 mod action_dispatch;
 mod agent;
+mod agent_profile;
 mod agent_uid;
 mod app;
 mod artifact;
@@ -23,10 +24,9 @@ mod backup;
 use cadence_agent::briefing;
 mod build_slot;
 mod business_templates;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1586_managed_settings_acceptance;
 mod claude;
 mod client_update;
+mod cloud_agent;
 mod codex;
 mod commands;
 mod confine;
@@ -38,6 +38,7 @@ mod devin;
 mod discovery;
 mod dispatch;
 mod doctor;
+mod endpoint;
 mod events;
 mod export;
 mod guidance;
@@ -52,9 +53,6 @@ mod job;
 mod join;
 mod launch;
 mod local_agent;
-#[cfg(test)]
-#[path = "logout_auth_dir_acceptance.rs"]
-mod logout_auth_dir_acceptance;
 mod master;
 mod mcp_agent;
 mod mcp_permission;
@@ -75,6 +73,7 @@ mod resume;
 mod resume_helpers;
 mod review;
 mod rollout;
+mod routine;
 mod sandbox;
 mod secret;
 mod self_info;
@@ -94,24 +93,18 @@ mod topic;
 mod ui;
 mod update;
 mod update_args;
+mod workspace_skill;
 // CAD-1406: independent refusal-acceptance for the update identity
 // and managed-runtime guards; the file is owned by its own author.
-#[cfg(all(test, feature = "test-seam"))]
-mod update_identity_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod update_recovery_tests;
 // CAD-1355: independent routing acceptance for `update` ignoring a saved
 // remote default — the file is owned by its own author.
-#[cfg(all(test, feature = "test-seam"))]
-mod update_routing_acceptance;
-
 mod upgrade;
 mod util;
 mod web;
 
 // CAD-1479: independently owned backend-default refusal acceptance.
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1479_backend_default_acceptance;
 mod wiki;
 mod workflow;
 
@@ -139,6 +132,7 @@ use connection::ConnectionAction;
 use daemon::DaemonAction;
 use delivery::DeliveryAction;
 pub(crate) use devin::{apply_cloud_params, insert_devin_cloud_params, split_cloud_params};
+use endpoint::EndpointAction;
 use idea::IdeaAction;
 use inbox::InboxAction;
 use intake::IntakeAction;
@@ -161,6 +155,7 @@ use resume_helpers::{
     resume_sweep, stop_group,
 };
 use rollout::RolloutAction;
+use routine::RoutineAction;
 use secret::SecretAction;
 use serde_json::json;
 use serde_json::Value;
@@ -192,7 +187,7 @@ use workflow::WorkflowAction;
     about = "Local controller for coding agents",
     // `0.1.0+<build commit>` — semver build metadata, `unknown` when
     // the build ran outside a git checkout.
-    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CADENCE_BUILD_COMMIT"))
+    version = cadence_agent::overview::BUILD_ID
 )]
 pub(crate) struct Cli {
     /// Runtime state directory (socket, database, logs).
@@ -205,8 +200,8 @@ pub(crate) struct Cli {
     /// original member; registry defaults and org switch stay refused.
     #[arg(long, global = true, value_name = "ORG")]
     org: Option<String>,
-    /// Seconds a remote command waits while its org's container wakes
-    /// (CAD-1019 slice 2). Only used when the selected org is remote.
+    /// Seconds a remote command waits when the hosted org answers that it is
+    /// still starting. Only used when the selected org is remote.
     #[arg(long, global = true, default_value_t = cadence_agent::remote_cli::WAKE_TIMEOUT_DEFAULT)]
     wake_timeout: u64,
     /// The argument ids the command line itself typed, read at the CLI
@@ -214,6 +209,9 @@ pub(crate) struct Cli {
     /// the client-only updater refuses instead of assuming none were typed.
     #[arg(skip)]
     command_line: Option<Vec<String>>,
+    /// Clap-validated subcommand names only, without any argument values.
+    #[arg(skip)]
+    command_path: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -563,7 +561,7 @@ pub(crate) fn send_message(
     // CAD-251: a stale mailbox still accepted the message — say so on
     // stderr so stdout stays the JSON receipt.
     if let Some(warning) = receipt["warning"].as_str() {
-        eprintln!("warning: {warning}");
+        eprint_line(&format!("warning: {warning}"));
     }
     Ok((receipt, false))
 }
@@ -577,6 +575,7 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             issue: Some(issue),
             source,
             action,
+            delegated: false,
             ..
         } => {
             if action != "scope" {
@@ -633,10 +632,33 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
         }
         // Handled in `cli::audit::run`: a read, not an RPC.
         // Handled in `cli::audit::run`: reads, not RPCs.
-        AuditAction::Approval { .. } | AuditAction::Verdicts { .. } | AuditAction::Scope { .. } => {
+        AuditAction::Approval { .. }
+        | AuditAction::Verdicts { .. }
+        | AuditAction::Scope { .. }
+        | AuditAction::Verdict { .. }
+        | AuditAction::Reviewers { .. }
+        | AuditAction::Identities { .. } => {
             unreachable!(
-                "audit approval/verdicts/scope are read-only and handled in cli::audit::run"
+                "audit approval/verdicts/scope/verdict/reviewers/identities are handled in \
+                 cli::audit::run"
             )
+        }
+        // CAD-2197: a local org files no workflow review rows, so there is
+        // nothing to accept. The verb is hosted-only and says so rather than
+        // recording a row no gate reads.
+        AuditAction::AcceptRevise { .. } => {
+            return Err(Error::rejected(
+                "audit accept-revise is hosted-only: a local org files no workflow review rows, \
+                 so there is nothing to accept. Nothing was recorded",
+            ));
+        }
+        // CAD-2201: findings are a workflow row's text, and a local org files
+        // no workflow rows. The verb is hosted-only and says so.
+        AuditAction::Findings { .. } => {
+            return Err(Error::rejected(
+                "audit findings is hosted-only: a local org files no workflow review rows. \
+                 Nothing was read",
+            ));
         }
         AuditAction::Designate {
             alias,
@@ -648,13 +670,45 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             "approval_designate",
             json!({"alias": alias, "project": project, "source": source, "active": !revoke}),
         )?,
-        AuditAction::Designations => client::rpc(state_dir, "approval_designations", json!({}))?,
-        AuditAction::Digest { since } => cadence_agent::audit::digest(state_dir, since.as_deref())?,
-        AuditAction::Revoke { id, source, reason } => client::rpc(
-            state_dir,
-            "approval_revoke",
-            json!({"id": id, "source": source, "reason": reason}),
-        )?,
+        AuditAction::Designations { project } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: local \
+                     designations store no project. Nothing was read"
+                )));
+            }
+            client::rpc(state_dir, "approval_designations", json!({}))?
+        }
+        AuditAction::Digest { since, project } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped read: local \
+                     digest takes no --project. Nothing was read"
+                )));
+            }
+            cadence_agent::audit::digest(state_dir, since.as_deref())?
+        }
+        AuditAction::Revoke {
+            id,
+            project,
+            source,
+            reason,
+        } => {
+            if let Some(project) = project {
+                return Err(Error::usage(format!(
+                    "--project {project} binds the hosted project-scoped revoke: local \
+                     revocations take no --project. Nothing was recorded"
+                )));
+            }
+            let source = source.ok_or_else(|| {
+                Error::usage("--source is required in local mode. Nothing was recorded")
+            })?;
+            client::rpc(
+                state_dir,
+                "approval_revoke",
+                json!({"id": id, "source": source, "reason": reason}),
+            )?
+        }
     };
     print_json(&result);
     Ok(0)
@@ -786,7 +840,12 @@ pub(crate) fn list_agents(
     }
     // The daemon counts before client-side group and project filters.
     // Keep the advertised capacity in the same scope as the visible rows.
-    list["live"] = json!(count_live_agents(&list));
+    // CAD-2215: a scoped read reports capacity as unavailable (`null`); a
+    // client-side filter must not turn that into a count of the rows it can
+    // see.
+    if list["live"].is_number() {
+        list["live"] = json!(count_live_agents(&list));
+    }
     Ok(list)
 }
 
@@ -802,10 +861,10 @@ pub(crate) fn retain_by_placement(view: &mut Value, want: registry::Placement) {
             ) == want
         });
     }
-    if view.get("live").is_some() {
+    if view["live"].is_number() {
         view["live"] = json!(count_live_agents(view));
     }
-    if view.get("footer").is_some() {
+    if view["footer"]["live"].is_number() {
         view["footer"]["live"] = json!(count_live_agents(view));
     }
 }
@@ -873,12 +932,15 @@ pub(crate) fn stamp_agent_projects(list: &mut Value) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_json(value: &Value) {
-    println!(
-        "{}",
-        cadence_agent::output::json_text(value).unwrap_or_default()
-    );
-}
+// The one closed-consumer rule for every stream, shared with the
+// library's verbs and defined beside the JSON policy: a reader that
+// stops early (`cadence … | head -1`) is not a command failure, so the
+// write is dropped and the verb's own exit code still decides the
+// status. Re-exported so every `cli` submodule keeps its bare
+// `print_json`/`print_line`/`eprint_line` calls.
+pub(crate) use cadence_agent::output::{
+    eprint_line, eprint_text, print_json, print_line, print_text, write_stdout,
+};
 
 /// Sort/limit/fields on `out[key]` — the shared list-grammar tail for
 /// daemon-RPC payloads, which already arrive as JSON. `names` is the
@@ -996,7 +1058,7 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
     match cadence_agent::master_perm::classify(&argv, &cwd, &[], std::slice::from_ref(&state_dir)) {
         cadence_agent::master_perm::Class::Allowlisted => return None,
         cadence_agent::master_perm::Class::Never { why } => {
-            eprintln!("{why} — a grant or a rule cannot allow it");
+            eprint_line(&format!("{why} — a grant or a rule cannot allow it"));
             return Some(1);
         }
         _ => {}
@@ -1010,22 +1072,22 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
             let stdout = out["stdout"].as_str().unwrap_or("");
             let stderr = out["stderr"].as_str().unwrap_or("");
             if !stdout.is_empty() {
-                print!("{stdout}");
+                print_text(stdout);
                 if !stdout.ends_with('\n') {
-                    println!();
+                    print_text("\n");
                 }
             }
             if !stderr.is_empty() {
-                eprint!("{stderr}");
+                eprint_text(stderr);
                 if !stderr.ends_with('\n') {
-                    eprintln!();
+                    eprint_text("\n");
                 }
             }
             Some(out["code"].as_i64().unwrap_or(1) as i32)
         }
         Ok(_) => None,
         Err(e) => {
-            eprintln!("{e}");
+            eprint_line(&e.to_string());
             Some(1)
         }
     }

@@ -66,8 +66,12 @@ const KEY_ID_BYTES: usize = 16;
 const SCHEMA_VERSION: i64 = 1;
 const ENVELOPE_VERSION: i64 = 1;
 const ALGORITHM: &str = "xchacha20poly1305";
-const DOMAIN_RECORD: &str = "cadence.connections.custody";
-const DOMAIN_HEADER: &str = "cadence.connections.custody.header";
+const NATIVE_MODEL_EXCHANGE: &str = "native-model-v1";
+// The record/header domain strings and the length-prefixed framing live in
+// the shared custody primitive (`cadence_core::connection_dispatch`), which
+// is byte-identical to this module. Delegating keeps ONE AAD implementation
+// across native and hosted while the frozen CAD-1128 checks keep pinning the
+// bytes: a change there fails them.
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 
@@ -176,41 +180,31 @@ pub struct EncryptedVault {
     inner: Mutex<Inner>,
 }
 
-/// Length-prefix one field per the contract's AAD v1 framing.
-fn aad_push(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(bytes);
-}
-
-/// Record AAD v1 — the exact concatenation the contract pins.
+/// Record AAD v1 — the exact concatenation the contract pins. Delegates to
+/// the shared custody primitive so native and hosted cannot drift; the value
+/// is byte-identical and the frozen CAD-1128 checks still pin it.
 fn record_aad(id: &ExpectedIdentity, locator: &[u8; LOCATOR_BYTES]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(256);
-    aad_push(&mut aad, DOMAIN_RECORD.as_bytes());
-    aad.extend_from_slice(&1u32.to_be_bytes()); // schema
-    aad.extend_from_slice(&1u32.to_be_bytes()); // envelope
-    aad_push(&mut aad, ALGORITHM.as_bytes());
-    aad_push(&mut aad, id.workspace_id.as_bytes());
-    aad_push(&mut aad, id.connection_id.as_bytes());
-    aad_push(&mut aad, id.provider.as_bytes());
-    aad_push(&mut aad, id.account.as_bytes());
-    aad.extend_from_slice(&id.credential_revision.to_be_bytes());
-    aad_push(&mut aad, locator);
-    aad_push(&mut aad, &id.key_id);
-    aad_push(&mut aad, id.exchange.as_bytes());
-    aad
+    // Borrow the identity fields straight into the shared AAD builder: the
+    // native bytes are unchanged, and no record just to compute them is
+    // copied.
+    cadence_core::connection_dispatch::native_record_aad_borrowed(
+        cadence_core::connection_dispatch::NativeCustodyIdentityRefV1 {
+            workspace_id: &id.workspace_id,
+            connection_id: &id.connection_id,
+            provider: &id.provider,
+            account: &id.account,
+            credential_revision: id.credential_revision,
+            key_id: &id.key_id,
+            exchange: &id.exchange,
+        },
+        locator,
+    )
 }
 
 /// Header AAD v1 — authenticates the empty-plaintext key-confirmation
-/// row under the same domain discipline.
+/// row under the same domain discipline. Delegated for the same reason.
 fn header_aad(workspace_id: &str, key_id: &[u8; KEY_ID_BYTES]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(128);
-    aad_push(&mut aad, DOMAIN_HEADER.as_bytes());
-    aad.extend_from_slice(&1u32.to_be_bytes());
-    aad.extend_from_slice(&1u32.to_be_bytes());
-    aad_push(&mut aad, ALGORITHM.as_bytes());
-    aad_push(&mut aad, workspace_id.as_bytes());
-    aad_push(&mut aad, key_id);
-    aad
+    cadence_core::connection_dispatch::native_header_aad(workspace_id, key_id)
 }
 
 /// Validate a stored identifier column BEFORE it becomes a Rust
@@ -262,7 +256,17 @@ fn workspace_valid(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 fn exchange_valid(s: &str) -> bool {
-    matches!(s, "smtp" | "token" | "consent")
+    matches!(s, "smtp" | "token" | "consent" | NATIVE_MODEL_EXCHANGE)
+}
+
+/// Native-model custody for the `agenticos` gateway pins the owner's
+/// canonical AgenticOS workspace ID (`ws_<lowercase UUID>`), while business
+/// `agenticos` connections keep the generic identifier grammar unchanged.
+fn account_valid(provider: &str, exchange: &str, account: &str) -> bool {
+    if provider == super::agenticos::PLATFORM && exchange == NATIVE_MODEL_EXCHANGE {
+        return super::connections::is_canonical_agenticos_workspace_id(account);
+    }
+    super::connections::provider_account_identifier(provider, account).is_ok()
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -496,7 +500,7 @@ impl EncryptedVault {
             || !exchange_valid(&id.exchange)
             || crate::proto::identifier(&id.connection_id, "Connection").is_err()
             || super::connections::provider_identifier(&id.provider, "Provider").is_err()
-            || super::connections::provider_account_identifier(&id.provider, &id.account).is_err()
+            || !account_valid(&id.provider, &id.exchange, &id.account)
         {
             return Err(invalid(CODE_INVALID_STORE, "custody identity is invalid"));
         }
@@ -992,7 +996,7 @@ impl EncryptedVault {
                     })?
                     .into_bytes(),
                     take_text(r.get_ref(3)?, 1, MAX_FIELD, |s| {
-                        super::connections::provider_account_identifier(&id.provider, s).is_ok()
+                        account_valid(&id.provider, &id.exchange, s)
                     })?
                     .into_bytes(),
                     r.get::<_, i64>(4)?,
@@ -1117,6 +1121,7 @@ impl EncryptedVault {
                 let provider = take_text(r.get_ref(3)?, 1, MAX_FIELD, |s| {
                     super::connections::provider_identifier(s, "Provider").is_ok()
                 })?;
+                let exchange = take_text(r.get_ref(5)?, 1, MAX_EXCHANGE, exchange_valid)?;
                 let revision: i64 = r.get(6)?;
                 if revision < 1 {
                     return Err(rusqlite::Error::InvalidQuery);
@@ -1135,10 +1140,10 @@ impl EncryptedVault {
                         crate::proto::identifier(s, "Connection").is_ok()
                     })?,
                     account: take_text(r.get_ref(4)?, 1, MAX_FIELD, |s| {
-                        super::connections::provider_account_identifier(&provider, s).is_ok()
+                        account_valid(&provider, &exchange, s)
                     })?,
                     provider,
-                    exchange: take_text(r.get_ref(5)?, 1, MAX_EXCHANGE, exchange_valid)?,
+                    exchange,
                     credential_revision: revision as u64,
                     nonce_and_ciphertext_digest: crate::secret::digest_bytes(&joined),
                 })
@@ -1255,4 +1260,131 @@ mod tests {
             b"payload"
         );
     }
+
+    fn agenticos_native_identity(account: &str) -> ExpectedIdentity {
+        ExpectedIdentity {
+            workspace_id: "ab".repeat(16),
+            connection_id: "33333333-4444-4555-8666-777777777777".into(),
+            provider: "agenticos".into(),
+            account: account.into(),
+            credential_revision: 1,
+            exchange: NATIVE_MODEL_EXCHANGE.into(),
+            key_id: crate::secret::fingerprint_key_id(&[7u8; 32]),
+        }
+    }
+
+    #[test]
+    fn agenticos_native_model_workspace_account_roundtrip_and_scope_guards() {
+        let (_dir, vault) = vault();
+        let workspace = "ws_11111111-2222-4333-8444-555555555555";
+        let id = agenticos_native_identity(workspace);
+        vault.initialize(&id.workspace_id, false).unwrap();
+
+        let reference = vault
+            .write_row(&id, b"synthetic-agenticos-model-token")
+            .unwrap();
+        assert!(reference.starts_with(TAG_PREFIX));
+        assert_eq!(
+            vault.read_exact(&reference, &id).unwrap().as_slice(),
+            b"synthetic-agenticos-model-token"
+        );
+
+        vault.lock().unwrap();
+        vault.unlock(&id.workspace_id).unwrap();
+        assert_eq!(
+            vault.read_exact(&reference, &id).unwrap().as_slice(),
+            b"synthetic-agenticos-model-token"
+        );
+
+        // Cross-workspace substitution refuses with integrity failure and preserves the row.
+        let wrong_workspace = agenticos_native_identity("ws_22222222-3333-4444-8555-666666666666");
+        assert!(matches!(
+            vault.read_exact(&reference, &wrong_workspace),
+            Err(ref e) if e.code() == Some(CODE_INTEGRITY)
+        ));
+        assert_eq!(
+            vault.read_exact(&reference, &id).unwrap().as_slice(),
+            b"synthetic-agenticos-model-token"
+        );
+
+        // Business exchanges continue refusing ws_<uuid> accounts on both write and read.
+        for business in ["token", "smtp", "consent"] {
+            let mut wrong_exchange = id.clone();
+            wrong_exchange.exchange = business.into();
+            assert!(
+                matches!(
+                    vault.write_row(&wrong_exchange, b"other"),
+                    Err(ref e) if e.code() == Some(CODE_INVALID_STORE)
+                ),
+                "write {business}"
+            );
+            assert!(
+                matches!(
+                    vault.read_exact(&reference, &wrong_exchange),
+                    Err(ref e) if e.code() == Some(CODE_INVALID_STORE)
+                ),
+                "read {business}"
+            );
+        }
+
+        // Non-canonical or business-only account spellings fail under agenticos/native-model-v1.
+        let upper = workspace.to_uppercase();
+        for bad_account in [
+            upper.as_str(),
+            "ws_example",
+            "ws_not-a-uuid",
+            "hosted",
+            "foo_bar",
+        ] {
+            let bad = agenticos_native_identity(bad_account);
+            assert!(
+                matches!(
+                    vault.write_row(&bad, b"other"),
+                    Err(ref e) if e.code() == Some(CODE_INVALID_STORE)
+                ),
+                "bad account {bad_account}"
+            );
+        }
+
+        // Devin native-model-v1 continues refusing ws_<uuid> while accepting canonical UUIDs.
+        let mut devin_ws = id.clone();
+        devin_ws.provider = "devin".into();
+        assert!(matches!(
+            vault.write_row(&devin_ws, b"other"),
+            Err(ref e) if e.code() == Some(CODE_INVALID_STORE)
+        ));
+        let mut devin_uuid = id;
+        devin_uuid.provider = "devin".into();
+        devin_uuid.account = "44444444-5555-4666-8777-888888888888".into();
+        let devin_ref = vault.write_row(&devin_uuid, b"devin-secret").unwrap();
+        assert_eq!(
+            vault
+                .read_exact(&devin_ref, &devin_uuid)
+                .unwrap()
+                .as_slice(),
+            b"devin-secret"
+        );
+    }
+
+    #[cfg(all(unix, feature = "test-seam"))]
+    #[test]
+    fn agenticos_native_model_rows_for_returns_workspace_account() {
+        let (_dir, vault) = vault();
+        let workspace = "ws_11111111-2222-4333-8444-555555555555";
+        let id = agenticos_native_identity(workspace);
+        vault.initialize(&id.workspace_id, false).unwrap();
+        let reference = vault
+            .write_row(&id, b"synthetic-agenticos-model-token")
+            .unwrap();
+        let rows = vault.rows_for(&id.connection_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reference, reference);
+        assert_eq!(rows[0].provider, "agenticos");
+        assert_eq!(rows[0].exchange, NATIVE_MODEL_EXCHANGE);
+        assert_eq!(rows[0].account, workspace);
+    }
 }
+
+#[cfg(all(test, unix))]
+#[path = "encrypted_sqlite/cad1085_native_purpose_acceptance_20261027.rs"]
+mod cad1085_native_purpose_acceptance_20261027;

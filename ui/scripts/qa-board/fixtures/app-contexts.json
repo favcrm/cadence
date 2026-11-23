@@ -1,0 +1,12 @@
+{
+  "contexts": [
+    {
+      "id": "qa-context",
+      "install_id": "qa-template",
+      "revision": 1,
+      "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "state": "active",
+      "config": { "schema": 1, "label": "QA context", "input_defaults": {} }
+    }
+  ]
+}

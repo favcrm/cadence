@@ -1,4 +1,8 @@
-import type { NeedsMe, ThreadRef } from "../../lib/types";
+import type { AgentsPayload, NeedsMe, StagedRoutineProposal, ThreadRef } from "../../lib/types";
+import { routePath } from "../../lib/router";
+import { hasScopedAssistantRoster, PERSONAL_ALIAS } from "../agents/personalAssistant";
+import { MASTER } from "./master";
+import { askedBy, sourceLine, titleOf, type StagedWrite } from "../decisions/stagedWrite";
 
 /**
  * The Home rail's "Needs you" (CAD-328), built from the overview's
@@ -41,6 +45,15 @@ export type NeedAction =
       issue: string;
     }
   | { type: "command"; command: string }
+  | {
+      /** CAD-2186: an owner decision staged by the assistant or the CLI; it
+       *  never comes from `needs_me`, the rail merges it in client-side. */
+      type: "staged";
+      id: string;
+      app: string | null;
+      askedBy: string | null;
+      external: boolean;
+    }
   | {
       type: "permission";
       id: string;
@@ -265,13 +278,49 @@ export function ageLabel(secs: number): string {
 /** What "Ask master" seeds: the row's title as the draft's ask and its
  *  subject as the `refs` the send attaches. Never auto-sends — the
  *  operator reviews and presses Enter. */
-export function askDraft(need: HomeNeed, lead?: string): { text: string; refs: ThreadRef[] } {
-  return { text: lead ?? `${need.title} — what should we do?`, refs: needRefs(need) };
+export function askDraft(need: HomeNeed, lead?: string, question = "what should we do?"): { text: string; refs: ThreadRef[] } {
+  return { text: lead ?? `${need.title} — ${question}`, refs: needRefs(need) };
 }
 
 /** The row's subject as the `refs` a Master message carries. */
 export function needRefs(need: HomeNeed): ThreadRef[] {
   return need.subject ? [{ kind: need.subject.kind, id: need.subject.id }] : [];
+}
+
+/** A review destination does not identify the proposer. Until a hosted roster
+ * answers, do not guess whether the personal alias still belongs to a job. */
+export function routineReviewHref(alias: string | null | undefined, roster?: AgentsPayload | null): string | null {
+  const scoped = roster === null || (roster !== undefined && hasScopedAssistantRoster(roster));
+  if (!scoped) return `${routePath({ screen: "agents", alias: alias ?? MASTER })}?tab=routines`;
+  const name = alias?.trim();
+  if (!name) return null;
+  if (name !== PERSONAL_ALIAS) return `${routePath({ screen: "agents", alias: name })}?tab=routines`;
+  const profileId = roster?.profiles?.find((profile) => profile.alias === name)?.id;
+  if (profileId) return `${routePath({ screen: "agents", alias: null, profileId })}?tab=routines`;
+  return roster === null ? null : `${routePath({ screen: "agents", alias: MASTER })}?tab=routines&routineAgent=${PERSONAL_ALIAS}`;
+}
+
+export function routineDraftReviewHref(
+  draft: Pick<StagedRoutineProposal, "kind" | "payload" | "proposed_by">,
+  roster?: AgentsPayload | null,
+): string | null {
+  const alias = draft.payload?.agent_alias;
+  const wikiPath = draft.payload?.path;
+  if (draft.kind === "wiki_propose" && typeof wikiPath === "string" && wikiPath) {
+    return `/wiki/${wikiPath.replace(/^wiki:/, "")}`;
+  }
+  const explicitAlias = typeof alias === "string" ? alias : null;
+  if (draft.kind !== "routine_propose" || roster == null || !hasScopedAssistantRoster(roster)) {
+    return routineReviewHref(explicitAlias, roster);
+  }
+  if (alias != null && explicitAlias === null) return null;
+  if (explicitAlias !== null) return routineReviewHref(explicitAlias, roster);
+  // Alias-less drafts can be reviewed in Master Routines if the effective
+  // target has no profile.
+  if (draft.proposed_by === PERSONAL_ALIAS && !roster.profiles?.some((profile) => profile.alias === PERSONAL_ALIAS)) {
+    return routineReviewHref(MASTER, roster);
+  }
+  return routineReviewHref(draft.proposed_by, roster) ?? routineReviewHref(MASTER, roster);
 }
 
 /**
@@ -293,24 +342,6 @@ export const UNFENCE_CHOICES: readonly UnfenceChoice[] = [
   { status: "failed", blurb: "the turn died — record it failed", plain: "It failed" },
 ];
 
-/** The collapsed rail's persistence (per viewer; brief §1). */
-const RAIL_KEY = "cadence:needs-rail";
-
-export function readRailCollapsed(): boolean {
-  try {
-    return globalThis.localStorage?.getItem(RAIL_KEY) === "collapsed";
-  } catch {
-    return false;
-  }
-}
-
-export function writeRailCollapsed(collapsed: boolean): void {
-  try {
-    globalThis.localStorage?.setItem(RAIL_KEY, collapsed ? "collapsed" : "open");
-  } catch {
-    /* a viewer without storage just loses the preference */
-  }
-}
 
 // ---- CAD-1216: the To do kind table ----
 
@@ -363,6 +394,8 @@ export const KIND_TABLE: Readonly<Record<string, KindSpec>> = {
     control: "Allow",
     title: fixed("Master wants to run a command"),
   },
+  // CAD-2186: opens the detail drawer; nothing expands in the rail.
+  staged_write: { type: "ok", place: "drawer", control: "Review", title: fixed("A write is waiting for your OK") },
   approval: { type: "ok", place: "inline", control: "Review", title: fixed("An agent is waiting for your OK") },
   approval_menu: { type: "ok", place: "inline", control: "Review", title: fixed("An agent is waiting for your OK") },
   question: {
@@ -399,7 +432,8 @@ const UNKNOWN_KIND: KindSpec = stuck("Something needs your attention");
 export function kindSpec(need: HomeNeed): KindSpec {
   const spec = KIND_TABLE[need.kind] ?? UNKNOWN_KIND;
   const t = need.action.type;
-  if (spec.place === "drawer" && t !== "plan" && t !== "idea" && t !== "merge") return UNKNOWN_KIND;
+  if (spec.place === "drawer" && t !== "plan" && t !== "idea" && t !== "merge" && t !== "staged") return UNKNOWN_KIND;
+  if (need.kind === "staged_write" && t !== "staged") return UNKNOWN_KIND;
   if (need.kind === "master_permission" && t !== "permission") return UNKNOWN_KIND;
   return spec;
 }
@@ -487,8 +521,66 @@ export function needFingerprint(need: HomeNeed): string {
     : a.type === "answer" ? `${a.issue}/${a.report}`
     : a.type === "plan" ? a.epic
     : a.type === "idea" ? a.issue
+    : a.type === "staged" ? a.id
     : need.subject?.id ?? "";
   return `${need.kind}|${id}`;
+}
+
+function stagedSummary(write: StagedWrite): string | null {
+  const cliSummary = write.cli?.summary?.trim();
+  if (cliSummary) return cliSummary;
+  const reason = write.reason?.trim();
+  if (reason) return reason;
+  const previewTitle = (write.connected?.preview?.title ?? write.customMcp?.preview?.title)?.trim();
+  if (previewTitle && previewTitle !== write.title.trim()) return previewTitle;
+  const targetLabel = write.target?.label?.trim();
+  if (targetLabel && !write.title.toLowerCase().includes(targetLabel.toLowerCase())) return targetLabel;
+  if (write.kind === "app_call" && write.changes.length > 0) {
+    const labels: string[] = [];
+    for (const change of write.changes) {
+      const label = change.label.trim();
+      if (label && !labels.includes(label)) labels.push(label);
+      if (labels.length === 3) break;
+    }
+    if (labels.length > 0) return labels.join(", ");
+  }
+  return null;
+}
+
+/** A pending staged decision as a To do card (CAD-2186). Built here, never read from `needs_me`. */
+export function stagedNeed(write: StagedWrite, t: (english: string) => string, nowMs = Date.now()): HomeNeed {
+  return {
+    key: `staged:${write.id}`,
+    kind: "staged_write",
+    label: "write",
+    title: titleOf(write, t),
+    shortTitle: titleOf(write, t),
+    why: sourceLine(write, t) || null,
+    owner: "operator",
+    age: Math.max(0, Math.floor((nowMs - write.createdAt) / 1000)),
+    project: null,
+    subject: null,
+    summary: stagedSummary(write),
+    escalatedBy: null,
+    command: "",
+    link: null,
+    issue: null,
+    agent: null,
+    action: {
+      type: "staged",
+      id: write.id,
+      app: write.app,
+      askedBy: askedBy(write, t),
+      external: write.connected !== null || write.customMcp != null,
+    },
+  };
+}
+
+/** To do with the staged decisions merged in: after the ok items already listed, before questions. */
+export function withStaged(todo: HomeNeed[], staged: HomeNeed[]): HomeNeed[] {
+  if (staged.length === 0) return todo;
+  const rank = (n: HomeNeed) => ["ok", "question", "stuck"].indexOf(kindSpec(n).type);
+  return [...todo, ...staged].sort((a, b) => rank(a) - rank(b));
 }
 
 /** `74` → `just now`, `240` → `4 min`, `7200` → `2 h`, `3 d`. */

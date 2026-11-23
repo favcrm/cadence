@@ -2,13 +2,20 @@
 //! Only the master's live turn may put; the daemon resolves that turn from
 //! the proven caller and takes the conversation and scope from it, so the
 //! CLI sends the kind, title, bytes and (for a new version) the id alone.
+//!
+//! AOS-346: on a hosted org (`--org`) a worker uses the same verb; see
+//! `cli/remote.rs`. `--issue`, `--label` and `--customer`, `find` and `show`
+//! are hosted-only for now, as are CAD-2286's `types` and `submit` (the
+//! document lifecycle).
 
 use super::*;
 
 #[derive(Subcommand)]
 pub(crate) enum ArtifactAction {
-    /// Put a file on the canvas beside the chat. The same `--id` again
-    /// stores the next version; without it a new artifact is created.
+    /// Native: put a file on the canvas beside the chat. Hosted (`--org`): store
+    /// it in the workspace, private to you unless `--issue` links it; it does not
+    /// show on a canvas. The same `--id` again stores the next version; without
+    /// it a new artifact is created.
     Put {
         /// md, pdf, html, image or csv.
         #[arg(long)]
@@ -26,6 +33,47 @@ pub(crate) enum ArtifactAction {
         /// first: the thread keeps only 160 characters of the command.
         #[arg(long)]
         id: Option<String>,
+        /// Hosted: link it to this issue, so whoever can read the issue can find it.
+        #[arg(long)]
+        issue: Option<String>,
+        /// Hosted: what it is, such as quotation, invoice or report.
+        #[arg(long)]
+        label: Option<String>,
+        /// Hosted: the customer it is for.
+        #[arg(long)]
+        customer: Option<String>,
+    },
+    /// Hosted: find artifacts you can see, by words, label, customer or kind.
+    Find {
+        /// Words in the title or customer.
+        q: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        customer: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Hosted: list an artifact's versions, or write one to a new file with `--out`.
+    Show {
+        id: String,
+        #[arg(long)]
+        version: Option<u32>,
+        /// A new file; identity, version, pages and digest are checked first. Never overwrites.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Hosted only: the workspace's document types and the baseline rules for an
+    /// unconfirmed type. Refused when the document lifecycle is not available.
+    Types,
+    /// Hosted only: submit a file you saved for review as a document. Its label
+    /// is its document type. Prints the stage it is in now; submitting again
+    /// answers the current stage.
+    Submit {
+        /// The artifact id (`art-…`).
+        id: String,
     },
 }
 
@@ -36,7 +84,15 @@ pub(super) fn run(state_dir: PathBuf, action: ArtifactAction) -> Result<i32> {
             title,
             file,
             id,
+            issue,
+            label,
+            customer,
         } => {
+            if issue.is_some() || label.is_some() || customer.is_some() {
+                return Err(Error::usage(
+                    "--issue, --label and --customer are hosted-only for now; pass --org <name>. Nothing was sent",
+                ));
+            }
             use base64::Engine;
             let limit = cadence_agent::store::ARTIFACT_MAX_BYTES as u64;
             // The master's file confinement applies exactly as for the other
@@ -85,5 +141,12 @@ pub(super) fn run(state_dir: PathBuf, action: ArtifactAction) -> Result<i32> {
             print_json(&client::rpc(&state_dir, "artifact_put", params)?);
             Ok(0)
         }
+        ArtifactAction::Find { .. }
+        | ArtifactAction::Show { .. }
+        | ArtifactAction::Types
+        | ArtifactAction::Submit { .. } => Err(Error::usage(
+            "artifact find, show, types and submit are hosted-only for now; pass --org \
+             <name>. On this board, the canvas shows what `artifact put` stored",
+        )),
     }
 }

@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CheckpointV1",
+  "description": "A private owner/custody-control checkpoint. Not a runtime permit.",
+  "type": "object",
+  "properties": {
+    "custody_domain": {
+      "$ref": "#/$defs/CustodyDomainV1"
+    },
+    "custody_epoch": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Revision"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "database_epoch": {
+      "$ref": "#/$defs/Revision"
+    },
+    "ledger_head": {
+      "$ref": "#/$defs/LedgerHeadV1"
+    },
+    "owner_epoch": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Revision"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "runtime_binding_digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "v": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "workspace_id": {
+      "$ref": "#/$defs/Ident"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "workspace_id",
+    "custody_domain",
+    "database_epoch",
+    "ledger_head",
+    "runtime_binding_digest"
+  ],
+  "$defs": {
+    "Counter": {
+      "description": "Nonnegative canonical decimal counter (`0|[1-9][0-9]*`, <= i64::MAX).",
+      "type": "string"
+    },
+    "CustodyDomainV1": {
+      "description": "The checkpoint's custody-domain selector: exactly `local` (native owner)\nor `hosted` (private custody deployment). It is NOT the Connection's data\ncustody domain, so the two must never be compared as strings.",
+      "type": "string",
+      "enum": [
+        "local",
+        "hosted"
+      ]
+    },
+    "Digest": {
+      "description": "`sha256:` plus 64 lowercase hex digits.",
+      "type": "string"
+    },
+    "Ident": {
+      "description": "Bounded printable ASCII identifier (`0x21..=0x7e`, 1..=128 bytes).",
+      "type": "string"
+    },
+    "LedgerHeadV1": {
+      "type": "object",
+      "properties": {
+        "database_epoch": {
+          "$ref": "#/$defs/Revision"
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Counter"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "database_epoch",
+        "digest"
+      ]
+    },
+    "Revision": {
+      "description": "Positive canonical decimal revision (0 refuses).",
+      "type": "string"
+    }
+  }
+}

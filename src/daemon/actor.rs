@@ -14,10 +14,25 @@ use crate::store::{self, Agent, Message, Take};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 impl Shared {
+    /// Initial submissions and fresh-session retries use the same committed
+    /// profile. A provider reset must not discard the actor's current identity.
+    fn prompt_with_profile(&self, message: &Message, mut body: String) -> Result<String> {
+        let context = if crate::master::is_master(&message.alias) {
+            Some(self.master_profile_context()?)
+        } else {
+            self.member_profile_context(message)?
+        };
+        if let Some(context) = context {
+            body.reserve(2 + context.len());
+            body.push_str("\n\n");
+            body.push_str(&context);
+        }
+        Ok(body)
+    }
+
     /// Spawn the actor for `alias` unless it is already owned (running or
     /// stopping) or fenced by an unknown outcome.
     pub fn launch_actor(self: &Arc<Self>, alias: &str) -> Result<()> {
@@ -96,7 +111,8 @@ impl Shared {
         let shared = Arc::clone(self);
         let owned = alias.to_string();
         let spawned = Arc::clone(&ctl);
-        let handle = thread::spawn(move || shared.run_actor(&owned, spawned));
+        let handle = crate::thread_budget::spawn(move || shared.run_actor(&owned, spawned))
+            .map_err(|e| Error::internal(format!("actor thread not started: {e}")))?;
         *ctl.thread.lock().unwrap() = Some(handle);
         lc.agents.insert(alias.to_string(), ctl);
         Ok(true)
@@ -196,11 +212,49 @@ impl Shared {
         // Release the alias only after cleanup and the final state write:
         // until this removal, lifecycle callers still see the agent owned.
         let mut lc = self.lifecycle.lock().unwrap();
-        if lc.agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
+        let removed = if lc.agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
             lc.agents.remove(alias);
-        }
+            true
+        } else {
+            false
+        };
         drop(lc);
+        if removed {
+            // The actor cannot join itself. Hand its budget unit to the reaper,
+            // which joins after this thread exits and only then releases it.
+            // `try_lock` keeps teardown from blocking on a handle someone else
+            // is joining; a contended lock leaks the unit (fail closed).
+            if let Ok(mut thread) = ctl.thread.try_lock() {
+                if let Some(thread) = thread.take() {
+                    thread.detach();
+                }
+            }
+        }
         self.wake();
+    }
+
+    /// A hot-restart adoption that cannot proceed: the in-flight message goes
+    /// `unknown` and `turn_adopt_refused` names why.
+    fn settle_refused_adoption(
+        &self,
+        alias: &str,
+        entries: &[crate::store::AdoptEntry],
+        error: &Error,
+    ) {
+        let reason = error.to_string();
+        let _ = self
+            .store
+            .orphan_running(alias, &format!("hot-restart adoption refused: {reason}"));
+        for e in entries {
+            let _ = self.store.event_public(
+                alias,
+                "turn_adopt_refused",
+                json!({"message": e.message_id,
+                       "turn_id": e.turn_id,
+                       "reason": reason}),
+            );
+        }
+        self.adoptions_settle(alias);
     }
 
     /// Open/adopt and enroll the endpoint before any queued turn can run.
@@ -223,7 +277,20 @@ impl Shared {
                 Box::new(move |request| shared.on_provider_request(&owned, request))
             },
         };
-        let adapter = adapter::build(agent, hooks, &log_path, &self.provider_env, self.agent_uid)?;
+        // Taken before `build`: an agent refused at build (CAD-2239: a reviewer
+        // pane row) must settle its in-flight adoption like a refused adoption,
+        // not leave the message `running`.
+        let adoption = self.store.take_adoption(alias);
+        let adapter =
+            match adapter::build(agent, hooks, &log_path, &self.provider_env, self.agent_uid) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    if let Some(entries) = &adoption {
+                        self.settle_refused_adoption(alias, entries, &error);
+                    }
+                    return Err(error);
+                }
+            };
         let adapter: Arc<dyn ProviderAdapter> = Arc::from(adapter);
         // Publish before `open` so stop/shutdown can force-close the
         // transport while initialization RPCs are still in flight.
@@ -241,27 +308,13 @@ impl Shared {
         // agent only: the message goes `unknown`, the actor exits into
         // `attention`, and `turn_adopt_refused` names the check that
         // failed.
-        let adoption = self.store.take_adoption(alias);
         let identity = match &adoption {
             // One pane proof covers the whole list — every entry for
             // an alias shares the marker's generation/pane/session.
             Some(entries) => match adapter.open_adopted(agent, &entries[0]) {
                 Ok(identity) => identity,
                 Err(error) => {
-                    let reason = error.to_string();
-                    let _ = self
-                        .store
-                        .orphan_running(alias, &format!("hot-restart adoption refused: {reason}"));
-                    for e in entries {
-                        let _ = self.store.event_public(
-                            alias,
-                            "turn_adopt_refused",
-                            json!({"message": e.message_id,
-                                   "turn_id": e.turn_id,
-                                   "reason": reason}),
-                        );
-                    }
-                    self.adoptions_settle(alias);
+                    self.settle_refused_adoption(alias, entries, &error);
                     return Err(error);
                 }
             },
@@ -423,6 +476,12 @@ impl Shared {
                             if !settled {
                                 return Err(error);
                             }
+                        }
+                        // CAD-2215: a polled kickoff completing here is the
+                        // private ledger's trigger, exactly like the other
+                        // completion paths. Never a shared effect.
+                        if status == "completed" && pending.source == "job_dispatch" {
+                            let _ = self.settle_private_completion(&pending.id);
                         }
                         cloud_held = None;
                         ctl.cloud_held.store(false, Ordering::SeqCst);
@@ -590,16 +649,12 @@ impl Shared {
                             &message,
                             slot.as_deref(),
                         );
-                        // CAD-1420: the stamped member's profile context is
-                        // appended AFTER the turn's own body, so the user's
-                        // request leads. An unreadable or unknown profile fails
-                        // the turn closed rather than sending a silent empty one.
-                        let body = match self.member_profile_context(&message)? {
-                            Some(context) => format!("{base}\n\n{context}"),
-                            None => base,
-                        };
+                        // The committed actor profile follows the request on
+                        // every real turn, including after provider `/new`.
+                        // Missing or unreadable profiles fail closed.
+                        let body = self.prompt_with_profile(&message, base)?;
                         // CAD-1822: mandatory task context is planned against
-                        // the delivery body and member profile first; optional
+                        // the delivery body and actor profile first; optional
                         // continuity history is budgeted from what remains.
                         let context = match self
                             .context_delivery(&agent, &message, &body, false, compacted)
@@ -690,9 +745,27 @@ impl Shared {
                                 &message.id,
                                 &on_started,
                             )?;
-                            if nudge || !adapter.reset_rejected_session(&first)? {
+                            let reset = if nudge {
+                                false
+                            } else {
+                                adapter.reset_rejected_session(&first)?
+                            };
+                            if !reset {
                                 return Ok(first);
                             }
+                            // A reset retry replaces the visible outcome.
+                            // Record fixed metadata only: the adapter's error
+                            // text can carry raw provider JSON, so the event
+                            // never copies it. The refusal category is
+                            // observable through the adapter's own fixed events.
+                            let _ = self.store.event_public(
+                                alias,
+                                "turn_retry",
+                                json!({
+                                    "message": message.id,
+                                    "first_status": first.status,
+                                }),
+                            );
                             // CAD-1076: one retry on a fresh session.
                             // Offered only for a master history refusal
                             // before any tool. A serialized-body refusal
@@ -705,13 +778,10 @@ impl Shared {
                                 slot.as_deref(),
                                 &first,
                             );
-                            // Same priority as the first attempt: the member
+                            // Same priority as the first attempt: the actor
                             // profile and mandatory task context are planned
                             // against the base body; optional history yields.
-                            let base = match self.member_profile_context(&message)? {
-                                Some(context) => format!("{base}\n\n{context}"),
-                                None => base,
-                            };
+                            let base = self.prompt_with_profile(&message, base)?;
                             pending_context = None;
                             let prompt =
                                 match self.context_delivery(&agent, &message, &base, true, false) {
@@ -1071,6 +1141,13 @@ impl Shared {
         } else {
             self.store
                 .finish(message, &status, &stored, result.error.as_deref())?;
+            // CAD-2215: the adapter's own completion is the private
+            // ledger's trigger. A ledger failure is reported beside the
+            // committed completion, never folded into it. Only a kickoff
+            // can own a private delivery, so ordinary turns do no work.
+            if status == "completed" && message.source == "job_dispatch" {
+                let _ = self.settle_private_completion(&message.id);
+            }
         }
         self.notify_routed_target(message, &stored);
         self.wake();

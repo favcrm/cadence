@@ -6,12 +6,13 @@ import type * as Locale from "../src/lib/locale";
 import type * as Client from "../src/features/app-shell/conversationClient";
 import type * as Engine from "../src/features/app-shell/chat/conversationThread";
 import type * as Bar from "../src/features/app-shell/chat/TurnBar";
+import type * as Composer from "../src/features/app-shell/chat/Composer";
 import type * as States from "../src/features/app-shell/chat/turnBarState";
+import type * as Preview from "../src/features/app-shell/chat/conversationPreview";
 import type * as Queries from "../src/lib/useResource";
 import type * as Resources from "../src/lib/resources";
 import type { MasterState } from "../src/lib/types";
 import type { ThreadEntry } from "../src/features/home/thread";
-import type { SseErrorState } from "../src/lib/sse";
 declare function require<T>(name: string): T;
 const { Window } = require<typeof HappyDOM>("happy-dom");
 const win = new Window({ url: "http://localhost/" });
@@ -23,8 +24,11 @@ const React = require<typeof ReactModule>("react");
 const { createRoot } = require<typeof ReactDOM>("react-dom/client");
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { conversationThread } = require<typeof Client>("../src/features/app-shell/conversationClient");
+type StreamLink = import("../src/features/app-shell/chat/conversationThread").StreamLink;
 const { useThreadStream } = require<typeof Engine>("../src/features/app-shell/chat/conversationThread");
+const { useConversationPreview } = require<typeof Preview>("../src/features/app-shell/chat/conversationPreview");
 const { TurnBar } = require<typeof Bar>("../src/features/app-shell/chat/TurnBar");
+const ComposerDefault = require<typeof Composer>("../src/features/app-shell/chat/Composer").default;
 const { turnBarState } = require<typeof States>("../src/features/app-shell/chat/turnBarState");
 const { useResource } = require<typeof Queries>("../src/lib/useResource");
 const { resources } = require<typeof Resources>("../src/lib/resources");
@@ -34,29 +38,61 @@ globalThis.fetch = async (input, init) => {
   if (!url.includes("/api/threads/master/stream")) throw new Error(`Unexpected request: ${url}`);
   const body = new ReadableStream<Uint8Array>({ start(controller) {
     streams.push({ url, controller });
-    init?.signal?.addEventListener("abort", () => controller.close(), { once: true });
+    init?.signal?.addEventListener("abort", () => { try { controller.close(); } catch { /* the test already closed it */ } }, { once: true });
   } });
   return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
 };
 const snapshot = (message: string): MasterState => ({
+  identity: { name: null, tone: null, look: "robot", revision: "fixture" },
   alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
   turn: { state: "working", message, conversation: "conv-stream", position: null }, queue: [],
 });
 const thread = conversationThread("conv-stream");
 thread.write(() => ({ exists: true, conversation: "conv-stream", entries: [{ seq: 10, role: "operator", kind: "message", text: "Request", message: "m-old" }], pending: [] }));
 resources.masterState.write(() => snapshot("m-old"));
+let graceMs: number | undefined;
 function Harness() {
   const data = useResource(thread);
   const master = useResource(resources.masterState);
-  const [link, setLink] = React.useState<"live" | SseErrorState>("reconnecting");
-  useThreadStream(thread, "/api/threads/master/stream?conversation=conv-stream", true, setLink);
+  const [link, setLink] = React.useState<StreamLink>("reconnecting");
+  useThreadStream(thread, "/api/threads/master/stream?conversation=conv-stream", true, setLink, undefined, graceMs);
   const state = turnBarState({ master: master.data, entries: data.data?.entries ?? [], pendingMessages: [], awaitingApproval: false, reconnecting: link !== "live" }, "conv-stream");
-  return React.createElement("main", { "data-link": link }, React.createElement(TurnBar, {
-    state, since: null, reconnecting: link !== "live",
-    actions: { onStop: () => undefined, onCancel: () => undefined, onReview: () => undefined },
-  }));
+  // CAD-1880: the running turn paints no dock row; Stop is the composer's
+  // send slot, enabled only once the stream is live.
+  const stoppable = (state.kind === "working" || state.kind === "writing") && link === "live";
+  return React.createElement("main", { "data-link": link },
+    React.createElement(TurnBar, {
+      state, reconnecting: link !== "live",
+      actions: { onCancel: () => undefined, onReview: () => undefined },
+    }),
+    React.createElement(ComposerDefault, {
+      density: "compact", block: null, onSend: () => undefined,
+      stop: stoppable ? { onStop: () => undefined } : null,
+    }),
+  );
 }
 function assert(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason); }
+// A finished turn has no bar state at all: the reply is the completion
+// signal, and the mapper returns idle rather than spending a variant nobody
+// renders. The bar still paints every state the operator must act on.
+{
+  const { renderToStaticMarkup } = require<typeof import("react-dom/server")>("react-dom/server");
+  const bar = (state: Parameters<typeof TurnBar>[0]["state"], reconnecting = false) =>
+    renderToStaticMarkup(React.createElement(TurnBar, {
+      state, reconnecting,
+      actions: { onCancel: () => undefined, onReview: () => undefined },
+    }));
+  const finished: ThreadEntry = { seq: 20, role: "agent", kind: "turn_result", text: "Done.", message: "m-done", created: new Date().toISOString() };
+  assert(
+    turnBarState({ master: null, entries: [finished], pendingMessages: [], awaitingApproval: false, reconnecting: false }, "conv-stream").kind === "idle",
+    "a completed turn reads as idle: no bar state carries a duration nobody renders",
+  );
+  assert(bar({ kind: "idle" }) === "", "an idle conversation has no bar");
+  assert(bar({ kind: "working", step: "planning", since: 1000, stopMessage: "m-1" }) === "", "a running turn paints no dock row: the typing bubble is the loading indicator");
+  assert(bar({ kind: "writing", since: 1000, stopMessage: "m-1" }) === "", "a writing turn paints no dock row either");
+  assert(bar({ kind: "queued", ahead: "", aheadConversation: null, cancelMessage: null }) !== "", "a queued turn still paints its bar");
+  assert(bar({ kind: "queued", ahead: "", aheadConversation: null, cancelMessage: null }, true).includes('data-stale="true"'), "a reconnect marks the remaining bar stale");
+}
 async function main() {
   const unthreaded = snapshot("m-unthreaded");
   unthreaded.turn!.conversation = null;
@@ -80,6 +116,7 @@ async function main() {
   });
   await mount();
   assert(streams.length === 1 && streams[0].url.includes("after=10"), "the actual stream resumes from its stored entry cursor");
+  assert(host.querySelector("main")?.getAttribute("data-link") === "connecting", "a first attempt is connecting, not reconnecting");
   assert(host.querySelector("main")?.getAttribute("data-link") !== "live" && !host.querySelector('[aria-label="Stop this turn"]'), "opening the socket cannot enable cached-turn actions before the current-state snapshot");
   await React.act(async () => {
     emit(`event: master\ndata: ${JSON.stringify(snapshot("m-new"))}\n\nid: 11\nevent: entry\ndata: ${JSON.stringify(entry(11))}\n\n`);
@@ -98,6 +135,65 @@ async function main() {
   await settle();
   assert(JSON.stringify(thread.get().data?.entries.map((row) => row.seq)) === "[10,11,12]", "resume has no gap or duplicate despite overlapping replay");
   assert(observed.some((row) => row.seq === 12) && observed.filter((row) => row.seq === 12).every((row) => row.master === "m-next"), "reconnected replay follows the new current-state snapshot");
+  // CAD-2012: a live stream dropping, or a first attempt failing, is an outage.
+  await React.act(async () => { streams.at(-1)!.controller.close(); });
+  await settle();
+  const dropped = host.querySelector("main")?.getAttribute("data-link");
+  assert(dropped !== "live" && dropped !== "connecting", `a dropped live stream reports an outage (got ${dropped})`);
+  await React.act(async () => { root.render(null); });
+  await mount();
+  await React.act(async () => { streams.at(-1)!.controller.close(); });
+  await settle();
+  const failed = host.querySelector("main")?.getAttribute("data-link");
+  assert(failed !== "live" && failed !== "connecting", `a failed first attempt reports an outage (got ${failed})`);
+  // A first attempt that hangs must not read as healthy forever.
+  await React.act(async () => { root.render(null); });
+  await settle();
+  graceMs = 1;
+  await mount();
+  const silentSince = Date.now();
+  while (host.querySelector("main")?.getAttribute("data-link") === "connecting" && Date.now() - silentSince < 2000) {
+    await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
+  }
+  assert(host.querySelector("main")?.getAttribute("data-link") === "reconnecting", "a silent first attempt becomes an outage after its grace");
+  await React.act(async () => { emit(`event: master\ndata: ${JSON.stringify(snapshot("m-next"))}\n\n`); });
+  await settle();
+  assert(host.querySelector("main")?.getAttribute("data-link") === "live", "a late first frame still goes live");
+  // An empty hosted app thread has no persisted thread id yet. Its selected
+  // conversation must be proved by the stream before live text can appear.
+  await React.act(async () => { root.render(null); });
+  const fresh = conversationThread("conv-fresh");
+  fresh.write(() => ({ exists: false, entries: [], pending: [] }));
+  const originalFrame = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (callback) => {
+    queueMicrotask(() => callback(0));
+    return 1;
+  };
+  function FreshHarness() {
+    const [link, setLink] = React.useState<StreamLink>("reconnecting");
+    useThreadStream(fresh, "/api/threads/master/stream?conversation=conv-fresh", true, setLink, undefined, undefined, "conv-fresh");
+    const preview = useConversationPreview("conv-fresh", true);
+    return React.createElement("main", { "data-link": link }, preview);
+  }
+  await React.act(async () => { root.render(React.createElement(FreshHarness)); });
+  await settle();
+  const freshSnapshot: MasterState = {
+    ...snapshot("m-fresh"),
+    turn: { state: "working", message: "m-fresh", conversation: "conv-fresh" },
+    session: { id: "conv-fresh" },
+    actor_identity: { scope: "personal", conversation_id: "conv-fresh", identity: { name: null, tone: null, look: "robot", revision: 0 } },
+  };
+  await React.act(async () => {
+    emit(`event: master\ndata: ${JSON.stringify({ ...freshSnapshot, session: { id: "other-conversation" } })}\n\nevent: preview\ndata: {"text":"foreign text"}\n\n`);
+  });
+  await settle();
+  assert(host.querySelector("main")?.getAttribute("data-link") === "reconnecting" && !host.textContent?.includes("foreign text"), "an empty thread refuses a mismatched session and its preview");
+  await React.act(async () => {
+    emit(`event: master\ndata: ${JSON.stringify(freshSnapshot)}\n\nevent: preview\ndata: {"text":"first live answer"}\n\n`);
+  });
+  await settle();
+  assert(host.querySelector("main")?.getAttribute("data-link") === "live" && host.textContent?.includes("first live answer"), "a proved empty app thread shows its first live answer");
+  globalThis.requestAnimationFrame = originalFrame;
   off();
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();

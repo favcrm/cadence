@@ -88,7 +88,7 @@ pub(super) struct ApprovalView {
 /// it — and any same-uid process can write rows into the store file
 /// directly. Until operator-by-positive-proof lands, a bound approval is
 /// reported as `operator-claimed`, never as a verified approval.
-pub(super) const APPROVAL_UNVERIFIED: &str = "unverified until CAD-280";
+pub(crate) const APPROVAL_UNVERIFIED: &str = "unverified until CAD-280";
 
 pub(super) fn store_evidence(path: &Path, workflow: bool) -> StoreEvidence {
     let mut ev = StoreEvidence::default();

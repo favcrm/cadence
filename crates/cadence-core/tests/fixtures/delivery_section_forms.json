@@ -1,0 +1,75 @@
+{
+  "about": "CAD-2708: stored hosted `delivery:` section forms and the owner-approved digest each must resolve to (null: no approved policy). The Cadence CLI reads them with `cadence_core::delivery::section_front`; the hosted service keeps a byte-identical copy and reads it with its own wrapper and pinned core. Change both copies together.",
+  "forms": [
+    {
+      "name": "value",
+      "text": "reviews:\n  review: {kind: agent, focus: general}\n  qa: {kind: agent, focus: browser-qa}\nrisk:\n  - require: [review]\n  - when: {paths: [\"src/components/nav/**\"]}\n    require: [review, qa]\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "keyed",
+      "text": "delivery:\n  reviews:\n    review: {kind: agent, focus: general}\n    qa: {kind: agent, focus: browser-qa}\n  risk:\n    - require: [review]\n    - when: {paths: [\"src/components/nav/**\"]}\n      require: [review, qa]\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "comment_above_value",
+      "text": "# Browser QA for shared navigation\nreviews:\n  review: {kind: agent, focus: general}\n  qa: {kind: agent, focus: browser-qa}\nrisk:\n  - require: [review]\n  - when: {paths: [\"src/components/nav/**\"]}\n    require: [review, qa]\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "comment_above_keyed",
+      "text": "# Browser QA for shared navigation\n\ndelivery:\n  reviews:\n    review: {kind: agent, focus: general}\n    qa: {kind: agent, focus: browser-qa}\n  risk:\n    - require: [review]\n    - when: {paths: [\"src/components/nav/**\"]}\n      require: [review, qa]\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "blank_lines_around_keyed",
+      "text": "\n\ndelivery:\n  reviews:\n    review: {kind: agent, focus: general}\n    qa: {kind: agent, focus: browser-qa}\n  risk:\n    - require: [review]\n    - when: {paths: [\"src/components/nav/**\"]}\n      require: [review, qa]\n\n\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "bom_keyed",
+      "text": "\ufeffdelivery:\n  reviews:\n    review: {kind: agent, focus: general}\n    qa: {kind: agent, focus: browser-qa}\n  risk:\n    - require: [review]\n    - when: {paths: [\"src/components/nav/**\"]}\n      require: [review, qa]\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "bom_comment_value_crlf",
+      "text": "\ufeff# note\r\nreviews:\r\n  review: {kind: agent, focus: general}\r\n  qa: {kind: agent, focus: browser-qa}\r\nrisk:\r\n  - require: [review]\r\n  - when: {paths: [\"src/components/nav/**\"]}\r\n    require: [review, qa]\r\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "crlf_keyed",
+      "text": "delivery:\r\n  reviews:\r\n    review: {kind: agent, focus: general}\r\n    qa: {kind: agent, focus: browser-qa}\r\n  risk:\r\n    - require: [review]\r\n    - when: {paths: [\"src/components/nav/**\"]}\r\n      require: [review, qa]\r\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "indented_keyed",
+      "text": "  delivery:\n    reviews:\n      review: {kind: agent, focus: general}\n      qa: {kind: agent, focus: browser-qa}\n    risk:\n      - require: [review]\n      - when: {paths: [\"src/components/nav/**\"]}\n        require: [review, qa]\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "reordered_keys_block_style",
+      "text": "risk:\n  - require: [review]\n  - when: {paths: [\"src/components/nav/**\"]}\n    require: [review, qa]\nreviews:\n  qa: {kind: agent, focus: browser-qa}\n  review:\n    kind: agent\n    focus: general  # the floor\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "flow_style_keyed",
+      "text": "delivery: {reviews: {review: {kind: agent, focus: general}, qa: {kind: agent, focus: browser-qa}}, risk: [{require: [review]}, {when: {paths: [\"src/components/nav/**\"]}, require: [review, qa]}]}\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "fenced_keyed",
+      "text": "---\ndelivery:\n  reviews:\n    review: {kind: agent, focus: general}\n    qa: {kind: agent, focus: browser-qa}\n  risk:\n    - require: [review]\n    - when: {paths: [\"src/components/nav/**\"]}\n      require: [review, qa]\n---\n",
+      "digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9"
+    },
+    {
+      "name": "key_that_only_starts_with_delivery",
+      "text": "delivery_x:\n  reviews:\n    review: {kind: agent, focus: general}\n    qa: {kind: agent, focus: browser-qa}\n  risk:\n    - require: [review]\n    - when: {paths: [\"src/components/nav/**\"]}\n      require: [review, qa]\n",
+      "digest": null
+    },
+    {
+      "name": "not_a_policy",
+      "text": "delivery:\n  classes: synthetic\n",
+      "digest": null
+    }
+  ]
+}

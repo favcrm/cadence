@@ -39,6 +39,7 @@
   ],
   "more_before": true,
   "reply_seq": 0,
+  "scanned_before": 2,
   "thread": {
     "alias": "master",
     "archived": false,

@@ -53,5 +53,6 @@
 
 /* The frame sits directly on the board's page background (no inset panel):
  * the document paints nothing of its own; the app's own CSS may still paint
- * its cards. */
-html, body { background: transparent; }
+ * its cards. Match html[data-cadence-kit] body so older bundled app CSS
+ * setting `body { background: ... }` cannot paint an opaque box over the shell. */
+html, body, html[data-cadence-kit], html[data-cadence-kit] body { background: transparent; }

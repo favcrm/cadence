@@ -109,6 +109,21 @@ impl State {
     }
 }
 
+/// CAD-622: the apps one exact PR head touches, with the binding that
+/// makes them evidence. The record keeps them only when that PR/head was
+/// accepted, and every reader re-checks the binding against the record's
+/// current `pr`/`head` — a stale or foreign app list is never trusted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppEvidence {
+    pub pr: String,
+    pub head: String,
+    /// The app names the head's changed files (or a pinned git source)
+    /// name.
+    pub apps: Vec<String>,
+    /// The apps among them recognised by their pinned git source.
+    pub from_git: Vec<String>,
+}
+
 /// One recorded verdict.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VerdictRec {
@@ -218,12 +233,53 @@ pub struct ReadyBinding {
     pub outcome_report: String,
 }
 
+/// CAD-2215: why this record exists, recorded from a fact the daemon
+/// itself observed — never inferred from a ticket id, a current active
+/// job, a worker alias or a report file name.
+///
+/// Only [`Origin::VerifiedOrdinary`] is ordinary work. A record written
+/// before provenance existed, or adopted from a report whose exact
+/// native receipt could not be proven, is [`Origin::LegacyUnknown`]:
+/// the operator may inspect and recover it, but it is never served as
+/// ordinary delivery, never drives a shared Needs-you row, and never
+/// publishes anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Origin {
+    /// The daemon accepted this dispatch itself: `dispatch` is the
+    /// accepted message id the loop follows. A later writer can only
+    /// mutate a record whose origin names its own dispatch.
+    VerifiedOrdinary { dispatch: String },
+    /// Ambiguous history — operator recovery only.
+    #[default]
+    LegacyUnknown,
+}
+
+impl Origin {
+    /// The native dispatch receipt this record stands on, if any.
+    pub fn verified_ordinary(&self) -> Option<&str> {
+        match self {
+            Origin::VerifiedOrdinary { dispatch } => Some(dispatch),
+            Origin::LegacyUnknown => None,
+        }
+    }
+
+    pub fn is_verified_ordinary(&self) -> bool {
+        self.verified_ordinary().is_some()
+    }
+}
+
 /// A ticket's place in the loop — one per dispatched ticket.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub issue: String,
     pub project: String,
     pub worker: String,
+    /// CAD-2215: the native receipt this loop stands on. Absent in a
+    /// pre-2215 file, which deserializes as [`Origin::LegacyUnknown`] —
+    /// the safe reading, never a promotion to ordinary.
+    #[serde(default)]
+    pub origin: Origin,
     pub state: State,
     /// When `state` was entered (epoch secs) — the Needs-you age.
     pub since: i64,
@@ -310,6 +366,29 @@ pub struct Record {
     /// reviewer — the note says so.
     #[serde(default)]
     pub risk: Option<String>,
+    /// CAD-622: the app names the accepted PR head's changed files touch,
+    /// bound to that exact PR and head. `None` is no evidence (never read
+    /// as "no app"): the guard only refuses on what it saw, and a list
+    /// that does not name the record's current head is re-resolved rather
+    /// than trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_evidence: Option<AppEvidence>,
+    /// CAD-2215: operator-only recovery reference for a legacy candidate.
+    /// The report it was adopted from is evidence for inspection, never
+    /// provenance, and is never routed or published. Shared projections
+    /// exclude legacy records entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_recovery: Option<LegacyRecovery>,
+}
+
+/// CAD-2215: what an operator can inspect to recover an unverified
+/// candidate. Deliberately not provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyRecovery {
+    /// The report file named when the candidate was adopted.
+    pub report: String,
+    /// Always true: this reference proves nothing about origin.
+    pub unverified: bool,
 }
 
 fn not_held(held: &bool) -> bool {
@@ -322,6 +401,9 @@ impl Record {
             issue: issue.to_string(),
             project: project.to_string(),
             worker: worker.to_string(),
+            // Created without a native receipt: never ordinary until a
+            // producer proves one through [`Record::new_ordinary`].
+            origin: Origin::LegacyUnknown,
             state: State::Working,
             since: now,
             dispatched_at: now,
@@ -347,7 +429,25 @@ impl Record {
             ticket_done: None,
             ready_epoch: 0,
             risk: None,
+            app_evidence: None,
+            legacy_recovery: None,
         }
+    }
+
+    /// CAD-2215: open a record that stands on a dispatch this daemon
+    /// accepted — the only constructor that makes ordinary work.
+    pub fn new_ordinary(
+        issue: &str,
+        project: &str,
+        worker: &str,
+        now: i64,
+        dispatch: &str,
+    ) -> Self {
+        let mut rec = Record::new(issue, project, worker, now);
+        rec.origin = Origin::VerifiedOrdinary {
+            dispatch: dispatch.to_string(),
+        };
+        rec
     }
 
     pub fn enter(&mut self, state: State, now: i64) {
@@ -519,13 +619,13 @@ pub enum Risk {
     Oversized,
 }
 
+/// `HEAVY_*` annotates the kickoff so the reviewer slows down.
+pub use cadence_core::delivery::HEAVY_FILES;
+pub use cadence_core::delivery::HEAVY_LINES;
 /// Diff-size thresholds. A review over `OVERSIZED_*` cannot be
 /// diligent — flagged for splitting before a reviewer is asked.
-pub const OVERSIZED_FILES: u64 = 40;
-pub const OVERSIZED_LINES: u64 = 3000;
-/// `HEAVY_*` annotates the kickoff so the reviewer slows down.
-pub const HEAVY_FILES: u64 = 10;
-pub const HEAVY_LINES: u64 = 800;
+pub use cadence_core::delivery::OVERSIZED_FILES;
+pub use cadence_core::delivery::OVERSIZED_LINES;
 
 impl Risk {
     pub fn as_str(self) -> &'static str {
@@ -559,6 +659,46 @@ pub fn path(state_dir: &Path) -> PathBuf {
 /// file reads as none.
 pub fn records(state_dir: &Path) -> BTreeMap<String, Record> {
     load(state_dir).unwrap_or_default()
+}
+
+/// CAD-2215: the records a shared reader may treat as ordinary work —
+/// only ones whose native dispatch receipt the daemon recorded. A
+/// legacy-unknown record is never promoted here by a matching ticket,
+/// job, alias or file name.
+pub fn ordinary_records(all: &BTreeMap<String, Record>) -> Vec<&Record> {
+    all.values()
+        .filter(|r| r.origin.is_verified_ordinary())
+        .collect()
+}
+
+/// CAD-2215: the records a shared reader must not see at all — written
+/// before provenance existed, or adopted without a proven receipt.
+pub fn legacy_records(all: &BTreeMap<String, Record>) -> Vec<&Record> {
+    all.values()
+        .filter(|r| !r.origin.is_verified_ordinary())
+        .collect()
+}
+
+/// The ordinary records in Needs-you order (oldest dispatch first).
+pub fn ordinary_in_order(all: &BTreeMap<String, Record>) -> Vec<&Record> {
+    let mut rows = ordinary_records(all);
+    rows.sort_by_key(|r| r.dispatched_at);
+    rows
+}
+
+/// CAD-2215: the key a legacy (unverified) candidate is stored under.
+/// Distinct from the ticket key, so an ordinary loop and a legacy
+/// candidate for the same ticket can coexist without either replacing
+/// the other. `name` only makes the key stable across passes — it is
+/// never read as evidence.
+pub fn legacy_key(issue: &str, name: &str) -> String {
+    format!("legacy:{issue}:{name}")
+}
+
+/// The legacy candidate stored for `issue`, if any.
+pub fn legacy_for_issue<'a>(all: &'a BTreeMap<String, Record>, issue: &str) -> Option<&'a Record> {
+    all.values()
+        .find(|r| r.issue == issue && !r.origin.is_verified_ordinary())
 }
 
 /// Every record, for the daemon's writes: a file that exists but does
@@ -944,9 +1084,10 @@ pub fn review_kickoff(
              pinned to the sha, and if the head moves the daemon sends a new review. File \
              the verdict: `cadence report file --task {issue} --kind verdict --file <f>` \
              with frontmatter `verdict: pass` or `verdict: revise` and `sha: {sha}`, the \
-             findings in the body. Include the actual policy class in `risk:`: `auto`, \
-             `human (<triggers>)` or `delegated (<triggers>)`, according to the change and \
-             repository rules, not the diff-size Risk above. An unattended PASS needs an \
+             findings in the body. Include the actual policy class in `risk:`: `auto` or \
+             `human (<triggers>)`, according to the change and repository rules, not the \
+             diff-size Risk above. `delegated` is not a verdict class: it names the \
+             daemon's `--delegated` approval check only (AGENTS.md). An unattended PASS needs an \
              explicit, genuinely eligible `risk: auto`; protected or sensitive work must \
              retain its actual classification and operator hold. Only you can file it, \
              and only for this head.",
@@ -1031,7 +1172,45 @@ pub fn awaiting_github(rec: &Record) -> bool {
 /// done report names a PR; the board's unattended sync applies it again
 /// before its `gh` reads one.
 pub fn project_pr_refusal(pm_dir: &Path, project: &str, pr: &str) -> Result<Option<String>> {
+    pr_refusal_for_remotes(project, pr, || {
+        Ok(crate::issue::project::list(pm_dir)?
+            .into_iter()
+            .find(|p| p.key == project)
+            .iter()
+            .flat_map(|p| p.repos.iter())
+            .filter_map(|r| r.remote.clone())
+            .collect())
+    })
+}
+
+/// [`project_pr_refusal`] over the project's declared `repos[].remote`
+/// values, however they were read — the local tracker or a hosted org's
+/// (CAD-1946). `remotes` runs only for a well-formed PR URL.
+pub fn pr_refusal_for_remotes(
+    project: &str,
+    pr: &str,
+    remotes: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<Option<String>> {
     let Some(key) = pr_ref(pr) else {
+        // A bare PR number is what `cadence delivery requirements --pr`
+        // documents and what `scripts/enqueue-reviewed` passes. It can only be
+        // checked against a project with one remote: with several, the number
+        // does not say which repo the PR belongs to, and guessing is how a gate
+        // ends up checking the wrong repository.
+        let bare = pr.trim().trim_start_matches('#');
+        if !bare.is_empty() && bare.bytes().all(|b| b.is_ascii_digit()) {
+            let remotes: Vec<String> = remotes()?;
+            return Ok(match remotes.len() {
+                1 => None,
+                0 => Some(format!(
+                    "names `pr: {pr}`, and the project lists no repo remote to match it against"
+                )),
+                _ => Some(format!(
+                    "names `pr: {pr}` without a repo, and project {project} has several \
+                     remotes — pass the full pull request URL"
+                )),
+            });
+        }
         return Ok(Some(format!(
             "names `pr: {pr}`, which is not a pull request URL"
         )));
@@ -1039,13 +1218,8 @@ pub fn project_pr_refusal(pm_dir: &Path, project: &str, pr: &str) -> Result<Opti
     let (slug, _) = crate::issue::task_report::parse_pr_url(pr)?;
     let want =
         crate::issue::project::normalize_remote(&format!("github.com/{slug}")).to_ascii_lowercase();
-    let found = crate::issue::project::list(pm_dir)?
-        .into_iter()
-        .find(|p| p.key == project);
-    let remotes: Vec<String> = found
+    let remotes: Vec<String> = remotes()?
         .iter()
-        .flat_map(|p| p.repos.iter())
-        .filter_map(|r| r.remote.as_deref())
         .map(|r| crate::issue::project::normalize_remote(r).to_ascii_lowercase())
         .collect();
     if remotes.contains(&want) {
@@ -1199,11 +1373,61 @@ fn gh_via(gh_bin: &str, polled: bool, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-#[cfg(test)]
-mod cad1751_pause_refusal_acceptance;
+pub mod hosted_gate;
+pub mod private;
+pub mod publication;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--pr` accepts a number, but only where the project has one remote: the
+    /// number alone cannot name a repository.
+    #[test]
+    fn a_bare_pr_number_is_checked_against_the_project_remote() {
+        let one = || Ok(vec!["github.com/favcrm/cadence".to_string()]);
+        assert_eq!(
+            pr_refusal_for_remotes("cadence", "1462", one).unwrap(),
+            None
+        );
+        assert_eq!(
+            pr_refusal_for_remotes("cadence", "#1462", one).unwrap(),
+            None
+        );
+
+        let none = || Ok(Vec::new());
+        let refused = pr_refusal_for_remotes("cadence", "1462", none)
+            .unwrap()
+            .expect("no remote is a refusal");
+        assert!(refused.contains("no repo remote"), "{refused}");
+
+        let several = || {
+            Ok(vec![
+                "github.com/favcrm/cadence".to_string(),
+                "github.com/favcrm/pm".to_string(),
+            ])
+        };
+        let refused = pr_refusal_for_remotes("cadence", "1462", several)
+            .unwrap()
+            .expect("several remotes is a refusal");
+        assert!(refused.contains("several"), "{refused}");
+
+        // A URL keeps its old path: it names its own repo.
+        let url = "https://github.com/favcrm/cadence/pull/1462";
+        assert_eq!(
+            pr_refusal_for_remotes("cadence", url, || Ok(vec![
+                "github.com/favcrm/cadence".to_string()
+            ]))
+            .unwrap(),
+            None
+        );
+        let refused = pr_refusal_for_remotes("cadence", url, || {
+            Ok(vec!["github.com/favcrm/pm".to_string()])
+        })
+        .unwrap()
+        .expect("another repo's PR is a refusal");
+        assert!(refused.contains("not a repo of project"), "{refused}");
+    }
 
     #[test]
     fn resolve_gh_is_absolute_or_fails_closed() {

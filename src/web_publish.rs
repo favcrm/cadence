@@ -194,7 +194,12 @@ pub fn freeze(input: &Path) -> Result<FrozenSite> {
     })
 }
 
-fn walk(dir: &File, rel: &str, out: &mut Vec<(String, Vec<u8>)>, total: &mut u64) -> Result<()> {
+fn walk(
+    dir: &anchored_fs::Dir,
+    rel: &str,
+    out: &mut Vec<(String, Vec<u8>)>,
+    total: &mut u64,
+) -> Result<()> {
     let entries = anchored_fs::entries(dir)
         .map_err(|_| reject("cannot enumerate the selected site folder safely"))?;
     for name in entries {

@@ -33,6 +33,7 @@ import type {
 
 /** The app's one query cache — every screen reads its stores from here. */
 export const cache = new QueryCache();
+let connectionsListPartial = false;
 
 const unavailablePrivateRecord = (error: unknown) => error instanceof ApiError &&
   (error.status === 401 || error.status === 403 || error.status === 404);
@@ -180,6 +181,11 @@ export const resources = {
   projects: cache.resource<Project[]>("projects", () => api.projects().then((r) => r.projects), {
     isEmpty: (rows) => rows.length === 0,
   }),
+  /** `GET /api/projects/<key>/policy` — the board's policy record. Native and
+   *  hosted answer different shapes (CAD-2255), validated by policyContract. */
+  projectPolicy: cache.family<string, unknown>("projectPolicy", (project) =>
+    api.projectPolicy(project),
+  ),
   /** `GET /api/agents` — agent rows, task bindings and `by_issue`. */
   agents: cache.resource<AgentsPayload>("agents", () => api.agents().then(normalizeAgentsPayload), {
     isEmpty: (p) => p.agents.length === 0,
@@ -198,6 +204,10 @@ export const resources = {
    * it when `agents` moves and after a `masterCommand`.
    */
   masterState: cache.resource<MasterState>("master", () => api.masterState()),
+  /** Hosted identity/status for one server-selected conversation, never Home's cached actor. */
+  masterConversation: cache.family<string, MasterState>("masterConversation", (id) => api.masterState(id), {
+    discardOnError: unavailablePrivateRecord,
+  }),
   /** `GET /api/issues/<id>` — one drawer's detail (and a plan card's epic). */
   issue: cache.family<string, IssueDetail>("issue", (id) => api.issue(id), (id) => ({
     discardOnError: unavailablePrivateRecord,
@@ -298,6 +308,17 @@ export const resources = {
    * only (CAD-585). Operator-only, like the providers read.
    */
   connections: cache.resource<Connection[]>("connections", () =>
-    api.connections().then((r) => r.connections),
+    api.connections().then((r) => {
+      connectionsListPartial = r.connections_unavailable !== undefined;
+      resources.connectionsPartial.write(() => ({ partial: connectionsListPartial }));
+      return r.connections;
+    }),
   ),
+  /**
+   * Whether that list is partial, because the board couldn't reach the platform's
+   * accounts. The list read sets it, so the two can't disagree and nothing reads twice.
+   */
+  connectionsPartial: cache.resource<{ partial: boolean }>("connections-partial", async () => ({
+    partial: connectionsListPartial,
+  })),
 };

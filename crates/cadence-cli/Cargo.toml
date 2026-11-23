@@ -1,0 +1,58 @@
+[package]
+name = "cadence-cli"
+version = "0.2.5"
+edition = "2021"
+license = "MIT"
+publish = false
+autobins = false
+autotests = false
+
+[features]
+ui = ["cadence-agent/ui", "cadence-ui/ui"]
+test-seam = ["cadence-agent/test-seam", "cadence-ui/test-seam"]
+native-fixture-admission = [
+    "cadence-agent/native-fixture-admission",
+    "cadence-ui/native-fixture-admission",
+]
+cli-runtime-test = [
+    "test-seam",
+    "cadence-agent/cli-runtime-test",
+    "cadence-ui/cli-runtime-test",
+]
+
+[[bin]]
+name = "cadence"
+path = "../../src/main.rs"
+
+[[test]]
+name = "suite"
+path = "../../tests/suite.rs"
+
+[dependencies]
+cadence-agent = { path = "../.." }
+cadence-core = { path = "../cadence-core", features = ["custody-crypto"] }
+cadence-ui = { path = "../cadence-ui" }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
+clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.3"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+regex = "1"
+ring = { version = "0.17", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "hooks"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pemfile = { version = "2" }
+serde_yaml = "0.9"
+shlex = "2.0.1"
+tiny_http = "0.12"

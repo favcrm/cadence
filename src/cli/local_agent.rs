@@ -1,4 +1,4 @@
-//! CLI for hosted local-agent coordination (CAD-1460).
+//! Hosted local-assignment verbs behind `agent` (CAD-1460).
 //!
 //! These commands talk to
 //! `/__platform/hosted-cadence/:organizationId/local-assignments`.
@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 
 use cadence_agent::local_assignment::delivery::deliver_kickoff;
 #[cfg(test)]
-use cadence_agent::local_assignment::delivery::{
-    claimant_target, redact_secrets, require_context, write_note,
-};
+use cadence_agent::local_assignment::delivery::{redact_secrets, write_note};
 use cadence_agent::local_assignment::http::BoardHttp;
 use cadence_agent::local_assignment::{Coordinator, Kickoff};
 use cadence_agent::remote_cli::RemoteTarget;
@@ -94,7 +92,12 @@ pub(crate) enum LocalAgentAction {
         to: Option<String>,
         #[arg(long)]
         cancel: bool,
+        /// After cancellation, try to release its merged, clean, idle lane.
+        #[arg(long, requires = "cancel", conflicts_with = "to")]
+        release_lane: bool,
     },
+    /// Clear a local guard for an already absent, unregistered lane.
+    ReconcileRelease { assignment: String },
     /// Save one optional legacy tool/publisher credential; does not activate tooling.
     Tool {
         /// Legacy `provider.draft` or `publish.send`; normal account images need neither.
@@ -105,6 +108,27 @@ pub(crate) enum LocalAgentAction {
 
 fn coordinator(target: &RemoteTarget) -> Result<Coordinator<BoardHttp>> {
     BoardHttp::open(target)?.into_coordinator()
+}
+pub(super) fn hosted_finish(
+    target: &RemoteTarget,
+    issue: &str,
+    worktree: Option<&Path>,
+    local_state: Option<&Path>,
+) -> Result<Value> {
+    let coord = coordinator(target).map_err(|e| {
+        Error::rejected(format!(
+            "Hosted lane release is unavailable: the coordinator ledger could not be opened ({e}). \
+             Nothing was removed. If the lane's work is merged and nothing is using it, remove it \
+             yourself with `git worktree remove <path>` (this deletes its ignored files) and \
+             `git branch -d <branch>`, which refuses a squash-merged branch: use `-D` only \
+             after verifying the merge"
+        ))
+    })?;
+    let state = match local_state {
+        Some(dir) => dir.to_path_buf(),
+        None => cadence_agent::client::state_dir()?,
+    };
+    cadence_agent::local_assignment::finish_guidance::release(&coord, issue, worktree, &state)
 }
 
 pub(super) fn run(
@@ -138,7 +162,11 @@ pub(super) fn run(
                 wiki,
             )?;
             print_json(&value);
-            return Ok(if value["status"] == "stored" { 0 } else { 5 });
+            return Ok(match value["status"].as_str() {
+                Some("stored") => 0,
+                Some("refused") => 5,
+                _ => 1,
+            });
         }
         _ => {}
     }
@@ -191,7 +219,9 @@ pub(super) fn run(
                     std::time::Duration::from_secs(35),
                 )?;
                 if previous.as_ref() != Some(&value) {
-                    print_json(&value);
+                    if !cadence_agent::output::stream_json(&value) {
+                        return Ok(0);
+                    }
                     previous = Some(value);
                 }
             }
@@ -238,12 +268,61 @@ pub(super) fn run(
             state,
             text,
             head,
-        } => coord.report(assignment, state, text.as_deref(), head.as_deref())?,
+        } => {
+            let value = coord.report(assignment, state, text.as_deref(), head.as_deref())?;
+            if *state == "result" {
+                // The assignment ends here; the ticket does not move on its own.
+                // Say the next step instead of leaving the session to infer it.
+                cadence_agent::output::eprint_line(
+                    "cadence: assignment complete — close the ticket with \
+                     `cadence issue set <ID> status=done` once the work is accepted",
+                );
+            }
+            value
+        }
         LocalAgentAction::Reassign {
             assignment,
             to,
             cancel,
-        } => coord.reassign(assignment, to.as_deref(), *cancel)?,
+            release_lane,
+        } => {
+            if *release_lane && (!*cancel || to.is_some()) {
+                return Err(Error::usage(
+                    "--release-lane requires --cancel and cannot be used with --to",
+                ));
+            }
+            let state = if *release_lane {
+                Some(
+                    local_state
+                        .clone()
+                        .map(Ok)
+                        .unwrap_or_else(cadence_agent::client::state_dir)?,
+                )
+            } else {
+                None
+            };
+            let cancelled = coord.reassign(assignment, to.as_deref(), *cancel)?;
+            if let Some(state) = state {
+                let released = cadence_agent::local_assignment::finish_guidance::release_cancelled(
+                    &coord, assignment, &state,
+                )
+                .map_err(|error| Error::unknown(format!(
+                    "Assignment {assignment} was cancelled; cancellation does not stop the actor. \
+                     Guarded lane release did not report success: {error}. Inspect the lane before \
+                     retrying; if it still exists and the refusal is resolved, run \
+                     `cadence --org {} issue finish <issue-id>` for this assignment's recorded issue. Do not repeat cancellation.",
+                    target.org
+                )))?;
+                json!({ "assignment": cancelled, "release": released })
+            } else {
+                cancelled
+            }
+        }
+        LocalAgentAction::ReconcileRelease { assignment } => {
+            cadence_agent::local_assignment::finish_guidance::reconcile_absent_guard(
+                &coord, assignment,
+            )?
+        }
         LocalAgentAction::Tool { lane } => coord.authorize_tool(lane)?,
     };
     finish(&value)
@@ -253,11 +332,14 @@ pub(super) fn dispatch(target: &RemoteTarget, issue: &str, to: &str) -> Result<i
     finish(&coordinator(target)?.dispatch(issue, Some(to))?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start(
     target: &RemoteTarget,
     id: &str,
     repo: Option<&Path>,
     name: Option<&str>,
+    profile: Option<&str>,
+    base: Option<&str>,
     wake_timeout: u64,
     local_state: Option<PathBuf>,
 ) -> Result<i32> {
@@ -266,6 +348,17 @@ pub(super) fn start(
             "hosted issue start requires --repo <local git checkout>; nothing was sent",
         ));
     };
+    if let Some(profile) = profile {
+        // CAD-1964: the caller is the actor, so this claims under the
+        // profile's session id and opens the lane without a local alias,
+        // a daemon handoff or any other waiting assignment.
+        return finish(&coordinator(target)?.start_session(id, repo, name, profile, base)?);
+    }
+    if base.is_some() {
+        return Err(Error::usage(
+            "hosted issue start accepts --base only with --profile; the alias path uses the              project's own base. Nothing was sent",
+        ));
+    }
     let mut deliver =
         |kickoff: &Kickoff| deliver_kickoff(target, local_state.clone(), kickoff, wake_timeout);
     let value = coordinator(target)?.start_here(id, repo, name, &mut deliver)?;
@@ -320,6 +413,7 @@ mod context_snapshots {
             audience: "https://board.test",
             subject_id: None,
             issuer: None,
+            profile_id: None,
         };
         let first = write_note(dir.path(), &kickoff, &json!({"issue": "original work"}))
             .expect("first context");
@@ -345,6 +439,244 @@ mod context_snapshots {
     }
 }
 
-#[cfg(test)]
-#[path = "local_agent_claimant_acceptance.rs"]
-mod claimant_acceptance;
+// Independently authored CAD-2009 consumer acceptance; do not weaken.
+#[cfg(all(test, unix))]
+mod cad2009_notify_acceptance {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const AGENT: &str = "lag_00000000-0000-4000-8000-000000000003";
+    const NOTICE: &str = "lan_00000000-0000-4000-8000-000000000004";
+    const OP: &str = "independent-notify-operation";
+    const CHILD: &str = "CAD2009_NOTIFY_ACCEPTANCE_CHILD";
+    const TEST: &str = "cad2009_notify_consumer_preserves_uncertainty_and_identical_key_recovery";
+
+    fn action() -> LocalAgentAction {
+        LocalAgentAction::Notify {
+            agent_id: AGENT.into(),
+            operation_id: OP.into(),
+            text: "Independent FYI only".into(),
+            issues: vec!["SYN-1".into()],
+            wiki: vec!["global/synthetic".into()],
+        }
+    }
+
+    fn target(endpoint: String) -> RemoteTarget {
+        RemoteTarget {
+            org: "synthetic".into(),
+            org_id: "ws_synthetic".into(),
+            endpoint,
+            identity: None,
+        }
+    }
+
+    fn child(case: &str) {
+        // Parent supplies a fresh private HOME/XDG_CONFIG_HOME in this child
+        // only. No global environment changes can race another acceptance.
+        let config = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+        let auth = config.join("cadence/remote-auth");
+        fs::create_dir_all(&auth).unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o700)).unwrap();
+        if case == "predispatch" {
+            let outcome = run(&target("http://127.0.0.1:1".into()), &action(), 1, None);
+            // No credential file exists, so no HTTP can be attempted. A local
+            // refusal must not become an `unknown` successful JSON answer.
+            match outcome {
+                Err(error) => {
+                    assert_eq!(error.kind(), "rejected");
+                    std::process::exit(cadence_agent::error::exit_code_for_kind(error.kind()));
+                }
+                Ok(code) => std::process::exit(code),
+            }
+        }
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr());
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let credential = json!({
+            "version": "hosted-cadence-auth.v1", "organization_id": "ws_synthetic",
+            "organization_slug": "synthetic", "audience": endpoint,
+            "issuer": "https://issuer.board.localhost", "subject_id": "user_sender",
+            "capabilities": ["cli.read", "cli.write"],
+            "access_token": format!("hct_{}", "a".repeat(43)), "expires_at": expires
+        });
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(auth.join("cli-synthetic.json"))
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&credential).unwrap())
+            .unwrap();
+        drop(file);
+        let case_owned = case.to_owned();
+        let worker = std::thread::spawn(move || {
+            let count = if case_owned == "reconcile" { 2 } else { 1 };
+            let mut requests = Vec::new();
+            for index in 0..count {
+                let mut req = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .expect("bounded notify dispatch");
+                assert_eq!(req.method().as_str(), "POST");
+                assert_eq!(
+                    req.url(),
+                    format!("/__platform/hosted-cadence/ws_synthetic/local-agents/{AGENT}/notify")
+                );
+                let mut bytes = Vec::new();
+                req.as_reader()
+                    .take(32_769)
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                assert!(bytes.len() <= 32_768);
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    body,
+                    json!({"version": "hosted-cadence-agent-directory.v1",
+                    "operation_id": OP, "kind": "fyi", "text": "Independent FYI only",
+                    "references": [{"kind": "issue", "id": "SYN-1"}, {"kind": "wiki", "id": "global/synthetic"}]})
+                );
+                requests.push(body);
+                let receipt = json!({"version": "hosted-cadence-agent-directory.v1",
+                    "operation_id": OP, "notice_id": NOTICE, "agent_id": AGENT,
+                    "kind": "fyi", "status": "stored"});
+                let (status, body) = if index == 1 || case_owned == "stored" {
+                    // One persisted receipt, returned unchanged for the explicit
+                    // same-member/agent/content/key recovery. Not a second notice.
+                    (200, receipt)
+                } else {
+                    // Producer rechecks humanActor after commitLocalEvents;
+                    // these exact unproved authorization envelopes can follow it.
+                    (401, json!({"ok": false, "code": "unauthorized"}))
+                };
+                req.respond(
+                    tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                )
+                .unwrap();
+            }
+            // Completion is event-driven: notify returned before this probe.
+            // An automatic replay would have occupied the next expected request
+            // or be pending here, rather than being silently accepted.
+            (server, requests)
+        });
+        let target = target(endpoint);
+        let first = run(&target, &action(), 1, None);
+        let second = if case == "reconcile" {
+            Some(run(&target, &action(), 1, None))
+        } else {
+            None
+        };
+        let (server, requests) = worker.join().unwrap();
+        assert!(
+            server.try_recv().unwrap().is_none(),
+            "unexpected automatic replay"
+        );
+        assert_eq!(requests.len(), if case == "reconcile" { 2 } else { 1 });
+        if case == "reconcile" {
+            assert_eq!(
+                requests[0], requests[1],
+                "recovery must not replace the operation id or content"
+            );
+            assert_eq!(second.unwrap().unwrap(), 0);
+        }
+        let code = match first {
+            Ok(code) => code,
+            Err(error) => cadence_agent::error::exit_code_for_kind(error.kind()),
+        };
+        std::process::exit(code);
+    }
+
+    #[test]
+    fn cad2009_notify_consumer_preserves_uncertainty_and_identical_key_recovery() {
+        if let Ok(case) = std::env::var(CHILD) {
+            child(&case);
+            return;
+        }
+        for (case, expected_exit) in [
+            ("predispatch", 3),
+            ("unknown", 1),
+            ("stored", 0),
+            ("reconcile", 1),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env(CHILD, case)
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", home.path().join("config"))
+                .env("XDG_STATE_HOME", home.path().join("state"))
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(home.path())
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            // libtest adds a prefix; deserialize real print_json documents from
+            // the first opening brace, not test-authored echoed expected output.
+            let values: Vec<Value> = stdout
+                .find('{')
+                .map(|offset| {
+                    serde_json::Deserializer::from_str(&stdout[offset..])
+                        .into_iter::<Value>()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "{case}: stdout={stdout}; stderr={stderr}"
+            );
+            if case == "predispatch" {
+                assert!(
+                    !values.iter().any(|value| value["status"] == "unknown"),
+                    "proven credential refusal was masked"
+                );
+            } else {
+                assert_eq!(values.len(), if case == "reconcile" { 2 } else { 1 });
+                assert_eq!(
+                    values[0]["status"],
+                    if case == "stored" {
+                        "stored"
+                    } else {
+                        "unknown"
+                    }
+                );
+                if case != "stored" {
+                    assert_eq!(values[0]["operation_id"], OP);
+                    assert_eq!(values[0]["agent_id"], AGENT);
+                    let guidance = values[0]["retry"]
+                        .as_str()
+                        .expect("same-operation-id recovery guidance");
+                    for pin in [
+                        "same workspace",
+                        "member",
+                        "agent",
+                        "--operation-id",
+                        "text",
+                        "references",
+                    ] {
+                        assert!(guidance.contains(pin), "recovery lost {pin}: {guidance}");
+                    }
+                    assert!(
+                        guidance.contains("does not mean delivered"),
+                        "FYI storage is not execution"
+                    );
+                }
+                if case == "reconcile" {
+                    assert_eq!(values[1]["status"], "stored");
+                    assert_eq!(values[1]["notice_id"], NOTICE);
+                }
+            }
+        }
+    }
+}

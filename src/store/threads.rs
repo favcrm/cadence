@@ -9,8 +9,8 @@
 //! a `system` entry marks it): a new agent under a reused alias starts
 //! fresh (CAD-304 S4).
 //!
-//! Entries are append-only and ordered by `seq` (one global
-//! autoincrement, so a cursor is a plain integer):
+//! Entries are append-only and ordered by one internal global `seq`.
+//! Member-assistant reads expose opaque positions instead.
 //!
 //! | role       | kind             | written by                                  |
 //! |------------|------------------|---------------------------------------------|
@@ -39,6 +39,16 @@ use crate::error::{Error, Result};
 
 mod model;
 pub use self::model::*;
+
+fn scoped_thread_message() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM messages
+         WHERE messages.id=thread_entries.message_id
+           AND messages.alias=(SELECT alias FROM threads WHERE id=thread_entries.thread_id)
+           {})",
+        super::messages::INDEX_PROJECT_FILTER
+    )
+}
 
 fn row_thread(row: &rusqlite::Row) -> rusqlite::Result<Thread> {
     Ok(Thread {
@@ -350,7 +360,7 @@ impl Store {
 
     /// [`Self::ensure_thread`] inside the caller's transaction; the
     /// caller has already proved the agent exists.
-    fn ensure_thread_in(tx: &impl super::StoreConn, alias: &str) -> Result<Thread> {
+    pub(super) fn ensure_thread_in(tx: &impl super::StoreConn, alias: &str) -> Result<Thread> {
         if let Some(thread) = Self::thread_in(tx, alias)? {
             return Ok(thread);
         }
@@ -960,6 +970,45 @@ impl Store {
         })
     }
 
+    /// CAD-2285: record the master's form on its conversation. One entry
+    /// per (turn, digest): asking the same form twice on one turn is
+    /// refused, so a replayed call cannot stack forms. It writes only this
+    /// thread entry.
+    pub fn surface_put(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        text: &str,
+        payload: Value,
+    ) -> Result<i64> {
+        let digest = payload["digest"].as_str().unwrap_or_default().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let dup: Option<i64> = tx
+                .query_row(
+                    "SELECT seq FROM thread_entries WHERE thread_id=? AND kind=? AND message_id=?
+                       AND json_extract(payload,'$.digest')=?",
+                    params![thread_id, KIND_SURFACE, message_id, digest],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if dup.is_some() {
+                return Err(Error::rejected("this turn already asked exactly this form"));
+            }
+            Self::thread_write_by_id_in(
+                tx,
+                thread_id,
+                NewEntry {
+                    role: ROLE_AGENT,
+                    kind: KIND_SURFACE,
+                    text,
+                    payload: Some(payload),
+                    message_id: Some(message_id),
+                },
+            )
+        })
+    }
+
     /// Append inside a caller's transaction to one thread by id.
     pub(super) fn thread_write_by_id_in(
         tx: &impl super::StoreConn,
@@ -1476,6 +1525,242 @@ impl Store {
         rows.truncate(limit as usize);
         rows.reverse();
         Ok((rows, more))
+    }
+
+    /// Page a member's own assistant history after excluding operator-only
+    /// entries, so hidden rows neither consume the limit nor affect `more`.
+    pub(crate) fn member_thread_entries_after(
+        &self,
+        thread_id: &str,
+        after: i64,
+        limit: i64,
+    ) -> Result<(Vec<ThreadEntry>, bool)> {
+        let conn = self.conn();
+        let limit = limit.clamp(1, PAGE_MAX);
+        let mut rows = conn.query_vec(
+            "SELECT * FROM thread_entries
+             WHERE thread_id=? AND seq>? AND kind NOT IN (?,?,?)
+             ORDER BY seq LIMIT ?",
+            params![
+                thread_id,
+                after,
+                KIND_ARTIFACT,
+                KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
+                limit + 1
+            ],
+            row_entry,
+        )?;
+        let more = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        Ok((rows, more))
+    }
+
+    /// The same visible history, newest first for selection and oldest first
+    /// in the returned page.
+    pub(crate) fn member_thread_entries_before(
+        &self,
+        thread_id: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ThreadEntry>, bool)> {
+        let conn = self.conn();
+        let limit = limit.clamp(1, PAGE_MAX);
+        let mut rows = conn.query_vec(
+            "SELECT * FROM thread_entries
+             WHERE thread_id=? AND seq<? AND kind NOT IN (?,?,?)
+             ORDER BY seq DESC LIMIT ?",
+            params![
+                thread_id,
+                before.unwrap_or(i64::MAX),
+                KIND_ARTIFACT,
+                KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
+                limit + 1
+            ],
+            row_entry,
+        )?;
+        let more = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        rows.reverse();
+        Ok((rows, more))
+    }
+
+    /// Project-filtered pages are selected before their cursor and limit, so
+    /// inaccessible entries neither consume a page nor advance its cursor.
+    pub(crate) fn thread_entries_after_scoped(
+        &self,
+        thread_id: &str,
+        after: i64,
+        limit: i64,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+        member: bool,
+    ) -> Result<Vec<ThreadEntry>> {
+        let conn = self.conn();
+        let issues = super::messages::project_filter_json(
+            issues,
+            Some(&denied.tasks),
+            Some(&denied.issues),
+            denied.exclude_cloud,
+        )?;
+        let sql = format!(
+            "SELECT thread_entries.* FROM thread_entries
+             WHERE thread_id=? AND seq>? AND {}
+               AND (?=0 OR thread_entries.kind NOT IN (?,?,?))
+             ORDER BY seq LIMIT ?",
+            scoped_thread_message()
+        );
+        Ok(conn.query_vec(
+            &sql,
+            params![
+                thread_id,
+                after,
+                issues,
+                member,
+                KIND_ARTIFACT,
+                KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
+                limit.clamp(1, PAGE_MAX)
+            ],
+            row_entry,
+        )?)
+    }
+
+    pub(crate) fn thread_entries_before_scoped(
+        &self,
+        thread_id: &str,
+        before: Option<i64>,
+        limit: i64,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+        member: bool,
+    ) -> Result<(Vec<ThreadEntry>, bool)> {
+        let conn = self.conn();
+        let issues = super::messages::project_filter_json(
+            issues,
+            Some(&denied.tasks),
+            Some(&denied.issues),
+            denied.exclude_cloud,
+        )?;
+        let limit = limit.clamp(1, PAGE_MAX);
+        let sql = format!(
+            "SELECT thread_entries.* FROM thread_entries
+             WHERE thread_id=? AND seq<? AND {}
+               AND (?=0 OR thread_entries.kind NOT IN (?,?,?))
+             ORDER BY seq DESC LIMIT ?",
+            scoped_thread_message()
+        );
+        let mut rows = conn.query_vec(
+            &sql,
+            params![
+                thread_id,
+                before.unwrap_or(i64::MAX),
+                issues,
+                member,
+                KIND_ARTIFACT,
+                KIND_HIRE_PROPOSAL,
+                KIND_SURFACE,
+                limit + 1
+            ],
+            row_entry,
+        )?;
+        let more = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        rows.reverse();
+        Ok((rows, more))
+    }
+
+    /// CAD-2663: one batch of a thread as its own agent may search it. A row
+    /// qualifies when its message:
+    /// - belongs to the thread's own agent;
+    /// - reached the agent, the [`Self::continuity_entries`] rule:
+    ///   delivered ([`DELIVERED_STATES`]) and not `current`;
+    /// - is either bound to an issue the agent's read scope admits (the
+    ///   scoped-agent filter `thread_read` applies), or bound to no issue
+    ///   and no task at all — a conversation turn the continuity pack
+    ///   already carries back to this agent.
+    ///
+    /// Rows tied to no message (system notes) never qualify. Backward reads
+    /// the rows below `anchor`, newest first; forward the rows above it,
+    /// oldest first. The flag says more rows lie beyond the batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn thread_entries_reached_scoped(
+        &self,
+        thread_id: &str,
+        current: &str,
+        anchor: i64,
+        backward: bool,
+        limit: i64,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+    ) -> Result<(Vec<ThreadEntry>, bool)> {
+        let conn = self.conn();
+        let issues = super::messages::project_filter_json(
+            issues,
+            Some(&denied.tasks),
+            Some(&denied.issues),
+            denied.exclude_cloud,
+        )?;
+        let limit = limit.clamp(1, PAGE_MAX);
+        let (bound, order) = if backward {
+            ("seq<?", "DESC")
+        } else {
+            ("seq>?", "ASC")
+        };
+        let sql = format!(
+            "SELECT thread_entries.* FROM thread_entries
+             WHERE thread_id=? AND {bound} AND EXISTS (SELECT 1 FROM messages
+               WHERE messages.id=thread_entries.message_id
+                 AND messages.alias=(SELECT alias FROM threads WHERE id=thread_entries.thread_id)
+                 AND messages.id != ? AND messages.state IN {DELIVERED_STATES}
+                 AND ((messages.issue IS NULL AND messages.task_id IS NULL)
+                      OR (1 {})))
+             ORDER BY seq {order} LIMIT ?",
+            super::messages::INDEX_PROJECT_FILTER
+        );
+        let mut rows = conn.query_vec(
+            &sql,
+            params![thread_id, anchor, current, issues, limit + 1],
+            row_entry,
+        )?;
+        let more = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        Ok((rows, more))
+    }
+
+    pub(crate) fn thread_reply_seq_scoped(
+        &self,
+        thread_id: &str,
+        issues: &[&str],
+        denied: &super::PrivateJobDenials,
+    ) -> Result<i64> {
+        let conn = self.conn();
+        let issues = super::messages::project_filter_json(
+            issues,
+            Some(&denied.tasks),
+            Some(&denied.issues),
+            denied.exclude_cloud,
+        )?;
+        let sql = format!(
+            "SELECT COALESCE((SELECT seq FROM thread_entries
+             WHERE thread_id=? AND role=? AND kind IN (?,?)
+               AND length(trim(text, ?)) > 0 AND {}
+             ORDER BY seq DESC LIMIT 1), 0)",
+            scoped_thread_message()
+        );
+        Ok(conn.query_row(
+            &sql,
+            params![
+                thread_id,
+                ROLE_AGENT,
+                KIND_ASSISTANT_TEXT,
+                KIND_TURN_RESULT,
+                REPLY_WHITESPACE,
+                issues
+            ],
+            |row| row.get(0),
+        )?)
     }
 
     /// The thread as a continuity pack may carry it (CAD-324): the

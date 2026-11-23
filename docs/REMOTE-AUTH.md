@@ -10,6 +10,11 @@ collaboration, explicit FYI registration and app lifecycle boundaries, start wit
 [Hosted workspace](guides/hosted-workspace.md). The credential details below
 remain separate from agent registration or package consent.
 
+For Native private-member assistant custody, least-scope board enrollment,
+credential-free preflight and genuine conversation acceptance, see
+[Native member-assistant enrollment](guides/member-assistant-enrollment.md).
+That procedure is not the Worker/Pi Durable deployment path.
+
 The separate CAD-539 provider credential import (`--token-stdin`) does not
 connect issue, message or team commands to hosted Cadence. Its
 `hosted_cadence: not_configured` result describes that provider import, not an
@@ -23,8 +28,8 @@ path does not require `provider.draft`. The optional legacy external-adapter
 and publisher setup commands below request separate financial consent:
 
 ```sh
-cadence --org <slug> local-agent tool --lane provider.draft
-cadence --org <slug> local-agent tool --lane publish.send
+cadence --org <slug> agent tool --lane provider.draft
+cadence --org <slug> agent tool --lane publish.send
 ```
 
 These use the existing device consent endpoints, not a new token issuer.
@@ -71,27 +76,121 @@ requires both selectors, and is never persisted. Invalid environment credentials
 fail without falling back to stored credentials. `login --token-stdin` explicitly
 uses stdin; browser login explicitly uses a new grant, regardless of environment.
 
-All status checks contact the issuer, so expired/revoked credentials fail on
-the next check. Redirects are refused; bearer credentials are never forwarded
-to another host. CLI network connections require HTTPS origins without paths,
-userinfo, query strings or fragments. No issuer response body or credential is
-printed on errors.
+An issuer-status check contacts the issuer, so an expired or revoked
+ephemeral credential fails on the next check. A saved hosted workspace is
+different: with `--org <name>`, a saved selection, or exactly one registered
+remote, `cadence auth status` reports that session's local state without any
+issuer call — `state`, `scopes`, `access_expires_at`,
+`session_idle_expires_at`, `session_absolute_expires_at` and
+`live_verified: false`. The states are `renewable` and
+`access_valid_until_expiry` (exit 0) and `reauthentication_required`,
+`no_credential`, `invalid_local_credential` and `unavailable` (exit 1). A
+present `CADENCE_TOKEN` still wins, and explicit `--issuer` or `--auth-dir`
+keep the issuer path. Redirects are refused; bearer credentials are never
+forwarded to another host. CLI network connections require HTTPS origins
+without paths, userinfo, query strings or fragments. No issuer response body
+or credential is printed on errors.
 
 ## Storage and logout
 
 Credentials use an explicit permission-restricted file fallback, not an OS
 keychain: `$XDG_CONFIG_HOME/cadence/remote-auth/credential.json` (otherwise
-`~/.config/cadence/remote-auth/credential.json`). Directory permissions are 0700
-and file permissions 0600; symlinks and unsafe ownership/permissions are refused.
-Concurrent saves are serialized. Use an absolute `--auth-dir` for isolated
-development or a separate connection. A different issuer/organization cannot
-replace an existing credential; org switching is separate CAD-657 work.
+`~/.config/cadence/remote-auth/credential.json`). A first run — no existing
+tracker, state directory or hosted config — keeps them in its consolidated
+home instead: `<CADENCE_HOME>/config/remote-auth/credential.json`, which is
+`~/.cadence/config/remote-auth/credential.json` by default (CAD-1922), even
+when `XDG_CONFIG_HOME` is exported (writing them there would make the next run
+see two layouts). A run given an explicit `CADENCE_HOME` with
+`XDG_CONFIG_HOME` exported uses `$XDG_CONFIG_HOME/cadence` instead; one given
+`CADENCE_HOME` without it reads a legacy root that already holds something and
+otherwise uses `<CADENCE_HOME>/config`. An installation that already has
+credentials never has them relocated by simply adding a `CADENCE_HOME`: the
+resolver reads the default roots and the named home, not a previous
+consolidated home. Directory permissions are 0700 and file permissions 0600;
+inside the consolidated home a symlinked home root, config root, credential
+directory or credential file is refused rather than followed — legacy config
+roots outside that home are not inspected that way. Concurrent saves are
+serialized. Use an absolute `--auth-dir` for isolated development or a
+separate connection. A different issuer/organization cannot replace an
+existing credential; org switching is separate CAD-657 work.
+
+For a fresh installation the same file lives under the consolidated home:
+`<CADENCE_HOME>/config/remote-auth/cli-<workspace>.json`.
 
 `cadence auth logout` removes the local credential only. Revoke the server
 credential using AgenticOS connected devices. Logout does not clear an environment
 token or terminate remote sessions. Device credentials currently expire after
 30 days; the protocol has no refresh token or token expiry introspection field.
 For imported tokens, expiry is unknown locally and checked by the issuer.
+
+## Managed agents and saved hosted logins (CAD-2148)
+
+**A managed agent credential is not a boundary around the member's saved
+login.** File mode `0600` restricts access by ordinary users with other UIDs,
+not by privileged processes or an unconfined process running as the same user.
+`CADENCE_ALIAS` is an accidental-change guard, not caller authentication. A
+managed CLI currently reads the member's login to mint its claim-bound agent
+credential; some operations and compatibility fallbacks still use the login.
+See the [hosted-workspace guide](guides/hosted-workspace.md) for those paths
+and their attribution.
+
+For a local endpoint, assume a same-user agent can read the member's login
+unless the actual launch and every route to that credential have been
+independently isolated. Cadence does not currently establish that boundary
+for these local endpoints:
+
+- **Codex managed stdio and managed-WS:** no hosted-login isolation is
+  established. The managed-WS loopback endpoint is unauthenticated;
+  loopback is not same-user isolation.
+- **Claude managed worker:** Cadence's Landlock wrapper is for the master;
+  it does not wrap an ordinary managed worker.
+- **Pi or OMP managed worker:** Landlock is opt-in and limits filesystem
+  paths. Explicit extra grants or another allowed path can include the login.
+- **Claude, Devin or Cursor PTY:** a normal same-user launch has no
+  separate-user credential boundary. Real profiles refuse the split-UID path
+  until native session preparation is supported. A reviewer role is refused
+  here: a reviewer is always a headless process or a hosted board session.
+
+Reviewer agents (`role: reviewer`) are the exception for `gh`: a reviewer is
+always a headless process the daemon starts, or a hosted board session, and at
+launch its worker does not inherit the operator's `gh` configuration. The daemon
+pins a private, empty `GH_CONFIG_DIR` under the worker's state directory and
+passes `CADENCE_REVIEWER_GH_TOKEN` as `GH_TOKEN` when the operator has
+provisioned a read-only token. With no such token `gh` is unauthenticated — the
+fail-closed direction, never the operator's account. The token's scope is the
+operator's responsibility; nothing here can verify it. `GH_TOKEN`,
+`GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` are always
+overridden — empty when nothing is provisioned — because `gh` prefers them over
+the config file and an inherited value would defeat the config pin. A role that
+reads as a review (`reviewer`, `Reviewer`, `code-reviewer`, `review`) gets the
+pin; other roles are unchanged. The daemon applies it when it starts the child,
+after the adapter's own scrub, on every local headless launch: Pi/OMP, Claude,
+Codex stdio and Codex managed-WS.
+
+The pin covers `gh` only. The operator's SSH agent and the git credential
+helpers under `HOME` are NOT covered, so a local reviewer can still push as the
+operator. The pin is an environment, not an identity boundary: a same-user
+worker can override its environment or read the operator's saved hosted login
+(the limits above), so only a separate user is a credential boundary. A
+reviewer reports its findings back (turn result, or hosted ticket tools);
+whoever dispatched it posts the PR comment or ticket comment.
+
+The remote Devin and cloud sandbox adapters launch no local actor. That does
+not establish what credentials or access the remote runtime receives.
+
+Pi/OMP Landlock does not gate network access or path-named Unix-socket
+connections and is not a capability sandbox against arbitrary execution.
+The protected split-UID managed-Pi path unconditionally refuses to launch in
+the current implementation. Enabling it needs future implementation and
+external sealed-helper, namespace-policy and restore-lineage pins; supplying
+those pins alone is not enough. Do not treat either an agent credential or a
+`confined` label as proof that a human login is unreachable.
+
+If that login must remain private from an agent, do not rely on same-user
+confinement to protect it. Use a separately controlled account or host, with
+its own authorized identity, only after verifying its filesystem, process and
+socket access. Do not copy the member's login into an agent environment to
+make a hosted command work.
 
 ## Hosted login and remote org transport (CAD-1019, CAD-1329)
 
@@ -109,6 +208,14 @@ the new workspace as the saved default, `--no-open` to print the
 registration URL instead of opening a browser, and `--json` for
 machine-readable success or failure state.
 
+In a session inheriting `CADENCE_ALIAS` or `CADENCE_GRANT_TOKEN`, hosted portal
+login and registration refuse `--use` before starting consent. `org switch`
+refuses before changing the registry. The operator can choose a default in
+their own shell; agents should target their assigned workspace explicitly. This
+is an accidental-change guard, not caller authentication: environment variables
+can be removed or changed, and filesystem permissions govern shared credentials
+and preferences.
+
 To preselect a workspace, use `cadence login <slug>`; the issuer verifies
 that selection and returns the authoritative workspace ID and slug. The
 CLI validates the returned slug and canonical audience before recording
@@ -123,6 +230,17 @@ remove an org binding; a verified re-login replaces it. Use
 `cadence login <slug> --use`) to make it the saved default; without
 `--use`, the current default is unchanged. `--no-open` prints the approval
 URL and code without opening a browser.
+
+After an unmanaged caller's successful browser login or human-readable
+registration, the CLI reports whether that workspace is the saved default.
+Without `--auth-dir`, it gives an explicit `cadence --org <slug> status` next
+step. With `--auth-dir`, it explains that hosted commands use the default
+credential directory; if the directories differ, sign in without `--auth-dir`
+before using those commands.
+Changing the saved default remains a separate choice. If the shell is bound to
+a local Cadence installation, use a shell without that binding for hosted
+commands. A managed agent uses its assignment's workspace binding rather than
+the saved default.
 
 An owner or current member can approve ordinary collaboration. Both the portal
 and explicit org login request `cli.read`, `cli.write`, `wiki.read` and
@@ -145,9 +263,16 @@ requires explicit `--issuer` and `--org`. Browser login uses PKCE and
 short-lived device codes; denial, expiry, mismatched identity or audience
 refuse before recording the org or credential. Org records use the
 verified workspace slug and canonical `https://<slug>.cadencecloud.app`
-endpoint. Credentials are stored at
-`$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600), bound to
-the verified workspace ID and endpoint, and never sent to another host.
+endpoint. Credentials are stored in the resolved config root as
+`remote-auth/cli-<slug>.json` (0600), bound to the verified workspace ID and
+endpoint, and never sent to another host.
+
+An absent org registry permits standalone local operation. A registry or
+declared config/home root that cannot be inspected or parsed, a dangling
+ancestor, or a symlinked registry refuses implicit destination selection
+instead of silently selecting local state. A stale sandbox profile refuses
+rather than reading the host registry. Explicit local state bindings and managed
+callers keep their existing routing.
 
 ### Advanced custom issuer trust
 
@@ -191,7 +316,7 @@ verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
 `message_inbox`, `team_list`, `team_invites`, `issue_new`, `issue_comment`,
 `issue_set`, `team_invite`, `team_revoke_invite`, `team_set_role`,
-`team_remove`, `project_policy`, `message_send` — and
+`team_remove`, `project_policy`, `project_ls`, `project_timeline`, `project_new`, `message_send` — and
 `arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
@@ -223,29 +348,84 @@ The gateway's real refusal shapes (AOS-243):
   proven session loss.
 - A `401 unauthorized` with no reason means the bearer did not resolve, but the
   server cannot say whether it expired or was revoked.
-- `503` means waking or unavailable. Without JSON, the HTTP status still
-  classifies the refusal: `401` is uncertain, `403` is authorization, and any
-  other `5xx` is availability. No server reason or correlation is inferred.
-- One exception: a dispatched mutation verb whose answer is lost, or that
-  answers with a bare `5xx`, is `outcome_unknown` and not availability. The
-  platform records a membership write and its receipt in the same batch, so a
-  `5xx` can follow a write that already committed. This covers `message_send`
-  and the four team mutations (`team_invite`, `team_revoke_invite`,
-  `team_set_role`, `team_remove`); the two team reads commit nothing and stay
-  availability. A `5xx` carrying the platform's own state marker is not a
-  bare one, and a refusal raised by the board's gate before the verb ran is
-  decided before anything was written, so neither is ambiguous.
-- A `503` whose safe `error.code` is `mutation_outcome_uncertain` or
-  `invite_email_uncertain` is the platform stating that a mutation may already
-  have committed. It is its own category, not availability.
+- `503` can mean waking or unavailable. Without JSON, `401` is uncertain,
+  `403` is authorization, and a read's `5xx` is availability; no server
+  reason or correlation is inferred.
+- A dispatched mutation whose answer is lost, whose `2xx` body is not an
+  object, or whose bare `5xx` lacks proof of a pre-forward refusal is
+  `outcome_unknown`. This includes hosted issue, wiki, team, settings and
+  audit mutations. A response can be lost after a write committed. A
+  documented `503` waking response, a board-gate refusal, the native CLI
+  route's `503 tracker_unavailable`, or `501` remains pre-effect; checked
+  `409` conflicts still mean not written. Other state strings and a waking
+  marker on a different status do not prove the call was unforwarded.
+- An issue, wiki upload, team, settings, delivery or audit receipt that fails
+  the operation's correlation checks is also `outcome_unknown`, not proof
+  that nothing was recorded. Team and settings writes require a receipt
+  consistent with the requested change; reconcile an uncertain result using
+  `team list`, `team invites` or the appropriate `settings agents` read.
+  Invite addresses are correlated using the tenant's whitespace and
+  lowercase normalization, without treating a different address as a match.
+  The native grant-request receipt contains only the new request id; the
+  grant-allow receipt does not echo the request id. Their shapes alone cannot
+  prove a request-to-grant correlation; inspect `settings agents grant list`
+  when that correlation is needed.
+- `artifact put` confirms the uploaded bytes and a usable version; when an
+  existing artifact ID was requested, the receipt must name that same ID.
+  A lost or unproved answer is unknown: inspect `artifact find` in the same
+  workspace before repeating an upload that could add another version. The
+  native CLI route's `tracker_unavailable` proof does not apply to this
+  separate upload endpoint or wiki uploads.
+- `artifact submit <id>` has no receipt correlation beyond the board's stage
+  answer. A lost or unproved answer is unknown: repeat the same
+  `artifact submit <id>` in the same workspace, which answers the document's
+  current stage and does not submit it twice. `artifact types` is a read.
+  `document_lifecycle_unavailable` is a final refusal with nothing read or
+  submitted, not an outage.
+- Hosted local-assignment writes use a separate protocol: authorization can be
+  rechecked after a report, claim or reassignment commits. A post-dispatch
+  `401` or `403` therefore does not prove rejection. A failed local activation
+  can itself send a blocked report; if its answer is lost, the result remains
+  unknown alongside the local failure. If a correlated receipt confirms the
+  remote action but local custody cannot be recorded, the error says the action
+  was confirmed and identifies the local failure. This holds for queue, claim,
+  report and reassignment alike. Every message names the workspace, assignment
+  and generation; then per path: queue names its `idempotency_key`; claim and
+  report name `claim_id` (only when the row has one) and `expected_generation`;
+  reassignment names `operation_id` and `expected_generation`. Inspect
+  `cadence agent assignments` in the same selected workspace (it takes the same
+  local lock, so fix the local fault first), and retain those identifiers
+  before deciding whether to retry; do not replay blindly. Repeating the same
+  queue command reuses its `idempotency_key`. Unsupported work kinds are never
+  started locally; a confirmed receipt is recorded before that local refusal.
+- Hosted app release mutations retain the caller's operation UUID. On an
+  unproved response, inspect `app catalog operation` or `reconcile` for that
+  UUID in the same workspace; do not create a new operation blindly.
+- A lost device-token or enrollment response may follow one-time credential
+  issuance. If registration or login receives a session but cannot save it,
+  the CLI reports the issued session and the original authority directory;
+  `register --json` reports `registered: null` when the outcome is unknown.
+  Inspect that directory and consult the issuer owner; a lost secret is not
+  assumed recoverable. An unconfirmed logout keeps the local session and names
+  the exact session for same-session recovery.
+- Publish Web retains its original workspace, request key and intent before
+  dispatch. An unproved upload or action remains unknown; inspect `cadence web
+  status` and reconcile with the original intent, not a different key. A later
+  refusal before dispatch does not settle an earlier uncertain action.
+- A result outbox's `local_pending` state proves local custody only, not remote
+  absence. Inspect the original command and destination before any retry; a
+  remote status or reconciliation route is not assumed to exist.
+- A response whose safe `error.code` is `mutation_outcome_uncertain` or
+  `invite_email_uncertain` states that a mutation may already have committed.
+  It takes precedence over a contradictory waking marker and is never retried.
 
 | Category | When | Next action |
 | --- | --- | --- |
 | `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `binding_mismatch`); `403` with `insufficient_scope` (container path or scope denial); or any `403` with `forbidden` or no safe code | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
 | `authentication` | A terminal session code: `invalid_token`, `invalid_grant`, `session_expired`, `session_revoked`, `lineage_terminal` | `cadence login` again, once. The only case that names login as the known remedy |
 | `uncertain` | `401` with no reason, `envelope_invalid`, or a non-JSON `401` | Not confirmed expiry or revocation. Run the read-only diagnosis before any login. Not retried |
-| `outcome_unknown` | The platform's `mutation_outcome_uncertain` or `invite_email_uncertain`; or a lost answer or a bare `5xx` on a dispatched mutation verb (`message_send`, `team_invite`, `team_revoke_invite`, `team_set_role`, `team_remove`) | The action may have committed. Reconcile with a read for the same explicit `--org` — `team list` or `team invites` for a team mutation, `message_read` for a send — then decide. Never replay the mutation with a fresh envelope first. Not retried |
-| `availability` | any other `5xx` (except a dispatched mutation verb — that is `outcome_unknown`), or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
+| `outcome_unknown` | The platform's `mutation_outcome_uncertain` or `invite_email_uncertain`; or a lost, unusable or unproven `5xx` answer to a dispatched mutation | The action may have committed. Reconcile with a read for the same explicit `--org`, such as `issue show`, `wiki cat`, `team list`, or `audit verdicts`, then decide. Never replay blindly. Not retried |
+| `availability` | A read's `5xx`, a proven pre-forward unavailable response, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
 | `unknown` | Any other answer. A `400`/`409`/`413`/`422` keeps its safe code, such as `payload_too_large` | Report the status and code. Not retried |
 
 ### Where a write or upload is refused (AOS-243)
@@ -288,11 +468,12 @@ issuer's `invalid_token` (401) and `invalid_grant` (400) ask for a fresh login.
 Any other answer keeps the saved login and the pending operation for a later
 retry, with no consent prompt.
 
-A mutation whose outcome is unknown — a dropped connection after dispatch, a
-`5xx` after forward, or the platform's own `mutation_outcome_uncertain` /
-`invite_email_uncertain` — is never replayed automatically. Reconcile with a
-read (`issue show`, `wiki ls`, `team list`, `team invites`) before repeating
-the write.
+Generic hosted CLI mutations whose outcome is unknown are not replayed
+automatically. Reconcile with a read (`issue show`, `wiki ls`, `team list`,
+`team invites`) before repeating the write. Publish Web action creation is a
+separate idempotent protocol: it may resend the identical body and request key
+once to recover the same action, never a new key. If still unknown, inspect
+the saved intent in the same workspace before deciding what to do.
 
 ### Hosted credential status (CAD-1434)
 
@@ -352,8 +533,15 @@ Refusals happen locally, before a byte is sent: `issue new` without
 `--id`/`--status`; `issue comment` with `--author` or `--kind`; `issue
 set` without `--if-rev`, with an empty revision, with `--force`, or
 naming more than one ticket. `--file` bodies are read client-side (`-` = stdin) and
-bounded by the 32 KB cap — never remote paths. `issue
-edit/attach`, provider verbs and operator verbs are not on the wire.
+bounded by the 32 KB cap — never remote paths. `issue edit`, provider verbs
+and operator verbs are not on the wire.
+
+When this build rejects a command locally as unavailable for a hosted org,
+the refusal names the command and confirms that no request was sent. Check the
+hosted CLI documentation for alternatives on that workspace. Switching to a
+local org selects a different tracker; it does not complete the hosted task.
+Authorization refusals and uncertain outcomes after dispatch retain their
+separate semantics.
 
 `issue set` is compare-and-swap: send the `rev` from `issue show`
 (`--if-rev`); a stale revision answers the conflict payload (HTTP 409
@@ -362,17 +550,62 @@ nothing. `--if-rev` is also accepted locally, where it uses the same
 under-lock check; without it, local `issue set` keeps its existing
 unconditional behavior.
 
+For `issue new`, a success receipt must name the requested project and title.
+The tenant trims those inputs; the native route preserves the title. Both
+receipt forms are accepted, but a foreign project or title remains unknown.
+
 A wake retry is the only automatic retry — it fires only on the
-pre-forward `waking` verdict. A timeout, dropped connection or error
-after forward is an explicitly unresolved outcome: the mutation may or
-may not have landed, so reconcile with `issue show`/`issue log` rather
-than re-issuing blindly. A 200 confirms the write was accepted — not
-that the tracker survived a later hard loss; durability is a hosted
-operational concern outside this client feature.
+pre-forward `waking` verdict. A timeout, dropped connection, unusable
+success response or unproven error after forward leaves the mutation
+unresolved. Reconcile with `issue show`/`issue log` rather than re-issuing
+blindly. An accepted receipt does not prove that the tracker survived a
+later hard loss; durability is a hosted operational concern outside this
+client feature.
 
 Each collaborating writer enrolls independently: a separate
 `XDG_CONFIG_HOME` (or separate account/machine) per identity, its own
 `cadence login` grant — credentials are never copied between homes.
+
+### Remote projects (CAD-1999)
+
+A hosted org keeps its own project registry, so a project can exist before
+any ticket does. `cadence project new` registers one; `cadence issue project
+ls` reads the registry, and `cadence issue ls --project <key>` reads its
+tickets (an empty registered project is an empty list).
+
+```sh
+cadence --org acme project new ops --name "Operations" [--prefix OPS]
+cadence --org acme issue project ls
+cadence --org acme issue ls --project ops
+```
+
+`project_new` arguments are exactly `{key, name, prefix?}`. `key` is 1-32
+lowercase letters, digits or hyphens; `name` is the required human label
+(1-200 bytes) and stays distinct from the key; `prefix` is the issue-id
+prefix (1-16 letters/digits starting with a letter, upper-cased, derived
+from the key when absent — letters/digits, up to 16, starting with a
+letter, else `ISSUE`; a local project keeps its own 1-8 character default
+of the key's first three letters/digits). The answer is
+`{project:{key,name,prefix,issues}, duplicate}`. The same key, name and
+prefix is the same project (`duplicate: true`); a key already registered —
+or already present only as its tickets' project — with a different name or
+prefix is `409 project_exists`; a prefix another project already uses is
+`409 prefix_conflict`. `project_ls` also reports the ticket-only projects,
+whose `name` is their key.
+
+Only a live human workspace owner is admitted to `project_new` (`cli.write`);
+`project_ls` is `cli.read`. A managed caller never spends the stored owner
+login for it: `--repo`, `--goal`, `--agent` and `--issue` refuse (a hosted
+org has no checkout or PROJECT.md), `--name` is required, `issue project ls`
+refuses `--sort`/`--limit`/`--fields`, and `issue ls` filters one `--project`
+per call. Nothing is renamed or deleted remotely. A `project_new` answer
+that is lost, unparsable (empty, 204, non-JSON), missing the requested
+project (a `null`, `{ok:true}` or foreign body), carrying a missing, invalid
+or different issue-id prefix, or a 5xx naming no pre-forward state is
+`outcome_unknown`: reconcile with `issue project ls` before repeating,
+since the same key, name and prefix is the same project.
+A board that predates CAD-1999 refuses the two registry verbs as an unknown
+verb — the command ends there, with no local fallback.
 
 ### Remote message send (CAD-1568)
 
@@ -387,7 +620,7 @@ The selected row's UID is checked inside the enqueue transaction; removing
 or replacing that recipient before enqueue refuses the send rather than
 allowing a later generic lookup to redirect it.
 Personal assistants require separate assistant authority and local workers
-use the `local-agent`/local-assignment plane; neither is a remote-send recipient.
+use the local-assignment plane (`agent connect` and the other hosted `agent` verbs); neither is a remote-send recipient.
 Generic member-to-member `send` and the local-worker follow-up journey remain
 refused on this transport. Explicit directory-addressed FYIs use the separate
 [`agent notify` flow](guides/hosted-workspace.md#a-teammates-own-agent-collaboration-flow);
@@ -612,10 +845,21 @@ reviewer rather than sharing one identity.
 The child expires no later than its bridge, which is capped at five minutes.
 After expiry, repeat `browser` and owner consent; `renew` deliberately refuses
 a browser record. This is a short-lived result sender, not persistent team
-login. AOS-68's continuity routes are not mounted and no browser renewal or
-sleep/wake guarantee is implied. Local removal does not revoke the hosted
-credential; the server checks live membership and revocation at receipt.
-Production flags remain off until a separate rollout approves them.
+login. No browser renewal or sleep/wake guarantee is implied. Local removal does
+not revoke the hosted credential; the server checks live membership and
+revocation at receipt. Production flags remain off until a separate rollout
+approves them.
+
+`browser --bind-continuity`, or `remote enrollment bind-continuity
+--enrollment-dir <dir>` afterwards, binds a private continuity key to the child
+where the issuer serves continuity. The key is written before either request,
+and a retry uses the same key. A lost or unproven bind answer exits as an unknown
+outcome: keep the directory and run `bind-continuity` again, which reports the
+binding if it committed. That works only while the child is valid. After it
+expires the directory cannot finish, so repeat `browser` with owner consent in a
+new private enrollment directory. A refusal is definite for the request it
+answers; it does not prove that an earlier attempt, whose answer was lost, did
+not commit.
 
 ## Board sign-in through the device grant (CAD-777)
 
@@ -669,7 +913,8 @@ grant Cadence operator privileges, and no board cookie/assertion guard is weaken
 ### Read-only diagnosis before repeated login (CAD-1434)
 
 Diagnose a hosted refusal in this order. Each step is read-only and none
-requires another login:
+requires another login. `cadence --org <org> doctor` runs the live part of this
+for you (CAD-2111); the steps below remain the detail behind its answer:
 
 1. `cadence org inspect <org>`: read `credential.state`, the scopes, the access
    expiry and the session idle/absolute expiry. `no_credential` or

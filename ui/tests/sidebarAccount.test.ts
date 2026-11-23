@@ -83,6 +83,16 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   assert(!(host.querySelector("aside")?.textContent ?? "").toLowerCase().includes("session"), "no old SESSION block");
   assert(!row.closest(".overflow-y-auto"), "the footer is outside the scrolling nav, so its dialog is not clipped");
   const aside = host.querySelector("aside")!;
+  const asideTokens = aside.className.split(/\s+/);
+  assert(
+    !asideTokens.includes("overflow-x-hidden") && !asideTokens.includes("overflow-hidden"),
+    "aside must not clip the 16rem account popover across the sidebar border",
+  );
+  assert(asideTokens.includes("min-w-0"), "aside keeps min-w-0 so the grid column shrinks to 64px rail cleanly");
+  assert(
+    aside.querySelector(".sidebar-scroll")?.className.split(/\s+/).includes("overflow-x-hidden"),
+    "inner sidebar scroll area retains overflow-x-hidden",
+  );
   const raised = () => /\bz-\[/.test(aside.className) || aside.hasAttribute("data-account-open");
   assert(!raised(), "menu closed: the aside carries no z-index (it must not cover the page's scrims)");
   await React.act(async () => { row.click(); });
@@ -100,10 +110,23 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   // Phone menu: identity has one home, so no writes chip.
   const open = host.querySelector("button[aria-label='Open navigation']") as HTMLButtonElement;
   await React.act(async () => { open.click(); });
-  const menu = host.querySelector("#mobile-navigation");
+  const menu = document.querySelector("#mobile-navigation");
   assert(menu && menu.textContent?.includes("Refresh board"), "phone menu is open");
   assert(!(menu.textContent ?? "").includes("writes:"), "no writes: chip in the phone menu");
+  await React.act(async () => {
+    document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  assert(!document.querySelector('[role="dialog"][aria-label="Search issues and knowledge"]'), "global search cannot open behind the modal drawer");
+  const mobileAccount = menu.querySelector<HTMLButtonElement>(".account-row");
+  assert(mobileAccount, "the drawer exposes its account menu");
+  await React.act(async () => { mobileAccount.click(); });
+  const settings = menu.querySelector<HTMLAnchorElement>('[data-account-menu] [role="dialog"] a');
+  assert(settings, "the drawer account menu links to settings");
+  await React.act(async () => { settings.click(); });
+  assert(!document.querySelector("#mobile-navigation") && location.pathname === "/settings/preferences", "account navigation closes the drawer and opens preferences");
+  assert(!host.querySelector<HTMLElement>("[data-app-shell]")?.inert, "the destination is interactive after navigation");
   done();
+  history.replaceState(null, "", "/");
 }
 
 // CAD-1034: both triggers (sidebar row, phone header avatar) carry the version line.
@@ -176,6 +199,10 @@ for (const state of [
   assert(host.querySelector("aside"), "explicit local anonymous access mounts the workspace");
   assert(privateReads > 0, "admitted local workspace may load private resources");
   assert(!host.querySelector("[data-account-menu]"), "anonymous reader never gains an account identity");
+  assert(
+    host.querySelector("[data-sidebar-footer] > div")?.className.split(/\s+/).includes("truncate"),
+    "signed-out footer truncates cleanly in 64px collapsed rail mode",
+  );
   done();
 }
 

@@ -1,0 +1,58 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.requirements.evaluate",
+    "input": {
+      "manifest": "---\nname: demo\nneeds:\n  requires:\n    contracts: {app-chat: [1], app-storage: [1]}\n---\nbody\n",
+      "target": {
+        "core": "0.3.0",
+        "contracts": {
+          "app-storage": {
+            "majors": [1],
+            "stage": "sandboxed"
+          }
+        }
+      }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "app.requirements.evaluate",
+    "value": {
+      "schema": 1,
+      "ok": false,
+      "compatible": false,
+      "unmet": "app requires host contract 'app-chat' major 1 — this host supports none (unknown contract)",
+      "declared": true,
+      "core": null,
+      "contracts": {
+        "app-chat": [1],
+        "app-storage": [1]
+      },
+      "host": {
+        "core": "0.3.0",
+        "contracts": {
+          "app-storage": [1]
+        }
+      },
+      "checks": [
+        {
+          "kind": "contract",
+          "contract": "app-chat",
+          "required": [1],
+          "supported": [],
+          "stage": null,
+          "ok": false
+        },
+        {
+          "kind": "contract",
+          "contract": "app-storage",
+          "required": [1],
+          "supported": [1],
+          "stage": "sandboxed",
+          "ok": true
+        }
+      ]
+    }
+  }
+}

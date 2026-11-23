@@ -131,7 +131,7 @@ fn settle_social_send(
         }
         if clock.now() >= deadline {
             receipt["send_error"] =
-                json!("not confirmed by AgenticOS yet; check Instagram before retrying");
+                json!("not confirmed by AgenticOS yet; check the account before retrying");
             return Ok(receipt);
         }
         clock.wait(SETTLE_STEP);
@@ -166,6 +166,24 @@ fn owner_grant(
     )
 }
 
+/// CAD-1939: the bindings whose stored receipt publishes to this
+/// destination (and toolkit, when named).
+fn publishing_to(
+    bindings: Vec<BindingProof>,
+    toolkit: Option<&str>,
+    destination_id: &str,
+) -> Vec<BindingProof> {
+    bindings
+        .into_iter()
+        .filter(|proof| {
+            proof.config["publish"]["destination_id"].as_str() == Some(destination_id)
+                && toolkit.is_none_or(|toolkit| {
+                    proof.config["publish"]["toolkit"].as_str() == Some(toolkit)
+                })
+        })
+        .collect()
+}
+
 fn social_effect_id(install: &str) -> String {
     format!(
         "sfx_{}_{}",
@@ -179,6 +197,182 @@ fn social_effect_id(install: &str) -> String {
 }
 
 impl Shared {
+    /// CAD-1939: the live binding of one publish destination of this
+    /// context's send slot. With no destination named, the slot must hold
+    /// exactly one live binding (the single-destination case, unchanged).
+    /// Only rows of this installation, this context's own scope, this slot
+    /// and this bundle are candidates; the destination matches the stored
+    /// receipt (`config.publish`), never a request field. The chosen row
+    /// then passes the same live check as every other slot use.
+    fn social_destination_binding(
+        &self,
+        install: &str,
+        context: &str,
+        slot: &str,
+        destination: Option<(Option<&str>, &str)>,
+        bundle: &Value,
+        files: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Option<BindingProof>> {
+        let all = self.store.app_bindings_for_slot_destinations(
+            install,
+            Some(context),
+            slot,
+            required_str(bundle, "digest")?,
+        )?;
+        if all.is_empty() {
+            return Ok(None);
+        }
+        let mut matching: Vec<BindingProof> = match destination {
+            None if all.len() == 1 => all,
+            None => {
+                return Err(Error::rejected(
+                    "this context publishes to several destinations; name the destination_id",
+                ))
+            }
+            Some((toolkit, id)) => publishing_to(all, toolkit, id),
+        };
+        match matching.len() {
+            0 => Err(Error::rejected(
+                "no live publication binding of this context publishes to that destination",
+            )),
+            1 => self
+                .app_binding_live_proof(
+                    install,
+                    Some(context),
+                    slot,
+                    matching.remove(0),
+                    bundle,
+                    files,
+                )
+                .map(Some),
+            _ => Err(Error::rejected(
+                "several publication bindings of this context publish to that destination",
+            )),
+        }
+    }
+
+    /// CAD-1939: re-check a frozen social effect against ITS OWN destination
+    /// binding: the live binding of the effect's context, slot, toolkit and
+    /// destination must still be send authority at the frozen digest,
+    /// revision and binding id.
+    /// Another destination's binding never stands in for it, and a change
+    /// to another destination's binding never touches it.
+    fn social_effect_binding_current(
+        &self,
+        install: &str,
+        authority: &Value,
+        bundle: &Value,
+        files: &std::collections::BTreeMap<String, String>,
+        changed: &'static str,
+    ) -> Result<()> {
+        let context = required_str(authority, "context_id")?;
+        let slot = required_str(&authority["binding"], "slot")?;
+        // An effect staged before CAD-1939 froze no binding id: it keeps
+        // today's check against the slot's one plain-scope binding.
+        if authority["binding"].get("id").is_none() {
+            let current = self
+                .app_binding_live(install, Some(context), slot, bundle, files)?
+                .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
+            if current.config["mapping"]["effect"] != "send"
+                || current.digest != authority["binding"]["digest"]
+                || current.revision != authority["binding"]["revision"]
+            {
+                return Err(Error::rejected(changed));
+            }
+            return Ok(());
+        }
+        let destination = (
+            Some(required_str(authority, "toolkit")?),
+            required_str(authority, "destination_id")?,
+        );
+        let all = self.store.app_bindings_for_slot_destinations(
+            install,
+            Some(context),
+            slot,
+            required_str(bundle, "digest")?,
+        )?;
+        if all.is_empty() {
+            return Err(Error::rejected("social publish binding is unavailable"));
+        }
+        // No row publishing to the frozen destination means its binding
+        // moved or was retired; two would be ambiguous. Both refuse.
+        let mut matching = publishing_to(all, destination.0, destination.1);
+        if matching.len() != 1 {
+            return Err(Error::rejected(changed));
+        }
+        let current = self.app_binding_live_proof(
+            install,
+            Some(context),
+            slot,
+            matching.remove(0),
+            bundle,
+            files,
+        )?;
+        if current.config["mapping"]["effect"] != "send"
+            || current.digest != authority["binding"]["digest"]
+            || current.revision != authority["binding"]["revision"]
+            || authority["binding"]["id"] != current.id.as_str()
+        {
+            return Err(Error::rejected(changed));
+        }
+        Ok(())
+    }
+
+    /// Screen-driven publish/schedule/reschedule/cancel (CAD-1876). The screen
+    /// names only an effect; the live session, mount and context are proven as
+    /// for staging, the effect must belong to that install and context, and the
+    /// frozen digest and current due epoch come from the stored effect, never
+    /// the request. The existing handlers then run their own checks unchanged.
+    fn screen_social_effect(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        pid: u32,
+    ) -> Result<Value> {
+        let (ctx, context) = self.social_draft_action(params, pid, true)?;
+        let id = required_str(params, "effect_id")?;
+        if social_effect_install(id).as_deref() != Some(ctx.install_id.as_str()) {
+            return Err(Error::rejected(
+                "social draft effect is outside this installation",
+            ));
+        }
+        let records =
+            crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?;
+        let shown = records.app_social_effect_show(id)?;
+        let effect = &shown["effect"];
+        if effect["install_id"].as_str() != Some(ctx.install_id.as_str())
+            || effect["context_id"].as_str() != Some(context.as_str())
+        {
+            return Err(Error::rejected(
+                "social draft effect is outside this screen context",
+            ));
+        }
+        let digest = effect["digest"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("social draft effect has no frozen digest"))?;
+        let requested_due = || {
+            params
+                .get("due_epoch")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| Error::rejected("due_epoch must be an integer"))
+        };
+        let current_due = || {
+            effect["due_epoch"]
+                .as_i64()
+                .ok_or_else(|| Error::rejected("social draft effect is not scheduled"))
+        };
+        match method {
+            "app_social_effect_confirm" => self.confirm_social_publish(id, digest),
+            "app_social_effect_schedule" => {
+                self.schedule_social_draft(id, digest, requested_due()?)
+            }
+            "app_social_effect_reschedule" => {
+                self.reschedule_social_draft(id, digest, current_due()?, requested_due()?)
+            }
+            _ => self.cancel_social_draft(id, digest, current_due()?),
+        }
+    }
+
     fn stage_social_draft_effect(self: &Arc<Self>, params: &Value, pid: u32) -> Result<Value> {
         let expected = [
             "action_token",
@@ -189,8 +383,20 @@ impl Shared {
             "request_id",
             "token",
         ];
+        // CAD-1939: `destination_id` is the one optional field.
+        let destination = match params.get("destination_id") {
+            None => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "social draft effect destination_id must be a non-empty string",
+                ))
+            }
+        };
         if !params.as_object().is_some_and(|o| {
-            o.len() == expected.len() && o.keys().all(|k| expected.contains(&k.as_str()))
+            o.len() == expected.len() + usize::from(destination.is_some())
+                && o.keys()
+                    .all(|k| expected.contains(&k.as_str()) || k == "destination_id")
         }) {
             return Err(Error::rejected(
                 "social draft effect request fields are invalid",
@@ -254,7 +460,14 @@ impl Shared {
                 }
                 need.validate()?;
                 let binding = self
-                    .app_binding_live(&ctx.install_id, Some(&context), slot, bundle, files)?
+                    .social_destination_binding(
+                        &ctx.install_id,
+                        &context,
+                        slot,
+                        destination.map(|id| (None, id)),
+                        bundle,
+                        files,
+                    )?
                     .ok_or_else(|| Error::rejected("social publish binding is absent"))?;
                 if binding.config["mapping"]["effect"] != "send" {
                     return Err(Error::rejected(
@@ -306,7 +519,7 @@ impl Shared {
                 let id = social_effect_id(&ctx.install_id);
                 let approval = format!("social-approval-{}", uuid::Uuid::new_v4().simple());
                 let key = format!("social_{}", uuid::Uuid::new_v4().simple());
-                let frozen = json!({"source":{"kind":"social_draft","draft_id":draft_id,"revision":revision},"install_id":ctx.install_id,"context_id":context,"bundle_digest":ctx.digest,"draft_id":draft_id,"revision":revision,"caption":frozen_draft["caption"],"caption_digest":crate::platform::agenticos_external::publish::caption_digest_of(frozen_draft["caption"].as_str().unwrap_or("")),"asset_id":asset_id,"image_digest":asset_digest,"mime":mime,"size_bytes":size,"toolkit":target.toolkit,"destination_id":target.destination_id,"destination_label":target.destination_label,"timezone":target.timezone,"aos_connection_id":resolved.aos_connection_id,"binding":{"slot":slot,"revision":binding.revision,"digest":binding.digest,"config":binding.config},"effect_id":id,"idempotency_key":key,"approval_id":approval});
+                let frozen = json!({"source":{"kind":"social_draft","draft_id":draft_id,"revision":revision},"install_id":ctx.install_id,"context_id":context,"bundle_digest":ctx.digest,"draft_id":draft_id,"revision":revision,"caption":frozen_draft["caption"],"caption_digest":crate::platform::agenticos_external::publish::caption_digest_of(frozen_draft["caption"].as_str().unwrap_or("")),"asset_id":asset_id,"image_digest":asset_digest,"mime":mime,"size_bytes":size,"toolkit":target.toolkit,"destination_id":target.destination_id,"destination_label":target.destination_label,"timezone":target.timezone,"aos_connection_id":resolved.aos_connection_id,"binding":{"id":binding.id,"slot":slot,"revision":binding.revision,"digest":binding.digest,"config":binding.config},"effect_id":id,"idempotency_key":key,"approval_id":approval});
                 records.app_social_effect_stage(
                     &context,
                     &crate::store::app_social_drafts::EffectStage {
@@ -351,18 +564,13 @@ impl Shared {
             required_str(&authority, "bundle_digest")?,
             |bundle, files| {
                 let context = required_str(&authority, "context_id")?;
-                let slot = required_str(&authority["binding"], "slot")?;
-                let binding = self
-                    .app_binding_live(&install, Some(context), slot, bundle, files)?
-                    .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
-                if binding.config["mapping"]["effect"] != "send"
-                    || binding.digest != authority["binding"]["digest"]
-                    || binding.revision != authority["binding"]["revision"]
-                {
-                    return Err(Error::rejected(
-                        "social publish binding changed since staging",
-                    ));
-                }
+                self.social_effect_binding_current(
+                    &install,
+                    &authority,
+                    bundle,
+                    files,
+                    "social publish binding changed since staging",
+                )?;
                 let draft = records
                     .app_social_draft_show(context, required_str(&authority, "draft_id")?)?;
                 if draft["revision"].as_i64() != authority["revision"].as_i64()
@@ -606,18 +814,13 @@ impl Shared {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 let context = required_str(&authority, "context_id")?;
-                let slot = required_str(&authority["binding"], "slot")?;
-                let current = self
-                    .app_binding_live(&install, Some(context), slot, bundle, files)?
-                    .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
-                if current.config["mapping"]["effect"] != "send"
-                    || current.digest != authority["binding"]["digest"]
-                    || current.revision != authority["binding"]["revision"]
-                {
-                    return Err(Error::rejected(
-                        "social publish binding changed since approval",
-                    ));
-                }
+                self.social_effect_binding_current(
+                    &install,
+                    &authority,
+                    bundle,
+                    files,
+                    "social publish binding changed since approval",
+                )?;
                 let current_draft = records
                     .app_social_draft_show(context, required_str(&authority, "draft_id")?)?;
                 if current_draft["revision"].as_i64() != authority["revision"].as_i64()
@@ -702,18 +905,13 @@ impl Shared {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     let context = required_str(&authority, "context_id")?;
-                    let slot = required_str(&authority["binding"], "slot")?;
-                    let current = self
-                        .app_binding_live(&install, Some(context), slot, bundle, files)?
-                        .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
-                    if current.config["mapping"]["effect"] != "send"
-                        || current.digest != authority["binding"]["digest"]
-                        || current.revision != authority["binding"]["revision"]
-                    {
-                        return Err(Error::rejected(
-                            "social publish binding changed since approval",
-                        ));
-                    }
+                    self.social_effect_binding_current(
+                        &install,
+                        &authority,
+                        bundle,
+                        files,
+                        "social publish binding changed since approval",
+                    )?;
                     let draft_id = required_str(&authority, "draft_id")?;
                     let current_draft = records.app_social_draft_show(context, draft_id)?;
                     if current_draft["revision"] != authority["revision"]
@@ -849,18 +1047,13 @@ impl Shared {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     let context = required_str(authority, "context_id")?;
-                    let slot = required_str(&authority["binding"], "slot")?;
-                    let current_binding = self
-                        .app_binding_live(&install, Some(context), slot, bundle, files)?
-                        .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
-                    if current_binding.config["mapping"]["effect"] != "send"
-                        || current_binding.digest != authority["binding"]["digest"]
-                        || current_binding.revision != authority["binding"]["revision"]
-                    {
-                        return Err(Error::rejected(
-                            "social publish binding changed since staging",
-                        ));
-                    }
+                    self.social_effect_binding_current(
+                        &install,
+                        authority,
+                        bundle,
+                        files,
+                        "social publish binding changed since staging",
+                    )?;
                     let draft = required_str(authority, "draft_id")?;
                     let revision = authority["revision"].as_i64().unwrap_or(0);
                     let current = records.app_social_draft_show(context, draft)?;
@@ -943,6 +1136,24 @@ impl Shared {
                     "key",
                     "origin",
                     "tool_alias",
+                    "destination_id",
+                ],
+                "app_social_effect_confirm" | "app_social_effect_cancel" => &[
+                    "action_token",
+                    "tool_alias",
+                    "token",
+                    "key",
+                    "origin",
+                    "effect_id",
+                ],
+                "app_social_effect_schedule" | "app_social_effect_reschedule" => &[
+                    "action_token",
+                    "tool_alias",
+                    "token",
+                    "key",
+                    "origin",
+                    "effect_id",
+                    "due_epoch",
                 ],
                 "app_effect_show" => &["effect_id"],
                 "app_effect_list" => &["install_id", "context_id", "state", "offset", "read_only"],
@@ -1035,10 +1246,19 @@ impl Shared {
             "app_effect_stage" => {
                 if params.get("proof").is_some() {
                     self.stage_social_draft_effect(params, pid)
+                } else if params.get("destination_id").is_some() {
+                    // CAD-1939: only a social draft stage names a destination.
+                    Err(Error::rejected(
+                        "app release payload has unsupported fields",
+                    ))
                 } else {
                     self.stage_app_artifact(params)
                 }
             }
+            "app_social_effect_confirm"
+            | "app_social_effect_schedule"
+            | "app_social_effect_reschedule"
+            | "app_social_effect_cancel" => self.screen_social_effect(method, params, pid),
             "app_effect_publish_now" => self.publish_social_draft_now(
                 required_str(params, "effect_id")?,
                 required_str(params, "digest")?,

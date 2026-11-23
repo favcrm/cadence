@@ -4,7 +4,8 @@ import { subscribeMasterChanged } from "../../../lib/masterChanged";
 import { useTranslate } from "../../../lib/locale";
 import Button from "../../../ui/Button";
 import Link from "../../../ui/Link";
-import { resourceHref, type ResourceRef } from "../assistantResourceNavigation";
+import { resourceAppView, resourceHref, type ResourceRef } from "../assistantResourceNavigation";
+import { openAppView, useCanvas } from "../../canvas/canvasStore";
 
 interface Action {
   id: string;
@@ -49,13 +50,16 @@ interface MediaRefinePreview {
   quote: MediaQuote;
   estimate_micros: number;
   currency: "USD";
-  ceiling_micros: number;
   allow_once: true;
 }
 interface PermissionRequest {
   reason: string;
   scope: { install_id: string; context_id: string; action_id: string; resource_id: string };
   allow_always: boolean;
+  // The server-stated lifetime of an "Always allow" grant (CAD-1868):
+  // "installation" for a Standalone board's local operator, "session" for a
+  // hosted owner. Absent on cards parked before it existed.
+  allowAlwaysScope: "installation" | "session" | null;
   preview: TagPreview | null;
   recordPreview: RecordPreview | null;
   mediaPreview: MediaRefinePreview | null;
@@ -172,7 +176,7 @@ function parseRecordPreview(value: unknown): RecordPreview | null {
     expected_revision: preview.expected_revision as number,
   };
 }
-const MEDIA_PREVIEW_KEYS = ["asset_id", "revision", "sha256", "title", "artifact_ref", "instructions", "workflow", "slot", "model", "quote", "estimate_micros", "currency", "ceiling_micros", "allow_once"] as const;
+const MEDIA_PREVIEW_KEYS = ["asset_id", "revision", "sha256", "title", "artifact_ref", "instructions", "workflow", "slot", "model", "quote", "estimate_micros", "currency", "allow_once"] as const;
 const MEDIA_QUOTE_KEYS = ["schema", "currency", "unit_price_micros", "units", "total_price_micros", "price_revision"] as const;
 function closedKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const seen = Object.keys(value);
@@ -199,7 +203,6 @@ function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
   const model = text(preview.model, 80);
   const revision = preview.revision;
   const estimate = usdMicros(preview.estimate_micros);
-  const ceiling = usdMicros(preview.ceiling_micros);
   const unit = usdMicros(quote.unit_price_micros);
   const total = usdMicros(quote.total_price_micros);
   const priceRevision = text(quote.price_revision, 128);
@@ -207,9 +210,9 @@ function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
       title === null || artifact === null || instructions === null || slot === null || model === null ||
       preview.workflow !== "refine-image" || preview.currency !== "USD" || preview.allow_once !== true ||
       !Number.isSafeInteger(revision) || (revision as number) < 1 ||
-      estimate === null || ceiling === null || unit === null || total === null || priceRevision === null ||
+      estimate === null || unit === null || total === null || priceRevision === null ||
       quote.schema !== 1 || quote.currency !== "USD" || quote.units !== 1 ||
-      estimate !== total || ceiling !== total || unit !== total) return null;
+      estimate !== total || unit !== total) return null;
   return {
     asset_id: assetId,
     revision: revision as number,
@@ -223,7 +226,6 @@ function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
     quote: { schema: 1, currency: "USD", unit_price_micros: unit, units: 1, total_price_micros: total, price_revision: priceRevision },
     estimate_micros: estimate,
     currency: "USD",
-    ceiling_micros: ceiling,
     allow_once: true,
   };
 }
@@ -232,7 +234,7 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
   const scope = record(v?.scope);
   if (!v || !scope || typeof v.allow_always !== "boolean") return null;
   if (v.preview_kind !== undefined && v.preview_kind !== null && v.preview_kind !== "record" && v.preview_kind !== "media_refine") return null;
-  if (v.preview_kind === "media_refine" && v.allow_always !== false) return null;
+  if (v.allow_always_scope !== undefined && v.allow_always_scope !== "installation" && v.allow_always_scope !== "session") return null;
   const fields = [scope.install_id, scope.context_id, scope.action_id, scope.resource_id];
   if (!fields.every((field) => typeof field === "string" && field.length > 0 && field.length <= 128)) return null;
   const reason = text(v.reason, 300);
@@ -248,6 +250,7 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
       resource_id: scope.resource_id as string,
     },
     allow_always: v.allow_always,
+    allowAlwaysScope: v.allow_always_scope === "installation" || v.allow_always_scope === "session" ? v.allow_always_scope : null,
     preview: v.preview_kind === "media_refine" ? null : parseTagPreview(v.preview),
     recordPreview: v.preview_kind === "media_refine" ? null : parseRecordPreview(v.preview),
     mediaPreview,
@@ -316,7 +319,26 @@ function resultValues(value: unknown, depth = 0): Array<[string, string]> {
   return rows;
 }
 
-function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath }: {
+/** Actions the operator may allow always, each with the label that states
+ *  the grant's real scope: tags per customer, the paid Social actions for the
+ *  whole installation (CAD-1852), and library image refine while the granting
+ *  owner stays signed in on this board (CAD-1868). */
+const STANDING_LABELS: Readonly<Record<string, string>> = {
+  "customer.tags.update": "Always allow for this customer",
+  "social.posts.fetch": "Always allow — any post in this installation",
+  "social.draft.create": "Always allow — any post in this installation",
+  "media.refine.prepare": "Always allow image edits while I'm signed in",
+};
+/** The button label for this card: the server's stated lifetime wins; a card
+ *  without one keeps the hosted wording. */
+function standingLabel(request: PermissionRequest, actionId: string): string {
+  if (actionId === "media.refine.prepare" && request.allowAlwaysScope === "installation") {
+    return "Always allow image edits — this installation";
+  }
+  return STANDING_LABELS[actionId];
+}
+
+function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath, screenTag, appLabel }: {
   operation: Operation;
   installId: string;
   contextId: string;
@@ -324,12 +346,17 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
   decide: (operation: Operation, decision: "allow_once" | "allow_always" | "deny") => void;
   /** The verified canonical `/apps/<key>` path for resource links; null means no link. */
   appPath: string | null;
+  /** The installed screen's tag; with it a resource link can open in the canvas. */
+  screenTag: string | null;
+  appLabel: string | null;
 }) {
   const t = useTranslate();
+  // The canvas shows once the conversation is fed to it; before that there is nothing to open into.
+  const canvasReady = useCanvas().conversation !== null;
   const request = operation.permission_request;
   const requestMatches = request !== null && request.scope.install_id === installId &&
     request.scope.context_id === contextId && request.scope.action_id === operation.action_id &&
-    (!request.allow_always || operation.action_id === "customer.tags.update");
+    (!request.allow_always || Object.hasOwn(STANDING_LABELS, operation.action_id));
   const requiresTagPreview = operation.action_id === "customer.tags.update";
   // A declared record change is decided only from its authoritative typed
   // preview, which must name this request's record. Legacy tag preview and
@@ -343,7 +370,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
   const mediaPreview = request?.mediaPreview ?? null;
   const mediaPreviewReady = mediaKind && mediaPreview !== null && request !== null &&
     mediaPreview.asset_id === request.scope.resource_id && mediaPreview.allow_once === true &&
-    request.allow_always === false && operation.action_id === "media.refine.prepare";
+    operation.action_id === "media.refine.prepare";
   const recordPreviewMissing = recordKind && !recordPreviewReady;
   const previewReady = requiresTagPreview
     ? request?.preview !== null && request?.preview !== undefined
@@ -391,8 +418,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
                   <div><dt>{t("Original")}</dt><dd>{mediaPreview.sha256}</dd></div>
                   <div><dt>{t("Instructions")}</dt><dd>{mediaPreview.instructions}</dd></div>
                   <div><dt>{t("Model")}</dt><dd>{mediaPreview.model}</dd></div>
-                  <div><dt>{t("Price")}</dt><dd>{formatUsdMicros(mediaPreview.quote.total_price_micros)}</dd></div>
-                  <div><dt>{t("Maximum spend")}</dt><dd>{formatUsdMicros(mediaPreview.ceiling_micros)}</dd></div>
+                  <div><dt>{t("Estimated price")}</dt><dd>{t("about {price}").replace("{price}", formatUsdMicros(mediaPreview.quote.total_price_micros))}</dd></div>
                 </dl>
               </div>
             )}
@@ -408,7 +434,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
             )}
             <div className="app-assistant-controls">
               <Button size="sm" variant="primary" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_once")}>{t("Allow once")}</Button>
-              {request.allow_always && !mediaKind && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t("Always allow for this customer")}</Button>}
+              {request.allow_always && Object.hasOwn(STANDING_LABELS, operation.action_id) && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t(standingLabel(request, operation.action_id))}</Button>}
               <Button size="sm" variant="danger" disabled={busy || !previewReady} onClick={() => decide(operation, "deny")}>{t("Deny this request")}</Button>
             </div>
           </>}
@@ -426,7 +452,13 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
         <ul className="app-assistant-resources" aria-label={t("Result resources")}>
           {operation.resource_refs.map((ref, index) => {
             const href = resourceHref(appPath, installId, contextId, ref);
-            return <li key={`${ref.kind}:${ref.id}:${index}`}>{href ? <Link className="lnk text-label" href={href}>{ref.label}</Link> : <span className="text-label text-ink-300">{ref.label}</span>}</li>;
+            const view = resourceAppView(appPath, installId, contextId, screenTag, ref, appLabel);
+            return (
+              <li key={`${ref.kind}:${ref.id}:${index}`}>
+                {href ? <Link className="lnk text-label" href={href}>{ref.label}</Link> : <span className="text-label text-ink-300">{ref.label}</span>}
+                {view && canvasReady ? <button type="button" className="lnk text-label app-assistant-canvas-open" onClick={() => openAppView(view)}>{t("Open in canvas")}</button> : null}
+              </li>
+            );
           })}
         </ul>
       )}
@@ -466,12 +498,15 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide, appPath, connectionRevision, onPendingChange }: {
+export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
   /** The verified canonical `/apps/<key>` path; resource links emit it. Null means no links. */
   appPath: string | null;
+  /** The installed screen's tag, for Open in canvas. Null means no such action. */
+  screenTag: string | null;
+  appLabel: string | null;
   /** The transcript snapshot this scope must reconcile before actions become live. */
   connectionRevision: number;
   onPendingChange: (pending: boolean, reconciledRevision: number | null) => void;
@@ -644,12 +679,12 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
       </div>
       {visible.consent && <p className="text-micro text-ink-400" role="status">{t("Approve the app to enable assistant actions.")}</p>}
       {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>{t("Retry")}</button></p>}
-      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} busy={busy === operation.id || !canDecide} decide={decide} />)}
+      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} screenTag={screenTag} appLabel={appLabel} busy={busy === operation.id || !canDecide} decide={decide} />)}
       {completedOperations.length > 0 && (
         <details className="app-assistant-history">
           <summary className="text-micro">{t("Completed activity")} ({completedOperations.length})</summary>
           <div className="app-assistant-history-list">
-            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} busy={busy === operation.id || !canDecide} decide={decide} />)}
+            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} screenTag={screenTag} appLabel={appLabel} busy={busy === operation.id || !canDecide} decide={decide} />)}
           </div>
         </details>
       )}

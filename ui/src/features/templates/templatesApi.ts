@@ -7,14 +7,15 @@ import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../.
  * one daemon method; the daemon owns scope, the approval digest and every
  * refusal, so this module only shapes requests and surfaces errors.
  *
- *   POST /api/templates/create   {name, docx_base64, spec}
- *   POST /api/templates/revise   {name, base, docx_base64, spec}
+ *   GET  /api/templates/list
+ *   POST /api/templates/create   {name, html | docx_base64, spec}
+ *   POST /api/templates/revise   {name, base, html | docx_base64, spec}
  *   POST /api/templates/approve  {name, version, digest, source}
  *   GET  /api/templates/show?name=&version=
- *   POST /api/documents/create   {template, version, data}
+ *   POST /api/documents/create   {template, version?, data, allow_partial?}
  *   GET  /api/documents/show?id=
- *   GET  /api/documents/export?id=   (DOCX and PDF as base64)
- *   GET  /api/templates/sample?name=&version=   (labelled sample, draft or approved)
+ *   GET|POST /api/documents/export (GET ?id=&format=html; POST {id, format: "pdf"})
+ *   GET  /api/templates/sample?name=&version=&format=   (labelled sample, draft or approved)
  *   POST /api/templates/intake   {file, source}  (read-only reference extraction)
  */
 
@@ -24,10 +25,23 @@ export interface TemplateSummary {
   based_on: number | null;
   status: "draft" | "approved";
   kind: string;
+  source_format?: "docx" | "html" | "authoring";
   content_sha256: string;
   source_sha256: string;
   approved_source: string | null;
   created: number;
+}
+
+export interface TemplateDirectoryEntry {
+  name: string;
+  latest_version: number;
+  latest_approved_version?: number | null;
+  approved_version?: number | null;
+  kind: string;
+  source_format: string;
+  status: string;
+  /** Hosted directory includes immutable version summaries; native directories may not. */
+  versions?: TemplateSummary[];
 }
 
 export interface TemplateSpec {
@@ -40,6 +54,7 @@ export interface TemplateSpec {
 export interface TemplateView {
   template: TemplateSummary;
   spec: TemplateSpec;
+  html?: string;
 }
 
 export interface TemplateList {
@@ -54,6 +69,7 @@ export interface DraftView {
   template_sha256: string;
   kind: string;
   state: "draft";
+  has_unresolved_pricing?: boolean;
   input: unknown;
   context: Record<string, unknown>;
   created: number;
@@ -79,11 +95,15 @@ export interface IntakeStructure {
   styles: string[];
 }
 
+export type IntakeDocxEvidence =
+  | { format: "docx"; blocks: IntakeBlock[]; structure: IntakeStructure }
+  | { format: "docx"; paragraphs: string[]; tables: string[][][]; placeholders: string[] };
+
 /** The provenance record the sandbox writes for one reference. */
 export interface IntakeProvenance {
-  source: { filename: string; sha256: string; preserved_as: string };
+  source: { filename: string; sha256: string; preserved_as: string | null };
   evidence:
-    | { format: "docx"; blocks: IntakeBlock[]; structure: IntakeStructure }
+    | IntakeDocxEvidence
     | { format: "pdf"; pages: { page: number; text: string }[] };
   reconstruction?: { file: string; kind: string; limitations: string[] };
 }
@@ -92,6 +112,7 @@ export interface IntakeView {
   file: string;
   provenance: IntakeProvenance;
   reconstruction_base64?: string;
+  suggested_html?: string;
 }
 
 export interface SampleView {
@@ -99,15 +120,21 @@ export interface SampleView {
   status: "draft" | "approved";
   template: string;
   version: number;
+  content_digest?: string;
   context: Record<string, unknown>;
-  docx_base64: string;
-  pdf_base64: string;
+  docx_base64?: string;
+  pdf_base64?: string;
+  html?: string;
+  html_base64?: string;
 }
 
 export interface ExportView {
   id: string;
-  docx_base64: string;
-  pdf_base64: string;
+  docx_base64?: string;
+  pdf_base64?: string;
+  html?: string;
+  html_base64?: string;
+  has_unresolved_pricing?: boolean;
 }
 
 /** Decode base64 export bytes into a downloadable blob. */
@@ -169,20 +196,28 @@ export function docxBase64(bytes: ArrayBuffer): string {
 }
 
 export const templatesApi = {
+  listAll: () => read<{ templates: TemplateDirectoryEntry[] }>("/api/templates/list"),
   create: (name: string, docx_base64: string, spec: unknown) =>
     write<TemplateView>("/api/templates/create", { name, docx_base64, spec }),
+  createHtml: (name: string, html: string, spec: unknown) =>
+    write<TemplateView>("/api/templates/create", { name, html, spec }),
   revise: (name: string, base: number, docx_base64: string, spec: unknown) =>
     write<TemplateView>("/api/templates/revise", { name, base, docx_base64, spec }),
+  reviseHtml: (name: string, base: number, html: string, spec: unknown) =>
+    write<TemplateView>("/api/templates/revise", { name, base, html, spec }),
   approve: (name: string, version: number, digest: string, source: string) =>
     write<TemplateView>("/api/templates/approve", { name, version, digest, source }),
   list: (name: string) => read<TemplateList>(`/api/templates/show?name=${encodeURIComponent(name)}`),
   version: (name: string, version: number) =>
     read<TemplateView>(`/api/templates/show?name=${encodeURIComponent(name)}&version=${version}`),
-  createDocument: (template: string, version: number, data: unknown) =>
-    write<DraftView>("/api/documents/create", { template, version, data }),
+  createDocument: (template: string, version: number | undefined, data: unknown, allowPartial?: boolean) =>
+    write<DraftView>("/api/documents/create", { template, data, ...(version !== undefined ? { version } : {}), ...(allowPartial ? { allow_partial: true } : {}) }),
   document: (id: string) => read<DraftView>(`/api/documents/show?id=${encodeURIComponent(id)}`),
-  exportDocument: (id: string) => read<ExportView>(`/api/documents/export?id=${encodeURIComponent(id)}`),
+  exportDocument: (id: string, format?: "html" | "pdf" | "docx" | "both") =>
+    format === "pdf"
+      ? write<ExportView>("/api/documents/export", { id, format })
+      : read<ExportView>(`/api/documents/export?id=${encodeURIComponent(id)}${format ? `&format=${encodeURIComponent(format)}` : ""}`),
   intake: (file: string, source: string) => write<IntakeView>("/api/templates/intake", { file, source }),
-  sample: (name: string, version: number) =>
-    read<SampleView>(`/api/templates/sample?name=${encodeURIComponent(name)}&version=${version}`),
+  sample: (name: string, version: number, format?: "html" | "pdf" | "docx" | "both", sampleRows?: number) =>
+    read<SampleView>(`/api/templates/sample?name=${encodeURIComponent(name)}&version=${version}${format ? `&format=${encodeURIComponent(format)}` : ""}${sampleRows !== undefined ? `&sample_rows=${sampleRows}` : ""}`),
 };

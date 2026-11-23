@@ -5,7 +5,52 @@
 //! ([`manifest_preflight`]); [`evaluate`] only decodes, dispatches and encodes.
 //! Domain input only: not caller authentication, and not a host
 //! compatibility decision (the native host stays authoritative for that).
-use crate::app_compat::parse_requires;
+//!
+//! `app.requirements.evaluate` is the one compatibility answer a non-native
+//! host may quote. It parses the exact manifest with the same rules as the
+//! native `needs.requires` parser and evaluates them against a target profile
+//! the *caller* supplies. There is no default profile: the native registry
+//! ([`crate::app_compat::SUPPORTED_CONTRACTS`]) describes this binary, not a
+//! Worker, a tenant or any other host, and is never substituted here. An
+//! absent or malformed target refuses; a valid target that does not meet the
+//! package reports `compatible: false` with the per-requirement checks.
+//!
+//! `app.screen.integrity` runs the one screen declaration/integrity validator
+//! ([`crate::app_screen_decl`]) over a declaration and host-computed
+//! size/sha256 *facts*, so a non-native host answers exactly what the native
+//! install/mount guard answers without shipping asset bodies through the ABI.
+//! The caller also supplies the app's `screens/<tag>/` package count, checked
+//! against the same [`MAX_SCREENS`] the native bundle scan enforces before any
+//! declaration work. The facts and the count are the caller's own report: the
+//! op proves the declaration agrees with them, and the caller must hash the
+//! exact bytes it installed. It grants no install, mount, execution or effect
+//! authority.
+//!
+//! `app.screen.asset-integrity` runs that same check under the host-owned
+//! operation admission: the declaration, assets and `screen_count` are
+//! identical and every shared rule still applies, but each `operations` token
+//! is checked as a bounded typed host token only. Which operations a host
+//! serves, and whether each is a CALL or a host-confirmed SLOT, is that
+//! host's closed vocabulary and permission classification — not the core's.
+//! The value is the same `app` tag and carries no operation grant; the caller
+//! must apply its own operation set and its own grants before publishing,
+//! installing or re-validating a package. `app.screen.integrity` keeps
+//! refusing an operation this core does not serve.
+//!
+//! `agent.form.check` runs the one agent-form validator
+//! ([`crate::agent_form::check`]) the native `master ask-form` gate runs, so
+//! a non-native host refuses exactly what the daemon refuses and builds the
+//! same fallback text and digest. It is a shape check only: who may ask,
+//! in which conversation and on which turn stays the host's own decision.
+//!
+//! `agent.form.compile` takes the agent's flat field list instead of an
+//! envelope, builds the envelope ([`crate::agent_form::compile`]) and runs
+//! the same check, so its value is the check's plus the `form`.
+
+use crate::app_compat::{parse_requires, Compat, ContractStage, HostContracts, SemVer};
+use crate::app_screen_decl::{
+    validate_facts, validate_facts_asset_integrity, ScreenAssetFact, MAX_SCREENS,
+};
 use crate::frontmatter::split_front;
 use crate::issue::{self, ReadinessInput, ReadinessValue, ValidateInput, ValidateValue};
 use crate::works::{self, Decision, Draft, State, Violation};
@@ -13,6 +58,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_yaml::Value as Yaml;
+use std::collections::BTreeMap;
 
 pub const CONTRACT_VERSION: u32 = 1;
 /// Native `MAX_FILE_BYTES` (and the published bundle grammar's `fileBytes`).
@@ -20,13 +66,26 @@ pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 /// A manifest can escape to six bytes per input byte inside the envelope.
 pub const MAX_INPUT_BYTES: usize = 6 * MAX_MANIFEST_BYTES + 4_096;
 
+/// `target.contracts` — a profile names at most this many host contracts,
+/// the same bound the manifest's `requires.contracts` carries.
+const MAX_TARGET_CONTRACTS: usize = 16;
+/// Majors one profile entry may declare — the manifest's own contract bound.
+const MAX_TARGET_MAJORS: usize = 8;
+/// A contract name is a bounded dotted tag, as in the manifest grammar.
+const CONTRACT_NAME_CAP: usize = 32;
+/// A contract major is a small positive integer, as in the manifest grammar.
+const CONTRACT_MAJOR_MAX: u64 = 99;
+
 /// Closed set of refusal codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Code {
     /// The envelope is malformed, oversize, unversioned or names no known op.
     InvalidCommand,
-    /// The manifest is not a well-formed `app.md` with a valid `needs.requires`.
+    /// The manifest is not a well-formed `app.md` with a valid `needs.requires`,
+    /// or a screen package set is not well formed: its app-level screen count,
+    /// its declaration grammar and bounds, or its declared↔supplied size/sha256
+    /// facts disagree.
     InvalidManifest,
 }
 
@@ -58,6 +117,19 @@ pub enum Operation {
     /// Split the frontmatter, then check `needs.requires`.
     #[serde(rename = "app.manifest.preflight")]
     AppManifestPreflight(ManifestPreflightInput),
+    /// Evaluate `needs.requires` against an explicit target profile.
+    #[serde(rename = "app.requirements.evaluate")]
+    AppRequirementsEvaluate(RequirementsInput),
+    /// Check one screen declaration against host-computed asset facts
+    /// (CAD-2008).
+    #[serde(rename = "app.screen.integrity")]
+    AppScreenIntegrity(ScreenIntegrityInput),
+    /// Check the same declaration, facts and `screen_count` with the host
+    /// owning the `operations` vocabulary (CAD-2118/AOS-479). Shared
+    /// structure and byte facts only; the caller still decides operation
+    /// membership and CALL/SLOT grants.
+    #[serde(rename = "app.screen.asset-integrity")]
+    AppScreenAssetIntegrity(ScreenIntegrityInput),
     /// Check an issue id, project key, tags, status and priority.
     #[serde(rename = "issue.validate")]
     IssueValidate(ValidateInput),
@@ -73,6 +145,163 @@ pub enum Operation {
     /// Whether a Works revision is approved material a host may export.
     #[serde(rename = "works.export.check")]
     WorksExportCheck(ExportInput),
+    /// Classify one delivery and answer what it needs to merge (CAD-1946).
+    ///
+    /// The evidence is the caller's own reads: the project's `delivery:`
+    /// section, its recorded approval, the diff rows and the trusted-base list
+    /// texts. Nothing here reads a file or a program, and no input carries a
+    /// class.
+    #[serde(rename = "delivery.requirements.evaluate")]
+    DeliveryRequirementsEvaluate(DeliveryRequirementsInput),
+    /// Check one agent form (an A2UI `createSurface` envelope) against the
+    /// pilot catalog the native daemon enforces (CAD-2331). A form the pilot
+    /// refuses is a `valid: false` value, not an envelope refusal.
+    #[serde(rename = "agent.form.check")]
+    AgentFormCheck(FormCheckInput),
+    /// Compile an agent's flat field list into the A2UI envelope and check it
+    /// (CAD-2345). The same answer shape as `agent.form.check`, plus `form`.
+    #[serde(rename = "agent.form.compile")]
+    AgentFormCompile(FormCompileInput),
+}
+
+/// Input of `agent.form.compile`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FormCompileInput {
+    /// The agent's `FormSpec`: optional `id`, `title`, `intro` and `submit`,
+    /// and 1-12 `fields`. Unknown keys are refused.
+    pub spec: Value,
+}
+
+/// Success value of `agent.form.compile`. When `valid`, `form`, `fallback`
+/// and `digest` are set; otherwise `message` names the refused spec or form
+/// path and rule.
+#[derive(Serialize, JsonSchema)]
+pub struct FormCompileValue {
+    pub valid: bool,
+    /// The compiled `{"version":"1.0","createSurface":{...}}` envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn form_compile(input: &FormCompileInput) -> FormCompileValue {
+    match crate::agent_form::compile(&input.spec) {
+        Ok(form) => FormCompileValue {
+            valid: true,
+            form: Some(form.envelope),
+            fallback: Some(form.fallback),
+            digest: Some(form.digest),
+            message: None,
+        },
+        Err(error) => FormCompileValue {
+            valid: false,
+            form: None,
+            fallback: None,
+            digest: None,
+            message: Some(error.to_string()),
+        },
+    }
+}
+
+/// Input of `agent.form.check`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FormCheckInput {
+    /// The `{"version":"1.0","createSurface":{...}}` envelope.
+    pub form: Value,
+}
+
+/// Success value of `agent.form.check`. When `valid`, `fallback` and
+/// `digest` are set; otherwise `message` names the refused path and rule,
+/// exactly as the native daemon words it.
+#[derive(Serialize, JsonSchema)]
+pub struct FormCheckValue {
+    pub valid: bool,
+    /// The text every surface that does not render the form shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// Lowercase sha256 hex of the envelope's compact JSON; a replay of the
+    /// same form compares equal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn form_check(input: &FormCheckInput) -> FormCheckValue {
+    match crate::agent_form::check(&input.form) {
+        Ok(form) => FormCheckValue {
+            valid: true,
+            fallback: Some(form.fallback),
+            digest: Some(form.digest),
+            message: None,
+        },
+        Err(error) => FormCheckValue {
+            valid: false,
+            fallback: None,
+            digest: None,
+            message: Some(error.to_string()),
+        },
+    }
+}
+
+/// Input of `delivery.requirements.evaluate`.
+///
+/// Every field is evidence the caller retrieved itself: the project's
+/// `delivery:` section, its recorded approval, the diff rows and the
+/// trusted-base list texts. No field carries a class, and nothing here reads a
+/// file, a program or a network answer.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryRequirementsInput {
+    /// The exact `delivery:` section text, or absent when the project has none.
+    pub policy: Option<String>,
+    /// CAD-2715: a stored `delivery:` section as a hosted owner saved it —
+    /// its YAML value or the section with its `delivery:` key — which the
+    /// core wraps with `delivery::section_front`, the wrapper the CLI uses,
+    /// so a host keeps no wrapper of its own. Refused together with `policy`.
+    pub policy_section: Option<String>,
+    /// The project's recorded work approval, when one exists.
+    pub approval: Option<DeliveryApprovalInput>,
+    /// `git diff --raw -z --no-renames <merge-base> <head>` rows.
+    pub changes: Vec<crate::delivery_requirements::Change>,
+    /// `git diff --numstat` total changed lines.
+    pub lines: u64,
+    /// The trusted base's `docs/roles/risk-paths.toml` text.
+    pub risk_paths: Option<String>,
+    /// The trusted base's `docs/roles/one-review-paths.toml` text.
+    pub one_review_paths: Option<String>,
+    /// CAD-2386: the caller proved both list files are absent at the anchor
+    /// (a definite "not found", never a failed read), so the product default
+    /// applies. Absent or `false` keeps today's reading: a missing text is
+    /// unreadable and fails closed. `true` with either text present refuses.
+    #[serde(default)]
+    pub lists_absent: bool,
+    /// CAD-2417: the host vouches that `policy` (or `policy_section`) is
+    /// owner-approved as sent (on hosted Cadence only a live owner can save a
+    /// project's delivery policy).
+    /// A policy that parses is then resolved as approved at its own digest,
+    /// exactly as an `approval` of it would be; an absent or malformed text
+    /// changes nothing. Absent or `false` keeps today's answers; `true` with an
+    /// `approval` refuses as contradictory. Set it only for an owner-written
+    /// host record, never for text read from a repository or a PR head.
+    #[serde(default)]
+    pub policy_owner_approved: bool,
+}
+
+/// The delivery half of a project work approval: the digest it recorded and
+/// the policy it approved.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryApprovalInput {
+    pub digest: String,
+    pub policy: Option<crate::delivery::DeliveryPolicy>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -80,6 +309,221 @@ pub enum Operation {
 pub struct ManifestPreflightInput {
     /// The exact `app.md` text.
     pub manifest: String,
+}
+
+/// Input of `app.requirements.evaluate`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementsInput {
+    /// The exact `app.md` text.
+    pub manifest: String,
+    /// The host being asked. Required: there is no native, hosted or other
+    /// default profile, and a missing one is refused, never assumed.
+    pub target: TargetProfile,
+}
+
+/// Input of `app.screen.integrity` and `app.screen.asset-integrity`.
+///
+/// The declaration is the exact `screens.json` text of one `screens/<tag>/`
+/// package, and `assets` carries host-computed *facts* for the bytes that host
+/// installed — never bodies. `screen_count` is the app-level package count the
+/// same host verified, bounded by the one [`MAX_SCREENS`] the native bundle
+/// scan enforces. The whole envelope is bounded by [`MAX_INPUT_BYTES`] before
+/// any JSON work, and the declaration by the screen contract's own 32 KiB and
+/// 32-asset limits, so no multi-megabyte asset can be encoded through the ABI.
+///
+/// Both operations take exactly this shape and run the same checks. They
+/// differ only in who owns the declaration's `operations` vocabulary:
+/// `app.screen.integrity` resolves each name against the native set and
+/// requires its `records.call`/`records.slot` grant, while
+/// `app.screen.asset-integrity` checks the token bound only and leaves
+/// membership and CALL/SLOT classification to the caller.
+///
+/// **Authority**: the facts and the count are the caller's report. A caller
+/// must compute `size`/`sha256` over the exact installed bytes and count the
+/// `screens/<tag>/` packages it actually installed; the op proves the
+/// declaration agrees with what it was told, and nothing here installs,
+/// mounts, executes or grants effect — or operation — authority.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenIntegrityInput {
+    /// The exact screen declaration (`screens.json`) text.
+    pub manifest: String,
+    /// Flat asset name → the facts the host computed for that installed body.
+    pub assets: BTreeMap<String, ScreenAssetFact>,
+    /// How many `screens/<tag>/` packages the app declares, 1 to
+    /// [`MAX_SCREENS`]. Fixed-width so the same JSON is accepted or refused
+    /// identically on every target: a `usize` field would overflow on a 32-bit
+    /// host and turn one refusal into another. Checked before any declaration
+    /// work, so the hosted answer refuses an over-count app exactly as the
+    /// native bundle scan does.
+    pub screen_count: u64,
+}
+
+/// A host's own capability profile, supplied by the caller. This crate never
+/// substitutes the native registry ([`crate::app_compat::SUPPORTED_CONTRACTS`])
+/// for it: native deliberately provides a different contract set (for example
+/// it does not serve `app-storage`), so copying it would answer for the wrong
+/// host. Contract names are host-owned data here, not entries in this build's
+/// registry — a target that really serves a contract may name it.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TargetProfile {
+    /// The running *host's* version: an exact semantic version. This is the
+    /// platform the package would run on, never the rules-core/wasm release
+    /// that computes the answer — those are different versions, and a caller
+    /// that cannot prove the host's own version must refuse rather than send
+    /// the rules version.
+    pub core: String,
+    /// Every host contract the target provides. An explicit empty map is a
+    /// host that provides none; omitting the field is an absent profile and
+    /// refuses.
+    pub contracts: BTreeMap<String, TargetContract>,
+}
+
+/// One contract a target provides, with the stage it is actually at.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TargetContract {
+    /// The contract majors this target serves, 1 to 8 values in 1..=99.
+    pub majors: Vec<u64>,
+    /// What the target actually does with the contract — never more.
+    pub stage: TargetStage,
+}
+
+/// The stage a target declares for a contract. Closed set: an unknown stage
+/// is a profile this core cannot evaluate and refuses.
+#[derive(Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetStage {
+    /// A strict validator exists; nothing executes the declaration.
+    Validator,
+    /// A consumer renders or runs the descriptor in a sandbox.
+    Sandboxed,
+}
+
+impl From<TargetStage> for ContractStage {
+    fn from(stage: TargetStage) -> Self {
+        match stage {
+            TargetStage::Validator => ContractStage::Validator,
+            TargetStage::Sandboxed => ContractStage::Sandboxed,
+        }
+    }
+}
+
+/// Success value of `app.requirements.evaluate`: the native compatibility
+/// receipt, typed. It is the value [`Compat::report`] produced for the
+/// supplied target, so native and non-native hosts quote one receipt shape.
+///
+/// This type is the *published shape* of the receipt (the op emits the
+/// receipt itself); `receipt_matches_the_published_shape` pins it.
+///
+/// **Authority**: the profile is caller data, not authenticated by this
+/// function. `compatible: true` means "every declared requirement is met by
+/// the exact profile supplied", never "this tenant is authorized to install".
+/// A consumer that admits must first establish that the profile it sends is
+/// its own current, authentic host profile, and must bind the answer to the
+/// exact manifest bytes and profile it supplied.
+///
+/// `ok` here is the receipt's compatibility verdict (as in the native
+/// receipt), not the envelope's `ok`, which only says the op ran.
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementsValue {
+    /// Receipt schema; `1` is the only version.
+    #[schemars(extend("const" = 1))]
+    pub schema: u32,
+    /// Compatibility verdict, always equal to `compatible`.
+    pub ok: bool,
+    /// Whether every declared requirement is met by the target.
+    pub compatible: bool,
+    /// The first unmet requirement in the native wording; `null` when
+    /// compatible. The full set is in `checks`.
+    pub unmet: Option<String>,
+    /// Whether the manifest declared any `needs.requires` at all.
+    pub declared: bool,
+    /// The declared `requires.core` range text; `null` when absent.
+    pub core: Option<String>,
+    /// The declared contract requirements, name → sorted majors.
+    pub contracts: BTreeMap<String, Vec<u64>>,
+    /// The target that was evaluated.
+    pub host: RequirementsHost,
+    /// One entry per checked requirement, in declaration order (core first,
+    /// then contracts by name).
+    pub checks: Vec<RequirementCheck>,
+}
+
+/// The version and contracts of the target that produced a receipt.
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementsHost {
+    /// The target's version, as it participated in precedence.
+    pub core: String,
+    /// The target's declared contracts, name → sorted majors.
+    pub contracts: BTreeMap<String, Vec<u64>>,
+}
+
+/// One requirement and whether the target met it.
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RequirementCheck {
+    /// The manifest's `requires.core` range against the target's version.
+    Core {
+        /// The declared range text.
+        required: Option<String>,
+        /// The target's version.
+        host: String,
+        /// Whether the target's version falls inside the range.
+        ok: bool,
+    },
+    /// One declared contract major list against the target's profile.
+    Contract {
+        /// The contract the manifest requires.
+        contract: String,
+        /// The majors the manifest requires.
+        required: Vec<u64>,
+        /// The majors the target declares for `contract`; empty when the
+        /// target does not provide it.
+        supported: Vec<u64>,
+        /// The target's stage for `contract`; `null` when it does not
+        /// provide it.
+        stage: Option<TargetStage>,
+        /// Whether every required major is supported.
+        ok: bool,
+    },
+}
+
+/// Success value of `app.screen.integrity` and
+/// `app.screen.asset-integrity`: the declared app tag of the one declaration
+/// that passed.
+///
+/// `ok: true` on the envelope only says the check ran; this value says the
+/// declaration and the supplied facts agreed under the shared screen
+/// contract. It is integrity evidence, not install, mount, execution or
+/// effect authority, and it covers the facts the caller supplied — the caller
+/// must have hashed the exact bytes it installed. Under
+/// `app.screen.asset-integrity` it likewise says nothing about operation
+/// membership or CALL/SLOT permission: the caller checks those itself.
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenIntegrityValue {
+    /// The declared app tag (`valid_tag` grammar).
+    pub app: String,
+}
+
+/// Success value of `delivery.requirements.evaluate`: the requirements the
+/// evaluator produced, beside the policy they were computed under. The value is
+/// emitted as produced; this type publishes its shape.
+#[derive(Serialize, JsonSchema)]
+pub struct DeliveryRequirementsValue {
+    pub policy: crate::delivery::DeliveryPolicy,
+    /// `default`, `file` or `approved`.
+    pub policy_source: String,
+    pub policy_digest: String,
+    /// `delivery_unapproved:`/`delivery_error:` when the file's section is not
+    /// the one in force.
+    pub policy_note: Option<String>,
+    pub requirements: crate::delivery_requirements::Requirements,
 }
 
 /// Success value of `app.manifest.preflight`.
@@ -342,6 +786,20 @@ pub fn export_check(input: &ExportInput) -> ExportValue {
 pub enum OpValue {
     #[serde(rename = "app.manifest.preflight")]
     Preflight(ManifestPreflightValue),
+    /// The native receipt [`Compat::report`] produced; its published shape is
+    /// [`RequirementsValue`], and the value is emitted as produced rather than
+    /// re-decoded, so a shape drift is a test failure, never a runtime trap.
+    #[serde(rename = "app.requirements.evaluate")]
+    #[schemars(with = "RequirementsValue")]
+    Requirements(Value),
+    /// The declared app tag of a screen declaration whose assets matched the
+    /// supplied facts (CAD-2008).
+    #[serde(rename = "app.screen.integrity")]
+    ScreenIntegrity(ScreenIntegrityValue),
+    /// The same app tag under the host-owned operation admission
+    /// (CAD-2118/AOS-479); no operation membership is implied.
+    #[serde(rename = "app.screen.asset-integrity")]
+    ScreenAssetIntegrity(ScreenIntegrityValue),
     #[serde(rename = "issue.validate")]
     Validate(ValidateValue),
     #[serde(rename = "issue.readiness")]
@@ -352,6 +810,15 @@ pub enum OpValue {
     Review(ReviewValue),
     #[serde(rename = "works.export.check")]
     Export(ExportValue),
+    /// The delivery-requirements document: the class, the reviews it needs and
+    /// the policy it was decided under (CAD-1946).
+    #[serde(rename = "delivery.requirements.evaluate")]
+    #[schemars(with = "DeliveryRequirementsValue")]
+    DeliveryRequirements(Value),
+    #[serde(rename = "agent.form.check")]
+    FormCheck(FormCheckValue),
+    #[serde(rename = "agent.form.compile")]
+    FormCompile(FormCompileValue),
 }
 
 /// Success response.
@@ -376,6 +843,13 @@ pub struct Refused {
 /// Structural preflight only: admit a well-formed `needs.requires` block and
 /// refuse a malformed one. Host compatibility is never inferred here.
 pub fn manifest_preflight(manifest: &str) -> Result<(), Refusal> {
+    manifest_compat(manifest).map(|_| ())
+}
+
+/// Parse the exact manifest into the same [`Compat`] the native installer
+/// uses: bounded bytes, one frontmatter split, the native `parse_requires`.
+/// A manifest that declares nothing is the legacy shape (`Compat::default`).
+fn manifest_compat(manifest: &str) -> Result<Compat, Refusal> {
     if manifest.len() > MAX_MANIFEST_BYTES {
         return Err(refuse(
             Code::InvalidCommand,
@@ -400,8 +874,192 @@ pub fn manifest_preflight(manifest: &str) -> Result<(), Refusal> {
         Some(Yaml::Mapping(needs)) => Some(needs),
         Some(_) => return Err(refuse(Code::InvalidManifest, "needs must be a mapping")),
     };
-    parse_requires(needs).map_err(|error| refuse(Code::InvalidManifest, error))?;
-    Ok(())
+    parse_requires(needs).map_err(|error| refuse(Code::InvalidManifest, error))
+}
+
+/// A target profile after validation: an owned, canonical form that
+/// [`HostContracts`] can borrow.
+struct CheckedTarget {
+    core: SemVer,
+    /// Name → sorted majors → stage, ordered by name.
+    contracts: Vec<(String, Vec<u64>, ContractStage)>,
+}
+
+/// Validate a caller-supplied profile strictly and fail closed. This is the
+/// only place a compatibility answer's host side enters, so a missing,
+/// unknown or inconsistent profile refuses instead of degrading to a default.
+fn check_target(target: &TargetProfile) -> Result<CheckedTarget, Refusal> {
+    // `SemVer::parse` trims; a profile must carry the version exactly, so
+    // `" 0.3.0"` is malformed rather than silently accepted.
+    if target.core.is_empty() || target.core.trim() != target.core {
+        return Err(refuse(
+            Code::InvalidCommand,
+            "target.core is one exact semantic version, without surrounding whitespace",
+        ));
+    }
+    let core = SemVer::parse(&target.core)
+        .map_err(|error| refuse(Code::InvalidCommand, format!("target.core: {error}")))?;
+    if target.contracts.len() > MAX_TARGET_CONTRACTS {
+        return Err(refuse(
+            Code::InvalidCommand,
+            format!("target.contracts — at most {MAX_TARGET_CONTRACTS} contracts"),
+        ));
+    }
+    let mut contracts = Vec::with_capacity(target.contracts.len());
+    // `BTreeMap` iteration is name-ordered, so the receipt is deterministic.
+    for (name, entry) in &target.contracts {
+        if !valid_contract_name(name) {
+            return Err(refuse(
+                Code::InvalidCommand,
+                format!(
+                    "target.contracts — '{name}' is not a contract name \
+                     ([a-z0-9-], ≤{CONTRACT_NAME_CAP})"
+                ),
+            ));
+        }
+        if entry.majors.is_empty() || entry.majors.len() > MAX_TARGET_MAJORS {
+            return Err(refuse(
+                Code::InvalidCommand,
+                format!("target.contracts.{name}.majors — 1 to {MAX_TARGET_MAJORS} majors"),
+            ));
+        }
+        let mut majors = Vec::with_capacity(entry.majors.len());
+        for &major in &entry.majors {
+            if major == 0 || major > CONTRACT_MAJOR_MAX {
+                return Err(refuse(
+                    Code::InvalidCommand,
+                    format!(
+                        "target.contracts.{name}.majors — {major} is not a contract \
+                         major (1..{CONTRACT_MAJOR_MAX})"
+                    ),
+                ));
+            }
+            if majors.contains(&major) {
+                return Err(refuse(
+                    Code::InvalidCommand,
+                    format!("target.contracts.{name}.majors repeats {major}"),
+                ));
+            }
+            majors.push(major);
+        }
+        majors.sort_unstable();
+        contracts.push((name.clone(), majors, entry.stage.into()));
+    }
+    Ok(CheckedTarget { core, contracts })
+}
+
+/// The contract-name grammar of the manifest's `requires.contracts`: lowercase
+/// ASCII letters, digits and `-`, no leading or trailing `-`, bounded. Kept in
+/// lockstep with `app_compat`'s parser by
+/// `target_names_match_the_manifest_contract_grammar`.
+fn valid_contract_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= CONTRACT_NAME_CAP
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// One delivery classification from the evidence the caller gathered.
+///
+/// The policy, its approval, the diff rows and the trusted lists decide; a
+/// malformed anything is a refusal, never a weaker requirement. The answer
+/// names the resolved policy beside the requirements so a reader can see which
+/// policy produced the class.
+fn delivery_requirements_value(input: &DeliveryRequirementsInput) -> Result<Value, Refusal> {
+    use crate::delivery::{effective, parse, section_front, Approved};
+
+    let text = match (&input.policy, &input.policy_section) {
+        (Some(_), Some(_)) => {
+            return Err(refuse(
+                Code::InvalidCommand,
+                "policy contradicts a supplied policy_section".to_string(),
+            ))
+        }
+        (Some(text), None) => Some(text.clone()),
+        (None, Some(section)) => Some(section_front(section)),
+        (None, None) => None,
+    };
+    let file = match text.as_deref() {
+        None => Ok(None),
+        Some(text) => parse(text).map_err(|error| error.to_string()),
+    };
+    if input.policy_owner_approved && input.approval.is_some() {
+        return Err(refuse(
+            Code::InvalidCommand,
+            "policy_owner_approved contradicts a supplied approval".to_string(),
+        ));
+    }
+    let approved = if input.policy_owner_approved {
+        // CAD-2417: the policy text itself is the owner's approval.
+        match &file {
+            Ok(Some(policy)) => Some(Approved {
+                digest: crate::delivery::digest(policy),
+                policy: Some(policy.clone()),
+            }),
+            _ => None,
+        }
+    } else {
+        input.approval.as_ref().map(|approval| Approved {
+            digest: approval.digest.clone(),
+            policy: approval.policy.clone(),
+        })
+    };
+    let resolved = effective("project", file, approved.as_ref());
+    let requirements = if input.lists_absent {
+        if input.risk_paths.is_some() || input.one_review_paths.is_some() {
+            return Err(refuse(
+                Code::InvalidCommand,
+                "lists_absent contradicts a supplied list text".to_string(),
+            ));
+        }
+        crate::delivery_requirements::classify_without_lists(&resolved, &input.changes, input.lines)
+    } else {
+        let lists = crate::delivery_requirements::TrustedLists {
+            risk_paths: input.risk_paths.as_deref(),
+            one_review: input.one_review_paths.as_deref(),
+        };
+        crate::delivery_requirements::classify(&resolved, &input.changes, input.lines, &lists)
+    };
+    serde_json::to_value(serde_json::json!({
+        "policy": resolved.policy,
+        "policy_source": resolved.source,
+        "policy_digest": resolved.digest,
+        "policy_note": resolved.note,
+        "requirements": requirements,
+    }))
+    .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))
+}
+
+/// The shared half of both screen operations: the app-level package count
+/// bound first, then the one screen validator the operation selects. The two
+/// operations differ only in that selector — the strict fact admission or the
+/// host-owned asset-integrity admission — and in the checked value each
+/// yields.
+fn screen_integrity_check<T>(
+    input: &ScreenIntegrityInput,
+    validate: fn(&str, &BTreeMap<String, ScreenAssetFact>) -> crate::error::Result<T>,
+) -> Result<T, Refusal> {
+    // The app-level package count is checked first, against the same
+    // bound the native bundle scan applies, so an over-count app
+    // refuses before any declaration work on either host. The shared
+    // bound widens to the input's fixed width and the input is never
+    // narrowed, so the answer is identical on 32- and 64-bit hosts.
+    if !(1..=MAX_SCREENS as u64).contains(&input.screen_count) {
+        return Err(refuse(
+            Code::InvalidManifest,
+            format!(
+                "screen_count {} — an app declares 1 to {MAX_SCREENS} screen packages",
+                input.screen_count
+            ),
+        ));
+    }
+    // The one shared screen validator: the declaration's grammar and
+    // bounds, then the declared↔supplied size/sha256 comparison. A
+    // refusal is a package-bytes refusal, not a command-shape one.
+    validate(&input.manifest, &input.assets).map_err(|error| refuse(Code::InvalidManifest, error))
 }
 
 fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
@@ -429,18 +1087,57 @@ fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
     if object.get("v").and_then(Value::as_u64) != Some(CONTRACT_VERSION.into()) {
         return Err(refuse(Code::InvalidCommand, "unsupported contract version"));
     }
-    let request: Request =
-        serde_json::from_value(value).map_err(|error| refuse(Code::InvalidCommand, error))?;
+    let request: Request = serde_json::from_value(value)
+        .map_err(|error| refuse(Code::InvalidCommand, error.to_string()))?;
     match request.operation {
         Operation::AppManifestPreflight(input) => {
             manifest_preflight(&input.manifest)?;
             Ok(OpValue::Preflight(ManifestPreflightValue {}))
         }
+        Operation::AppRequirementsEvaluate(input) => {
+            // After the envelope decodes, the manifest is parsed before the
+            // profile's semantic checks: a malformed package with a decodable
+            // profile stays `invalid_manifest`.
+            let compat = manifest_compat(&input.manifest)?;
+            let target = check_target(&input.target)?;
+            let supported: Vec<(&str, &[u64], ContractStage)> = target
+                .contracts
+                .iter()
+                .map(|(name, majors, stage)| (name.as_str(), majors.as_slice(), *stage))
+                .collect();
+            let host = HostContracts {
+                core: target.core,
+                supported: &supported,
+            };
+            // One receipt source: the native evaluation, not a second copy.
+            // Emitted as produced: `RequirementsValue` publishes the shape.
+            Ok(OpValue::Requirements(compat.report(&host)))
+        }
+        Operation::AppScreenIntegrity(input) => {
+            let checked = screen_integrity_check(&input, validate_facts)?;
+            Ok(OpValue::ScreenIntegrity(ScreenIntegrityValue {
+                app: checked.into_app(),
+            }))
+        }
+        Operation::AppScreenAssetIntegrity(input) => {
+            // Identical input, bounds and declaration pipeline; the operation
+            // tokens are the caller's vocabulary here, so the caller must
+            // still apply its closed operation set and its CALL/SLOT grants.
+            let checked = screen_integrity_check(&input, validate_facts_asset_integrity)?;
+            Ok(OpValue::ScreenAssetIntegrity(ScreenIntegrityValue {
+                app: checked.into_app(),
+            }))
+        }
+        Operation::DeliveryRequirementsEvaluate(input) => Ok(OpValue::DeliveryRequirements(
+            delivery_requirements_value(&input)?,
+        )),
         Operation::IssueValidate(input) => Ok(OpValue::Validate(issue::validate(&input))),
         Operation::IssueReadiness(input) => Ok(OpValue::Readiness(issue::readiness(&input))),
         Operation::WorksDraftValidate(input) => Ok(OpValue::Draft(draft_validate(&input))),
         Operation::WorksReviewCheck(input) => Ok(OpValue::Review(review_check(&input))),
         Operation::WorksExportCheck(input) => Ok(OpValue::Export(export_check(&input))),
+        Operation::AgentFormCheck(input) => Ok(OpValue::FormCheck(form_check(&input))),
+        Operation::AgentFormCompile(input) => Ok(OpValue::FormCompile(form_compile(&input))),
     }
 }
 
@@ -464,5 +1161,508 @@ pub fn evaluate(input: &[u8]) -> Vec<u8> {
             result: value,
         }),
         Err(Refusal { code, message }) => refusal_bytes(code, &message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One `app.requirements.evaluate` envelope.
+    fn request(manifest: &str, target: Value) -> Vec<u8> {
+        let mut input = serde_json::json!({ "manifest": manifest });
+        if !target.is_null() {
+            input["target"] = target;
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "v": CONTRACT_VERSION,
+            "op": "app.requirements.evaluate",
+            "input": input,
+        }))
+        .unwrap()
+    }
+
+    /// A target profile JSON with `(name, majors, stage)` entries.
+    fn profile(core: &str, contracts: &[(&str, &[u64], &str)]) -> Value {
+        let mut table = serde_json::Map::new();
+        for (name, majors, stage) in contracts {
+            table.insert(
+                (*name).to_string(),
+                serde_json::json!({ "majors": majors, "stage": stage }),
+            );
+        }
+        serde_json::json!({ "core": core, "contracts": table })
+    }
+
+    fn call(manifest: &str, target: Value) -> Value {
+        serde_json::from_slice(&evaluate(&request(manifest, target))).unwrap()
+    }
+
+    fn refusal(manifest: &str, target: Value) -> (String, String) {
+        let response = call(manifest, target);
+        assert_eq!(response["ok"], false, "{response}");
+        (
+            response["code"].as_str().unwrap().to_string(),
+            response["message"].as_str().unwrap().to_string(),
+        )
+    }
+
+    const REQUIRES_STORAGE: &str = "---\nname: demo\nneeds:\n  requires:\n    \
+        contracts: {app-storage: [1]}\n---\nbody\n";
+
+    /// The delivery op must answer exactly what the native evaluator answers
+    /// for the same evidence — one implementation, two callers.
+    #[test]
+    fn delivery_requirements_op_matches_the_native_evaluator() {
+        use crate::delivery::{default_policy, effective};
+        use crate::delivery_requirements::{classify, TrustedLists};
+
+        let request = |input: Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "v": CONTRACT_VERSION,
+                "op": "delivery.requirements.evaluate",
+                "input": input,
+            }))
+            .unwrap()
+        };
+        let lists = TrustedLists {
+            risk_paths: Some(""),
+            one_review: Some(""),
+        };
+        let native = classify(
+            &effective("project", Ok(None), None),
+            &[],
+            0,
+            &TrustedLists {
+                risk_paths: Some(""),
+                one_review: Some(""),
+            },
+        );
+        let response: Value = serde_json::from_slice(&evaluate(&request(serde_json::json!({
+            "policy": null,
+            "approval": null,
+            "changes": [],
+            "lines": 0,
+            "risk_paths": "",
+            "one_review_paths": "",
+        }))))
+        .unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(
+            response["value"]["requirements"],
+            serde_json::to_value(&native).unwrap(),
+            "the op and the native evaluator disagree"
+        );
+        assert_eq!(
+            response["value"]["policy"],
+            serde_json::to_value(default_policy()).unwrap()
+        );
+        let _ = lists;
+
+        // A malformed section is the default policy plus its note, and the
+        // strict requirements that note implies — never the file's weaker
+        // reading, and never a silent default.
+        let bad: Value = serde_json::from_slice(&evaluate(&request(serde_json::json!({
+            "policy": "---\ndelivery: {bogus: 1}\n---\n",
+            "approval": null,
+            "changes": [],
+            "lines": 0,
+            "risk_paths": null,
+            "one_review_paths": null,
+        }))))
+        .unwrap();
+        assert_eq!(bad["ok"], true, "{bad}");
+        assert_eq!(bad["value"]["policy_source"], "default");
+        assert!(
+            bad["value"]["policy_note"]
+                .as_str()
+                .is_some_and(|note| note.starts_with("delivery_error:")),
+            "{bad}"
+        );
+        assert_eq!(bad["value"]["requirements"]["class"], "strict", "{bad}");
+        assert_eq!(
+            bad["value"]["requirements"]["operator_approval"], true,
+            "{bad}"
+        );
+    }
+
+    #[test]
+    fn hosted_profile_is_the_only_host_authority() {
+        // `app-storage` is not in this build's native registry: only the
+        // caller's profile may say a host serves it.
+        let compatible = call(
+            REQUIRES_STORAGE,
+            profile("0.3.0", &[("app-storage", &[1], "sandboxed")]),
+        );
+        assert_eq!(compatible["value"]["compatible"], true, "{compatible}");
+        assert_eq!(compatible["value"]["checks"][0]["ok"], true);
+
+        // The same package on a host that does not declare it is refused by
+        // the evaluation, never admitted by a native fallback.
+        let incompatible = call(
+            REQUIRES_STORAGE,
+            profile("0.3.0", &[("app-chat", &[1], "sandboxed")]),
+        );
+        assert_eq!(incompatible["value"]["compatible"], false);
+        assert_eq!(incompatible["value"]["checks"][0]["supported"], json!([]));
+        assert_eq!(incompatible["value"]["checks"][0]["stage"], Value::Null);
+
+        // A contract native ships is not compatible on a target that omits it.
+        let native_only = call(
+            "---\nneeds:\n  requires:\n    contracts: {crm-campaign-work: [1]}\n---\n",
+            profile("0.3.0", &[("app-chat", &[1], "sandboxed")]),
+        );
+        assert_eq!(native_only["value"]["compatible"], false, "{native_only}");
+    }
+
+    #[test]
+    fn receipt_is_the_native_report() {
+        let manifest = "---\nneeds:\n  requires:\n    core: \">=0.2.0 <2.0.0\"\n    \
+            contracts: {app-chat: [1]}\n---\n";
+        let response = call(
+            manifest,
+            profile("0.3.0", &[("app-chat", &[1], "sandboxed")]),
+        );
+        let compat = manifest_compat(manifest).expect("the manifest parses");
+        let host = HostContracts {
+            core: SemVer::parse("0.3.0").unwrap(),
+            supported: &[("app-chat", &[1], ContractStage::Sandboxed)],
+        };
+        assert_eq!(
+            response["value"],
+            compat.report(&host),
+            "the op must quote the native receipt, not a second evaluation"
+        );
+    }
+
+    #[test]
+    fn receipt_matches_the_published_shape() {
+        // The emitted receipt must decode into the type the success schema is
+        // generated from, with no field left over or missing. This is the
+        // compile-time-checked substitute for decoding at runtime.
+        for (manifest, target) in [
+            (
+                "---\nneeds:\n  requires:\n    core: \">=0.2.0\"\n    \
+                 contracts: {app-chat: [1], app-storage: [1]}\n---\n",
+                profile("0.3.0", &[("app-chat", &[1], "sandboxed")]),
+            ),
+            ("---\nname: demo\n---\n", profile("0.3.0", &[])),
+            (
+                "---\nneeds:\n  requires:\n    core: \">=0.4.0\"\n---\n",
+                profile("0.3.0", &[]),
+            ),
+        ] {
+            let response = call(manifest, target);
+            let typed: RequirementsValue =
+                serde_json::from_value(response["value"].clone()).expect("published shape");
+            assert_eq!(
+                serde_json::to_value(&typed).expect("typed receipt serializes"),
+                response["value"]
+            );
+        }
+    }
+
+    /// The screen op quotes the one shared validator: matching facts return the
+    /// declared app tag, a wrong digest refuses as a package-bytes problem, an
+    /// app-level count outside the native bound refuses before declaration work,
+    /// and an asset body cannot ride the ABI at all.
+    #[test]
+    fn screen_integrity_op_quotes_the_shared_validator() {
+        use sha2::{Digest, Sha256};
+
+        let body = "console.log(1);\n";
+        let digest = format!("sha256:{:x}", Sha256::digest(body.as_bytes()));
+        let manifest = serde_json::json!({
+            "contract": "app-screens/v1",
+            "app": "demo",
+            "entry": "client.js",
+            "assets": [{
+                "name": "client.js",
+                "media_type": "text/javascript",
+                "sha256": digest,
+                "size": body.len(),
+            }],
+            "provenance": {
+                "source_digest": digest,
+                "sdk_digest": digest,
+                "toolchain_digest": digest,
+            },
+        })
+        .to_string();
+        let call = |screen_count: u64, assets: Value| -> Value {
+            let request = serde_json::json!({
+                "v": CONTRACT_VERSION,
+                "op": "app.screen.integrity",
+                "input": {
+                    "manifest": manifest,
+                    "assets": assets,
+                    "screen_count": screen_count,
+                },
+            });
+            serde_json::from_slice(&evaluate(&serde_json::to_vec(&request).unwrap())).unwrap()
+        };
+
+        let response = call(
+            1,
+            json!({ "client.js": { "size": body.len(), "sha256": digest } }),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["op"], "app.screen.integrity");
+        assert_eq!(response["value"], json!({ "app": "demo" }));
+
+        // A wrong digest (same length) is a declaration/facts disagreement.
+        let response = call(
+            1,
+            json!({
+                "client.js": { "size": body.len(), "sha256": format!("sha256:{}", "0".repeat(64)) },
+            }),
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["code"], "invalid_manifest");
+
+        // The app-level count is bounded by the one native `MAX_SCREENS`.
+        for screen_count in [0, MAX_SCREENS as u64 + 1] {
+            let response = call(
+                screen_count,
+                json!({ "client.js": { "size": body.len(), "sha256": digest } }),
+            );
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(response["code"], "invalid_manifest", "{screen_count}");
+        }
+
+        // Facts carry no bytes: an extra body field refuses the command.
+        let response = call(
+            1,
+            json!({ "client.js": { "size": body.len(), "sha256": digest, "body": body } }),
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["code"], "invalid_command");
+    }
+
+    /// CAD-2118/AOS-479: the asset-integrity operation admits a host-only
+    /// operation name while the strict op keeps refusing it. Both return the
+    /// same `app` value shape; neither grants operation permission, and every
+    /// other declaration/byte/count refusal still applies.
+    #[test]
+    fn asset_integrity_op_admits_host_operation_names_only() {
+        use sha2::{Digest, Sha256};
+
+        let body = "console.log(1);\n";
+        let digest = format!("sha256:{:x}", Sha256::digest(body.as_bytes()));
+        let manifest = serde_json::json!({
+            "contract": "app-screens/v2",
+            "app": "demo",
+            "entry": "client.js",
+            "assets": [{
+                "name": "client.js",
+                "media_type": "text/javascript",
+                "sha256": digest,
+                "size": body.len(),
+            }],
+            "provenance": {
+                "source_digest": digest,
+                "sdk_digest": digest,
+                "toolchain_digest": digest,
+            },
+            "host_contract": "screen-records.v1",
+            "may": ["records.call"],
+            "operations": ["sends.cancel"],
+        })
+        .to_string();
+        let call = |op: &str, screen_count: u64, assets: Value, manifest: &str| -> Value {
+            let request = serde_json::json!({
+                "v": CONTRACT_VERSION,
+                "op": op,
+                "input": {
+                    "manifest": manifest,
+                    "assets": assets,
+                    "screen_count": screen_count,
+                },
+            });
+            serde_json::from_slice(&evaluate(&serde_json::to_vec(&request).unwrap())).unwrap()
+        };
+        let assets = json!({ "client.js": { "size": body.len(), "sha256": digest } });
+        const ASSET_INTEGRITY: &str = "app.screen.asset-integrity";
+
+        let strict = call("app.screen.integrity", 1, assets.clone(), &manifest);
+        assert_eq!(strict["ok"], false, "{strict}");
+        assert_eq!(strict["code"], "invalid_manifest", "{strict}");
+
+        let admitted = call(ASSET_INTEGRITY, 1, assets.clone(), &manifest);
+        assert_eq!(admitted["ok"], true, "{admitted}");
+        assert_eq!(admitted["op"], ASSET_INTEGRITY);
+        assert_eq!(admitted["value"], json!({ "app": "demo" }));
+
+        // Wrong bytes, a repeated operation entry and the app-level count
+        // bound keep their existing refusals.
+        let wrong = json!({
+            "client.js": { "size": body.len(), "sha256": format!("sha256:{}", "0".repeat(64)) },
+        });
+        let refused = call(ASSET_INTEGRITY, 1, wrong, &manifest);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "invalid_manifest");
+
+        let duplicate = manifest.replace("\"sends.cancel\"", "\"sends.cancel\",\"sends.cancel\"");
+        let refused = call(ASSET_INTEGRITY, 1, assets.clone(), &duplicate);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "invalid_manifest");
+
+        for screen_count in [0, MAX_SCREENS as u64 + 1] {
+            let refused = call(ASSET_INTEGRITY, screen_count, assets.clone(), &manifest);
+            assert_eq!(refused["ok"], false, "{refused}");
+            assert_eq!(refused["code"], "invalid_manifest", "{screen_count}");
+        }
+
+        // Facts still carry no bytes.
+        let with_body =
+            json!({ "client.js": { "size": body.len(), "sha256": digest, "body": body } });
+        let refused = call(ASSET_INTEGRITY, 1, with_body, &manifest);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "invalid_command");
+
+        // A native operation still passes both: the new operation adds an
+        // admission mode, it does not replace the strict one.
+        let native = manifest.replace("\"sends.cancel\"", "\"records.list\"");
+        assert_eq!(
+            call("app.screen.integrity", 1, assets.clone(), &native)["ok"],
+            true
+        );
+        assert_eq!(call(ASSET_INTEGRITY, 1, assets, &native)["ok"], true);
+    }
+
+    #[test]
+    fn legacy_manifest_needs_nothing() {
+        // No `requires:` is the legacy shape natively: nothing declared,
+        // nothing to check, compatible even against an empty profile.
+        let response = call("---\nname: demo\n---\nbody\n", profile("0.3.0", &[]));
+        let value = &response["value"];
+        assert_eq!(response["ok"], true);
+        assert_eq!(value["declared"], false);
+        assert_eq!(value["compatible"], true);
+        assert_eq!(value["unmet"], Value::Null);
+        assert_eq!(value["core"], Value::Null);
+        assert_eq!(value["checks"], json!([]));
+        assert_eq!(value["host"]["contracts"], json!({}));
+    }
+
+    #[test]
+    fn empty_profile_never_admits_a_requirement() {
+        let response = call(REQUIRES_STORAGE, profile("0.3.0", &[]));
+        assert_eq!(response["value"]["compatible"], false, "{response}");
+        assert_eq!(response["value"]["checks"][0]["ok"], false);
+    }
+
+    #[test]
+    fn absent_or_malformed_profiles_refuse() {
+        let manifest = "---\nname: demo\n---\n";
+
+        // Absent: no default profile, not even the native registry.
+        let (code, message) = refusal(manifest, Value::Null);
+        assert_eq!(code, "invalid_command");
+        assert!(message.contains("target"), "{message}");
+
+        // Unknown field inside the profile.
+        let (code, message) = refusal(
+            manifest,
+            json!({ "core": "0.3.0", "contracts": {}, "native": true }),
+        );
+        assert_eq!(code, "invalid_command");
+        assert!(message.contains("native"), "{message}");
+
+        // Unknown stage — a capability this core cannot evaluate.
+        let (code, message) = refusal(manifest, profile("0.3.0", &[("app-chat", &[1], "native")]));
+        assert_eq!(code, "invalid_command");
+        assert!(message.contains("sandboxed"), "{message}");
+
+        // Malformed version, and a version carrying surrounding whitespace.
+        for core in ["0.3", "", " 0.3.0", "0.3.0 "] {
+            let (code, message) = refusal(manifest, profile(core, &[]));
+            assert_eq!(code, "invalid_command", "{core}: {message}");
+            assert!(message.contains("target.core"), "{core}: {message}");
+        }
+
+        // Malformed contract entries.
+        for target in [
+            profile("0.3.0", &[("App-Chat", &[1], "sandboxed")]),
+            profile("0.3.0", &[("app_chat", &[1], "sandboxed")]),
+            profile("0.3.0", &[("-app-chat", &[1], "sandboxed")]),
+            profile("0.3.0", &[("app-chat", &[], "sandboxed")]),
+            profile("0.3.0", &[("app-chat", &[0], "sandboxed")]),
+            profile("0.3.0", &[("app-chat", &[100], "sandboxed")]),
+            profile("0.3.0", &[("app-chat", &[1, 1], "sandboxed")]),
+            profile(
+                "0.3.0",
+                &[("app-chat", &[1, 2, 3, 4, 5, 6, 7, 8, 9], "sandboxed")],
+            ),
+        ] {
+            let (code, _) = refusal(manifest, target);
+            assert_eq!(code, "invalid_command");
+        }
+
+        // Too many contracts for a profile.
+        let many: Vec<(String, Vec<u64>, &str)> = (0..=MAX_TARGET_CONTRACTS)
+            .map(|i| (format!("app-c{i}"), vec![1], "validator"))
+            .collect();
+        let table: serde_json::Map<String, Value> = many
+            .iter()
+            .map(|(name, majors, stage)| {
+                (name.clone(), json!({ "majors": majors, "stage": stage }))
+            })
+            .collect();
+        let (code, _) = refusal(manifest, json!({ "core": "0.3.0", "contracts": table }));
+        assert_eq!(code, "invalid_command");
+    }
+
+    #[test]
+    fn malformed_manifest_stays_invalid_manifest() {
+        // The manifest is parsed before the profile's semantic checks, so a
+        // broken package with a decodable profile is `invalid_manifest`, not
+        // a profile complaint.
+        let (code, message) = refusal(
+            "---\nneeds:\n  requires:\n    core: 2\n---\n",
+            profile("0.3.0", &[]),
+        );
+        assert_eq!(code, "invalid_manifest");
+        assert!(message.contains("needs.requires.core"), "{message}");
+    }
+
+    #[test]
+    fn target_names_match_the_manifest_contract_grammar() {
+        // The profile grammar must not drift from the manifest's. Both sides
+        // run on the same candidates: `parse_requires` through a real manifest
+        // and `valid_contract_name` directly.
+        let long = "a".repeat(CONTRACT_NAME_CAP + 1);
+        let candidates = [
+            "app-chat",
+            "app1",
+            "app--chat",
+            "a",
+            "app_chat",
+            "App-Chat",
+            "-app",
+            "app-",
+            "",
+            long.as_str(),
+        ];
+        for name in candidates {
+            let mut contracts = serde_yaml::Mapping::new();
+            contracts.insert(
+                Yaml::String(name.to_string()),
+                Yaml::Sequence(vec![Yaml::Number(1_u64.into())]),
+            );
+            let mut requires = serde_yaml::Mapping::new();
+            requires.insert(Yaml::String("contracts".into()), Yaml::Mapping(contracts));
+            let mut needs = serde_yaml::Mapping::new();
+            needs.insert(Yaml::String("requires".into()), Yaml::Mapping(requires));
+            let mut front = serde_yaml::Mapping::new();
+            front.insert(Yaml::String("needs".into()), Yaml::Mapping(needs));
+            let manifest = format!("---\n{}---\n", serde_yaml::to_string(&front).unwrap());
+            assert_eq!(
+                manifest_preflight(&manifest).is_ok(),
+                valid_contract_name(name),
+                "contract name {name:?}"
+            );
+        }
     }
 }

@@ -1,0 +1,10 @@
+/* AOS-711: the print page is one app view and nothing else — no board chrome, a white sheet. */
+html, body { background: #fff; margin: 0; }
+.print-view { position: fixed; inset: 0; background: #fff; color: #111; }
+.print-view-frame { width: 100%; height: 100%; }
+.print-view-frame > div, .print-view-frame iframe { width: 100%; height: 100%; }
+.print-view-note { margin: 0; padding: 1rem; font: 14px/1.5 system-ui, sans-serif; }
+@page { size: A4; margin: 12mm; }
+@media print {
+  .print-view { position: static; height: 273mm; }
+}

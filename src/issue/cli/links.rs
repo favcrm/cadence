@@ -84,10 +84,12 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             refs,
             unrefs,
             attach,
+            body,
             acceptance,
             comment_file,
             author,
             force,
+            if_rev,
         } => {
             // The master has no stdin and no free file reads (CAD-614),
             // and `edit` is not on its allowlist; refuse here too so a
@@ -95,6 +97,11 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             if crate::master::caller_is_master() {
                 return Err(Error::rejected(
                     "issue edit is not available to the master — use the single-purpose verbs",
+                ));
+            }
+            if body.is_some() || if_rev.is_some() {
+                return Err(Error::usage(
+                    "issue edit --body and --if-rev are hosted-only",
                 ));
             }
             let is_stdin = |f: &Option<PathBuf>| f.as_ref().is_some_and(|p| p.as_os_str() == "-");
@@ -139,6 +146,46 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             print_json(&write::attach(&pm, id, file)?);
             Ok(0)
         }
+        IssueAction::Artifact { id, name } => {
+            use std::os::unix::fs::OpenOptionsExt;
+            if !crate::issue::model::valid_artifact_name(name) {
+                return Err(Error::rejected("invalid artifact name"));
+            }
+            let pm = open_pm()?;
+            let (_, issue_dir) = write::issue_dir(&pm, id)?;
+            let dir = issue_dir.join("artifacts");
+            if !crate::issue::board::is_real_dir(&dir) {
+                return Err(Error::rejected("artifact unavailable"));
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(dir.join(name))?;
+            let meta = file.metadata()?;
+            if !meta.is_file() || meta.len() > pm.config.artifact_max_bytes {
+                return Err(Error::rejected("artifact unavailable"));
+            }
+            let mut bytes = Vec::with_capacity(meta.len() as usize);
+            file.take(pm.config.artifact_max_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > pm.config.artifact_max_bytes {
+                return Err(Error::rejected("artifact unavailable"));
+            }
+            crate::output::write_stdout(&bytes)?;
+            Ok(0)
+        }
+        // A verdict's authority is the hosted reviewer's own enrollment and
+        // the artifact digest the tenant stores, so it has no local form.
+        IssueAction::Review { .. } => Err(Error::rejected(
+            "reviewing a task artifact needs a hosted org — nothing was written",
+        )),
+        // The tenant store holds them; a local tracker has no equivalent yet.
+        IssueAction::Say { .. }
+        | IssueAction::Messages { .. }
+        | IssueAction::MessagesRead { .. } => Err(Error::rejected(
+            "ticket messages need a hosted org for now — pass `--org <org>`; nothing was \
+                 read or written",
+        )),
         _ => unreachable!("links"),
     }
 }

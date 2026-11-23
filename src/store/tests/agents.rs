@@ -623,7 +623,14 @@
             host: "h.example.test".into(),
         };
         let opened = auth
-            .open_public_bound_with_intent(user, ("jti", 4_000_000_000), "ua", realm, 1_000, |_| Ok(()))
+            .open_public_bound_with_intent(
+                user,
+                ("jti", 4_000_000_000),
+                "ua",
+                (realm, None),
+                1_000,
+                |_| Ok(()),
+            )
             .unwrap()
             .unwrap();
         assert_matches(

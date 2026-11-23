@@ -177,6 +177,10 @@ pub(super) fn is_plain_ref(b: &str) -> bool {
 /// remote first (normalised both sides), then declared path against
 /// the build checkout. Returns the project key and the local clone to
 /// walk — the declared `path`, else the build root itself.
+///
+/// A repo several projects register (CAD-2001) names no single project:
+/// the clone is still returned so drift can be measured, but the key is
+/// empty rather than the first claimant's.
 pub(super) fn build_repo_match(projects: &[project::Project]) -> Option<(String, PathBuf)> {
     let build_remote = if BUILD_REMOTE == "unknown" {
         None
@@ -192,6 +196,7 @@ pub(super) fn build_repo_match(projects: &[project::Project]) -> Option<(String,
                 .unwrap_or_else(|_| PathBuf::from(BUILD_ROOT)),
         )
     };
+    let mut hits: Vec<(String, PathBuf)> = Vec::new();
     for p in projects {
         for r in &p.repos {
             let remote_hit = match (&build_remote, &r.remote) {
@@ -210,9 +215,19 @@ pub(super) fn build_repo_match(projects: &[project::Project]) -> Option<(String,
                     .clone()
                     .or_else(|| build_root.clone())
                     .unwrap_or_else(|| PathBuf::from("."));
-                return Some((p.key.clone(), repo));
+                if !hits.iter().any(|(key, _)| key == &p.key) {
+                    hits.push((p.key.clone(), repo));
+                }
             }
         }
     }
-    None
+    let repo = hits.first()?.1.clone();
+    let mut keys: Vec<&str> = hits.iter().map(|(key, _)| key.as_str()).collect();
+    keys.sort();
+    keys.dedup();
+    let key = match keys.as_slice() {
+        [one] => (*one).to_string(),
+        _ => String::new(),
+    };
+    Some((key, repo))
 }

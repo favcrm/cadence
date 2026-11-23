@@ -40,25 +40,29 @@ interface Row {
   snippet?: string;
 }
 
-/**
- * Card-field matches, ranked: exact ID, then ID prefix, then title, then
- * owner or tag. Completed, dropped and container cards are included.
- */
-function rankIssues(issues: IssueCard[], query: string, project: string | null): IssueCard[] {
+/** Rank scoped card-field matches while preserving their original order within a rank. */
+function rankIssues(issues: IssueCard[], query: string, project: string | null): { matches: IssueCard[]; ambiguous: boolean; compactQuery: boolean } {
   const q = query.trim().toLowerCase();
-  if (!q) return [];
+  if (!q) return { matches: [], ambiguous: false, compactQuery: false };
+  const separated = /^([a-z][a-z0-9]{0,15})(?:[\t\n\v\f\r ]+|[\t\n\v\f\r ]*[-\u2010-\u2014][\t\n\v\f\r ]*)([0-9]{1,9})$/.exec(q);
+  const candidate = separated ? `${separated[1]}-${separated[2]}` : null;
+  const compact = /^[a-z][a-z0-9]*[0-9]$/.test(q);
   const scored: [number, IssueCard][] = [];
+  let compactExact = 0;
   for (const card of issues) {
     if (project !== null && card.project !== project) continue;
     const id = card.id.toLowerCase();
+    const compactId = compact ? id.replace("-", "") : "";
+    if (compact && compactId === q) compactExact++;
     let rank = 0;
     if (id === q) rank = 1;
-    else if (id.startsWith(q)) rank = 2;
-    else if (card.title.toLowerCase().includes(q)) rank = 3;
-    else if ([card.owner ?? "", ...(card.tags ?? [])].join(" ").toLowerCase().includes(q)) rank = 4;
+    else if (id === candidate || (compact && compactId === q)) rank = 2;
+    else if (id.startsWith(q) || (candidate !== null && id.startsWith(candidate)) || (compact && compactId.startsWith(q))) rank = 3;
+    else if (card.title.toLowerCase().includes(q)) rank = 4;
+    else if ([card.owner ?? "", ...(card.tags ?? [])].join(" ").toLowerCase().includes(q)) rank = 5;
     if (rank) scored.push([rank, card]);
   }
-  return scored.sort((a, b) => a[0] - b[0]).map(([, card]) => card);
+  return { matches: scored.sort((a, b) => a[0] - b[0]).map(([, card]) => card), ambiguous: compactExact > 1, compactQuery: compact };
 }
 
 /** The project the route is in, or null where none applies. */
@@ -84,20 +88,20 @@ export default function HeaderSearch({
   issues,
   route,
   navHref,
-  hosted = false,
+  noWiki = false,
 }: {
   issues: ResourceState<IssueCard[]>;
   route: Route;
   navHref: (route: Route) => string;
-  /** A hosted tenant does not serve /api/wiki; the Knowledge group is absent there. */
-  hosted?: boolean;
+  /** The board does not serve /api/wiki (see wikiAvailable); the Knowledge group is absent there. */
+  noWiki?: boolean;
 }) {
   const t = useTranslate();
   const currentProject = routeProject(route);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [choice, setChoice] = useState<Choice>("all");
-  const [active, setActive] = useState(0);
+  const [selection, setSelection] = useState<{ key: string; href: string; explicit: boolean } | null>(null);
   const [wikiState, setWikiState] = useState<WikiState>({ status: "idle", key: "" });
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const mobileTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -114,17 +118,20 @@ export default function HeaderSearch({
   // Binds the route's default scope in the same event as opening.
   const openSearch = () => {
     setChoice(defaultChoice);
+    setSelection(null);
     setOpen(true);
   };
 
   // Cmd/Ctrl+K opens the dialog, or refocuses it when already open.
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+      if (!e.defaultPrevented && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
         if (open) inputRef.current?.focus();
-        else {
+        // A modal already owns the board's keyboard focus.
+        else if (!document.querySelector("dialog:modal, [aria-modal='true']")) {
           setChoice(defaultChoice);
+          setSelection(null);
           setOpen(true);
         }
       }
@@ -159,7 +166,7 @@ export default function HeaderSearch({
   // Knowledge: debounced; a request id drops replies superseded by a newer query or scope.
   useEffect(() => {
     requestRef.current += 1;
-    if (!open || !trimmed || hosted) {
+    if (!open || !trimmed || noWiki) {
       setWikiState({ status: "idle", key: wikiKey });
       return;
     }
@@ -179,14 +186,14 @@ export default function HeaderSearch({
         });
     }, DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [open, trimmed, wikiRoot, wikiKey, hosted]);
+  }, [open, trimmed, wikiRoot, wikiKey, noWiki]);
 
-  const issueMatches = useMemo(
+  const { matches: issueMatches, ambiguous, compactQuery } = useMemo(
     () => rankIssues(issues.data ?? [], trimmed, projectKey),
     [issues.data, trimmed, projectKey],
   );
   const issueShown = issueMatches.slice(0, LIMIT);
-  const knowledge = hosted
+  const knowledge = noWiki
     ? { status: "idle" as const, key: wikiKey }
     : wikiState.key === wikiKey
       ? wikiState
@@ -206,13 +213,22 @@ export default function HeaderSearch({
         ? contextHref(project, { screen: "wiki", mode: "browse", path: hit.path, query: null })
         : navHref({ screen: "wiki", mode: "browse", path: hit.path, query: null }),
       title: hit.name,
-      meta: `${project ?? t("wiki")} · ${t(hitKind(hit))} · ${hit.path}`,
+      meta: `${project ?? t("wiki")} · ${t(hitKind(hit) ?? "file")} · ${hit.path}`,
       snippet: hit.snippet,
     };
   });
   const rows = [...issueRows, ...hitRows];
 
-  useEffect(() => setActive(0), [trimmed, projectKey]);
+  const selectionKey = `${query}\u0000${projectKey ?? ""}`;
+  const requiresExplicit = ambiguous || (compactQuery && issues.data === null && issues.status !== "failed");
+  const selected = selection?.key === selectionKey && (!requiresExplicit || selection.explicit) ? selection : null;
+  const defaultActive = rows.length > 0 && !requiresExplicit ? 0 : -1;
+  const active = selected ? rows.findIndex((row) => row.href === selected.href) : defaultActive;
+  const setActive = (index: number, explicit = true) => {
+    const row = rows[index];
+    if (row) setSelection({ key: selectionKey, href: row.href, explicit });
+  };
+  const hoverRow = requiresExplicit ? undefined : (index: number) => setActive(index, false);
 
   const close = () => {
     returnFocusRef.current = true;
@@ -250,10 +266,10 @@ export default function HeaderSearch({
     if (e.target !== inputRef.current) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActive((i) => Math.min(i + 1, Math.max(rows.length - 1, 0)));
+      setActive(Math.min(active + 1, rows.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setActive((i) => Math.max(i - 1, 0));
+      setActive(active < 0 ? 0 : Math.max(active - 1, 0));
     } else if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey && rows[active]) {
       e.preventDefault();
       choose(rows[active]);
@@ -272,7 +288,7 @@ export default function HeaderSearch({
         onClick={openSearch}
       >
         <IconSearch size={14} />
-        <span>{t(hosted ? "Search issues…" : "Search issues and knowledge…")}</span>
+        <span>{t(noWiki ? "Search issues…" : "Search issues and knowledge…")}</span>
         <kbd>Ctrl K</kbd>
       </button>
       <div className="lg:hidden">
@@ -280,7 +296,7 @@ export default function HeaderSearch({
           ref={mobileTriggerRef}
           type="button"
           className="header-icon header-search-icon"
-          aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
+          aria-label={t(noWiki ? "Search issues" : "Search issues and knowledge")}
           aria-expanded={open}
           onClick={openSearch}
         >
@@ -296,7 +312,7 @@ export default function HeaderSearch({
             className="card header-search-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
+            aria-label={t(noWiki ? "Search issues" : "Search issues and knowledge")}
             onKeyDown={onKeyDown}
           >
             <div className="header-search-controls">
@@ -309,10 +325,10 @@ export default function HeaderSearch({
                 aria-controls="header-search-results"
                 aria-activedescendant={rows[active] ? `header-search-row-${active}` : undefined}
                 aria-autocomplete="list"
-                aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
-                placeholder={t(hosted ? "Search issues by ID, title, owner or tag…" : "Search issues by ID, title, owner or tag, or knowledge…")}
+                aria-label={t(noWiki ? "Search issues" : "Search issues and knowledge")}
+                placeholder={t(noWiki ? "Search issues by ID, title, owner or tag…" : "Search issues by ID, title, owner or tag, or knowledge…")}
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => { setSelection(null); setQuery(e.target.value); }}
               />
               <div className="header-search-scope" role="group" aria-label={t("Search scope")}>
                 {currentProject !== null && (
@@ -320,7 +336,7 @@ export default function HeaderSearch({
                     type="button"
                     className={`header-search-chip${projectKey !== null ? " on" : ""}`}
                     aria-pressed={projectKey !== null}
-                    onClick={() => setChoice("route")}
+                    onClick={() => { if (choice !== "route") setSelection(null); setChoice("route"); }}
                   >
                     {currentProject}
                   </button>
@@ -329,7 +345,7 @@ export default function HeaderSearch({
                   type="button"
                   className={`header-search-chip${projectKey === null ? " on" : ""}`}
                   aria-pressed={projectKey === null}
-                  onClick={() => setChoice("all")}
+                  onClick={() => { if (choice !== "all") setSelection(null); setChoice("all"); }}
                 >
                   {t("All projects")}
                 </button>
@@ -338,14 +354,16 @@ export default function HeaderSearch({
 
             {!trimmed ? (
               <p className="header-search-guide text-label text-ink-400">
-                {hosted
+                {noWiki
                   ? t("Type an issue ID, title word, owner or tag. Issue search covers card fields only, not descriptions or comments.")
                   : t("Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.")}
+                {" "}{t("For example, CAD-123 or CAD123.")}
               </p>
             ) : (
               <div id="header-search-results" className="header-search-results">
                 <section aria-labelledby="header-search-issues-h">
                   <h3 id="header-search-issues-h" className="slabel">{t("Issues")}</h3>
+                  {ambiguous && <p className="text-label text-ink-400">{t("More than one issue matches this ID. Select a result or type the ID with its hyphen.")}</p>}
                   {issues.status === "failed" && issues.data === null ? (
                     <p className="text-label text-fail" role="alert">{issues.error ? fill(t("Issues could not load: {error}"), { error: issues.error }) : t("Issues could not load.")}</p>
                   ) : issues.data === null ? (
@@ -358,15 +376,15 @@ export default function HeaderSearch({
                         </p>
                       )}
                       {issueMatches.length === 0 ? (
-                        <p className="text-label text-ink-400">{projectKey ? fill(t("No issues match “{q}” in {p}."), { q: trimmed, p: projectKey }) : fill(t("No issues match “{q}”."), { q: trimmed })}</p>
+                        <p className="text-label text-ink-400">{projectKey ? <>{fill(t("No issues match “{q}” in {p}."), { q: trimmed, p: projectKey })}{" "}{t("Try All projects.")}</> : fill(t("No issues match “{q}”."), { q: trimmed })}</p>
                       ) : (
-                        <ResultList rows={issueRows} offset={0} active={active} onHover={setActive} onPick={choose} />
+                        <ResultList rows={issueRows} offset={0} active={active} onHover={hoverRow} onFocus={setActive} onPick={choose} />
                       )}
                     </>
                   )}
                 </section>
 
-                {!hosted && <section aria-labelledby="header-search-knowledge-h">
+                {!noWiki && <section aria-labelledby="header-search-knowledge-h">
                   <h3 id="header-search-knowledge-h" className="slabel">{t("Knowledge")}{projectKey ? ` · ${projectKey}` : ""}</h3>
                   {knowledge.status === "loading" || knowledge.status === "idle" ? (
                     <p className="text-label text-ink-400">{t("Searching knowledge…")}</p>
@@ -377,7 +395,7 @@ export default function HeaderSearch({
                   ) : hitCount === 0 ? (
                     <p className="text-label text-ink-400">{fill(t("No knowledge matches “{q}”."), { q: trimmed })}</p>
                   ) : (
-                    <ResultList rows={hitRows} offset={issueRows.length} active={active} onHover={setActive} onPick={choose} />
+                    <ResultList rows={hitRows} offset={issueRows.length} active={active} onHover={hoverRow} onFocus={setActive} onPick={choose} />
                   )}
                 </section>}
 
@@ -399,12 +417,14 @@ function ResultList({
   offset,
   active,
   onHover,
+  onFocus,
   onPick,
 }: {
   rows: Row[];
   offset: number;
   active: number;
-  onHover: (index: number) => void;
+  onHover?: (index: number) => void;
+  onFocus: (index: number) => void;
   onPick: (row: Row) => void;
 }) {
   return (
@@ -418,8 +438,8 @@ function ResultList({
             role="option"
             aria-selected={active === index}
             className={`header-search-row${active === index ? " is-active" : ""}`}
-            onMouseEnter={() => onHover(index)}
-            onFocus={() => onHover(index)}
+            onMouseEnter={onHover ? () => onHover(index) : undefined}
+            onFocus={() => onFocus(index)}
           >
             <Link
               href={row.href}

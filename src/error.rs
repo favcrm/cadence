@@ -123,6 +123,16 @@ impl Error {
     pub fn unknown(message: impl Into<String>) -> Self {
         Self::OutcomeUnknown(message.into())
     }
+    /// An uncertain outcome with a stable code. The wire kind is `unknown`,
+    /// never a rejection: the caller must reconcile, not retry blindly.
+    pub fn unknown_coded(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "unknown",
+            code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
@@ -159,6 +169,16 @@ impl Error {
     pub fn gate_coded(code: &'static str, message: impl Into<String>) -> Self {
         Self::Structured(Structured {
             kind: "gate",
+            code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
+    /// An explicit provider refusal with a stable code. The wire kind stays
+    /// `provider` (CAD-1868: the typed 402 `insufficient_funds`).
+    pub fn provider_coded(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "provider",
             code: code.to_string(),
             message: message.into(),
             revision: None,

@@ -42,6 +42,7 @@ equal(screenFailurePane({ kind: "refused", status: 503, code: "app_bundle_missin
 equal(screenFailurePane({ kind: "refused", status: 503, code: "app_bundle_missing" }, true), { title: FILES_MISSING, actions: ["retry", "reinstall"] }, "an installable missing bundle also reinstalls");
 equal(screenFailurePane({ kind: "refused", status: 404, code: "screen_unavailable" }), { title: SCREEN_MISSING, actions: ["retry"] }, "screen_unavailable retries");
 equal(screenFailurePane({ kind: "refused", status: 404, code: "not_found" }), { title: SCREEN_MISSING, actions: ["retry"] }, "not_found retries");
+equal(screenFailurePane({ kind: "refused", status: 403, code: "owner_required" }), { title: "Only workspace owners can open {app}.", actions: [] }, "a role-refused mount names owners");
 equal(screenFailurePane({ kind: "refused", status: 503, code: "capability_unavailable" }), { title: DID_NOT_LOAD, actions: ["retry"] }, "an unclassified refusal retries");
 for (const kind of ["invalid_receipt", "handshake_timeout", "frame_unavailable"] as const) {
   equal(screenFailurePane({ kind }), { title: DID_NOT_LOAD, actions: ["retry"] }, `${kind} retries`);

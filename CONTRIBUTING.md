@@ -43,22 +43,36 @@ For UI changes, run `bun run --cwd ui typecheck`, `bun run --cwd ui test:url-sta
 frontend test directory. Use `bun run --cwd ui test` when that alias is available in
 the checked-out package scripts.
 
-Select the affected Rust test binary and a meaningful filter. For example,
-after admission and isolation are configured:
+Select the affected Rust test binary and a meaningful filter, and run it on
+Boat:
 
 ```bash
-rtk proxy cargo test --locked --features test-seam --test daemon <FILTER> -- --test-threads 2
+scripts/boat-build -- cargo test --locked --features test-seam --test daemon <FILTER> -- --test-threads 1
 ```
 
-Set `CARGO_BUILD_JOBS=4`. Keep host-wide sccache enabled; only use the documented
-one-off `RUSTC_WRAPPER=` diagnostic after a strange build failure. Shared model
-changes also require compilation of all affected targets: a narrow behavior
-selection cannot find an incompatible initializer in another test crate.
+`scripts/boat-build` keeps one sandbox for this worktree. The first run sends a
+shallow git snapshot plus the tracked patch; later runs send the patch only.
+`git add` new files first. Prefer `cargo check` when you only need a
+compile. The sandbox lifecycle, snapshot and quota are in
+[DEV-CYCLE.md](docs/DEV-CYCLE.md) ("One entry point, executed on Boat").
+Required CI, review and operator approval stay authoritative.
 
-On a shared Cadence host, obtain build/test admission before compilation.
-Use an authenticated `cadence build-slot run test -- <command>` when your native
-endpoint can hold a slot. Callers without a pane use an authorized project
-recipe through `cadence build-slot launch <RECIPE> --project cadence --worktree <LANE>`.
+A local compile is the exception, for a binary that has to run here (`cargo
+run`, a board smoke, a release artifact). It still takes a build slot and
+`CARGO_BUILD_JOBS=4`. `CADENCE_PRE_PUSH_LOCAL=1` is the emergency path for
+the push hook. Keep host-wide sccache enabled for that local exception
+(`SCCACHE_DIR` forced to `~/.cache/sccache` in `~/.cargo/config.toml` so a
+lane tmp `XDG_CACHE_HOME` cannot steal port 4226); only use the documented
+one-off `RUSTC_WRAPPER=` diagnostic after a strange local build failure. The
+Boat sandbox does not use the host sccache. Shared model changes also require
+compilation of all affected targets: a narrow behavior selection cannot find
+an incompatible initializer in another test crate.
+
+On a shared Cadence host, a local exception obtains build/test admission
+before compilation. Use an authenticated `cadence build-slot run test --
+<command>` when your native endpoint can hold a slot. Callers without a pane
+use an authorized project recipe through `cadence build-slot launch <RECIPE>
+--project cadence --worktree <LANE>`.
 Check `cadence build-slot --help` and the project's configured recipes; recipe
 names are project configuration, not universal commands. The admitted focused
 test recipe for external reviewers — exact `build.recipes` proposal, fixed
@@ -77,14 +91,22 @@ every script check is compilation-free.
 
 ## Fixture isolation and test tiers
 
-For ordinary hosted feedback on one retained case, run that case through the
-live suite instead: `scripts/cadence-nextest -E 'test(=name)'` locally, or the
-`stress` workflow on ephemeral runners for repeated runs. The former
-`test-feedback` workflow and its CAD-663/CAD-650 allowlist are gone — those two
-cases' cargo test targets were retired with the legacy integration suite, so
-the workflow could not have run. This route does not retry required CI or
-replace local build admission; the separate mutation workflow still requires a
+For feedback on one retained case, run it through the live suite:
+`scripts/cadence-nextest -E 'test(=name)'` locally, or the `stress` workflow on
+ephemeral runners for repeated runs. This does not retry required CI or replace
+local build admission; the separate mutation workflow still requires a
 deliberate assertion failure.
+
+Do not loop a flaky test more than 10 times on the shared host. Use the stress
+workflow instead (the branch must contain `stress.yml`):
+
+```bash
+gh workflow run stress.yml -R favcrm/cadence --ref <branch> -f filter='test(=name)' \
+  -f features=test-seam -f count=30 -f copies=4 -f load=true -f stop_on_fail=false
+```
+
+Then watch the run and download `stress-failures-*`. `count` is 1-200, `copies`
+1-8, with a 120-minute cap per copy.
 
 Fixture daemons and boards use a short `/tmp/<lane>` root for HOME, XDG paths
 and TMPDIR: Unix socket paths cannot exceed 107 bytes. Pass through the real
@@ -126,7 +148,7 @@ mkdir -m 700 -p "$XDG_CONFIG_HOME"
 unset CADENCE_TOKEN CADENCE_ISSUER CADENCE_ORG
 bun install --cwd ui --frozen-lockfile
 bun run --cwd ui build
-# On a shared host, obtain the documented build-slot admission first.
+# Local exception: the board process runs on this host. Take a build slot.
 CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 ./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
 bun run --cwd ui dev --host 127.0.0.1
@@ -139,6 +161,7 @@ board. The Vite development command refuses a missing or out-of-range
 leave Vite running, then rebuild and restart the sandbox:
 
 ```bash
+# Same local exception: the rebuilt binary has to run on this host.
 CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 ./target/debug/cadence sandbox down dev
 ./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
@@ -186,23 +209,28 @@ an isolated case uses `scripts/cadence-nextest --features test-seam --test <TARG
 These retain pinned checksums, zero retries, non-empty selections and JUnit
 evidence. Judge check exit codes through `rtk proxy`, not filtered output.
 
+Editing `skills/cadence/SKILL.md` goes through review like any rule file.
+`src/skill.rs` embeds it; daemon startup and `cadence update` sync it to hosts and
+`cadence skill install` repairs a host. Verify the source, installed and embedded
+copies, since an older binary can overwrite a local edit. Notify affected agents
+at their next task boundary; a running session does not reload it.
+
 Update the owning contract and examples with behavior changes. Check navigation
 with `python3 scripts/check-doc-links.py`; it uses Git's tracked inventory, so
 an ignored local document cannot satisfy a link. It checks paths, not external
 sites or heading fragments.
 
 Post the six-field reflection (expected, evidence, cause, correction, lesson,
-next) to the ticket. Hand independent review the exact committed head and PR.
-Only a passing review pinned to that head permits merge-queue enrollment:
-`gh pr merge <PR> -R favcrm/cadence --auto --squash --match-head-commit <REVIEWED-SHA>`.
-Disable auto-merge before changing a queued head. The full delivery and
-production-safety rules remain in [AGENTS.md](AGENTS.md).
+next) to the ticket. Hand a fresh-session review (a non-author session with no
+inherited context, including a subagent; AGENTS.md "Review") the exact committed
+head and PR, with a brief that points at the change and not at your conclusions.
 
-After your PR merges, preview recorded merged lanes with
-`cadence issue finish --merged --dry-run`; the preview removes nothing. Finish
-only your recorded lane with `cadence issue finish <ID> --worktree <path>`.
-Its activity, clean-tree and commit-survival guards may refuse cleanup. An
-unrecorded lane needs its owner's review; its directory name is not ownership
-proof. To clear local `origin/*` tracking refs for branches gone from the
-remote, run `git fetch --prune origin`. This does not remove local branches or
-worktrees, or prove that either is safe to remove.
+Delivery is the operator's act. You check readiness with
+`cadence --org <org> delivery check` and hand the PR over; you never approve,
+enqueue or run `gh pr merge`, except `gh pr merge <n> --disable-auto` before
+changing a queued head (AGENTS.md "Merging"). The route, the Browser QA rule and the
+auto-merge precaution before changing a queued head are in AGENTS.md "Review"
+and "Merging".
+
+After your PR merges, finish the ticket and release your lane as AGENTS.md
+"Finish" describes. That is the one procedure; do not follow another copy.

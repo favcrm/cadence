@@ -213,8 +213,10 @@ fn hash_dir(dir: &Path, h: &mut DefaultHasher) {
 }
 
 /// An issue folder's stamp: `issue.md`, `comments/` and `artifacts/` —
-/// the three things [`board::load_issue`] reads.
-fn folder_stamp(dir: &Path) -> u64 {
+/// the three things [`board::load_issue`] reads. The shared entity diff and a
+/// reader's own card diff use the same stamp, so a body/comment/artifact edit
+/// that leaves the card text unchanged still moves it.
+pub(super) fn folder_stamp(dir: &Path) -> u64 {
     let mut h = DefaultHasher::new();
     hash_meta(&dir.join("issue.md"), &mut h);
     hash_dir(&dir.join("comments"), &mut h);
@@ -735,7 +737,11 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
     let agents = agents_payload_typed(state_dir, list.clone(), jobs.as_ref());
     let agents_fp = list.map(|l| {
         let rows = serde_json::to_value(&agents.agents).expect("agent rows serialize");
-        value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&rows)]))
+        value_fp(&json!([
+            rows_fp(&l["agents"]),
+            rows_fp(&rows),
+            &agents.profiles
+        ]))
     });
     let outcomes = jobs
         .as_ref()
@@ -809,6 +815,14 @@ struct Watch {
 /// A heartbeat the stream loop drops: a failed send is how the watcher
 /// learns a client hung up.
 pub(super) const HEARTBEAT: &str = "";
+
+/// The end of one watcher write batch on the subscriber channel. Every frame
+/// a tick produces is sent under the hub lock, but a receiver can wake after
+/// the first of them, so "nothing more is queued right now" proves nothing.
+/// A reader that must decide a whole tick at once (the member stream) waits
+/// for this marker; a reader that forwards each frame as it comes (the
+/// operator stream) drops it. It is never written to a socket.
+pub(super) const BATCH_END: &str = "\u{0}batch_end";
 
 fn frame(event: &str, data: &Value) -> Arc<str> {
     format!("event: {event}\ndata: {data}\n\n").into()
@@ -1123,10 +1137,11 @@ impl Model {
         project: Option<&str>,
         snap: &DaemonSnap,
         readable: Option<&BTreeSet<String>>,
+        scoped_jobs: Option<(&board::JobOutcomes, u64)>,
     ) -> BoardRead {
         let mut t = lock(&self.tracker);
         t.refresh(&pm.dir);
-        let jobs = (&snap.outcomes, snap.jobs_fp.unwrap_or(0));
+        let jobs = scoped_jobs.unwrap_or((&snap.outcomes, snap.jobs_fp.unwrap_or(0)));
         let (_, views) = t.views(pm, project, Some(jobs), readable);
         BoardRead {
             views,
@@ -1143,13 +1158,19 @@ impl Model {
     /// the agent strip.
     pub(super) fn board(&self, pm: &Pm, project: Option<&str>) -> BoardRead {
         let snap = self.daemon_snap();
-        self.board_with(pm, project, &snap, None)
+        self.board_with(pm, project, &snap, None, None)
     }
 
     /// Restrict raw issues before deriving relationships, roll-ups and card counts.
-    pub(super) fn board_readable(&self, pm: &Pm, readable: &BTreeSet<String>) -> BoardRead {
+    pub(super) fn board_readable(
+        &self,
+        pm: &Pm,
+        project: Option<&str>,
+        readable: &BTreeSet<String>,
+        scoped_jobs: (&board::JobOutcomes, u64),
+    ) -> BoardRead {
         let snap = self.daemon_snap();
-        self.board_with(pm, None, &snap, Some(readable))
+        self.board_with(pm, project, &snap, Some(readable), Some(scoped_jobs))
     }
 
     /// `/api/agents`, with the snapshot's [`Self::freshness`] keys:
@@ -1189,7 +1210,7 @@ impl Model {
 
     // CI observations move delivery state without moving an agent or
     // tracker issue. Atomic replacement must invalidate cached decisions.
-    fn delivery_stamp(&self) -> u64 {
+    pub(super) fn delivery_stamp(&self) -> u64 {
         let mut h = DefaultHasher::new();
         hash_meta(&self.state_dir.join("delivery.json"), &mut h);
         h.finish()
@@ -1451,9 +1472,14 @@ impl Model {
     }
 
     fn master_fp(&self) -> Option<u64> {
-        client::rpc(&self.state_dir, "master_stamp", json!({}))
-            .ok()
-            .map(|l| value_fp(&l))
+        self.master_stamp().map(|l| value_fp(&l))
+    }
+
+    /// The raw `master_stamp` behind a `master` frame. A reader that may see
+    /// only part of it (a signed member sees the turn, not the operator's
+    /// transcript) decides from these fields itself.
+    pub(super) fn master_stamp(&self) -> Option<Value> {
+        client::rpc(&self.state_dir, "master_stamp", json!({})).ok()
     }
 
     fn monitoring_fp(&self) -> Option<u64> {
@@ -1468,7 +1494,7 @@ impl Model {
         let Ok(pm) = Pm::at(&self.pm_dir) else {
             return (HashMap::new(), HashMap::new());
         };
-        let read = self.board_with(&pm, None, snap, None);
+        let read = self.board_with(&pm, None, snap, None, None);
         let by_id = read.by_id();
         let ctx = read.ctx(&by_id);
         let mut cards = HashMap::new();
@@ -1537,6 +1563,10 @@ impl Model {
             if frames.is_empty() {
                 continue;
             }
+            // The marker is part of the same lock-held send, so a subscriber
+            // that sees it has seen every frame of this tick — no scheduling
+            // assumption about how far the sender has got.
+            frames.push(Arc::<str>::from(BATCH_END));
             let mut hub = lock(&self.hub);
             hub.subs
                 .retain(|tx| frames.iter().all(|f| tx.send(f.clone()).is_ok()));
@@ -1641,11 +1671,17 @@ impl Model {
         if !snap.failed && (jobs || agents || error_moved) {
             // Bindings and totals can move without an agent row moving.
             let served = self.served_agents(&snap);
+            // The frame is shared by every stream reader, and the profile's
+            // job is the operator's: it never rides the stream.
+            let mut profiles = served["profiles"].clone();
+            for profile in profiles.as_array_mut().into_iter().flatten() {
+                profile["job"] = Value::Null;
+            }
             frames.push(frame(
                 "agent_meta",
                 &json!({
                     "daemon": served["daemon"], "totals": served["totals"],
-                    "by_issue": served["by_issue"],
+                    "by_issue": served["by_issue"], "profiles": profiles,
                     "snapshot_age_secs": served["snapshot_age_secs"],
                     "stale": served["stale"], "refresh_error": served["refresh_error"],
                 }),
@@ -1710,6 +1746,7 @@ mod tests {
                 ..AgentTotals::default()
             }),
             by_issue: BTreeMap::new(),
+            profiles: vec![],
         }
     }
 
@@ -2134,6 +2171,43 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_meta_frame_carries_no_profile_job() {
+        let fetch: Fetch = Box::new(|_| DaemonSnap {
+            at: Instant::now(),
+            outcomes: Default::default(),
+            jobs_fp: Some(1),
+            agents: AgentsPayload {
+                profiles: vec![serde_json::json!({
+                    "id": "dev-1", "alias": "dev-1", "job": "PRIVATE STANDING JOB",
+                    "runtimes": [],
+                })],
+                ..versioned(1)
+            },
+            agents_fp: Some(1),
+            approvals: Arc::new(Default::default()),
+            failed: false,
+            agents_down: false,
+        });
+        let model = Arc::new(Model::new(
+            Path::new("/nonexistent/state"),
+            Path::new("/nonexistent/pm"),
+            fetch,
+        ));
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        let meta = frames
+            .iter()
+            .find(|f| f.starts_with("event: agent_meta\n"))
+            .unwrap_or_else(|| panic!("no agent_meta: {frames:?}"));
+        assert!(
+            meta.contains("dev-1"),
+            "the profile still rides the frame: {meta}"
+        );
+        assert!(!meta.contains("PRIVATE STANDING JOB"), "job leaked: {meta}");
+    }
+
+    #[test]
     fn the_stream_reports_an_unreachable_daemon_over_last_good_rows() {
         let (model, _) = fake_daemon_failing(|_| {}, None, |n| n == 2);
         let mut watch = blank_watch();
@@ -2345,6 +2419,7 @@ mod tests {
                                 resume: None,
                             }],
                         )]),
+                        profiles: vec![],
                     }
                 },
                 agents_fp: (!failed).then_some(1),
@@ -2713,6 +2788,9 @@ mod tests {
                     "app_runs",
                     "outbox",
                     "app_outputs",
+                    // CAD-1950: a project's recorded policy is its own read,
+                    // not a collection the entity frame patches.
+                    "projectPolicy",
                 ][..],
             ),
             (

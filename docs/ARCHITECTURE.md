@@ -49,8 +49,8 @@ existing authority recheck and absolute deadline.
 
 | Path | Responsibility / first read |
 |---|---|
-| [src/main.rs](../src/main.rs) | Binary entry point, process error/exit handling; delegates commands to CLI. |
-| [src/cli/mod.rs](../src/cli/mod.rs), [src/cli/](../src/cli/) | CLI definitions, routing and launch composition; command behavior split into verb modules. |
+| [src/main.rs](../src/main.rs), [crates/cadence-cli/Cargo.toml](../crates/cadence-cli/Cargo.toml) | Binary entry point (`cadence-cli` crate compiling `src/main.rs` and `tests/suite.rs`), process error/exit handling; delegates commands to CLI. |
+| [src/cli/mod.rs](../src/cli/mod.rs), [src/cli/](../src/cli/) | CLI definitions, routing and launch composition (`cadence-cli`); command behavior split into verb modules. |
 | [src/briefing.rs](../src/briefing.rs) | Briefing modes, document and cloud bootstrap rendering, role carry-forward and opt-in AGENTS.md block. |
 | [src/client.rs](../src/client.rs), [src/proto.rs](../src/proto.rs) | Local RPC client and protocol vocabulary. |
 | [src/remote_auth.rs](../src/remote_auth.rs), [src/remote_enrollment.rs](../src/remote_enrollment.rs), [src/remote_result_outbox.rs](../src/remote_result_outbox.rs), [src/cli/remote_result.rs](../src/cli/remote_result.rs) | Distinct issuer sign-in, protected hosted child enrollment, immutable offline result custody and explicit sender CLI. The sender uses the issuer-bound record and original outbox pin; it does not enable a production gateway or grant daemon authority. See [issuer/enrollment contract](REMOTE-AUTH.md). |
@@ -64,7 +64,7 @@ existing authority recheck and absolute deadline.
 | [src/review.rs](../src/review.rs), [src/audit/](../src/audit/mod.rs) | Revision-bound review evidence and merge/audit reconstruction. |
 | [src/slots.rs](../src/slots.rs), [src/slots/persistence.rs](../src/slots/persistence.rs), [src/doctor/host/mod.rs](../src/doctor/host/mod.rs), [src/doctor/host/](../src/doctor/host/) | Slots: live build/test admission and coordination; persistence: serialization, strict commit, rejected-file evidence preservation and restart recovery. Doctor: partitioned host/session ownership/resource checks. |
 | [src/session.rs](../src/session.rs), [src/worktree.rs](../src/worktree.rs), [src/proc.rs](../src/proc.rs) | Session/worktree operations and process helpers. |
-| [src/ui.rs](../src/ui.rs), [src/overview.rs](../src/overview.rs), [src/overview/sources.rs](../src/overview/sources.rs), [src/overview/assembly.rs](../src/overview/assembly.rs), [src/overview/monitoring.rs](../src/overview/monitoring.rs) | UI: HTTP/API surface. Overview root: orchestration and shared read model; sources: bounded acquisition with owned fresh or borrowed reused snapshots; assembly: project/agent/actionable rows with contextual tracker/runtime/Git reads retained; monitoring: monitor health and durable alert projections. |
+| [src/ui.rs](../src/ui.rs), [src/ui/crate_root.rs](../src/ui/crate_root.rs), [crates/cadence-ui/Cargo.toml](../crates/cadence-ui/Cargo.toml), [src/overview.rs](../src/overview.rs), [src/overview/sources.rs](../src/overview/sources.rs), [src/overview/assembly.rs](../src/overview/assembly.rs), [src/overview/monitoring.rs](../src/overview/monitoring.rs) | UI: client/lifecycle seam (`src/ui.rs`) and HTTP/API server (`cadence-ui` crate mounting `src/ui/crate_root.rs`). Overview root: orchestration and shared read model; sources: bounded acquisition with owned fresh or borrowed reused snapshots; assembly: project/agent/actionable rows with contextual tracker/runtime/Git reads retained; monitoring: monitor health and durable alert projections. |
 | [ui/src/features/](../ui/src/features/), [ui/src/lib/](../ui/src/lib/), [ui/src/ui/](../ui/src/ui/) | React feature screens, shared frontend libraries and UI primitives. |
 | [tests/](../tests/) | Retired in CAD-1073 clean-slate. The integration suite and fixtures were removed; only the safety-floor binary remains. |
 | [scripts/](../scripts/), [.config/nextest.toml](../.config/nextest.toml), [.github/workflows/](../.github/workflows/) | Review receipts, pinned test tooling and CI. |
@@ -78,7 +78,7 @@ provider/pane observations are different axes. An inbox endpoint stores
 messages but has no worker actor. External collaboration agents are not
 implicitly members of the native Cadence registry.
 
-Implementation results go to independent review. A verdict names the reviewed
+Implementation results go to fresh-session review. A verdict names the reviewed
 commit; changing the head invalidates its applicability. Combined-tree checks
 address changes that landed in main after review. Recording merge evidence is
 different from executing a GitHub merge. Source merge is different from a live
@@ -88,24 +88,46 @@ Resource admission and provider quota are also different. A free build slot does
 not prove provider allowance, and attaching/detaching a terminal does not prove
 its provider process ended. Reclamation must prove ownership at action time.
 
-### Task context delivery (CAD-1822)
+### Task context delivery (CAD-1822, CAD-1846, CAD-2001)
 
 A project opts in by setting `agent_delivery: true` in its tracked
-`docs/cadence/project-context.yaml` at HEAD; absent or false leaves every
-existing dispatch path unchanged. A manifest the daemon cannot read or parse
-cannot prove the opt-in, so delivery stays off; once `agent_delivery: true` is
-parsed, an invalid manifest, a missing required source or an over-cap payload
-refuses. An
-opted-in issue-bound managed dispatch pins one deterministic task manifest
-(`src/context_pack.rs`) before the kickoff becomes claimable: the issue id,
-SHA-256 of the issue source, complete acceptance, the assigned project's HEAD
-and each selected tracked document's path/revision/digest/bytes, plus the
-selection role and explicit gaps. Selection reuses the bounded project-context
-reader and its documentation allowlist (`src/issue/context.rs`) against the
-project's declared repository — never a client-supplied path or revision.
-`gate_issue` and native `dispatch_send` derive the title, acceptance and task
-revision from one captured issue-source snapshot; `context_guard` never rereads
-the issue to relabel already-selected criteria after a concurrent tracker edit.
+`docs/cadence/projects/<key>/project-context.yaml` at HEAD, or — when that
+per-project manifest is not tracked — in `docs/cadence/project-context.yaml`,
+which must name the same project in its `project:` field (a checkout can serve
+several projects, so the per-project path is preferred and a manifest naming
+another project is refused, never read as this project's). Absent or false
+leaves every existing dispatch path unchanged. A manifest the daemon cannot
+read or parse cannot prove the opt-in, so delivery stays off; once
+`agent_delivery: true` is parsed, an invalid manifest, a missing required
+source or an over-cap payload refuses. An
+opted-in issue-bound managed dispatch pins one deterministic schema-2 task
+manifest (`src/context_pack.rs`) before the kickoff becomes claimable.
+Plain issue dispatch, explicit issue `--job` and native issue-linked task
+dispatch share project-document and current-policy eligible-lesson selection.
+The contract contains canonical issue prose, complete criteria, distinct
+parent issue/task identities, and the job's full effective spec and native
+execution/report contract where applicable. Tracker frontmatter and comments
+are not task prose; criteria and spec are not repeated in the kickoff.
+Plain revisions hash the one captured issue source; job composite revisions
+also cover the effective spec, task criteria and execution contract.
+`context_guard` never rereads the issue to relabel already-selected criteria.
+Selection reuses the bounded documentation allowlist (`src/issue/context.rs`)
+against the assigned project's declared repository at HEAD, never a
+client-supplied project or revision. Job specs are separately restricted to
+the canonical issue directory, its real task worktree or a tracked regular
+file in that declared repository. Descriptor-relative bounded reads reject
+escapes; a spec's working-byte digest is not Git verification.
+For newly created opted-in canonical issue-as-default-spec jobs, the native
+job's spec hash covers the complete body (criteria included), while the pin
+retains exact raw issue provenance. Native bookkeeping may change frontmatter
+without revising the spec; a material body change still refuses, never refreshes
+the accepted hash. Other spec files retain raw-byte job hashes. Task-specific
+acceptance cannot erase distinct criteria belonging to the effective spec.
+
+Read-only job inspection retains the stored job/task view and an `attention`
+diagnostic when optional canonical-spec drift inspection cannot read its source;
+it never refreshes the accepted hash or relaxes mandatory dispatch admission.
+
 An opted-in manifest always requires a prompt-capable endpoint, even when no
 document body is selected: the canonical task contract is still mandatory.
 
@@ -145,8 +167,13 @@ Known local adapter-added prompt material is reserved in the same cap — the
 44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
 provider, even while the guard is off (readiness can change). This is a local byte
 reservation, not provider-window accounting; the receipt carries
-`adapter_reserved_bytes`, never as appended source. Only an opted-in project's
-changed kickoff body supersedes a reported duplicate.
+`adapter_reserved_bytes`, never as appended source. An opted-in plain issue's
+changed actionable contract or kickoff body supersedes a reported duplicate.
+The completed-only comparison uses a domain-separated, length-prefixed task
+digest excluding incidental raw tracker revision. An exact alias/message pin
+lookup through the existing daemon read surface returns only this digest, not
+source bodies; malformed/incomplete old pins do not compare equal. This digest
+never replaces immutable provenance or conversation/session residency proofs.
 Pre-turn delivery
 (`src/daemon.rs`, `src/daemon/actor.rs`) appends the full payload when the
 provider session is new, lost or compacted, and appends nothing when the same
@@ -163,6 +190,29 @@ residency. Required-source failure, an unusable manifest and a combined payload
 over the local 48 000-byte cap refuse before provider submission; a required
 document over the reader's 64 KiB cap refuses rather than being truncated.
 Source text is quoted data, never instruction or authorization.
+
+Job admission plans capture the full task/job/worker preimage outside the
+write transaction. Inside the existing manual/automatic admission guards,
+the store rechecks that preimage before atomically writing the message, its
+pin/disabled selection and the task revision. Accepted retries return their
+original binding without source I/O. CLI preflight separates plain and job
+kickoffs before lane/job creation, proves a unique open job's canonical task,
+and only reuses an undispatched draft whose material scope matches.
+An explicit task-bound follow-up must match its own pin or active binding,
+never an undispatched sibling's context. Passive routed results do not
+activate a reported task. Lost sessions restore the current complete
+contract, including native execution/report requirements; old incomplete
+pins are not relabeled as complete.
+
+Eligible lessons use the versioned native memory evaluator, scope/team-role
+selection and validity withholding (including v2 unused expiry). Their one
+bounded optional inline source records selected IDs and explicit gaps; it is
+omitted whole when it cannot fit, and `--no-lessons` selects none. This replaces,
+rather than duplicates, the opted-in path's legacy lesson sidecar. Its revision
+hashes rendered guidance, not policy audit history or feedback counters.
+Neither inclusion nor a supply receipt claims source verification, observed
+model consumption, business correctness or billed savings.
+
 
 ### Bounded workflow preauthorization
 
@@ -279,22 +329,28 @@ provider operation or completion of CAD-225's full acceptance.
 
 ## Memory implementation boundaries
 
-`src/issue/dispatch.rs` matches accepted project memories, writes a bounded
-lessons file and records included and withheld IDs. `src/briefing.rs` adds accepted
-project-wide rules to generated briefings. `--job` kickoffs are
-daemon-templated and carry no lessons (CAD-194); do not assume every entry point
-shares this retrieval behavior.
+For projects not opted into agent delivery, `src/issue/dispatch.rs` matches
+accepted project memories, writes a bounded lessons file and records included
+and withheld IDs. Legacy `--job` kickoffs remain daemon-templated without a
+lessons sidecar. In opted-in projects, plain issue, explicit issue `--job` and
+native issue-linked task dispatch instead share the bounded optional inline
+`native:lessons` source described under task context delivery above.
+`src/briefing.rs` adds accepted project-wide rules to generated briefings;
+do not assume every entry point shares the opted-in task delivery behavior.
 
 A memory record carries the daemon-authenticated proposer proof, one receipt
 per independent reviewer (identity, digest, evidence) and PM finalization
 receipts; `src/memory/mod.rs` refuses retrieval without two non-author passes
 and a matching PM finalization; see the [memory implementation](../src/memory/mod.rs)
 and [agent protocol](../skills/cadence/SKILL.md).
-Freshness is a label from the last finalized verify; only an explicit `stale:`
-mark withholds, and no citation re-check exists yet. Path-only matching depends
-on recorded commit paths, so new work without commits can miss a relevant
-lesson. The [development-team proposal](design/DEVELOPMENT-TEAM.md) describes
-future learning behavior separately from these implementation guarantees.
+Issue matching includes validated planned paths as well as recorded commit
+paths, so path-scoped lessons can match before the first commit. The optional
+lesson source records applicability, freshness, accessible Wiki citations and
+declared conditions; inaccessible or unproven citation targets are withheld.
+Conditions and citation analysis are advisory, not proof of a check or authority
+to finalize. Supply receipts distinguish included, withheld and omitted lessons;
+supply does not prove use. Explicit stale and policy validity rules can withhold
+a lesson; age alone changes its freshness label.
 
 ## CLI errors and exit codes
 

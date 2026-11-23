@@ -3,9 +3,9 @@
 //! crate's lib test, which the required CI `test` job runs on every PR and in
 //! the merge queue.
 use crate::board_api::{
-    AgentRegisterReq, AgentsResponse, CommentReq, ConversationReq, IssueDetail, IssuesResponse,
-    LinkReq, MasterState, MetaResponse, NewIssueReq, PatchReq, RefReq, ReportReq, ThreadMessageReq,
-    ThreadPage,
+    AgentProfileReq, AgentRegisterReq, AgentsResponse, CommentReq, ConversationReq, IssueDetail,
+    IssuesResponse, LinkReq, MasterState, MetaResponse, NewIssueReq, PatchReq, RefReq, ReportReq,
+    ThreadMessageReq, ThreadPage,
 };
 use crate::evaluate::{Refused, Request, Success};
 use crate::issue::IssueCard;
@@ -17,7 +17,7 @@ fn pretty(schema: schemars::Schema) -> String {
 /// `(path from the repository root, generated schema)` for every committed
 /// contract file.
 pub fn committed_schemas() -> Vec<(&'static str, String)> {
-    vec![
+    let mut schemas = vec![
         (
             "contracts/cadence-core/v1/request.schema.json",
             pretty(schemars::schema_for!(Request)),
@@ -87,6 +87,10 @@ pub fn committed_schemas() -> Vec<(&'static str, String)> {
             pretty(schemars::schema_for!(AgentRegisterReq)),
         ),
         (
+            "contracts/board-api/v1/request-agent-profile.schema.json",
+            pretty(schemars::schema_for!(AgentProfileReq)),
+        ),
+        (
             "contracts/board-api/v1/request-thread-message.schema.json",
             pretty(schemars::schema_for!(ThreadMessageReq)),
         ),
@@ -94,5 +98,7 @@ pub fn committed_schemas() -> Vec<(&'static str, String)> {
             "contracts/board-api/v1/request-conversation.schema.json",
             pretty(schemars::schema_for!(ConversationReq)),
         ),
-    ]
+    ];
+    schemas.extend(crate::connection_dispatch::schema::connection_committed_schemas());
+    schemas
 }

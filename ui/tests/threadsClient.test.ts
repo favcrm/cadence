@@ -3,12 +3,14 @@ import { ApiError } from "../src/lib/api";
 import {
   changeSubscriber,
   createTopic,
+  earlierBoundary,
   postToTopic,
   predatesThreads,
   readTopic,
   readWorkConversation,
   listWorkConversations,
   requestFromTopic,
+  type BackwardPage,
 } from "../src/features/threads/threadsClient";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -91,6 +93,52 @@ async function main() {
     forbidden = e instanceof ApiError && e.status === 403 && !predatesThreads(e);
   }
   assert(forbidden, "a refused write surfaces its status, never as legacy");
+
+  // Backward pagination follows what a page SCANNED. A fully filtered page
+  // keeps no row, so a kept-row cursor would re-fetch it forever and "Load
+  // earlier" would never reach the oldest history (browser QA: six clicks,
+  // zero new messages).
+  equal(
+    earlierBoundary({ scanned_before: 950, more_before: true }, null),
+    { before: 950, more: true },
+    "a fully filtered page continues from its scanned boundary",
+  );
+  equal(
+    earlierBoundary({ scanned_before: 850, more_before: true }, 860),
+    { before: 850, more: true },
+    "the scanned boundary wins over the oldest kept row",
+  );
+  equal(
+    earlierBoundary({ more_before: true }, 42),
+    { before: 42, more: true },
+    "an older daemon without scanned_before falls back to the kept row",
+  );
+  equal(
+    earlierBoundary({ more_before: true }, null),
+    { before: null, more: false },
+    "a page that scanned and kept nothing offers no backward control",
+  );
+  equal(
+    earlierBoundary({ scanned_before: 10, more_before: false }, 12),
+    { before: 10, more: false },
+    "exhaustion is the daemon's answer, not whether rows came back",
+  );
+  // Six backward reads from a fully filtered newest page each cross one
+  // scanned page; the sixth page is where the daemon says history ends.
+  let backward: BackwardPage = { scanned_before: 1000, more_before: true };
+  let at = earlierBoundary(backward, null);
+  const boundaries: number[] = [];
+  for (let click = 0; click < 6 && at.more && at.before !== null; click++) {
+    boundaries.push(at.before);
+    backward = { scanned_before: at.before - 50, more_before: click < 5 };
+    at = earlierBoundary(backward, null);
+  }
+  equal(boundaries, [1000, 950, 900, 850, 800, 750], "every click crosses one scanned page");
+  equal(at.more, false, "the daemon's exhaustion answer closes the control");
+  // A boundary that cannot move stops the control instead of reading it again.
+  const stuck = earlierBoundary({ scanned_before: 1000, more_before: true }, null);
+  const next = Math.min(1000, stuck.before ?? 1000);
+  equal({ next, more: stuck.more && next < 1000 }, { next: 1000, more: false }, "a stuck boundary is exhausted");
 
   console.log("threads client checks passed");
 }

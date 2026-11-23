@@ -8,8 +8,8 @@ use std::io::Read;
 use std::path::Path;
 
 use cadence_core::board_api::{
-    AgentRegisterReq, CardAgent, CommentReq, IssueDetail, LinkReq, NewIssueReq, PatchReq, RefReq,
-    ReportReq,
+    AgentProfileReq, AgentRegisterReq, CardAgent, CommentReq, IssueDetail, LinkReq, NewIssueReq,
+    PatchReq, RefReq, ReportReq,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,8 +22,8 @@ use super::ServeOpts;
 use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
-    connections, crm_send, crm_smtp, endpoints, home, lane, operator, read_model, social_publish,
-    stages, threads, updates, whatsapp, wiki, workflows,
+    connections, credential_entry, crm_send, crm_smtp, endpoints, home, lane, operator, read_model,
+    routines, social_publish, stages, threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -40,7 +40,7 @@ pub(crate) const JSON_CAP: u64 = 256 * 1024;
 /// The actor an operator write commits as — visible in `git log`
 /// subjects. A pane's write commits as its alias
 /// ([`operator::board_caller`]).
-pub(crate) const UI_ACTOR: &str = "operator (ui)";
+pub(crate) use super::UI_ACTOR;
 
 pub(crate) type HttpResp = Response<std::io::Cursor<Vec<u8>>>;
 
@@ -339,6 +339,34 @@ fn resolve_location(req: &AgentRegisterReq) -> std::result::Result<(String, Stri
     }
 }
 
+/// `POST /api/agent-profiles` (CAD-1989): a hire saves a profile and launches
+/// nothing. The operator gate ran in `admit`; the daemon proves it again.
+pub(crate) fn post_agent_profile(request: &mut Request, state_dir: &Path) -> HttpResp {
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: AgentProfileReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let params = json!({
+        "alias": req.alias.trim(),
+        "catalogue": req.catalogue,
+        "job": req.job,
+        "model": req.model,
+    });
+    match client::rpc(state_dir, "agent_profile_create", params) {
+        Ok(profile) => {
+            let bytes = serde_json::to_vec_pretty(&json!({"profile": profile})).unwrap_or_default();
+            let mut resp = Response::from_data(bytes).with_status_code(StatusCode(201));
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            resp
+        }
+        Err(err) => super::home::rpc_err(&err, "agent_profile_create"),
+    }
+}
+
 /// `POST /api/agents`: register one agent through the daemon's
 /// `agent_register` (`rpc_register`). The operator gate ran in `admit`;
 /// the daemon applies the same validation a CLI registration does.
@@ -351,49 +379,6 @@ pub(crate) fn post_agent(request: &mut Request, state_dir: &Path) -> HttpResp {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    // CAD-1752: a catalogue hire is relayed without a runtime — the daemon
-    // takes provider and endpoint kind from the install and refuses a
-    // caller that names them; here the board refuses `location` as well.
-    if req.catalogue.is_some() {
-        if req.location.is_some() || req.provider.is_some() || req.endpoint_kind.is_some() {
-            return err_response(
-                400,
-                "a catalogue hire takes its runtime from the install - send no location, provider or endpoint kind",
-            );
-        }
-        let params = json!({
-            "alias": req.alias.trim(),
-            "catalogue": req.catalogue,
-            "look": req.look,
-            "role": req.role,
-            "team_role": req.team_role,
-            "model_policy": req.model_policy,
-            "cwd": req.cwd,
-            "sandbox": req.sandbox,
-            "instructions": req.instructions,
-            "params": req.params,
-        });
-        let instructions = match (&req.instructions, req.catalogue.as_deref()) {
-            (Some(text), _) => Some(text.clone()),
-            (None, Some(id)) => crate::agent_roles::find(id).map(|role| role.instructions()),
-            (None, None) => None,
-        };
-        return match client::rpc(state_dir, "agent_register", params) {
-            Ok(mut out) => {
-                crate::briefing::brief_registered(
-                    state_dir,
-                    req.alias.trim(),
-                    instructions.as_deref(),
-                    &mut out,
-                );
-                json_response(out)
-            }
-            Err(err) => super::home::rpc_err(&err, "agent_register"),
-        };
-    }
-    if req.look.is_some() {
-        return err_response(400, "look only applies to a catalogue hire");
-    }
     let (provider, endpoint_kind) = match resolve_location(&req) {
         Ok(pair) => pair,
         Err(message) => return err_response(400, &message),
@@ -447,12 +432,63 @@ pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Val
     ))
 }
 
+/// `POST /api/projects/<key>/policy` (CAD-1950): replace a project's
+/// recorded access policy.
+///
+/// The board is a second entry point, not a second writer: this calls the
+/// same [`issue_write::set_project_policy`] the CLI does, so the version
+/// bump, grant validation, the gate refusal and the tracker commit cannot
+/// diverge. The body is `{visibility, members}` in the recorded spelling;
+/// `members` is the full grant list and replaces what was there, exactly
+/// like `issue project policy --grant`.
+///
+/// `actor` is the admitted caller's own spelling: the tracker trailer names
+/// whoever pressed Save, and a named owner's write must not be attributed to
+/// the shared `operator` identity.
+fn project_policy_write(request: &mut Request, pm_dir: &Path, key: &str, actor: &str) -> HttpResp {
+    #[derive(Deserialize)]
+    struct PolicyReq {
+        visibility: String,
+        #[serde(default)]
+        members: Vec<String>,
+    }
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: PolicyReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // An unknown spelling is a refusal, never the default visibility.
+    let visibility = match crate::issue::cli::PolicyVisibility::from_wire(&req.visibility) {
+        Some(v) => v.recorded(),
+        None => return err_response(400, "'visibility' must be workspace-visible or private"),
+    };
+    let pm = match Pm::at(pm_dir) {
+        Ok(pm) => pm,
+        Err(e) => return err_response(503, &e.to_string()),
+    };
+    match issue_write::set_project_policy(&pm, key, visibility, &req.members, actor) {
+        Ok(out) => json_response(out),
+        // A key with no project answers like an absent one, the same way the
+        // read arms do.
+        Err(Error::Rejected(m)) if m.starts_with("no project ") => err_response(404, &m),
+        Err(e) => write_err(&e),
+    }
+}
+
 /// Map a writer error to an HTTP status: unknown ids are 404, rejections
 /// are 400, internals are 500.
 pub(crate) fn write_err(e: &Error) -> HttpResp {
     match e {
         Error::Rejected(m) if m.starts_with("Unknown issue") => err_response(404, m),
         Error::Rejected(m) => err_response(400, m),
+        // A coded refusal (`Error::invalid`) keeps its stable code on the wire
+        // so the board can branch on it instead of showing raw text.
+        Error::Structured(_) if e.kind() == "rejected" && e.code().is_some() => {
+            coded_response(400, e.code().unwrap_or_default(), &e.to_string(), None)
+        }
         other => err_response(500, &other.to_string()),
     }
 }
@@ -618,16 +654,22 @@ pub(crate) fn tailnet_proxy(
     if !tailnet_host(request, opts) {
         return None;
     }
-    Some(match request.remote_addr() {
-        Some(peer) => crate::tailnet_proof::prove(
+    // CAD-760: the proxy's socket is matched on the full four-tuple.
+    let server = super::operator::concrete_board_server(opts);
+    Some(match (request.remote_addr(), server) {
+        (Some(peer), Ok(server)) => crate::tailnet_proof::prove(
             opts.tailscaled_socket.as_deref(),
             &opts.tailnet_latch,
-            opts.port,
+            server,
             *peer,
         ),
-        None => Err(crate::tailnet_proof::Refusal {
+        (None, _) => Err(crate::tailnet_proof::Refusal {
             check: crate::tailnet_proof::Check::ClientSocket,
             why: "the request has no peer address".to_string(),
+        }),
+        (_, Err(why)) => Err(crate::tailnet_proof::Refusal {
+            check: crate::tailnet_proof::Check::ClientSocket,
+            why,
         }),
     })
 }
@@ -740,7 +782,7 @@ fn explorer_write(
     install: Option<&str>,
 ) -> HttpResp {
     let relay = operator::public_relay(request, opts);
-    app_explorer::write(request, action, install, caller, relay, state_dir)
+    app_explorer::write(request, action, install, caller, relay, state_dir, opts)
 }
 
 /// Seconds a client should wait before retrying a busy daemon.
@@ -800,6 +842,9 @@ pub(crate) fn require_model_defaults(state_dir: &Path) -> std::result::Result<()
 }
 
 pub(crate) fn settings_rpc_error(err: Error) -> HttpResp {
+    if err.kind() == "unknown" {
+        return coded_response(409, "outcome_unknown", &err.to_string(), None);
+    }
     if daemon_unavailable(&err) {
         return coded_response(503, "daemon_unavailable", &err.to_string(), None);
     }
@@ -1105,7 +1150,11 @@ pub(crate) fn write_route(
             | RouteId::ArtifactRead
             | RouteId::ArtifactVersions
             | RouteId::AgentDetail
-            | RouteId::AgentRoles => err_response(500, "a read row reached the write dispatcher"),
+            | RouteId::AgentRoles
+            | RouteId::AutomaticUpdatesGet
+            | RouteId::MemberAccessGet => {
+                err_response(500, "a read row reached the write dispatcher")
+            }
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
             RouteId::SessionLogout => operator::logout(&request, state_dir, opts),
             RouteId::SessionDeviceCode => operator::device_code(&mut request, state_dir, opts),
@@ -1169,6 +1218,14 @@ pub(crate) fn write_route(
                 app_explorer::WriteAction::UpdateCheck,
                 bound.get("id"),
             ),
+            RouteId::AutomaticUpdatesSet => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::AutomaticUpdatesSet,
+                bound.get("id"),
+            ),
             RouteId::ExplorerRemovePreview => explorer_write(
                 &mut request,
                 state_dir,
@@ -1193,6 +1250,22 @@ pub(crate) fn write_route(
                 app_explorer::WriteAction::Restore,
                 bound.get("id"),
             ),
+            RouteId::MemberAccessGrant => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::MemberAccessGrant,
+                bound.get("id"),
+            ),
+            RouteId::MemberAccessRevoke => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::MemberAccessRevoke,
+                bound.get("id"),
+            ),
             RouteId::Mount => app_screens::mount(
                 &mut request,
                 state_dir,
@@ -1214,11 +1287,25 @@ pub(crate) fn write_route(
             }
             RouteId::ModelDefaults => model_defaults_post(&mut request, state_dir),
             RouteId::Locale => super::locale::post(&mut request, state_dir, opts),
+            RouteId::TimeZone => super::time_zone::post(&mut request, state_dir, opts),
             RouteId::Reports => match caller.as_ref() {
                 Some(caller) => post_report(&mut request, state_dir, pm_dir, caller.actor()),
                 None => err_response(500, "unadmitted write"),
             },
             RouteId::AgentRegister => post_agent(&mut request, state_dir),
+            RouteId::AgentProfileCreate => post_agent_profile(&mut request, state_dir),
+            // CAD-1950: the one writer for a project's access policy — the
+            // same `set_project_policy` the CLI calls, so version bumping,
+            // grant validation and the commit cannot diverge.
+            RouteId::ProjectPolicy => match caller.as_ref() {
+                Some(caller) => project_policy_write(
+                    &mut request,
+                    pm_dir,
+                    bound.get("key").unwrap_or_default(),
+                    caller.actor(),
+                ),
+                None => err_response(500, "unadmitted write"),
+            },
             RouteId::CatalogInstall => explorer_write(
                 &mut request,
                 state_dir,
@@ -1428,7 +1515,10 @@ pub(crate) fn write_route(
         // every other template write (WRITE_ROUTES); the daemon reads it only.
         if *method != Method::Post
             || !(business_templates::is_write(&route)
-                || matches!(route, business_templates::Route::Intake))
+                || matches!(
+                    route,
+                    business_templates::Route::Intake | business_templates::Route::DocumentExport
+                ))
         {
             send(request, err_response(405, "method not allowed"));
             return;
@@ -1549,6 +1639,15 @@ pub(crate) fn write_route(
         send(request, response);
         return;
     }
+    if let Some(route) = routines::route(path) {
+        if *method != Method::Post || !route.is_writable() {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = routines::handle_write(&mut request, state_dir, route);
+        send(request, response);
+        return;
+    }
     if let Some(route) = connections::route(path) {
         let writable = matches!(route, connections::Route::List) || !route.is_read();
         if *method != Method::Post || !writable {
@@ -1556,6 +1655,23 @@ pub(crate) fn write_route(
             return;
         }
         let response = connections::handle(&mut request, state_dir, route, true);
+        send(request, response);
+        return;
+    }
+    // CAD-1085: the trusted credential-entry writes. `admit` ran above as
+    // OperatorOnly; these relays then re-prove the operator in the daemon
+    // and bind the form nonce to the live browser session.
+    if let Some(route) = credential_entry::route(path) {
+        if *method != Method::Post
+            || matches!(
+                route,
+                credential_entry::Route::Show(_) | credential_entry::Route::ManagementStatus
+            )
+        {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = credential_entry::handle_write(&mut request, state_dir, opts, route);
         send(request, response);
         return;
     }
@@ -1691,6 +1807,18 @@ pub(crate) fn write_route(
     // action token to `app_media_original` and streams the verified
     // bytes back. Closed body `{action_token, asset_id}`; a body
     // credential/ref/scope field is 400 before dispatch.
+    // CAD-1962: copy one retained image into the shared workspace
+    // library. Closed body `{action_token, receipt_id, request_id}`; a
+    // body credential/scope field is 400 before dispatch.
+    if app_media::import_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_media::media_import(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
     if app_media::original_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -1790,6 +1918,18 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-1817: the workspace coordinator's identity write. OperatorOnly in
+    // `WRITE_ROUTES` (admitted above); the handler narrows the body and the
+    // daemon proves the operator connection again.
+    if path == "/api/master/identity" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::master_identity(&mut request, state_dir);
+        send(request, resp);
+        return;
+    }
     // CAD-1168: the chat attachment upload — OperatorOnly in
     // `WRITE_ROUTES` (admitted above with the multipart carve-out);
     // the handler streams the part into staging and relays
@@ -1802,6 +1942,34 @@ pub(crate) fn write_route(
         let proof = operator::chat_upload_session_proof(&request, opts);
         let resp = threads::post_upload(&mut request, state_dir, proof);
         send(request, resp);
+        return;
+    }
+    // CAD-1853: cloud-agent writes. `WRITE_ROUTES` classifies them
+    // OperatorOnly and `admit` ran before this handler, so a peer or
+    // forged-identity caller never reaches the daemon relay.
+    if let Some(tail) = path.strip_prefix("/api/cloud-agents/") {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let mut segments = tail.split('/');
+        let id = segments.next().unwrap_or_default();
+        let handled = if id.is_empty() || id.contains('?') {
+            err_response(400, "bad cloud agent id")
+        } else {
+            match (segments.next(), segments.next(), segments.next()) {
+                (Some("messages"), None, None) => {
+                    super::cloud_agents::post_message(&mut request, state_dir, id)
+                }
+                (Some("operations"), Some(operation), Some("read"))
+                    if segments.next().is_none() =>
+                {
+                    super::cloud_agents::post_read(&mut request, state_dir, id, operation)
+                }
+                _ => err_response(404, "no such cloud agent write route"),
+            }
+        };
+        send(request, handled);
         return;
     }
     // The operator's chat message to an agent (CAD-319) — guarded and
@@ -1963,9 +2131,9 @@ pub(crate) fn write_route(
         return;
     };
     let actor = caller.actor().to_string();
-    // AOS-274: the policy key, built from the variant — `actor()` above is
-    // display text for attribution.
-    let spelling = operator::caller_spelling(&caller);
+    // Project authorization uses the verified subject, not the attribution
+    // handle, which can collide after sanitization.
+    let spelling = operator::policy_caller(&caller);
     let pm = match Pm::at(pm_dir) {
         Ok(pm) => pm,
         Err(e) => {
@@ -2413,8 +2581,6 @@ mod agent_setup_tests {
             sandbox: None,
             instructions: None,
             params: None,
-            catalogue: None,
-            look: None,
         }
     }
 
@@ -2447,5 +2613,523 @@ mod agent_setup_tests {
     #[test]
     fn unknown_location_is_refused() {
         assert!(resolve_location(&req("remote", Some("claude"), Some("pty"))).is_err());
+    }
+}
+
+// CAD-2009: independently authored by the fresh-context Standards reviewer.
+// Implementers must not edit or weaken these acceptance assertions.
+#[cfg(all(test, feature = "test-seam", unix))]
+mod cad2009_status_authority_acceptance {
+    use std::cell::RefCell;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
+    use std::process::Command;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+    use tiny_http::{Header, Method, Request, TestRequest};
+
+    use super::{write_route, HttpResp};
+    use crate::issue::{board, write as issue_write, Pm};
+    use crate::test_seam::{self, Asserted};
+    use crate::ui::ServeOpts;
+
+    const CHILD: &str = "CAD2009_HTTP_STATUS_AUTHORITY_CHILD";
+    const COMPLETE: &str = "CAD2009 HTTP STATUS AUTHORITY ACCEPTANCE COMPLETE";
+    const PATH: &str = "/api/issues/SYN-1";
+    const BODY: &str = "{\"status\":\"dropped\"}";
+
+    #[derive(Clone, Copy, Debug)]
+    enum JobReply {
+        Unavailable,
+        Malformed,
+        KnownEmpty,
+    }
+
+    // Only the runtime read dependency is synthetic. HTTP admission,
+    // dispatch, status authorization, persistence and reload are production
+    // functions, called directly without starting a board or daemon.
+    struct RuntimePeer {
+        completion: Option<UnixStream>,
+        worker: Option<JoinHandle<Vec<Value>>>,
+    }
+
+    impl RuntimePeer {
+        fn start(state: &Path, reply: JobReply) -> Self {
+            let socket = crate::client::socket_path(state);
+            assert!(
+                socket.as_os_str().as_bytes().len() < 100,
+                "acceptance needs a short isolated TMPDIR: {}",
+                socket.display()
+            );
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (completion, completed) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut requests = Vec::new();
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !remaining.is_zero(),
+                        "HTTP acceptance did not complete its runtime exchange: {requests:?}"
+                    );
+                    let mut descriptors = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: completed.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    let timeout = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+                    // SAFETY: these are two initialized pollfd values whose
+                    // owning listener/stream remain live for this call.
+                    let ready = unsafe {
+                        libc::poll(
+                            descriptors.as_mut_ptr(),
+                            descriptors.len() as libc::nfds_t,
+                            timeout,
+                        )
+                    };
+                    if ready < 0 {
+                        let error = std::io::Error::last_os_error();
+                        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+                        continue;
+                    }
+                    assert!(
+                        ready > 0,
+                        "synthetic runtime deadline expired: {requests:?}"
+                    );
+                    // Drain an already queued request before honoring completion.
+                    if descriptors[0].revents & libc::POLLIN != 0 {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut line = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .read_line(&mut line)
+                            .unwrap();
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let method = request["method"].as_str().unwrap().to_string();
+                        requests.push(request);
+                        let result = match method.as_str() {
+                            "job_list" => {
+                                if matches!(reply, JobReply::Unavailable) {
+                                    // Read the actual request, then close before
+                                    // any reply: transport loss, not an empty table.
+                                    drop(stream);
+                                    continue;
+                                }
+                                let jobs = match reply {
+                                    JobReply::KnownEmpty => json!([]),
+                                    JobReply::Malformed => json!([{
+                                        "id": "synthetic-job",
+                                        "issue": "SYN-1",
+                                        "state": "open",
+                                        "created": 1,
+                                        "tasks": "not-a-task-summary"
+                                    }]),
+                                    JobReply::Unavailable => unreachable!(),
+                                };
+                                json!({"jobs": jobs})
+                            }
+                            // A successful PATCH reloads through the real read
+                            // model, which fetches these read-only dependencies
+                            // concurrently. Neither can manufacture a mutation.
+                            "agent_list" => json!({"agents": [], "profiles": []}),
+                            "project_work_approvals" => json!({"approvals": {}}),
+                            other => panic!("unexpected runtime operation: {other}"),
+                        };
+                        writeln!(stream, "{}", json!({"ok": true, "result": result})).unwrap();
+                    } else if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                        return requests;
+                    } else {
+                        panic!("unexpected synthetic runtime poll events");
+                    }
+                }
+            });
+            Self {
+                completion: Some(completion),
+                worker: Some(worker),
+            }
+        }
+
+        fn finish(mut self) -> Vec<Value> {
+            self.completion.take().unwrap().write_all(b"done").unwrap();
+            self.worker.take().unwrap().join().unwrap()
+        }
+    }
+
+    impl Drop for RuntimePeer {
+        fn drop(&mut self) {
+            // HUP wakes the peer even if an assertion unwinds this fixture.
+            drop(self.completion.take());
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn fixture(root: &Path) -> Pm {
+        let pm_dir = root.join("pm");
+        let notes = root.join("notes");
+        std::fs::create_dir_all(&pm_dir).unwrap();
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(
+            pm_dir.join("pm.yaml"),
+            format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+        )
+        .unwrap();
+        let pm = Pm::init(&pm_dir).unwrap();
+        issue_write::project_add(&pm, "synthetic", "SYN", &[], &[], &[], None).unwrap();
+        let created = issue_write::new_issue(
+            &pm,
+            root,
+            Some("synthetic"),
+            "Synthetic HTTP status-authority acceptance",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "synthetic fixture",
+        )
+        .unwrap();
+        assert_eq!(created["id"], "SYN-1");
+        assert_eq!(
+            board::load_issue(&pm.dir, "synthetic", "SYN-1")
+                .unwrap()
+                .front
+                .status,
+            "backlog"
+        );
+        pm
+    }
+
+    fn patch(state: &Path, pm: &Pm) -> (u16, Value) {
+        // TestRequest supplies a genuine tiny_http Request to the production
+        // write dispatcher; this does not bind a board port or mock its guard.
+        let opts = ServeOpts {
+            host: "127.0.0.1".to_string(),
+            port: 3110,
+            ..ServeOpts::default()
+        };
+        let request: Request = TestRequest::new()
+            .with_method(Method::Patch)
+            .with_path(PATH)
+            .with_body(BODY)
+            .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+            .with_header(Header::from_bytes("X-Cadence-Board", "1").unwrap())
+            .with_header(Header::from_bytes("Host", "cadence-3110.localhost:3110").unwrap())
+            .with_header(
+                Header::from_bytes("Origin", "http://cadence-3110.localhost:3110").unwrap(),
+            )
+            .with_header(Header::from_bytes("Sec-Fetch-Site", "same-origin").unwrap())
+            .into();
+        let response: RefCell<Option<HttpResp>> = RefCell::new(None);
+        test_seam::scoped(Asserted::Agent("cad2009-acceptance".to_string()), || {
+            write_route(
+                request,
+                &Method::Patch,
+                PATH,
+                &|_| None,
+                state,
+                &pm.dir,
+                &opts,
+                &|request, reply| {
+                    drop(request);
+                    assert!(
+                        response.borrow_mut().replace(reply).is_none(),
+                        "one HTTP response only"
+                    );
+                },
+            );
+        });
+        let response = response
+            .into_inner()
+            .expect("PATCH dispatcher emitted no response");
+        let status = response.status_code().0;
+        let mut body = String::new();
+        response.into_reader().read_to_string(&mut body).unwrap();
+        (
+            status,
+            serde_json::from_str(&body).expect("PATCH response must be JSON"),
+        )
+    }
+
+    fn committed_issue(pm: &Pm) -> Vec<u8> {
+        // issue::git trims its String result, so observe this byte contract
+        // through Git's unmodified stdout instead.
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&pm.dir)
+            .args(["show", "HEAD:synthetic/SYN-1/issue.md"]);
+        let output = crate::reaper::output(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn exercise(reply: JobReply) {
+        let root = tempfile::Builder::new().prefix("p-").tempdir().unwrap();
+        let pm = fixture(root.path());
+        let state = root.path().join("s");
+        // The supported debug seam alone mints this fixture's credential;
+        // no daemon, hand-written identity proof or ambient caller is used.
+        let _seam = test_seam::arm_if_requested(&state, true).unwrap().unwrap();
+        let issue_dir = pm.dir.join("synthetic/SYN-1");
+        let issue_file = issue_dir.join("issue.md");
+        let before_bytes = std::fs::read(&issue_file).unwrap();
+        let before_head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+        let before_status = crate::issue::git(
+            &pm.dir,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+        .unwrap();
+        assert!(
+            before_status.is_empty(),
+            "fixture must start clean: {before_status}"
+        );
+
+        let peer = RuntimePeer::start(&state, reply);
+        let (status, body) = patch(&state, &pm);
+        let requests = peer.finish();
+        assert!(
+            !requests.is_empty(),
+            "PATCH never reached the job-authority read"
+        );
+        assert_eq!(requests[0]["method"], "job_list");
+        assert_eq!(requests[0]["params"], json!({"all": true}));
+        assert_eq!(requests[0]["test_caller"]["as"], "agent:cad2009-acceptance");
+
+        let after_head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+        match reply {
+            JobReply::Unavailable | JobReply::Malformed => {
+                assert_eq!(status, 500, "{reply:?}: {body}");
+                let error = body["error"]
+                    .as_str()
+                    .expect("refusal must explain the failed authority read");
+                assert!(
+                    error.contains("needs authoritative job state"),
+                    "{reply:?}: {body}"
+                );
+                if matches!(reply, JobReply::Malformed) {
+                    assert!(error.contains("malformed"), "{body}");
+                } else {
+                    assert!(error.contains("closed the connection"), "{body}");
+                    assert!(
+                        !error.contains("malformed"),
+                        "transport loss is not malformed data: {body}"
+                    );
+                }
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "refusal must precede post-commit/reload work: {requests:?}"
+                );
+                assert_eq!(
+                    std::fs::read(&issue_file).unwrap(),
+                    before_bytes,
+                    "refused PATCH changed issue bytes"
+                );
+                assert_eq!(
+                    after_head, before_head,
+                    "refused PATCH created a tracker commit"
+                );
+                assert_eq!(
+                    crate::issue::git(
+                        &pm.dir,
+                        &["status", "--porcelain=v1", "--untracked-files=all"]
+                    )
+                    .unwrap(),
+                    before_status,
+                    "refused PATCH staged or left tracker edits"
+                );
+            }
+            JobReply::KnownEmpty => {
+                assert_eq!(
+                    status, 200,
+                    "authoritative empty job state must admit this file-owned edit: {body}"
+                );
+                assert_eq!(body["issue"]["id"], "SYN-1");
+                assert_eq!(body["card"]["id"], "SYN-1");
+                assert_eq!(body["card"]["status"], "dropped");
+                assert_eq!(
+                    board::load_issue(&pm.dir, "synthetic", "SYN-1")
+                        .unwrap()
+                        .front
+                        .status,
+                    "dropped"
+                );
+                assert_ne!(
+                    after_head, before_head,
+                    "successful PATCH must commit the status change"
+                );
+                assert_eq!(
+                    committed_issue(&pm),
+                    std::fs::read(&issue_file).unwrap(),
+                    "successful PATCH must publish its exact bytes in the tracker commit"
+                );
+                assert!(crate::issue::git(
+                    &pm.dir,
+                    &["status", "--porcelain=v1", "--untracked-files=all"]
+                )
+                .unwrap()
+                .is_empty());
+            }
+        }
+        // Both outcomes must unwind the production scoped writer guard.
+        let lock = pm.try_lock_for_paths(&[issue_dir]).unwrap();
+        assert!(
+            lock.is_some(),
+            "HTTP PATCH left the tracker writer lock held"
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn unavailable_and_malformed_job_state_refuse_http_status_patch() {
+        // Re-exec only this direct-function acceptance to isolate HOME/XDG,
+        // caller/socket routing and Git without changing another test's env.
+        // This starts no CLI, board process or daemon.
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::Builder::new()
+                .prefix("c2-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            for name in ["home", "tmp", "config", "cache", "state", "data"] {
+                std::fs::create_dir(root.path().join(name)).unwrap();
+            }
+            let full_name = format!(
+                "{}::unavailable_and_malformed_job_state_refuse_http_status_patch",
+                module_path!()
+            );
+            let test_name = full_name.split_once("::").unwrap().1;
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", test_name, "--nocapture", "--test-threads", "1"])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("HOME", root.path().join("home"))
+                .env("TMPDIR", root.path().join("tmp"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+                .env("GIT_CONFIG_VALUE_0", "false")
+                .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+                .env("GIT_CONFIG_VALUE_1", "/dev/null");
+            for key in ["RUSTUP_HOME", "CARGO_HOME"] {
+                if let Some(value) = std::env::var_os(key) {
+                    child.env(key, value);
+                }
+            }
+            let output = crate::reaper::output(&mut child).unwrap();
+            assert!(
+                output.status.success(),
+                "HTTP status-authority acceptance child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(COMPLETE),
+                "the exact child acceptance must actually run"
+            );
+            return;
+        }
+        exercise(JobReply::Unavailable);
+        exercise(JobReply::Malformed);
+        exercise(JobReply::KnownEmpty);
+        println!("{COMPLETE}");
+    }
+}
+
+#[cfg(test)]
+mod cad2009_settings_rpc_error_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn cad2009_settings_rpc_error_preserves_unknown_sync_and_definite_refusal() {
+        let partial_sync = "profile sync may have updated the Pi export before the Claude export failed; read settings agents show and settings agents history with the same explicit --org before repeating it";
+        let rejected = "unknown profile 'missing'";
+        for (error, expected_status, expected_code, expected_message) in [
+            (
+                Error::unknown(partial_sync),
+                409,
+                "outcome_unknown",
+                partial_sync,
+            ),
+            (Error::rejected(rejected), 400, "invalid_request", rejected),
+        ] {
+            let response = settings_rpc_error(error);
+            assert_eq!(response.status_code().0, expected_status, "{expected_code}");
+            let mut body = String::new();
+            response.into_reader().read_to_string(&mut body).unwrap();
+            let body: Value = serde_json::from_str(&body).expect("settings error must be JSON");
+            assert_eq!(body["code"], expected_code);
+            assert_eq!(body["error"], expected_message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cad2376_private_refusal_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// The board's policy write answers a private request with 400 and the
+    /// stable `private_unavailable` code, and writes nothing.
+    #[test]
+    fn policy_put_private_answers_private_unavailable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm_dir = tmp.path().join("pm");
+        let notes = tmp.path().join("notes");
+        std::fs::create_dir_all(&pm_dir).unwrap();
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(
+            pm_dir.join("pm.yaml"),
+            format!("schema: 1\nnotes_dir: '{}'\n", notes.display()),
+        )
+        .unwrap();
+        crate::issue::Pm::init(&pm_dir).unwrap();
+        let before = std::fs::read_dir(&pm_dir).unwrap().count();
+        let mut request: Request = tiny_http::TestRequest::new()
+            .with_method(Method::Post)
+            .with_body(r#"{"visibility":"private","members":[]}"#)
+            .into();
+        let resp = project_policy_write(&mut request, &pm_dir, "pay", "operator");
+        assert_eq!(resp.status_code().0, 400);
+        let mut body = String::new();
+        resp.into_reader().read_to_string(&mut body).unwrap();
+        let body: Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(body["code"], "private_unavailable", "{body}");
+        assert_eq!(body["error"], issue_write::PRIVATE_UNAVAILABLE);
+        assert_eq!(std::fs::read_dir(&pm_dir).unwrap().count(), before);
     }
 }

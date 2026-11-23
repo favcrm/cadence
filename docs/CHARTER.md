@@ -2,13 +2,11 @@
 
 ## Background
 
-Cadence is a local controller that coordinates coding agents (Devin,
-Claude, Codex, Cursor) through durable message queues, native terminals
-and a git-native issue tracker. It started as plumbing: deliver a message
-to a terminal agent and know whether it was done. Running real work
-through it showed that plumbing is the easy half. The hard half is the
-operating model around the agents: who decides what to build, who checks
-it, who lands it, and how the system notices when something is stuck.
+Cadence coordinates human and agent work in native and hosted workspaces,
+including software development and business projects. It records work,
+assignments, evidence and decisions while the owning workspace and connected
+systems enforce identity, permissions and external effects. A project
+coordinates work that belongs to it; standalone app work need not invent one.
 
 On 2026-09-19 the project merged eleven PRs through cadence itself.
 Every incident that day (a disk that filled, a permission menu that sat
@@ -18,37 +16,40 @@ is the gap this charter is about.
 
 ## Goal
 
-A fully autonomous agentic development system: a human states goals and
-approves substantial decisions; agents do the research, design,
-implementation, review, merging and operations, and the system itself
-detects, reports and recovers from its own failures.
+An agentic work system: people state goals and approve decisions where
+policy requires them; agents research, design, implement, verify and carry
+authorized work through delivery. The system detects, reports and safely
+recovers from failures without presenting an uncertain result as success.
 
 ## Principles
 
-1. **Evidence over self-report.** Work is done when an independent
-   check says so: a verdict pinned to a commit, a gate run, a live
-   probe. A worker's "done" is a claim.
-2. **Separation of duties.** The author never reviews or merges its own
-   work. The proposer of a memory lesson never accepts it.
+1. **Evidence over self-report.** Verify the outcome with an appropriate
+   check and durable receipt, revision-pinned review or live probe. A worker's
+   "done" is a claim.
+2. **Separation of duties.** An author cannot provide a required
+   independent review or approval. Authorized automation may deliver only
+   after the applicable controls pass. A memory proposer cannot accept its
+   own lesson.
 3. **Fail closed.** When the system cannot tell (pane state, ownership,
    merge status), it refuses and says why rather than guessing.
-4. **Humans approve the substantial, not the routine.** Risk classes
-   (`docs/roles/risk-classes.md`) decide which merges and actions need
-   the operator. Everything else runs.
-5. **Everything durable is in git.** Issues, notes, verdicts, role
-   briefings and decisions live in files with history, not in a chat.
+4. **People decide where required, not by default.** Agents carry out
+   authorized work; the applicable policy and delivery gate determine the
+   required reviews and approvals. A policy goal never waives a live gate.
+5. **Durable, attributable evidence.** Issues, decisions and results
+   retain provenance and history in their authoritative native or hosted
+   store. A chat statement alone is not proof of an approval or effect.
 6. **Detect, then automate.** Every manual fix a human had to make
    becomes an issue that makes the system detect or prevent it.
-7. **Resources are finite.** One full test suite per host at a time;
-   disk, pipes and provider state are watched (`cadence doctor --host`).
+7. **Resources are finite.** Follow the active host and project admission
+   limits; disk, pipes and provider state must remain observable.
 
 ## Non-goals
 
-- A hosted service. Cadence runs on the operator's machine.
 - Replacing provider tools. Cadence drives Devin, Claude, Codex and
   Cursor as they are.
-- Unattended outward actions: releases, repository settings, anything
-  public beyond a reviewed merge stay with the operator.
+- Unauthorized external effects. Sending, publishing, deployment and
+  other outward actions remain subject to the applicable permission and
+  approval policy; a workflow cannot grant its own authority.
 
 ## Autonomy ladder
 
@@ -56,7 +57,7 @@ detects, reports and recovers from its own failures.
 |---|---|---|
 | L1 | The PM dispatches; a human reviews and merges | reached |
 | L2 | A reviewer agent reviews, a DevOps agent prepares merges, a human approves each | reached 2026-09-19 |
-| L3 | Routine merges land automatically; the human approves substantial ones | **current** |
+| L3 | Routine merges land automatically; the human approves substantial ones | target; verify the active gate |
 | L4 | Research and design agents turn goals into specs and tickets; the PM plans from the roadmap without prompting | next |
 | L5 | The system tunes itself: retros feed memory, scorecards drive routing, metrics drive the roadmap | later |
 

@@ -5,17 +5,20 @@
  * parsed from message text, tool output or URLs.
  */
 import { useEffect, useRef } from "react";
-import { isArtifactPutCall, openStep, stepSummary, toolSteps, type ThreadItem } from "../home/thread";
+import { HOME_VIEW_SCOPE, parseViewRef, recordCardView, viewCardAppView, viewHere, type ViewScope } from "../home/chatCards";
+import { isArtifactPutCall, toolSteps, type ThreadItem } from "../home/thread";
 import {
   ARTIFACT_KINDS,
   feedCanvas,
   type ArtifactKind,
   type ArtifactRef,
   type FeedCard,
+  type FeedRecord,
+  type FeedView,
   type Surface,
-  type WorkStep,
   type Working,
 } from "./canvasStore";
+import { noteChatActivity } from "./canvasChrome";
 
 /** A stored artifact card's payload, validated; null when malformed. */
 export function artifactRef(payload: Record<string, unknown> | null | undefined): ArtifactRef | null {
@@ -34,127 +37,6 @@ export function artifactRef(payload: Record<string, unknown> | null | undefined)
   };
 }
 
-/** Plain words for a tool step: the tool's name decides, never its
- *  arguments — no command line, path or JSON reaches the Working view. The
- *  raw step stays in the "details" disclosure. */
-export function plainStep(text: string): string {
-  const raw = stepSummary(text);
-  const tool = /^([A-Za-z_][\w .-]{0,30}?):/.exec(raw)?.[1]?.trim().toLowerCase() ?? "";
-  if (isArtifactPutCall(text)) return "Putting it in the canvas";
-  if (tool === "read" || tool === "cat" || tool === "grep" || tool === "glob" || tool === "ls") return "Reading";
-  if (tool === "write" || tool === "edit") return "Writing a draft";
-  if (tool === "bash") return "Checking the board";
-  return "Working on it";
-}
-
-/** A word that names a filesystem path: it starts with `/`, `~/`, `./` or
- *  `../` (after any opening punctuation), has a `/` after `=` or `:`, or
- *  names the master's tmp or the state dir. */
-const PATHISH = /^[("'`[{<]*(?:\/|~\/|\.\/|\.\.\/)|[=:][^\s=:]*\/|master\/tmp|\.local\/state/;
-
-/** The longest JSON span `scrubJson` will look at. */
-const JSON_SPAN_MAX = 20_000;
-
-/** Replace a balanced `{…}` / `[…]` that starts a line or word and holds a
- *  JSON property (a string, optional whitespace, then `:`) with an ellipsis,
- *  so pretty-printed or spaced JSON never reaches the strip. One forward pass
- *  that tracks strings and escapes, so a delimiter inside a string does not
- *  count. A span that does not balance within the cap is kept as written and
- *  skipped, never rescanned. */
-function scrubJson(text: string): string {
-  let out = "";
-  let i = 0;
-  while (i < text.length) {
-    const c = text[i];
-    if ((c === "{" || c === "[") && (i === 0 || /\s/.test(text[i - 1]))) {
-      const end = Math.min(text.length, i + JSON_SPAN_MAX);
-      let depth = 0;
-      let inStr = false;
-      let esc = false;
-      let afterStr = false;
-      let prop = false;
-      let j = i;
-      for (; j < end; j++) {
-        const d = text[j];
-        if (inStr) {
-          if (esc) esc = false;
-          else if (d === "\\") esc = true;
-          else if (d === '"') {
-            inStr = false;
-            afterStr = true;
-          }
-          continue;
-        }
-        if (d === " " || d === "\t" || d === "\n" || d === "\r") continue;
-        if (d === '"') {
-          inStr = true;
-          afterStr = false;
-          continue;
-        }
-        if (d === ":" && afterStr) prop = true;
-        afterStr = false;
-        if (d === "{" || d === "[") depth++;
-        else if (d === "}" || d === "]") {
-          depth--;
-          if (depth === 0) {
-            j++;
-            break;
-          }
-        }
-      }
-      const span = text.slice(i, j);
-      out += depth === 0 && prop ? "…" : span;
-      i = j;
-    } else {
-      out += c;
-      i++;
-    }
-  }
-  return out;
-}
-
-/** A word that opens a quoted command: a quote or backtick, then `cadence`. */
-const QUOTED_CMD = /^[("'`]{1,3}(?:\S*\/)?cadence$/i;
-/** A word that closes a quote or backtick span. */
-const CLOSES_QUOTE = /["'`)]$/;
-
-/** Elide a command quoted mid-sentence (`run "cadence artifact put …" now`):
- *  from the quoted `cadence` to the closing quote, or the end of the line. */
-function elideQuotedCommands(words: string[]): string[] {
-  const out: string[] = [];
-  let eliding = false;
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    if (eliding) {
-      if (w.trim() !== "" && CLOSES_QUOTE.test(w)) eliding = false;
-      continue;
-    }
-    if (QUOTED_CMD.test(w) && words[i + 2] !== undefined) {
-      out.push("…");
-      eliding = true;
-      continue;
-    }
-    out.push(w);
-  }
-  return out;
-}
-
-/** The agent's own words: command lines (`bash:`, `$ `) dropped, a command
- *  quoted mid-sentence elided, and every path-like or inline-JSON word
- *  replaced by an ellipsis. Linear: one pass per line, one anchored test per
- *  word. */
-function plainWords(text: string): string {
-  return scrubJson(text)
-    .split("\n")
-    .filter((line) => !/^\s*(?:bash:|\$ )/i.test(line))
-    .map((line) =>
-      elideQuotedCommands(line.split(/(\s+)/))
-        .map((w) => (PATHISH.test(w) || ((w[0] === "{" || w[0] === "[") && w.includes('":')) ? "…" : w))
-        .join(""),
-    )
-    .join("\n");
-}
-
 /** Artifact ids a tool call asks to add a version to: `artifact put … --id art-x`
  *  (the thread keeps only the first 160 characters of a command, so the
  *  master gives `--id` first). */
@@ -166,6 +48,8 @@ function putTargets(text: string): string[] {
 
 export interface FeedParts {
   cards: FeedCard[];
+  views: FeedView[];
+  records: FeedRecord[];
   working: Working | null;
   turn: string | null;
 }
@@ -177,7 +61,7 @@ export interface FeedParts {
  * strip and the chip follow that turn, not the newest operator message, which
  * may be a follow-up queued behind it.
  */
-export function feedParts(items: ThreadItem[], liveAfter: number, running: string | null): FeedParts {
+export function feedParts(items: ThreadItem[], liveAfter: number, running: string | null, viewScope: ViewScope = HOME_VIEW_SCOPE): FeedParts {
   const operatorTurns = new Set<string>();
   let turn: string | null = null;
   let lastOperator = -1;
@@ -189,7 +73,22 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
     }
   });
   const cards: FeedCard[] = [];
+  const views: FeedView[] = [];
+  const records: FeedRecord[] = [];
   for (const item of items) {
+    if (item.type === "record") {
+      const ref = recordCardView(item.entry);
+      const message = item.entry.message ?? null;
+      if (ref) records.push({ key: `record:${item.key}`, ref, live: item.entry.seq > liveAfter, operatorTurn: message !== null && operatorTurns.has(message), turn: message });
+      continue;
+    }
+    if (item.type === "view") {
+      const model = parseViewRef(item.entry);
+      const ref = model && viewCardAppView(model, viewScope);
+      const message = item.entry.message ?? null;
+      if (ref) views.push({ key: `view:${item.key}`, ref, ...(model?.placement ? { placement: model.placement } : {}), ...(model && viewHere(model, viewScope) ? { here: true as const } : {}), live: item.entry.seq > liveAfter, operatorTurn: message !== null && operatorTurns.has(message), turn: message });
+      continue;
+    }
     if (item.type !== "artifact") continue;
     const ref = artifactRef(item.entry.payload);
     if (!ref) continue;
@@ -208,32 +107,18 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
     const own = (m: string | null | undefined) => !m || m === running;
     const start = items.findIndex((i) => i.type === "operator" && i.entry.message === running);
     const tail = items.slice((start >= 0 ? start : lastOperator) + 1);
-    let plan: string | null = null;
-    const steps: WorkStep[] = [];
     const updating = new Set<string>();
     for (const item of tail) {
-      if (item.type === "commentary" && own(item.entry.message) && item.entry.text.trim()) plan = plainWords(item.entry.text.trim());
-      if (item.type === "tools") {
-        for (const s of toolSteps(item.entries.filter((x) => own(x.message)))) {
-          steps.push({ text: plainStep(s.call.text), raw: s.summary, done: s.done });
-          // Only a put still waiting for its result is "updating"; a landed one
-          // reads "updated to vN" from the tab itself.
-          if (!s.done) for (const id of putTargets(s.call.text)) updating.add(id);
-        }
+      if (item.type !== "tools") continue;
+      for (const s of toolSteps(item.entries.filter((x) => own(x.message)))) {
+        // Only a put still waiting for its result is "updating"; a landed one
+        // reads "updated to vN" from the tab itself.
+        if (!s.done) for (const id of putTargets(s.call.text)) updating.add(id);
       }
     }
-    const tools = [...tail].reverse().find((i) => i.type === "tools");
-    const open = tools && tools.type === "tools" ? openStep(tools.entries.filter((x) => own(x.message))) : null;
-    working = {
-      plan,
-      step: open ? plainStep(open.text) : null,
-      steps: steps.slice(-4),
-      count: steps.length,
-      turn,
-      updating: [...updating],
-    };
+    working = { turn, updating: [...updating] };
   }
-  return { cards, working, turn };
+  return { cards, views, records, working, turn };
 }
 
 /** The highest stored seq among the items — the mount watermark. */
@@ -259,13 +144,28 @@ export function useCanvasFeed(opts: {
   items: ThreadItem[];
   loaded: boolean;
   running: string | null;
+  /** Default true. False keeps a card from opening the drawer by itself. */
+  autoOpen?: boolean;
+  /** Where a `view_ref` card opens its tab (the app pane's install and context); default: Home's. */
+  viewScope?: ViewScope;
 }): void {
-  const { conversation, surface, composerKey, items, loaded, running } = opts;
+  const { conversation, surface, composerKey, items, loaded, running, autoOpen } = opts;
+  const scopeInstall = opts.viewScope?.installId ?? null;
+  const scopeContext = opts.viewScope?.contextId ?? HOME_VIEW_SCOPE.contextId;
+  const showHere = opts.viewScope?.showHere;
   const mark = useRef<{ conversation: string | null; seq: number | null }>({ conversation: null, seq: null });
+  // The newest stored seq this host has shown, so a later one can light the chat rail while the canvas is expanded.
+  const seen = useRef<{ conversation: string | null; seq: number }>({ conversation: null, seq: 0 });
+  useEffect(() => {
+    if (!loaded || conversation === null) return;
+    const top = topSeq(items);
+    if (seen.current.conversation === conversation && top > seen.current.seq) noteChatActivity();
+    seen.current = { conversation, seq: top };
+  }, [conversation, items, loaded]);
   useEffect(() => {
     if (mark.current.conversation !== conversation) mark.current = { conversation, seq: null };
     if (!loaded || conversation === null) return;
     if (mark.current.seq === null) mark.current.seq = topSeq(items);
-    feedCanvas({ conversation, surface, composerKey, ...feedParts(items, mark.current.seq, running) });
-  }, [conversation, surface, composerKey, items, loaded, running]);
+    feedCanvas({ conversation, surface, composerKey, autoOpen, showHere, ...feedParts(items, mark.current.seq, running, { installId: scopeInstall, contextId: scopeContext, showHere }) });
+  }, [conversation, surface, composerKey, items, loaded, running, autoOpen, scopeInstall, scopeContext, showHere]);
 }

@@ -10,6 +10,23 @@ import type { Meta } from "../../lib/types";
 
 export const SIGN_IN_COMMAND = "cadence ui login";
 
+/** Whether `/api/meta`'s session is a verified identity the shell admits
+ *  (AuthBoundary): a known origin, its times, and on a public (hosted)
+ *  session a subject and a role of exactly `operator` or `member`. A
+ *  signed-in answer without one is unanswered, never authority. */
+export function sessionAdmissible(session: Meta["session"] | undefined): boolean {
+  return session !== null && session !== undefined
+    && typeof session.id === "string" && session.id.trim().length > 0
+    && ["loopback", "tailnet", "public"].includes(session.origin)
+    && Number.isFinite(session.created)
+    && Number.isFinite(session.idle_expires_at)
+    && Number.isFinite(session.expires_at)
+    && (session.origin !== "public" || (
+      typeof session.user?.sub === "string" && session.user.sub.trim().length > 0
+      && (session.user.role === "operator" || session.user.role === "member")
+    ));
+}
+
 export const READ_ONLY_REASON = "The board is read-only — the server refuses every write.";
 
 /** Why writes are disabled for this client, or null when they are not.
@@ -55,6 +72,21 @@ export function kickoffBlock(meta: Meta | null): string | null {
 
 /** The reason a non-operator session is refused hiring and job edits. */
 export const OPERATOR_HIRE_REASON = "Only the operator can hire.";
+
+/** Why a project's access settings are disabled, or null when this session
+ *  may change them. The policy write is an operator-only route, so a
+ *  signed-in member passes [`writeBlock`] and is still refused. */
+export function policyBlock(meta: Meta | null): string | null {
+  const writes = writeBlock(meta);
+  if (writes) return writes;
+  if (meta?.operator === null) {
+    return "Only the operator can change who can see a project — the board could not confirm whether this session is the operator's. It is re-checking; retry in a moment.";
+  }
+  if (meta?.operator !== true) {
+    return "Only the operator can change who can see a project — this session is not the operator's.";
+  }
+  return null;
+}
 
 /** Why hiring (and editing an agent's job) is disabled, or null when this
  *  session may. Both go over operator-only routes, so a signed-in member

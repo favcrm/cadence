@@ -7,191 +7,353 @@
 //! and revise omit `--docx`, and `show --out` writes that exact version
 //! into a new directory. It does not render, price, or approve anything.
 
+#![forbid(unsafe_code)]
+
 use super::*;
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
-#[derive(Subcommand)]
-pub(crate) enum TemplateAction {
-    /// Create version 1 from a spec JSON file. A quotation or invoice also
-    /// needs `--docx`. An authoring pack must omit `--docx`. The daemon
-    /// assigns the version; the result is a draft and is not approved.
-    Create {
-        /// The template name (lowercase letters, digits, '-').
-        name: String,
-        /// DOCX source for a quotation or invoice. Refused for an authoring pack.
-        #[arg(long)]
-        docx: Option<PathBuf>,
-        /// Spec JSON. Financial: kind, fields, fixed_text, calculation.
-        /// Authoring: kind "authoring", purpose, format, guidelines, references.
-        #[arg(long)]
-        file: PathBuf,
-    },
-    /// Create the next version from `--base`. The base is left unchanged;
-    /// the result is a new draft and does not inherit approval.
-    Revise {
-        name: String,
-        /// The version this revision starts from.
-        #[arg(long)]
-        base: i64,
-        /// DOCX source for a quotation or invoice. Refused for an authoring pack.
-        #[arg(long)]
-        docx: Option<PathBuf>,
-        #[arg(long)]
-        file: PathBuf,
-    },
-    /// List the versions of a template, or show one with `--version`.
-    /// `--out` materialises one authoring pack into a new directory.
-    Show {
-        name: String,
-        #[arg(long)]
-        version: Option<i64>,
-        /// New directory for an authoring pack (`guidelines.md`, reference
-        /// files, `template.json`). Requires `--version`. Must not exist.
-        /// Created mode 0700; files inside are created 0644. Refused for a
-        /// quotation or invoice.
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-    /// Read a company DOCX or readable PDF as a reference: its text,
-    /// placeholders, loop tags, tables and styles, with provenance. Proposes
-    /// nothing and stores nothing; a PDF also yields an editable DOCX
-    /// reconstruction in `--out` that needs its own approval.
-    Intake {
-        /// The reference file (DOCX or readable PDF).
-        file: PathBuf,
-        /// Existing directory for the reconstruction DOCX (PDF only).
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-    /// Render a labelled SAMPLE preview of a draft or approved version with
-    /// placeholder values, to DOCX and PDF in `--out`. Stores nothing.
-    Sample {
-        name: String,
-        #[arg(long)]
-        version: i64,
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Approve exactly one version (operator connection only). `--sha256`
-    /// must be the content digest `template show` printed for it.
-    Approve {
-        name: String,
-        #[arg(long)]
-        version: i64,
-        #[arg(long)]
-        sha256: String,
-        /// Who decided and where (e.g. "chris in chat 22:33Z").
-        #[arg(long)]
-        source: String,
-    },
+use cadence_agent::fd_fs::DirFd;
+
+mod args;
+
+pub(crate) use args::{ArtifactSaveArgs, DocumentAction, TemplateAction};
+
+fn erej(m: impl Into<String>) -> Error {
+    Error::rejected(m)
+}
+fn b64_dec(s: &str, msg: &str) -> Result<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    B64.decode(s).map_err(|_| erej(msg))
+}
+fn b64_enc(b: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    B64.encode(b)
 }
 
-#[derive(Subcommand)]
-pub(crate) enum DocumentAction {
-    /// Create a draft from an approved template version. Validates the data
-    /// and computes totals in code. Issues no invoice number and sends
-    /// nothing.
-    Create {
-        /// The approved template name.
-        template: String,
-        #[arg(long)]
-        version: i64,
-        /// The data JSON: fields and line items (quantities and prices as text).
-        #[arg(long)]
-        file: PathBuf,
-    },
-    /// Show a retained draft with its input and computed context.
-    Show { id: String },
-    /// Export a retained draft to DOCX and PDF files in `--out`. Creates no
-    /// invoice, number or send: the files are a preview of the draft.
-    Export {
-        id: String,
-        /// Existing directory the DOCX and PDF are written into.
-        #[arg(long)]
-        out: PathBuf,
-    },
+pub(super) fn read_bounded_template_file(path: &Path, cap: u64, label: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let d = path.display();
+    let over = |n| {
+        erej(format!(
+            "{label} refused: {n} bytes > {cap}-byte cap; nothing sent"
+        ))
+    };
+    let mut opt = std::fs::OpenOptions::new();
+    opt.read(true);
+    #[cfg(unix)]
+    opt.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = opt.open(path).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return erej(format!("{label} refused: {d} is a symlink"));
+        }
+        erej(format!("{label}: cannot open {d}: {e}"))
+    })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| erej(format!("{label}: cannot read {d}: {e}")))?;
+    if !meta.is_file() {
+        return Err(erej(format!("{label} refused: {d} is not a file")));
+    }
+    if meta.len() > cap {
+        return Err(over(meta.len()));
+    }
+    let mut bytes = Vec::new();
+    (&file).take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(over(bytes.len() as u64));
+    }
+    Ok(bytes)
 }
 
 /// The DOCX bytes, base64 for the JSON request.
-fn read_docx(path: &PathBuf) -> Result<String> {
-    use base64::Engine;
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::rejected(format!("Cannot read {}: {e}", path.display())))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+fn read_docx(path: &Path) -> Result<String> {
+    Ok(b64_enc(&read_bounded_template_file(
+        path,
+        10 * 1024 * 1024,
+        "DOCX template",
+    )?))
 }
 
-fn read_json(path: &PathBuf) -> Result<Value> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::rejected(format!("Cannot read {}: {e}", path.display())))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| Error::rejected(format!("{} is not valid JSON: {e}", path.display())))
+pub(super) fn read_html_source(path: &Path) -> Result<String> {
+    let cap = cadence_agent::business_templates::html::HTML_MAX_BYTES;
+    let bytes = read_bounded_template_file(path, cap as u64, "HTML template")?;
+    let d = path.display();
+    if bytes.is_empty() {
+        return Err(erej(format!("HTML template {d} must be 1..={cap} bytes")));
+    }
+    String::from_utf8(bytes).map_err(|_| erej(format!("{d} is not valid UTF-8 HTML")))
 }
 
-/// Financial templates keep the historical DOCX field. An authoring pack
-/// omits `source`; a supplied DOCX is refused before the RPC.
-fn optional_docx(spec: &Value, docx: Option<PathBuf>) -> Result<Option<String>> {
-    let authoring = spec.get("kind").and_then(Value::as_str) == Some("authoring");
-    match (authoring, docx) {
-        (true, Some(_)) => Err(Error::rejected("an authoring pack does not accept --docx")),
-        (true, None) => Ok(None),
-        (false, None) => Err(Error::rejected(
-            "a quotation or invoice template requires --docx",
-        )),
-        (false, Some(path)) => Ok(Some(read_docx(&path)?)),
+pub(super) fn read_json(path: &PathBuf) -> Result<Value> {
+    let d = path.display();
+    let bytes = std::fs::read(path).map_err(|e| erej(format!("Cannot read {d}: {e}")))?;
+    serde_json::from_slice(&bytes).map_err(|e| erej(format!("{d} is not valid JSON: {e}")))
+}
+
+pub(super) fn validate_artifact_meta_flags(a: &ArtifactSaveArgs) -> Result<()> {
+    let any = a.title.is_some() || a.label.is_some() || a.customer.is_some() || a.issue.is_some();
+    if !a.save_artifact && any {
+        return Err(Error::usage(
+            "--title, --label, --customer and --issue require --save-artifact",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_native_save_artifact(a: &ArtifactSaveArgs) -> Result<()> {
+    validate_artifact_meta_flags(a)?;
+    if a.save_artifact && (a.label.is_some() || a.customer.is_some() || a.issue.is_some()) {
+        return Err(erej(
+            "--label, --customer and --issue with --save-artifact require a hosted --org workspace",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_export_target(out: &Option<PathBuf>, save_artifact: bool) -> Result<()> {
+    if out.is_none() && !save_artifact {
+        return Err(Error::usage(
+            "document export requires --out <path> or --save-artifact",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn normalize_sample_or_export_format(format: Option<&str>) -> Result<Option<String>> {
+    match format {
+        None => Ok(None),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            f @ ("html" | "pdf" | "docx" | "both") => Ok(Some(f.to_string())),
+            _ => Err(Error::usage(format!(
+                "unsupported format '{raw}'; expected html, pdf, docx, or both"
+            ))),
+        },
     }
 }
 
-fn template_params(name: &str, spec: Value, source: Option<String>) -> Value {
+pub(super) fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opt = std::fs::OpenOptions::new();
+    opt.write(true).create_new(true);
+    #[cfg(unix)]
+    opt.mode(0o600);
+    let d = path.display();
+    let mut file = opt
+        .open(path)
+        .map_err(|e| erej(format!("cannot create {d}: {e}")))?;
+    if let Err(err) = file.write_all(bytes) {
+        let _ = std::fs::remove_file(path);
+        return Err(erej(format!("cannot write {d}: {err}")));
+    }
+    Ok(())
+}
+
+pub(super) fn resolve_single_or_dir_out(out: &Path, name: &str) -> PathBuf {
+    if out.is_dir() {
+        out.join(name)
+    } else {
+        out.to_path_buf()
+    }
+}
+
+fn native_template_params(
+    name: &str,
+    base: Option<i64>,
+    html: Option<PathBuf>,
+    docx: Option<PathBuf>,
+    file: &PathBuf,
+) -> Result<(&'static str, Value)> {
+    let spec = read_json(file)?;
+    let auth = spec.get("kind").and_then(Value::as_str) == Some("authoring");
+    let (h, d) = match (auth, html, docx) {
+        (true, Some(_), _) | (true, _, Some(_)) => {
+            return Err(erej("an authoring pack does not accept --html or --docx"))
+        }
+        (true, None, None) => (None, None),
+        (false, Some(p), None) => (Some(read_html_source(&p)?), None),
+        (false, None, Some(p)) => (None, Some(read_docx(&p)?)),
+        (false, Some(_), Some(_)) => {
+            return Err(Error::usage("pass either --html or --docx, not both"))
+        }
+        (false, None, None) => {
+            return Err(erej(
+                "a quotation or invoice template requires --html or --docx",
+            ))
+        }
+    };
     let mut params = json!({"name": name, "spec": spec});
-    if let Some(source) = source {
-        params["source"] = json!(source);
+    if let Some(v) = h {
+        params["html"] = json!(v);
     }
-    params
+    if let Some(v) = d {
+        params["source"] = json!(v);
+    }
+    if let Some(b) = base {
+        params["base"] = json!(b);
+        return Ok(("business_template_revise", params));
+    }
+    Ok(("business_template_create", params))
+}
+
+fn decode_b64_field(v: &Value, key: &str, missing: &str, bad: &str) -> Result<Vec<u8>> {
+    b64_dec(
+        v.get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| erej(missing))?,
+        bad,
+    )
+}
+
+fn extract_html_bytes_from_value(v: &Value) -> Result<Vec<u8>> {
+    if let Some(h) = v.get("html").and_then(Value::as_str) {
+        return Ok(h.as_bytes().to_vec());
+    }
+    decode_b64_field(
+        v,
+        "html_base64",
+        "server response contained no HTML content",
+        "invalid HTML base64",
+    )
+}
+
+pub(super) fn write_rendered_outputs(
+    out: &Path,
+    stem: &str,
+    format: Option<&str>,
+    summary: &mut serde_json::Map<String, Value>,
+    get_html: impl FnOnce() -> Result<Vec<u8>>,
+    get_pdf: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<()> {
+    let fmt = format.unwrap_or("html");
+    if fmt == "pdf" {
+        let p = resolve_single_or_dir_out(out, &format!("{stem}.pdf"));
+        write_new_file(&p, &get_pdf()?)?;
+        summary.insert("pdf".into(), json!(p));
+        return Ok(());
+    }
+    let html = get_html()?;
+    let hp = resolve_single_or_dir_out(out, &format!("{stem}.html"));
+    if fmt == "both" {
+        let pdf = get_pdf()?;
+        let pp = if out.is_dir() {
+            out.join(format!("{stem}.pdf"))
+        } else {
+            out.with_extension("pdf")
+        };
+        if pp == hp {
+            return Err(erej(
+                "pass a directory or .html path for --out with --format both",
+            ));
+        }
+        write_new_file(&hp, &html)?;
+        if let Err(err) = write_new_file(&pp, &pdf) {
+            let _ = std::fs::remove_file(&hp);
+            return Err(err);
+        }
+        summary.insert("html".into(), json!(hp));
+        summary.insert("pdf".into(), json!(pp));
+        return Ok(());
+    }
+    write_new_file(&hp, &html)?;
+    summary.insert("html".into(), json!(hp));
+    Ok(())
+}
+
+fn write_sample_or_export(
+    out: &Path,
+    stem: &str,
+    fmt: Option<&str>,
+    res: &Value,
+    mode: &str,
+) -> Result<Value> {
+    if res.get("docx_base64").is_none() {
+        let mut s = if mode == "sample" {
+            json!({"sample": true, "context": res["context"]})
+        } else {
+            json!({"id": res["id"]})
+        };
+        let map = s.as_object_mut().expect("json object");
+        let gh = || extract_html_bytes_from_value(res);
+        let gp = || decode_b64_field(res, "pdf_base64", "PDF output missing", "invalid PDF bytes");
+        write_rendered_outputs(out, stem, fmt, map, gh, gp)?;
+        return Ok(s);
+    }
+    let docx = decode_b64_field(res, "docx_base64", "missing DOCX", "invalid DOCX bytes")?;
+    let pdf = decode_b64_field(res, "pdf_base64", "missing PDF", "invalid PDF bytes")?;
+    let (dp, pp) = (
+        out.join(format!("{stem}.docx")),
+        out.join(format!("{stem}.pdf")),
+    );
+    std::fs::write(&dp, docx)
+        .and_then(|_| std::fs::write(&pp, pdf))
+        .map_err(|e| erej(format!("cannot write {mode}: {e}")))?;
+    Ok(if mode == "sample" {
+        json!({"sample": true, "docx": dp, "pdf": pp, "context": res["context"]})
+    } else {
+        json!({"id": stem, "docx": dp, "pdf": pp})
+    })
 }
 
 pub(super) fn run_template(state_dir: PathBuf, action: TemplateAction) -> Result<i32> {
     let result = match action {
-        TemplateAction::Create { name, docx, file } => {
-            let spec = read_json(&file)?;
-            let source = optional_docx(&spec, docx)?;
-            client::rpc(
-                &state_dir,
-                "business_template_create",
-                template_params(&name, spec, source),
-            )?
+        TemplateAction::List => client::rpc(&state_dir, "business_template_list", json!({}))?,
+        TemplateAction::Create {
+            name,
+            html,
+            docx,
+            file,
+        } => {
+            let (m, p) = native_template_params(&name, None, html, docx, &file)?;
+            client::rpc(&state_dir, m, p)?
         }
         TemplateAction::Revise {
             name,
             base,
+            html,
             docx,
             file,
         } => {
-            let spec = read_json(&file)?;
-            let source = optional_docx(&spec, docx)?;
-            let mut params = template_params(&name, spec, source);
-            params["base"] = json!(base);
-            client::rpc(&state_dir, "business_template_revise", params)?
+            let (m, p) = native_template_params(&name, Some(base), html, docx, &file)?;
+            client::rpc(&state_dir, m, p)?
         }
         TemplateAction::Show { name, version, out } => {
             if out.is_some() && version.is_none() {
-                return Err(Error::rejected("template show --out requires --version"));
+                return Err(erej("template show --out requires --version"));
             }
             let mut params = json!({"name": name});
-            if let Some(version) = version {
-                params["version"] = json!(version);
+            if let Some(v) = version {
+                params["version"] = json!(v);
             }
-            let result = client::rpc(&state_dir, "business_template_show", params)?;
+            let r = client::rpc(&state_dir, "business_template_show", params)?;
             match out {
-                Some(out) => materialise_authoring_pack(&out, result)?,
-                None => result,
+                Some(p) if r["spec"]["kind"].as_str() == Some("authoring") => {
+                    materialise_authoring_pack(&p, r)?
+                }
+                Some(p)
+                    if r["template"]["source_format"].as_str() == Some("html")
+                        || r.get("html").is_some() =>
+                {
+                    write_new_file(&p, &extract_html_bytes_from_value(&r)?)?;
+                    json!({"template": r["template"], "spec": r["spec"], "written": p})
+                }
+                Some(_) => {
+                    return Err(erej(
+                        "template show --out supports authoring packs and HTML templates",
+                    ))
+                }
+                None => r,
             }
         }
         TemplateAction::Intake { file, out } => {
             use base64::Engine;
-            let bytes = std::fs::read(&file)
-                .map_err(|e| Error::rejected(format!("Cannot read {}: {e}", file.display())))?;
+            let bytes = read_bounded_template_file(&file, 10 * 1024 * 1024, "template intake")?;
             let name = file
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -224,26 +386,26 @@ pub(super) fn run_template(state_dir: PathBuf, action: TemplateAction) -> Result
             }
             result
         }
-        TemplateAction::Sample { name, version, out } => {
-            use base64::Engine;
-            let result = client::rpc(
-                &state_dir,
-                "business_template_sample",
-                json!({"name": name, "version": version}),
-            )?;
-            let engine = base64::engine::general_purpose::STANDARD;
-            let docx = engine
-                .decode(result["docx_base64"].as_str().unwrap_or_default())
-                .map_err(|_| Error::rejected("sample returned invalid DOCX bytes"))?;
-            let pdf = engine
-                .decode(result["pdf_base64"].as_str().unwrap_or_default())
-                .map_err(|_| Error::rejected("sample returned invalid PDF bytes"))?;
-            let docx_path = out.join(format!("{name}-v{version}-sample.docx"));
-            let pdf_path = out.join(format!("{name}-v{version}-sample.pdf"));
-            std::fs::write(&docx_path, docx)
-                .and_then(|_| std::fs::write(&pdf_path, pdf))
-                .map_err(|e| Error::rejected(format!("cannot write sample: {e}")))?;
-            json!({"sample": true, "docx": docx_path, "pdf": pdf_path, "context": result["context"]})
+        TemplateAction::Sample {
+            name,
+            version,
+            out,
+            format,
+        } => {
+            let fmt = normalize_sample_or_export_format(format.as_deref())?;
+            let mut params = json!({"name": name});
+            if let Some(v) = version {
+                params["version"] = json!(v);
+            }
+            if let Some(f) = &fmt {
+                params["format"] = json!(f);
+            }
+            let r = client::rpc(&state_dir, "business_template_sample", params)?;
+            let stem = format!(
+                "{name}-v{}-sample",
+                r["version"].as_i64().or(version).unwrap_or(1)
+            );
+            write_sample_or_export(&out, &stem, fmt.as_deref(), &r, "sample")?
         }
         TemplateAction::Approve {
             name,
@@ -260,36 +422,96 @@ pub(super) fn run_template(state_dir: PathBuf, action: TemplateAction) -> Result
     Ok(0)
 }
 
+fn save_native_artifact(
+    state_dir: &Path,
+    a: &ArtifactSaveArgs,
+    default_title: &str,
+    kind: &str,
+    bytes: &[u8],
+) -> Result<Value> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    client::rpc(
+        state_dir,
+        "artifact_put",
+        json!({"kind": kind, "title": a.title.as_deref().unwrap_or(default_title), "content": B64.encode(bytes)}),
+    )
+}
+
 pub(super) fn run_document(state_dir: PathBuf, action: DocumentAction) -> Result<i32> {
     let result = match action {
         DocumentAction::Create {
             template,
             version,
             file,
-        } => client::rpc(
-            &state_dir,
-            "business_document_create",
-            json!({"template": template, "version": version, "data": read_json(&file)?}),
-        )?,
+            allow_partial,
+            artifact,
+        } => {
+            validate_native_save_artifact(&artifact)?;
+            let mut params = json!({"template": template, "data": read_json(&file)?, "allow_partial": allow_partial});
+            if let Some(v) = version {
+                params["version"] = json!(v);
+            }
+            let mut created = client::rpc(&state_dir, "business_document_create", params)?;
+            if artifact.save_artifact {
+                let bytes = extract_html_bytes_from_value(&created).map_err(|_| {
+                    Error::rejected(
+                        "--save-artifact on document create requires an HTML template draft",
+                    )
+                })?;
+                let title = format!(
+                    "{template} v{} ({})",
+                    created["version"].as_i64().unwrap_or(1),
+                    created["id"].as_str().unwrap_or("draft")
+                );
+                created["artifact"] =
+                    save_native_artifact(&state_dir, &artifact, &title, "html", &bytes)?;
+            }
+            created
+        }
         DocumentAction::Show { id } => {
             client::rpc(&state_dir, "business_document_show", json!({"id": id}))?
         }
-        DocumentAction::Export { id, out } => {
-            use base64::Engine;
-            let result = client::rpc(&state_dir, "business_document_export", json!({"id": id}))?;
-            let engine = base64::engine::general_purpose::STANDARD;
-            let docx = engine
-                .decode(result["docx_base64"].as_str().unwrap_or_default())
-                .map_err(|_| Error::rejected("export returned invalid DOCX bytes"))?;
-            let pdf = engine
-                .decode(result["pdf_base64"].as_str().unwrap_or_default())
-                .map_err(|_| Error::rejected("export returned invalid PDF bytes"))?;
-            let docx_path = out.join(format!("{id}.docx"));
-            let pdf_path = out.join(format!("{id}.pdf"));
-            std::fs::write(&docx_path, docx)
-                .and_then(|_| std::fs::write(&pdf_path, pdf))
-                .map_err(|e| Error::rejected(format!("cannot write export: {e}")))?;
-            json!({"id": id, "docx": docx_path, "pdf": pdf_path})
+        DocumentAction::Export {
+            id,
+            out,
+            format,
+            artifact,
+        } => {
+            validate_native_save_artifact(&artifact)?;
+            validate_export_target(&out, artifact.save_artifact)?;
+            let format = normalize_sample_or_export_format(format.as_deref())?;
+            let mut params = json!({"id": id});
+            if let Some(fmt) = &format {
+                params["format"] = json!(fmt);
+            }
+            let result = client::rpc(&state_dir, "business_document_export", params)?;
+            let mut out_val = match out {
+                Some(p) => write_sample_or_export(&p, &id, format.as_deref(), &result, "export")?,
+                None => json!({"id": id}),
+            };
+            if artifact.save_artifact {
+                let (kind, bytes) = if format.as_deref() == Some("pdf") {
+                    (
+                        "pdf",
+                        decode_b64_field(
+                            &result,
+                            "pdf_base64",
+                            "--save-artifact could not obtain PDF export bytes",
+                            "export returned invalid PDF bytes",
+                        )?,
+                    )
+                } else {
+                    ("html", extract_html_bytes_from_value(&result)?)
+                };
+                out_val["artifact"] = save_native_artifact(
+                    &state_dir,
+                    &artifact,
+                    &format!("Document {id}"),
+                    kind,
+                    &bytes,
+                )?;
+            }
+            out_val
         }
     };
     print_json(&result);
@@ -304,7 +526,7 @@ struct PackManifest<'a> {
 
 /// Validate once through the model, then materialise data into a fresh
 /// private directory. Reference contents are never interpreted or executed.
-fn materialise_authoring_pack(out: &Path, mut show: Value) -> Result<Value> {
+pub(super) fn materialise_authoring_pack(out: &Path, mut show: Value) -> Result<Value> {
     use base64::Engine;
     use std::io::Write;
 
@@ -372,49 +594,23 @@ fn io_pack_err(context: &str, err: std::io::Error) -> Error {
     }
 }
 
-fn open_dir_path(path: &Path) -> Result<OwnedFd> {
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| Error::rejected("path contains NUL"))?;
-    // SAFETY: `c` is a NUL-terminated path; the returned fd is owned.
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io_pack_err(
-            &format!("cannot open directory {}", path.display()),
-            std::io::Error::last_os_error(),
-        ));
+fn open_dir_path(path: &Path) -> Result<DirFd> {
+    if CString::new(path.as_os_str().as_bytes()).is_err() {
+        return Err(Error::rejected("path contains NUL"));
     }
-    // SAFETY: `fd` is a freshly opened descriptor not owned elsewhere.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    DirFd::open_nofollow(path)
+        .map_err(|err| io_pack_err(&format!("cannot open directory {}", path.display()), err))
 }
 
-fn openat_dir(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd> {
+fn openat_dir(dir: &DirFd, name: &OsStr) -> Result<DirFd> {
     let c = CString::new(name.as_bytes())
         .map_err(|_| Error::rejected("path component contains NUL"))?;
-    // SAFETY: `dir` is an open directory fd and `c` is one path component.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io_pack_err(
-            &format!("cannot open {}", name.to_string_lossy()),
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: `fd` is a freshly opened descriptor not owned elsewhere.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    dir.open_child_dir(&c)
+        .map_err(|err| io_pack_err(&format!("cannot open {}", name.to_string_lossy()), err))
 }
 
 /// Walk `path` with `O_NOFOLLOW` on every component, including `.` and `/`.
-fn open_nofollow_dir(path: &Path) -> Result<OwnedFd> {
+fn open_nofollow_dir(path: &Path) -> Result<DirFd> {
     use std::path::Component;
     let mut components = path.components().peekable();
     if components.peek().is_none() {
@@ -446,8 +642,8 @@ fn open_nofollow_dir(path: &Path) -> Result<OwnedFd> {
 /// A directory this process just created. Dropping it leaves the files in
 /// place; `abort` removes only the names this process created.
 struct FreshDir {
-    parent: OwnedFd,
-    dir: OwnedFd,
+    parent: DirFd,
+    dir: DirFd,
     name: CString,
     files: Vec<CString>,
 }
@@ -481,12 +677,9 @@ impl FreshDir {
         })?;
         let name = CString::new(leaf.as_bytes())
             .map_err(|_| Error::rejected("output directory name contains NUL"))?;
-        // SAFETY: `parent` is an open directory and `name` is one component.
         // mkdirat creates exclusively; an existing file or link gives EEXIST.
         // 0700, not 0755: the pack can hold confidential company references.
-        let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
+        if let Err(err) = parent.mkdir(&name, 0o700) {
             if err.raw_os_error() == Some(libc::EEXIST) {
                 return Err(Error::rejected(format!(
                     "refusing to overwrite {}; template show --out requires a directory that does not exist",
@@ -500,14 +693,8 @@ impl FreshDir {
         }
         let dir = openat_dir(&parent, leaf)?;
         // mkdirat masks with the process umask. Force owner-only access.
-        // SAFETY: `dir` is the directory this process just created.
-        let chmod_rc = unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) };
-        if chmod_rc != 0 {
-            let err = std::io::Error::last_os_error();
-            // SAFETY: removes only the empty directory this process created.
-            unsafe {
-                libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
-            }
+        if let Err(err) = dir.fchmod(0o700) {
+            let _ = parent.rmdir_child(&name);
             return Err(io_pack_err(
                 &format!("cannot restrict permissions on {}", out.display()),
                 err,
@@ -523,44 +710,29 @@ impl FreshDir {
 
     fn create_file(&mut self, name: &str) -> Result<std::fs::File> {
         let c = leaf_cstring(name)?;
-        // SAFETY: `O_EXCL|O_NOFOLLOW` creates one regular file and refuses a
-        // symlink or an existing name. The fd is owned immediately below.
-        let fd = unsafe {
-            libc::openat(
-                self.dir.as_raw_fd(),
-                c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o644,
-            )
-        };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EEXIST) {
-                return Err(Error::rejected(format!(
-                    "refusing to overwrite {name} in the output directory"
-                )));
+        let file = match self.dir.open_file_nofollow(
+            &c,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o644,
+        ) {
+            Ok(file) => file,
+            Err(err) => {
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    return Err(Error::rejected(format!(
+                        "refusing to overwrite {name} in the output directory"
+                    )));
+                }
+                return Err(io_pack_err(&format!("cannot create {name}"), err));
             }
-            return Err(io_pack_err(&format!("cannot create {name}"), err));
-        }
+        };
         self.files.push(c);
-        // SAFETY: `fd` is a freshly opened descriptor not owned elsewhere.
-        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        Ok(file)
     }
 
     fn abort(self) {
         for name in &self.files {
-            // SAFETY: unlinks a basename this process created in `dir`.
-            unsafe {
-                libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0);
-            }
+            let _ = self.dir.unlink_child(name);
         }
-        // SAFETY: removes the directory this process created, not a symlink.
-        unsafe {
-            libc::unlinkat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            );
-        }
+        let _ = self.parent.rmdir_child(&self.name);
     }
 }

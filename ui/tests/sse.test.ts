@@ -109,12 +109,30 @@ async function main() {
     await fire();
     equal(delays[4], 100, "an open resets the backoff");
     equal(seen, ["entry:5:a", "entry:null:b", "entry:6:c"], "frames delivered in order");
-    equal(states.slice(0, 2), ["reconnecting", "reopening"], "error states");
+    equal(states.slice(0, 3), ["reconnecting", "reconnecting", "reopening"], "error states");
     sub.close();
     equal(opened[5].closed, true, "close closes the live source");
     opened[5].fail(2);
     await flush();
     equal(opened.length, 6, "no reopen after close");
+  }
+
+  // A stalled status probe must not leave consumers showing stale live state.
+  {
+    let source: FakeSource | null = null;
+    const states: SseErrorState[] = [];
+    const sub = subscribeSse({
+      url: "/api/threads/master/stream",
+      events: ["preview"],
+      onEvent: () => {},
+      onError: (state) => states.push(state),
+      probe: () => new Promise(() => {}),
+      open: (url) => (source = new FakeSource(url)),
+    });
+    source!.opened();
+    source!.fail(2);
+    equal(states, ["reconnecting"], "closed stream reports disconnection before the probe resolves");
+    sub.close();
   }
 
   // A permanent 4xx stops the subscription; timeouts and 5xx keep retrying.
@@ -140,7 +158,7 @@ async function main() {
     opened[0].fail(2);
     await flush();
     await flush();
-    equal(states, ["stopped"], "404 stops");
+    equal(states, ["reconnecting", "stopped"], "404 stops");
     equal(opened.length, 1, "no reopen after a permanent refusal");
     equal(isPermanent(404) && isPermanent(410) && isPermanent(400), true, "4xx permanent");
     equal(isPermanent(408) || isPermanent(429) || isPermanent(503) || isPermanent(null), false, "retryable");
@@ -270,7 +288,7 @@ async function main() {
         equal(request.init?.credentials ?? "same-origin", "same-origin", "both requests retain same-origin cookie policy");
         equal(request.init?.signal?.aborted, true, "retired stream and header-only probe are aborted");
       }
-      equal(errors, ["stopped"], "permanent authenticated probe refusal stops reconnection");
+      equal(errors, ["reconnecting", "stopped"], "permanent authenticated probe refusal stops reconnection");
     } finally {
       sub?.close();
       globalThis.fetch = oldFetch;

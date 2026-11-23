@@ -1,9 +1,9 @@
 import SafeLink from "../../ui/SafeLink";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Resource, type ResourceState } from "../../lib/cache";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
-import { useQuery } from "../../lib/useResource";
+import { useMaybeResource, useQuery } from "../../lib/useResource";
 import type {
   AgentsPayload,
   IssueDetail,
@@ -16,12 +16,14 @@ import SectionTabs from "../../ui/SectionTabs";
 import "./issues.css";
 import KickoffDialog from "./KickoffDialog";
 import IdeaCard from "../home/IdeaCard";
+import { stageLabel } from "../projects/work";
 import { LaneCard, type LanePayload } from "./LaneCard";
 import { LaneConversation } from "./LaneConversation";
 import { Activity } from "./Activity";
 import { PrPanel } from "./PrPanel";
 import { Evidence } from "./Evidence";
 import { Fields } from "./Fields";
+import { STATUS_CHIP } from "./chips";
 import { WorkResult } from "./WorkResult";
 import { Links } from "./Links";
 import { type IssuePageProps as Props } from "./issuePageProps";
@@ -29,6 +31,7 @@ import { useLocale } from "../../lib/locale";
 import { ReadNotice } from "./issuePageShared";
 import {
   acceptanceItems,
+  hasCodeDelivery,
   issuePath,
   kickoffBlock,
   laneFenceBanner,
@@ -47,15 +50,6 @@ const TABS: { id: IssueTab; label: string }[] = [
   { id: "evidence", label: "Evidence" },
 ];
 
-const STATUS_CHIP: Record<string, string> = {
-  backlog: "bg-ink-800 text-ink-400",
-  ready: "bg-ink-800 text-ink-200",
-  doing: "bg-info/15 text-info",
-  review: "bg-warn/15 text-warn",
-  done: "bg-ok/15 text-ok",
-  dropped: "bg-ink-800 text-ink-500",
-};
-
 export default function IssuePage(props: Props) {
   // All drafts and dialogs belong to one issue, including cached-to-cached navigation.
   return <IssueWorkspace key={props.id} {...props} />;
@@ -63,9 +57,13 @@ export default function IssuePage(props: Props) {
 
 function IssueWorkspace(props: Props) {
   const state = useQuery(resources.issue(props.id));
-  const laneState = useQuery(resources.lane(props.id));
+  const laneResource = props.hosted ? null : resources.lane(props.id);
+  useEffect(() => {
+    if (laneResource) void laneResource.revalidate();
+  }, [laneResource]);
+  const laneState = useMaybeResource(laneResource);
   const detail = state.data?.id === props.id ? state.data : null;
-  const lane = laneState.data?.issue === props.id ? laneState.data : null;
+  const lane = laneState?.data?.issue === props.id ? laneState.data : null;
   const [historyResource] = useState(
     () =>
       new Resource(() => api.history(props.id, 40).then((r) => r.history), {
@@ -115,7 +113,7 @@ function IssueWorkspace(props: Props) {
         blocked={kickoffWhy}
         setKickoff={setKickoff}
       />
-      {kickoff && (
+      {kickoff && !props.hosted && (
         <KickoffDialog
           id={detail.id}
           title={detail.title}
@@ -135,7 +133,7 @@ function IssueWorkspace(props: Props) {
 
 function seatOptions(
   agents: AgentsPayload | null,
-): { alias: string; provider: string; state: string }[] {
+): { alias: string; provider: string; state: string | null }[] {
   return (agents?.agents ?? [])
     .filter((a) => a.provider !== "inbox" && !a.dead)
     .map((a) => ({ alias: a.alias, provider: a.provider, state: a.state }));
@@ -166,28 +164,47 @@ function PageBody({
   onError,
   onOpen,
   setKickoff,
+  hosted,
+  managedFiles,
+  projectRepos,
+  stagedActions,
 }: Props & {
   detail: IssueDetail;
   history: ResourceState<IssueHistoryEntry[]>;
   issueState: ResourceState<IssueDetail>;
-  laneState: ResourceState<LanePayload>;
+  laneState: ResourceState<LanePayload> | null;
   retryHistory: () => void;
   lane: LanePayload | null;
   blocked: string | null;
   setKickoff: (open: boolean) => void;
 }) {
-  const { t, formatNumber } = useLocale();
+  const { t } = useLocale();
+  const fieldsId = useId();
   const items = acceptanceItems(detail.body);
   const rows = timelineRows(detail, history.data ?? []);
   const pr = prRef(detail.refs);
+  const codeDelivery = hasCodeDelivery(detail, projectRepos, hosted);
+  const visibleTabs = TABS.filter((tabItem) => {
+    if (tabItem.id === "pr" && !codeDelivery) return false;
+    if (tabItem.id === "conversation" && hosted && !lane?.lane) return false;
+    return true;
+  });
+  const activeTab: IssueTab = visibleTabs.some((tabItem) => tabItem.id === tab)
+    ? tab
+    : "overview";
   const done = items.filter((i) => i.checked).length;
   const fenced = laneFenceBanner(lane?.lane?.state);
   const images = detail.artifacts.filter((f) => IMG.test(f.name));
   const files = detail.artifacts.filter((f) => !IMG.test(f.name));
   const [compose, setCompose] = useState<"ask" | "instruct">("ask");
+  const [descriptionDraft, setDescriptionDraft] = useState<{ body: string; rev: string } | null>(null);
+  const editingDescription = hosted === true && !readOnly && descriptionDraft !== null;
+  const [savingDescription, setSavingDescription] = useState(false);
+  const [descriptionConflict, setDescriptionConflict] = useState(false);
+  const descriptionStale = descriptionConflict || (descriptionDraft !== null && descriptionDraft.rev !== detail.rev);
   const reloadLane = () => {
     void resources.issue(id).invalidate();
-    void resources.lane(id).invalidate();
+    if (!hosted) void resources.lane(id).invalidate();
   };
   const epics = issues.filter(
     (i) =>
@@ -211,17 +228,35 @@ function PageBody({
       .then((r) => onWrite(r, verb))
       .catch((e) => onError(e, verb));
   };
+  const saveDescription = async () => {
+    if (!descriptionDraft || descriptionStale || savingDescription || readOnly) return;
+    setSavingDescription(true);
+    try {
+      const result = await api.patch(id, { body: descriptionDraft.body }, descriptionDraft.rev);
+      onWrite(result, t("Description"));
+      setDescriptionDraft(null);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        setDescriptionConflict(true);
+        void resources.issue(id).invalidate();
+      } else {
+        onError(error, t("Description"));
+      }
+    } finally {
+      setSavingDescription(false);
+    }
+  };
 
   return (
     <div className="issue-workspace flex flex-col min-w-0" data-issue-page={id}>
       <header className="flex flex-wrap items-end justify-between gap-4 px-4 lg:px-8 pt-5 pb-3">
         <div className="min-w-0">
           <div className="kicker">
-            <span className="num">{id}</span>
+            <span className="num normal-case">{id}</span>
             {" · "}
             {project}
           </div>
-          <h1 className="text-drawer font-semibold text-ink-100 tracking-tight mt-0.5">
+          <h1 className="issue-title font-semibold text-ink-100 tracking-tight mt-0.5">
             {detail.title}
           </h1>
           <div className="flex flex-wrap items-center gap-2 mt-2">
@@ -230,25 +265,29 @@ function PageBody({
             >
               {t(detail.status)}
             </span>
-            <span className="chip bg-ink-800 text-ink-400">
-              {t(detail.priority)}
-            </span>
-            {(detail.parent || detail.component) && (
-              <span className="chip bg-ink-800 text-ink-400">
-                {detail.parent ?? detail.component}
-              </span>
+            <span className="num text-label text-ink-400">{t(detail.priority)}</span>
+            {detail.work?.stage && (
+              <span className="text-label text-ink-400">{stageLabel(detail.work.stage, t)}</span>
             )}
+            {detail.component && (
+              <span className="text-label text-ink-400">{detail.component}</span>
+            )}
+            <a className="lnk text-label xl:hidden" href={`#${fieldsId}`}>
+              {t("Fields & links")}
+            </a>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2 ml-auto">
-          <Button
-            variant={blocked ? "secondary" : "primary"}
-            disabled={!!blocked}
-            title={blocked == null ? undefined : t(blocked)}
-            onClick={() => setKickoff(true)}
-          >
-            {t("Kick off")}
-          </Button>
+        <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
+          {!hosted && (
+            <Button
+              variant={blocked ? "secondary" : "primary"}
+              disabled={!!blocked}
+              title={blocked == null ? undefined : t(blocked)}
+              onClick={() => setKickoff(true)}
+            >
+              {t("Kick off")}
+            </Button>
+          )}
           {lane?.lane && (
             <Button href={tabHref("conversation")}>{t("Ask agent")}</Button>
           )}
@@ -267,7 +306,7 @@ function PageBody({
           retry={() => void resources.issue(id).refresh()}
         />
       </div>
-      {(fenced || items.length === 0) && (
+      {(fenced || (!hosted && items.length === 0)) && (
         <div className="grid gap-2 px-4 lg:px-8 pt-1">
           {fenced && (
             <div className="border border-ink-700 border-l-[3px] border-l-fail rounded-lg px-3.5 py-3 bg-fail/10">
@@ -277,7 +316,7 @@ function PageBody({
               </p>
             </div>
           )}
-          {items.length === 0 && (
+          {!hosted && items.length === 0 && (
             <div className="border border-ink-700 border-l-[3px] border-l-warn rounded-lg px-3.5 py-3 bg-warn/10">
               <strong className="text-ink-100">{t("Kick off blocked")}</strong>
               <p className="text-secondary text-ink-300 mt-1 m-0">{blocked && t(blocked)}</p>
@@ -288,16 +327,16 @@ function PageBody({
 
       <SectionTabs
         label={t("Issue")}
-        tabs={TABS.map((tabItem) => ({
+        tabs={visibleTabs.map((tabItem) => ({
           label: t(tabItem.label),
           href: tabHref(tabItem.id),
-          on: tab === tabItem.id,
+          on: activeTab === tabItem.id,
         }))}
       />
 
-      <div className="grid xl:grid-cols-[minmax(0,1fr)_340px] items-start">
-        <main className="min-w-0 px-4 lg:px-8 py-5 grid gap-4">
-          {tab === "overview" && (detail.tags ?? []).includes("plan-ready") && (
+      <div className="grid grid-cols-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_340px] items-start">
+        <main className="min-w-0 px-4 lg:px-8 py-5 grid grid-cols-[minmax(0,1fr)] gap-5">
+          {activeTab === "overview" && (detail.tags ?? []).includes("plan-ready") && (
             <section aria-label={t("Idea decision")}>
               <IdeaCard
                 issue={id}
@@ -307,35 +346,67 @@ function PageBody({
               />
             </section>
           )}
-          {tab === "overview" && (
+          {activeTab === "overview" && (
             <WorkResult
               detail={detail}
               lane={lane}
               checksDone={done}
               checksTotal={items.length}
+              checklistVisible={!editingDescription}
               blocked={blocked}
+              hosted={hosted === true}
+              codeDelivery={codeDelivery}
+              stagedActions={stagedActions}
               tabHref={tabHref}
               onCompose={composeWith}
-              onKickoff={() => setKickoff(true)}
               onOpen={onOpen}
-            />
-          )}
-          {tab === "overview" && (
-            <section className="issue-description grid gap-4">
-              {items.length > 0 && (
-                <div className="issue-acceptance-progress">
-                  <span>{t("Acceptance")}</span>
-                  <strong className="num">
-                    {formatNumber(done)} {t("of")} {formatNumber(items.length)} {t("complete")}
-                  </strong>
-                </div>
+            >
+              {editingDescription ? (
+                <form className="grid gap-2" onSubmit={(event) => {
+                  event.preventDefault();
+                  void saveDescription();
+                }}>
+                  <label className="slabel" htmlFor="issue-description-draft">{t("Description")}</label>
+                  <textarea
+                    id="issue-description-draft"
+                    name="body"
+                    className="field w-full !h-auto py-2"
+                    rows={10}
+                    value={descriptionDraft.body}
+                    readOnly={savingDescription}
+                    onChange={(event) => setDescriptionDraft({ ...descriptionDraft, body: event.target.value })}
+                    autoFocus
+                  />
+                  {descriptionStale && (
+                    <p role="alert" className="text-secondary text-warn">
+                      {t("The issue changed while you were editing. Copy your draft, then reopen the editor to use the latest version.")}
+                    </p>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="submit" variant="primary" loading={savingDescription} disabled={descriptionStale}>
+                      {t("Save changes")}
+                    </Button>
+                    <Button disabled={savingDescription} onClick={() => setDescriptionDraft(null)}>{t("Cancel")}</Button>
+                  </div>
+                </form>
+              ) : (
+                <>
+                  {hosted && !readOnly && detail.rev && (
+                    <div>
+                      <Button size="sm" onClick={() => {
+                        setDescriptionConflict(false);
+                        setDescriptionDraft({ body: detail.body, rev: detail.rev });
+                      }}>
+                        {t("Edit description")}
+                      </Button>
+                    </div>
+                  )}
+                  <Md text={detail.body} onOpen={onOpen} />
+                </>
               )}
-              <div className="issue-reader max-w-[84ch] text-secondary text-ink-300">
-                <Md text={detail.body} onOpen={onOpen} />
-              </div>
-            </section>
+            </WorkResult>
           )}
-          {tab === "activity" && (
+          {activeTab === "activity" && (
             <Activity
               id={id}
               history={history}
@@ -348,9 +419,9 @@ function PageBody({
               onOpen={onOpen}
             />
           )}
-          {tab === "conversation" &&
+          {activeTab === "conversation" &&
             lane !== null &&
-            (!laneState.error || lane.lane !== null) && (
+            (!laneState?.error || lane.lane !== null) && (
               <LaneConversation
                 issue={id}
                 agent={lane?.lane?.agent ?? null}
@@ -359,7 +430,7 @@ function PageBody({
                 onMode={setCompose}
               />
             )}
-          {tab === "pr" && (
+          {activeTab === "pr" && (
             <PrPanel
               detail={detail}
               readOnly={readOnly}
@@ -367,24 +438,27 @@ function PageBody({
               onError={onError}
             />
           )}
-          {tab === "evidence" && (
+          {activeTab === "evidence" && (
             <Evidence
               id={id}
               images={images}
               files={files}
               readOnly={readOnly}
+              managedFiles={managedFiles}
               onWrite={onWrite}
               onError={onError}
             />
           )}
         </main>
-        <aside className="grid gap-3 px-4 lg:px-8 xl:px-4 xl:pr-8 py-5 xl:border-l xl:border-ink-700 min-w-0">
-          <ReadNotice
-            name="lane"
-            state={laneState}
-            retry={() => void resources.lane(id).refresh()}
-          />
-          {lane !== null && (!laneState.error || lane.lane !== null) && (
+        <aside id={fieldsId} tabIndex={-1} className="issue-context grid grid-cols-[minmax(0,1fr)] gap-5 px-4 lg:px-8 xl:px-6 xl:pr-8 py-5 min-w-0">
+          {!hosted && laneState && (
+            <ReadNotice
+              name="lane"
+              state={laneState}
+              retry={() => void resources.lane(id).refresh()}
+            />
+          )}
+          {!hosted && lane !== null && (!laneState?.error || lane.lane !== null) && (
             <LaneCard
               issue={id}
               lane={lane?.lane ?? null}

@@ -123,16 +123,17 @@ pub fn notify(
         target.org_id
     );
     let retry = "Retry only with the same workspace, member, agent, --operation-id, text and references; stored does not mean delivered, read or executed.";
-    let reply =
-        match BoardHttp::open(target).and_then(|mut http| http.send("POST", &path, Some(&body))) {
-            Ok(reply) => reply,
-            Err(error) => {
-                return Ok(json!({
-                    "version": VERSION, "operation_id": operation_id, "agent_id": agent_id,
-                    "kind": "fyi", "status": "unknown", "error": error.to_string(), "retry": retry,
-                }))
-            }
-        };
+    let mut http = BoardHttp::open(target)?;
+    let reply = match http.send("POST", &path, Some(&body)) {
+        Ok(reply) => reply,
+        Err(error) if error.kind() == "unknown" => {
+            return Ok(json!({
+                "version": VERSION, "operation_id": operation_id, "agent_id": agent_id,
+                "kind": "fyi", "status": "unknown", "error": error.to_string(), "retry": retry,
+            }));
+        }
+        Err(error) => return Err(error),
+    };
     if matches!(reply.status, 200 | 201) {
         let receipt = serde_json::from_value::<Receipt>(reply.body.clone());
         if receipt.is_ok_and(|receipt| {

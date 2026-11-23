@@ -1,6 +1,11 @@
 # CAD-1073: reduced profile from the clean-slate transition (ended by CAD-1102).
 # Overrides and test-groups for deleted binaries are removed; they would
 # fail nextest config validation ("no binary IDs matched").
+#
+# GHSA-vc25-qg58-w57c: refuse 0.9.125–0.9.149, which recorded raw Cargo
+# args in portable reruns. scripts/cadence-nextest pins the same floor.
+nextest-version = "0.9.150"
+
 [profile.cadence]
 retries = 0
 fail-fast = false
@@ -48,6 +53,25 @@ threads-required = 'num-test-threads'
 # could not bind"); reserve the worker pool like the CAD-1489 fixtures.
 [[profile.cadence.overrides]]
 filter = 'test(/cad1590_templates_and_broadcasts/)'
+threads-required = 'num-test-threads'
+
+# CAD-347: this HTTP acceptance reuses a probe-then-bind board fixture.
+# Reserve the worker pool like the existing CAD-1489 fixtures so it cannot
+# take the safety floor's port between that test's probe and actual bind.
+# CAD-1970: the whole module reserves, not only cad347. The gate now runs one
+# job at `--jobs $(nproc)` instead of six shards at `--jobs 4`, so every
+# probe-then-bind fixture in this module runs beside more neighbours than it
+# did; `public_workspace_wiki_reads_require_its_real_host_bound_session` hit
+# `AddrInUse` on the first single-runner PR. Reserving the pool costs this
+# module's parallelism, not the suite's.
+[[profile.cadence.overrides]]
+filter = 'test(/^wiki_board_http_guard_acceptance::/)'
+threads-required = 'num-test-threads'
+
+# CAD-348: the memory-detail acceptance reuses the probe-then-bind board
+# fixture, so reserve the worker pool like the fixtures above.
+[[profile.cadence.overrides]]
+filter = 'test(/^cad348_memory_detail_identity_acceptance::/)'
 threads-required = 'num-test-threads'
 
 [profile.cadence.junit]

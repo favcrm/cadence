@@ -7,7 +7,6 @@
 //! re-applies the cargo target and mints nothing; a `--name` for a
 //! different slug, or several open refs, refuses.
 
-use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -18,12 +17,20 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
-use crate::issue::{claim, finish, git, parse, project, write, Pm};
+use crate::issue::{claim, git, parse, write, Pm};
 use crate::worktree::{self, layout};
+
+mod base;
+
+use base::{branch_base, resolve_existing_base, worktree_branch};
+pub(crate) use base::{configured_integration, declared_repos, resolve_base, resolve_repo};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
 /// [--assignee <alias>]`.
 pub struct JobArgs {
+    /// Native client key when dispatch has proved an existing draft binding.
+    /// `None` creates a fresh job through the unchanged one-open-job guard.
+    pub id: Option<String>,
     pub pm: String,
     pub spec: PathBuf,
     pub assignee: Option<String>,
@@ -45,357 +52,6 @@ pub struct StartArgs {
     /// CAD-383 `--take-over <reason>`: start an issue someone else holds
     /// in doing/review; recorded on the issue.
     pub take_over: Option<String>,
-}
-
-/// The project's declared repo roots, canonicalized.
-pub(crate) fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
-    project
-        .repos
-        .iter()
-        .filter_map(|r| r.path.as_deref())
-        .map(|p| {
-            project::expand_home(p)
-                .canonicalize()
-                .unwrap_or_else(|_| project::expand_home(p))
-        })
-        .collect()
-}
-
-fn repo_list(project: &project::Project, candidates: &[PathBuf]) -> String {
-    if candidates.is_empty() {
-        format!("{} declares no repos with a local path", project.key)
-    } else {
-        format!(
-            "{} declares: {}",
-            project.key,
-            candidates
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-/// Repo resolution per decision 1: explicit `--repo` (which must be a
-/// declared repo — undeclared work never surfaces in code-commit
-/// discovery), then the cwd's repo when it is one of the project's,
-/// then the project's only repo, else refuse naming the candidates.
-/// Returns the main checkout root (linked worktrees resolve to it).
-pub(crate) fn resolve_repo(
-    project: &project::Project,
-    flag: Option<&Path>,
-    cwd: &Path,
-) -> Result<PathBuf> {
-    let candidates = declared_repos(project);
-    if let Some(dir) = flag {
-        let root = worktree::main_root(dir)?;
-        if !candidates.contains(&root) {
-            return Err(Error::rejected(format!(
-                "Repo {} is not declared — {}. Add it to `repos` in \
-                 project.yaml first",
-                root.display(),
-                repo_list(project, &candidates)
-            )));
-        }
-        return Ok(root);
-    }
-    if let Some((root, _)) = project::repo_identity(cwd) {
-        if candidates.contains(&root) {
-            return Ok(root);
-        }
-    }
-    if candidates.len() == 1 {
-        return worktree::main_root(&candidates[0]);
-    }
-    Err(Error::rejected(format!(
-        "Which repo does this issue work in? Pass --repo — {}",
-        repo_list(project, &candidates)
-    )))
-}
-
-/// The ref and commit a new lane is cut from.
-#[derive(Debug)]
-pub(crate) struct ResolvedBase {
-    pub name: String,
-    pub sha: String,
-    /// Set when the main checkout's tip is not contained in `sha`.
-    /// The lane is still cut from `sha`; this only names the mismatch.
-    pub warning: Option<String>,
-}
-
-/// The integration branch configured on the project repo whose checkout
-/// is `root`, if any.
-pub(crate) fn configured_integration<'a>(
-    project: &'a project::Project,
-    root: &Path,
-) -> Option<&'a str> {
-    let root = root.canonicalize().ok()?;
-    project.repos.iter().find_map(|repo| {
-        let path = repo.path.as_deref()?;
-        let expanded = project::expand_home(path);
-        let canon = expanded.canonicalize().ok()?;
-        if canon == root {
-            repo.base.as_deref()
-        } else {
-            None
-        }
-    })
-}
-
-/// Base resolution for a new lane.
-///
-/// An explicit `--base` is used as given. Otherwise the base is the
-/// project's integration ref, fetched from the remote: `configured`
-/// (`repos[].base`), else `origin/HEAD` when that symbolic ref exists,
-/// else the remote's symbolic HEAD (`git ls-remote --symref origin
-/// HEAD`). A repository with no `origin` remote still uses its current
-/// branch — there is no remote integration ref to adopt instead.
-///
-/// When `origin` exists but its integration branch cannot be resolved,
-/// this refuses. It does not adopt the main checkout's current branch.
-/// When the checkout's tip is not contained in the integration commit,
-/// the lane is still cut from that commit and [`ResolvedBase::warning`]
-/// names the mismatch.
-pub(crate) fn resolve_base(
-    root: &Path,
-    flag: Option<&str>,
-    configured: Option<&str>,
-) -> Result<ResolvedBase> {
-    if let Some(base) = flag {
-        return Ok(ResolvedBase {
-            sha: verify_base(root, base)?,
-            name: base.to_string(),
-            warning: None,
-        });
-    }
-    if let Some(configured) = configured {
-        return pin_integration(root, normalize_integration(configured)?);
-    }
-    if let Ok(origin_head) = git(
-        root,
-        &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
-    ) {
-        return pin_integration(root, origin_head);
-    }
-    if origin_configured(root) {
-        let branch = remote_head_branch(root)?;
-        return pin_integration(root, format!("origin/{branch}"));
-    }
-    let base =
-        git(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string());
-    Ok(ResolvedBase {
-        sha: verify_base(root, &base)?,
-        name: base,
-        warning: None,
-    })
-}
-
-fn pin_integration(root: &Path, base: String) -> Result<ResolvedBase> {
-    fetch_integration(root, &base)?;
-    let sha = verify_base(root, &base)?;
-    let warning = checkout_divergence(root, &base, &sha);
-    Ok(ResolvedBase {
-        name: base,
-        sha,
-        warning,
-    })
-}
-
-fn verify_base(root: &Path, base: &str) -> Result<String> {
-    git(
-        root,
-        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
-    )
-    .map_err(|_| {
-        Error::rejected(format!(
-            "Base '{base}' does not resolve in {} — pass --base <ref>",
-            root.display()
-        ))
-    })
-}
-
-fn origin_configured(root: &Path) -> bool {
-    git(root, &["config", "--get", "remote.origin.url"])
-        .ok()
-        .is_some_and(|url| !url.is_empty())
-}
-
-fn remote_head_branch(root: &Path) -> Result<String> {
-    let label = checkout_label(root);
-    let out = git(root, &["ls-remote", "--symref", "origin", "HEAD"]).map_err(|e| {
-        Error::rejected(format!(
-            "Refusing to adopt the main checkout's branch '{label}' as the lane base in {}: \
-             origin has no resolvable integration branch ({e}). Pass --base <ref>, or set \
-             repos[].base to the integration branch",
-            root.display()
-        ))
-    })?;
-    let branch = out.lines().find_map(|line| {
-        let rest = line.strip_prefix("ref:")?.trim_start();
-        let name = rest.split_whitespace().next()?;
-        name.strip_prefix("refs/heads/")
-    });
-    match branch {
-        Some(branch) if valid_branch(branch) => Ok(branch.to_string()),
-        _ => Err(Error::rejected(format!(
-            "Refusing to adopt the main checkout's branch '{label}' as the lane base in {}: \
-             origin HEAD is not a branch. Pass --base <ref>, or set repos[].base to the \
-             integration branch",
-            root.display()
-        ))),
-    }
-}
-
-fn fetch_integration(root: &Path, base: &str) -> Result<()> {
-    let (remote, branch) = base.split_once('/').ok_or_else(|| {
-        Error::rejected(format!(
-            "Integration ref '{base}' is not a remote-tracking name — expected 'origin/<branch>'"
-        ))
-    })?;
-    if !valid_remote(remote) || !valid_branch(branch) {
-        return Err(Error::rejected(format!(
-            "Integration ref '{base}' is not a branch on origin"
-        )));
-    }
-    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-    git(
-        root,
-        &[
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            remote,
-            &refspec,
-        ],
-    )
-    .map(|_| ())
-    .map_err(|e| {
-        Error::rejected(format!(
-            "Could not refresh integration ref '{base}' in {} ({e}) — retry when origin is \
-             reachable or pass --base <ref>",
-            root.display()
-        ))
-    })
-}
-
-/// `staging` and `origin/staging` both mean `origin/staging`.
-fn normalize_integration(spec: &str) -> Result<String> {
-    let spec = spec.trim();
-    let branch = spec
-        .strip_prefix("refs/remotes/origin/")
-        .or_else(|| spec.strip_prefix("refs/heads/"))
-        .or_else(|| spec.strip_prefix("origin/"))
-        .unwrap_or(spec);
-    if !valid_branch(branch) {
-        return Err(Error::rejected(format!(
-            "Integration ref '{spec}' is not a branch name — set repos[].base to a branch such \
-             as 'staging' or 'origin/staging'"
-        )));
-    }
-    Ok(format!("origin/{branch}"))
-}
-
-fn valid_remote(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('-')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
-fn valid_branch(branch: &str) -> bool {
-    branch != "HEAD"
-        && !branch.is_empty()
-        && !branch.starts_with('/')
-        && !branch.ends_with('/')
-        && !branch.contains("//")
-        && branch.split('/').all(|segment| {
-            !segment.is_empty()
-                && segment != "."
-                && segment != ".."
-                && segment
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        })
-}
-
-fn checkout_label(root: &Path) -> String {
-    let raw =
-        git(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string());
-    raw.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
-}
-
-fn short_sha(sha: &str) -> &str {
-    let n = sha.len().min(12);
-    &sha[..n]
-}
-
-/// `None` when the main checkout's tip is contained in the integration
-/// commit (equal, or behind it). A foreign tip is named, not adopted.
-fn checkout_divergence(root: &Path, base: &str, base_sha: &str) -> Option<String> {
-    let sha = git(root, &["rev-parse", "--verify", "HEAD^{commit}"]).ok()?;
-    if git(root, &["merge-base", "--is-ancestor", &sha, base_sha]).is_ok() {
-        return None;
-    }
-    Some(format!(
-        "main checkout '{}' ({}) is not contained in integration ref {base} ({}); the lane is \
-         based on {base}, not that checkout",
-        checkout_label(root),
-        short_sha(&sha),
-        short_sha(base_sha),
-    ))
-}
-
-fn branch_base(root: &Path, branch: &str, fallback: &str) -> String {
-    git(
-        root,
-        &[
-            "reflog",
-            "show",
-            "--format=%H",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
-    .ok()
-    .and_then(|log| log.lines().last().map(str::to_string))
-    .filter(|sha| !sha.is_empty())
-    .unwrap_or_else(|| fallback.to_string())
-}
-
-fn resolve_existing_base(root: &Path, branch: &str) -> Result<(String, String)> {
-    let base = git(
-        root,
-        &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
-    )
-    .or_else(|_| git(root, &["symbolic-ref", "--short", "HEAD"]))
-    .unwrap_or_else(|_| branch.to_string());
-    let tip = git(
-        root,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("refs/heads/{branch}^{{commit}}"),
-        ],
-    )?;
-    Ok((base, branch_base(root, branch, &tip)))
-}
-
-/// The branch a worktree dir is checked out on, None only when it is absent or detached.
-fn worktree_branch(dir: &Path) -> Result<Option<String>> {
-    match fs::symlink_metadata(dir) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(Error::rejected(format!(
-                "{} is not a real worktree directory",
-                dir.display()
-            )))
-        }
-        Ok(_) => finish::git_branch(dir),
-    }
 }
 
 fn refuse_terminal_lifecycle_record(
@@ -531,23 +187,32 @@ fn reuse_lane(
         let (want, _) = layout::issue_names(&front.id, &front.title, Some(name))?;
         if want != wt_name {
             return Err(Error::rejected(format!(
-                "{id} already has an open worktree '{slug}' at {path} — \
+                "{id} already has an open worktree {slug} at {path} — \
                  --name {name} would start a second lane. Re-run without \
-                 --name to reuse it, or close it first with `cadence issue \
-                 finish {id} --worktree {path}`",
+                 --name to reuse it, or close it first with {finish}",
                 id = front.id,
-                path = lane.display()
+                slug = crate::printed_command::sanitized(slug),
+                path = crate::printed_command::shown(lane),
+                finish = {
+                    use crate::printed_command::{command, Part};
+                    command(&[
+                        Part::Fixed("cadence issue finish "),
+                        Part::Value(&front.id),
+                        Part::Fixed(" --worktree "),
+                        Part::Path(lane),
+                    ])
+                },
             )));
         }
     }
     if let Some(other) = lane_root(lane).filter(|r| r != root) {
         return Err(Error::rejected(format!(
-            "{}'s open worktree {} belongs to repo {}, not {} — pass --repo {}",
+            "{}: open worktree {} belongs to repo {}, not {} — pass --repo {}",
             front.id,
-            lane.display(),
-            other.display(),
-            root.display(),
-            other.display()
+            crate::printed_command::shown(lane),
+            crate::printed_command::shown(&other),
+            crate::printed_command::shown(root),
+            crate::printed_command::shown(&other)
         )));
     }
     let open_branch = |b: &str| {
@@ -593,7 +258,7 @@ pub(crate) fn resolve_lane(
             front.id,
             many.len(),
             many.iter()
-                .map(|p| p.display().to_string())
+                .map(|p| crate::printed_command::shown(p))
                 .collect::<Vec<_>>()
                 .join("\n  "),
             front.id
@@ -787,7 +452,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         let resolved = resolve_base(
             &root,
             args.base.as_deref(),
-            configured_integration(&project, &root),
+            configured_integration(&project, &root)?,
         )?;
         (resolved.name, resolved.sha, resolved.warning)
     };
@@ -1340,7 +1005,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         let created_job = client::rpc(
             &state_dir,
             "job_new",
-            json!({"pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
+            json!({"job": job.id, "pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
                    "title": front.title, "issue": front.id,
                    "repo": root, "base_ref": lane_base_sha,
                    "task_worktree": wt_name, "task_branch": branch,
@@ -1485,6 +1150,7 @@ fn write_slot_env(wt_dir: &Path, pm_dir: &Path) -> Result<PathBuf> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    crate::worktree::record_lane_env(wt_dir, &text);
     Ok(file)
 }
 
@@ -1627,6 +1293,100 @@ mod resolve_base_tests {
         let resolved = resolve_base(&fix.checkout, Some("side"), None).expect("override");
         assert_eq!(resolved.sha, fix.side_sha);
         assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn explicit_branch_base_is_the_remote_tip_not_a_stale_local_ref() {
+        let fix = fixture();
+        // Advance origin/main from a second clone; the checkout's local
+        // `main` and its remote-tracking ref both stay behind.
+        let other = fix._tmp.path().join("other");
+        let origin = fix._tmp.path().join("origin.git");
+        run_git(
+            fix._tmp.path(),
+            &[
+                "clone",
+                "--quiet",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        run_git(&other, &["config", "user.email", "t@example.com"]);
+        run_git(&other, &["config", "user.name", "t"]);
+        std::fs::write(other.join("n"), "newer\n").unwrap();
+        run_git(&other, &["add", "n"]);
+        run_git(&other, &["commit", "--quiet", "-m", "newer"]);
+        run_git(
+            &other,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        let remote_tip = rev(&other, "HEAD");
+        assert_ne!(remote_tip, fix.main_sha);
+        assert_eq!(rev(&fix.checkout, "main"), fix.main_sha);
+
+        let resolved = resolve_base(&fix.checkout, Some("main"), None).expect("fresh");
+        assert_eq!(resolved.name, "main");
+        assert_eq!(resolved.sha, remote_tip);
+
+        // A full SHA is used as given.
+        let pinned = resolve_base(&fix.checkout, Some(&fix.main_sha), None).expect("sha");
+        assert_eq!(pinned.sha, fix.main_sha);
+    }
+
+    #[test]
+    fn explicit_base_ignores_a_local_ref_shadowing_origin_main() {
+        let fix = fixture();
+        // A local tag named `origin/main` outranks the short remote-tracking name.
+        run_git(&fix.checkout, &["tag", "origin/main", &fix.side_sha]);
+        let resolved = resolve_base(&fix.checkout, Some("main"), None).expect("main");
+        assert_eq!(resolved.sha, fix.main_sha);
+        let resolved = resolve_base(&fix.checkout, Some("origin/main"), None).expect("origin/main");
+        assert_eq!(resolved.sha, fix.main_sha);
+    }
+
+    #[test]
+    fn explicit_remote_base_refuses_a_branch_origin_dropped() {
+        let fix = fixture();
+        run_git(
+            &fix.checkout,
+            &["push", "--quiet", "origin", "--delete", "staging"],
+        );
+        // The push pruned the tracking ref; restore it as a stale leftover.
+        run_git(
+            &fix.checkout,
+            &[
+                "update-ref",
+                "refs/remotes/origin/staging",
+                &fix.staging_sha,
+            ],
+        );
+        for base in ["origin/staging", "refs/remotes/origin/staging"] {
+            let error = resolve_base(&fix.checkout, Some(base), None).expect_err(base);
+            assert!(error.to_string().contains("no longer carries"), "{error}");
+        }
+    }
+
+    #[test]
+    fn explicit_origin_head_resolves_the_remote_head_branch() {
+        let fix = fixture();
+        let resolved = resolve_base(&fix.checkout, Some("origin/HEAD"), None).expect("head");
+        assert_eq!(resolved.sha, fix.main_sha);
+    }
+
+    #[test]
+    fn explicit_branch_base_refuses_when_origin_is_unreachable() {
+        let fix = fixture();
+        run_git(
+            &fix.checkout,
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+        let error = resolve_base(&fix.checkout, Some("main"), None).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("Could not reach origin"),
+            "{error}"
+        );
+        // A full SHA does not need the remote.
+        resolve_base(&fix.checkout, Some(&fix.main_sha), None).expect("sha");
     }
 
     #[test]

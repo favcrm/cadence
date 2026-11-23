@@ -151,11 +151,8 @@ await React.act(async () => {
       overview,
       readOnly: false,
       onOpenIssue: () => {},
-      overviewHref: "/overview",
       permissionsHref: "/settings/permissions",
       onAsk: () => {},
-      collapsed: false,
-      onToggleCollapse: () => {},
       onAskAgent: () => {},
     }),
   );
@@ -172,45 +169,47 @@ await settle(() => assert(host.querySelector('[data-need="idea_plan"]'), "idea c
   const merge = host.querySelector('[data-need="merge_decision"]')!;
   assert(!/cccc|acme\/app|r1/.test(merge.textContent ?? ""), "the merge card carries no hash, PR or reviewer");
   assert(host.querySelectorAll("[data-need-group]").length === 0, "no group headings");
-  await click(Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Review"));
+  const needKinds = Array.from(host.querySelectorAll("[data-need]")).map((el) => el.getAttribute("data-need"));
+  assert(needKinds.indexOf("merge_decision") < needKinds.indexOf("idea_plan"), `Approvals sort before Reviews (${needKinds.join(",")})`);
+  await click(card.querySelector(".todo-hit"));
 }
 
 // The idea drawer: approve, send back with a reason, park with a date —
 // every control reachable at 390px without horizontal push.
-await settle(() => assert(host.querySelector('[data-drawer="review"]'), "review drawer renders"));
+await settle(() => assert(document.querySelector('[data-drawer="review"]'), "review drawer renders"));
 {
-  const drawer = host.querySelector('[data-drawer="review"]')!;
+  const drawer = document.querySelector('[data-drawer="review"]')!;
   assert(drawer.getAttribute("data-scrim") === "board", "the scrim covers the whole board");
-  assert(host.querySelector(".crm-drawer-scrim")?.getAttribute("data-scrim") === "board", "scrim is board-wide");
+  assert(document.querySelector(".crm-drawer-scrim")?.getAttribute("data-scrim") === "board", "scrim is board-wide");
   const labels = Array.from(drawer.querySelectorAll("button")).map((b) => b.textContent);
   assert(labels.some((t) => t?.includes("Approve idea")), "approve offered");
   assert(labels.includes("Not now"), "Not now closes without deciding");
-  assert(/1 of 2/.test(drawer.textContent ?? ""), "n of m names the position");
+  assert(/2 of 2/.test(drawer.textContent ?? ""), "n of m names the position");
   assert(!/Easy to undo|Undo/.test(drawer.textContent ?? ""), "no undo promise: no server reversal exists");
   assert(!drawer.textContent?.includes("cadence "), "no command in the drawer");
   const title = drawer.querySelector(".crm-drawer-title");
   assert(title && title.textContent?.startsWith("Dark mode"), "the drawer is titled by the idea");
   await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent?.includes("Send back")));
-  assert(host.querySelector('[aria-label="What is wrong with this idea?"]'), "send back asks why");
+  assert(document.querySelector('[aria-label="What is wrong with this idea?"]'), "send back asks why");
   await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent?.includes("Park it for later")));
-  assert(host.querySelector("#rv-park"), "park asks until when");
+  assert(document.querySelector("#rv-park"), "park asks until when");
   await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent === "Details"));
   assert(drawer.querySelector(".rv-tech")?.textContent?.includes("D-9"), "Details shows the technical fields on request");
   // Not now closes and leaves the card.
   await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent === "Not now"));
 }
-await settle(() => assert(!host.querySelector('[data-drawer="review"]'), "Not now closes the drawer"));
+await settle(() => assert(!document.querySelector('[data-drawer="review"]'), "Not now closes the drawer"));
 assert(host.querySelector('[data-need="idea_plan"]'), "the card stays after Not now");
 
 // The merge drawer: what passed, the pinned head under Details, and the
 // send-back that states why.
 {
   const row = host.querySelector('[data-need="merge_decision"]')!;
-  await click(Array.from(row.querySelectorAll("button")).find((b) => b.textContent === "Review"));
+  await click(row.querySelector(".todo-hit"));
 }
-await settle(() => assert(host.querySelector('[data-drawer="review"]'), "merge drawer renders"));
+await settle(() => assert(document.querySelector('[data-drawer="review"]'), "merge drawer renders"));
 {
-  const drawer = host.querySelector('[data-drawer="review"]')!;
+  const drawer = document.querySelector('[data-drawer="review"]')!;
   assert(drawer.querySelector(".crm-drawer-title")?.textContent === "Light the fuselage", "titled by the change");
   assert(!drawer.textContent?.includes("cccccccccccc"), "the head is hidden until Details");
   assert(drawer.textContent?.includes("passed by a second agent"), "a Checked tick appears for the reviewer the row carries");
@@ -219,7 +218,7 @@ await settle(() => assert(host.querySelector('[data-drawer="review"]'), "merge d
   await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent === "Details"));
   assert(drawer.querySelector(".rv-tech")?.textContent?.includes("head cccccccccccc"), "Details names the reviewed head");
   await click(Array.from(drawer.querySelectorAll("button")).find((b) => b.textContent?.includes("Send back")));
-  assert(host.querySelector('[aria-label="What should change before this goes out?"]'), "send back asks why");
+  assert(document.querySelector('[aria-label="What should change before this goes out?"]'), "send back asks why");
 }
 
 // 390px containment on the RENDERED tree. happy-dom has no layout

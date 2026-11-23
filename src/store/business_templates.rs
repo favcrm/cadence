@@ -13,8 +13,9 @@ use serde_json::Value;
 
 use super::{now, Store, StoreConn};
 use crate::business_templates::{
-    build_draft, check_definition_approvable, content_digest, retained_source, sha256_hex,
-    validate_definition, DocumentData, TemplateDefinition,
+    build_draft_with_options, check_definition_approvable, content_digest,
+    retained_source_with_format, sha256_hex, validate_definition, DocumentData, SourceFormat,
+    TemplateDefinition,
 };
 use crate::error::{Error, Result};
 
@@ -74,6 +75,7 @@ pub struct TemplateVersion {
     pub based_on: Option<i64>,
     pub status: String,
     pub kind: String,
+    pub source_format: String,
     pub content_sha256: String,
     pub source_sha256: String,
     pub approved_source: Option<String>,
@@ -90,6 +92,7 @@ impl TemplateVersion {
             "based_on": self.based_on,
             "status": self.status,
             "kind": self.kind,
+            "source_format": self.source_format,
             "content_sha256": self.content_sha256,
             "source_sha256": self.source_sha256,
             "approved_source": self.approved_source,
@@ -109,6 +112,7 @@ pub struct BusinessDocument {
     pub input: Value,
     pub context: Value,
     pub created: f64,
+    pub has_unresolved_pricing: bool,
 }
 
 impl BusinessDocument {
@@ -123,6 +127,7 @@ impl BusinessDocument {
             "input": self.input,
             "context": self.context,
             "created": self.created,
+            "has_unresolved_pricing": self.has_unresolved_pricing,
         })
     }
 }
@@ -150,7 +155,7 @@ fn version_in(
 ) -> Result<Option<TemplateVersion>> {
     let row = tx
         .query_row(
-            "SELECT name,version,based_on,status,kind,content_sha256,approved_source,created,spec_json,source_sha256
+            "SELECT name,version,based_on,status,kind,content_sha256,approved_source,created,spec_json,source_sha256,source_format
              FROM business_template_versions WHERE company_id=? AND name=? AND version=?",
             params![company, name, version],
             |r| {
@@ -165,6 +170,7 @@ fn version_in(
                     r.get::<_, f64>(7)?,
                     r.get::<_, String>(8)?,
                     r.get::<_, String>(9)?,
+                    r.get::<_, String>(10)?,
                 ))
             },
         )
@@ -180,18 +186,25 @@ fn version_in(
         created,
         spec_json,
         source_sha,
+        raw_source_format,
     )) = row
     else {
         return Ok(None);
     };
     let spec: TemplateDefinition = serde_json::from_str(&spec_json)
         .map_err(|e| Error::internal(format!("stored template spec is unreadable: {e}")))?;
+    let source_format = if kind == "authoring" {
+        "authoring".to_string()
+    } else {
+        raw_source_format
+    };
     Ok(Some(TemplateVersion {
         name,
         version,
         based_on,
         status,
         kind,
+        source_format,
         content_sha256: sha,
         source_sha256: source_sha,
         approved_source,
@@ -214,15 +227,34 @@ impl Store {
         source: &[u8],
         definition: &TemplateDefinition,
     ) -> Result<TemplateVersion> {
+        let format = match definition {
+            TemplateDefinition::Authoring(_) => SourceFormat::Authoring,
+            TemplateDefinition::Financial(_) => SourceFormat::Docx,
+        };
+        self.business_template_add_version_with_format(name, based_on, format, source, definition)
+    }
+
+    /// Create or revise a template version in an explicit `SourceFormat` (`docx`,
+    /// `html`, or `authoring`).
+    pub fn business_template_add_version_with_format(
+        &self,
+        name: &str,
+        based_on: Option<i64>,
+        format: SourceFormat,
+        source: &[u8],
+        definition: &TemplateDefinition,
+    ) -> Result<TemplateVersion> {
         check_name(name)?;
         validate_definition(definition)?;
-        let source = retained_source(definition, source)?;
+        let retained = retained_source_with_format(definition, format, source)?;
+        let source = retained.as_slice();
         let company = self.connection_workspace_id()?;
         let source_sha = sha256_hex(source);
         let digest = content_digest(&source_sha, definition)?;
         let spec_json =
             serde_json::to_string(definition).map_err(|e| Error::internal(e.to_string()))?;
         let kind = definition.kind();
+        let source_format = format.as_str();
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let latest: Option<i64> = tx.query_row(
@@ -256,9 +288,9 @@ impl Store {
                 params![company, source_sha, source.len() as i64, source, created],
             )?;
             tx.execute(
-                "INSERT INTO business_template_versions(company_id,name,version,based_on,status,kind,spec_json,content_sha256,created,source_sha256)
-                 VALUES(?,?,?,?,'draft',?,?,?,?,?)",
-                params![company, name, version, based_on, kind, spec_json, digest, created, source_sha],
+                "INSERT INTO business_template_versions(company_id,name,version,based_on,status,kind,spec_json,content_sha256,created,source_sha256,source_format)
+                 VALUES(?,?,?,?,'draft',?,?,?,?,?,?)",
+                params![company, name, version, based_on, kind, spec_json, digest, created, source_sha, source_format],
             )?;
             Ok(TemplateVersion {
                 name: name.to_string(),
@@ -266,6 +298,7 @@ impl Store {
                 based_on,
                 status: "draft".into(),
                 kind: kind.into(),
+                source_format: source_format.into(),
                 content_sha256: digest,
                 source_sha256: source_sha,
                 approved_source: None,
@@ -273,6 +306,65 @@ impl Store {
                 spec: definition.clone(),
             })
         })
+    }
+
+    /// Summary entry per template name in this company, ordered alphabetically.
+    pub fn business_template_list(&self) -> Result<Vec<Value>> {
+        let company = self.connection_workspace_id()?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT name FROM business_template_versions WHERE company_id=? ORDER BY name ASC",
+        )?;
+        let names: Vec<String> = stmt
+            .query_map(params![company], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let latest_version: i64 = conn.query_row(
+                "SELECT MAX(version) FROM business_template_versions WHERE company_id=? AND name=?",
+                params![company, name],
+                |r| r.get(0),
+            )?;
+            let approved_version: Option<i64> = conn.query_row(
+                "SELECT MAX(version) FROM business_template_versions WHERE company_id=? AND name=? AND status='approved'",
+                params![company, name],
+                |r| r.get(0),
+            )?;
+            let versions_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM business_template_versions WHERE company_id=? AND name=?",
+                params![company, name],
+                |r| r.get(0),
+            )?;
+            if let Some(latest) = version_in(&conn, &company, &name, latest_version)? {
+                out.push(serde_json::json!({
+                    "name": latest.name,
+                    "kind": latest.kind,
+                    "source_format": latest.source_format,
+                    "latest_version": latest.version,
+                    "approved_version": approved_version,
+                    "versions_count": versions_count,
+                    "status": latest.status,
+                    "content_sha256": latest.content_sha256,
+                    "source_sha256": latest.source_sha256,
+                    "updated": latest.created,
+                    "latest": latest.summary(),
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Latest approved version number for `name`, `None` if never approved.
+    pub fn business_template_latest_approved_version(&self, name: &str) -> Result<Option<i64>> {
+        check_name(name)?;
+        let company = self.connection_workspace_id()?;
+        let conn = self.conn();
+        let v: Option<i64> = conn.query_row(
+            "SELECT MAX(version) FROM business_template_versions WHERE company_id=? AND name=? AND status='approved'",
+            params![company, name],
+            |r| r.get(0),
+        )?;
+        Ok(v)
     }
 
     /// One version of `name` in this company, `None` when absent.
@@ -362,6 +454,18 @@ impl Store {
         version: i64,
         data: &DocumentData,
     ) -> Result<BusinessDocument> {
+        self.business_document_create_with_options(name, version, data, false)
+    }
+
+    /// Create a draft from an approved version, optionally allowing partial
+    /// `"UNRESOLVED"` line prices.
+    pub fn business_document_create_with_options(
+        &self,
+        name: &str,
+        version: i64,
+        data: &DocumentData,
+        allow_partial: bool,
+    ) -> Result<BusinessDocument> {
         check_name(name)?;
         let company = self.connection_workspace_id()?;
         self.write_tx(|conn| {
@@ -373,7 +477,7 @@ impl Store {
                     "template '{name}' version {version} is not approved; approve it before creating documents"
                 )));
             }
-            let draft = build_draft(row.spec.financial()?, data)?;
+            let draft = build_draft_with_options(row.spec.financial()?, data, allow_partial)?;
             let id = format!("doc-{}", uuid::Uuid::new_v4().simple());
             let input_json =
                 serde_json::to_string(data).map_err(|e| Error::internal(e.to_string()))?;
@@ -381,9 +485,10 @@ impl Store {
             let context_json =
                 serde_json::to_string(&context).map_err(|e| Error::internal(e.to_string()))?;
             let created = now();
+            let unresolved_flag = i64::from(draft.has_unresolved_pricing);
             tx.execute(
-                "INSERT INTO business_documents(company_id,id,template_name,template_version,template_sha256,kind,input_json,context_json,created)
-                 VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO business_documents(company_id,id,template_name,template_version,template_sha256,kind,input_json,context_json,created,has_unresolved_pricing)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)",
                 params![
                     company,
                     id,
@@ -393,7 +498,8 @@ impl Store {
                     row.kind,
                     input_json,
                     context_json,
-                    created
+                    created,
+                    unresolved_flag
                 ],
             )?;
             Ok(BusinessDocument {
@@ -405,6 +511,7 @@ impl Store {
                 input: serde_json::from_str(&input_json).unwrap_or(Value::Null),
                 context,
                 created,
+                has_unresolved_pricing: draft.has_unresolved_pricing,
             })
         })
     }
@@ -464,7 +571,7 @@ impl Store {
         let conn = self.conn();
         let row = conn
             .query_row(
-                "SELECT id,template_name,template_version,template_sha256,kind,input_json,context_json,created
+                "SELECT id,template_name,template_version,template_sha256,kind,input_json,context_json,created,has_unresolved_pricing
                  FROM business_documents WHERE company_id=? AND id=?",
                 params![company, id],
                 |r| {
@@ -477,6 +584,7 @@ impl Store {
                         r.get::<_, String>(5)?,
                         r.get::<_, String>(6)?,
                         r.get::<_, f64>(7)?,
+                        r.get::<_, i64>(8)?,
                     ))
                 },
             )
@@ -490,6 +598,7 @@ impl Store {
             input,
             context,
             created,
+            has_unresolved_pricing,
         )) = row
         else {
             return Ok(None);
@@ -503,6 +612,7 @@ impl Store {
             input: serde_json::from_str(&input).unwrap_or(Value::Null),
             context: serde_json::from_str(&context).unwrap_or(Value::Null),
             created,
+            has_unresolved_pricing: has_unresolved_pricing != 0,
         }))
     }
 }

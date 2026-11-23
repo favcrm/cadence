@@ -1,28 +1,58 @@
 import { useContext, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
-import { WriteGate } from "../auth/WriteGate";
-import type { Agent, AgentDetail } from "../../lib/types";
+import { IconSettings } from "../../ui/icons";
+import { useWriteBlock, WriteGate } from "../auth/WriteGate";
+import type { Agent, AgentDetail, HiredProfile } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
+import AgentChat, { type ChatGate } from "./AgentChat";
+import { ConnectRuntime, ProfileDetails, workText } from "./ProfileSeat";
+import type { ToastMsg } from "../../ui/Toast";
+import { seatStatus } from "./SeatCard";
 import { RecoveryBlock } from "./AgentProfile";
-import AgentTabBody, { type TabContext } from "./AgentTabs";
+import { MASTER } from "../home/master";
+import { useInstructionsDoc } from "./useInstructionsDoc";
+import { instructionsKind } from "./instructionsDoc";
+import AgentTabBody, { AgentSettingsDrawer, Work, type TabContext } from "./AgentTabs";
 import {
   categoryLabel,
   durationText,
   hiredText,
   roleOf,
+  roleOfProfile,
   runsOnText,
   type RolesState,
 } from "./agentRoles";
 import { AGENT_TABS, type AgentTab } from "./agentTabModel";
+import { dmExpectation } from "../threads/threadsView";
 import {
   agentHoldsWorkButDead,
   agentLocation,
+  conversationalOnlyCloud,
   lifecycleBadge,
   lifecycleOf,
+  type ProfileWork,
 } from "./agentView";
 import "./agents.css";
+
+/** CAD-1853: the daemon's truthful cloud-agent projection on an agent page.
+ *  Remote ids are distinct from local ids; capabilities are the enforced
+ *  ceiling (conversational only), never a claimed shell/git/effect grant. */
+interface CloudAgentView {
+  id: string;
+  state: string;
+  connected: boolean;
+  principal?: { kind: string; label: string };
+  remote_agent_id: string;
+  runtime: string;
+  model?: string | null;
+  provider_session_id?: string | null;
+  capabilities?: Record<string, boolean>;
+  thread?: { id: string; link?: string | null } | null;
+  sessions?: { remote_session_id: string; conversation_id: string; thread?: { id: string; link?: string | null } }[];
+  operations?: { operation_id: string; status: string; reply?: { text: string } | null }[];
+}
 
 const TONE: Record<string, string> = {
   fail: "var(--color-fail)",
@@ -38,56 +68,118 @@ export default function AgentPage({
   alias,
   observed,
   roles,
+  profiles,
+  selectedProfile,
   tab,
+  routineAgent,
   onTab,
   onBack,
   onOpenIssue,
+  hosted,
+  groups,
+  rosterLoaded,
+  rosterFailed,
+  rosterStale,
+  onRetryRoster,
+  operator,
+  onRetryAccess,
+  hostedBoard,
+  scopedRoster = false,
+  companyMaster,
+  hiredWork,
+  onToast,
 }: {
   alias: string;
   observed?: Agent;
   roles: RolesState;
+  profiles: HiredProfile[];
+  selectedProfile?: HiredProfile;
   tab: AgentTab;
+  routineAgent?: "assistant";
   onTab: (tab: AgentTab) => void;
   onBack: () => void;
   onOpenIssue: (id: string) => void;
+  hosted: boolean;
+  /** PM aliases a runtime can join on a native board. */
+  groups: string[];
+  /** The team list has answered, so a missing alias really is missing. */
+  rosterLoaded: boolean;
+  rosterFailed: boolean;
+  /** The list shows its last answer because the board isn't answering now. */
+  rosterStale: boolean;
+  onRetryRoster: () => void;
+  operator: boolean | null;
+  onRetryAccess: () => void;
+  hostedBoard: boolean;
+  scopedRoster?: boolean;
+  /** CAD-2353: this is the company Master. It has no chat yet, so an owner's page for it is the page. */
+  companyMaster: boolean;
+  /** What a runtime-less profile's card names, if anything. */
+  hiredWork: ProfileWork | null;
+  onToast: (kind: ToastMsg["kind"], text: string) => void;
 }) {
-  const writeBlock = useContext(WriteGate);
+  const boardBlock = useContext(WriteGate);
+  const writeBlock = useWriteBlock(operator !== true) ?? boardBlock;
   const t = useTranslate();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [notServed, setNotServed] = useState(false);
   const [retry, setRetry] = useState(0);
 
+  // The gear opens over the current section; `?tab=settings` opens over Instructions.
+  const [gear, setGear] = useState(false);
+  const hired = selectedProfile ?? (observed ? undefined : profiles.find((p) => p.alias === alias));
+  const masterPage = companyMaster && operator === true;
+  const chat = tab === "overview" && !masterPage;
+  const leave = chat || masterPage ? onBack : () => onTab("overview");
+  // Leaving for the chat closes the gear, so coming back doesn't reopen it.
   useEffect(() => {
+    if (chat) setGear(false);
+  }, [chat]);
+  useEffect(() => {
+    // A runtime-less profile is not a registered agent: there is nothing to read.
+    // Once the roster has answered, or failed, so a failed read still says so.
+    if (hired || (!rosterLoaded && !rosterFailed)) return;
     // A reload after a save keeps what is on screen; only a new alias resets.
     if (retry === 0) setDetail(null);
     setErr(null);
+    setNotServed(false);
     let live = true;
     api
       .agent(alias)
       .then((d) => live && setDetail(d))
-      .catch((e) => live && setErr(String(e.message ?? e)));
+      .catch((e) => {
+        if (!live) return;
+        // The board's own "not implemented" is permanent, not a failed read to
+        // retry. Another 501, such as an outdated daemon, is an ordinary failure.
+        if (e instanceof ApiError && e.status === 501 && e.code === "not_implemented") setNotServed(true);
+        else setErr(String(e.message ?? e));
+      });
     return () => {
       live = false;
     };
-  }, [alias, retry]);
+  }, [alias, retry, hired, rosterLoaded, rosterFailed]);
 
   // Esc leaves the page, unless it is closing something inside it.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
+      // An open drawer takes Esc for itself, wherever focus is.
+      if (document.querySelector("[data-drawer]") !== null) return;
       const target = event.target;
       if (
         target instanceof HTMLElement &&
         (target.closest("input, textarea, select, dialog, [contenteditable]") !== null)
       )
         return;
-      onBack();
+      leave();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onBack]);
+  }, [leave]);
 
   const a = detail?.agent;
+  const served = a?.instructions ?? null;
   // A collection observation keeps evidence available during loading/failure.
   // Detail carries provider evidence, but not selection provenance or grouping.
   const profile: Agent | undefined = a
@@ -105,23 +197,29 @@ export default function AgentPage({
         on: detail.on ?? observed?.on ?? [],
       }
     : observed;
+  const isCloud = conversationalOnlyCloud(profile);
+  const mailbox = profile?.inbox === true || profile?.provider === "inbox";
   const fenced = detail?.fenced ?? observed?.fenced;
   const recovery = detail?.recovery ?? observed?.recovery;
   const resume = detail?.resume ?? observed?.resume;
   const lifecycle = profile ? lifecycleOf(profile) : "normal";
   const deadHolding = profile ? agentHoldsWorkButDead(profile) : false;
   const params = (a?.params ?? observed?.params) as Record<string, unknown> | undefined;
-  const role = profile
-    ? roleOf({ params: params ?? profile.params, catalogue: observed?.catalogue }, roles.data)
-    : null;
-  const hosted = roles.data?.install.hosted ?? false;
+  const role = hired
+    ? roleOfProfile(hired, roles.data)
+    : profile
+      ? roleOf({ alias }, roles.data, profiles)
+      : null;
   const badge = profile ? lifecycleBadge(profile, t) : null;
-  const where =
-    profile && agentLocation(profile) === "cloud"
+  const where = isCloud
+    ? t("a cloud runtime")
+    : profile && agentLocation(profile) === "cloud"
       ? t("a cloud sandbox")
       : t(runsOnText(hosted));
   const categoryText = role ? `${role.title} · ${t(categoryLabel(roles.data, role.category))}` : null;
   const figures = detail?.stats ?? null;
+  const cloud =
+    (a as unknown as { cloud_agents?: CloudAgentView[] } | undefined)?.cloud_agents ?? [];
   const count = (n: number | null | undefined) => (n === null || n === undefined ? "—" : String(n));
   const stats: [string, string][] =
     role?.kind === "apps"
@@ -138,6 +236,32 @@ export default function AgentPage({
           ["Hired", hiredText(figures?.hired_at)],
         ];
 
+  // Hosted keeps a profile with a revision; native overwrites the runtime's text.
+  // A master, or an agent whose job comes from a settings profile, is read-only.
+  const docKind = instructionsKind({
+    hired: hired !== undefined,
+    hostedBoard: hostedBoard || hosted,
+    served,
+    master: alias === MASTER,
+    profileBound: params?.profile !== undefined,
+    // CAD-2354: an owner on the company Master's page edits its text.
+    own: masterPage ? "workspace" : null,
+  });
+  const doc = useInstructionsDoc({
+    alias,
+    kind: docKind,
+    profileId: hired?.id ?? null,
+    nativeServed: served,
+    writable: operator === true && boardBlock === null && !rosterStale,
+    onSaved: () => setRetry((n) => n + 1),
+    toast: onToast,
+  });
+
+  const unread = err !== null || (notServed && observed === undefined);
+  const retryDetail = () => {
+    setRetry((r) => r + 1);
+    if (!observed) onRetryRoster();
+  };
   const ctx: TabContext = {
     alias,
     profile,
@@ -145,84 +269,99 @@ export default function AgentPage({
     detail,
     role,
     hosted,
+    hostedBoard: hostedBoard || hosted,
+    scopedRoster,
     resume,
-    fenced,
-    lifecycle,
-    deadHolding,
     onOpenIssue,
-    onTab,
-    onSaved: () => setRetry((n) => n + 1),
+    hired,
+    operator: operator === true,
+    writable: operator === true && boardBlock === null && !rosterStale,
+    // Why the page is read-only, from what it already knows; null when it isn't.
+    readOnlyReason:
+      operator === false
+        ? "Only the operator can edit instructions."
+        : operator === null
+          ? "We couldn’t confirm your access"
+          : (boardBlock ?? (rosterStale ? "The board isn’t answering, so instructions are read-only for now." : null)),
+    toast: onToast,
+    stats,
+    // Without a roster row nothing is known about the agent, so this reads as
+    // the failure it is: the board's "not recorded" is only about a known agent.
+    detailFailed: unread,
+    detailNotServed: notServed && observed !== undefined,
+    retryDetail,
+    roleRead: roles.data || (hired && !hired.catalogue) ? "read" : roles.error ? "failed" : "reading",
+    retryRole: roles.retry,
+    doc,
   };
 
-  return (
-    <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
-      <button type="button" className="rc-back" onClick={onBack}>
-        ← {t("Agents")}
-      </button>
-      <header className="ap-hero">
-        <AgentAvatar
-          slug={agentLook(alias, params)}
-          look={typeof params?.look === "string" ? params.look : undefined}
-          still={lifecycle !== "active"}
-          active={lifecycle === "active"}
-          size={72}
-        />
-        <div className="min-w-0">
-          <h1>{alias}</h1>
-          <div className="ap-sub">
-            <span>
-              {categoryText ??
-                `${a?.role ?? observed?.role ?? t("Agent")} · ${a?.provider ?? observed?.provider ?? t("Loading provider")}${profile ? ` / ${profile.endpoint_kind}` : ""}`}
-            </span>
-            {badge && (
-              <>
+  const cloudCards = (
+    <>
+      {cloud.length > 0 && (
+        <section className="ap-cloud" aria-label={t("Cloud runtime")}>
+          {cloud.map((c) => (
+            <div key={c.id} className="ap-cloud-card">
+              <div className="ap-sub">
+                <strong>{t("Cloud runtime")}</strong>
                 <span aria-hidden="true">·</span>
-                <span className="rc-dot" style={{ "--c": TONE[badge.tone] } as React.CSSProperties} />
-                <span>{badge.label}</span>
-              </>
-            )}
-            <span aria-hidden="true">·</span>
-            <span>{t("runs on {where}").replace("{where}", () => where)}</span>
-          </div>
-          {observed && (
-            <p className="text-micro text-ink-500 mt-1">
-              {t("Group:")} {observed.group_root ? t("root") : observed.group}
-              {observed.team_role ? ` · ${t("Team role:")} ${observed.team_role}` : ""}
-            </p>
-          )}
-          {role && <p className="ap-job">{role.job}</p>}
-        </div>
-        <div className="ap-acts">
-          {/* Threads resolves the alias: the existing You ↔ agent conversation
-              opens; otherwise `?dm=` starts a local draft — nothing is sent
-              and no server row is created until the operator writes. */}
-          <Button
-            variant="primary"
-            href={`/threads?dm=${encodeURIComponent(alias)}`}
-            disabled={writeBlock !== null}
-            title={writeBlock ?? t("Open the direct conversation with this agent")}
-          >
-            {t("Message")}
-          </Button>
-          <Button onClick={() => onTab("work")}>{t("Assign work")}</Button>
-          <Button variant="ghost" size="sm" disabled aria-label={t("More")} title={t("No more actions yet")}>
-            ⋯
-          </Button>
-        </div>
-      </header>
+                <span>{c.runtime}</span>
+                <span aria-hidden="true">·</span>
+                <span>{c.state}</span>
+                {c.principal && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>
+                      {c.principal.kind === "agent"
+                        ? `${t("enrolled peer")} ${c.principal.label}`
+                        : t("operator connection")}
+                    </span>
+                  </>
+                )}
+              </div>
+              <p className="text-micro text-ink-500">
+                {t("Model:")} {c.model ?? t("gateway label pending")} · {t("Remote agent:")} {c.remote_agent_id}
+              </p>
+              <p className="text-micro text-ink-500">
+                {t("Capabilities:")} {t("conversation")}
+                {", "}
+                {t("no tools, MCP, skills, approvals or shell")}
+              </p>
+              {(c.sessions ?? []).length > 1 && (
+                <ul className="text-micro text-ink-500">
+                  {(c.sessions ?? []).map((s) => (
+                    <li key={s.conversation_id}>
+                      {s.thread?.link ? (
+                        <a href={s.thread.link}>{s.thread.id}</a>
+                      ) : (
+                        s.thread?.id ?? s.conversation_id
+                      )}
+                      {" · "}
+                      {s.remote_session_id}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
+        </section>
+      )}
+    </>
+  );
 
-      {!detail && !err && (
+  const notices = (
+    <>
+      {!detail && !err && !notServed && (
         <p role="status" className="text-label text-ink-500 mb-3">
           {t("Loading agent details…")}
         </p>
       )}
-      {err && (
-        <div className="space-y-2 mb-3">
-          <p role="alert" className="text-label text-fail">
-            {t("Could not load agent details:")} {err}
-          </p>
-          <Button onClick={() => setRetry((r) => r + 1)}>{t("Retry details")}</Button>
-        </div>
+      {unread && (
+        <p role="status" className="text-label text-ink-500 mb-3">
+          {t("Some details aren’t available on this board.")}{" "}
+          <button type="button" className="lnk" onClick={retryDetail}>
+            {t("Retry")}
+          </button>
+        </p>
       )}
       {deadHolding && (
         <div className="agents-banner tone-fail mb-3" role="status">
@@ -253,38 +392,206 @@ export default function AgentPage({
           />
         </section>
       )}
+    </>
+  );
 
-      <div className="ap-stats">
-        {stats.map(([label, value]) => (
-          <div
-            key={label}
-            className="ap-stat"
-            title={value === "—" ? t("Not recorded for this agent") : undefined}
-          >
-            <b className="num">{value}</b>
-            <small>{t(label)}</small>
+  if (chat) {
+    const status = profile ? seatStatus(profile, t) : null;
+    const boardIsHosted = hostedBoard || hosted;
+    const gate: ChatGate | null = !rosterLoaded
+      ? {
+          title: rosterFailed ? t("Could not load agents") : t("Loading agents…"),
+          body: "",
+          extra: rosterFailed ? <Button onClick={onRetryRoster}>{t("Retry")}</Button> : undefined,
+        }
+      : operator === null
+        ? {
+            title: t("We couldn’t confirm your access"),
+            body: t("This doesn’t mean you’ve been signed out. The connection may be interrupted."),
+            extra: <Button onClick={onRetryAccess}>{t("Retry")}</Button>,
+          }
+      : !operator
+        ? boardIsHosted
+          ? {
+              title: t("Your assistant is on Home"),
+              body: t("Conversations with agents here are for the workspace operator."),
+              extra: <Button href="/">{t("Open Home")}</Button>,
+            }
+          : {
+              title: boardBlock ?? t("Conversations with agents are for the operator"),
+              body: t("You can still see what this agent is working on."),
+            }
+        : hired
+          ? {
+              title: t("{alias} can’t reply here yet").replace("{alias}", () => alias),
+              body: boardIsHosted
+                ? t("Chat with a profile isn’t available on hosted boards yet. It works on issues started under its profile.")
+                : t("It has no runtime connected to this board. Connect one to talk to it here."),
+              extra: <ConnectRuntime profile={hired} hosted={boardIsHosted} groups={groups} />,
+            }
+          : mailbox
+            ? {
+                title: t("This is a mailbox, not an agent"),
+                body: t("Mail waits here until an agent reads it."),
+              }
+            : !profile && (err !== null || notServed)
+              ? {
+                  title: t("No agent named {alias}").replace("{alias}", () => alias),
+                  body: t("It may have been removed. Pick another agent from the list."),
+                }
+              : null;
+    const faceLook = hired ? (hired.look ?? undefined) : typeof params?.look === "string" ? params.look : undefined;
+    return (
+      <AgentChat
+        alias={alias}
+        gate={gate}
+        look={agentLook(alias, params)}
+        expectation={t(dmExpectation(profile))}
+        attach={!boardIsHosted}
+        block={writeBlock}
+        onBack={onBack}
+        onOpenIssue={onOpenIssue}
+        // With nothing known about the agent, the gate is already the one answer
+        // for an unread roster or a board that keeps no details. A known agent
+        // keeps its recovery banners, and a failed read for an unlisted agent
+        // keeps its Retry: a successful read is what would bring the page back.
+        notices={hired || (!profile && (!rosterLoaded || notServed)) ? null : notices}
+        heading={
+          <>
+            <AgentAvatar
+              slug={hired ? "custom" : agentLook(alias, params)}
+              look={faceLook}
+              still={lifecycle !== "active"}
+              active={lifecycle === "active"}
+              size={34}
+            />
+            <div className="ag-chat-title min-w-0">
+              <h1>{alias}</h1>
+              <p>
+                {hired ? (
+                  <>
+                    <span className="rc-dot" style={{ "--c": "var(--color-ink-500)" } as React.CSSProperties} />{" "}
+                    {hiredWork ? workText(hiredWork, t) : t("Idle · no runtime")}
+                  </>
+                ) : (
+                  <>
+                    {status && (
+                      <>
+                        <span className="rc-dot" style={{ "--c": TONE[status.tone] } as React.CSSProperties} /> {status.text}
+                        {" · "}
+                      </>
+                    )}
+                    {categoryText ?? profile?.role ?? t("Agent")}
+                  </>
+                )}
+              </p>
+            </div>
+          </>
+        }
+        panel={
+          hired ? (
+            <div className="ag-chat-panel-body">
+              <ProfileDetails
+                profile={hired}
+                work={hiredWork}
+                onOpenIssue={onOpenIssue}
+              />
+              <Button onClick={() => onTab("instructions")}>{t("Manage profile")}</Button>
+            </div>
+          ) : isCloud ? (
+            cloudCards
+          ) : (
+            <div className="ag-chat-panel-body">
+              <Work c={ctx} />
+              {!mailbox && <Button onClick={() => onTab("instructions")}>{t("Manage profile")}</Button>}
+            </div>
+          )
+        }
+      />
+    );
+  }
+
+  const manageSubline = hired
+    ? hiredWork
+      ? workText(hiredWork, t)
+      : t("Idle · no runtime")
+    : [categoryText ?? a?.role ?? observed?.role ?? t("Agent"), badge?.label, t("runs on {where}").replace("{where}", () => where)]
+        .filter(Boolean)
+        .join(" · ");
+  const section = tab === "settings" || tab === "overview" ? "instructions" : tab;
+  return (
+    <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
+      <button type="button" className="rc-back" onClick={leave}>
+        ← {masterPage ? t("Agents") : t("Chat")}
+      </button>
+      <header className="ap-hero">
+        <AgentAvatar
+          slug={hired ? "custom" : agentLook(alias, params)}
+          look={hired ? (hired.look ?? undefined) : typeof params?.look === "string" ? params.look : undefined}
+          still={lifecycle !== "active"}
+          active={lifecycle === "active"}
+          size={48}
+        />
+        <div className="min-w-0">
+          <h1>{alias}</h1>
+          <div className="ap-sub">
+            <span>{manageSubline}</span>
           </div>
-        ))}
-      </div>
-      <nav className="ap-tabs" role="tablist" aria-label={t("Agent sections")}>
-        {AGENT_TABS.map((entry) => (
-          <button
-            key={entry.id}
-            type="button"
-            role="tab"
-            id={`ap-tab-${entry.id}`}
-            aria-selected={tab === entry.id}
-            aria-controls="ap-panel"
-            className="ap-tab"
-            onClick={() => onTab(entry.id)}
-          >
-            {t(entry.label)}
-          </button>
-        ))}
-      </nav>
-      <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${tab}`}>
-        <AgentTabBody key={`${alias}:${tab}:${detail ? "d" : "n"}`} tab={tab} c={ctx} />
-      </div>
+        </div>
+        {!isCloud && !mailbox && (
+          <div className="ap-acts">
+            <Button variant="ghost" size="sm" aria-label={t("Agent settings")} title={t("Settings")} onClick={() => setGear(true)}>
+              <IconSettings />
+            </Button>
+          </div>
+        )}
+      </header>
+
+      {cloudCards}
+
+      {!hired && notices}
+
+      {mailbox ? (
+        <p className="rc-note">{t("A mailbox has nothing to manage.")}</p>
+      ) : !isCloud && (
+        <>
+          <nav className="ap-tabs" role="tablist" aria-label={t("Agent sections")}>
+            {AGENT_TABS.map((entry) => (
+              <button
+                key={entry.id}
+                type="button"
+                role="tab"
+                id={`ap-tab-${entry.id}`}
+                aria-selected={section === entry.id}
+                aria-controls="ap-panel"
+                className="ap-tab"
+                onClick={() => onTab(entry.id)}
+              >
+                {t(entry.label)}
+              </button>
+            ))}
+          </nav>
+          <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
+            {section === "routines" && routineAgent ? (
+              <>
+                <p className="text-label text-ink-400">{t("Agent")}: {routineAgent}</p>
+                <AgentTabBody key={`routine:${routineAgent}`} tab={section} c={{ ...ctx, alias: routineAgent }} />
+              </>
+            ) : (
+              <AgentTabBody key={`${alias}:${section}`} tab={section} c={ctx} />
+            )}
+          </div>
+          {(gear || tab === "settings") && (
+            <AgentSettingsDrawer
+              c={ctx}
+              onClose={() => {
+                setGear(false);
+                if (tab === "settings") onTab("instructions");
+              }}
+            />
+          )}
+        </>
+      )}
     </main>
   );
 }

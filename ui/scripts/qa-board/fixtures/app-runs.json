@@ -1,0 +1,29 @@
+{
+  "runs": [
+    {
+      "id": "qa-run-ready",
+      "install_id": "qa-template",
+      "context_id": "qa-context",
+      "state": "succeeded",
+      "snapshot_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "approved_digest": null,
+      "snapshot": {
+        "workflow": {
+          "title": "Synthetic completed run",
+          "steps": [{ "id": "fixture-step", "kind": "produce_text", "assignee": "fixture", "dependencies": [], "instruction": "Synthetic fixture only" }]
+        },
+        "inputs": {},
+        "owner_pm": "",
+        "assignments": {},
+        "capabilities": {},
+        "context": { "id": "qa-context", "revision": 1, "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+        "publication": { "slot": "", "binding": null }
+      },
+      "steps": [{ "step_id": "fixture-step", "task_id": "task-qa-run-ready", "state": "succeeded", "message_id": null }],
+      "created": 1794600000,
+      "updated": 1794600060,
+      "artifacts": [],
+      "reviews": []
+    }
+  ]
+}
