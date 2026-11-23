@@ -402,6 +402,10 @@ pub enum ScreenOperation {
     // operator-session CALL; deliberately not a read-only-mount operation.
     #[serde(rename = "routines.list")]
     RoutinesList,
+    // CAD-2706: owner-only hosted Composio connection asset discovery; native
+    // execution stays unavailable and read-only mounts never advertise it.
+    #[serde(rename = "connections.assets")]
+    ConnectionsAssets,
 }
 
 impl ScreenOperation {
@@ -2185,6 +2189,21 @@ mod tests {
         assert!(!ScreenOperation::RoutinesList.is_slot());
         assert!(!ScreenOperation::RoutinesList.is_screen_read());
         let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &["routines.list"]);
+        assert!(validate_map(&slot_only, &bodies).is_err());
+    }
+
+    /// CAD-2706: `connections.assets` is an owner-only hosted CALL that parses
+    /// with `records.call` alone; it is not a SLOT and not a read-only-mount verb.
+    #[test]
+    fn connections_assets_is_an_owner_call_that_parses() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let call = records_declaration(BODY, &[MAY_RECORDS_CALL], &["connections.assets"]);
+        let checked = validate_map(&call, &bodies).expect("connections.assets validates");
+        assert_eq!(checked.operations(), &[ScreenOperation::ConnectionsAssets]);
+        assert!(!ScreenOperation::ConnectionsAssets.is_slot());
+        assert!(!ScreenOperation::ConnectionsAssets.is_screen_read());
+        assert_eq!(ScreenOperation::ConnectionsAssets.args_limit(), 16_384);
+        let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &["connections.assets"]);
         assert!(validate_map(&slot_only, &bodies).is_err());
     }
 
