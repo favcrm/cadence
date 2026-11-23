@@ -207,12 +207,19 @@ still needs Browser QA under any policy. The
 needs the reviews its rules name.
 
 A change to the section takes effect only through the owner's approval: an
-agent's edit to `PROJECT.md` is not the approved policy. This section describes
-the hosted gate. The native merge queue does not apply an approved custom policy
-yet. It refuses a change that the policy alone decides. It accepts a change at
-the strict floor, but enforces only the floor, the owner's approval and Browser
-QA, not the policy's own required checks or named reviews. Keep a native project
-on the default policy until it does.
+agent's edit to `PROJECT.md` is not the approved policy.
+
+The native merge queue (`scripts/enqueue-reviewed`) applies the approved policy
+the same way. It counts the reviews the policy names, including a single
+`standards` or `spec_security` review or none. It also requires every
+`check` review in `mode: required` on the exact head: the latest run of that
+check name from the named GitHub App, matched by slug, must have succeeded. A
+run from another App never counts. These checks come on top of the base
+branch's required contexts and the review and approval floors. The gate refuses
+an answer it does not recognize: an unknown field or review shape, required
+checks that do not match the policy's `check` reviews, or a check with no App.
+A non-pass verdict still refuses there, even on an axis the policy does not
+require. A project without an approved custom policy is unchanged.
 
 ## Review evidence
 
