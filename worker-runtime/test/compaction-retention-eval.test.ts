@@ -16,6 +16,7 @@ Launch Larkspur Tide Bakery's sourdough box page.
 ## Constraints & Preferences
 - Launch date 2027-03-14; total budget HK$18,450, not to be exceeded.
 - Odessa Venn approves every page. No emoji in any copy.
+- The POS shows error E-4417 when it syncs the sourdough stock; the page must not go live until that is fixed.
 
 ## Key Decisions
 - **Sourdough box first** (product LTB-4471), pastry box later: the supplier is signed.

@@ -23,6 +23,8 @@ export const FACTS: readonly Fact[] = [
   { name: "product code", variants: ["LTB-4471"] },
   { name: "decision", variants: ["sourdough box first", "sourdough box before", "start with the sourdough box", "lead with the sourdough box"] },
   { name: "preference", variants: ["emoji"] },
+  // An error the user reports is a fact about their business, not a tool failure.
+  { name: "user-reported error", variants: ["E-4417"] },
 ];
 
 const TOOL = "canvas_open";
@@ -77,7 +79,8 @@ const BRIEF =
   "Brief for the launch. The business is Larkspur Tide Bakery. We launch on 2027-03-14. " +
   "The total launch budget is HK$18,450 and must not be exceeded. Odessa Venn approves every page. " +
   "The product code for the sourdough box is LTB-4471. Decision: launch the sourdough box first and " +
-  "the pastry box later, because the sourdough supplier is already signed. Preference: no emoji in any copy.";
+  "the pastry box later, because the sourdough supplier is already signed. Preference: no emoji in any copy. " +
+  "Our POS shows error E-4417 when it syncs the sourdough stock; the launch page must not go live until that is fixed.";
 const ASK = "Open the launch canvas and lay out the sourdough box page.";
 const RETRY = "Try opening the canvas once more.";
 const LAST = "The canvas was fixed in today's deploy. Continue with the launch page.";

@@ -94,12 +94,18 @@ function withSummaryBudget(input: Record<string, unknown>): Record<string, unkno
  * CAD-2658: tools change with every deploy, so a summarized tool failure must
  * not steer later turns. Appended to the system prompt of the attested
  * summarization request only; a turn request never carries it.
+ *
+ * CAD-2729: Pi's base prompt asks to "preserve exact ... error messages", and
+ * without an explicit override the summary quoted every tool error verbatim
+ * (CAD-2725 eval). The override covers tool output only: an error the user
+ * reports is a fact about their business and is kept.
  */
 export const SUMMARY_INSTRUCTION =
   "Keep the user's goals, decisions, preferences, facts about their business and open tasks. " +
   "Do not record tool errors, refusals, retries or \"X doesn't work\" as lasting facts or as instructions; " +
   "at most say that an earlier attempt to do X failed and to try again normally. " +
-  "Do not copy tool-call argument shapes into the summary.";
+  "For tool calls this replaces the request to preserve exact error messages: do not quote a tool's error code, " +
+  "error text or loop-guard message, and do not copy tool-call argument shapes into the summary.";
 
 function withSummaryInstruction(input: Record<string, unknown>): Record<string, unknown> {
   const source = summarySource(input);
