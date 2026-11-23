@@ -395,6 +395,29 @@ fn intake_native_start_refuses_unready_dependency_and_old_base_without_claim() {
     fx.approve(epic);
 
     let before = fx.snapshot(dependent);
+    let refusal = crate::issue::claim::claim(
+        &fx.pm,
+        dependent,
+        Some("acceptance"),
+        None,
+        None,
+        "acceptance",
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_dependency_unready"),
+        "{refusal:?}"
+    );
+    assert!(refusal.to_string().contains(prerequisite), "{refusal:?}");
+    assert_eq!(fx.snapshot(dependent), before);
+    assert!(board::find_issue(&fx.pm.dir, dependent)
+        .unwrap()
+        .front
+        .claim
+        .is_none());
+
+    let before = fx.snapshot(dependent);
     let refusal = fx.start(dependent, None).unwrap_err();
     assert_eq!(
         refusal.code(),
@@ -417,6 +440,113 @@ fn intake_native_start_refuses_unready_dependency_and_old_base_without_claim() {
     let front = board::find_issue(&fx.pm.dir, prerequisite).unwrap().front;
     assert_eq!(front.status, "ready");
     assert!(front.claim.is_none());
+
+    std::fs::write(fx.repo.join("docs/scope.md"), "Changed scope\n").unwrap();
+    git(&fx.repo, &["add", "docs/scope.md"]);
+    git(&fx.repo, &["commit", "-qm", "Change approved scope"]);
+    let before = fx.snapshot(prerequisite);
+    let refusal = crate::issue::claim::claim(
+        &fx.pm,
+        prerequisite,
+        Some("acceptance"),
+        None,
+        None,
+        "acceptance",
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(refusal.to_string().contains("scope"), "{refusal:?}");
+    assert_eq!(fx.snapshot(prerequisite), before);
+    assert!(board::find_issue(&fx.pm.dir, prerequisite)
+        .unwrap()
+        .front
+        .claim
+        .is_none());
+}
+
+#[test]
+fn intake_missing_promised_source_refuses_without_invoking_git_transport() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = IntakeFixture::new();
+    let proposal = fx.propose(LINKED_INTAKE);
+    let epic = proposal["epic"].as_str().unwrap();
+    let issue = proposal["tickets"][0].as_str().unwrap();
+    fx.approve(epic);
+
+    let remote = fx._dir.path().join("promisor.git");
+    std::fs::create_dir(&remote).unwrap();
+    git(&remote, &["init", "--bare", "-q"]);
+    let marker = fx._dir.path().join("transport-invoked");
+    let upload_pack = fx._dir.path().join("record-upload-pack");
+    std::fs::write(
+        &upload_pack,
+        format!(
+            "#!/bin/sh\nprintf attempted > '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&upload_pack, std::fs::Permissions::from_mode(0o700)).unwrap();
+    git(
+        &fx.repo,
+        &[
+            "config",
+            "remote.origin.url",
+            &format!("file://{}", remote.display()),
+        ],
+    );
+    git(&fx.repo, &["config", "remote.origin.promisor", "true"]);
+    git(
+        &fx.repo,
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    );
+    git(
+        &fx.repo,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().unwrap(),
+        ],
+    );
+    git(&fx.repo, &["config", "protocol.file.allow", "always"]);
+    let blob = git(&fx.repo, &["rev-parse", "HEAD:docs/scope.md"]);
+    let blob = blob.trim();
+    let loose = fx
+        .repo
+        .join(".git/objects")
+        .join(&blob[..2])
+        .join(&blob[2..]);
+    assert!(loose.is_file(), "fixture source blob must be loose");
+    std::fs::remove_file(loose).unwrap();
+
+    let before = fx.snapshot(issue);
+    let refusal =
+        crate::issue::claim::claim(&fx.pm, issue, Some("acceptance"), None, None, "acceptance")
+            .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(
+        !marker.exists(),
+        "missing source invoked the promisor transport"
+    );
+    assert_eq!(fx.snapshot(issue), before);
+    assert!(board::find_issue(&fx.pm.dir, issue)
+        .unwrap()
+        .front
+        .claim
+        .is_none());
+    // Positive control: the configured local file transport really reaches
+    // the marker when Git is allowed to fetch; it never contacts a network.
+    let mut control = std::process::Command::new("git");
+    control
+        .arg("-C")
+        .arg(&fx.repo)
+        .args(["fetch", "origin"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = crate::reaper::output(&mut control).unwrap();
+    assert!(!output.status.success());
+    assert!(marker.is_file(), "local transport marker was not wired");
 }
 
 #[test]

@@ -343,6 +343,16 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     front.owner = Some("worker-1".into());
     front.claim = Some(crate::issue::claim::new_claim("worker-1", None));
     front.refs.push(crate::issue::model::Ref {
+        kind: "branch".into(),
+        url: None,
+        path: Some("acceptance-lane".into()),
+        label: None,
+        closed: None,
+        worktree: None,
+        cargo_target: None,
+        agent: None,
+    });
+    front.refs.push(crate::issue::model::Ref {
         kind: "worktree".into(),
         url: None,
         path: Some(lane.to_string_lossy().into_owned()),
@@ -456,6 +466,40 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     pm.commit(&[issue_dir.join("issue.md")], "Restore registered lane")
         .unwrap();
 
+    // The lane stays registered, but a checkout of another branch must
+    // not inherit the issue's recorded branch authority.
+    git(&lane, &["checkout", "-qb", "other-lane-branch"]);
+    let before_branch_head = git(&pm_dir, &["rev-parse", "HEAD"]);
+    let before_branch_issue = std::fs::read(issue_dir.join("issue.md")).unwrap();
+    let before_branch_lanes = git(&repo, &["worktree", "list", "--porcelain"]);
+    let branch_message = "cad224-mismatched-branch";
+    let mut branch_request = accepted_request.clone();
+    branch_request["message"] = json!(branch_message);
+    let refusal = scoped(Asserted::Operator, || {
+        shared.rpc_dispatch_send(&branch_request, std::process::id())
+    })
+    .unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    assert!(
+        refusal.to_string().contains("expected branch"),
+        "{refusal:?}"
+    );
+    assert!(!shared.store.message_exists(branch_message).unwrap());
+    assert_eq!(
+        shared.store.queued_count("worker-1").unwrap(),
+        accepted_queue
+    );
+    assert_eq!(git(&pm_dir, &["rev-parse", "HEAD"]), before_branch_head);
+    assert_eq!(
+        std::fs::read(issue_dir.join("issue.md")).unwrap(),
+        before_branch_issue
+    );
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"]),
+        before_branch_lanes
+    );
+    git(&lane, &["checkout", "-q", "acceptance-lane"]);
+
     let spec = dir.path().join("intake-job.md");
     std::fs::write(&spec, "Deliver the approved capability.\n").unwrap();
     let spec_sha = crate::delegation::sha256_hex(b"Deliver the approved capability.\n");
@@ -477,7 +521,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             Some("acceptance-lane"),
             Some(&lane_base),
             Some("worker-1"),
-            Some("Retired criterion"),
+            Some("Independent task requirement"),
         )
         .unwrap();
     shared
@@ -488,7 +532,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             Some("Fresh work"),
             Some("worker-2"),
             None,
-            Some("Original draft criterion"),
+            None,
             Some(lane.to_str().unwrap()),
             Some("acceptance-lane"),
             Some(&lane_base),
@@ -530,12 +574,27 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
         "{accepted_body}"
     );
     assert!(
-        accepted_body.contains("Recorded task acceptance: \"Retired criterion\""),
+        accepted_body.contains("Independent task requirement"),
         "{accepted_body}"
     );
+    let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+    let event_payload: String = conn
+        .query_row(
+            "SELECT payload FROM events WHERE kind = 'task_dispatched' AND task_id = ?1",
+            ["cad224-job-t1"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event: Value = serde_json::from_str(&event_payload).unwrap();
+    assert_eq!(event["message"], accepted_job_id);
+    let approved_scope = event["intake_acceptance"].as_str().unwrap();
     assert!(
-        accepted_body.contains("earlier inherited issue checklist is historical"),
-        "{accepted_body}"
+        approved_scope.contains("Capability is available"),
+        "{event}"
+    );
+    assert!(
+        approved_scope.contains("Under production traffic"),
+        "{event}"
     );
     assert_eq!(
         shared
@@ -544,14 +603,18 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             .unwrap()
             .acceptance
             .as_deref(),
-        Some("1) [ ] \"Capability is available\"")
+        Some("Independent task requirement")
     );
     let steering = shared
         .store
         .compose_task_message("cad224-job-t1", "worker-1", "Continue", 4000)
         .unwrap();
     assert!(steering.contains("Capability is available"), "{steering}");
-    assert!(!steering.contains("Retired criterion"), "{steering}");
+    assert!(
+        steering.contains("Independent task requirement"),
+        "{steering}"
+    );
+    assert!(steering.contains("Under production traffic"), "{steering}");
     let queue_with_job = shared.store.queued_count("worker-1").unwrap();
     assert_eq!(queue_with_job, accepted_queue + 1);
 
@@ -579,7 +642,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             let before_lanes = lane_inventory();
             let before_lane_head = git(&lane, &["rev-parse", "HEAD"]);
             let before_task = shared.store.task("cad224-fresh-task").unwrap().to_json();
-            assert_eq!(before_task["acceptance"], "Original draft criterion");
+            assert!(before_task["acceptance"].is_null());
             let queues =
                 ["worker-1", "worker-2"].map(|alias| shared.store.queued_count(alias).unwrap());
             let seen = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -810,7 +873,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             .unwrap()
             .acceptance
             .as_deref(),
-        Some("1) [ ] \"Capability is available\"")
+        Some("Independent task requirement")
     );
     let replay_monitor = scoped(Asserted::Operator, || {
         shared.rpc_monitor_dispatch(
