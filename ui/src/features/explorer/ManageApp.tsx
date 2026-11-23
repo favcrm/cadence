@@ -19,7 +19,13 @@ import { AppAgentSettings } from "../workspace-apps/AppAgentSettings";
 import { PrivateAppUpdaterSettings } from "../workspace-apps/PrivateAppUpdaterSettings";
 import { CatalogBindings } from "../workspace-apps/CatalogBindings";
 import { declaredSlots, isCatalogSlot } from "../workspace-apps/bindingChoices";
+import {
+  readWhatsAppSettings,
+  whatsappSettingsSummary,
+  type WhatsAppProvider,
+} from "../workspace-apps/whatsappSettings";
 import "../workspace-apps/workspace-apps.css";
+import "../workspace-apps/whatsappSettings.css";
 import { installationAppHref } from "../apps/appViewModel";
 import { AppGlyph, useModal } from "./shared";
 import MemberAccessPanel from "./MemberAccessPanel";
@@ -86,6 +92,11 @@ export default function ManageApp({
   const [catalogError, setCatalogError] = useState(false);
   const [catalogBusy, setCatalogBusy] = useState(false);
   const catalogLock = useRef(false);
+  const [wabaSummary, setWabaSummary] = useState<{
+    activeMode: WhatsAppProvider | null;
+    statusTone: "ok" | "warn" | "bad" | "muted";
+    statusLabel: string;
+  } | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
   const hasCatalogSlots = inst?.source_kind === "private" && declaredSlots(inst).some(isCatalogSlot);
@@ -119,6 +130,22 @@ export default function ManageApp({
       .catch(() => { if (!controller.signal.aborted) setHomeUnavailable(true); });
     return () => controller.abort();
   }, [installId, reread, isOp]);
+
+  useEffect(() => {
+    setWabaSummary(null);
+    if (!hosted || !isOp || !inst || inst.install_id !== installId || inst.name !== "waba" || inst.removed != null) {
+      return;
+    }
+    const controller = new AbortController();
+    void readWhatsAppSettings(installId, controller.signal)
+      .then((snap) => {
+        if (!controller.signal.aborted) setWabaSummary(whatsappSettingsSummary(snap));
+      })
+      .catch(() => {
+        // Older boards without host WhatsApp settings routes degrade cleanly.
+      });
+    return () => controller.abort();
+  }, [hosted, installId, inst?.install_id, inst?.name, inst?.removed, isOp, reread]);
 
   useEffect(() => {
     if (!isOp || !inst || inst.install_id !== installId || !hasCatalogSlots || inst.removed != null) return;
@@ -507,7 +534,7 @@ export default function ManageApp({
           <h3>{t("Connections and setup")}</h3>
           <p>{t("The accounts and helpers {title} uses.").replace("{title}", () => inst.title)}</p>
           {(inst.connection_slots ?? []).length === 0 ? (
-            !hasCatalogSlots && <p className="hint mt-2">{t("No outside accounts.")}</p>
+            !hasCatalogSlots && !wabaSummary && <p className="hint mt-2">{t("No outside accounts.")}</p>
           ) : (
             <ul className="mt-2">
               {inst.connection_slots.map((s) => (
@@ -515,13 +542,39 @@ export default function ManageApp({
               ))}
             </ul>
           )}
-          <div className="mt-3">
+          {wabaSummary && (
+            <div className="wa-manage-summary">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-ink-400">{t("Active mode")}:</span>
+                <strong className="text-ink-100 font-medium">
+                  {t(
+                    wabaSummary.activeMode === "official"
+                      ? "Official API"
+                      : wabaSummary.activeMode === "linked"
+                        ? "Linked device"
+                        : "Not set",
+                  )}
+                </strong>
+              </div>
+              <span className={`wa-badge ${wabaSummary.statusTone}`}>
+                {t(wabaSummary.statusLabel)}
+              </span>
+            </div>
+          )}
+          <div className="mt-3 flex flex-wrap gap-2">
             {removed ? null : (() => {
               const href = installationAppHref(installs, inst.install_id);
               return href === null ? (
                 <span className="text-micro text-ink-500">{t("The app page is unavailable for this installation.")}</span>
               ) : (
-                <Link className="btn btn-sm" href={href}>{t("Open its page")}</Link>
+                <>
+                  <Link className="btn btn-sm" href={href}>{t("Open its page")}</Link>
+                  {inst.name === "waba" && hosted && (
+                    <Link className="btn btn-sm" href={`${href}?waba=connection`}>
+                      {t("Open Settings →")}
+                    </Link>
+                  )}
+                </>
               );
             })()}
           </div>

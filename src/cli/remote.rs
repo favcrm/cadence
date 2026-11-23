@@ -1802,6 +1802,37 @@ fn valid_whatsapp_company_id(value: &str) -> bool {
         && !value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
 }
 
+fn whatsapp_connection_stderr_hint(
+    action: &super::connection::WhatsappAction,
+    body: &Value,
+) -> Option<String> {
+    use super::connection::{WhatsappAction, WhatsappProviderArg};
+    let url = body
+        .pointer("/data/url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("https://"))?;
+    match action {
+        WhatsappAction::Connect {
+            provider: WhatsappProviderArg::Linked,
+        } => {
+            if body
+                .pointer("/data/alreadyConnected")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                Some(format!(
+                    "Linked WhatsApp is already connected. Open Cadence WhatsApp Settings to manage or pause ($0/mo):\n  {url}"
+                ))
+            } else {
+                Some(format!(
+                    "Open Cadence WhatsApp Settings in your browser to scan the pairing QR code (no browser was opened here and no QR secret is printed):\n  {url}"
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn platform_request_key(
     tool: &str,
     query: Option<&Value>,
@@ -3264,20 +3295,13 @@ where
                 );
                 return Ok(0);
             }
-            if matches!(
-                &command,
-                Commands::Connection {
-                    action: ConnectionAction::Whatsapp {
-                        action: super::connection::WhatsappAction::Connect { .. }
-                            | super::connection::WhatsappAction::Rescope { .. }
-                    }
-                }
-            ) && body.pointer("/data/url").and_then(Value::as_str).is_some()
+            if let Commands::Connection {
+                action: ConnectionAction::Whatsapp { action },
+            } = &command
             {
-                eprint_line(
-                    "Open this authenticated URL in your own browser; no browser was opened \
-                     here and no pairing QR secret is printed.",
-                );
+                if let Some(hint) = whatsapp_connection_stderr_hint(action, &body) {
+                    eprint_line(&hint);
+                }
             }
             if matches!(&command, Commands::Platform { .. }) {
                 for summary in super::platform::platform_human_summary(&body) {
@@ -6492,7 +6516,7 @@ mod read_contract_tests {
                 "provider": "linked",
                 "action": "connect",
                 "state": "pairing",
-                "url": "https://app.example.test/account#linked",
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked",
                 "expiresAt": "2026-11-23T02:00:00Z",
                 "extraRenamedSecret": "strip-me"
             }}),
@@ -6504,7 +6528,7 @@ mod read_contract_tests {
                 "provider": "linked",
                 "action": "connect",
                 "state": "pairing",
-                "url": "https://app.example.test/account#linked",
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked",
                 "expiresAt": "2026-11-23T02:00:00Z"
             }})
         );
@@ -6524,6 +6548,75 @@ mod read_contract_tests {
                 "expected refusal for {bad_connect}"
             );
         }
+
+        let linked_pairing_hint = whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &connect_ok,
+        )
+        .unwrap();
+        assert!(linked_pairing_hint.contains("Cadence WhatsApp Settings"));
+        assert!(linked_pairing_hint
+            .contains("https://alpha.board.example.test/apps/waba?waba=connection&mode=linked"));
+        assert!(linked_pairing_hint.contains("no QR secret is printed"));
+
+        let linked_connected_hint = whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "alreadyConnected": true,
+                "url": "https://alpha.board.example.test/apps/waba?waba=connection&mode=linked"
+            }}),
+        )
+        .unwrap();
+        assert!(linked_connected_hint.contains("already connected"));
+        assert!(linked_connected_hint.contains("$0/mo"));
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Linked,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "linked",
+                "action": "connect",
+                "url": "http://insecure.example.test/apps/waba"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Connect {
+                provider: WhatsappProviderArg::Official,
+            },
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "action": "connect",
+                "url": "https://portal.favcrm.example.test/wa/connect?token=tok"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Rescope { request: None },
+            &json!({"ok": true, "data": {
+                "provider": "official",
+                "action": "rescope",
+                "url": "https://portal.favcrm.example.test/wa/connect?token=tok"
+            }}),
+        )
+        .is_none());
+
+        assert!(whatsapp_connection_stderr_hint(
+            &WhatsappAction::Status {
+                provider: WhatsappProviderArg::Linked
+            },
+            &json!({"ok": true, "data": {"provider": "linked", "state": "connected"}}),
+        )
+        .is_none());
     }
 
     #[test]
