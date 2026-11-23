@@ -993,7 +993,6 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
     carries two counted principals (serial rebinding), the set refuses and
     those rows count for nothing."""
     reasons, counted = [], []
-    ignored = policy_ignored_kinds(policy_kind)
     identity = lambda v: reviewer_key(v, hosted)
 
     def evidence(n):
@@ -1010,7 +1009,7 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue, hosted=None,
         stamped = [n for n in notes if n["stamp"]]
         passes = [n for n in stamped if n["outcome"] == "pass"]
         for n in notes:
-            if n["outcome"] == "pass" or n["kind"] in ignored:
+            if n["outcome"] == "pass":
                 continue
             # CAD-2192: a later pass supersedes only what it re-reviewed. A
             # Browser QA failure is cleared by Browser QA, not by the same
@@ -1397,13 +1396,6 @@ def policy_evidence(req):
         kind = "combined" if axes["general"] else "none"
     return {"names": sorted(names), "checks": sorted(listed), "kind": kind,
             "browser_qa": qa, "operator": operator}
-
-
-def policy_ignored_kinds(policy_kind):
-    """The verdict kinds a policy asking one axis or no code review does not need:
-    as on the hosted gate, a non-pass of one of them does not block."""
-    return {"none": ("standards", "spec-security"), "standards": ("spec-security",),
-            "spec_security": ("standards",)}.get(policy_kind, ())
 
 
 def policy_floor_reasons(changes, lines, risk, never):
@@ -1939,14 +1931,12 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         authors.add(str(ticket["claim"]["by"]).lower())
 
     authority = None
-    policy, ignored_kinds = None, ()
+    policy = None
     required_comment_evidence = []
     if issue:
         try:
             authority = requirements_inspection(issue, repo, pr, head)
             policy = authority["policy"]
-            if policy is not None and authority["requirements"]["class"] == "consequential":
-                ignored_kinds = policy_ignored_kinds(authority["requirements"]["review_kind"])
             if (authority["binding"]["base"] != base_oid
                     or authority["binding"]["base_ref"] != base
                     or authority["binding"]["repo"] != repo.lower()
@@ -2162,8 +2152,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     # "missing or malformed acceptance names the head it would need" rule: a
     # failed or absent read answers with the same sentence, never with a lift.
     if (accepted_revise is None and hosted_project is not None
-            and any(is_workflow_row(v) and v["outcome"] != "pass" and v["kind"] not in ignored_kinds
-                    for v in verdicts)):
+            and any(is_workflow_row(v) and v["outcome"] != "pass" for v in verdicts)):
         reasons.append(
             f"a workflow review at head {head} is not a pass and no acceptance is recorded for "
             f"that head; the operator accepts it with `cadence audit accept-revise --pr {pr} "

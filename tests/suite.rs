@@ -19534,6 +19534,22 @@ mod cad2494_acceptance {
     }
 
     #[test]
+    fn a_consequential_answer_cannot_waive_the_trusted_list_floor() {
+        let repo = Repo::new();
+        let ordinary = repo.head("code", "src/area/new.rs");
+        let boundary = repo.head("peer", "src/peer.rs");
+        let p = || kind(0, "none", None);
+        gate(&repo, &ordinary, p(), vec![]).passes();
+        let (code, said) = gate(&repo, &boundary, p(), vec![]).run();
+        assert_eq!(code, 1, "{said}");
+        assert!(
+            said.contains("consequential") || said.contains("floor"),
+            "{said}"
+        );
+        assert!(!said.contains("every rule holds"), "{said}");
+    }
+
+    #[test]
     fn a_default_answer_is_unchanged() {
         let repo = Repo::new();
         let head = repo.head("code", "src/area/new.rs");
