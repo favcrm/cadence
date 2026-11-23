@@ -170,6 +170,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   useEffect(() => onAppliedThemeChange(setFrameTheme), []);
   const [failure, setFailure] = useState<ScreenPaneState | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const autoRemountRef = useRef<{ scope: string; at: number } | null>(null);
   /** Retry re-mounts the same projection: the effect's scope identity is
    *  unchanged, so only the attempt counter rebuilds the frame. */
   const retry = () => { setFailure(null); setState("loading"); setAttempt(value => value + 1); };
@@ -376,7 +377,30 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         if (receipt.host_contract === "screen-records.v1") {
           admitDisplaySession(receipt.display_session_key!);
           setRemoteImages(receipt.remote_images ?? []);
-          services = recordServices(receipt, JSON.stringify([current.install_id, current.context_id]), { current: isCurrent, command, refused: () => { owned?.close(true); } });
+          services = recordServices(receipt, JSON.stringify([current.install_id, current.context_id]), {
+            current: isCurrent,
+            command,
+            refused: reason => {
+              if (
+                reason?.status === 403 &&
+                reason.code === "screen_access_denied" &&
+                isCurrent() &&
+                privateReadsAllowed()
+              ) {
+                const now = Date.now();
+                const prev = autoRemountRef.current;
+                if (!prev || prev.scope !== scope || now - prev.at >= 30_000) {
+                  autoRemountRef.current = { scope, at: now };
+                  retired = true;
+                  clearTimeout(timer);
+                  owned?.close();
+                  retry();
+                  return;
+                }
+              }
+              owned?.close(true);
+            },
+          });
         }
         let selectedWhatsApp: { conversationId: string; provider: WhatsAppComposeProvider } | null = null;
         const composeServices = primary && !readOnly && current.installation.name === "waba" && admitsWhatsAppComposer(receipt)

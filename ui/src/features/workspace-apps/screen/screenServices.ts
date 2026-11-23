@@ -217,7 +217,8 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }
 export type HostCommand = { operation: string; args: ActionArgs; conversation_id?: string | null };
-export interface RecordHost { current(): boolean; command(command: HostCommand): void; refused(): void }
+export type ScreenRefusalReason = { status: number; code: string | null };
+export interface RecordHost { current(): boolean; command(command: HostCommand): void; refused(reason?: ScreenRefusalReason): void }
 
 /** One admitted mount; no caller-selected native route or RPC. */
 export function recordServices(receipt: MountReceipt, domain: string, host: RecordHost) {
@@ -269,7 +270,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     ) {
       retired = true;
       purgeDisplayCache();
-      host.refused();
+      host.refused({ status: error.status, code: error.code ?? null });
     }
     return refusal(error, operation);
   }
