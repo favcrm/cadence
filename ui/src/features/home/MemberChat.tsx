@@ -4,7 +4,8 @@ import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import { displayUiNotice } from "../../lib/uiNotice";
-import type { ThreadRef } from "../../lib/types";
+import { subscribeSse } from "../../lib/sse";
+import type { MasterState, ThreadRef } from "../../lib/types";
 import { agentOn } from "../../lib/agentOn";
 import type { HostedTemplateList, HostedTemplateRail } from "../templates/HostedTemplateReview";
 import SharedComposer from "../app-shell/chat/Composer";
@@ -26,7 +27,10 @@ import {
   sendToAssistant,
 } from "./memberThread";
 import { initialFollow, motionBehavior, onSend, type Follow } from "./scrollFollow";
+import { ThreadTurn } from "./ThreadView";
 import {
+  inFlightTurnKey,
+  itemMessage,
   lastSeq,
   threadItems,
   visibleWindow,
@@ -69,13 +73,11 @@ import {
  * authority, no envelope and no signed SSO fragment — just the `sub`
  * and session the verified session already carries.
  *
- * Unlike the Master thread there is no operator stream: the bound
- * conversation id is the daemon's stored binding, read through
- * `memberAssistHistory` page reads (tail on open, `after` to catch up,
- * `before` for older). A gentle poll keeps a live turn's replies
- * flowing; send still lands an optimistic row reconciled by `message`
- * id. The store keys on the session-scoped `scope`, so a member switch
- * and a re-login never cross, and the Master draft is never reused.
+ * History stays on the member's paged route. The bound conversation's
+ * stream reports activity, not transcript content. Sends land an optimistic
+ * row reconciled by `message` id. The store keys on the session-scoped
+ * `scope`, so a member switch and a re-login never cross, and the Master
+ * draft is never reused.
  * `key={scope}` on this component remounts it on any scope change, so
  * no local state, follow ref or scroll position leaks across.
  */
@@ -126,6 +128,7 @@ export default function MemberChat({
     void store.revalidate();
   }, [store]);
   const [surface, setSurface] = useState<MemberSurface | null>(null);
+  const [liveTurn, setLiveTurn] = useState<{ conversation: string; message: string | null } | null>(null);
   const [pendingLook, setPendingLook] = useState<AvatarLook | null>(null);
   const alive = useRef(true);
   const identityGate = useRef<{ inflight: boolean; again: boolean; timer: number | null }>({
@@ -246,10 +249,7 @@ export default function MemberChat({
     }
   }, [loaded, identitySeq, scheduleSurface]);
 
-  // Poll the bound conversation for new entries — the member surface has
-  // no operator stream, so a live turn's reply lands through `loadThread`'s
-  // forward `after` page (the fetch the store's refresh runs). Slower than
-  // the Master stream but truthful; pending sends ride the same store.
+  // Paged history is authoritative even if the private stream is unavailable.
   useEffect(() => {
     if (!loaded) return;
     const timer = setInterval(() => void store.refresh(), 6000);
@@ -260,11 +260,54 @@ export default function MemberChat({
   // assistant's conversation (the same id the image provider below uses) is
   // wired to the canvas and the Browser tab explicitly.
   const conversationId = surface?.conversation ?? null;
+  useEffect(() => {
+    if (conversationId === null || surface?.ok !== true) return;
+    // An absent message means the runtime confirmed activity but couldn't
+    // name the send. Undefined means there is no verified running turn.
+    let previous: string | null | undefined;
+    const publish = (message?: string | null) => {
+      if (previous !== message) {
+        previous = message;
+        void store.invalidate();
+      }
+      setLiveTurn((turn) =>
+        message === undefined ? null
+          : turn?.conversation === conversationId && turn.message === message ? turn
+          : { conversation: conversationId, message },
+      );
+    };
+    const stream = subscribeSse({
+      url: `/api/threads/master/stream?${new URLSearchParams({ conversation: conversationId })}`,
+      // Entry ids advance the reconnect cursor, but member history keeps
+      // its own opaque cursor. Don't merge entries or subscribe to previews.
+      events: ["master", "entry"],
+      onEvent: ({ type, data }) => {
+        if (type !== "master") return;
+        try {
+          const snapshot = JSON.parse(data) as MasterState | null;
+          const turn = snapshot?.turn;
+          if (snapshot?.session?.id === conversationId &&
+              (!Object.hasOwn(snapshot, "actor_identity") || snapshot.actor_identity?.conversation_id === conversationId) &&
+              turn?.conversation === conversationId && turn.state === "working") {
+            publish(typeof turn.message === "string" && turn.message !== "" ? turn.message : null);
+            return;
+          }
+        } catch {
+          // An unusable frame is not evidence that the agent is working.
+        }
+        publish();
+      },
+      onError: () => setLiveTurn(null),
+    });
+    return () => {
+      stream.close();
+      setLiveTurn(null);
+    };
+  }, [conversationId, store, surface?.ok]);
   // Auto-open is off here: an artifact opens the drawer when the person asks,
   // so on a phone the drawer never covers the chat they are reading.
   useCanvasFeed({ conversation: conversationId, surface: "home", composerKey: `member-assist:${scope}`, items, loaded, running: null, autoOpen: false });
-  // There is no turn state on this surface, so a turn counts as open while the
-  // thread does not end on an answer or a failed send; the store bounds how long.
+  // Browser activity still follows the last stored item when the feed is down.
   const tail = [...items].reverse().find((i) => !["system", "artifact", "image", "video", "hire"].includes(i.type));
   const turnOpen = tail !== undefined && tail.type !== "answer" && !(tail.type === "pending" && tail.pending.state === "failed");
   useBrowserFeed(conversationId, turnOpen, `${lastSeq(thread.data) ?? 0}:${thread.data?.pending?.length ?? 0}`);
@@ -410,6 +453,24 @@ export default function MemberChat({
   );
 
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
+  const working = liveTurn?.conversation === conversationId ? liveTurn : null;
+  const sendIndex = working === null ? -1 : shown.findLastIndex((item) =>
+    item.type === "operator"
+      ? working.message === null || itemMessage(item) === working.message
+      : item.type === "pending" && item.pending.state !== "failed" &&
+        working.message !== null && item.pending.message === working.message,
+  );
+  // A stored result wins over an older working frame. An unnamed turn can
+  // only follow a stored send, never the latest optimistic message.
+  const workingItem = sendIndex < 0 || shown.some((item, index) =>
+    index > sendIndex && item.type === "answer" &&
+      (working?.message == null || item.entry.message == null || item.entry.message === working.message),
+  ) ? null : shown[sendIndex];
+  const running = workingItem === null ? null : itemMessage(workingItem);
+  const runningUnnamed = workingItem !== null && running === null;
+  const openingItem = workingItem !== null && inFlightTurnKey(shown, running, runningUnnamed) === null
+    ? workingItem
+    : null;
   // A confirmed-empty greeting only when a real history read succeeded
   // and the last read was clean: a failed first read or a stale refresh
   // is unknown history, never "empty" — the greeting waits for an
@@ -511,6 +572,11 @@ export default function MemberChat({
               mode={{ kind: "home" }}
               highlightSkillCommand
               items={shown}
+              running={running}
+              runningUnnamed={runningUnnamed}
+              activity={(item) => item === openingItem
+                ? { kind: "row", position: "after", node: <ThreadTurn items={[]} running /> }
+                : null}
               legacyTranscript={!items.some((item) => item.type === "answer")}
               readOnly={readOnly}
               liveAfter={liveAfter.current ?? 0}

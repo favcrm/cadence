@@ -94,6 +94,11 @@ AgenticOS supplies the authenticated model proxy and domain capabilities.
 Provider credentials, model routing, financial authorization, current tenant
 membership and human approval decisions remain with that platform.
 
+In a member's private Home chat, the existing typing indicator appears when
+the assistant reports that the turn is working, not when the send is queued.
+It shows the current tool step once it appears in history. If the live feed
+disconnects, the indicator clears; history still refreshes.
+
 In hosted Home, type `/skills` and press Enter to browse approved workspace
 skills without sending a message. Selecting a skill inserts `/skill:<name>`
 in the draft. Send it with your request, or type the command directly. The
