@@ -6,6 +6,24 @@ Creating or selecting a connection grants no worker, app or run permissions.
 The Settings Connections page and executable app bindings are separate work.
 These provider accounts are different from local organization/socket routing.
 
+## Custom MCP setup from chat
+
+The owner opens the connection card and approves the requested scopes at the
+provider. On return, Cadence checks the connection, endpoint, owner and required
+scopes before showing **Continue in chat**. Continuing does not enable tools or
+approve any action.
+
+Use **Review tool access** on the card to enable a specific tool offered for
+read access. The tool can then run without per-call approval, subject to existing
+workspace and agent policies. Disabled tools and tools with unreviewed changes
+stay disabled or held for review. Use **Manage in Connections** for the full
+tool and access settings.
+
+If authorization fails, retry or choose **Edit endpoint** to correct the path
+on the same server and start a fresh sign-in. Ask for a new setup card to use a
+different server origin. A return opened in another tab of the same browser
+profile can recover the original setup; a callback URL alone cannot resume chat.
+
 ## Inspect configuration
 
 ```sh

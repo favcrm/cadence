@@ -1,14 +1,15 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { ApiError, api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { usingPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { routePath } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
+import type { CustomMcpConnectionSummary, CustomMcpToolPin } from "../../lib/types";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import { useImageConversation } from "../canvas/imageConversation";
 import { CustomMcpConnectDrawer } from "../settings/CustomMcpDrawer";
-import { customMcpAuthorizationUrl, customMcpErrorText, customMcpReturn } from "../settings/customMcpView";
+import { customMcpAuthorizationUrl, customMcpErrorText, customMcpReturn, isToolDestructiveHint, isToolReadOnlyHint } from "../settings/customMcpView";
 import { hostedConnectError, hostedConnectUrl, UI_HOSTED_REFUSED } from "../settings/hostedConnect";
 import { withoutConnectParams } from "../workspace-apps/socialConnect";
 import { TurnCard, type CardDensity } from "../../ui/TurnCard";
@@ -27,13 +28,14 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
   const t = useTranslate();
   const writeBlock = useContext(WriteGate);
   const operatorBlock = useContext(HireBlock);
+  const conversation = useImageConversation();
   const [busy, setBusy] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [resumed, setResumed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const setup = parseCustomMcpSetup(entry);
   if (setup && writeBlock === null && operatorBlock === null) {
-    return <CustomMcpSetupCard entry={entry} setup={setup} density={density} />;
+    return <CustomMcpSetupCard key={`${conversation}:${entry.seq}`} entry={entry} setup={setup} density={density} conversation={conversation} />;
   }
   const model = parseConnectRef(entry);
   if (!model) return <p className="text-micro text-ink-500 break-words chatcard-line">· {plainText(entry.text, 500)}</p>;
@@ -198,158 +200,254 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
   );
 }
 
-function CustomMcpSetupCard({ entry, setup, density }: {
+// Browser storage only locates the original attempt. It never establishes a grant.
+function readSetupAttempt(key: string, endpoint: string): { id: string; endpoint: string } | null {
+  for (const source of ["localStorage", "sessionStorage"] as const) {
+    try {
+      const [id, savedEndpoint = endpoint] = (window[source].getItem(key) ?? "").split("\n");
+      if (id) return { id, endpoint: new URL(savedEndpoint).href };
+    } catch {
+      // The other storage type may still be available.
+    }
+  }
+  return null;
+}
+
+function matchesSetupScopes(actual: readonly string[], expected: string | undefined): boolean {
+  if (expected === undefined) return true;
+  const scopes = expected.split(" ");
+  return actual.length === scopes.length && scopes.every((scope) => actual.includes(scope));
+}
+
+function reviewableRead(pin: CustomMcpToolPin): boolean {
+  return pin.mode === "approval" && !pin.drifted && isToolReadOnlyHint(pin) && !isToolDestructiveHint(pin);
+}
+
+function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   entry: ThreadEntry;
   setup: CustomMcpSetup;
   density: CardDensity;
+  conversation: string | null;
 }) {
   const t = useTranslate();
-  const conversation = useImageConversation();
-  const [drawer, setDrawer] = useState(false);
+  const [drawer, setDrawer] = useState<"connect" | "edit" | null>(null);
   const [busy, setBusy] = useState(false);
   const [resumed, setResumed] = useState(false);
-  const [cleared, setCleared] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [connection, setConnection] = useState<CustomMcpConnectionSummary | null>(null);
+  const [recheck, setRecheck] = useState(0);
   const url = new URL(window.location.href);
-  const callback = !cleared && url.searchParams.get("mcp_setup") === String(entry.seq)
-    ? customMcpReturn(url.search)
-    : null;
+  const callback = url.searchParams.get("mcp_setup") === String(entry.seq) ? customMcpReturn(url.search) : null;
   const key = `cadence:mcp-setup:${conversation}:${entry.seq}`;
-  let connId: string | null = null;
-  if (!cleared && conversation) {
-    try {
-      connId = window.sessionStorage.getItem(key);
-    } catch {
-      // No verified return without the local enrollment receipt.
-    }
-  }
-  const returned = connId && callback?.connectionId === connId ? callback : null;
-  const ready = returned?.outcome === "connected" && !!conversation;
-  const settings = `${routePath({ screen: "settings", section: "connections" })}?mcp_focus=${encodeURIComponent(connId ?? setup.label)}`;
-  const clearReturn = () => {
-    const clean = new URL(window.location.href);
-    clean.search = withoutConnectParams(clean.search);
-    clean.searchParams.delete("mcp_setup");
-    navigate(`${clean.pathname}${clean.search}${clean.hash}`, { replace: true });
-    setCleared(true);
-    window.sessionStorage.removeItem(key);
-  };
-
-  const retryOAuth = async () => {
-    if (busy || !connId) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const started = await api.customMcpOAuthStart(connId, { return_to: url.href });
-      const authUrl = customMcpAuthorizationUrl(started);
-      if (started.connection_id !== connId || authUrl === null) {
-        setError("Server did not return a valid https:// authorization URL.");
-        return;
-      }
-      window.location.assign(authUrl);
-    } catch (e: unknown) {
-      if (e instanceof ApiError && e.status === 404) clearReturn();
-      setError(customMcpErrorText(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const continueReply = async () => {
-    if (busy || !ready || !conversation || !connId) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await usingPrivateOperation(undefined, async (operation) => {
-        const { connections } = await api.customMcpList(true, operation);
-        const row = connections.find((item) => item.id === connId);
-        if (!row) {
-          clearReturn();
-          setError("This connection is no longer available. Start a new connection.");
-          return;
-        }
-        if (row.status !== "active" || row.name !== setup.label ||
-            row.endpoint_host !== new URL(setup.endpointUrl).host ||
-            (row.auth_kind !== "oauth" && row.auth_kind !== "oauth_static") ||
-            (setup.requiredScopes && (row.oauth_scopes.length !== setup.requiredScopes.length ||
-              setup.requiredScopes.some((scope) => !row.oauth_scopes.includes(scope))))) {
-          setError("Cadence could not verify this Custom MCP connection.");
-          return;
-        }
-        if (!row.tools?.some((tool) => tool.mode === "read" && !tool.drifted)) {
-          setError("Enable the required read tool in Connections, then try again.");
-          return;
-        }
-        const sent = await sendToMaster(
-          `Custom MCP connection ${connId} has enabled read tools. Continue my original request with this connection.`,
-          undefined, undefined, undefined, conversation, operation,
-        );
-        if (!sent.ok) {
-          setError(sent.error);
-          return;
-        }
-        clearReturn();
-        setResumed(true);
-      });
-    } catch (e: unknown) {
-      setError(customMcpErrorText(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const openSetup = () => {
-    setError(null);
-    try {
-      window.sessionStorage.removeItem(key);
-      setDrawer(true);
-    } catch {
-      setError("Allow session storage in this tab to finish OAuth and return to this conversation.");
-    }
-  };
+  const attempt = conversation ? readSetupAttempt(key, setup.endpointUrl) : null;
+  const connId = attempt?.id;
+  const endpoint = attempt?.endpoint ?? setup.endpointUrl;
+  const outcome = connId && callback?.connectionId === connId ? callback.outcome : null;
+  const requiredScopes = setup.requiredScopes?.join(" ");
   url.search = withoutConnectParams(url.search);
   url.searchParams.set("mcp_setup", String(entry.seq));
+  const returnTo = url.href;
+
+  function verified(row: CustomMcpConnectionSummary | undefined): row is CustomMcpConnectionSummary {
+    return row !== undefined && row.id === connId && row.connected_by_you === true &&
+      row.name === setup.label && new URL(row.endpoint_url).href === endpoint &&
+      (row.auth_kind === "oauth" || row.auth_kind === "oauth_static") &&
+      matchesSetupScopes(row.oauth_scopes, requiredScopes);
+  }
+
+  useEffect(() => {
+    if (outcome !== "connected" || resumed) return;
+    const controller = new AbortController();
+    setConnection(null);
+    setError(null);
+    void usingPrivateOperation(undefined, async (operation) => {
+      const { connections } = await api.customMcpList(true, operation);
+      return connections.find(verified);
+    }, controller.signal).then((row) => {
+      if (controller.signal.aborted) return;
+      if (row) setConnection(row);
+      else setError("Cadence could not verify this Custom MCP connection.");
+    }, (e: unknown) => {
+      if (!controller.signal.aborted) setError(customMcpErrorText(e));
+    });
+    return () => controller.abort();
+  }, [connId, endpoint, outcome, requiredScopes, setup.label, resumed, recheck]);
+
+  function remember(id: string, endpointUrl: string) {
+    const value = `${id}\n${endpointUrl}`;
+    // A same-origin tab can recover an attempt; restricted browsers still support same-tab return.
+    try {
+      window.localStorage.setItem(key, value);
+    } catch {
+      window.sessionStorage.setItem(key, value);
+    }
+  }
+
+  function forget() {
+    for (const source of ["localStorage", "sessionStorage"] as const) {
+      try {
+        window[source].removeItem(key);
+      } catch {
+        // An unavailable storage type held no usable receipt.
+      }
+    }
+    const clean = new URL(returnTo);
+    clean.searchParams.delete("mcp_setup");
+    navigate(`${clean.pathname}${clean.search}${clean.hash}`, { replace: true });
+  }
+
+  async function run(work: () => Promise<void>) {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await work();
+    } catch (e: unknown) {
+      setError(customMcpErrorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function retryOAuth() {
+    if (!connId) return;
+    void run(async () => {
+      try {
+        const started = await api.customMcpOAuthStart(connId, { return_to: returnTo });
+        const authUrl = customMcpAuthorizationUrl(started);
+        if (started.connection_id !== connId || authUrl === null) {
+          setError("Server did not return a valid https:// authorization URL.");
+          return;
+        }
+        if (requiredScopes !== undefined) {
+          const actual = new URL(authUrl).searchParams.getAll("scope");
+          if (actual.length !== 1 || !matchesSetupScopes(actual[0].split(" "), requiredScopes)) {
+            setError("The provider did not request exactly the required OAuth scopes.");
+            return;
+          }
+        }
+        window.location.assign(authUrl);
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) forget();
+        throw e;
+      }
+    });
+  }
+
+  function continueReply() {
+    if (!conversation || !connId) return;
+    void run(() => usingPrivateOperation(undefined, async (operation) => {
+      const { connections } = await api.customMcpList(true, operation);
+      const row = connections.find(verified);
+      if (row?.status !== "active" || readSetupAttempt(key, setup.endpointUrl)?.id !== connId) {
+        setConnection(row ?? null);
+        setError("Cadence could not verify this Custom MCP connection.");
+        return;
+      }
+      const sent = await sendToMaster(
+        `Custom MCP connection ${connId} is connected. Continue my original request using only currently permitted tools. If a tool is unavailable, explain what access is needed.`,
+        undefined, undefined, undefined, conversation, operation,
+      );
+      if (!sent.ok) {
+        setError(sent.error);
+        return;
+      }
+      forget();
+      setResumed(true);
+    }));
+  }
+
+  function enableRead(pin: CustomMcpToolPin) {
+    if (!connId) return;
+    void run(async () => {
+      const { connections } = await api.customMcpList();
+      const row = connections.find(verified);
+      setConnection(row ?? null);
+      const current = row?.tools?.find((tool) => tool.tool_name === pin.tool_name);
+      if (row?.status !== "active" || !current || current.tool_digest !== pin.tool_digest || !reviewableRead(current)) {
+        setError("Tool access changed. Review the current tool before enabling it.");
+        return;
+      }
+      const { connection: updated } = await api.customMcpUpdateTools(connId, [{ tool_name: pin.tool_name, mode: "read" }]);
+      if (verified(updated)) setConnection(updated);
+      else setRecheck((value) => value + 1);
+    });
+  }
+
+  const current = outcome === "connected" && connection?.id === connId ? connection : null;
+  const active = current?.status === "active";
+  const tools = current?.tools ?? [];
+  const canRead = tools.some((pin) => pin.mode === "read" && !pin.drifted);
+  const readOptions = tools.filter(reviewableRead);
+  const settings = `${routePath({ screen: "settings", section: "connections" })}?mcp_focus=${encodeURIComponent(connId ?? setup.label)}`;
+  let status: string | null = null;
+  let actions;
+  if (resumed) {
+    actions = <span className="text-micro text-ok font-medium">{t("Reply resumed")}</span>;
+  } else if (active) {
+    status = canRead ? "Connected." : "Connected. No tools can run automatically.";
+    actions = <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Continue in chat")}</button>;
+  } else if (connId) {
+    if (outcome === "connected" && !current && !error) status = "Checking connection…";
+    else if (current?.status === "needs_review") status = "The server changed its tools. Review the changes in Connections.";
+    else if (current?.status === "auth_expired") status = "OAuth sign-in expired. Sign in again.";
+    else if (outcome === "cancelled") status = "OAuth sign-in was cancelled.";
+    else if (callback && outcome === null) status = "This sign-in does not match this setup.";
+    else if (outcome === "failed") status = "OAuth sign-in did not finish. Retry or edit the server endpoint.";
+    else if (outcome === null) status = "Waiting for OAuth sign-in.";
+    actions = (
+      <div className="flex flex-wrap gap-2">
+        {outcome === "connected" && !current ? (
+          <button type="button" className="btn btn-secondary" disabled={!error || busy} onClick={() => setRecheck((value) => value + 1)}>{t("Check connection")}</button>
+        ) : current?.status !== "needs_review" ? (
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={retryOAuth}>{t("Retry OAuth sign-in")}</button>
+        ) : null}
+        <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setDrawer("edit")}>{t("Edit endpoint")}</button>
+      </div>
+    );
+  } else {
+    actions = <button type="button" className="btn btn-primary" disabled={!conversation} onClick={() => setDrawer("connect")}>{t("Connect {label}").replace("{label}", () => setup.label)}</button>;
+  }
+
   return (
     <>
       <TurnCard kind="connect" className="card chatcard" bodyClassName="chatcard-body" density={density}
         data-kind="connect_ref" label={t("Connect card")} kindLabel={t("Connection")} subject={setup.label}
-        footer={resumed ? (
-          <span className="text-micro text-ok font-medium">{t("Reply resumed")}</span>
-        ) : ready ? (
-          <div className="flex flex-wrap items-center gap-2">
-            <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void continueReply()}>
-              {busy ? t("Checking connection…") : t("Verify and continue")}
-            </button>
-            <a className="btn btn-sm btn-ghost" href={settings} target="_blank" rel="noopener noreferrer">
-              {t("Manage in Connections")}
-            </a>
-          </div>
-        ) : connId ? (
-          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void retryOAuth()}>
-            {busy ? t("Opening sign-in…") : t("Retry OAuth sign-in")}
-          </button>
-        ) : (
-          <button type="button" className="btn btn-primary" disabled={!conversation} onClick={openSetup}>
-            {t("Connect {label}").replace("{label}", () => setup.label)}
-          </button>
-        )}
+        footer={actions}
       >
         <p className="text-label text-ink-300 break-words">{plainText(entry.text, 500)}</p>
-        {ready && <p className="text-micro text-ink-300">{t("Review and enable the required read tool in Connections before continuing.")}</p>}
-        {returned && returned.outcome !== "connected" && (
-          <p className="text-micro text-warn" role="status">{t("OAuth sign-in did not finish — try connecting again.")}</p>
+        {status && <p className={`text-micro ${active ? "text-ok" : "text-warn"}`} role="status">{t(status)}</p>}
+        {active && (
+          <details className="text-micro text-ink-300">
+            <summary className="cursor-pointer">{t("Review tool access")}</summary>
+            <p>{t("Tools you enable can run without asking again.")}</p>
+            {readOptions.length > 0 ? (
+              <ul className="mt-2 space-y-2">
+                {readOptions.map((pin) => (
+                  <li key={pin.tool_name} className="flex flex-wrap items-start gap-2">
+                    <div className="min-w-0 flex-1 break-words">
+                      <code>{pin.tool_name}</code>
+                      <p>{pin.description}</p>
+                    </div>
+                    <button type="button" className="btn btn-sm btn-secondary" disabled={busy}
+                      aria-label={`${t("Enable read access")}: ${pin.tool_name}`} onClick={() => enableRead(pin)}
+                    >{t("Enable read access")}</button>
+                  </li>
+                ))}
+              </ul>
+            ) : <p>{t("No read-only tools are available to enable here.")}</p>}
+            <a className="btn btn-sm btn-ghost" href={settings} target="_blank" rel="noopener noreferrer">{t("Manage in Connections")}</a>
+          </details>
         )}
+        {current?.status === "needs_review" && <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>}
         {error && <p className="text-label text-fail break-words" role="alert">{t(error)}</p>}
       </TurnCard>
       {drawer && (
         <CustomMcpConnectDrawer
-          setup={{ ...setup, returnTo: url.href }}
-          onClose={() => setDrawer(false)}
-          onConnected={() => setDrawer(false)}
-          onOAuthStarted={(id) => {
-            window.sessionStorage.setItem(key, id);
-            setCleared(false);
-          }}
+          setup={{ ...setup, endpointUrl: endpoint, returnTo, editEndpoint: drawer === "edit" }}
+          onClose={() => setDrawer(null)}
+          onConnected={() => setDrawer(null)}
+          onOAuthStarted={remember}
         />
       )}
     </>

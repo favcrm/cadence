@@ -8,6 +8,7 @@
  */
 declare function require(name: string): any;
 import type { act as reactAct } from "react";
+import type { ThreadEntry } from "../src/features/home/thread";
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`customMcpUi: ${msg}`);
@@ -83,6 +84,7 @@ async function main() {
   const sampleMcp = {
     id: "conn_mcp_billing_1", name: "Acme Billing", endpoint_url: "https://mcp.acme.example/v1/mcp", endpoint_host: "mcp.acme.example",
     auth_kind: "oauth", auth_hint: "OAuth 2.1", oauth_issuer: "https://auth.acme.example", oauth_scopes: ["mcp:read"], oauth_account: null,
+    connected_by_you: true,
     visibility: "shared", status: "active", snapshot_revision: 2, pending_revision: null, server_name: "acme-billing-mcp", server_version: "1.4.0",
     server_instructions_digest: "sha256:abc", has_server_instructions: true, instructions_drifted: false, has_agent_guide: true,
     agent_guide_source: "https://docs.acme.example/llms.txt", last_synced_at: 1_795_000_000_000, last_used_at: null, created_at: 1_795_000_000_000, updated_at: 1_795_000_000_000,
@@ -108,11 +110,19 @@ async function main() {
 
   const jsonRes = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   const policyCalls: string[] = [];
+  let returnedMcp = sampleMcp;
+  const toolWrites: unknown[] = [];
   const innerFetch = globalThis.fetch;
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? "GET";
-    if (url.endsWith("/api/connections/mcp") && method === "GET") return jsonRes({ connections: [sampleMcp] });
+    if (url.endsWith("/api/connections/mcp") && method === "GET") return jsonRes({ connections: [returnedMcp] });
+    if (url.endsWith(`/api/connections/mcp/${sampleMcp.id}/tools`) && method === "POST") {
+      toolWrites.push(JSON.parse(String(init?.body)));
+      returnedMcp = { ...returnedMcp, tools: returnedMcp.tools.map((tool) =>
+        tool.tool_name === "catalog.search" ? { ...tool, mode: "read" } : tool) };
+      return jsonRes({ connection: returnedMcp });
+    }
     if (url.endsWith("/api/connections/mcp") && method === "POST") {
       return jsonRes({
         mode: "oauth_redirect", authorization_url: "https://auth.acme.example/authorize?state=xyz", connection_id: "conn_mcp_new_1",
@@ -215,6 +225,67 @@ async function main() {
   await settle(() => assert(host.querySelector('[data-continue-mcp="Acme Billing"]')?.textContent?.includes("Continue reply"), "ConnectCard renders Continue reply"));
   await act(async () => (host.querySelector('[data-continue-mcp="Acme Billing"]') as HTMLButtonElement).click());
   await settle(() => assert(text().includes("Reply resumed"), "Continue reply updates card to Reply resumed"));
+
+  const { ImageConversation } = require("../src/features/canvas/imageConversation") as typeof import("../src/features/canvas/imageConversation");
+  const setupEntry = {
+    seq: 20, role: "agent", kind: "connect_ref", message: "msg_setup", text: "Connect Acme Billing",
+    payload: { v: 2, toolkit: "custom_mcp", toolkit_label: sampleMcp.name,
+      endpoint_url: sampleMcp.endpoint_url, required_scopes: ["mcp:read"] },
+  } satisfies ThreadEntry;
+  const receiptKey = "cadence:mcp-setup:thread-20:20";
+  async function openSetup(key: string, outcome = "connected", conversation = "thread-20") {
+    win.history.replaceState({}, "", `/home?mcp_setup=20&aos_connect=${outcome}&toolkit=custom_mcp&connection_id=${sampleMcp.id}`);
+    await act(async () => {
+      root.render(React.createElement(PageLocale, null, React.createElement(ImageConversation, {
+        value: conversation,
+      }, React.createElement(ConnectCard, { key, entry: setupEntry }))));
+    });
+  }
+
+  win.sessionStorage.setItem(receiptKey, sampleMcp.id);
+  await openSetup("same-tab");
+  await settle(() => assert(byText("button", "Continue in chat"), "active grant can continue with zero read pins"));
+  assert(text().includes("No tools can run automatically"), "tool availability is separate from OAuth");
+  await act(async () => byText("button", "Continue in chat")!.click());
+  await settle(() => assert(text().includes("Reply resumed"), "chat resumes without a tool permission edit"));
+  assert(toolWrites.length === 0, "continue does not change tool permissions");
+  assert(win.sessionStorage.getItem(receiptKey) === null, "successful continue clears the old same-tab receipt");
+
+  win.localStorage.setItem(receiptKey, `${sampleMcp.id}\n${sampleMcp.endpoint_url}`);
+  await openSetup("different-thread", "connected", "another-thread");
+  assert(!byText("button", "Continue in chat"), "return cannot resume another conversation");
+
+  for (const [key, bad] of Object.entries({
+    owner: { ...sampleMcp, connected_by_you: false },
+    path: { ...sampleMcp, endpoint_url: "https://mcp.acme.example/" },
+    scopes: { ...sampleMcp, oauth_scopes: ["mcp:read", "mcp:write"] },
+  })) {
+    returnedMcp = bad;
+    await openSetup(key);
+    await settle(() => assert(text().includes("could not verify"), `cannot resume with a different ${key}`));
+    assert(!byText("button", "Continue in chat"), "unverified return has no continuation");
+  }
+
+  const brokerAnnotations = { readOnlyHint: true, destructiveHint: true };
+  returnedMcp = { ...sampleMcp, tools: [
+    { ...sampleMcp.tools[0], tool_name: "catalog.search", description: "Search the catalog.", annotations: { readOnlyHint: true } },
+    { ...sampleMcp.tools[0], tool_name: "execute_tool", description: "Broker", annotations: brokerAnnotations },
+  ] };
+  await openSetup("recovered-tab");
+  await settle(() => assert(byText("button", "Continue in chat"), "shared receipt recovers the exact active connection"));
+  assert(!document.querySelector('[aria-label="Enable read access: execute_tool"]'), "broker has no inline read promotion");
+  await act(async () => byText("summary", "Review tool access")!.click());
+  await act(async () => (document.querySelector('[aria-label="Enable read access: catalog.search"]') as HTMLButtonElement).click());
+  await settle(() => assert(!text().includes("No tools can run automatically"), "enable updates the verified tool status"));
+  assert(JSON.stringify(toolWrites) === JSON.stringify([{ tools: [{ tool_name: "catalog.search", mode: "read" }] }]),
+    "explicit enable changes only the selected tool");
+
+  await openSetup("cancelled", "cancelled");
+  assert(text().includes("was cancelled") && !byText("button", "Continue in chat"), "cancel is recoverable without claiming success");
+  await openSetup("wrong-endpoint", "failed");
+  await act(async () => byText("button", "Edit endpoint")!.click());
+  assert(document.querySelector<HTMLInputElement>('input[type="url"]')?.readOnly === false, "failed setup can edit its endpoint");
+  assert(text().includes("mcp:read"), "edited setup retains the requested OAuth scope");
 
   globalThis.fetch = innerFetch;
   await act(async () => root.unmount());
