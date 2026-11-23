@@ -3181,9 +3181,10 @@ mod tests {
         }
     }
 
-    /// CAD-2708: the hosted readback answers the digest the core gives an
-    /// owner-saved `policy_section`, the input a host's gate evaluates.
-    /// For every way the owner may write that section, the CLI then
+    /// CAD-2708: the hosted readback answers the digest the core gives the
+    /// owner-saved section under `policy_owner_approved`, the call the
+    /// hosted gate makes. For every way the owner may write that section
+    /// (wrapped as the host wraps it), the CLI then
     /// resolves the same approved policy at the same digest, and classifies
     /// a PR into the same requirements the gate's core call returns —
     /// here the floor review plus Browser QA for a shared-navigation change.
@@ -3218,7 +3219,8 @@ mod tests {
             format!("\u{feff}# note\n{}", value.replace('\n', "\r\n")),
         ] {
             let request = json!({"v": 1, "op": "delivery.requirements.evaluate", "input": {
-                "policy_section": stored, "policy_owner_approved": true,
+                "policy": delivery_policy::section_front(&stored),
+                "policy_owner_approved": true,
                 "changes": changes, "lines": 12,
                 "risk_paths": RISK, "one_review_paths": ONE}});
             let gate: Value = serde_json::from_slice(&cadence_core::evaluate(

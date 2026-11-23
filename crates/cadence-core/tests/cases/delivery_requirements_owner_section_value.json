@@ -3,7 +3,7 @@
     "v": 1,
     "op": "delivery.requirements.evaluate",
     "input": {
-      "policy_section": "reviews:\n  review: {kind: agent, focus: general}\n  qa: {kind: agent, focus: browser-qa}\nrisk:\n  - require: [review]\n  - when: {paths: [\"src/components/nav/**\"]}\n    require: [review, qa]\n",
+      "policy": "---\ndelivery:\n  reviews:\n    review: {kind: agent, focus: general}\n    qa: {kind: agent, focus: browser-qa}\n  risk:\n    - require: [review]\n    - when: {paths: [\"src/components/nav/**\"]}\n      require: [review, qa]\n---\n",
       "approval": null,
       "changes": [
         {

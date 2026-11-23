@@ -357,16 +357,9 @@
           ]
         },
         "policy_owner_approved": {
-          "description": "CAD-2417: the host vouches that `policy` (or `policy_section`) is\nowner-approved as sent (on hosted Cadence only a live owner can save a\nproject's delivery policy).\nA policy that parses is then resolved as approved at its own digest,\nexactly as an `approval` of it would be; an absent or malformed text\nchanges nothing. Absent or `false` keeps today's answers; `true` with an\n`approval` refuses as contradictory. Set it only for an owner-written\nhost record, never for text read from a repository or a PR head.",
+          "description": "CAD-2417: the host vouches that `policy` is owner-approved as sent (on\nhosted Cadence only a live owner can save a project's delivery policy).\nA policy that parses is then resolved as approved at its own digest,\nexactly as an `approval` of it would be; an absent or malformed text\nchanges nothing. Absent or `false` keeps today's answers; `true` with an\n`approval` refuses as contradictory. Set it only for an owner-written\nhost record, never for text read from a repository or a PR head.",
           "type": "boolean",
           "default": false
-        },
-        "policy_section": {
-          "description": "CAD-2708: a stored `delivery:` section as a hosted owner saved it —\nits YAML value or the section with its `delivery:` key — which the\ncore wraps with `delivery::section_front`, the wrapper the CLI uses,\nso a host keeps no wrapper of its own. Refused together with `policy`.",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "risk_paths": {
           "description": "The trusted base's `docs/roles/risk-paths.toml` text.",
