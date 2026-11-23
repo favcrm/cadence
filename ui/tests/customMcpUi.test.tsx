@@ -9,14 +9,15 @@
 declare function require(name: string): any;
 import type { act as reactAct } from "react";
 import type { ThreadEntry } from "../src/features/home/thread";
+import { guardedMcpReadRequest } from "./custom-mcp-read-guard.fixture";
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`customMcpUi: ${msg}`);
 }
 
 let act: typeof reactAct;
-// act drains React effects and their promise continuations without timers.
-const drain = () => act(async () => { await Promise.resolve(); });
+// Allow asynchronous Web Crypto and React effects to complete.
+const drain = () => act(async () => { await require("node:timers/promises").setTimeout(0); });
 async function settle(fn: () => void) {
   for (let turn = 0; turn < 40; turn++) {
     await drain();
@@ -63,6 +64,7 @@ async function main() {
     Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
   }
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+  Object.defineProperty(globalThis, "crypto", { value: require("node:crypto").webcrypto, configurable: true });
 
   const loader = require("module");
   const originalRequire = loader.prototype.require;
@@ -111,6 +113,10 @@ async function main() {
   const jsonRes = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   const policyCalls: string[] = [];
   let returnedMcp = sampleMcp;
+  const messageWrites: Array<Record<string, unknown>> = [];
+  let messageMode: "ok" | "uncertain" | "deferred" = "ok";
+  let resolveMessage: ((response: Response) => void) | undefined;
+  let rejectNextGuard = false;
   const toolWrites: unknown[] = [];
   const innerFetch = globalThis.fetch;
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
@@ -118,7 +124,20 @@ async function main() {
     const method = init?.method ?? "GET";
     if (url.endsWith("/api/connections/mcp") && method === "GET") return jsonRes({ connections: [returnedMcp] });
     if (url.endsWith(`/api/connections/mcp/${sampleMcp.id}/tools`) && method === "POST") {
-      toolWrites.push(JSON.parse(String(init?.body)));
+      const body = JSON.parse(String(init?.body));
+      toolWrites.push(body);
+      if (body.read_guard) {
+        const selected = returnedMcp.tools.find((tool) => tool.tool_name === body.tools?.[0]?.tool_name);
+        if (rejectNextGuard || body.tools.length !== 1 || body.tools[0].mode !== "read" ||
+            body.read_guard.snapshot_revision !== returnedMcp.snapshot_revision ||
+            body.read_guard.tool_digest !== selected?.tool_digest ||
+            body.read_guard.tool_updated_at !== selected?.updated_at) {
+          rejectNextGuard = false;
+          return new Response(JSON.stringify({ error: { code: "stale_revision", message: "Snapshot changed" } }), {
+            status: 409, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
       returnedMcp = { ...returnedMcp, tools: returnedMcp.tools.map((tool) =>
         tool.tool_name === "catalog.search" ? { ...tool, mode: "read" } : tool) };
       return jsonRes({ connection: returnedMcp });
@@ -128,6 +147,17 @@ async function main() {
         mode: "oauth_redirect", authorization_url: "https://auth.acme.example/authorize?state=xyz", connection_id: "conn_mcp_new_1",
         discovery: { issuer: "https://auth.acme.example", authorization_host: "auth.acme.example", registration: "dcr", scopes: ["mcp:read"], resource_metadata_url: "https://mcp.acme.example/.well-known/oauth-protected-resource" },
       });
+    }
+    if (url.endsWith("/api/threads/master/messages") && method === "POST") {
+      messageWrites.push(JSON.parse(String(init?.body)));
+      if (messageMode === "uncertain") {
+        messageMode = "ok";
+        throw new Error("Response lost");
+      }
+      if (messageMode === "deferred") {
+        return await new Promise<Response>((resolve) => { resolveMessage = resolve; });
+      }
+      return jsonRes({ ok: true });
     }
     if (url.endsWith("/api/connections")) return jsonRes({ connections: platformRows });
     if (url.endsWith("/api/connection-providers")) return jsonRes({ providers: [] });
@@ -251,6 +281,55 @@ async function main() {
   assert(toolWrites.length === 0, "continue does not change tool permissions");
   assert(win.sessionStorage.getItem(receiptKey) === null, "successful continue clears the old same-tab receipt");
 
+  const attemptReceipt = `${sampleMcp.id}\n${sampleMcp.endpoint_url}\nattempt-one`;
+  win.localStorage.setItem(receiptKey, attemptReceipt);
+  messageWrites.length = 0;
+  messageMode = "uncertain";
+  await openSetup("uncertain-response");
+  await settle(() => assert(byText("button", "Continue in chat"), "uncertain send has verified connection"));
+  await act(async () => byText("button", "Continue in chat")!.click());
+  await settle(() => assert(text().includes("Response lost"), "uncertain send remains retryable"));
+  assert(win.localStorage.getItem(receiptKey) === attemptReceipt, "uncertain send retains its receipt");
+  await openSetup("uncertain-other-tab");
+  await settle(() => assert(byText("button", "Continue in chat"), "another tab recovers the same attempt"));
+  await act(async () => byText("button", "Continue in chat")!.click());
+  await settle(() => assert(text().includes("Reply resumed"), "same attempt can retry"));
+  assert(messageWrites.length === 2 && JSON.stringify(messageWrites[0]) === JSON.stringify(messageWrites[1]),
+    "uncertain retry sends exactly the same envelope");
+  assert(typeof messageWrites[0].message === "string" && /^mcp-setup-[0-9a-f]{64}$/.test(messageWrites[0].message as string) &&
+    messageWrites[0].conversation === "thread-20", "retry uses one bounded stable message ID in the original conversation");
+
+  win.localStorage.setItem(receiptKey, attemptReceipt);
+  messageWrites.length = 0;
+  messageMode = "deferred";
+  await openSetup("delayed-response");
+  await settle(() => assert(byText("button", "Continue in chat"), "delayed send has verified connection"));
+  await act(async () => byText("button", "Continue in chat")!.click());
+  await settle(() => assert(resolveMessage && messageWrites.length === 1, "send is in flight"));
+  const newerReceipt = `${sampleMcp.id}\n${sampleMcp.endpoint_url}\nattempt-two`;
+  win.localStorage.setItem(receiptKey, newerReceipt);
+  win.history.replaceState({}, "", "/home?mcp_setup=21&aos_connect=connected&toolkit=custom_mcp&connection_id=another#new");
+  await act(async () => { resolveMessage!(jsonRes({ ok: true })); });
+  assert(win.localStorage.getItem(receiptKey) === newerReceipt, "late completion does not consume the newer attempt");
+  assert(win.location.search.includes("mcp_setup=21") && win.location.hash === "#new", "late completion does not navigate over a newer return");
+  messageMode = "ok";
+  resolveMessage = undefined;
+
+  win.localStorage.setItem(receiptKey, attemptReceipt);
+  messageWrites.length = 0;
+  messageMode = "deferred";
+  await openSetup("navigated-response");
+  await settle(() => assert(byText("button", "Continue in chat"), "navigated send has verified connection"));
+  await act(async () => byText("button", "Continue in chat")!.click());
+  await settle(() => assert(resolveMessage && messageWrites.length === 1, "navigated send is in flight"));
+  win.history.replaceState({}, "", "/settings/connections?mcp_focus=other#new");
+  await act(async () => { resolveMessage!(jsonRes({ ok: true })); });
+  assert(win.location.pathname === "/settings/connections" && win.location.search === "?mcp_focus=other" &&
+    win.location.hash === "#new", "late completion preserves navigation even without a newer receipt");
+  assert(win.localStorage.getItem(receiptKey) === null, "known success consumes the matching attempt");
+  messageMode = "ok";
+  resolveMessage = undefined;
+
   win.localStorage.setItem(receiptKey, `${sampleMcp.id}\n${sampleMcp.endpoint_url}`);
   await openSetup("different-thread", "connected", "another-thread");
   assert(!byText("button", "Continue in chat"), "return cannot resume another conversation");
@@ -267,8 +346,17 @@ async function main() {
   }
 
   const brokerAnnotations = { readOnlyHint: true, destructiveHint: true };
-  returnedMcp = { ...sampleMcp, tools: [
-    { ...sampleMcp.tools[0], tool_name: "catalog.search", description: "Search the catalog.", annotations: { readOnlyHint: true } },
+  const readGuard = guardedMcpReadRequest.read_guard;
+  const reviewedTool = {
+    ...sampleMcp.tools[0],
+    tool_name: guardedMcpReadRequest.tools[0].tool_name,
+    description: "Search the catalog.",
+    annotations: { readOnlyHint: true },
+    tool_digest: readGuard.tool_digest,
+    updated_at: readGuard.tool_updated_at,
+  };
+  returnedMcp = { ...sampleMcp, snapshot_revision: readGuard.snapshot_revision, tools: [
+    reviewedTool,
     { ...sampleMcp.tools[0], tool_name: "execute_tool", description: "Broker", annotations: brokerAnnotations },
   ] };
   await openSetup("recovered-tab");
@@ -277,8 +365,18 @@ async function main() {
   await act(async () => byText("summary", "Review tool access")!.click());
   await act(async () => (document.querySelector('[aria-label="Enable read access: catalog.search"]') as HTMLButtonElement).click());
   await settle(() => assert(!text().includes("No tools can run automatically"), "enable updates the verified tool status"));
-  assert(JSON.stringify(toolWrites) === JSON.stringify([{ tools: [{ tool_name: "catalog.search", mode: "read" }] }]),
-    "explicit enable changes only the selected tool");
+  assert(JSON.stringify(toolWrites) === JSON.stringify([guardedMcpReadRequest]),
+    "explicit enable matches the shared wire fixture for the reviewed pin");
+
+  returnedMcp = { ...returnedMcp, tools: [reviewedTool] };
+  rejectNextGuard = true;
+  await openSetup("stale-guard");
+  await settle(() => assert(byText("button", "Continue in chat"), "stale case shows reviewed tool"));
+  await act(async () => byText("summary", "Review tool access")!.click());
+  await act(async () => (document.querySelector('[aria-label="Enable read access: catalog.search"]') as HTMLButtonElement).click());
+  await settle(() => assert(text().includes("Refresh and review again"), "stale guard requires review and reload"));
+  assert(toolWrites.at(1) && !toolWrites.at(2) && JSON.stringify(toolWrites[0]) === JSON.stringify(toolWrites[1]),
+    "stale response does not trigger an unguarded update");
 
   await openSetup("cancelled", "cancelled");
   assert(text().includes("was cancelled") && !byText("button", "Continue in chat"), "cancel is recoverable without claiming success");

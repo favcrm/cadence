@@ -1531,6 +1531,15 @@ export const api = {
       `/api/connections/mcp/${encodeURIComponent(id)}/tools`,
       { tools },
     ),
+  customMcpEnableReviewedRead: (
+    id: string,
+    toolName: string,
+    readGuard: { snapshot_revision: number; tool_digest: string; tool_updated_at: number },
+  ) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/tools`,
+      { tools: [{ tool_name: toolName, mode: "read" }], read_guard: readGuard },
+    ),
   customMcpAcceptDrift: (
     id: string,
     tools?: Array<{ tool_name: string; mode: CustomMcpToolMode }>,

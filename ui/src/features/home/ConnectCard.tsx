@@ -115,6 +115,7 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
     if (continuing || !readyToContinue) return;
     setContinuing(true);
     setError(null);
+    const returnUrl = window.location.href;
     try {
       const connId = mcpReturned?.connectionId;
       const note = connId
@@ -126,13 +127,13 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
         setError(sent.error);
         return;
       }
-      if (typeof window !== "undefined") {
+      if (typeof window !== "undefined" && window.location.href === returnUrl) {
         navigate(
           window.location.pathname + withoutConnectParams(window.location.search) + window.location.hash,
           { replace: true },
         );
+        setResumed(true);
       }
-      setResumed(true);
     } finally {
       setContinuing(false);
     }
@@ -201,16 +202,37 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
 }
 
 // Browser storage only locates the original attempt. It never establishes a grant.
-function readSetupAttempt(key: string, endpoint: string): { id: string; endpoint: string } | null {
+type SetupAttempt = { id: string; endpoint: string; nonce: string };
+
+function parseSetupAttempt(value: string | null, endpoint: string): SetupAttempt | null {
+  try {
+    const [id, savedEndpoint = endpoint, nonce = ""] = (value ?? "").split("\n");
+    return id ? { id, endpoint: new URL(savedEndpoint).href, nonce } : null;
+  } catch {
+    return null;
+  }
+}
+
+function sameSetupAttempt(a: SetupAttempt | null, b: SetupAttempt | null): boolean {
+  return a !== null && b !== null && a.id === b.id && a.endpoint === b.endpoint && a.nonce === b.nonce;
+}
+
+function readSetupAttempt(key: string, endpoint: string): SetupAttempt | null {
   for (const source of ["localStorage", "sessionStorage"] as const) {
     try {
-      const [id, savedEndpoint = endpoint] = (window[source].getItem(key) ?? "").split("\n");
-      if (id) return { id, endpoint: new URL(savedEndpoint).href };
+      const attempt = parseSetupAttempt(window[source].getItem(key), endpoint);
+      if (attempt) return attempt;
     } catch {
       // The other storage type may still be available.
     }
   }
   return null;
+}
+
+async function setupMessageId(conversation: string, seq: number, attempt: SetupAttempt): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify([conversation, seq, attempt.id, attempt.endpoint, attempt.nonce]));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return `mcp-setup-${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function matchesSetupScopes(actual: readonly string[], expected: string | undefined): boolean {
@@ -237,6 +259,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   const [connection, setConnection] = useState<CustomMcpConnectionSummary | null>(null);
   const [recheck, setRecheck] = useState(0);
   const url = new URL(window.location.href);
+  const originalHref = url.href;
   const callback = url.searchParams.get("mcp_setup") === String(entry.seq) ? customMcpReturn(url.search) : null;
   const key = `cadence:mcp-setup:${conversation}:${entry.seq}`;
   const attempt = conversation ? readSetupAttempt(key, setup.endpointUrl) : null;
@@ -274,7 +297,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   }, [connId, endpoint, outcome, requiredScopes, setup.label, resumed, recheck]);
 
   function remember(id: string, endpointUrl: string) {
-    const value = `${id}\n${endpointUrl}`;
+    const value = `${id}\n${new URL(endpointUrl).href}\n${crypto.randomUUID()}`;
     // A same-origin tab can recover an attempt; restricted browsers still support same-tab return.
     try {
       window.localStorage.setItem(key, value);
@@ -283,17 +306,32 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     }
   }
 
-  function forget() {
+  function liveCallback(expected: SetupAttempt): boolean {
+    const live = new URL(window.location.href);
+    const returned = customMcpReturn(live.search);
+    return live.pathname === url.pathname && live.searchParams.get("mcp_setup") === String(entry.seq) &&
+      returned?.connectionId === expected.id && returned.outcome === callback?.outcome &&
+      sameSetupAttempt(readSetupAttempt(key, setup.endpointUrl), expected);
+  }
+
+  function forget(expected: SetupAttempt) {
+    if (!sameSetupAttempt(readSetupAttempt(key, setup.endpointUrl), expected)) return;
+    const cleanRoute = liveCallback(expected);
     for (const source of ["localStorage", "sessionStorage"] as const) {
       try {
-        window[source].removeItem(key);
+        if (sameSetupAttempt(parseSetupAttempt(window[source].getItem(key), setup.endpointUrl), expected)) {
+          window[source].removeItem(key);
+        }
       } catch {
         // An unavailable storage type held no usable receipt.
       }
     }
-    const clean = new URL(returnTo);
-    clean.searchParams.delete("mcp_setup");
-    navigate(`${clean.pathname}${clean.search}${clean.hash}`, { replace: true });
+    if (cleanRoute) {
+      const live = new URL(window.location.href);
+      live.search = withoutConnectParams(live.search);
+      live.searchParams.delete("mcp_setup");
+      navigate(`${live.pathname}${live.search}${live.hash}`, { replace: true });
+    }
   }
 
   async function run(work: () => Promise<void>) {
@@ -310,7 +348,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   }
 
   function retryOAuth() {
-    if (!connId) return;
+    if (!connId || !attempt) return;
     void run(async () => {
       try {
         const started = await api.customMcpOAuthStart(connId, { return_to: returnTo });
@@ -326,49 +364,70 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
             return;
           }
         }
+        if (window.location.href !== originalHref ||
+            !sameSetupAttempt(readSetupAttempt(key, setup.endpointUrl), attempt)) return;
+        remember(connId, endpoint);
         window.location.assign(authUrl);
       } catch (e: unknown) {
-        if (e instanceof ApiError && e.status === 404) forget();
+        if (e instanceof ApiError && e.status === 404) forget(attempt);
         throw e;
       }
     });
   }
 
   function continueReply() {
-    if (!conversation || !connId) return;
+    if (!conversation || !connId || !attempt) return;
     void run(() => usingPrivateOperation(undefined, async (operation) => {
       const { connections } = await api.customMcpList(true, operation);
       const row = connections.find(verified);
-      if (row?.status !== "active" || readSetupAttempt(key, setup.endpointUrl)?.id !== connId) {
+      if (row?.status !== "active" || !liveCallback(attempt)) {
         setConnection(row ?? null);
         setError("Cadence could not verify this Custom MCP connection.");
         return;
       }
+      const message = await setupMessageId(conversation, entry.seq, attempt);
+      if (!liveCallback(attempt)) return;
       const sent = await sendToMaster(
         `Custom MCP connection ${connId} is connected. Continue my original request using only currently permitted tools. If a tool is unavailable, explain what access is needed.`,
-        undefined, undefined, undefined, conversation, operation,
+        message, undefined, undefined, conversation, operation,
       );
       if (!sent.ok) {
         setError(sent.error);
         return;
       }
-      forget();
-      setResumed(true);
+      const current = liveCallback(attempt);
+      forget(attempt);
+      if (current) setResumed(true);
     }));
   }
 
   function enableRead(pin: CustomMcpToolPin) {
-    if (!connId) return;
+    if (!connId || !connection || !attempt) return;
     void run(async () => {
       const { connections } = await api.customMcpList();
       const row = connections.find(verified);
       setConnection(row ?? null);
       const current = row?.tools?.find((tool) => tool.tool_name === pin.tool_name);
-      if (row?.status !== "active" || !current || current.tool_digest !== pin.tool_digest || !reviewableRead(current)) {
+      if (row?.status !== "active" || !liveCallback(attempt) ||
+          row.snapshot_revision !== connection.snapshot_revision ||
+          !Number.isSafeInteger(connection.snapshot_revision) || connection.snapshot_revision <= 0 ||
+          !/^sha256:[0-9a-f]{64}$/.test(pin.tool_digest) ||
+          !Number.isSafeInteger(pin.updated_at) || pin.updated_at < 0 ||
+          !current || current.tool_digest !== pin.tool_digest || current.updated_at !== pin.updated_at || !reviewableRead(current)) {
         setError("Tool access changed. Review the current tool before enabling it.");
         return;
       }
-      const { connection: updated } = await api.customMcpUpdateTools(connId, [{ tool_name: pin.tool_name, mode: "read" }]);
+      let updated: CustomMcpConnectionSummary;
+      try {
+        ({ connection: updated } = await api.customMcpEnableReviewedRead(connId, pin.tool_name, {
+          snapshot_revision: connection.snapshot_revision,
+          tool_digest: pin.tool_digest,
+          tool_updated_at: pin.updated_at,
+        }));
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.code === "stale_revision") setConnection(null);
+        throw e;
+      }
       if (verified(updated)) setConnection(updated);
       else setRecheck((value) => value + 1);
     });
