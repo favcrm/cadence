@@ -198,6 +198,7 @@ function PageBody({
   const files = detail.artifacts.filter((f) => !IMG.test(f.name));
   const [compose, setCompose] = useState<"ask" | "instruct">("ask");
   const [descriptionDraft, setDescriptionDraft] = useState<{ body: string; rev: string } | null>(null);
+  const editingDescription = hosted === true && !readOnly && descriptionDraft !== null;
   const [savingDescription, setSavingDescription] = useState(false);
   const [descriptionConflict, setDescriptionConflict] = useState(false);
   const descriptionStale = descriptionConflict || (descriptionDraft !== null && descriptionDraft.rev !== detail.rev);
@@ -351,6 +352,7 @@ function PageBody({
               lane={lane}
               checksDone={done}
               checksTotal={items.length}
+              checklistVisible={!editingDescription}
               blocked={blocked}
               hosted={hosted === true}
               codeDelivery={codeDelivery}
@@ -359,7 +361,7 @@ function PageBody({
               onCompose={composeWith}
               onOpen={onOpen}
             >
-              {hosted && !readOnly && descriptionDraft ? (
+              {editingDescription ? (
                 <form className="grid gap-2" onSubmit={(event) => {
                   event.preventDefault();
                   void saveDescription();

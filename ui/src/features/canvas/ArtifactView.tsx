@@ -157,6 +157,7 @@ export default function ArtifactView({
   data,
   contentRef,
   htmlView = "rendered",
+  focusablePreview = false,
   aspect,
 }: {
   kind: ArtifactKind;
@@ -164,6 +165,8 @@ export default function ArtifactView({
   data: Loaded;
   contentRef: React.RefObject<HTMLDivElement | null>;
   htmlView?: HtmlView;
+  /** Include the rendered document in an enclosing drawer's explicit tab order. */
+  focusablePreview?: boolean;
   /** A generated image's shape, for its overlay. */
   aspect?: string;
 }) {
@@ -172,7 +175,7 @@ export default function ArtifactView({
     case "md":
       return (
         <div ref={contentRef} className="canvas-doc issue-reader text-secondary text-ink-200 break-words min-w-0" data-artifact-view="md">
-          <Md text={decode(data)} />
+          <Md text={decode(data)} focusableTables={focusablePreview} />
         </div>
       );
     case "csv":
@@ -194,6 +197,7 @@ export default function ArtifactView({
           className="canvas-frame"
           data-artifact-view="html"
           title={title}
+          tabIndex={focusablePreview ? 0 : undefined}
           sandbox=""
           referrerPolicy="no-referrer"
           srcDoc={htmlFrameDocument(decode(data))}

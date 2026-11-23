@@ -128,6 +128,7 @@ export function WorkResult({
   lane,
   checksDone,
   checksTotal,
+  checklistVisible = true,
   blocked,
   hosted = false,
   codeDelivery,
@@ -141,6 +142,7 @@ export function WorkResult({
   lane: LanePayload | null;
   checksDone: number;
   checksTotal: number;
+  checklistVisible?: boolean;
   blocked: string | null;
   hosted?: boolean;
   codeDelivery: boolean;
@@ -191,7 +193,9 @@ export function WorkResult({
       tone: checksTotal === 0 || checksDone < checksTotal ? "wait" : "done",
       detail: progress === null
         ? t("No acceptance checklist on the issue.")
-        : <button type="button" className="lnk" onClick={openChecklist}>{t("Open checklist")}</button>,
+        : checklistVisible
+          ? <button type="button" className="lnk" onClick={openChecklist}>{t("Open checklist")}</button>
+          : progress,
     },
     {
       title: t("Worker report"),
@@ -380,7 +384,7 @@ export function WorkResult({
           })}
         </p>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-label">
-          {progress !== null && (
+          {progress !== null && checklistVisible && (
             <button type="button" className="lnk" aria-label={`${t("Acceptance checks")}: ${progress}`} onClick={openChecklist}>
               {progress}
             </button>

@@ -28,7 +28,7 @@ Issue IDs are case-insensitive: `CAD-123`, `CAD123`, `CAD 123` and `CAD–123` f
 
 Overview shows the recorded next action, the full authored Markdown, then Result and Verification. A linked PR is not evidence of merge; an assignment record is not proof of a live agent. The same layout serves repository and non-code projects, using only the tabs and verification rows that apply. Fields and Links stay in a side rail on desktop and can be reached from the title on narrow screens.
 
-Evidence opens a single reader without leaving the issue. Markdown and CSV can be viewed rendered or as exact UTF-8 source; files in other encodings remain downloadable without conversion. Safe raster images open in the same reader. On narrow screens the reader fills the viewport. Wide Markdown tables scroll within the reader without squeezing columns or widening the issue. Closing the reader returns focus to the file and preserves the list position. Attachment writes remain unavailable in read-only mode.
+Evidence opens a single reader without leaving the issue. Markdown and CSV can be viewed rendered or as exact UTF-8 source; files in other encodings remain downloadable without conversion. Safe raster images open in the same reader. Rendered HTML stays sandboxed and can be reached by keyboard. On narrow screens the reader fills the viewport. Wide Markdown tables scroll within the reader without squeezing columns or widening the issue. Closing the reader returns focus to the file and preserves the list position. Attachment writes remain unavailable in read-only mode.
 
 ## Project Context workspace
 

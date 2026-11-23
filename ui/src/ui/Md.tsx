@@ -386,13 +386,24 @@ function IdCode({ className, children }: { className?: string; children?: ReactN
   );
 }
 
-function MarkdownTable({ children }: { children?: ReactNode }) {
+function FocusableMarkdownTable({ children }: { children?: ReactNode }) {
   const t = useTranslate();
   return (
     <div className="md-table-wrap" role="region" aria-label={t("Markdown table")} tabIndex={0}>
       <table>{children}</table>
     </div>
   );
+}
+
+const focusableTableComponents = new WeakMap<Components, Components>();
+
+function withFocusableTables(components: Components): Components {
+  let focusable = focusableTableComponents.get(components);
+  if (!focusable) {
+    focusable = { ...components, table: FocusableMarkdownTable };
+    focusableTableComponents.set(components, focusable);
+  }
+  return focusable;
 }
 
 function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids = false, knownIssue?: (id: string) => boolean): Components {
@@ -404,7 +415,7 @@ function buildComponents(onOpen?: (id: string) => void, wikiPage?: string, ids =
           code: ({ className, children }) => <IdCode className={className}>{children}</IdCode>,
         }
       : {}),
-    table: MarkdownTable,
+    table: ({ children }) => <div className="md-table-wrap"><table>{children}</table></div>,
     blockquote: (props) => (
       <CalloutBlockquote callout={(props as { "data-callout"?: string })["data-callout"]}>
         {props.children}
@@ -506,6 +517,7 @@ export default function Md({
   wikiPage,
   idTokens = false,
   knownIssue,
+  focusableTables = false,
 }: {
   text: string;
   onOpen?: (id: string) => void;
@@ -515,6 +527,8 @@ export default function Md({
   wikiPage?: string;
   /** CAD-2363: an assistant answer shows long hex identifiers as short copyable tokens. */
   idTokens?: boolean;
+  /** Modal Markdown previews need explicit keyboard targets for horizontal scrolling. */
+  focusableTables?: boolean;
 }) {
   const components =
     knownIssue && onOpen && wikiPage === undefined
@@ -528,7 +542,7 @@ export default function Md({
       // `issue:` ids and pinned wiki revisions are ours; everything else
       // takes react-markdown's safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") || url.startsWith("wiki-rev:") ? url : defaultUrlTransform(url))}
-      components={components}
+      components={focusableTables ? withFocusableTables(components) : components}
     >
       {text}
     </Markdown>

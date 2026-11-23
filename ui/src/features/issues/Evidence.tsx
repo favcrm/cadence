@@ -243,11 +243,12 @@ function useLoadedArtifact(id: string, name: string, image: boolean) {
   };
 }
 
-function EvidenceDrawer({ filename, subtitle, previewKind, children, onClose }: {
+function EvidenceDrawer({ filename, subtitle, previewKind, children, footerAction, onClose }: {
   filename: string;
   subtitle: string;
   previewKind?: DeliverablePreviewKind;
   children: ReactNode;
+  footerAction?: ReactNode;
   onClose: () => void;
 }) {
   const t = useTranslate();
@@ -284,6 +285,7 @@ function EvidenceDrawer({ filename, subtitle, previewKind, children, onClose }: 
     <DrawerShell kind="issue-evidence" label={`${t("Preview")} ${filename}`} title={filename}
       subtitle={subtitle} scrim="board" size="lg" modal trapFocus
       className="issue-evidence-drawer" scrimClassName="issue-evidence-scrim"
+      secondary={footerAction}
       closeLabel={t("Close")} onClose={() => { restoreBoard(); onClose(); }}
       dataAttributes={previewKind ? { "data-deliverable-preview": previewKind } : undefined}>
       {children}
@@ -383,6 +385,13 @@ function FileArtifactRow({ id, name, size, open, onOpen, onClose }: {
   }, [open, ready, previewKind]);
 
   const showPreview = Boolean(open && ready && !failed && previewKind);
+  // For HTML, this action follows the sandboxed frame in the native tab order.
+  const download = showPreview && previewBytes && previewKind ? (
+    <button type="button" className="lnk text-micro"
+      onClick={() => saveBytes(previewBytes, PREVIEW_MIME[previewKind], displayName)}>
+      {t("Download")}
+    </button>
+  ) : null;
 
   return (
     <li className="issue-evidence-row min-w-0">
@@ -442,7 +451,7 @@ function FileArtifactRow({ id, name, size, open, onOpen, onClose }: {
       </div>
       {showPreview && previewKind && (
         <EvidenceDrawer filename={displayName} subtitle={`${previewKind.toUpperCase()} · ${fmtBytes(size)}`}
-          previewKind={previewKind} onClose={onClose}>
+          previewKind={previewKind} onClose={onClose} footerAction={previewKind === "html" ? download : null}>
           <div className="issue-evidence-actions">
               {(previewKind === "html" || previewKind === "md" || previewKind === "csv") && (
                 <div className="vers cv-view" role="group" aria-label={t("Document view")}>
@@ -467,27 +476,13 @@ function FileArtifactRow({ id, name, size, open, onOpen, onClose }: {
                   {t("Open in new tab")}
                 </button>
               )}
-              {previewBytes && (
-                <button
-                  type="button"
-                  className="lnk text-micro"
-                  onClick={() =>
-                    saveBytes(
-                      previewBytes,
-                      PREVIEW_MIME[previewKind],
-                      displayName,
-                    )
-                  }
-                >
-                  {t("Download")}
-                </button>
-              )}
+              {previewKind !== "html" && download}
           </div>
           <div className="issue-evidence-content">
             {previewBytes && !textSource && (
               <ArtifactView kind={previewKind} title={displayName}
                 data={{ bytes: previewBytes, mime: PREVIEW_MIME[previewKind] }}
-                contentRef={contentRef} htmlView={htmlView} />
+                contentRef={contentRef} htmlView={htmlView} focusablePreview />
             )}
             {previewBytes && textSource && (sourceText === null ? (
               <p className="text-secondary" role="status">
