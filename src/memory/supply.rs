@@ -34,7 +34,7 @@ pub const SUPPLY_EVENT: &str = "lessons_supplied";
 pub const AXIS_MAX: usize = 16;
 /// Longest extra component or tag.
 pub const AXIS_VALUE_MAX: usize = 128;
-/// Withheld and load-error rows shown per lookup; the counts stay whole.
+/// Load-error rows shown per lookup; the count stays whole.
 const LIST_MAX: usize = 32;
 
 /// Extra match axes for one lookup, already validated.
@@ -144,12 +144,17 @@ pub(super) fn supply_view(
         .filter_map(|slug| matched.lessons.iter().find(|m| &m.front.id == slug))
         .map(|m| json!({"slug": m.front.id, "type": m.front.kind, "digest": semantic_digest(m)}))
         .collect();
-    let withheld: Vec<Value> = matched
-        .withheld
-        .iter()
-        .take(LIST_MAX)
-        .map(|(m, reason)| json!({"slug": m.front.id, "reason": redacted(reason)}))
-        .collect();
+    // Dispatch's own bound for withheld detail: redacted, then clipped, and
+    // capped at its entry limit.
+    let withheld: Vec<Value> = crate::context_pack::lesson_notes(
+        matched
+            .withheld
+            .iter()
+            .map(|(m, reason)| (m.front.id.clone(), reason.clone())),
+    )
+    .into_iter()
+    .map(|note| json!({"slug": note.id, "reason": note.reason}))
+    .collect();
     let errors: Vec<String> = load_errors
         .iter()
         .take(LIST_MAX)

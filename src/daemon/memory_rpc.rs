@@ -4,6 +4,8 @@ use super::*;
 use crate::memory::{self, policy, IdentityProof, NativeIdentity};
 
 #[cfg(all(test, feature = "test-seam"))]
+mod cad2662_refusal_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad2662_tests;
 
 impl Shared {
@@ -132,6 +134,8 @@ impl Shared {
                 "roles",
                 "evidence_refs",
                 "verification_condition",
+                "message",
+                "token",
             ],
         )?;
         let actor = self.memory_actor(peer_pid, true)?;

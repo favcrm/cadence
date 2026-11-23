@@ -142,7 +142,9 @@ fn tools(platform_tools: &[PlatformTool]) -> Value {
              "scope_components":{"type":"array","items":{"type":"string"}},
              "scope_providers":{"type":"array","items":{"type":"string"}},
              "scope_tags":{"type":"array","items":{"type":"string"}},
-             "scope_project":{"type":"boolean","description":"The lesson applies to every task in the project."}},
+             "scope_project":{"type":"boolean","description":"The lesson applies to every task in the project."},
+             "message":{"type":"string","description":"Only when you hold several turns: the id from self."},
+             "token":{"type":"string","description":"Only with message: that turn's turn_id from self."}},
              "required":["kind","text","source"],"additionalProperties":false}},
         {"name":"app_run_artifact","description":"Read one text dependency artifact for your current assigned app turn. Required strings: artifact_id from the kickoff, plus message and token equal to the id and turn_id from self. Alias, provider, path, and command are refused.",
          "inputSchema":{"type":"object","properties":{
@@ -236,8 +238,8 @@ struct PlatformTool {
     connected_read: bool,
 }
 
-/// When to look up lessons — shared by the tool description and the Codex
-/// developer instructions so the two never disagree.
+/// When to look up lessons. The Codex developer instructions
+/// (`adapter::codex`) say the same in their own words.
 const MEMORY_MATCH_DESCRIPTION: &str = "Project lessons that apply to your current task: \
     the same reviewed selection your kickoff was given, recomputed now. Call it at the start \
     of a task, whenever the scope changes (a new path, component or tag), and before you \
@@ -629,6 +631,8 @@ fn memory_propose_params(args: &Value) -> Result<(&'static str, Value)> {
             "scope_providers",
             "scope_tags",
             "scope_project",
+            "message",
+            "token",
         ],
     )?;
     let required = |key: &str| {
@@ -652,7 +656,7 @@ fn memory_propose_params(args: &Value) -> Result<(&'static str, Value)> {
         project: scope_project,
     };
     // The CLI's own defaults for what this tool does not expose.
-    let params = crate::memory::cli::propose_params(&crate::memory::cli::Proposal {
+    let mut params = crate::memory::cli::propose_params(&crate::memory::cli::Proposal {
         project: None,
         kind: required("kind")?,
         scope: &scope,
@@ -667,6 +671,20 @@ fn memory_propose_params(args: &Value) -> Result<(&'static str, Value)> {
         evidence_refs: &[],
         verification_condition: None,
     });
+    // Only to name one turn when the agent holds several; the daemon checks
+    // the pair against its own running turns.
+    match (tool_str(object, "message")?, tool_str(object, "token")?) {
+        (Some(message), Some(token)) => {
+            params["message"] = json!(message);
+            params["token"] = json!(token);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(Error::rejected(
+                "memory_propose takes message and token together, or neither",
+            ))
+        }
+    }
     Ok(("memory_propose", params))
 }
 
