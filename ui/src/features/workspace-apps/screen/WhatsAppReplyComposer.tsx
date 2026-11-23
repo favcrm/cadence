@@ -80,10 +80,8 @@ const EFFECT = /^wae_[0-9a-f]{32}$/;
 const OFFICIAL_EFFECT = /^[A-Za-z0-9_.:-]{1,128}$/;
 const AUTO_POLL_DELAYS_MS = [300, 700, 1_200, 1_600, 2_200] as const;
 const ACCEPTED_POLL_DELAYS_MS = [500, 1_000, 2_000, 3_500] as const;
-const SENT_BANNER_DISMISS_MS = 3_000;
-const ACCEPTED_BANNER_DISMISS_MS = 3_500;
 const VERIFY_HINT_DELAY_MS = 300;
-type StatusTone = "sent" | "accepted" | "uncertain" | "failed";
+type StatusTone = "uncertain" | "failed";
 // Retain only unresolved uncertain sends across navigation so an interrupted
 // confirmation cannot accidentally authorize a duplicate reply.
 const replyRecovery = new Map<string, string>();
@@ -177,7 +175,6 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const mountedRef = useRef(true);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const acceptedPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draftDirtyRef = useRef(false);
   const latestSelection = useRef(selection);
   latestSelection.current = selection;
@@ -187,30 +184,6 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       clearTimeout(ref.current);
       ref.current = null;
     }
-  }
-
-  function scheduleSentDismiss(effectId: string | null) {
-    clearTimer(dismissTimerRef);
-    dismissTimerRef.current = setTimeout(() => {
-      dismissTimerRef.current = null;
-      if (!mountedRef.current || !latestSelection.current.current()) return;
-      setAttempt(curr => (curr?.outcome === "sent" && curr.effectId === effectId ? null : curr));
-    }, SENT_BANNER_DISMISS_MS);
-  }
-
-  function scheduleAcceptedDismiss(effectId: string | null) {
-    clearTimer(dismissTimerRef);
-    dismissTimerRef.current = setTimeout(() => {
-      dismissTimerRef.current = null;
-      if (!mountedRef.current || !latestSelection.current.current()) return;
-      setAttempt(curr => (curr?.outcome === "accepted" && curr.effectId === effectId ? null : curr));
-    }, ACCEPTED_BANNER_DISMISS_MS);
-  }
-
-  function dismissQuietStatus() {
-    clearTimer(dismissTimerRef);
-    clearTimer(acceptedPollTimerRef);
-    setAttempt(null);
   }
   const overlay = selection.announceInset !== undefined;
   const hidden = bounds === null || (overlay && bounds === undefined);
@@ -281,7 +254,6 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       mountedRef.current = false;
       clearTimer(pollTimerRef);
       clearTimer(acceptedPollTimerRef);
-      clearTimer(dismissTimerRef);
       if (previewUrlRef.current && typeof URL.revokeObjectURL === "function") {
         URL.revokeObjectURL(previewUrlRef.current);
       }
@@ -298,7 +270,6 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     if (!bound) {
       clearTimer(pollTimerRef);
       clearTimer(acceptedPollTimerRef);
-      clearTimer(dismissTimerRef);
       setConfirming(false);
       setAttempt(null);
     }
@@ -412,17 +383,14 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           if (!mountedRef.current || !latestSelection.current.current()) return;
           const recorded = recordedState(res.ok && object(res.data) ? (res.data.state ?? res.data.status) : null);
           if (recorded === "sent") {
-            clearTimer(dismissTimerRef);
             latestSelection.current.announce(draftDirtyRef.current, true);
             setAttempt(curr => {
               if (curr?.effectId !== effectId || curr.outcome !== "accepted") return curr;
-              scheduleSentDismiss(effectId);
               return { effectId, outcome: "sent" };
             });
             return;
           }
           if (recorded === "failed") {
-            clearTimer(dismissTimerRef);
             setAttempt({ effectId, outcome: "failed" });
             return;
           }
@@ -460,11 +428,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
             setConfirming(false);
             setAttempt({ effectId, outcome: recorded });
             latestSelection.current.announce(draftDirtyRef.current, true);
-            if (recorded === "sent") scheduleSentDismiss(effectId);
-            else if (recorded === "accepted") {
-              scheduleAcceptedDismiss(effectId);
-              if (!group) scheduleAcceptedUpgradePoll(effectId, 0);
-            }
+            if (recorded === "accepted" && !group) scheduleAcceptedUpgradePoll(effectId, 0);
             return;
           }
         } catch {
@@ -487,7 +451,6 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     if (pending) { setAttempt({ effectId: pending, outcome: "uncertain" }); return; }
     clearTimer(pollTimerRef);
     clearTimer(acceptedPollTimerRef);
-    clearTimer(dismissTimerRef);
     setConfirming(false);
     running.current = true;
     setPendingOp("send");
@@ -604,11 +567,8 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         if (submitted && effectId && outcome === "uncertain") {
           setConfirming(true);
           scheduleAutoStatusCheck(key, effectId, 0);
-        } else if (outcome === "sent") {
-          scheduleSentDismiss(effectId);
-        } else if (outcome === "accepted") {
-          scheduleAcceptedDismiss(effectId);
-          if (!group && effectId) scheduleAcceptedUpgradePoll(effectId, 0);
+        } else if (outcome === "accepted" && !group && effectId) {
+          scheduleAcceptedUpgradePoll(effectId, 0);
         }
         setPendingOp(null);
         selection.announce(!mayHaveSent && (!!text || (!!attachment && !staleAttachmentHandled)), submitted);
@@ -620,7 +580,6 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     if (!attempt?.effectId || !recipient || running.current || !selection.current()) return;
     clearTimer(pollTimerRef);
     clearTimer(acceptedPollTimerRef);
-    clearTimer(dismissTimerRef);
     setConfirming(false);
     running.current = true;
     setPendingOp("check");
@@ -633,11 +592,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       const outcome = recorded === "uncertain" && attempt.outcome === "accepted" ? "accepted" : recorded;
       settleReceipt(receiptKey(selection, recipient), effectId, outcome);
       setAttempt({ effectId, outcome });
-      if (outcome === "sent") scheduleSentDismiss(effectId);
-      else if (outcome === "accepted") {
-        scheduleAcceptedDismiss(effectId);
-        if (!group) scheduleAcceptedUpgradePoll(effectId, 0);
-      }
+      if (outcome === "accepted" && !group) scheduleAcceptedUpgradePoll(effectId, 0);
       selection.announce(!!text || !!attachment, true);
     } finally {
       running.current = false;
@@ -654,34 +609,28 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const settledAttempt = sending || resolvingConfirm ? null : attempt;
   const note = staleRecipient ? (zh ? "未有傳送。請清除草稿並重新開啟對話，以再次核對收件人。" : "Nothing sent. Clear the draft and reopen the conversation to verify the recipient again.")
     : windowClosedNote ?? attachError ?? audioNote
-    ?? (settledAttempt?.outcome === "sent" ? (group ? (zh ? "已傳送至群組" : "Sent to group") : (zh ? "已送達" : "Delivered"))
-    : settledAttempt?.outcome === "accepted" ? (group ? (zh ? "已傳送至群組" : "Sent to group") : (zh ? "已傳送" : "Sent"))
+    ?? (settledAttempt?.outcome === "sent" || settledAttempt?.outcome === "accepted" ? null
     : settledAttempt?.outcome === "uncertain" ? (zh ? "未能確認是否已傳送。請檢查狀態，不要重新傳送。" : "Send not confirmed. Check the status; don’t resend this reply.")
     : settledAttempt ? (zh ? "未傳送。請檢查對話及連線後再試。" : "Not sent. Check the conversation and connection before trying again.") : null);
   const statusTone: StatusTone | undefined = staleRecipient || windowClosed || !!attachError || audioHasCaption
     ? "failed"
-    : settledAttempt?.outcome === "sent" ? "sent"
-    : settledAttempt?.outcome === "accepted" ? "accepted"
     : settledAttempt?.outcome === "uncertain" ? "uncertain"
-    : settledAttempt ? "failed" : undefined;
+    : settledAttempt?.outcome === "failed" ? "failed" : undefined;
   const statusAlert = staleRecipient || windowClosed || !!attachError || audioHasCaption || settledAttempt?.outcome === "uncertain" || settledAttempt?.outcome === "failed";
   const canCheckAction = !windowClosed && !attachError && !audioHasCaption && !sending && !resolvingConfirm && locked;
-  const isQuietStatus = !staleRecipient && !windowClosed && !attachError && !audioHasCaption && (settledAttempt?.outcome === "accepted" || settledAttempt?.outcome === "sent");
   const sendSpinning = sending || resolvingConfirm;
   const sendLabel = sending
     ? (zh ? "正在傳送" : "Sending")
     : resolvingConfirm
       ? (zh ? "正在確認傳送狀態" : "Confirming send")
       : (zh ? "傳送" : "Send");
-  const status = note && <div className="wa-reply-status" data-tone={statusTone} data-quiet={isQuietStatus ? "true" : undefined}>
+  const status = note && <div className="wa-reply-status" data-tone={statusTone}>
     <p role={statusAlert ? "alert" : "status"}>
-      {isQuietStatus && <span className="wa-reply-status-dot" aria-hidden="true" />}
       <span>{note}</span>
     </p>
     {canCheckAction && <Button size="sm" loading={checking} disabled={busy} onClick={() => { void check(); }}>
       {zh ? "檢查狀態" : "Check status"}
     </Button>}
-    {isQuietStatus && <button type="button" className="wa-reply-status-close" aria-label={zh ? "關閉" : "Dismiss"} onClick={dismissQuietStatus}>×</button>}
   </div>;
 
   const attBadge = attachment
@@ -729,11 +678,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           : (zh ? "輸入回覆…" : "Write a reply…")}
         value={text} rows={1} maxLength={4096} readOnly={textareaReadOnly}
         onChange={e => {
-          const next = e.target.value;
-          setText(next);
-          if (next !== "" && (attempt?.outcome === "accepted" || attempt?.outcome === "sent")) {
-            dismissQuietStatus();
-          }
+          setText(e.target.value);
         }} onKeyDown={e => {
           if (e.key !== "Enter" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing || e.keyCode === 229) return;
           e.preventDefault();
