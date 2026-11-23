@@ -277,6 +277,46 @@ fn read_job_spec(
     Ok((text, file, label))
 }
 
+/// Capture a repo-relative default job spec for an intake cloud kickoff
+/// without granting the locator authority to read outside the approved scope.
+/// Canonical issue specs use the approved issue snapshot, not their old raw
+/// digest; independent specs must still match the job's immutable byte pin.
+pub(crate) fn capture_intake_cloud_spec(
+    gated: &GatedIssue,
+    task: &store::Task,
+    job: &store::Job,
+    bound_spec: Option<&Path>,
+) -> Result<String> {
+    let (text, file, _) = read_job_spec(&gated.project, &gated.dir, task, job, &job.spec_path)?;
+    if bound_spec.is_some_and(|expected| expected != file.as_path()) {
+        return Err(Error::rejected(
+            "task dispatch refused: independent spec changed while preparing the kickoff",
+        ));
+    }
+    let canonical_issue = gated
+        .dir
+        .join("issue.md")
+        .canonicalize()
+        .ok()
+        .is_some_and(|issue| issue == file);
+    if canonical_issue {
+        return Ok(gated.source.clone());
+    }
+    let expected = job.spec_sha256.as_deref().ok_or_else(|| {
+        Error::rejected(
+            "task dispatch refused: a relative independent intake cloud spec has no immutable digest",
+        )
+    })?;
+    if content_digest(text.as_bytes()) != expected {
+        return Err(Error::rejected(format!(
+            "context refused: spec-changed: the task spec {} no longer matches the revision \
+             the job was opened with — reopen the task or restore the pinned spec; nothing was queued",
+            file.display()
+        )));
+    }
+    Ok(text)
+}
+
 /// Canonical issue specs contain mutable tracker metadata that is not part
 /// of their effective spec. Pin every body byte, including all criteria;
 /// retain the separate raw source digest in the delivery manifest.

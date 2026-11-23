@@ -2552,8 +2552,39 @@ impl Shared {
             } else {
                 &plan.task
             };
-            Ok(store::PreparedJobKickoff {
-                body: store::job_kickoff(
+            let scoped_cloud = issue_snapshot.filter(|snapshot| {
+                snapshot.intake.is_some()
+                    && plan.task.spec_path.is_none()
+                    && !std::path::Path::new(&plan.job.spec_path).is_absolute()
+                    && matches!(
+                        (
+                            plan.worker.provider.as_str(),
+                            plan.worker.endpoint_kind.as_str()
+                        ),
+                        ("devin", "cloud") | ("sandbox", "sandbox")
+                    )
+            });
+            let body = if let Some(snapshot) = scoped_cloud {
+                let gated = snapshot
+                    .gated
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+                let spec = crate::issue::dispatch::capture_intake_cloud_spec(
+                    gated,
+                    &plan.task,
+                    &plan.job,
+                    snapshot.relative_spec_file.as_deref(),
+                )?;
+                store::captured_cloud_kickoff(
+                    &plan.job,
+                    task,
+                    plan.revision,
+                    &plan.worker.provider,
+                    &plan.worker.endpoint_kind,
+                    &spec,
+                )?
+            } else {
+                store::job_kickoff(
                     &plan.job,
                     task,
                     plan.revision,
@@ -2561,7 +2592,10 @@ impl Shared {
                     &plan.worker.provider,
                     &plan.worker.endpoint_kind,
                     false,
-                )?,
+                )?
+            };
+            Ok(store::PreparedJobKickoff {
+                body,
                 selection: store::IssueSelection::Disabled {
                     task: plan.task.id.clone(),
                     reason,
