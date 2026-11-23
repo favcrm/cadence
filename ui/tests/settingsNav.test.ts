@@ -34,10 +34,11 @@ equal(
   "a hosted board that lists templates shows the sidebar entry",
 );
 equal(
-  flat({ ...OWNER, platform_account_configured: true }).includes("Account"),
+  flat({ ...OWNER, platform_account_configured: true }).includes("Billing"),
   true,
-  "Account keeps its own flag",
+  "Billing keeps its own flag",
 );
+equal(settingsLabel("account"), "Billing", "the crumb names Billing");
 equal(settingsRedirect("models", OWNER), "members", "bare /settings opens on a working page");
 equal(settingsRedirect("permissions", OWNER), "members", "a direct link to a hidden section moves");
 equal(settingsRedirect("connections", OWNER), null, "a served section stays");

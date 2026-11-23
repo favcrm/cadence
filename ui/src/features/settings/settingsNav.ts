@@ -20,7 +20,7 @@ const ENTRIES = {
   memory: { section: "memory", label: "Memory", icon: "memory" },
   permissions: { section: "permissions", label: "Master permissions", icon: "permissions" },
   custody: { section: "custody", label: "Advanced custody", icon: "custody" },
-  account: { section: "account", label: "Account", icon: "account" },
+  account: { section: "account", label: "Billing", icon: "account" },
   /** CAD-2115: hosted only — a native board has no tenant member list, so this
    *  entry is offered only by a board that names `members` in its sections. */
   members: { section: "members", label: "Members", icon: "members" },
