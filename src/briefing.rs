@@ -419,6 +419,35 @@ mod cad1373_briefing_pointer_tests {
     }
 }
 
+/// CAD-2662: every harness's briefing says how and when to look up and
+/// propose lessons — the MCP tools for Codex, whose sandbox cannot reach the
+/// daemon socket, and the CLI for every shell harness.
+#[cfg(test)]
+mod cad2662_lesson_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn briefing_names_the_lesson_lookup_for_each_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = |provider: &str| {
+            let agent = json!({"alias": "worker", "provider": provider,
+                               "endpoint_kind": "managed", "params": {}, "cwd": dir.path()});
+            briefing_body(dir.path(), &agent, "worker", None)
+        };
+        for provider in ["claude", "pi", "omp"] {
+            let text = body(provider);
+            assert!(text.contains("`cadence memory match --turn`"), "{provider}");
+            assert!(text.contains("whenever the scope changes"), "{provider}");
+            assert!(text.contains("before you repeat an approach"), "{provider}");
+            assert!(!text.contains("`memory_match` tool"), "{provider}");
+        }
+        let codex = body("codex");
+        assert!(codex.contains("`memory_match` tool"));
+        assert!(codex.contains("whenever the scope changes"));
+        assert!(!codex.contains("cadence memory match --turn"));
+    }
+}
+
 #[cfg(test)]
 mod project_memory_section_tests {
     use super::project_memory_section;

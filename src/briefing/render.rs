@@ -195,6 +195,23 @@ pub fn briefing_body(
     } else {
         String::new()
     };
+    // CAD-2662: every harness gets the same lesson lookup and proposal.
+    // Codex's command sandbox cannot reach the daemon socket, so it uses
+    // the MCP tools; every other harness uses the CLI from its shell.
+    let lessons = if provider_s == "codex" {
+        "- Project lessons: call the `memory_match` tool at the start of a\n\
+         \x20 task, whenever the scope changes, and before you repeat an\n\
+         \x20 approach that already failed; `memory_propose` files a lesson\n\
+         \x20 you learned for review.\n"
+    } else {
+        "- `cadence memory match --turn` — the project lessons that apply\n\
+         \x20 to your running task (add `--path`, `--component` or `--tag`\n\
+         \x20 for what you now work on). Run it at the start of a task,\n\
+         \x20 whenever the scope changes, and before you repeat an approach\n\
+         \x20 that already failed. `cadence memory propose` without\n\
+         \x20 `--project` files a lesson you learned, for review, into your\n\
+         \x20 task's project.\n"
+    };
     // Accepted project-wide memory rules for the project the agent's
     // cwd belongs to — PM-curated facts every worker should carry.
     // Absent pm dir / unresolvable project / no rules → no section.
@@ -235,6 +252,7 @@ pub fn briefing_body(
          \x20 `--all` lists everyone. `cadence agent show <alias>` for one.\n\
          - `cadence message send <peer> --ready --text '<note>'` — reach a\n\
          \x20 peer directly (the `--ready` flag is the pty ready claim).\n\
+         {lessons}\
          - Company questions (policy, memos, procedures, notes): read the\n\
          \x20 \"Business knowledge\" section of\n\
          \x20 $HOME/.agents/skills/cadence/SKILL.md (`cadence skill status`\n\

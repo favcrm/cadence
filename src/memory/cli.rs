@@ -57,6 +57,16 @@ pub fn propose_params(proposal: &Proposal<'_>) -> serde_json::Value {
     params
 }
 
+/// The `memory_match` RPC params for a turn lookup — one shape for the CLI's
+/// `memory match --turn` and the agent MCP tool (CAD-2662).
+pub fn turn_match_params(
+    components: &[String],
+    paths: &[String],
+    tags: &[String],
+) -> serde_json::Value {
+    json!({"components": components, "paths": paths, "tags": tags})
+}
+
 /// `cadence memory …` — returns the process exit code.
 pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
     match action {
@@ -114,7 +124,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 state_dir,
                 "memory_propose",
                 propose_params(&Proposal {
-                    project: Some(project),
+                    project: project.as_deref(),
                     kind,
                     scope: &scope,
                     source: source.as_deref(),
@@ -277,9 +287,32 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
+        MemoryAction::Match {
+            turn: true,
+            component,
+            path,
+            tag,
+            json: as_json,
+            ..
+        } => {
+            let out = client::rpc(
+                state_dir,
+                "memory_match",
+                turn_match_params(component, path, tag),
+            )?;
+            if *as_json {
+                crate::issue::cli::print_json(&out);
+            } else {
+                match out["lessons"].as_str().filter(|text| !text.is_empty()) {
+                    Some(text) => print!("{text}"),
+                    None => println!("No project lessons apply to this task."),
+                }
+            }
+            Ok(0)
+        }
         MemoryAction::Ls { .. }
         | MemoryAction::Show { .. }
-        | MemoryAction::Match { .. }
+        | MemoryAction::Match { turn: false, .. }
         | MemoryAction::Lint { .. } => query::run(action),
     }
 }

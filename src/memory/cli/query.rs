@@ -212,6 +212,7 @@ pub(super) fn run(action: &MemoryAction) -> Result<i32> {
             Ok(0)
         }
         MemoryAction::Match {
+            turn: _,
             issue,
             project,
             provider,

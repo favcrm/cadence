@@ -596,11 +596,11 @@ fn tool_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<Option<&'a 
 
 fn memory_match_params(args: &Value) -> Result<(&'static str, Value)> {
     let object = tool_object(args, &["paths", "components", "tags", "message", "token"])?;
-    let mut params = json!({
-        "paths": tool_strings(object, "paths")?,
-        "components": tool_strings(object, "components")?,
-        "tags": tool_strings(object, "tags")?,
-    });
+    let mut params = crate::memory::cli::turn_match_params(
+        &tool_strings(object, "components")?,
+        &tool_strings(object, "paths")?,
+        &tool_strings(object, "tags")?,
+    );
     match (tool_str(object, "message")?, tool_str(object, "token")?) {
         (Some(message), Some(token)) => {
             params["message"] = json!(message);
