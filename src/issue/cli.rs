@@ -485,6 +485,9 @@ pub enum IssueAction {
         /// Checklist file; every nonblank line must be a checkbox item.
         #[arg(long, value_name = "FILE")]
         from: PathBuf,
+        /// The current issue revision (required for a hosted org).
+        #[arg(long)]
+        if_rev: Option<String>,
     },
     /// Set writable fields: `status priority owner component title
     /// tags type milestone size` (`type`: epic|task|bug|spike; `size`:
@@ -671,6 +674,9 @@ pub enum IssueAction {
         /// Attach a file, as `issue attach`. Repeatable.
         #[arg(long = "attach", value_name = "FILE")]
         attach: Vec<PathBuf>,
+        /// Replace the Markdown description from FILE on a hosted org (`-` = stdin).
+        #[arg(long, value_name = "FILE|-", conflicts_with = "acceptance")]
+        body: Option<PathBuf>,
         /// Replace the Acceptance checklist from FILE (`-` = stdin).
         #[arg(long, value_name = "FILE|-")]
         acceptance: Option<PathBuf>,
@@ -683,6 +689,9 @@ pub enum IssueAction {
         /// Override the `status=done` evidence gate, as `issue set --force`.
         #[arg(long, value_name = "REASON")]
         force: Option<String>,
+        /// The current issue revision (required for a hosted org).
+        #[arg(long)]
+        if_rev: Option<String>,
     },
     /// Check the whole PM dir: schema, id/folder mismatch, dangling and
     /// cyclic links, depth > 2, oversize artifacts, unknown status/kind.

@@ -396,7 +396,10 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
             }
             Ok(0)
         }
-        IssueAction::Acceptance { id, from } => {
+        IssueAction::Acceptance { id, from, if_rev } => {
+            if if_rev.is_some() {
+                return Err(Error::usage("issue acceptance --if-rev is hosted-only"));
+            }
             let pm = open_pm()?;
             print_json(&write::set_acceptance(&pm, id, from, "")?);
             Ok(0)
