@@ -1289,15 +1289,14 @@ fn cad224_fresh_sandbox_start_reuses_terminal_jobs_branch() {
     // job as if the first job had reached a terminal state.
     let second =
         crate::issue::start::run(&fx.pm, issue, &args, "acceptance", fx._dir.path()).unwrap();
-    let mut stop = UnixStream::connect(&socket).unwrap();
-    writeln!(stop, "{}", json!({"method": "stop"})).unwrap();
-    daemon.join().unwrap();
     let branch = first["branch"].as_str().unwrap();
     assert_eq!(second["branch"], branch);
-    let jobs = jobs.lock().unwrap();
-    assert_eq!(jobs.len(), 2);
-    assert_eq!(jobs[0]["task_branch"], branch);
-    assert_eq!(jobs[1]["task_branch"], branch);
+    {
+        let jobs = jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["task_branch"], branch);
+        assert_eq!(jobs[1]["task_branch"], branch);
+    }
     let front = board::find_issue(&fx.pm.dir, issue).unwrap().front;
     let branches: Vec<_> = front
         .refs
@@ -1316,4 +1315,65 @@ fn cad224_fresh_sandbox_start_reuses_terminal_jobs_branch() {
             .count(),
         1
     );
+    let (_, issue_dir) = write::issue_dir(&fx.pm, issue).unwrap();
+    let (mut host_front, body) = write::load_front(&issue_dir).unwrap();
+    let host_branch = host_front
+        .refs
+        .iter_mut()
+        .find(|r| r.kind == "branch" && r.closed != Some(true))
+        .unwrap();
+    host_branch.label = Some("host development lane".into());
+    write::save_front(&issue_dir, &host_front, &body).unwrap();
+    fx.pm
+        .commit(&[issue_dir.join("issue.md")], "Record host branch label")
+        .unwrap();
+    let before_host = fx.snapshot(issue);
+    let refusal =
+        crate::issue::start::run(&fx.pm, issue, &args, "acceptance", fx._dir.path()).unwrap_err();
+    assert!(refusal.to_string().contains("cloud"), "{refusal:?}");
+    assert_eq!(fx.snapshot(issue), before_host);
+    assert_eq!(jobs.lock().unwrap().len(), 2);
+
+    let (mut duplicate_front, body) = write::load_front(&issue_dir).unwrap();
+    let existing = duplicate_front
+        .refs
+        .iter_mut()
+        .find(|r| r.kind == "branch" && r.closed != Some(true))
+        .unwrap();
+    existing.label = Some("cloud sandbox lane".into());
+    let duplicate = existing.clone();
+    duplicate_front.refs.push(duplicate);
+    write::save_front(&issue_dir, &duplicate_front, &body).unwrap();
+    fx.pm
+        .commit(
+            &[issue_dir.join("issue.md")],
+            "Record legacy duplicate cloud branch",
+        )
+        .unwrap();
+    let third =
+        crate::issue::start::run(&fx.pm, issue, &args, "acceptance", fx._dir.path()).unwrap();
+    assert_eq!(third["branch"], branch);
+    {
+        let jobs = jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[2]["task_branch"], branch);
+    }
+    let after = board::find_issue(&fx.pm.dir, issue).unwrap().front;
+    let branches: Vec<_> = after
+        .refs
+        .iter()
+        .filter(|r| r.kind == "branch" && r.closed != Some(true))
+        .collect();
+    assert_eq!(branches.len(), 2);
+    assert!(branches
+        .iter()
+        .all(|r| r.path.as_deref() == Some(branch)
+            && r.label.as_deref() == Some("cloud sandbox lane")));
+    assert!(!after
+        .refs
+        .iter()
+        .any(|r| r.kind == "worktree" && r.closed != Some(true)));
+    let mut stop = UnixStream::connect(&socket).unwrap();
+    writeln!(stop, "{}", json!({"method": "stop"})).unwrap();
+    daemon.join().unwrap();
 }
