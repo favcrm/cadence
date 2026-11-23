@@ -201,8 +201,10 @@ pub fn briefing_body(
     // shell. Only a native PM or worker holds the issue turn the lookup is
     // bound to, and hosted/cloud harnesses are out of scope, so nobody else
     // is told to call a guard that would refuse them.
+    // An allowlist of the native harnesses, so a provider added later is not
+    // told about a lookup until someone checks it can reach it.
     let lesson_caller = matches!(agent["role"].as_str(), Some("pm" | "worker"))
-        && !matches!(provider_s, "devin" | "cursor" | "agenticos-cloud");
+        && matches!(provider_s, "claude" | "codex" | "pi" | "omp");
     let lessons = if !lesson_caller {
         ""
     } else if provider_s == "codex" {

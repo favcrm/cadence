@@ -447,7 +447,12 @@ mod cad2662_lesson_lookup_tests {
         assert!(!codex.contains("cadence memory match --turn"));
         // A reviewer holds no issue turn, and a cloud harness is out of
         // scope: neither is told to call a lookup the guard refuses.
-        for (provider, role) in [("claude", "reviewer"), ("devin", "worker")] {
+        // A provider nobody has checked yet gets nothing either.
+        for (provider, role) in [
+            ("claude", "reviewer"),
+            ("devin", "worker"),
+            ("some-new-host", "worker"),
+        ] {
             let agent = json!({"alias": "r", "provider": provider, "role": role,
                                "endpoint_kind": "managed", "params": {}, "cwd": dir.path()});
             let text = briefing_body(dir.path(), &agent, "r", None);
