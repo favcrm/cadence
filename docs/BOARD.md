@@ -571,6 +571,27 @@ source filtering precede pagination. A proven operator retains numeric thread
 positions. `cadence thread show` requires the corresponding per-response
 acknowledgement and refuses an older or malformed daemon page.
 
+`thread_search` (CAD-2663) lets a native agent (Claude, Codex, Pi or OMP) find
+an exact fact in its own conversation after a compaction. It runs as
+`cadence thread search "<phrase>"` from the agent's shell, and as the
+`thread_search` MCP tool on Codex. The daemon searches only the conversation
+the caller's running turn belongs to, and the request cannot name an agent,
+thread or conversation. A row qualifies only when its message reached the
+agent: delivered, and not the running turn. An issue-bound message is
+included only while the caller's project scope and private-job denials admit
+it. A message with no issue or task is included, as the continuity pack
+carries it.
+
+A query is an exact phrase or up to 6 words. Entries holding the whole phrase
+rank first, then entries ranked by how many of the words they hold, newest
+first. One search reads the newest 4,000 such entries and returns at most 10
+hits and 4 KiB of snippets. Each hit has an opaque handle, bound to the
+caller, thread, turn and read scope. `--around <handle>` reads up to 6 entries
+either side, with each entry clipped to 1.5 KiB and the window capped at
+8 KiB. Text is returned as stored, which is already secret-redacted, and turn
+tokens are redacted on the way out. No global position or payload is
+returned. A continuity pack names the route in one line of its header.
+
 This is not yet a complete private-activity boundary. Relayed member and
 `read_as` thread pages still expose global positions. On an ordinary thread, a
 cloud row whose owner has **no** enrolled credential for the target is

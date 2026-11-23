@@ -1912,10 +1912,60 @@ impl Store {
         })
     }
 
+    /// CAD-2663: this native agent's current owned active turn, with no
+    /// issue or role requirement — the identity half of the fence below, for
+    /// a read of the agent's own thread. Refusals start with `purpose`.
+    pub(crate) fn owned_turn(
+        &self,
+        expected: &Agent,
+        id: &str,
+        token: &str,
+        purpose: &str,
+    ) -> Result<(Agent, Message)> {
+        let conn = self.conn();
+        self.owned_turn_in(&conn, expected, id, token, purpose)
+    }
+
+    /// Current registration, generation and process, and a running message
+    /// the agent owns with the live turn token.
+    fn owned_turn_in(
+        &self,
+        tx: &impl super::StoreConn,
+        expected: &Agent,
+        id: &str,
+        token: &str,
+        purpose: &str,
+    ) -> Result<(Agent, Message)> {
+        let agent = self.agent_in(tx, &expected.alias)?;
+        let message = self
+            .message_in(tx, id)?
+            .ok_or_else(|| Error::rejected(format!("unknown {purpose} message")))?;
+        if message.alias != expected.alias
+            || message.recipient_uid.as_deref() != Some(agent.uid.as_str())
+            || message.state != "running"
+            || message.turn_id.as_deref() != Some(token)
+            || agent.uid != expected.uid
+            || agent.created.to_bits() != expected.created.to_bits()
+            || agent.generation != expected.generation
+            || agent.pid != expected.pid
+            || agent.pid_start != expected.pid_start
+            || !registry::turn_token_current(
+                &agent.provider,
+                &agent.endpoint_kind,
+                agent.generation.as_deref(),
+                token,
+            )
+        {
+            return Err(Error::rejected(format!(
+                "{purpose} requires this native agent's current owned active turn"
+            )));
+        }
+        Ok((agent, message))
+    }
+
     /// One fence for every caller that acts within its own running turn:
-    /// current registration, generation and process, a running message it
-    /// owns with the live turn token, and the issue that turn is bound to.
-    /// Refusals start with `purpose`.
+    /// [`Self::owned_turn_in`] for a native PM or worker, and the issue that
+    /// turn is bound to. Refusals start with `purpose`.
     fn with_owned_issue_turn<T: 'static>(
         &self,
         expected: &Agent,
@@ -1925,27 +1975,8 @@ impl Store {
         save: impl FnOnce(Agent, Message, String) -> Result<T>,
     ) -> Result<T> {
         self.write_tx(|tx| {
-            let agent = self.agent_in(tx, &expected.alias)?;
-            let message = self
-                .message_in(tx, id)?
-                .ok_or_else(|| Error::rejected(format!("unknown {purpose} message")))?;
-            if !matches!(agent.role.as_str(), "pm" | "worker")
-                || message.alias != expected.alias
-                || message.recipient_uid.as_deref() != Some(agent.uid.as_str())
-                || message.state != "running"
-                || message.turn_id.as_deref() != Some(token)
-                || agent.uid != expected.uid
-                || agent.created.to_bits() != expected.created.to_bits()
-                || agent.generation != expected.generation
-                || agent.pid != expected.pid
-                || agent.pid_start != expected.pid_start
-                || !registry::turn_token_current(
-                    &agent.provider,
-                    &agent.endpoint_kind,
-                    agent.generation.as_deref(),
-                    token,
-                )
-            {
+            let (agent, message) = self.owned_turn_in(tx, expected, id, token, purpose)?;
+            if !matches!(agent.role.as_str(), "pm" | "worker") {
                 return Err(Error::rejected(format!(
                     "{purpose} requires this native agent's current owned active turn"
                 )));

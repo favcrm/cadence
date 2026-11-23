@@ -22,6 +22,29 @@ pub const CLOUD_SECRET_ENV: &[&str] = &[
     "CADENCE_DEVIN_RECOVER_BUDGET_MS",
 ];
 
+/// How a native harness reaches the daemon's agent lookups — lessons
+/// (CAD-2662) and its own thread (CAD-2663).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentToolRoute {
+    /// The `cadence-agent` MCP tools: Codex, whose command sandbox cannot
+    /// reach the daemon socket.
+    Mcp,
+    /// The `cadence` CLI from the agent's own shell.
+    Cli,
+}
+
+/// The route for `provider`, or `None` for a provider nobody has checked
+/// can reach these lookups (hosted, cloud, Devin, Cursor, or one added
+/// later). An allowlist, so a new provider is never told to call a lookup
+/// its guard refuses.
+pub fn agent_tool_route(provider: &str) -> Option<AgentToolRoute> {
+    match provider {
+        "codex" => Some(AgentToolRoute::Mcp),
+        "claude" | "pi" | "omp" => Some(AgentToolRoute::Cli),
+        _ => None,
+    }
+}
+
 /// `env -u` arguments that drop [`CLOUD_SECRET_ENV`] before a pane command.
 pub fn cloud_secret_env_prefix() -> String {
     CLOUD_SECRET_ENV

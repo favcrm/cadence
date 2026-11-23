@@ -725,7 +725,10 @@ Before dispatch or resuming changed scope:
   `--help` for issue/path/component axes). While you work an assigned task,
   `cadence memory match --turn` (the `memory_match` tool on Codex) returns that
   task's lessons; run it at the start, on a scope change, and before repeating
-  a failed approach. Inspect sources, scope and applicable
+  a failed approach. After a compaction, find an exact fact from earlier in
+  your own conversation with `cadence thread search "<phrase>"` (the
+  `thread_search` tool on Codex) rather than guessing; say so if it is not
+  found. Inspect sources, scope and applicable
   versions before using accepted lessons. Proposed, stale or contradicted
   lessons are hypotheses, not instructions. Record missing or conflicting
   evidence without borrowing another project's memory implicitly.

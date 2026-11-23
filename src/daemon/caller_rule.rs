@@ -202,6 +202,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     ("thread_read", Rule::Read),
+    (
+        "thread_search",
+        Rule::Handler("rpc_thread_search: caller_identity and owned active turn; the turn's own thread under the agent read scope (CAD-2663)"),
+    ),
     // CAD-1374: the owner activity trail. The handler always proves the
     // operator connection; a present public_session must also be a live
     // board-owner session (AND, not OR). Export records its receipt after

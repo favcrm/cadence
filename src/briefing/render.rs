@@ -201,13 +201,15 @@ pub fn briefing_body(
     // shell. Only a native PM or worker holds the issue turn the lookup is
     // bound to, and hosted/cloud harnesses are out of scope, so nobody else
     // is told to call a guard that would refuse them.
-    // An allowlist of the native harnesses, so a provider added later is not
-    // told about a lookup until someone checks it can reach it.
-    let lesson_caller = matches!(agent["role"].as_str(), Some("pm" | "worker"))
-        && matches!(provider_s, "claude" | "codex" | "pi" | "omp");
-    let lessons = if !lesson_caller {
+    // The native-harness allowlist is shared with the thread search line
+    // (CAD-2663), so a provider added later is told about neither until
+    // someone checks it can reach them.
+    use crate::adapter::{agent_tool_route, AgentToolRoute};
+    let route = agent_tool_route(provider_s)
+        .filter(|_| matches!(agent["role"].as_str(), Some("pm" | "worker")));
+    let lessons = if route.is_none() {
         ""
-    } else if provider_s == "codex" {
+    } else if route == Some(AgentToolRoute::Mcp) {
         "- Project lessons: call the `memory_match` tool at the start of a\n\
          \x20 task, whenever the scope changes, and before you repeat an\n\
          \x20 approach that already failed; `memory_propose` files a lesson\n\
