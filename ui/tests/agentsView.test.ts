@@ -49,6 +49,8 @@ const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
 ).default;
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 type Agent = import("../src/lib/types").Agent;
 type AgentDetail = import("../src/lib/types").AgentDetail;
 type IssueCard = import("../src/lib/types").IssueCard;
@@ -137,7 +139,6 @@ let releaseDetail: (() => void) | null = null;
 let holdDetail = false;
 const reads: string[] = [];
 const threadReads: string[] = [];
-let threadExtra: Record<string, unknown> = {};
 let viewerIsOperator: boolean | null = true;
 let viewerHosted = false;
 let rolesPayload: unknown = null;
@@ -149,7 +150,7 @@ globalThis.fetch = async (input, init) => {
   const path = new URL(String(input), "http://localhost").pathname;
   if (path.startsWith("/api/threads/")) {
     threadReads.push(path);
-    return new Response(JSON.stringify({ entries: [], cursor: 0, more_before: false, ...threadExtra }), {
+    return new Response(JSON.stringify({ entries: [], cursor: 0, more_before: false }), {
       headers: { "Content-Type": "application/json" },
     });
   }
@@ -235,7 +236,9 @@ const flush = async () => {
 async function render() {
   await React.act(() =>
     root.render(
-      React.createElement(LocaleProvider, null, React.createElement(Agents, {
+      React.createElement(NavigationProvider, {
+        adapter: hostNavigation,
+        children: React.createElement(LocaleProvider, null, React.createElement(Agents, {
         key: `${viewerIsOperator}`,
         operator: viewerIsOperator,
         onRetryAccess: () => {},
@@ -262,6 +265,7 @@ async function render() {
         onRetry: () => {},
 
       })),
+      }),
     ),
   );
   await flush();
@@ -377,14 +381,13 @@ async function main() {
   await render();
   assert(open === "Developer", "a profile opens on the same agent route as any agent");
   assert(!document.querySelector('[data-drawer="hire"]'), "the drawer is gone");
-  const gate = host.querySelector(".ag-chat-gate");
-  assert(gate?.textContent?.includes("can’t reply here yet"), "the page says why nothing can answer");
-  assert(gate?.textContent?.includes("cadence agent context ap_1"), "the reason sits with the connect commands");
-  assert(!host.querySelector("[data-composer]"), "no composer pretends to send");
+  assert(host.querySelector(".ag-chat") === null && !host.querySelector("[data-composer]"), "agents view renders zero duplicate chat composer");
+  assert(host.querySelector("main.agents-page [role='tablist']"), "a hired profile opens directly onto its agent tabs");
+  assert(host.querySelector(".ap-tab[aria-selected='true']")?.textContent === "Overview", "Overview is the default selected tab");
+  assert(host.textContent?.includes("cadence agent context ap_1"), "Overview includes runtime connection commands");
   assert(!reads.includes("/api/agents/Developer"), "a profile is not read as a registered agent");
-  await click("Details");
-  const panel = host.querySelector(".ag-chat-panel");
-  assert(panel?.textContent?.includes("Ship it") && panel?.textContent?.includes("Model"), "details hold the job and model");
+  const overviewPanel = host.querySelector("#ap-panel");
+  assert(overviewPanel?.textContent?.includes("Ship it") && overviewPanel?.textContent?.includes("Model"), "Overview holds the job and model");
   open = null;
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   await render();
@@ -406,13 +409,18 @@ async function main() {
   assert(aliases().length === 4, "the roster lists the team regardless of project");
   await click("Open agent blocked");
   await render();
+  const channelLink = Array.from(host.querySelectorAll("a")).find((a) => a.textContent?.includes("Mention in channel"));
   assert(
-    host.querySelector("main.ag-chat h1")?.textContent === "blocked" && host.querySelector("[data-composer]"),
-    "an agent opens on its conversation with a composer",
+    host.querySelector("main.agents-page h1")?.textContent === "blocked" &&
+      !host.querySelector(".ag-chat") &&
+      !host.querySelector("[data-composer]") &&
+      threadReads.length === 0 &&
+      channelLink?.getAttribute("href") === "/threads",
+    "a live agent opens directly onto its consolidated Overview with a Mention in channel link and zero duplicate chat",
   );
   assert(
-    host.querySelector("main.ag-chat")?.textContent?.includes("Some details aren’t available") &&
-      !host.querySelector("main.ag-chat [role='alert']"),
+    host.querySelector("main.agents-page")?.textContent?.includes("Some details aren’t available") &&
+      !host.querySelector("main.agents-page [role='alert']"),
     "a detail failure is a quiet line, not an alert",
   );
   tab = "settings";
@@ -548,7 +556,7 @@ async function main() {
   // CAD-2054 review: who may see a conversation, and what each page claims.
   failDetail = false;
   issueState = loaded(issues);
-  const dock = () => host.querySelector("[data-chat-dock]")?.textContent ?? "";
+  const pageText = () => host.querySelector("main.agents-page")?.textContent ?? "";
   // A board that isn't answering keeps its last data on screen and takes no writes.
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   open = "stopped";
@@ -583,7 +591,7 @@ async function main() {
   await render();
   tab = "instructions";
   await render();
-  assert(!document.querySelector("[data-drawer='agent-settings']"), "the chat closes the gear, so coming back doesn't reopen it");
+  assert(!document.querySelector("[data-drawer='agent-settings']"), "returning to Overview closes the gear, so coming back doesn't reopen it");
   state = { ...state, status: "stale", error: "Refresh unavailable" };
   await render();
   assert(box()?.value === "Synthetic instructions" && box()!.readOnly, "a stale board keeps the text and takes no edit");
@@ -595,12 +603,15 @@ async function main() {
   tab = "overview";
   threadReads.length = 0;
   await render();
-  assert(!host.querySelector("[data-composer]"), "a non-operator gets no composer");
-  assert(dock().includes("for the operator"), "a non-operator is told why");
-  assert(threadReads.length === 0, "a non-operator does not read an agent's conversation, as on Threads");
+  assert(!host.querySelector("[data-composer]"), "a non-operator gets no composer on /agents");
+  assert(
+    Array.from(host.querySelectorAll("a")).find((a) => a.textContent?.includes("Mention in channel"))?.getAttribute("href") === "/threads",
+    "a non-operator Mention in channel CTA links to /threads rather than a ?dm= operator route",
+  );
+  assert(threadReads.length === 0, "a non-operator does not read an agent's conversation on /agents");
   viewerHosted = true;
   await render();
-  assert(dock().includes("Your assistant is on Home"), "a hosted member is sent to their assistant");
+  assert(!host.querySelector("[data-composer]") && threadReads.length === 0, "a hosted member sees Overview cleanly with zero thread reads");
   viewerHosted = false;
   viewerIsOperator = true;
   state = { ...state, data: null, status: "loading" };
@@ -610,7 +621,7 @@ async function main() {
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   open = "inbox";
   await render();
-  assert(dock().includes("mailbox") && !host.querySelector("[data-composer]"), "a mailbox has no composer");
+  assert(pageText().includes("mailbox") && !host.querySelector("[data-composer]"), "a mailbox has no composer or tabs");
   const withProfile = { id: "ap_2", alias: "Writer", role: "worker", team_role: "worker", catalogue: null, look: null, job: "Write", model: "inherit", runtimes: [] } as unknown as import("../src/lib/types").HiredProfile;
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [withProfile] });
   open = "Writer";
@@ -634,19 +645,14 @@ async function main() {
   state = loaded({ daemon: "reachable", agents: [...agents, cloudAgent], totals: null, ...fresh });
   open = "cloudy";
   await render();
-  await click("Details");
-  const cloudPanel = host.querySelector(".ag-chat-panel")?.textContent ?? "";
-  assert(!cloudPanel.includes("Doing now") && !cloudPanel.includes("MCP & tools"), "a conversational-only cloud agent claims no local work panels");
-  threadExtra = { cloud_withheld: "denied" };
+  const cloudPage = pageText();
+  assert(!cloudPage.includes("Doing now") && !cloudPage.includes("MCP & tools"), "a conversational-only cloud agent claims no local work panels");
   open = "dev";
   state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
-  await render();
-  assert(host.textContent?.includes("Cloud content unavailable") && !host.textContent?.includes("No messages with dev"), "a withheld thread does not read as empty");
-  threadExtra = {};
   viewerIsOperator = null;
   threadReads.length = 0;
   await render();
-  assert(dock().includes("couldn’t confirm your access") && !dock().includes("for the operator"), "an unanswered access check is not a non-operator");
+  assert(pageText().includes("couldn’t confirm your access"), "an unanswered access check reports access uncertainty");
   assert(!host.querySelector("[data-composer]") && threadReads.length === 0, "an unanswered access check grants nothing");
   tab = "instructions";
   await render();
@@ -666,25 +672,28 @@ async function main() {
   const mountFresh = async (alias: string, section: typeof tab) => {
     await React.act(() =>
       freshRoot.render(
-        React.createElement(LocaleProvider, null, React.createElement(Agents, {
-          key: `${alias}:${section}`,
-          operator: true,
-          onRetryAccess: () => {},
-          hostedBoard: false,
-          state: failedRoster,
-          issues: issueState,
-          open: alias,
-          tab: section,
-          recruit: false,
-          ask: false,
-          onAsk: () => {},
-          onOpenAgent: () => {},
-          onTab: () => {},
-          onToast: () => {},
-          onRecruit: () => {},
-          onOpenIssue: () => {},
-          onRetry: () => {},
-        })),
+        React.createElement(NavigationProvider, {
+          adapter: hostNavigation,
+          children: React.createElement(LocaleProvider, null, React.createElement(Agents, {
+            key: `${alias}:${section}`,
+            operator: true,
+            onRetryAccess: () => {},
+            hostedBoard: false,
+            state: failedRoster,
+            issues: issueState,
+            open: alias,
+            tab: section,
+            recruit: false,
+            ask: false,
+            onAsk: () => {},
+            onOpenAgent: () => {},
+            onTab: () => {},
+            onToast: () => {},
+            onRecruit: () => {},
+            onOpenIssue: () => {},
+            onRetry: () => {},
+          })),
+        }),
       ),
     );
     await flush();
@@ -696,12 +705,8 @@ async function main() {
   assert(!freshHost.textContent?.includes("Nothing right now") && !freshHost.textContent?.includes("Nothing queued"), "a failed roster claims nothing about an agent's work");
   await mountFresh("foreign", "overview");
   assert(freshHost.textContent?.includes("Could not load agents") && !freshHost.textContent?.includes("Loading agent details"), "the page gives one answer, with no loading line beside the failure");
-  const detailsButton = Array.from(freshHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
-  assert(detailsButton, "the details panel can be opened");
-  await React.act(() => detailsButton.click());
-  await flush();
-  const failedPanel = freshHost.querySelector(".ag-chat-panel")?.textContent ?? "";
-  assert(failedPanel.includes("Agent details are unavailable."), "the panel says its details could not be read");
+  const failedPanel = freshHost.querySelector("#ap-panel")?.textContent ?? "";
+  assert(failedPanel.includes("Agent details are unavailable."), "the Overview panel says its details could not be read");
   for (const empty of ["Nothing queued.", "No results yet.", "No events yet.", "no role text"])
     assert(!failedPanel.includes(empty), `the panel claims nothing about unread details: ${empty}`);
   await React.act(() => freshRoot.unmount());
@@ -715,25 +720,28 @@ async function main() {
   const mountServed = async (alias: string, section: typeof tab, roster: typeof state, operator = true) => {
     await React.act(() =>
       servedRoot.render(
-        React.createElement(LocaleProvider, null, React.createElement(Agents, {
-          key: `${alias}:${section}:${roster.status}:${operator}`,
-          operator,
-          onRetryAccess: () => {},
-          hostedBoard: true,
-          state: roster,
-          issues: issueState,
-          open: alias,
-          tab: section,
-          recruit: false,
-          ask: false,
-          onAsk: () => {},
-          onOpenAgent: () => {},
-          onTab: () => {},
-          onToast: () => {},
-          onRecruit: () => {},
-          onOpenIssue: () => {},
-          onRetry: () => {},
-        })),
+        React.createElement(NavigationProvider, {
+          adapter: hostNavigation,
+          children: React.createElement(LocaleProvider, null, React.createElement(Agents, {
+            key: `${alias}:${section}:${roster.status}:${operator}`,
+            operator,
+            onRetryAccess: () => {},
+            hostedBoard: true,
+            state: roster,
+            issues: issueState,
+            open: alias,
+            tab: section,
+            recruit: false,
+            ask: false,
+            onAsk: () => {},
+            onOpenAgent: () => {},
+            onTab: () => {},
+            onToast: () => {},
+            onRecruit: () => {},
+            onOpenIssue: () => {},
+            onRetry: () => {},
+          })),
+        }),
       ),
     );
     await flush();
@@ -741,19 +749,15 @@ async function main() {
   };
   const liveRoster: typeof state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   await mountServed("dev", "overview", liveRoster);
-  const notServedButton = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
-  assert(notServedButton, "the details panel opens on a 501 board");
-  await React.act(() => notServedButton.click());
-  await flush();
-  const servedPanel = servedHost.querySelector(".ag-chat-panel")?.textContent ?? "";
+  const servedPanel = servedHost.querySelector("#ap-panel")?.textContent ?? "";
   const NOT_RECORDED = "This board doesn’t record agent history.";
   assert(servedPanel.split(NOT_RECORDED).length === 2, "a 501 board says so once");
   for (const claim of ["No results yet.", "No events yet.", "Agent details are unavailable.", "no role text"])
     assert(!servedPanel.includes(claim), `a 501 board claims nothing it cannot know: ${claim}`);
   assert(servedPanel.includes("Doing now") && servedPanel.includes("Queue"), "roster data still shows on a 501 board");
-  const servedMain = servedHost.querySelector("main.ag-chat")?.textContent ?? "";
+  const servedMain = servedHost.querySelector("main.agents-page")?.textContent ?? "";
   assert(!servedMain.includes("Some details aren’t available"), "a 501 is not reported as a failure");
-  assert(!Array.from(servedHost.querySelectorAll(".ag-chat-main button")).some((b) => b.textContent?.trim() === "Retry"), "there is no Retry that can never succeed");
+  assert(!Array.from(servedHost.querySelectorAll("main.agents-page button")).some((b) => b.textContent?.trim() === "Retry"), "there is no Retry that can never succeed");
   for (const section of ["history", "instructions", "settings"] as const) {
     await mountServed("dev", section, liveRoster);
     const page = document.body.textContent ?? "";
@@ -775,25 +779,22 @@ async function main() {
       assert(page.includes("Some details aren’t available"), `${label}, ${section}, 501: reports that details are missing`);
     }
   }
-  // The panel on an unknown agent claims no role text it could not read.
+  // A missing agent on 501 Overview shows one clean missing-agent notice without false empty claims.
   await mountServed("nobody", "overview", liveRoster);
-  const unknownDetails = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
-  assert(unknownDetails, "the panel opens for an unknown agent");
-  await React.act(() => unknownDetails.click());
-  await flush();
-  assert(!servedHost.querySelector(".ag-chat-panel")?.textContent?.includes("no role text"), "an unread read claims no role text");
-  assert(!servedHost.querySelector(".ag-chat-main")?.textContent?.includes("Some details"), "a missing agent has one answer, the gate");
+  assert(!servedHost.querySelector("main.agents-page")?.textContent?.includes("no role text"), "an unread read claims no role text");
+  assert(!servedHost.querySelector("main.agents-page")?.textContent?.includes("Some details"), "a missing agent on 501 has one clean answer");
+  assert(servedHost.querySelector("main.agents-page")?.textContent?.includes("No agent named nobody"), "an unknown agent on a 501 board is reported as missing");
   // An ordinary failed read for an unlisted agent can still recover, so it keeps its Retry.
   detailNotServed = false;
   failDetail = true;
   await mountServed("dev", "overview", liveRoster); // A new page, so this read is its own.
   await mountServed("nobody", "overview", liveRoster);
-  const failedUnlisted = servedHost.querySelector(".ag-chat-main")?.textContent ?? "";
+  const failedUnlisted = servedHost.querySelector("main.agents-page")?.textContent ?? "";
   assert(failedUnlisted.includes("Some details aren’t available") && failedUnlisted.includes("Retry"), "a failed read for an unlisted agent keeps its line and Retry");
   failDetail = false;
   // A failed roster must not hide what a served read says about the agent.
   await mountServed("blocked", "overview", failedRoster);
-  assert(servedHost.querySelector(".ag-chat-main")?.textContent?.includes("Recovery required"), "a failed roster keeps a fenced agent's recovery banner");
+  assert(servedHost.querySelector("main.agents-page")?.textContent?.includes("Recovery required"), "a failed roster keeps a fenced agent's recovery banner");
   detailNotServed = true;
   await mountServed("dev", "history", liveRoster);
   assert(servedHost.textContent?.includes(NOT_RECORDED), "a known agent's history says it isn't recorded");
@@ -808,20 +809,13 @@ async function main() {
   assert(servedHost.textContent?.includes("Some details aren’t available") && servedHost.textContent?.includes("Retry"), "another 501 keeps its Retry");
   detailNotServedCode = "not_implemented";
   await mountServed("nobody", "overview", liveRoster);
-  assert(servedHost.querySelector(".ag-chat-gate")?.textContent?.includes("No agent named nobody"), "an unknown agent on a 501 board is still reported as missing");
+  assert(servedHost.querySelector("main.agents-page")?.textContent?.includes("No agent named nobody"), "an unknown agent on a 501 board is still reported as missing");
   // A read still running says nothing about the agent, on a deep link.
   const unsettled = ["No events yet.", "No results yet.", "no role text"];
   holdDetail = true;
-  const openPanel = async () => {
-    const details = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
-    assert(details, "the details panel opens");
-    await React.act(() => details.click());
-    await flush();
-    return servedHost.querySelector(".ag-chat-panel")?.textContent ?? "";
-  };
   await mountServed("dev", "overview", liveRoster);
-  const inFlightPanel = await openPanel();
-  assert(inFlightPanel.includes("Doing now"), "the panel shows Work while the read runs");
+  const inFlightPanel = servedHost.querySelector("#ap-panel")?.textContent ?? "";
+  assert(inFlightPanel.includes("Doing now"), "Overview shows Work while the read runs");
   for (const claim of unsettled)
     assert(!inFlightPanel.includes(claim), `work, read in flight: claims nothing yet: ${claim}`);
   await React.act(async () => releaseDetail?.());
@@ -829,8 +823,8 @@ async function main() {
   holdDetail = false;
   await mountServed("dev", "history", liveRoster); // A new page, so its panel starts closed.
   await mountServed("dev", "overview", { ...liveRoster, data: null, status: "loading" });
-  const pendingPanel = await openPanel();
-  assert(pendingPanel.includes("Doing now"), "the panel shows Work while the roster is pending");
+  const pendingPanel = servedHost.querySelector("#ap-panel")?.textContent ?? "";
+  assert(pendingPanel.includes("Doing now"), "Overview shows Work while the roster is pending");
   for (const claim of [...unsettled, "Nothing right now", "Nothing queued", "Nothing needs attention"])
     assert(!pendingPanel.includes(claim), `work, roster pending: claims nothing yet: ${claim}`);
   detailNotServed = false;
@@ -861,15 +855,12 @@ async function main() {
   rolesPayload = { roles: [sellerRole], categories: [], install: { hosted: true } };
   await clickRetry(servedHost.querySelector("#ap-panel"));
   assert(skillsPanel().includes("pipeline") && !skillsPanel().includes("couldn’t be read"), "Retry brings the role's skills back");
-  // First-job chips open a composer, so they follow the same write rule.
+  // First-job chips open a composer in Channels, so they follow the same write rule.
   const runner = { ...seller, runtimes: ["stopped"] };
   const withRunner = loaded({ daemon: "reachable", agents, totals: null, ...fresh, profiles: [runner] }) as unknown as typeof state;
   const chipsFor = async (roster: typeof state, operator: boolean) => {
     await mountServed("stopped", "overview", roster, operator);
-    const details = Array.from(servedHost.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Details");
-    if (details && !servedHost.querySelector(".ag-chat-panel")?.textContent?.includes("Doing now")) await React.act(() => details.click());
-    await flush();
-    return servedHost.querySelector(".ag-chat-panel")?.textContent ?? "";
+    return servedHost.querySelector("#ap-panel")?.textContent ?? "";
   };
   assert((await chipsFor(withRunner, true)).includes("Call the first lead"), "an operator on a live board gets first-job chips");
   assert(!(await chipsFor(withRunner, false)).includes("Call the first lead"), "a member gets no first-job chips");

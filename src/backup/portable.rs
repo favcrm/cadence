@@ -1105,10 +1105,33 @@ const CATALOG: &[(&str, &[&str])] = &[
     ("human_push_presence", &["device", "tab", "room", "expires"]),
     ("human_read_markers", &["room", "human", "seq"]),
     (
+        "human_room_events",
+        &["id", "room", "after_seq", "text", "created"],
+    ),
+    (
         "human_room_members",
         &["room", "kind", "member", "cutoff", "added", "removed"],
     ),
     ("human_room_mutes", &["room", "human", "muted"]),
+    (
+        "human_room_post_meta",
+        &["post_id", "silent", "outcomes_json"],
+    ),
+    (
+        "human_room_post_requests",
+        &[
+            "post_id",
+            "agent_uid",
+            "message_id",
+            "origin_actor",
+            "authority_mode",
+            "created",
+        ],
+    ),
+    (
+        "human_room_state",
+        &["room", "agent_chain_count", "agent_chain_limit", "updated"],
+    ),
     (
         "human_rooms",
         &[
@@ -2610,7 +2633,7 @@ pub(super) fn rename_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
 fn exclusions() -> Vec<String> {
     [
         "authority: platform_credentials, platform_grants, platform_defaults, platform_drafts, platform_effects, app_grants, rollout_grants, rollout_leases, staging_grants, staging_instances, daemon_build (rows deleted from the private copy)",
-        "private or private-capable state is never exported at any fidelity, and a source holding any of it refuses export instead of dropping it: queued-but-unpromoted member requests (assist_request_queue), member-private job ownership (assist_requests, assist_job_shares, assist_stall_checks), member job subscriptions (job_subscribers), member assistants (assistants), app member grants in any state including revoked tombstones (app_member_grants), app conversations (threads.install_id), app contexts (app_contexts), app team defaults (app-teams.json), per-installation app records (app-records/), chat attachments (chat_files, chat-file custody under the workspace .cadence/chat-files and the state chat-files/), chat upload accounts (chat_upload_accounts), issue artifacts (artifacts, artifacts/), member-private job specs (assist_jobs/), upload staging under wiki-uploads/, human-room topics and membership (human_rooms, human_room_members, human_room_mutes, topics.type=human_room), cloud-agent state (cloud_agents, cloud_agent_sources, cloud_agent_sessions, cloud_agent_operations, provider=agenticos-cloud aliases, source=cloud_agent messages), the state-dir private delivery/publication ledger (delivery-private.json), publication comments in the tracker, and private project policies (project.yaml visibility private). This package was classified as holding none of it",
+        "private or private-capable state is never exported at any fidelity, and a source holding any of it refuses export instead of dropping it: queued-but-unpromoted member requests (assist_request_queue), member-private job ownership (assist_requests, assist_job_shares, assist_stall_checks), member job subscriptions (job_subscribers), member assistants (assistants), app member grants in any state including revoked tombstones (app_member_grants), app conversations (threads.install_id), app contexts (app_contexts), app team defaults (app-teams.json), per-installation app records (app-records/), chat attachments (chat_files, chat-file custody under the workspace .cadence/chat-files and the state chat-files/), chat upload accounts (chat_upload_accounts), issue artifacts (artifacts, artifacts/), member-private job specs (assist_jobs/), upload staging under wiki-uploads/, human-room topics and membership (human_rooms, human_room_members, human_room_mutes, human_room_state, human_room_post_requests, human_room_post_meta, human_room_events, topics.type=human_room), cloud-agent state (cloud_agents, cloud_agent_sources, cloud_agent_sessions, cloud_agent_operations, provider=agenticos-cloud aliases, source=cloud_agent messages), the state-dir private delivery/publication ledger (delivery-private.json), publication comments in the tracker, and private project policies (project.yaml visibility private). This package was classified as holding none of it",
         "live execution authority nulled: agents.generation, pid, pid_start, endpoint, thread_id, session_id, params; messages.turn_id; token-shaped values redacted by the existing scrub",
         "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
         "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults, settings_authority",

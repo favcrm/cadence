@@ -14,6 +14,15 @@ import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, WORKSPACE_SKILLS_COMMAND, type SlashCommand } from "../../home/master";
 import type { PendingAttachment } from "../../home/thread";
 import WorkspaceSkillPicker from "../../home/WorkspaceSkillPicker";
+import MentionPicker from "../../mentions/MentionPicker";
+import { handleMentionKeyDown } from "../../mentions/candidates";
+import {
+  applyMention,
+  filterMentionCandidates,
+  findActiveMention,
+  startsWithNote,
+  type MentionCandidate,
+} from "../../mentions/mentions";
 import { attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../../../lib/uiNotice";
 import {
@@ -144,6 +153,18 @@ export interface ComposerProps {
   stop?: { onStop: () => void } | null;
   /** Optional Up-arrow handler when the composer is empty and no menu is open. */
   onArrowUpEmpty?: () => boolean;
+  /** Optional `@mention` candidates shown when typing `@...`. */
+  mentionCandidates?: MentionCandidate[];
+  /** Allow leading `/note` without invoking the slash-command dispatcher. */
+  allowNote?: boolean;
+  /** Observe draft text changes (e.g. for private Home mention previews). */
+  onDraftChange?: (draft: string) => void;
+  /** Optional pre-send gate; returning `false` holds the draft in place. */
+  beforeSend?: (body: string) => boolean;
+  /** Optional `/note` silent-post toggle (Channels). */
+  showSilentToggle?: boolean;
+  silent?: boolean;
+  onSilentChange?: (next: boolean) => void;
 }
 
 /** One host action behind the compact composer's More actions menu. */
@@ -417,6 +438,13 @@ export default function Composer({
   actions,
   stop = null,
   onArrowUpEmpty,
+  mentionCandidates,
+  allowNote = false,
+  onDraftChange,
+  beforeSend,
+  showSilentToggle = false,
+  silent = false,
+  onSilentChange,
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
@@ -433,6 +461,11 @@ export default function Composer({
   const hasArtifactRef = citesArtifact(refs);
   const libraryImage = cell.libraryImage;
   const libraryPin = libraryImage?.state === "ready" ? libraryImage.pin : null;
+  const onDraftChangeRef = useRef(onDraftChange);
+  onDraftChangeRef.current = onDraftChange;
+  useEffect(() => {
+    onDraftChangeRef.current?.(draft);
+  }, [draft]);
   const setDraft = (next: string) => setComposerDraft(key, next);
   const setRefs = (next: ThreadRef[]) => setComposerRefs(key, next);
   // The queue lives in the store, keyed like the draft: a remount
@@ -465,6 +498,9 @@ export default function Composer({
   // reopens it (or a cleared draft does).
   const [menuOffFor, setMenuOffFor] = useState<string | null>(null);
   const [skillsFor, setSkillsFor] = useState<string | null>(null);
+  const [caret, setCaret] = useState<number>(0);
+  const [mentionHi, setMentionHi] = useState<number>(0);
+  const [mentionOffFor, setMentionOffFor] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
   const revealRef = useRef(onReveal);
   revealRef.current = onReveal;
@@ -532,6 +568,47 @@ export default function Composer({
   const complete = (c: SlashCommand) => {
     setDraft(`/${c.name}${c.arg ? " " : ""}`);
     setMenuOffFor(null);
+  };
+
+  const activeMention =
+    !compact &&
+    !block &&
+    !skillPickerOpen &&
+    matches.length === 0 &&
+    mentionCandidates &&
+    mentionCandidates.length > 0
+      ? findActiveMention(draft, caret)
+      : null;
+  const mentionSpanKey = activeMention ? `${activeMention.start}:${activeMention.query}` : null;
+  const mentionMatches =
+    activeMention && mentionCandidates && mentionSpanKey !== mentionOffFor
+      ? filterMentionCandidates(mentionCandidates, activeMention.query)
+      : [];
+  const selectableMentionIndices = mentionMatches
+    .map((candidate, index) => (candidate.active ? index : -1))
+    .filter((index) => index >= 0);
+  const mentionHiClamped =
+    selectableMentionIndices.length === 0
+      ? -1
+      : selectableMentionIndices.includes(mentionHi)
+        ? mentionHi
+        : selectableMentionIndices[0]!;
+  useEffect(() => {
+    setMentionHi(0);
+  }, [mentionSpanKey]);
+
+  const completeMention = (candidate: MentionCandidate) => {
+    if (!activeMention || !candidate.active) return;
+    const applied = applyMention(draft, activeMention, candidate);
+    setDraft(applied.text);
+    setCaret(applied.caret);
+    setMentionOffFor(null);
+    requestAnimationFrame(() => {
+      const el = box.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(applied.caret, applied.caret);
+    });
   };
 
   // A command has gone: empty the box, which closes the menu, and keep focus.
@@ -609,18 +686,20 @@ export default function Composer({
         return;
       }
     }
-    // Pin before a pending row or command card paints, so a follow
-    // effect scrolls the working indicator into view.
-    onSubmitted?.();
-    const cmd = parseSlash(body);
+    const cmd = (showSilentToggle || allowNote) && startsWithNote(body) ? null : parseSlash(body);
     if (cmd && onCommand === undefined) {
+      onSubmitted?.();
       // A verb that the host does not handle is not ordinary chat.
       onNotice?.({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name: cmd.name } });
       return;
     } else if (cmd) {
+      onSubmitted?.();
       if (onCommand?.(cmd.name, cmd.arg) !== false) finishCommand();
       else keepRefused(cmd.arg);
     } else {
+      if (beforeSend && beforeSend(outgoing) === false) return;
+      // Pin before a pending row paints, so a follow effect scrolls into view.
+      onSubmitted?.();
       // Capture the ready rows by key+generation, not by file id: two
       // distinct rows can legitimately share a dedup id, and a later row
       // must survive this send's settlement.
@@ -686,6 +765,19 @@ export default function Composer({
   };
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+    if (
+      activeMention &&
+      handleMentionKeyDown(e, {
+        matches: mentionMatches,
+        selectableIndices: selectableMentionIndices,
+        highlightedIndex: mentionHiClamped,
+        onHighlight: setMentionHi,
+        onSelect: completeMention,
+        onDismiss: () => setMentionOffFor(mentionSpanKey),
+      })
+    ) {
+      return;
+    }
     if (matches.length) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -765,13 +857,21 @@ export default function Composer({
       ref={box}
       id={textareaId}
       value={draft}
-      onChange={(e) => { setSkillsFor(null); setDraft(e.target.value); }}
+      onChange={(e) => {
+        setSkillsFor(null);
+        setMentionOffFor(null);
+        setCaret(e.target.selectionStart ?? e.target.value.length);
+        setDraft(e.target.value);
+      }}
+      onClick={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+      onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+      onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
       onKeyDown={onKey}
       rows={1}
       disabled={!!block}
       placeholder={t(block ? blockedPlaceholder : hasArtifactRef ? "Say what to change…" : (placeholder ?? ""))}
       aria-label={t(ariaLabel ?? "Message to Assistant")}
-      aria-expanded={matches.length > 0 || undefined}
+      aria-expanded={matches.length > 0 || mentionMatches.length > 0 || undefined}
       className={
         compact
           ? "app-chat-box app-chat-textarea"
@@ -956,13 +1056,33 @@ export default function Composer({
           ))}
         </ul>
       )}
+      {mentionMatches.length > 0 && (
+        <MentionPicker
+          candidates={mentionMatches}
+          highlighted={mentionHiClamped}
+          onHighlight={setMentionHi}
+          onSelect={completeMention}
+        />
+      )}
       {refsRow}
       {attachChips}
       {boxEl}
-      {/* CAD-2425: one footer row — attach, the keyboard hint, then send. */}
+      {/* CAD-2425: one footer row — attach, optional /note toggle, keyboard hint, then send. */}
       <div className="composer-foot" data-composer-foot="">
         {attachInput}
         {attachControl(true)}
+        {showSilentToggle && onSilentChange && (
+          <button
+            type="button"
+            className="composer-silent-toggle"
+            aria-pressed={silent}
+            disabled={!!block}
+            title={t("Silent note — post without notifying members or waking agents")}
+            onClick={() => onSilentChange(!silent)}
+          >
+            <span>/note</span>
+          </button>
+        )}
         {/* A held send's reason is on the failed file's own row; this
             line is only for a blocked (read-only) composer. */}
         {block ? (

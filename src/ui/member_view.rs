@@ -32,6 +32,7 @@ const MEMBER_ROW_FIELDS: &[&str] = &[
     "endpoint_kind",
     "role",
     "team_role",
+    "personal_assistant",
     "catalogue",
     "look",
     "kind",

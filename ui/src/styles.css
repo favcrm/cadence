@@ -1454,6 +1454,36 @@ textarea.agentform-input { height: auto; width: 100%; }
   background: color-mix(in srgb, var(--color-accent) 10%, var(--color-ink-800));
 }
 
+/* Shared ConfirmDialog modal overlay (rendered inside ordinary DOM or modal <dialog>). */
+.s-confirm-wrap {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+.s-confirm-scrim {
+  position: fixed;
+  inset: 0;
+  background: var(--color-scrim);
+}
+.s-confirm {
+  position: relative;
+  z-index: 1;
+  width: min(26rem, calc(100vw - 2rem));
+  padding: 1.1rem 1.25rem;
+  background: var(--color-ink-850);
+  border: 1px solid var(--color-ink-700);
+  box-shadow: 0 18px 48px rgb(0 0 0 / .45);
+}
+.s-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
 /* Command result cards sit in the thread flow like a system line. */
 .cmdcard {
   font-size: var(--text-secondary);

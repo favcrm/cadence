@@ -9,7 +9,11 @@ import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
+import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
+import { buildMentionCandidates } from "../mentions/candidates";
+import { HomeMentionHandoffCard, useHomeMentionHandoff } from "../mentions/HomeMentionHandoff";
+import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import {
   composerBlock,
   kvRows,
@@ -926,6 +930,7 @@ function MasterHome({
   const t = useTranslate();
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
+  const teammates = useWorkspaceTeammates(hosted === true);
   const master = useQuery(resources.masterState);
   const [seed, setSeed] = useState<{ text: string; n: number; refs?: ThreadRef[] }>({
     text: "",
@@ -960,6 +965,11 @@ function MasterHome({
   const dockRef = useRef<HTMLDivElement | null>(null);
   /** Older history just paged in above: not an arrival, never a pill. */
   const earlierLanded = useRef(false);
+  const homeMentionCandidates = useMemo(
+    () => buildMentionCandidates(agents.data?.agents, teammates, t("Teammate · consent to share"), MASTER),
+    [agents.data?.agents, teammates, t],
+  );
+  const mentionHandoff = useHomeMentionHandoff(homeMentionCandidates, dockRef);
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
@@ -1881,13 +1891,23 @@ function MasterHome({
               stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
               textareaId={HOME_COMPOSER_ID}
               onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
+              mentionCandidates={homeMentionCandidates}
+              allowNote
+              onDraftChange={mentionHandoff.onDraftChange}
+              beforeSend={mentionHandoff.beforeSend}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly
-                ? "The board is read-only."
+                ? t("The board is read-only.")
                 : missing
-                  ? "The Master conversation is unavailable."
-                  : "A Home conversation must be ready before attaching files."}
+                  ? t("The Master conversation is unavailable.")
+                  : t("A Home conversation must be ready before attaching files.")}
+            />
+            <HomeMentionHandoffCard
+              teammates={mentionHandoff.mentionedTeammates}
+              sendBlockedForConsent={mentionHandoff.handoffHold}
+              onOpenChannels={() => navigate("/threads")}
+              onKeepPrivate={mentionHandoff.onKeepPrivate}
             />
           </div>
         </div>

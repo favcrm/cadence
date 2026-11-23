@@ -130,6 +130,7 @@ pub(super) fn retain_scoped_agent_fields(
         "endpoint_kind",
         "role",
         "team_role",
+        "personal_assistant",
         "state",
         "enabled",
         "archived",
@@ -948,11 +949,29 @@ impl Shared {
         })
     }
 
-    /// CAD-384: apply `method`'s caller rule ([`caller_rule::RULES`])
-    /// before it runs. `Ok(Some(params))` is the request with its
-    /// attribution field stamped to the caller; a refusal happens
-    /// before any write. Only reads are made here: the connection's
-    /// `/proc` ancestry, the target row, the rollout lease.
+    /// Safe non-escalating RPCs an agent may invoke while executing a
+    /// non-owner member's `@mention` channel turn (`authority_mode == "member"`).
+    const MEMBER_CHANNEL_TURN_ALLOWED_RPCS: &'static [&'static str] = &[
+        "health",
+        "daemon_info",
+        "agent_identity",
+        "agent_profile_context",
+        "topic_read",
+        "topic_publish",
+        "request_open",
+        "request_wait",
+        "request_close",
+        "message_report",
+        "agent_inbox",
+        "agent_inbox_ack",
+        "memory_match",
+    ];
+
+    /// CAD-384 / CAD-2711: apply `method`'s caller rule ([`caller_rule::RULES`])
+    /// and runtime member-channel authority intersection before it runs.
+    /// `Ok(Some(params))` is the request with its attribution field stamped to
+    /// the caller; a refusal happens before any write. Only reads are made here:
+    /// the connection's `/proc` ancestry, the target row, the rollout lease.
     pub(super) fn caller_gate(
         &self,
         method: &str,
@@ -963,10 +982,49 @@ impl Shared {
         let Some(rule) = caller_rule::rule_of(method) else {
             return Ok(None);
         };
+        let check_member_authority = |who: &Who| -> Result<()> {
+            if let Who::Agent(alias) = who {
+                if let Some(turn) = self.store.running_channel_authority(alias)? {
+                    if turn.authority_mode == "member" {
+                        if !Self::MEMBER_CHANNEL_TURN_ALLOWED_RPCS.contains(&method) {
+                            return Err(Error::invalid(
+                                "member_authority_refused",
+                                format!(
+                                    "{method} refused: member channel turn cannot invoke privileged operations"
+                                ),
+                            ));
+                        }
+                        if matches!(method, "topic_read" | "topic_publish") {
+                            let same_channel = turn.topic_id.as_deref().is_some_and(|tid| {
+                                params.get("topic").and_then(Value::as_str) == Some(tid)
+                            });
+                            if !same_channel {
+                                return Err(Error::invalid(
+                                    "member_authority_refused",
+                                    format!(
+                                        "{method} refused: member channel turn is restricted to its originating channel"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
         if !rule.checks_connection() {
+            match self.connection_caller(peer_pid) {
+                Ok(who) => check_member_authority(&who)?,
+                Err(err) => {
+                    if !Self::MEMBER_CHANNEL_TURN_ALLOWED_RPCS.contains(&method) {
+                        return Err(err);
+                    }
+                }
+            }
             return Ok(None);
         }
         let who = self.connection_caller(peer_pid)?;
+        check_member_authority(&who)?;
         let mut facts = Facts::default();
         match (rule, &who) {
             (Rule::OnAgent(target, _), Who::Agent(_)) => {

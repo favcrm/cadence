@@ -3,13 +3,11 @@ import { api, ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { IconSettings } from "../../ui/icons";
-import { useWriteBlock, WriteGate } from "../auth/WriteGate";
+import { WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentDetail, HiredProfile } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
-import AgentChat, { type ChatGate } from "./AgentChat";
 import { ConnectRuntime, ProfileDetails, workText } from "./ProfileSeat";
 import type { ToastMsg } from "../../ui/Toast";
-import { seatStatus } from "./SeatCard";
 import { RecoveryBlock } from "./AgentProfile";
 import { MASTER } from "../home/master";
 import { useInstructionsDoc } from "./useInstructionsDoc";
@@ -25,7 +23,7 @@ import {
   type RolesState,
 } from "./agentRoles";
 import { AGENT_TABS, type AgentTab } from "./agentTabModel";
-import { dmExpectation } from "../threads/threadsView";
+import { isShareableAgent } from "../mentions/candidates";
 import {
   agentHoldsWorkButDead,
   agentLocation,
@@ -54,16 +52,7 @@ interface CloudAgentView {
   operations?: { operation_id: string; status: string; reply?: { text: string } | null }[];
 }
 
-const TONE: Record<string, string> = {
-  fail: "var(--color-fail)",
-  warn: "var(--color-warn)",
-  info: "var(--color-info)",
-  ok: "var(--color-ok)",
-  ink: "var(--color-ink-500)",
-};
-
-/** The full agent page at `agents/<alias>`: hero, stats, tabs. It replaces
- *  the old drawer and carries every banner and guard the drawer had. */
+/** The unified agent page at `agents/<alias>`: overview, tabs, settings, and CTA to Channels or Home. */
 export default function AgentPage({
   alias,
   observed,
@@ -119,7 +108,6 @@ export default function AgentPage({
   onToast: (kind: ToastMsg["kind"], text: string) => void;
 }) {
   const boardBlock = useContext(WriteGate);
-  const writeBlock = useWriteBlock(operator !== true) ?? boardBlock;
   const t = useTranslate();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -130,12 +118,13 @@ export default function AgentPage({
   const [gear, setGear] = useState(false);
   const hired = selectedProfile ?? (observed ? undefined : profiles.find((p) => p.alias === alias));
   const masterPage = companyMaster && operator === true;
-  const chat = tab === "overview" && !masterPage;
-  const leave = chat || masterPage ? onBack : () => onTab("overview");
-  // Leaving for the chat closes the gear, so coming back doesn't reopen it.
+  const boardIsHosted = hostedBoard || hosted;
+  const section = tab === "settings" ? "instructions" : tab;
+  const leave = section === "overview" || masterPage ? onBack : () => onTab("overview");
+  // Returning to overview closes the gear drawer so subsequent tab visits start clean.
   useEffect(() => {
-    if (chat) setGear(false);
-  }, [chat]);
+    if (tab === "overview") setGear(false);
+  }, [tab]);
   useEffect(() => {
     // A runtime-less profile is not a registered agent: there is nothing to read.
     // Once the roster has answered, or failed, so a failed read still says so.
@@ -348,14 +337,15 @@ export default function AgentPage({
     </>
   );
 
+  const showUnreadNotice = unread && !(section === "overview" && !profile && notServed);
   const notices = (
     <>
-      {!detail && !err && !notServed && (
+      {!detail && !err && !notServed && (rosterLoaded || rosterFailed) && (
         <p role="status" className="text-label text-ink-500 mb-3">
           {t("Loading agent details…")}
         </p>
       )}
-      {unread && (
+      {showUnreadNotice && (
         <p role="status" className="text-label text-ink-500 mb-3">
           {t("Some details aren’t available on this board.")}{" "}
           <button type="button" className="lnk" onClick={retryDetail}>
@@ -395,122 +385,6 @@ export default function AgentPage({
     </>
   );
 
-  if (chat) {
-    const status = profile ? seatStatus(profile, t) : null;
-    const boardIsHosted = hostedBoard || hosted;
-    const gate: ChatGate | null = !rosterLoaded
-      ? {
-          title: rosterFailed ? t("Could not load agents") : t("Loading agents…"),
-          body: "",
-          extra: rosterFailed ? <Button onClick={onRetryRoster}>{t("Retry")}</Button> : undefined,
-        }
-      : operator === null
-        ? {
-            title: t("We couldn’t confirm your access"),
-            body: t("This doesn’t mean you’ve been signed out. The connection may be interrupted."),
-            extra: <Button onClick={onRetryAccess}>{t("Retry")}</Button>,
-          }
-      : !operator
-        ? boardIsHosted
-          ? {
-              title: t("Your assistant is on Home"),
-              body: t("Conversations with agents here are for the workspace operator."),
-              extra: <Button href="/">{t("Open Home")}</Button>,
-            }
-          : {
-              title: boardBlock ?? t("Conversations with agents are for the operator"),
-              body: t("You can still see what this agent is working on."),
-            }
-        : hired
-          ? {
-              title: t("{alias} can’t reply here yet").replace("{alias}", () => alias),
-              body: boardIsHosted
-                ? t("Chat with a profile isn’t available on hosted boards yet. It works on issues started under its profile.")
-                : t("It has no runtime connected to this board. Connect one to talk to it here."),
-              extra: <ConnectRuntime profile={hired} hosted={boardIsHosted} groups={groups} />,
-            }
-          : mailbox
-            ? {
-                title: t("This is a mailbox, not an agent"),
-                body: t("Mail waits here until an agent reads it."),
-              }
-            : !profile && (err !== null || notServed)
-              ? {
-                  title: t("No agent named {alias}").replace("{alias}", () => alias),
-                  body: t("It may have been removed. Pick another agent from the list."),
-                }
-              : null;
-    const faceLook = hired ? (hired.look ?? undefined) : typeof params?.look === "string" ? params.look : undefined;
-    return (
-      <AgentChat
-        alias={alias}
-        gate={gate}
-        look={agentLook(alias, params)}
-        expectation={t(dmExpectation(profile))}
-        attach={!boardIsHosted}
-        block={writeBlock}
-        onBack={onBack}
-        onOpenIssue={onOpenIssue}
-        // With nothing known about the agent, the gate is already the one answer
-        // for an unread roster or a board that keeps no details. A known agent
-        // keeps its recovery banners, and a failed read for an unlisted agent
-        // keeps its Retry: a successful read is what would bring the page back.
-        notices={hired || (!profile && (!rosterLoaded || notServed)) ? null : notices}
-        heading={
-          <>
-            <AgentAvatar
-              slug={hired ? "custom" : agentLook(alias, params)}
-              look={faceLook}
-              still={lifecycle !== "active"}
-              active={lifecycle === "active"}
-              size={34}
-            />
-            <div className="ag-chat-title min-w-0">
-              <h1>{alias}</h1>
-              <p>
-                {hired ? (
-                  <>
-                    <span className="rc-dot" style={{ "--c": "var(--color-ink-500)" } as React.CSSProperties} />{" "}
-                    {hiredWork ? workText(hiredWork, t) : t("Idle · no runtime")}
-                  </>
-                ) : (
-                  <>
-                    {status && (
-                      <>
-                        <span className="rc-dot" style={{ "--c": TONE[status.tone] } as React.CSSProperties} /> {status.text}
-                        {" · "}
-                      </>
-                    )}
-                    {categoryText ?? profile?.role ?? t("Agent")}
-                  </>
-                )}
-              </p>
-            </div>
-          </>
-        }
-        panel={
-          hired ? (
-            <div className="ag-chat-panel-body">
-              <ProfileDetails
-                profile={hired}
-                work={hiredWork}
-                onOpenIssue={onOpenIssue}
-              />
-              <Button onClick={() => onTab("instructions")}>{t("Manage profile")}</Button>
-            </div>
-          ) : isCloud ? (
-            cloudCards
-          ) : (
-            <div className="ag-chat-panel-body">
-              <Work c={ctx} />
-              {!mailbox && <Button onClick={() => onTab("instructions")}>{t("Manage profile")}</Button>}
-            </div>
-          )
-        }
-      />
-    );
-  }
-
   const manageSubline = hired
     ? hiredWork
       ? workText(hiredWork, t)
@@ -518,11 +392,15 @@ export default function AgentPage({
     : [categoryText ?? a?.role ?? observed?.role ?? t("Agent"), badge?.label, t("runs on {where}").replace("{where}", () => where)]
         .filter(Boolean)
         .join(" · ");
-  const section = tab === "settings" || tab === "overview" ? "instructions" : tab;
+  const isMaster = companyMaster || alias === MASTER;
+  const showHomeCta = isMaster && !hired && !mailbox;
+  const showChannelsCta = !isMaster && !mailbox && Boolean(profile && isShareableAgent(profile));
+  const unknownOverview501 = section === "overview" && rosterLoaded && !hired && !profile && notServed;
+
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
-      <button type="button" className="rc-back" onClick={leave}>
-        ← {masterPage ? t("Agents") : t("Chat")}
+      <button type="button" className="rc-back" onClick={onBack}>
+        ← {t("Agents")}
       </button>
       <header className="ap-hero">
         <AgentAvatar
@@ -538,11 +416,23 @@ export default function AgentPage({
             <span>{manageSubline}</span>
           </div>
         </div>
-        {!isCloud && !mailbox && (
+        {(showHomeCta || showChannelsCta || (!isCloud && !mailbox)) && (
           <div className="ap-acts">
-            <Button variant="ghost" size="sm" aria-label={t("Agent settings")} title={t("Settings")} onClick={() => setGear(true)}>
-              <IconSettings />
-            </Button>
+            {showHomeCta && (
+              <Button variant="primary" size="sm" href="/">
+                {t("Open in Home")}
+              </Button>
+            )}
+            {showChannelsCta && (
+              <Button variant="primary" size="sm" href="/threads">
+                {t("Mention in channel")}
+              </Button>
+            )}
+            {!isCloud && !mailbox && (
+              <Button variant="ghost" size="sm" aria-label={t("Agent settings")} title={t("Settings")} onClick={() => setGear(true)}>
+                <IconSettings />
+              </Button>
+            )}
           </div>
         )}
       </header>
@@ -551,9 +441,44 @@ export default function AgentPage({
 
       {!hired && notices}
 
+      {!rosterLoaded && !rosterFailed && !hired && !profile && (
+        <p role="status" className="rc-note mb-3">
+          {t("Loading agents…")}
+        </p>
+      )}
+
+      {!rosterLoaded && rosterFailed && !hired && !profile && section === "overview" && (
+        <div className="ap-now mb-3" role="status">
+          <b>{t("Could not load agents")}</b>
+          <div className="mt-2">
+            <Button size="sm" onClick={onRetryRoster}>
+              {t("Retry")}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {rosterLoaded && !hired && !profile && (err !== null || notServed) && (
+        <div className="ap-now mb-3" role="status">
+          <b>{t("No agent named {alias}").replace("{alias}", () => alias)}</b>
+          <p className="rc-note mt-1">{t("It may have been removed. Pick another agent from the list.")}</p>
+        </div>
+      )}
+
+      {operator === null && section === "overview" && (
+        <p role="status" className="rc-note mb-3">
+          {t("We couldn’t confirm your access")}{" "}
+          <button type="button" className="lnk" onClick={onRetryAccess}>
+            {t("Retry")}
+          </button>
+        </p>
+      )}
+
       {mailbox ? (
-        <p className="rc-note">{t("A mailbox has nothing to manage.")}</p>
-      ) : !isCloud && (
+        <p className="rc-note">
+          {t("This is a mailbox, not an agent")}. {t("Mail waits here until an agent reads it.")}
+        </p>
+      ) : !isCloud && !unknownOverview501 && (
         <>
           <nav className="ap-tabs" role="tablist" aria-label={t("Agent sections")}>
             {AGENT_TABS.map((entry) => (
@@ -572,7 +497,20 @@ export default function AgentPage({
             ))}
           </nav>
           <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${section}`}>
-            {section === "routines" && routineAgent ? (
+            {section === "overview" ? (
+              hired ? (
+                <div className="ap-body">
+                  <ProfileDetails
+                    profile={hired}
+                    work={hiredWork}
+                    onOpenIssue={onOpenIssue}
+                  />
+                  <ConnectRuntime profile={hired} hosted={boardIsHosted} groups={groups} />
+                </div>
+              ) : (
+                <Work c={ctx} />
+              )
+            ) : section === "routines" && routineAgent ? (
               <>
                 <p className="text-label text-ink-400">{t("Agent")}: {routineAgent}</p>
                 <AgentTabBody key={`routine:${routineAgent}`} tab={section} c={{ ...ctx, alias: routineAgent }} />

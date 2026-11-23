@@ -106,7 +106,7 @@ export function NotificationToastProvider({ children }: { children: ReactNode })
   return (
     <ToastContext.Provider value={api}>
       {children}
-      <div className="fixed" aria-live="polite" style={{ right: 22, bottom: 22, zIndex: 50, display: "grid", gap: 8 }}>
+      <div className="fixed notification-toast-stack" aria-live="polite">
         {alerts.map((a) => (
           <div key={a.id} className="notification-toast" role="status">
             <div>

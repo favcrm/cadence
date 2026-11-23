@@ -202,6 +202,12 @@ pub(crate) fn write_reply(
             if let Some(route) = out.get("route") {
                 body["route"] = route.clone();
             }
+            if let Some(silent) = out.get("silent") {
+                body["silent"] = silent.clone();
+            }
+            if let Some(outcomes) = out.get("mention_outcomes") {
+                body["mention_outcomes"] = outcomes.clone();
+            }
             let body = serde_json::to_vec_pretty(&body).unwrap_or_default();
             let mut resp = Response::from_data(body).with_status_code(StatusCode(if created {
                 201
@@ -2406,6 +2412,68 @@ pub(crate) fn write_route(
                         req.if_rev.as_deref(),
                         &actor,
                     );
+                    let out = match out {
+                        Ok(mut reply)
+                            if reply.get("committed").and_then(Value::as_bool) == Some(true)
+                                && matches!(
+                                    caller,
+                                    operator::Caller::Operator(_) | operator::Caller::Named(_)
+                                ) =>
+                        {
+                            let parsed = crate::store::mentions::parse_mentions(&req.body, false);
+                            if (parsed.silent || !parsed.handles.is_empty())
+                                && client::socket_path(state_dir).exists()
+                            {
+                                let comment_key = reply["comment"].as_str().unwrap_or("comment");
+                                let mut params = json!({
+                                    "issue_id": id,
+                                    "comment_key": comment_key,
+                                    "body": req.body,
+                                });
+                                let public_tok = operator::session_token_for(
+                                    &request,
+                                    opts,
+                                    crate::operator_auth::Origin::Public,
+                                );
+                                let can_dispatch = match (&caller, public_tok) {
+                                    (operator::Caller::Named(_), Some(tok))
+                                    | (operator::Caller::Operator(_), Some(tok)) => {
+                                        params["token"] = json!(tok);
+                                        true
+                                    }
+                                    (operator::Caller::Operator(_), None) => {
+                                        params["local_operator"] = json!(true);
+                                        true
+                                    }
+                                    (operator::Caller::Named(_), None)
+                                    | (operator::Caller::Agent(_), _) => false,
+                                };
+                                if can_dispatch {
+                                    match client::rpc(state_dir, "issue_comment_mentions", params) {
+                                        Ok(res) => {
+                                            reply["silent"] = res["silent"].clone();
+                                            reply["mention_outcomes"] = res["outcomes"].clone();
+                                        }
+                                        Err(err) => {
+                                            let note = Value::String(format!(
+                                                "mention dispatch skipped: {err}"
+                                            ));
+                                            if let Some(arr) = reply
+                                                .get_mut("warnings")
+                                                .and_then(Value::as_array_mut)
+                                            {
+                                                arr.push(note);
+                                            } else {
+                                                reply["warnings"] = json!([note]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(reply)
+                        }
+                        other => other,
+                    };
                     (pm, out)
                 }
                 Err(resp) => {

@@ -2,6 +2,7 @@ import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
 import type { SlashCommand } from "./master";
 import type { AttachDestination } from "../app-shell/chat/attach";
+import type { MentionCandidate } from "../mentions/mentions";
 import { sendToMaster } from "./send";
 import { newMessageId } from "./thread";
 import { useAssistantComposerLabels } from "../assistant/AssistantIdentity";
@@ -30,6 +31,10 @@ export default function Composer({
   stop = null,
   textareaId,
   onArrowUpEmpty,
+  mentionCandidates,
+  allowNote,
+  onDraftChange,
+  beforeSend,
 }: {
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
@@ -44,6 +49,10 @@ export default function Composer({
   stop?: { onStop: () => void } | null;
   textareaId?: string;
   onArrowUpEmpty?: () => boolean;
+  mentionCandidates?: MentionCandidate[];
+  allowNote?: boolean;
+  onDraftChange?: (draft: string) => void;
+  beforeSend?: (body: string) => boolean;
 }) {
   const { placeholder, ariaLabel } = useAssistantComposerLabels();
   return (
@@ -62,6 +71,10 @@ export default function Composer({
       stop={stop}
       textareaId={textareaId}
       onArrowUpEmpty={onArrowUpEmpty}
+      mentionCandidates={mentionCandidates}
+      allowNote={allowNote}
+      onDraftChange={onDraftChange}
+      beforeSend={beforeSend}
       attach={{
         enabled: attachEnabled,
         reason: attachReason,

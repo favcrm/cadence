@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import "./notifications.css";
 import Button from "../../ui/Button";
+import Select from "../../ui/Select";
 import { IconCheck, IconClose, IconSettings, IconThreads } from "../../ui/icons";
 import { navigate, useHref } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
@@ -510,16 +511,22 @@ function PreferenceList({ prefs, onChange }: { prefs: NotificationPreferences; o
           <input type="checkbox" checked={Boolean(prefs[r.key])} onChange={(e) => onChange({ ...prefs, [r.key]: e.target.checked })} />
         </label>
       ))}
-      <label className="notification-setting">
+      <div className="notification-setting">
         <span>
           <strong>{t("Quiet hours")}</strong>
           <small>{t("22:00 to 08:00 in your time zone. Unread counts still update.")}</small>
         </span>
-        <select className="field" value={prefs.quiet} onChange={(e) => onChange({ ...prefs, quiet: e.target.value === "22-08" ? "22-08" : "off", zone: browserZone() })}>
-          <option value="off">{t("Off")}</option>
-          <option value="22-08">{t("22:00 to 08:00")}</option>
-        </select>
-      </label>
+        <Select
+          size="sm"
+          value={prefs.quiet}
+          aria-label={t("Quiet hours")}
+          onChange={(val) => onChange({ ...prefs, quiet: val === "22-08" ? "22-08" : "off", zone: browserZone() })}
+          options={[
+            { value: "off", label: t("Off") },
+            { value: "22-08", label: t("22:00 to 08:00") },
+          ]}
+        />
+      </div>
     </div>
   );
 }

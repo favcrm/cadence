@@ -1,10 +1,19 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type ResourceState } from "../../lib/cache";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import type { IssueHistoryEntry } from "../../lib/types";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
+import MentionPicker from "../mentions/MentionPicker";
+import { handleMentionKeyDown } from "../mentions/candidates";
+import {
+  applyMention,
+  filterMentionCandidates,
+  findActiveMention,
+  startsWithNote,
+  type MentionCandidate,
+} from "../mentions/mentions";
 import { timelineRows } from "./model";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { ReadNotice } from "./issuePageShared";
@@ -27,6 +36,7 @@ export function Activity({
   onWrite,
   onError,
   onOpen,
+  mentionCandidates,
 }: {
   id: string;
   rows: ReturnType<typeof timelineRows>;
@@ -37,16 +47,57 @@ export function Activity({
   onWrite: Props["onWrite"];
   onError: Props["onError"];
   onOpen: (id: string) => void;
+  mentionCandidates?: MentionCandidate[];
 }) {
   const { t, formatDate } = useLocale();
   const [comment, setComment] = useState("");
+  const [silentNote, setSilentNote] = useState(false);
   const [preview, setPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [caret, setCaret] = useState(0);
+  const [mentionHi, setMentionHi] = useState(0);
+  const [mentionOffFor, setMentionOffFor] = useState<string | null>(null);
+  const commentRef = useRef<HTMLTextAreaElement | null>(null);
   const pending = useRef(false);
+  const activeMention =
+    !preview && !busy && mentionCandidates && mentionCandidates.length > 0
+      ? findActiveMention(comment, caret)
+      : null;
+  const mentionSpanKey = activeMention ? `${activeMention.start}:${activeMention.query}` : null;
+  useEffect(() => {
+    setMentionHi(0);
+  }, [mentionSpanKey]);
+  const mentionMatches =
+    activeMention && mentionCandidates && mentionSpanKey !== mentionOffFor
+      ? filterMentionCandidates(mentionCandidates, activeMention.query)
+      : [];
+  const selectableIndices = mentionMatches
+    .map((candidate, index) => (candidate.active ? index : -1))
+    .filter((index) => index >= 0);
+  const mentionHiClamped =
+    selectableIndices.length === 0
+      ? -1
+      : selectableIndices.includes(mentionHi)
+        ? mentionHi
+        : selectableIndices[0]!;
+  const completeMention = (candidate: MentionCandidate) => {
+    if (!activeMention || !candidate.active) return;
+    const applied = applyMention(comment, activeMention, candidate);
+    setComment(applied.text);
+    setCaret(applied.caret);
+    setMentionOffFor(null);
+    requestAnimationFrame(() => {
+      const el = commentRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(applied.caret, applied.caret);
+    });
+  };
   const send = async () => {
-    const body = comment.trim();
-    if (!body || readOnly || pending.current) return;
+    const rawBody = comment.trim();
+    if (!rawBody || readOnly || pending.current) return;
+    const body = silentNote && !startsWithNote(rawBody) ? `/note ${rawBody}` : rawBody;
     pending.current = true;
     setBusy(true);
     setError(null);
@@ -54,6 +105,7 @@ export function Activity({
       const result = await api.comment(id, body, rev);
       onWrite(result, `${id} comment`);
       setComment("");
+      setSilentNote(false);
       setPreview(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : t("Comment could not be posted."));
@@ -131,6 +183,17 @@ export function Activity({
             >
               {t(preview ? "Edit comment" : "Preview")}
             </Button>
+            <button
+              type="button"
+              className="composer-silent-toggle ml-auto"
+              aria-pressed={silentNote}
+              disabled={busy}
+              title={t("Silent note — post without notifying members or waking agents")}
+              onClick={() => setSilentNote((v) => !v)}
+            >
+              <span>/note</span>
+              <span>{t("Silent note")}</span>
+            </button>
           </div>
           {preview ? (
             <div className="issue-reader card p-3 text-secondary text-ink-300 min-h-16">
@@ -143,15 +206,46 @@ export function Activity({
               )}
             </div>
           ) : (
-            <textarea
-              id="issue-comment"
-              disabled={busy}
-              className="field w-full !h-auto py-2 text-secondary"
-              rows={3}
-              value={comment}
-              onChange={(e) => setComment(e.target.value)}
-              placeholder={t("Add an update or a question…")}
-            />
+            <div className="relative">
+              {mentionMatches.length > 0 && (
+                <MentionPicker
+                  placement="below"
+                  candidates={mentionMatches}
+                  highlighted={mentionHiClamped}
+                  onHighlight={setMentionHi}
+                  onSelect={completeMention}
+                />
+              )}
+              <textarea
+                ref={commentRef}
+                id="issue-comment"
+                disabled={busy}
+                className="field w-full !h-auto py-2 text-secondary"
+                rows={3}
+                value={comment}
+                onChange={(e) => {
+                  setMentionOffFor(null);
+                  setCaret(e.target.selectionStart ?? e.target.value.length);
+                  setComment(e.target.value);
+                }}
+                onClick={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+                onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+                onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? e.currentTarget.value.length)}
+                onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+                  if (!activeMention) return;
+                  handleMentionKeyDown(e, {
+                    matches: mentionMatches,
+                    selectableIndices,
+                    highlightedIndex: mentionHiClamped,
+                    onHighlight: setMentionHi,
+                    onSelect: completeMention,
+                    onDismiss: () => setMentionOffFor(mentionSpanKey),
+                  });
+                }}
+                placeholder={t("Add an update or a question…")}
+              />
+            </div>
           )}
           {error && (
             <p className="text-secondary text-fail m-0" role="alert">

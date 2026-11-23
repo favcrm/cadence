@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
+import Select from "../../ui/Select";
 import { Bubble, OperatorText } from "../home/ThreadView";
 import { readableAnswer } from "../home/operatorText";
 import Md from "../../ui/Md";
@@ -121,15 +122,17 @@ export function ThreadComposerFrame({
             <button type="button" aria-pressed={mode === "ask"} onClick={() => onMode?.("ask")}>{t("Ask agent")}</button>
           )}
           {mode === "ask" && (
-            <label className="threads-target">
-              <span className="sr-only">{targetLabel}</span>
-              <select value={target} onChange={(e) => onTarget?.(e.target.value)} aria-label={targetLabel}>
-                <option value="">{targetPlaceholder}</option>
-                {targetOptions.map((o) => (
-                  <option key={o.id} value={o.id}>{o.label}</option>
-                ))}
-              </select>
-            </label>
+            <div className="threads-target">
+              <Select
+                searchable
+                size="sm"
+                value={target}
+                onChange={(next) => onTarget?.(next)}
+                options={targetOptions.map((o) => ({ value: o.id, label: o.label }))}
+                placeholder={targetPlaceholder}
+                aria-label={targetLabel}
+              />
+            </div>
           )}
         </div>
       )}

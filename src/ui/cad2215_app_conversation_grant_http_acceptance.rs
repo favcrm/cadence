@@ -2708,3 +2708,8 @@ fn human_room_signed_owner_ask_has_opaque_idempotent_receipt() {
         .unwrap();
     assert_eq!(posts, 1, "one bound Ask post");
 }
+
+#[path = "cad2711_channels_mentions_acceptance.rs"]
+mod cad2711_channels_mentions_acceptance;
+#[path = "cad2711_independent_gate_acceptance.rs"]
+mod cad2711_independent_gate_acceptance;

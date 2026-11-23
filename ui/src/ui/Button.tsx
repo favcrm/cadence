@@ -31,6 +31,7 @@ export type ButtonProps = {
   onClick?: (event: MouseEvent<HTMLButtonElement | HTMLAnchorElement>) => void;
   "aria-label"?: string;
   "aria-pressed"?: boolean | "mixed";
+  "aria-expanded"?: boolean;
 };
 
 function buttonClass(props: ButtonProps): string {
@@ -94,6 +95,7 @@ export function Button(props: ButtonProps) {
         className={className}
         title={tip}
         aria-label={ariaLabel}
+        aria-expanded={props["aria-expanded"]}
         aria-disabled={inactive || undefined}
         aria-busy={loading || undefined}
         tabIndex={inactive ? -1 : undefined}
@@ -118,6 +120,7 @@ export function Button(props: ButtonProps) {
       title={tip}
       aria-label={ariaLabel}
       aria-pressed={props["aria-pressed"]}
+      aria-expanded={props["aria-expanded"]}
       aria-busy={loading || undefined}
       disabled={inactive || undefined}
       onClick={onClick}

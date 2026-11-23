@@ -195,6 +195,13 @@ dialog.notification-popover.notification-settings[open] { display: block; }
   outline: 2px solid var(--color-accent);
   outline-offset: 3px;
 }
+.notification-toast-stack {
+  right: 22px;
+  bottom: 22px;
+  z-index: 50;
+  display: grid;
+  gap: 8px;
+}
 .notification-toast {
   display: flex;
   align-items: flex-start;
@@ -211,6 +218,10 @@ dialog.notification-popover.notification-settings[open] { display: block; }
 .notification-toast strong { color: var(--color-ink-100); font-size: var(--text-secondary); font-weight: 500; }
 .notification-toast p { margin-block: .25rem; color: var(--color-ink-400); font-size: var(--text-label); }
 .notification-toast .lnk { font-size: var(--text-label); }
+
+body:has(dialog.threads-context-sheet[open], dialog.threads-create-sheet[open]) .notification-toast-stack {
+  display: none;
+}
 
 @media (max-width: 640px) {
   .notification-anchor { position: static; }
