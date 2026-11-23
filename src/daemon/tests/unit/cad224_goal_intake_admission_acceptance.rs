@@ -418,6 +418,11 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             true,
         )
         .unwrap();
+    shared.store.check_monitor("cad224-monitor", 10.0).unwrap();
+    assert_eq!(
+        shared.store.monitor("cad224-monitor").unwrap().state,
+        "active"
+    );
     let job_request =
         json!({"task": "cad224-job-t1", "by": "worker-1", "message": "cad224-job-message"});
     let accepted_job = shared.rpc_task_dispatch(&job_request).unwrap();
@@ -465,67 +470,68 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let exercise_race = |attempt: &dyn Fn() -> crate::error::Result<Value>,
-                         message: Option<&str>| {
-        let before_head = git(&pm_dir, &["rev-parse", "HEAD"]);
-        let before_issue = std::fs::read(issue_dir.join("issue.md")).unwrap();
-        let before_lanes = lane_inventory();
-        let before_lane_head = git(&lane, &["rev-parse", "HEAD"]);
-        let before_task = shared.store.task("cad224-fresh-task").unwrap().to_json();
-        let queues =
-            ["worker-1", "worker-2"].map(|alias| shared.store.queued_count(alias).unwrap());
-        let seen = std::rc::Rc::new(std::cell::Cell::new(false));
-        let observed = std::rc::Rc::clone(&seen);
-        let source_repo = repo.clone();
-        crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
-            if point != "intake-pre-enqueue" {
-                return;
-            }
-            assert!(!observed.replace(true), "enqueue seam ran twice");
-            std::fs::write(source_repo.join("docs/scope.md"), "Changed at enqueue\n").unwrap();
-            git(&source_repo, &["add", "docs/scope.md"]);
-            git(
-                &source_repo,
-                &["commit", "-qm", "Change scope before enqueue"],
+    let exercise_race =
+        |route: &str, attempt: &dyn Fn() -> crate::error::Result<Value>, message: Option<&str>| {
+            let before_head = git(&pm_dir, &["rev-parse", "HEAD"]);
+            let before_issue = std::fs::read(issue_dir.join("issue.md")).unwrap();
+            let before_lanes = lane_inventory();
+            let before_lane_head = git(&lane, &["rev-parse", "HEAD"]);
+            let before_task = shared.store.task("cad224-fresh-task").unwrap().to_json();
+            let queues =
+                ["worker-1", "worker-2"].map(|alias| shared.store.queued_count(alias).unwrap());
+            let seen = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = std::rc::Rc::clone(&seen);
+            let source_repo = repo.clone();
+            crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+                if point != "intake-pre-enqueue" {
+                    return;
+                }
+                assert!(!observed.replace(true), "enqueue seam ran twice");
+                std::fs::write(source_repo.join("docs/scope.md"), "Changed at enqueue\n").unwrap();
+                git(&source_repo, &["add", "docs/scope.md"]);
+                git(
+                    &source_repo,
+                    &["commit", "-qm", "Change scope before enqueue"],
+                );
+            })));
+            let result = attempt();
+            crate::issue::lockseam::set_hook(None);
+            assert!(
+                seen.get(),
+                "{route}: fresh preparation did not reach the enqueue seam; result: {result:?}"
             );
-        })));
-        let result = attempt();
-        crate::issue::lockseam::set_hook(None);
-        assert!(
-            seen.get(),
-            "fresh preparation did not reach the enqueue seam"
-        );
-        let refusal = result.unwrap_err();
-        assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
-        if let Some(message) = message {
-            assert!(!shared.store.message_exists(message).unwrap());
-        }
-        assert!(shared
-            .store
-            .messages_for_task("cad224-fresh-task")
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            shared.store.task("cad224-fresh-task").unwrap().to_json(),
-            before_task
-        );
-        assert_eq!(
-            ["worker-1", "worker-2"].map(|alias| shared.store.queued_count(alias).unwrap()),
-            queues
-        );
-        assert_eq!(git(&pm_dir, &["rev-parse", "HEAD"]), before_head);
-        assert_eq!(
-            std::fs::read(issue_dir.join("issue.md")).unwrap(),
-            before_issue
-        );
-        assert_eq!(lane_inventory(), before_lanes);
-        assert_eq!(git(&lane, &["rev-parse", "HEAD"]), before_lane_head);
-        std::fs::write(repo.join("docs/scope.md"), "Approved scope\n").unwrap();
-        git(&repo, &["add", "docs/scope.md"]);
-        git(&repo, &["commit", "-qm", "Restore approved scope"]);
-    };
+            let refusal = result.unwrap_err();
+            assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+            if let Some(message) = message {
+                assert!(!shared.store.message_exists(message).unwrap());
+            }
+            assert!(shared
+                .store
+                .messages_for_task("cad224-fresh-task")
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                shared.store.task("cad224-fresh-task").unwrap().to_json(),
+                before_task
+            );
+            assert_eq!(
+                ["worker-1", "worker-2"].map(|alias| shared.store.queued_count(alias).unwrap()),
+                queues
+            );
+            assert_eq!(git(&pm_dir, &["rev-parse", "HEAD"]), before_head);
+            assert_eq!(
+                std::fs::read(issue_dir.join("issue.md")).unwrap(),
+                before_issue
+            );
+            assert_eq!(lane_inventory(), before_lanes);
+            assert_eq!(git(&lane, &["rev-parse", "HEAD"]), before_lane_head);
+            std::fs::write(repo.join("docs/scope.md"), "Approved scope\n").unwrap();
+            git(&repo, &["add", "docs/scope.md"]);
+            git(&repo, &["commit", "-qm", "Restore approved scope"]);
+        };
     let direct_message = "cad224-late-direct";
     exercise_race(
+        "direct",
         &|| {
             scoped(Asserted::Operator, || {
                 shared.rpc_dispatch_send(
@@ -546,6 +552,7 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     );
     let job_message = "cad224-late-job";
     exercise_race(
+        "job",
         &|| {
             shared.rpc_task_dispatch(&json!({
                 "task": "cad224-fresh-task",
@@ -557,6 +564,11 @@ fn fresh_dispatch_refuses_stale_approved_intake_evidence() {
     );
     for automatic in [false, true] {
         exercise_race(
+            if automatic {
+                "automatic monitor"
+            } else {
+                "manual monitor"
+            },
             &|| shared.monitor_dispatch_task("cad224-monitor", "cad224-fresh-task", automatic),
             None,
         );
