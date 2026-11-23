@@ -16,6 +16,18 @@
 .issue-evidence-drawer .cv-source, .issue-evidence-drawer .cv-source .codeblock,
 .issue-evidence-drawer .cv-source pre { min-width: 0; max-width: 100%; }
 .issue-evidence-drawer .cv-source pre { overflow-x: auto; }
+/* Preserve readable columns; the existing focusable wrapper owns overflow. */
+.issue-evidence-drawer [data-artifact-view="md"] .md-table-wrap > table {
+  inline-size: max-content;
+  min-inline-size: 100%;
+  max-inline-size: none;
+  overflow: visible;
+}
+.issue-evidence-drawer [data-artifact-view="md"] .md-table-wrap :is(th, td) {
+  max-inline-size: 32ch;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .issue-evidence-drawer .canvas-frame { width: 100%; min-height: 28rem; max-width: 100%; }
 .issue-evidence-drawer .cv-foot { margin-top: 1rem; }
 .issue-evidence-image-view img { display: block; max-width: 100%; height: auto; margin: 0 auto 1rem; }
