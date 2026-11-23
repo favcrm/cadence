@@ -329,6 +329,29 @@ fn cad2711_creator_and_owner_manage_members_auto_upgrade_and_scope_audit_events(
         0,
         "audit events must not pollute topic_posts"
     );
+
+    // Owner can also remove the added shared agent via DELETE /members/agent/:uid.
+    room_ok(
+        &rig,
+        &owner,
+        "DELETE",
+        &format!("{path}/members/agent/{worker_uid}"),
+        None,
+    );
+    let after_agent_remove = room_ok(&rig, &owner, "GET", &path, None);
+    assert!(
+        !after_agent_remove["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["kind"] == "agent" && m["id"] == worker_uid),
+        "removed shared agent must disappear from members"
+    );
+    assert_eq!(
+        after_agent_remove["events"].as_array().unwrap().len(),
+        4,
+        "agent removal appends fourth audit event"
+    );
 }
 
 #[test]
@@ -349,8 +372,9 @@ fn cad2711_personal_assistant_excluded_from_catalog_create_and_invite() {
     let ana = login(&rig, "ana", "member");
     roster.lock().unwrap().allowed_cookies = vec![ana.clone()];
 
-    // assist-agent-ben is bound in `assistants`; shareable-worker is not.
+    // assist-agent-ben is bound in `assistants`; `master` is the workspace assistant; shareable-worker is shareable.
     let assist_ben_uid = register_shareable_agent(&rig, "assist-agent-ben");
+    let master_uid = register_shareable_agent(&rig, "master");
     let shareable_uid = register_shareable_agent(&rig, "shareable-worker");
 
     let catalog = room_ok(&rig, &ana, "GET", "/api/human-threads/agents", None);
@@ -365,22 +389,28 @@ fn cad2711_personal_assistant_excluded_from_catalog_create_and_invite() {
         !agents.iter().any(|a| a["alias"] == "assist-agent-ben"),
         "personal assistant must never appear in shared channel agent catalog: {agents:?}"
     );
-
-    let (create_status, create_err) = room_http(
-        &rig,
-        &ana,
-        "POST",
-        "/api/human-threads/groups",
-        Some(json!({
-            "kind": "mixed_group",
-            "title": "Blocked Assistant",
-            "client_id": "bad-asst-create",
-            "humans": [],
-            "agents": [assist_ben_uid]
-        })),
+    assert!(
+        !agents.iter().any(|a| a["alias"] == "master"),
+        "master personal assistant must never appear in shared channel agent catalog: {agents:?}"
     );
-    assert_eq!(create_status, 400, "{create_err}");
-    assert_eq!(create_err["code"], "personal_assistant_excluded");
+
+    for (label, blocked_uid) in [("assist-ben", &assist_ben_uid), ("master", &master_uid)] {
+        let (create_status, create_err) = room_http(
+            &rig,
+            &ana,
+            "POST",
+            "/api/human-threads/groups",
+            Some(json!({
+                "kind": "mixed_group",
+                "title": "Blocked Assistant",
+                "client_id": format!("bad-asst-create-{label}"),
+                "humans": [],
+                "agents": [blocked_uid]
+            })),
+        );
+        assert_eq!(create_status, 400, "{label}: {create_err}");
+        assert_eq!(create_err["code"], "personal_assistant_excluded");
+    }
 
     let group = room_ok(
         &rig,
@@ -396,15 +426,17 @@ fn cad2711_personal_assistant_excluded_from_catalog_create_and_invite() {
         })),
     );
     let room = group["room"].as_str().unwrap();
-    let (inv_status, inv_err) = room_http(
-        &rig,
-        &ana,
-        "POST",
-        &format!("/api/human-threads/rooms/{room}/members"),
-        Some(json!({ "agent_uid": assist_ben_uid })),
-    );
-    assert_eq!(inv_status, 400, "{inv_err}");
-    assert_eq!(inv_err["code"], "personal_assistant_excluded");
+    for blocked_uid in [&assist_ben_uid, &master_uid] {
+        let (inv_status, inv_err) = room_http(
+            &rig,
+            &ana,
+            "POST",
+            &format!("/api/human-threads/rooms/{room}/members"),
+            Some(json!({ "agent_uid": blocked_uid })),
+        );
+        assert_eq!(inv_status, 400, "{inv_err}");
+        assert_eq!(inv_err["code"], "personal_assistant_excluded");
+    }
 }
 
 #[test]
@@ -570,6 +602,8 @@ fn cad2711_channel_mention_preserves_caller_authority_never_escalating_member() 
         r.allowed_cookies = vec![ana.clone()];
     }
     let worker_uid = register_shareable_agent(&rig, "auth-worker");
+    let hop_uid = register_shareable_agent(&rig, "auth-hop");
+    let _other_uid = register_shareable_agent(&rig, "other-worker");
     let ana_actor =
         crate::store::human_threads::VerifiedHuman::verified(&rig.issuer, ORG, "ana").unwrap();
     let owner_actor =
@@ -586,10 +620,17 @@ fn cad2711_channel_mention_preserves_caller_authority_never_escalating_member() 
             "title": "Authority Separation",
             "client_id": "auth-sep-room",
             "humans": ["ana"],
-            "agents": [worker_uid]
+            "agents": [worker_uid, hop_uid]
         })),
     );
     let room = group["room"].as_str().unwrap();
+    let topic: String = room_fixture_db(&rig)
+        .query_row(
+            "SELECT topic_id FROM human_rooms WHERE id=?1",
+            [room],
+            |r| r.get(0),
+        )
+        .unwrap();
 
     let mem_post = room_post(&rig, &ana, room, "mem-ask-1", "Member ask @auth-worker");
     assert_eq!(mem_post["post"]["outcomes"][0]["kind"], "queued");
@@ -629,6 +670,63 @@ fn cad2711_channel_mention_preserves_caller_authority_never_escalating_member() 
         mem_operator_entries, 0,
         "member @mention must never record an operator thread entry"
     );
+
+    // Runtime execution under a running member-triggered channel turn refuses
+    // privileged RPCs (agent_send, agent_register) while allowing topic_publish
+    // and preserving `authority_mode = "member"` across a second hop.
+    db.execute(
+        "UPDATE messages SET state='running' WHERE id=?1",
+        [mem_msg_id.as_str()],
+    )
+    .unwrap();
+    let denied_send = scoped(Asserted::Agent("auth-worker".to_string()), || {
+        crate::client::rpc(
+            rig._dir.path(),
+            "agent_send",
+            json!({ "alias": "other-worker", "text": "escalate", "message": "esc-send-1" }),
+        )
+    })
+    .expect_err("member channel turn must refuse privileged agent_send");
+    assert_eq!(denied_send.code(), Some("member_authority_refused"));
+
+    let denied_reg = scoped(Asserted::Agent("auth-worker".to_string()), || {
+        crate::client::rpc(
+            rig._dir.path(),
+            "agent_register",
+            json!({ "alias": "rogue-worker", "provider": "fake", "role": "worker" }),
+        )
+    })
+    .expect_err("member channel turn must refuse agent_register");
+    assert_eq!(denied_reg.code(), Some("member_authority_refused"));
+
+    let hop = agent_topic_publish(
+        &rig,
+        "auth-worker",
+        &topic,
+        "member-hop-1",
+        "Handing off @auth-hop",
+    )
+    .expect("topic_publish in same channel must succeed");
+    assert_eq!(hop["deliveries"].as_array().unwrap().len(), 1);
+    let hop_msg_id = hop["deliveries"][0]["message"].as_str().unwrap();
+    let (hop_src, hop_actor, hop_mode): (String, String, String) = db
+        .query_row(
+            "SELECT m.source, pr.origin_actor, pr.authority_mode
+               FROM human_room_post_requests pr
+               JOIN messages m ON m.id=pr.message_id
+              WHERE pr.message_id=?1",
+            [hop_msg_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(hop_src, "member");
+    assert_eq!(hop_actor, ana_actor.id);
+    assert_eq!(hop_mode, "member");
+    db.execute(
+        "UPDATE messages SET state='completed' WHERE id=?1",
+        [mem_msg_id.as_str()],
+    )
+    .unwrap();
 
     let (own_msg_id, own_src, own_sender, own_actor, own_mode): (
         String,
@@ -751,4 +849,84 @@ fn cad2711_human_turn_brake_blocks_third_agent_hop_until_human_resets() {
     let hop4 = agent_topic_publish(&rig, "hop-a", &topic, "hop-4", "Back on track")
         .expect("agent turn must resume after human post");
     assert_eq!(hop4["chain_count"], 1);
+}
+
+#[test]
+fn cad2711_multi_agent_post_retry_recovers_missing_meta_and_pending_dispatches() {
+    let roster = Arc::new(Mutex::new(GrantRoster {
+        target_present: true,
+        ..GrantRoster::default()
+    }));
+    let (observer, _events) = queue_observer();
+    let rig = grant_rig(
+        Arc::new(AtomicBool::new(true)),
+        roster.clone(),
+        observer,
+        None,
+        None,
+    );
+    let _keys = initialize_queue_keyring(&rig);
+    let ana = login(&rig, "ana", "member");
+    roster.lock().unwrap().allowed_cookies = vec![ana.clone()];
+    let w1 = register_shareable_agent(&rig, "retry-a");
+    let w2 = register_shareable_agent(&rig, "retry-b");
+
+    let group = room_ok(
+        &rig,
+        &ana,
+        "POST",
+        "/api/human-threads/groups",
+        Some(json!({
+            "kind": "mixed_group",
+            "title": "Retry Recovery",
+            "client_id": "retry-recovery-room",
+            "humans": [],
+            "agents": [w1, w2]
+        })),
+    );
+    let room = group["room"].as_str().unwrap();
+    let body = "Ping @retry-a and @retry-b";
+    let first = room_post(&rig, &ana, room, "multi-retry-1", body);
+    let post_id = first["post"]["id"].as_str().unwrap();
+    assert_eq!(first["post"]["outcomes"].as_array().unwrap().len(), 2);
+
+    // Simulate a partial mid-loop failure where @retry-a queued before meta committed.
+    let db = room_fixture_db(&rig);
+    let w2_msg_id: String = db
+        .query_row(
+            "SELECT message_id FROM human_room_post_requests WHERE post_id=?1 AND agent_uid=?2",
+            rusqlite::params![post_id, &w2],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "DELETE FROM human_room_post_meta WHERE post_id=?1",
+        [post_id],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM human_room_post_requests WHERE post_id=?1 AND agent_uid=?2",
+        rusqlite::params![post_id, &w2],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM thread_entries WHERE message_id=?1",
+        [&w2_msg_id],
+    )
+    .unwrap();
+    db.execute("DELETE FROM messages WHERE id=?1", [&w2_msg_id])
+        .unwrap();
+
+    // Re-posting with the same client_id recovers @retry-b and persists outcomes without duplicating @retry-a.
+    let retried = room_post(&rig, &ana, room, "multi-retry-1", body);
+    assert_eq!(retried["created"], false);
+    let outcomes = retried["post"]["outcomes"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    let total_msgs: i64 = db
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        total_msgs, 2,
+        "retry must enqueue @retry-b once without duplicating @retry-a"
+    );
 }

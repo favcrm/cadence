@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type ResourceState } from "../../lib/cache";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
@@ -10,6 +10,7 @@ import {
   applyMention,
   filterMentionCandidates,
   findActiveMention,
+  startsWithNote,
   type MentionCandidate,
 } from "../mentions/mentions";
 import { timelineRows } from "./model";
@@ -49,6 +50,7 @@ export function Activity({
 }) {
   const { t, formatDate } = useLocale();
   const [comment, setComment] = useState("");
+  const [silentNote, setSilentNote] = useState(false);
   const [preview, setPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -62,6 +64,9 @@ export function Activity({
       ? findActiveMention(comment, caret)
       : null;
   const mentionSpanKey = activeMention ? `${activeMention.start}:${activeMention.query}` : null;
+  useEffect(() => {
+    setMentionHi(0);
+  }, [mentionSpanKey]);
   const mentionMatches =
     activeMention && mentionCandidates && mentionSpanKey !== mentionOffFor
       ? filterMentionCandidates(mentionCandidates, activeMention.query)
@@ -89,8 +94,9 @@ export function Activity({
     });
   };
   const send = async () => {
-    const body = comment.trim();
-    if (!body || readOnly || pending.current) return;
+    const rawBody = comment.trim();
+    if (!rawBody || readOnly || pending.current) return;
+    const body = silentNote && !startsWithNote(rawBody) ? `/note ${rawBody}` : rawBody;
     pending.current = true;
     setBusy(true);
     setError(null);
@@ -98,6 +104,7 @@ export function Activity({
       const result = await api.comment(id, body, rev);
       onWrite(result, `${id} comment`);
       setComment("");
+      setSilentNote(false);
       setPreview(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : t("Comment could not be posted."));
@@ -175,6 +182,17 @@ export function Activity({
             >
               {t(preview ? "Edit comment" : "Preview")}
             </Button>
+            <button
+              type="button"
+              className="composer-silent-toggle ml-auto"
+              aria-pressed={silentNote}
+              disabled={busy}
+              title={t("Silent note — post without notifying members or waking agents")}
+              onClick={() => setSilentNote((v) => !v)}
+            >
+              <span>/note</span>
+              <span>{t("Silent note")}</span>
+            </button>
           </div>
           {preview ? (
             <div className="issue-reader card p-3 text-secondary text-ink-300 min-h-16">

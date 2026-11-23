@@ -587,7 +587,8 @@ impl Shared {
             explicit_silent,
         )?;
 
-        let meta = if created {
+        let needs_dispatch = created || !self.store.human_room_has_post_meta(&post.id)?;
+        let meta = if needs_dispatch {
             let parsed = crate::store::mentions::parse_mentions(body, explicit_silent);
             let active_agents = self
                 .store
@@ -630,6 +631,40 @@ impl Shared {
                     || crate::store::mentions::human_handle_matches(&m.name, h)
                     || crate::store::mentions::human_handle_matches(&m.subject_id, h)
             };
+            let matching_active_humans = |h: &str| {
+                let mut seen = std::collections::HashSet::new();
+                let mut matched = Vec::new();
+                for (hid, name) in &active_humans {
+                    let hit = hid.eq_ignore_ascii_case(h)
+                        || (!name.is_empty()
+                            && (name.trim().eq_ignore_ascii_case(h)
+                                || crate::store::mentions::human_handle_matches(name, h)));
+                    if hit && seen.insert(hid.clone()) {
+                        let label = if name.trim().is_empty() {
+                            hid.clone()
+                        } else {
+                            name.clone()
+                        };
+                        matched.push(label);
+                    }
+                }
+                for m in &current.roster.members {
+                    if let Some(hid) = roster_member_id(&m.subject_id) {
+                        if active_human_ids.contains(hid.as_str())
+                            && roster_matches_handle(m, h)
+                            && seen.insert(hid)
+                        {
+                            let label = if m.name.trim().is_empty() {
+                                m.subject_id.clone()
+                            } else {
+                                m.name.clone()
+                            };
+                            matched.push(label);
+                        }
+                    }
+                }
+                matched
+            };
 
             for handle in &parsed.handles {
                 if let Some((uid, alias)) = active_agents
@@ -644,10 +679,6 @@ impl Shared {
                             reason: Some("Posted silently (/note)".to_string()),
                         });
                     } else {
-                        let req_id = crate::store::topic_request_id(
-                            &scope.topic,
-                            &format!("{client_id}:{uid}"),
-                        );
                         let queued = format!(
                             "[{ROOM_TOPIC_TYPE}] Teammate @mentioned you in a channel (origin: {origin}, authority: {authority_mode}). \
                              Read it: `cadence topic read {topic}`. Reply in the same channel: \
@@ -657,44 +688,23 @@ impl Shared {
                             topic = scope.topic,
                             post_id = post.id,
                         );
-                        let binding = if primary_unbound {
-                            primary_unbound = false;
-                            Some(super::messages_rpc::SendBinding::TopicPost(&post.id))
-                        } else {
-                            None
-                        };
-                        let send = json!({
-                            "alias": alias,
-                            "text": queued,
-                            "message": req_id,
-                            "source": source_tag
-                        });
-                        let member_actor = current.actor.id.clone();
-                        self.send_with_human_expected(
-                            &send,
-                            &|_| {
-                                if use_owner_authority {
-                                    Ok(crate::store::Sender::OperatorChat)
-                                } else {
-                                    Ok(crate::store::Sender::Member(member_actor.clone()))
-                                }
-                            },
-                            &|verb| {
-                                Err(Error::rejected(format!(
-                                    "{verb} refused: this send carries no caller to steer with"
-                                )))
-                            },
-                            None,
-                            Some(uid),
-                            binding,
-                        )?;
-                        self.store.human_room_bind_post_request(
-                            &post.id,
-                            uid,
-                            &req_id,
-                            &current.actor.id,
+                        self.dispatch_channel_agent_mention(ChannelAgentDispatch {
+                            topic: &scope.topic,
+                            post_id: &post.id,
+                            client_id,
+                            agent_uid: uid,
+                            agent_alias: alias,
+                            queued_text: &queued,
+                            source_tag,
+                            origin_actor: &current.actor.id,
                             authority_mode,
-                        )?;
+                            sender: if use_owner_authority {
+                                crate::store::Sender::OperatorChat
+                            } else {
+                                crate::store::Sender::Member(current.actor.id.clone())
+                            },
+                            primary_unbound: &mut primary_unbound,
+                        })?;
                         outcomes.push(crate::store::mentions::MentionOutcome {
                             kind: "queued".to_string(),
                             handle: format!("@{alias}"),
@@ -706,82 +716,57 @@ impl Shared {
                             }),
                         });
                     }
-                } else if let Some(human_label) = active_humans
-                    .iter()
-                    .find_map(|(hid, name)| {
-                        let matched = hid.eq_ignore_ascii_case(handle)
-                            || (!name.is_empty()
-                                && (name.trim().eq_ignore_ascii_case(handle)
-                                    || crate::store::mentions::human_handle_matches(name, handle)));
-                        matched.then(|| {
-                            if name.trim().is_empty() {
-                                hid.clone()
-                            } else {
-                                name.clone()
-                            }
-                        })
-                    })
-                    .or_else(|| {
-                        current.roster.members.iter().find_map(|m| {
-                            let is_active = roster_member_id(&m.subject_id)
-                                .is_some_and(|hid| active_human_ids.contains(hid.as_str()));
-                            (is_active && roster_matches_handle(m, handle)).then(|| {
-                                if m.name.trim().is_empty() {
-                                    m.subject_id.clone()
+                } else {
+                    let matched_humans = matching_active_humans(handle);
+                    if !matched_humans.is_empty() {
+                        for human_label in matched_humans {
+                            outcomes.push(crate::store::mentions::MentionOutcome {
+                                kind: if parsed.silent { "silent" } else { "notified" }.to_string(),
+                                handle: format!("@{handle}"),
+                                label: human_label,
+                                reason: Some(if parsed.silent {
+                                    "Silent note (/note)".to_string()
                                 } else {
-                                    m.name.clone()
-                                }
-                            })
-                        })
-                    })
-                {
-                    outcomes.push(crate::store::mentions::MentionOutcome {
-                        kind: if parsed.silent { "silent" } else { "notified" }.to_string(),
-                        handle: format!("@{handle}"),
-                        label: human_label,
-                        reason: Some(if parsed.silent {
-                            "Silent note (/note)".to_string()
+                                    "Notified (bell inbox · assistant stays isolated)".to_string()
+                                }),
+                            });
+                        }
+                    } else if let Some((_, alias)) = shareable_agents
+                        .iter()
+                        .find(|(_, a)| a.eq_ignore_ascii_case(handle))
+                    {
+                        if room_kind == crate::store::human_threads::KIND_DM {
+                            outcomes.push(crate::store::mentions::MentionOutcome {
+                                kind: "blocked_dm".to_string(),
+                                handle: format!("@{alias}"),
+                                label: alias.clone(),
+                                reason: Some("Shared agents are excluded from 1:1 DMs".to_string()),
+                            });
                         } else {
-                            "Notified (bell inbox · assistant stays isolated)".to_string()
-                        }),
-                    });
-                } else if let Some((_, alias)) = shareable_agents
-                    .iter()
-                    .find(|(_, a)| a.eq_ignore_ascii_case(handle))
-                {
-                    if room_kind == crate::store::human_threads::KIND_DM {
-                        outcomes.push(crate::store::mentions::MentionOutcome {
-                            kind: "blocked_dm".to_string(),
-                            handle: format!("@{alias}"),
-                            label: alias.clone(),
-                            reason: Some("Shared agents are excluded from 1:1 DMs".to_string()),
-                        });
-                    } else {
+                            outcomes.push(crate::store::mentions::MentionOutcome {
+                                kind: "blocked_acl".to_string(),
+                                handle: format!("@{alias}"),
+                                label: alias.clone(),
+                                reason: Some("Not added to this channel".to_string()),
+                            });
+                        }
+                    } else if let Some(member) = current.roster.members.iter().find(|m| {
+                        let is_active = roster_member_id(&m.subject_id)
+                            .is_some_and(|hid| active_human_ids.contains(hid.as_str()));
+                        !is_active && roster_matches_handle(m, handle)
+                    }) {
                         outcomes.push(crate::store::mentions::MentionOutcome {
                             kind: "blocked_acl".to_string(),
-                            handle: format!("@{alias}"),
-                            label: alias.clone(),
-                            reason: Some("Not added to this channel".to_string()),
+                            handle: format!("@{handle}"),
+                            label: member.name.clone(),
+                            reason: Some("Not a member of this channel".to_string()),
                         });
                     }
-                } else if let Some(member) = current.roster.members.iter().find(|m| {
-                    let is_active = roster_member_id(&m.subject_id)
-                        .is_some_and(|hid| active_human_ids.contains(hid.as_str()));
-                    !is_active && roster_matches_handle(m, handle)
-                }) {
-                    outcomes.push(crate::store::mentions::MentionOutcome {
-                        kind: "blocked_acl".to_string(),
-                        handle: format!("@{handle}"),
-                        label: member.name.clone(),
-                        reason: Some("Not a member of this channel".to_string()),
-                    });
                 }
             }
 
-            if parsed.silent || !outcomes.is_empty() {
-                self.store
-                    .human_room_save_post_meta(&post.id, parsed.silent, &outcomes)?;
-            }
+            self.store
+                .human_room_save_post_meta(&post.id, parsed.silent, &outcomes)?;
             crate::store::human_threads::HumanPostMeta {
                 silent: parsed.silent,
                 outcomes,
@@ -980,24 +965,80 @@ impl Shared {
         let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
         let is_owner = current.self_role == "owner";
         let room = room_param(params)?;
-        if let Some(subject) = optional_str(params, "human_subject") {
-            let peer = roster_peer(&current, subject)?;
-            self.store
-                .human_group_add_human(&current.actor, is_owner, room, &peer.id)?;
-        } else if let Some(uid) = optional_str(params, "agent_uid") {
-            let alias = self
-                .store
-                .alias_of_uid(uid)?
-                .ok_or_else(|| Error::rejected("Agent not found"))?;
-            self.store
-                .human_group_add_agent(&current.actor, is_owner, room, &alias)?;
-        } else {
-            return Err(Error::invalid(
-                "invalid_request",
-                "name a human_subject or an agent_uid",
-            ));
+        match (
+            optional_str(params, "human_subject"),
+            optional_str(params, "agent_uid"),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "name either human_subject or agent_uid, not both",
+                ));
+            }
+            (Some(subject), None) => {
+                let peer = roster_peer(&current, subject)?;
+                self.store
+                    .human_group_add_human(&current.actor, is_owner, room, &peer.id)?;
+            }
+            (None, Some(uid)) => {
+                let alias = self
+                    .store
+                    .alias_of_uid(uid)?
+                    .ok_or_else(|| Error::rejected("Agent not found"))?;
+                self.store
+                    .human_group_add_agent(&current.actor, is_owner, room, &alias)?;
+            }
+            (None, None) => {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "name a human_subject or an agent_uid",
+                ));
+            }
         }
         Ok(json!({"ok": true}))
+    }
+
+    pub(super) fn dispatch_channel_agent_mention(
+        self: &Arc<Self>,
+        args: ChannelAgentDispatch<'_>,
+    ) -> Result<String> {
+        let req_id = crate::store::topic_request_id(
+            args.topic,
+            &format!("{}:{}", args.client_id, args.agent_uid),
+        );
+        let binding = if *args.primary_unbound {
+            *args.primary_unbound = false;
+            Some(super::messages_rpc::SendBinding::TopicPost(args.post_id))
+        } else {
+            None
+        };
+        let send = json!({
+            "alias": args.agent_alias,
+            "text": args.queued_text,
+            "message": req_id,
+            "source": args.source_tag
+        });
+        let sender = args.sender;
+        self.send_with_human_expected(
+            &send,
+            &|_| Ok(sender.clone()),
+            &|verb| {
+                Err(Error::rejected(format!(
+                    "{verb} refused: this send carries no steering authority"
+                )))
+            },
+            None,
+            Some(args.agent_uid),
+            binding,
+        )?;
+        self.store.human_room_bind_post_request(
+            args.post_id,
+            args.agent_uid,
+            &req_id,
+            args.origin_actor,
+            args.authority_mode,
+        )?;
+        Ok(req_id)
     }
 
     /// `human_room_remove {token, room, kind, member}` — channel creator or
@@ -1012,6 +1053,20 @@ impl Shared {
             .human_group_remove(&current.actor, is_owner, room, kind, member)?;
         Ok(json!({"ok": true}))
     }
+}
+
+pub(super) struct ChannelAgentDispatch<'a> {
+    pub topic: &'a str,
+    pub post_id: &'a str,
+    pub client_id: &'a str,
+    pub agent_uid: &'a str,
+    pub agent_alias: &'a str,
+    pub queued_text: &'a str,
+    pub source_tag: &'a str,
+    pub origin_actor: &'a str,
+    pub authority_mode: &'a str,
+    pub sender: crate::store::Sender,
+    pub primary_unbound: &'a mut bool,
 }
 
 /// Refuse any field the delivery RPC does not name. A caller-chosen endpoint,

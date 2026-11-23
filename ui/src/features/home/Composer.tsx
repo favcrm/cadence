@@ -32,6 +32,9 @@ export default function Composer({
   textareaId,
   onArrowUpEmpty,
   mentionCandidates,
+  allowNote,
+  onDraftChange,
+  beforeSend,
 }: {
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
@@ -47,6 +50,9 @@ export default function Composer({
   textareaId?: string;
   onArrowUpEmpty?: () => boolean;
   mentionCandidates?: MentionCandidate[];
+  allowNote?: boolean;
+  onDraftChange?: (draft: string) => void;
+  beforeSend?: (body: string) => boolean;
 }) {
   const { placeholder, ariaLabel } = useAssistantComposerLabels();
   return (
@@ -66,6 +72,9 @@ export default function Composer({
       textareaId={textareaId}
       onArrowUpEmpty={onArrowUpEmpty}
       mentionCandidates={mentionCandidates}
+      allowNote={allowNote}
+      onDraftChange={onDraftChange}
+      beforeSend={beforeSend}
       attach={{
         enabled: attachEnabled,
         reason: attachReason,

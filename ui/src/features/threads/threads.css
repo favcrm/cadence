@@ -37,6 +37,9 @@
   .threads-layout {
     grid-template-columns: minmax(0, 16rem) minmax(0, 1fr) minmax(0, 18rem);
   }
+  .threads-layout:has(> .threads-context.is-collapsed) {
+    grid-template-columns: minmax(0, 16rem) minmax(0, 1fr);
+  }
 }
 .threads-list,
 .threads-main,
@@ -577,13 +580,11 @@
   color: inherit;
   font: inherit;
 }
-.threads-context-toggle {
+.threads-context.is-collapsed {
   display: none;
 }
-@media (max-width: 1279px) {
-  .threads-context-toggle {
-    display: inline-flex;
-  }
+.threads-context-toggle {
+  display: inline-flex;
 }
 .threads-create-sheet,
 .threads-context-sheet {
@@ -1092,4 +1093,53 @@
   color: var(--color-ink-500);
   font-size: var(--text-micro);
 }
+.threads-context-section + .threads-context-section {
+  margin-top: 1.15rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--color-ink-800);
+}
+.threads-guardrails {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.55rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-300);
+}
+.threads-guardrails li {
+  display: grid;
+  gap: 0.12rem;
+}
+.threads-guardrails strong {
+  color: var(--color-ink-100);
+  font-weight: 600;
+}
+.threads-guardrails span {
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+}
+.threads-remove-card {
+  display: grid;
+  gap: 0.5rem;
+}
+.threads-remove-target {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: 0.45rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-900);
+}
+.threads-remove-target-copy {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+}
+.threads-remove-role {
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+}
+
 

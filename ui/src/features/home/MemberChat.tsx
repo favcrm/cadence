@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
+import { navigate } from "../../lib/useLocation";
 import { useQuery, useResource } from "../../lib/useResource";
+import { HomeMentionHandoffCard, findMentionedTeammates } from "../mentions/HomeMentionHandoff";
+import { teammateMentionCandidates, useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import { useTranslate } from "../../lib/locale";
 import { onThreadReload } from "../../lib/masterChanged";
 import { displayUiNotice } from "../../lib/uiNotice";
@@ -117,6 +120,10 @@ export default function MemberChat({
 }) {
   const t = useTranslate();
   const roster = useQuery(resources.agents);
+  const teammates = useWorkspaceTeammates(true);
+  const [draftText, setDraftText] = useState("");
+  const [handoffHold, setHandoffHold] = useState(false);
+  const approvedPrivateDraftRef = useRef<string | null>(null);
   const store = memberThreadStore(scope);
   const thread = useResource(store);
   // The member scope is never named in stream-resource invalidations
@@ -604,22 +611,71 @@ export default function MemberChat({
             {sendNote !== null && (
               <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
             )}
-            <SharedComposer
-              density="full"
-              storeKey={`member-assist:${scope}`}
-              block={readOnly ? t("The board is read-only.") : null}
-              commands={[WORKSPACE_SKILLS_COMMAND]}
-              mentionCandidates={(roster.data?.agents ?? [])
-                .filter((a) => !a.inbox && a.provider !== "inbox" && !a.dead && a.alias !== surface?.alias && a.alias !== "master")
-                .map((a) => ({
-                  id: a.alias,
-                  handle: a.alias,
-                  label: a.alias,
-                  kind: "agent" as const,
-                  subtitle: a.role ?? undefined,
-                  active: true,
-                }))}
-              onNotice={(notice) => setSendNote(displayUiNotice(notice, t))}
+            {(() => {
+              const memberMentionCandidates = [
+                ...(roster.data?.agents ?? [])
+                  .filter(
+                    (a) =>
+                      !a.inbox &&
+                      a.provider !== "inbox" &&
+                      !a.dead &&
+                      a.alias !== surface?.alias &&
+                      a.alias !== "master" &&
+                      a.role !== "reviewer",
+                  )
+                  .map((a) => ({
+                    id: a.alias,
+                    handle: a.alias,
+                    label: a.alias,
+                    kind: "agent" as const,
+                    subtitle: a.role ?? undefined,
+                    active: true,
+                  })),
+                ...teammateMentionCandidates(teammates, t("Teammate · consent to share")),
+              ];
+              const mentionedTeammates = findMentionedTeammates(draftText, memberMentionCandidates);
+              return (
+                <>
+                  <HomeMentionHandoffCard
+                    teammates={mentionedTeammates}
+                    sendBlockedForConsent={handoffHold}
+                    onOpenChannels={() => navigate("/threads")}
+                    onKeepPrivate={() => {
+                      approvedPrivateDraftRef.current = draftText.trim();
+                      setHandoffHold(false);
+                      dockRef.current?.querySelector<HTMLFormElement>("form[data-composer]")?.requestSubmit();
+                    }}
+                  />
+                  <SharedComposer
+                    density="full"
+                    storeKey={`member-assist:${scope}`}
+                    block={readOnly ? t("The board is read-only.") : null}
+                    commands={[WORKSPACE_SKILLS_COMMAND]}
+                    mentionCandidates={memberMentionCandidates}
+                    allowNote
+                    onDraftChange={(next) => {
+                      setDraftText(next);
+                      if (next.trim() !== approvedPrivateDraftRef.current) {
+                        approvedPrivateDraftRef.current = null;
+                      }
+                      if (findMentionedTeammates(next, memberMentionCandidates).length === 0) {
+                        setHandoffHold(false);
+                      }
+                    }}
+                    beforeSend={(outgoing) => {
+                      const normalized = outgoing.trim();
+                      if (
+                        findMentionedTeammates(normalized, memberMentionCandidates).length > 0 &&
+                        approvedPrivateDraftRef.current !== normalized
+                      ) {
+                        setHandoffHold(true);
+                        return false;
+                      }
+                      approvedPrivateDraftRef.current = null;
+                      setHandoffHold(false);
+                      return true;
+                    }}
+                    onNotice={(notice) => setSendNote(displayUiNotice(notice, t))}
               onSend={({ body }) => {
                 void sendToAssistant(scope, body).then((receipt) => {
                   // The actual receipt decides the note: a queued-but-
@@ -639,6 +695,9 @@ export default function MemberChat({
               ariaLabel={messageLabel(identity, "personal", t)}
               formProps={{ "data-composer": "" }}
             />
+                </>
+              );
+            })()}
           </div>
         </div>
       </section>

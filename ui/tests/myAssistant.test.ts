@@ -294,9 +294,9 @@ async function main() {
       host.querySelector("[data-composer]") === null &&
       threadReads.length === 0 &&
       Array.from(host.querySelectorAll("a")).some(
-        (a) => a.textContent?.includes("Open in Channels") && a.getAttribute("href") === "/threads?dm=crm-action-review",
+        (a) => a.textContent?.includes("Mention in channel") && a.getAttribute("href") === "/threads",
       ),
-    "live worker opens consolidated Overview with Open in Channels CTA and zero duplicate chat",
+    "live worker opens consolidated Overview with Mention in channel CTA and zero duplicate chat",
   );
 
   // A member who types /agents/master reads the owners-only gate; the assistant is on Home.

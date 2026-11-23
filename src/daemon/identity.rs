@@ -948,11 +948,32 @@ impl Shared {
         })
     }
 
-    /// CAD-384: apply `method`'s caller rule ([`caller_rule::RULES`])
-    /// before it runs. `Ok(Some(params))` is the request with its
-    /// attribution field stamped to the caller; a refusal happens
-    /// before any write. Only reads are made here: the connection's
-    /// `/proc` ancestry, the target row, the rollout lease.
+    /// Safe non-escalating RPCs an agent may invoke while executing a
+    /// non-owner member's `@mention` channel turn (`authority_mode == "member"`).
+    const MEMBER_CHANNEL_TURN_ALLOWED_RPCS: &'static [&'static str] = &[
+        "agent_identity",
+        "agent_list",
+        "agent_show",
+        "agent_profile_context",
+        "topic_read",
+        "topic_publish",
+        "request_open",
+        "message_read",
+        "message_list",
+        "message_report",
+        "agent_requests",
+        "agent_answer",
+        "agent_inbox",
+        "agent_inbox_ack",
+        "memory_match",
+        "memory_propose",
+    ];
+
+    /// CAD-384 / CAD-2711: apply `method`'s caller rule ([`caller_rule::RULES`])
+    /// and runtime member-channel authority intersection before it runs.
+    /// `Ok(Some(params))` is the request with its attribution field stamped to
+    /// the caller; a refusal happens before any write. Only reads are made here:
+    /// the connection's `/proc` ancestry, the target row, the rollout lease.
     pub(super) fn caller_gate(
         &self,
         method: &str,
@@ -963,10 +984,33 @@ impl Shared {
         let Some(rule) = caller_rule::rule_of(method) else {
             return Ok(None);
         };
+        if matches!(rule, Rule::Read | Rule::Bearer) {
+            return Ok(None);
+        }
+        let check_member_authority = |who: &Who| -> Result<()> {
+            if let Who::Agent(alias) = who {
+                if let Some((_, mode)) = self.store.running_channel_authority(alias)? {
+                    if mode == "member" && !Self::MEMBER_CHANNEL_TURN_ALLOWED_RPCS.contains(&method)
+                    {
+                        return Err(Error::invalid(
+                            "member_authority_refused",
+                            format!(
+                                "{method} refused: member channel turn cannot invoke privileged operations"
+                            ),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        };
         if !rule.checks_connection() {
+            if let Ok(who) = self.connection_caller(peer_pid) {
+                check_member_authority(&who)?;
+            }
             return Ok(None);
         }
         let who = self.connection_caller(peer_pid)?;
+        check_member_authority(&who)?;
         let mut facts = Facts::default();
         match (rule, &who) {
             (Rule::OnAgent(target, _), Who::Agent(_)) => {

@@ -62,6 +62,8 @@ export interface HumanRoomState {
   members: HumanMember[] | null;
   denied: boolean;
   canManage: boolean;
+  agentChainCount: number;
+  agentChainLimit: number;
 }
 
 function isDenial(e: unknown): boolean {
@@ -267,6 +269,7 @@ export function HumanRoomTimeline({
   refresh,
   onState,
   onOpenContext,
+  detailsOpen = false,
   onInvite,
   onChanged,
   isDm,
@@ -278,6 +281,7 @@ export function HumanRoomTimeline({
   refresh: number;
   onState: (state: HumanRoomState) => void;
   onOpenContext: () => void;
+  detailsOpen?: boolean;
   onInvite?: () => void;
   onChanged: () => void;
   isDm: boolean;
@@ -319,7 +323,14 @@ export function HumanRoomTimeline({
     setCursorBlocked(true);
     setPage(null);
     setError(messageOf(failure));
-    onStateRef.current({ id, members: null, denied: false, canManage: false });
+    onStateRef.current({
+      id,
+      members: null,
+      denied: false,
+      canManage: false,
+      agentChainCount: 0,
+      agentChainLimit: 0,
+    });
   }, [id]);
 
   const load = useCallback(async () => {
@@ -356,7 +367,14 @@ export function HumanRoomTimeline({
       setPage((cur) => mergePage(cur, next));
       setDenied(false);
       setError(null);
-      onStateRef.current({ id, members: next.members, denied: false, canManage: next.can_manage });
+      onStateRef.current({
+        id,
+        members: next.members,
+        denied: false,
+        canManage: next.can_manage,
+        agentChainCount: next.agent_chain_count,
+        agentChainLimit: next.agent_chain_limit,
+      });
     } catch (e) {
       if (n !== latest.current) return;
       if (isCursorRefusal(e)) {
@@ -366,7 +384,14 @@ export function HumanRoomTimeline({
       if (isDenial(e)) {
         setPage(null);
         setDenied(true);
-        onStateRef.current({ id, members: null, denied: true, canManage: false });
+        onStateRef.current({
+          id,
+          members: null,
+          denied: true,
+          canManage: false,
+          agentChainCount: 0,
+          agentChainLimit: 0,
+        });
       } else {
         setError(messageOf(e));
       }
@@ -604,7 +629,13 @@ export function HumanRoomTimeline({
               {t("+ Invite")}
             </Button>
           )}
-          <Button variant="ghost" size="sm" onClick={onOpenContext} className="threads-context-toggle">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onOpenContext}
+            aria-expanded={detailsOpen}
+            className="threads-context-toggle"
+          >
             {t("Details")}
           </Button>
         </div>
@@ -729,13 +760,15 @@ function PersonNote({ people, error }: { people: HumanPerson[] | null; error: st
   return <p className="threads-note" role="status">{error ? `People unavailable: ${error}` : "Loading people…"}</p>;
 }
 
-/** The Details rail / sheet for a Channel or DM: searchable member filter, Invite Select, Remove ConfirmDialog. */
+/** The Details rail / sheet for a Channel or DM: Teammates, Shared Agents, Active Guardrails, and Remove ConfirmDialog. */
 export function HumanContextPanel({
   room,
   me,
   members,
   denied,
   canManage,
+  agentChainCount = 0,
+  agentChainLimit = 0,
   people,
   peopleError,
   agents,
@@ -747,6 +780,8 @@ export function HumanContextPanel({
   members: HumanMember[] | null;
   denied: boolean;
   canManage?: boolean;
+  agentChainCount?: number;
+  agentChainLimit?: number;
   people: HumanPerson[] | null;
   peopleError: string | null;
   agents: HumanAgent[] | null;
@@ -799,12 +834,14 @@ export function HumanContextPanel({
     }
   };
 
+  const humanMembers = members.filter((m) => m.kind === "human");
+  const agentMembers = members.filter((m) => m.kind === "agent");
   const addable = (people ?? []).filter((p) => p.id !== me.id && !members.some((m) => m.id === p.id));
   const addableAgents = (agents ?? []).filter((a) => !members.some((m) => m.kind === "agent" && m.id === a.uid));
   const query = memberFilter.trim().toLowerCase();
-  const shownMembers = query === ""
-    ? members
-    : members.filter((m) => m.label.toLowerCase().includes(query) || m.kind.includes(query));
+  const shownHumans = query === ""
+    ? humanMembers
+    : humanMembers.filter((m) => m.label.toLowerCase().includes(query));
 
   const startSharedChannelFromDm = () => {
     const humans = members
@@ -826,132 +863,184 @@ export function HumanContextPanel({
       .catch((e: unknown) => setError(messageOf(e)));
   };
 
+  const renderMemberRow = (m: HumanMember) => {
+    const canRemove =
+      isGroup &&
+      mayManage &&
+      ((m.kind === "human" && m.id !== room.creator && m.id !== me.id) || m.kind === "agent");
+    return (
+      <li key={`${m.kind}:${m.id}`} data-kind={m.kind}>
+        <span className="threads-person">
+          <span aria-hidden className="threads-avatar" data-kind={m.kind}>
+            {m.label.trim().charAt(0).toUpperCase() || "?"}
+          </span>
+          <span>
+            {m.kind === "agent" ? `@${m.label}` : m.label}
+            {m.kind === "agent" && <small className="threads-member-tag"> · {t("Shared agent")}</small>}
+          </span>
+        </span>
+        {canRemove && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setRemoveError(null);
+              setPendingRemove(m);
+            }}
+          >
+            {t("Remove")}
+          </Button>
+        )}
+      </li>
+    );
+  };
+
   return (
     <div className="threads-context-body">
-      <div className="threads-context-heading">
-        <h3 className="threads-context-title">{t("Participants")}</h3>
-        <span className="threads-context-count">{members.length}</span>
-      </div>
-      {members.length >= 5 && (
-        <div className="threads-member-filter-wrap">
-          <input
-            type="search"
-            className="field threads-member-filter"
-            value={memberFilter}
-            onChange={(e) => setMemberFilter(e.target.value)}
-            placeholder={t("Filter members…")}
-            aria-label={t("Filter members")}
-          />
+      <section className="threads-context-section" aria-label={t("Teammates")}>
+        <div className="threads-context-heading">
+          <h3 className="threads-context-title">{t("Teammates")}</h3>
+          <span className="threads-context-count">{humanMembers.length}</span>
         </div>
-      )}
-      <ul className="threads-roster">
-        {shownMembers.map((m) => {
-          const canRemove =
-            isGroup &&
-            mayManage &&
-            ((m.kind === "human" && m.id !== room.creator && m.id !== me.id) || m.kind === "agent");
-          return (
-            <li key={`${m.kind}:${m.id}`} data-kind={m.kind}>
-              <span className="threads-person">
-                <span aria-hidden className="threads-avatar" data-kind={m.kind}>
-                  {m.label.trim().charAt(0).toUpperCase() || "?"}
-                </span>
-                <span>
-                  {m.kind === "agent" ? `@${m.label}` : m.label}
-                  {m.kind === "agent" && <small className="threads-member-tag"> · {t("Agent")}</small>}
-                </span>
-              </span>
-              {canRemove && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setRemoveError(null);
-                    setPendingRemove(m);
-                  }}
-                >
-                  {t("Remove")}
-                </Button>
-              )}
-            </li>
-          );
-        })}
-        {shownMembers.length === 0 && query !== "" && (
-          <li className="threads-note">{t("No members match “{query}”.").replace("{query}", memberFilter.trim())}</li>
+        {humanMembers.length >= 5 && (
+          <div className="threads-member-filter-wrap">
+            <input
+              type="search"
+              className="field threads-member-filter"
+              value={memberFilter}
+              onChange={(e) => setMemberFilter(e.target.value)}
+              placeholder={t("Filter members…")}
+              aria-label={t("Filter members")}
+            />
+          </div>
         )}
-      </ul>
+        <ul className="threads-roster" data-roster-humans="">
+          {shownHumans.map(renderMemberRow)}
+          {shownHumans.length === 0 && query !== "" && (
+            <li className="threads-note">{t("No members match “{query}”.").replace("{query}", memberFilter.trim())}</li>
+          )}
+        </ul>
 
-      {room.kind === "dm" && (
-        <div className="threads-add">
-          <Button variant="secondary" size="sm" disabled={people === null} onClick={startSharedChannelFromDm}>
-            {t("Start shared channel")}
-          </Button>
+        {room.kind === "dm" && (
+          <div className="threads-add">
+            <Button variant="secondary" size="sm" disabled={people === null} onClick={startSharedChannelFromDm}>
+              {t("Start shared channel")}
+            </Button>
+          </div>
+        )}
+
+        {isGroup && mayManage && (
+          <form
+            className="threads-add"
+            aria-label="Invite teammate to channel"
+            data-invite-select=""
+            onSubmit={(e) => {
+              e.preventDefault();
+              const subject = people?.find((p) => p.id === picked)?.subject;
+              if (!subject) return;
+              void act(async () => {
+                await addHumanMember(room.id, { human_subject: subject });
+                setPicked("");
+              });
+            }}
+          >
+            <div className="threads-form-field">
+              <span className="threads-field-label">{t("Add a person")}</span>
+              <Select
+                full
+                searchable
+                size="sm"
+                value={picked}
+                onChange={setPicked}
+                disabled={addable.length === 0}
+                placeholder={addable.length === 0 ? t("No people to add") : t("+ Invite teammate…")}
+                aria-label={t("Add a person")}
+                options={addable.map((p) => ({ value: p.id, label: p.name }))}
+              />
+            </div>
+            <Button variant="secondary" size="sm" type="submit" disabled={picked === ""}>{t("Add")}</Button>
+          </form>
+        )}
+      </section>
+
+      {isGroup && (
+        <section className="threads-context-section" aria-label={t("Shared Agents")}>
+          <div className="threads-context-heading">
+            <h3 className="threads-context-title">{t("Shared Agents")}</h3>
+            <span className="threads-context-count">{agentMembers.length}</span>
+          </div>
+          {agentMembers.length > 0 ? (
+            <ul className="threads-roster" data-roster-agents="">
+              {agentMembers.map(renderMemberRow)}
+            </ul>
+          ) : (
+            <p className="threads-note">{t("No shared agents added yet.")}</p>
+          )}
+          {mayManage && (
+            <form
+              className="threads-add"
+              aria-label="Add agent to channel"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (addAgentPick === "") return;
+                void act(async () => {
+                  await addHumanMember(room.id, { agent_uid: addAgentPick });
+                  setAddAgentPick("");
+                });
+              }}
+            >
+              <div className="threads-form-field">
+                <span className="threads-field-label">{t("Add an agent")}</span>
+                <Select
+                  full
+                  searchable
+                  size="sm"
+                  value={addAgentPick}
+                  onChange={setAddAgentPick}
+                  disabled={addableAgents.length === 0}
+                  placeholder={addableAgents.length === 0 ? t("No agents available") : t("+ Add shared agent…")}
+                  aria-label={t("Add an agent")}
+                  options={addableAgents.map((a) => ({ value: a.uid, label: `@${a.alias}` }))}
+                />
+              </div>
+              <Button variant="secondary" size="sm" type="submit" disabled={addAgentPick === ""}>{t("Add")}</Button>
+            </form>
+          )}
+        </section>
+      )}
+
+      <section className="threads-context-section" aria-label={t("Active Guardrails")}>
+        <div className="threads-context-heading">
+          <h3 className="threads-context-title">{t("Active Guardrails")}</h3>
         </div>
-      )}
-
-      {isGroup && mayManage && (
-        <form
-          className="threads-add"
-          aria-label="Invite teammate to channel"
-          data-invite-select=""
-          onSubmit={(e) => {
-            e.preventDefault();
-            const subject = people?.find((p) => p.id === picked)?.subject;
-            if (!subject) return;
-            void act(async () => {
-              await addHumanMember(room.id, { human_subject: subject });
-              setPicked("");
-            });
-          }}
-        >
-          <div className="threads-form-field">
-            <span className="threads-field-label">{t("Add a person")}</span>
-            <Select
-              full
-              searchable
-              size="sm"
-              value={picked}
-              onChange={setPicked}
-              disabled={addable.length === 0}
-              placeholder={addable.length === 0 ? t("No people to add") : t("Choose a person")}
-              aria-label={t("Add a person")}
-              options={addable.map((p) => ({ value: p.id, label: p.name }))}
-            />
-          </div>
-          <Button variant="secondary" size="sm" type="submit" disabled={picked === ""}>{t("Add")}</Button>
-        </form>
-      )}
-
-      {isGroup && mayManage && (
-        <form
-          className="threads-add"
-          aria-label="Add agent to channel"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (addAgentPick === "") return;
-            void act(async () => {
-              await addHumanMember(room.id, { agent_uid: addAgentPick });
-              setAddAgentPick("");
-            });
-          }}
-        >
-          <div className="threads-form-field">
-            <span className="threads-field-label">{t("Add an agent")}</span>
-            <Select
-              full
-              searchable
-              size="sm"
-              value={addAgentPick}
-              onChange={setAddAgentPick}
-              disabled={addableAgents.length === 0}
-              placeholder={addableAgents.length === 0 ? t("No agents available") : t("Choose an agent")}
-              aria-label={t("Add an agent")}
-              options={addableAgents.map((a) => ({ value: a.uid, label: `@${a.alias}` }))}
-            />
-          </div>
-          <Button variant="secondary" size="sm" type="submit" disabled={addAgentPick === ""}>{t("Add")}</Button>
-        </form>
-      )}
+        <ul className="threads-guardrails" data-active-guardrails="">
+          <li>
+            <strong>{t("Membership ACL")}</strong>
+            <span>{t("Only admitted members receive notifications or @mentions.")}</span>
+          </li>
+          <li>
+            <strong>{t("Personal assistants")}</strong>
+            <span>{t("Human @mentions notify bell inbox only; private assistants stay isolated.")}</span>
+          </li>
+          {room.kind === "dm" ? (
+            <li>
+              <strong>{t("1:1 DM isolation")}</strong>
+              <span>{t("Shared agents cannot join direct messages.")}</span>
+            </li>
+          ) : (
+            <li>
+              <strong>{t("Human-Turn Brake")}</strong>
+              <span>
+                {agentChainLimit > 0
+                  ? t("Agent hops: {count}/{limit} before human turn required.")
+                      .replace("{count}", String(agentChainCount))
+                      .replace("{limit}", String(agentChainLimit))
+                  : t("Paused after consecutive agent turns until a human posts.")}
+              </span>
+            </li>
+          )}
+        </ul>
+      </section>
 
       <PersonNote people={people} error={peopleError} />
       {error && <p className="threads-note" role="status">{error}</p>}
@@ -959,10 +1048,29 @@ export function HumanContextPanel({
       {pendingRemove && (
         <ConfirmDialog
           title={t(pendingRemove.kind === "agent" ? "Remove agent" : "Remove member")}
+          role="alertdialog"
+          initialFocus="cancel"
           body={
-            pendingRemove.kind === "agent"
-              ? `Remove @${pendingRemove.label} from this channel? They will stop receiving @mentions here.`
-              : `Remove ${pendingRemove.label} from this channel? They will lose access to future messages and earlier history before re-invite.`
+            <div className="threads-remove-card">
+              <div className="threads-remove-target">
+                <span aria-hidden className="threads-avatar" data-kind={pendingRemove.kind}>
+                  {pendingRemove.label.trim().charAt(0).toUpperCase() || "?"}
+                </span>
+                <span className="threads-remove-target-copy">
+                  <strong>{pendingRemove.kind === "agent" ? `@${pendingRemove.label}` : pendingRemove.label}</strong>
+                  <span className="threads-remove-role">
+                    {t(pendingRemove.kind === "agent" ? "Shared agent" : "Teammate")}
+                  </span>
+                </span>
+              </div>
+              <p className="threads-note m-0">
+                {t(
+                  pendingRemove.kind === "agent"
+                    ? "Removing @{name} stops future @mentions in this channel from queueing turns."
+                    : "Removing {name} revokes access to future messages and earlier channel history before re-invite.",
+                ).replace("{name}", () => pendingRemove.label)}
+              </p>
+            </div>
           }
           confirmLabel={t(removing ? "Removing…" : "Remove")}
           confirmVariant="danger"

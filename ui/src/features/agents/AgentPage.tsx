@@ -23,7 +23,6 @@ import {
   type RolesState,
 } from "./agentRoles";
 import { AGENT_TABS, type AgentTab } from "./agentTabModel";
-import { agentThreadHref } from "./AgentBlocks";
 import {
   agentHoldsWorkButDead,
   agentLocation,
@@ -424,8 +423,8 @@ export default function AgentPage({
               </Button>
             )}
             {showChannelsCta && (
-              <Button variant="primary" size="sm" href={operator === true ? agentThreadHref(alias) : "/threads"}>
-                {t("Open in Channels")}
+              <Button variant="primary" size="sm" href="/threads">
+                {t("Mention in channel")}
               </Button>
             )}
             {!isCloud && !mailbox && (

@@ -9,7 +9,10 @@ import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
+import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
+import { HomeMentionHandoffCard, findMentionedTeammates } from "../mentions/HomeMentionHandoff";
+import { teammateMentionCandidates, useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import {
   composerBlock,
   kvRows,
@@ -926,6 +929,7 @@ function MasterHome({
   const t = useTranslate();
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
+  const teammates = useWorkspaceTeammates(hosted === true);
   const master = useQuery(resources.masterState);
   const [seed, setSeed] = useState<{ text: string; n: number; refs?: ThreadRef[] }>({
     text: "",
@@ -960,6 +964,36 @@ function MasterHome({
   const dockRef = useRef<HTMLDivElement | null>(null);
   /** Older history just paged in above: not an arrival, never a pill. */
   const earlierLanded = useRef(false);
+  const [draftText, setDraftText] = useState("");
+  const [handoffHold, setHandoffHold] = useState(false);
+  const approvedPrivateDraftRef = useRef<string | null>(null);
+  const homeMentionCandidates = useMemo(
+    () => [
+      ...(agents.data?.agents ?? [])
+        .filter(
+          (a) =>
+            !a.inbox &&
+            a.provider !== "inbox" &&
+            !a.dead &&
+            a.alias !== MASTER &&
+            a.role !== "reviewer",
+        )
+        .map((a) => ({
+          id: a.alias,
+          handle: a.alias,
+          label: a.alias,
+          kind: "agent" as const,
+          subtitle: a.role ?? undefined,
+          active: true,
+        })),
+      ...teammateMentionCandidates(teammates, t("Teammate · consent to share")),
+    ],
+    [agents.data?.agents, teammates, t],
+  );
+  const mentionedTeammates = useMemo(
+    () => findMentionedTeammates(draftText, homeMentionCandidates),
+    [draftText, homeMentionCandidates],
+  );
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
@@ -1872,6 +1906,16 @@ function MasterHome({
                 resolveAppPath={resolveAppPath}
               />
             )}
+            <HomeMentionHandoffCard
+              teammates={mentionedTeammates}
+              sendBlockedForConsent={handoffHold}
+              onOpenChannels={() => navigate("/threads")}
+              onKeepPrivate={() => {
+                approvedPrivateDraftRef.current = draftText.trim();
+                setHandoffHold(false);
+                dockRef.current?.querySelector<HTMLFormElement>("form[data-composer]")?.requestSubmit();
+              }}
+            />
             <Composer
               block={block}
               seed={seed}
@@ -1881,16 +1925,30 @@ function MasterHome({
               stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
               textareaId={HOME_COMPOSER_ID}
               onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
-              mentionCandidates={(agents.data?.agents ?? [])
-                .filter((a) => !a.inbox && a.provider !== "inbox" && !a.dead && a.alias !== MASTER)
-                .map((a) => ({
-                  id: a.alias,
-                  handle: a.alias,
-                  label: a.alias,
-                  kind: "agent" as const,
-                  subtitle: a.role ?? undefined,
-                  active: true,
-                }))}
+              mentionCandidates={homeMentionCandidates}
+              allowNote
+              onDraftChange={(next) => {
+                setDraftText(next);
+                if (next.trim() !== approvedPrivateDraftRef.current) {
+                  approvedPrivateDraftRef.current = null;
+                }
+                if (findMentionedTeammates(next, homeMentionCandidates).length === 0) {
+                  setHandoffHold(false);
+                }
+              }}
+              beforeSend={(outgoing) => {
+                const normalized = outgoing.trim();
+                if (
+                  findMentionedTeammates(normalized, homeMentionCandidates).length > 0 &&
+                  approvedPrivateDraftRef.current !== normalized
+                ) {
+                  setHandoffHold(true);
+                  return false;
+                }
+                approvedPrivateDraftRef.current = null;
+                setHandoffHold(false);
+                return true;
+              }}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly

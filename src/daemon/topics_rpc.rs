@@ -352,7 +352,9 @@ impl Shared {
             let receipt = self
                 .store
                 .human_agent_post(&org, &uid, &topic.id, client_id, text)?;
-            if !receipt.fresh {
+            let needs_dispatch =
+                receipt.fresh || !self.store.human_room_has_post_meta(&receipt.post.id)?;
+            if !needs_dispatch {
                 return Ok(json!({
                     "topic": topic.id,
                     "message": receipt.post.id,
@@ -364,9 +366,14 @@ impl Shared {
                 .store
                 .alias_of_uid(&uid)?
                 .ok_or_else(|| Error::rejected("Agent not found"))?;
+            let hop_member_origin = self
+                .store
+                .running_channel_authority(&sender_alias)?
+                .and_then(|(origin, mode)| (mode == "member").then_some(origin));
             let parsed = crate::store::mentions::parse_mentions(text, false);
             let active_agents = self.store.human_room_active_agents(&org, &receipt.room)?;
             let active_humans = self.store.human_room_active_humans(&org, &receipt.room)?;
+            let shareable_agents = self.store.human_shareable_agents()?;
             let mut outcomes = Vec::new();
             let mut deliveries = Vec::new();
             let mut queued_hops: i64 = 0;
@@ -402,10 +409,6 @@ impl Shared {
                         });
                         continue;
                     }
-                    let req_id = crate::store::topic_request_id(
-                        &topic.id,
-                        &format!("{client_id}:{target_uid}"),
-                    );
                     let queued_text = format!(
                         "[{}] @{sender_alias} mentioned you in a channel. \
                          Read it: `cadence topic read {topic_id}`. Reply in the same channel: \
@@ -415,38 +418,35 @@ impl Shared {
                         topic_id = topic.id,
                         post_id = receipt.post.id,
                     );
-                    let binding = if primary_unbound {
-                        primary_unbound = false;
-                        Some(super::messages_rpc::SendBinding::TopicPost(
-                            &receipt.post.id,
-                        ))
-                    } else {
-                        None
-                    };
-                    let send = json!({
-                        "alias": target_alias,
-                        "text": queued_text,
-                        "message": req_id,
-                        "source": "agent"
-                    });
-                    self.send_with_human_expected(
-                        &send,
-                        &|_| Ok(crate::store::Sender::Agent(sender_alias.clone())),
-                        &|verb| {
-                            Err(Error::rejected(format!(
-                                "{verb} refused: agent hop carries no steering authority"
-                            )))
+                    let (source_tag, origin_actor, authority_mode, sender) =
+                        match &hop_member_origin {
+                            Some(member_origin) => (
+                                "member",
+                                member_origin.as_str(),
+                                "member",
+                                crate::store::Sender::Member(member_origin.clone()),
+                            ),
+                            None => (
+                                "agent",
+                                sender_alias.as_str(),
+                                "agent_hop",
+                                crate::store::Sender::Agent(sender_alias.clone()),
+                            ),
+                        };
+                    let req_id = self.dispatch_channel_agent_mention(
+                        super::human_threads_rpc::ChannelAgentDispatch {
+                            topic: &topic.id,
+                            post_id: &receipt.post.id,
+                            client_id,
+                            agent_uid: target_uid,
+                            agent_alias: target_alias,
+                            queued_text: &queued_text,
+                            source_tag,
+                            origin_actor,
+                            authority_mode,
+                            sender,
+                            primary_unbound: &mut primary_unbound,
                         },
-                        None,
-                        Some(target_uid),
-                        binding,
-                    )?;
-                    self.store.human_room_bind_post_request(
-                        &receipt.post.id,
-                        target_uid,
-                        &req_id,
-                        &sender_alias,
-                        "agent_hop",
                     )?;
                     queued_hops += 1;
                     outcomes.push(crate::store::mentions::MentionOutcome {
@@ -463,27 +463,46 @@ impl Shared {
                         "alias": target_alias,
                         "message": req_id
                     }));
-                } else if let Some((_, human_name)) = active_humans.iter().find(|(_, name)| {
-                    !name.is_empty()
-                        && (name.trim().eq_ignore_ascii_case(handle)
-                            || crate::store::mentions::human_handle_matches(name, handle))
-                }) {
-                    outcomes.push(crate::store::mentions::MentionOutcome {
-                        kind: if parsed.silent { "silent" } else { "notified" }.to_string(),
-                        handle: format!("@{handle}"),
-                        label: human_name.clone(),
-                        reason: Some(if parsed.silent {
-                            "Silent note (/note)".to_string()
-                        } else {
-                            "Notified (bell inbox)".to_string()
-                        }),
-                    });
+                } else {
+                    let mut matched_humans = Vec::new();
+                    let mut seen_humans = std::collections::HashSet::new();
+                    for (hid, human_name) in &active_humans {
+                        if !human_name.is_empty()
+                            && (human_name.trim().eq_ignore_ascii_case(handle)
+                                || crate::store::mentions::human_handle_matches(human_name, handle))
+                            && seen_humans.insert(hid.as_str())
+                        {
+                            matched_humans.push(human_name.clone());
+                        }
+                    }
+                    if !matched_humans.is_empty() {
+                        for human_name in matched_humans {
+                            outcomes.push(crate::store::mentions::MentionOutcome {
+                                kind: if parsed.silent { "silent" } else { "notified" }.to_string(),
+                                handle: format!("@{handle}"),
+                                label: human_name,
+                                reason: Some(if parsed.silent {
+                                    "Silent note (/note)".to_string()
+                                } else {
+                                    "Notified (bell inbox)".to_string()
+                                }),
+                            });
+                        }
+                    } else if let Some((_, alias)) = shareable_agents
+                        .iter()
+                        .find(|(_, alias)| alias.eq_ignore_ascii_case(handle))
+                    {
+                        outcomes.push(crate::store::mentions::MentionOutcome {
+                            kind: "blocked_acl".to_string(),
+                            handle: format!("@{alias}"),
+                            label: alias.clone(),
+                            reason: Some("Not added to this channel".to_string()),
+                        });
+                    }
                 }
             }
-            if parsed.silent || !outcomes.is_empty() {
-                self.store
-                    .human_room_save_post_meta(&receipt.post.id, parsed.silent, &outcomes)?;
-            }
+            self.store
+                .human_room_save_post_meta(&receipt.post.id, parsed.silent, &outcomes)?;
             return Ok(json!({
                 "topic": topic.id,
                 "message": receipt.post.id,

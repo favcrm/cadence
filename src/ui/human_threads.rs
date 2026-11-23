@@ -734,6 +734,14 @@ fn daemon_failure(error: &crate::error::Error) -> HttpResp {
             None,
         );
     }
+    if error.code() == Some("agent_not_shareable") {
+        return coded_response(
+            400,
+            "agent_not_shareable",
+            "This agent cannot be added to shared channels",
+            None,
+        );
+    }
     if error.code() == Some("waiting_for_person") {
         return coded_response(
             409,

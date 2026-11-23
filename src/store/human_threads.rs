@@ -367,8 +367,15 @@ fn max_seq(conn: &impl StoreConn, topic: &str) -> Result<i64> {
     )?)
 }
 
-/// Resolve an agent alias to its active durable uid, refusing personal assistants.
+/// Resolve an agent alias to its active durable uid, refusing `master`,
+/// personal assistants, reviewers, and inbox rows.
 fn shareable_agent_uid_by_alias_in(conn: &impl StoreConn, alias: &str) -> Result<String> {
+    if alias.eq_ignore_ascii_case("master") {
+        return Err(Error::invalid(
+            "personal_assistant_excluded",
+            "Personal assistants cannot be added to shared channels",
+        ));
+    }
     let is_assistant: Option<i64> =
         conn.query_opt("SELECT 1 FROM assistants WHERE alias=?", [alias], |r| {
             r.get(0)
@@ -379,13 +386,51 @@ fn shareable_agent_uid_by_alias_in(conn: &impl StoreConn, alias: &str) -> Result
             "Personal assistants cannot be added to shared channels",
         ));
     }
-    let row: Option<(String, Option<f64>)> = conn.query_opt(
-        "SELECT uid, archived_at FROM agents WHERE alias=?",
+    struct AgentShareabilityRow {
+        uid: String,
+        archived_at: Option<f64>,
+        role: Option<String>,
+        provider: Option<String>,
+        endpoint_kind: Option<String>,
+    }
+    let row = conn.query_opt(
+        "SELECT uid, archived_at, role, provider, endpoint_kind FROM agents WHERE alias=?",
         [alias],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| {
+            Ok(AgentShareabilityRow {
+                uid: r.get(0)?,
+                archived_at: r.get(1)?,
+                role: r.get(2)?,
+                provider: r.get(3)?,
+                endpoint_kind: r.get(4)?,
+            })
+        },
     )?;
     match row {
-        Some((uid, None)) => Ok(uid),
+        Some(AgentShareabilityRow {
+            uid,
+            archived_at: None,
+            role,
+            provider,
+            endpoint_kind,
+        }) => {
+            let non_shareable = role
+                .as_deref()
+                .is_some_and(|r| r.eq_ignore_ascii_case("reviewer"))
+                || provider
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case("inbox"))
+                || endpoint_kind
+                    .as_deref()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("inbox"));
+            if non_shareable {
+                return Err(Error::invalid(
+                    "agent_not_shareable",
+                    "This agent cannot be added to shared channels",
+                ));
+            }
+            Ok(uid)
+        }
         _ => Err(Error::rejected("Agent not found")),
     }
 }
@@ -514,12 +559,31 @@ fn notification_intents(
         params![room, sender_uid, post.seq],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let active_agent_aliases: Vec<String> = conn.query_vec(
+        "SELECT a.alias FROM human_room_members m
+           JOIN agents a ON a.uid=m.member
+          WHERE m.room=? AND m.kind='agent' AND m.removed IS NULL AND a.archived_at IS NULL",
+        [&room],
+        |r| r.get(0),
+    )?;
     let parsed = super::mentions::parse_mentions(&post.body, false);
+    let non_agent_handles: Vec<&str> = parsed
+        .handles
+        .iter()
+        .map(String::as_str)
+        .filter(|h| {
+            !active_agent_aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(h))
+        })
+        .collect();
     let mentions_by_name = |name: &str| {
         !name.is_empty()
-            && (post.body.contains(&format!("@{name}"))
-                || parsed
-                    .handles
+            && ((post.body.contains(&format!("@{name}"))
+                && !active_agent_aliases
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(name)))
+                || non_agent_handles
                     .iter()
                     .any(|h| super::mentions::human_handle_matches(name, h)))
     };
@@ -735,6 +799,7 @@ impl Store {
                  VALUES(?,'human',?,0,?)",
                 params![id, actor.id, at],
             )?;
+            let mut seen_agents = std::collections::HashSet::new();
             for member in members {
                 match member {
                     RoomMember::Human(human) => {
@@ -742,11 +807,13 @@ impl Store {
                     }
                     RoomMember::Agent(alias) => {
                         let uid = shareable_agent_uid_by_alias_in(conn, alias)?;
-                        conn.execute(
-                            "INSERT INTO human_room_members(room,kind,member,cutoff,added)
-                             VALUES(?,'agent',?,0,?)",
-                            params![id, uid, at],
-                        )?;
+                        if seen_agents.insert(uid.clone()) {
+                            conn.execute(
+                                "INSERT INTO human_room_members(room,kind,member,cutoff,added)
+                                 VALUES(?,'agent',?,0,?)",
+                                params![id, uid, at],
+                            )?;
+                        }
                     }
                 }
             }
@@ -1351,13 +1418,17 @@ impl Store {
         })
     }
 
-    /// Active agents eligible for shared channels: excludes archived agents and
-    /// any private personal assistant in `assistants`.
+    /// Active agents eligible for shared channels: excludes archived agents,
+    /// `master`, `reviewer`/`inbox` rows, and any personal assistant in `assistants`.
     pub fn human_shareable_agents(&self) -> Result<Vec<(String, String)>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
                 "SELECT uid, alias FROM agents
                   WHERE archived_at IS NULL
+                    AND lower(alias) <> 'master'
+                    AND lower(COALESCE(role,'')) <> 'reviewer'
+                    AND lower(COALESCE(provider,'')) <> 'inbox'
+                    AND lower(COALESCE(endpoint_kind,'')) <> 'inbox'
                     AND NOT EXISTS (SELECT 1 FROM assistants a WHERE a.alias=agents.alias)
                   ORDER BY alias",
                 [],
@@ -1367,7 +1438,7 @@ impl Store {
     }
 
     /// Active shared agent members `(uid, alias)` of a room in `org`
-    /// (defense-in-depth: also excludes any alias bound as a personal assistant).
+    /// (defense-in-depth: also excludes `master`, `reviewer`/`inbox`, and `assistants`).
     pub fn human_room_active_agents(&self, org: &str, room: &str) -> Result<Vec<(String, String)>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
@@ -1377,6 +1448,10 @@ impl Store {
                    JOIN agents a ON a.uid=m.member
                   WHERE m.room=? AND r.org=? AND m.kind='agent'
                     AND m.removed IS NULL AND a.archived_at IS NULL
+                    AND lower(a.alias) <> 'master'
+                    AND lower(COALESCE(a.role,'')) <> 'reviewer'
+                    AND lower(COALESCE(a.provider,'')) <> 'inbox'
+                    AND lower(COALESCE(a.endpoint_kind,'')) <> 'inbox'
                     AND NOT EXISTS (SELECT 1 FROM assistants asst WHERE asst.alias=a.alias)
                   ORDER BY m.added, a.alias",
                 params![room, org],
@@ -1409,12 +1484,28 @@ impl Store {
         })
     }
 
-    /// `(room_id, kind)` for a `human_room` topic in `org`.
-    pub fn human_room_for_topic(&self, org: &str, topic: &str) -> Result<Option<(String, String)>> {
+    /// True if `human_room_post_meta` already persisted outcomes for `post_id`.
+    pub fn human_room_has_post_meta(&self, post_id: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM human_room_post_meta WHERE post_id=?)",
+                [post_id],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    /// If `alias` is currently running a turn triggered by a human-room
+    /// `@mention` or channel hop, return `(origin_actor, authority_mode)`.
+    pub fn running_channel_authority(&self, alias: &str) -> Result<Option<(String, String)>> {
         self.read_tx(|conn| {
             Ok(conn.query_opt(
-                "SELECT id,kind FROM human_rooms WHERE topic_id=? AND org=?",
-                params![topic, org],
+                "SELECT pr.origin_actor, pr.authority_mode
+                   FROM messages m
+                   JOIN human_room_post_requests pr ON pr.message_id=m.id
+                  WHERE m.alias=? AND m.state='running'
+                  ORDER BY m.seq DESC LIMIT 1",
+                [alias],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?)
         })

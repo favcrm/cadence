@@ -132,6 +132,34 @@
   color: var(--color-accent);
 }
 
+.home-handoff-preview {
+  display: grid;
+  gap: 0.45rem;
+  border-color: color-mix(in srgb, var(--color-warn) 45%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-warn) 8%, var(--color-ink-900));
+}
+
+.home-handoff-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  font-size: var(--text-label);
+}
+
+.home-handoff-handles {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-micro);
+  color: var(--color-accent);
+}
+
+.home-handoff-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .mention-picker {
     animation: menu-in 0.14s cubic-bezier(0.2, 0.8, 0.2, 1) both;

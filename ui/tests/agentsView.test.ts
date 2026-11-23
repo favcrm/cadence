@@ -409,14 +409,14 @@ async function main() {
   assert(aliases().length === 4, "the roster lists the team regardless of project");
   await click("Open agent blocked");
   await render();
-  const channelLink = Array.from(host.querySelectorAll("a")).find((a) => a.textContent?.includes("Open in Channels"));
+  const channelLink = Array.from(host.querySelectorAll("a")).find((a) => a.textContent?.includes("Mention in channel"));
   assert(
     host.querySelector("main.agents-page h1")?.textContent === "blocked" &&
       !host.querySelector(".ag-chat") &&
       !host.querySelector("[data-composer]") &&
       threadReads.length === 0 &&
-      channelLink?.getAttribute("href") === "/threads?dm=blocked",
-    "a live agent opens directly onto its consolidated Overview with an Open in Channels link and zero duplicate chat",
+      channelLink?.getAttribute("href") === "/threads",
+    "a live agent opens directly onto its consolidated Overview with a Mention in channel link and zero duplicate chat",
   );
   assert(
     host.querySelector("main.agents-page")?.textContent?.includes("Some details aren’t available") &&
@@ -605,8 +605,8 @@ async function main() {
   await render();
   assert(!host.querySelector("[data-composer]"), "a non-operator gets no composer on /agents");
   assert(
-    Array.from(host.querySelectorAll("a")).find((a) => a.textContent?.includes("Open in Channels"))?.getAttribute("href") === "/threads",
-    "a non-operator Open in Channels CTA links to /threads rather than a ?dm= operator route",
+    Array.from(host.querySelectorAll("a")).find((a) => a.textContent?.includes("Mention in channel"))?.getAttribute("href") === "/threads",
+    "a non-operator Mention in channel CTA links to /threads rather than a ?dm= operator route",
   );
   assert(threadReads.length === 0, "a non-operator does not read an agent's conversation on /agents");
   viewerHosted = true;

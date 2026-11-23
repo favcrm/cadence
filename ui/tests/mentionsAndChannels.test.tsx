@@ -7,6 +7,8 @@ import type { Root } from "react-dom/client";
 import type * as MentionsModule from "../src/features/mentions/mentions";
 import type * as PickerModule from "../src/features/mentions/MentionPicker";
 import type * as HumanThreadsModule from "../src/features/threads/HumanThreads";
+import type * as NewConvModule from "../src/features/threads/NewHumanConversation";
+import type * as HandoffModule from "../src/features/mentions/HomeMentionHandoff";
 import type * as PartsModule from "../src/features/threads/ThreadChatParts";
 import type * as ClientModule from "../src/features/threads/humanThreadsClient";
 import type * as LocaleModule from "../src/lib/locale";
@@ -98,6 +100,8 @@ async function main(): Promise<void> {
   } = require<typeof MentionsModule>("../src/features/mentions/mentions");
   const MentionPicker = require<typeof PickerModule>("../src/features/mentions/MentionPicker").default;
   const { HumanContextPanel, HumanRoomTimeline } = require<typeof HumanThreadsModule>("../src/features/threads/HumanThreads");
+  const NewHumanConversation = require<typeof NewConvModule>("../src/features/threads/NewHumanConversation").default;
+  const { HomeMentionHandoffCard, findMentionedTeammates } = require<typeof HandoffModule>("../src/features/mentions/HomeMentionHandoff");
   const { ThreadComposerFrame } = require<typeof PartsModule>("../src/features/threads/ThreadChatParts");
   const { LocaleProvider } = require<typeof LocaleModule>("../src/lib/locale");
   const { allowPrivateReads, resetPrivateSession } = require<typeof SessionModule>("../src/lib/privateSession");
@@ -171,6 +175,7 @@ async function main(): Promise<void> {
     { kind: "human", id: "human-bob", label: "Bob" },
     { kind: "human", id: "human-carol", label: "Carol" },
     { kind: "human", id: "human-dan", label: "Dan" },
+    { kind: "human", id: "human-erin", label: "Erin" },
     { kind: "agent", id: "ag-dev", label: "dev" },
   ];
   const people: ClientModule.HumanPerson[] = [
@@ -226,6 +231,12 @@ async function main(): Promise<void> {
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
     calls.push({ method, path: url.pathname, body });
     if (url.pathname === "/api/human-threads/agents") return json({ agents });
+    if (url.pathname === "/api/human-threads/people") {
+      const q = (url.searchParams.get("query") ?? "").trim().toLowerCase();
+      const filteredPeople = q ? people.filter((p) => p.name.toLowerCase().includes(q)) : people;
+      return json({ actor: "human-me", people: filteredPeople, has_more: false });
+    }
+    if (url.pathname === "/api/human-threads/groups" && method === "POST") return json({ room: "room-new" });
     if (url.pathname === "/api/human-threads/rooms/room-1" && method === "GET") return json(roomPage);
     if (url.pathname === "/api/human-threads/rooms/room-1/posts" && method === "POST") {
       return json({
@@ -280,6 +291,8 @@ async function main(): Promise<void> {
             members: roomMembers,
             denied: false,
             canManage: true,
+            agentChainCount: 2,
+            agentChainLimit: 2,
             people,
             peopleError: null,
             agents,
@@ -306,17 +319,22 @@ async function main(): Promise<void> {
   assert(host.textContent?.includes("Mei added @dev"), "renders interleaved channel audit event");
   assert(host.textContent?.includes("Channel paused after consecutive agent turns"), "renders Human-Turn Brake banner at chain limit");
 
-  // Searchable member filter (>= 5 members)
+  // Split Context sections: Teammates, Shared Agents, and Active Guardrails
+  assert(host.querySelector('[data-roster-humans]') !== null && host.querySelector('[data-roster-agents]') !== null, "HumanContextPanel separates Teammates and Shared Agents");
+  const guardrailsText = host.querySelector("[data-active-guardrails]")?.textContent ?? "";
+  assert(guardrailsText.includes("Membership ACL") && guardrailsText.includes("Agent hops: 2/2 before human turn required."), "Active Guardrails shows ACL and Human-Turn Brake counters");
+
+  // Searchable member filter (>= 5 human members)
   const filterInput = host.querySelector<HTMLInputElement>(".threads-member-filter");
-  assert(filterInput !== null, "member search filter shows when channel has >= 5 participants");
+  assert(filterInput !== null, "member search filter shows when channel has >= 5 teammates");
   const inputSetter = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!;
   await React.act(async () => {
     inputSetter.call(filterInput!, "Carol");
     filterInput!.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await flush();
-  const visibleRosterText = host.querySelector(".threads-roster")?.textContent ?? "";
-  assert(visibleRosterText.includes("Carol") && !visibleRosterText.includes("Dan"), "live member filter narrows participant list");
+  const visibleRosterText = host.querySelector("[data-roster-humans]")?.textContent ?? "";
+  assert(visibleRosterText.includes("Carol") && !visibleRosterText.includes("Dan"), "live member filter narrows teammate list");
   await React.act(async () => {
     inputSetter.call(filterInput!, "");
     filterInput!.dispatchEvent(new Event("input", { bubbles: true }));
@@ -339,14 +357,17 @@ async function main(): Promise<void> {
   await flush();
   assert(calls.some((c) => c.method === "POST" && c.path === "/api/human-threads/rooms/room-1/members" && (c.body as { human_subject?: string }).human_subject === "sub-eva"), "Add person posts sub-eva to members endpoint");
 
-  // Remove ConfirmDialog: Cancel + Escape keep member; Confirm sends DELETE
-  const bobRow = Array.from(host.querySelectorAll<HTMLElement>(".threads-roster li")).find((li) => li.textContent?.includes("Bob"));
+  // Remove ConfirmDialog: role=alertdialog, target card, Cancel focus default + Escape keep member; Confirm sends DELETE
+  const bobRow = Array.from(host.querySelectorAll<HTMLElement>("[data-roster-humans] li")).find((li) => li.textContent?.includes("Bob"));
   const bobRemove = bobRow?.querySelector<HTMLButtonElement>("button");
   assert(bobRemove !== null, "Bob has Remove action for channel manager");
   await React.act(async () => { bobRemove!.click(); });
   await flush();
-  assert(host.querySelector(".s-confirm-wrap") !== null, "clicking Remove opens ConfirmDialog");
+  const confirmEl = host.querySelector<HTMLElement>(".s-confirm");
+  assert(confirmEl?.getAttribute("role") === "alertdialog", "Remove ConfirmDialog uses role=alertdialog");
+  assert(host.querySelector(".threads-remove-card")?.textContent?.includes("Bob"), "Remove ConfirmDialog summarizes target person");
   const cancelBtn = Array.from(host.querySelectorAll<HTMLButtonElement>(".s-confirm button")).find((b) => b.textContent?.trim() === "Cancel");
+  assert(document.activeElement === cancelBtn, "Remove ConfirmDialog focuses Cancel by default");
   await React.act(async () => { cancelBtn?.click(); });
   await flush();
   assert(host.querySelector(".s-confirm-wrap") === null, "Cancel closes ConfirmDialog");
@@ -397,6 +418,97 @@ async function main(): Promise<void> {
     calls.some((c) => c.method === "POST" && c.path === "/api/human-threads/rooms/room-1/posts" && (c.body as { silent?: boolean; body?: string }).silent === true),
     "submitting with /note toggled sends silent: true",
   );
+
+  // 4. NewHumanConversation: DM badge + searchable multi-pick Select without checkboxes
+  let createdRoom: string | null = null;
+  await React.act(async () => {
+    root.render(
+      React.createElement(LocaleProvider, null,
+        React.createElement("div", null,
+          React.createElement(NewHumanConversation, {
+            mode: "direct",
+            me: { id: "human-me", name: "Mei" },
+            agents,
+            agentsError: null,
+            existingDmPeers: new Set(["bob"]),
+            onBusy: () => {},
+            onCancel: () => {},
+            onCreated: (id) => { createdRoom = id; },
+          }),
+          React.createElement(NewHumanConversation, {
+            mode: "group",
+            me: { id: "human-me", name: "Mei" },
+            agents,
+            agentsError: null,
+            onBusy: () => {},
+            onCancel: () => {},
+            onCreated: (id) => { createdRoom = id; },
+          }),
+        ),
+      ),
+    );
+  });
+  for (let i = 0; i < 6; i += 1) await flush();
+  assert(host.querySelectorAll('input[type="checkbox"], input[type="radio"]').length === 0, "NewHumanConversation uses zero checkboxes or radios");
+  assert(!host.textContent?.includes("Scope") && !host.textContent?.includes("Project"), "NewHumanConversation omits redundant Scope & Project fields");
+  const dmCombo = host.querySelector<HTMLButtonElement>('form[aria-label="New direct message"] [role="combobox"]');
+  await React.act(async () => { dmCombo?.click(); });
+  await flush();
+  const bobDmOpt = Array.from(document.querySelectorAll<HTMLElement>(".select-opt")).find((el) => el.textContent?.includes("Bob"));
+  assert(bobDmOpt?.textContent?.includes("Existing DM"), "DM dropdown flags existing direct message peers");
+  await React.act(async () => { bobDmOpt?.click(); });
+  await flush();
+
+  const chCombo = host.querySelector<HTMLButtonElement>('form[aria-label="New channel"] [aria-label="Teammates"][role="combobox"]');
+  await React.act(async () => { chCombo?.click(); });
+  await flush();
+  const searchInput = document.querySelector<HTMLInputElement>(".select-pop .select-search");
+  const bobGroupOpt = Array.from(document.querySelectorAll<HTMLElement>(".select-opt")).find((el) => el.textContent?.includes("Bob"));
+  await React.act(async () => { bobGroupOpt?.click(); });
+  await flush();
+  assert(document.querySelector(".select-pop") !== null && document.activeElement === searchInput, "keepOpenOnPick preserves popup open state and search focus");
+  const evaGroupOpt = Array.from(document.querySelectorAll<HTMLElement>(".select-opt")).find((el) => el.textContent?.includes("Eva"));
+  await React.act(async () => { evaGroupOpt?.click(); });
+  await flush();
+  assert(host.querySelectorAll(".threads-picked .threads-picked-person").length === 2, "multi-pick adds removable teammate chips");
+  const createGroupBtn = host.querySelector<HTMLButtonElement>('form[aria-label="New channel"] button[type="submit"]');
+  await React.act(async () => { createGroupBtn?.click(); });
+  await flush();
+  assert(
+    calls.some((c) => c.method === "POST" && c.path === "/api/human-threads/groups" && (c.body as { kind?: string }).kind === "human_group") &&
+      createdRoom === "room-new",
+    "NewHumanConversation submits new channel creation",
+  );
+
+  // 5. Private Home colleague mention detection and consent-gated HomeMentionHandoffCard
+  const homeCandidates: MentionsModule.MentionCandidate[] = [
+    { id: "human-bob", handle: "bob", label: "Bob", kind: "human", active: true },
+  ];
+  equal(findMentionedTeammates("ping @bob on release", homeCandidates).map((c) => c.handle), ["bob"], "finds non-silent @teammate in Home draft");
+  equal(findMentionedTeammates("email bob@example.com", homeCandidates), [], "ignores email addresses in Home draft");
+  equal(findMentionedTeammates("/note private @bob", homeCandidates), [], "ignores /note silent drafts in Home");
+
+  let handoffClicks = 0;
+  let keepPrivateClicks = 0;
+  await React.act(async () => {
+    root.render(
+      React.createElement(LocaleProvider, null,
+        React.createElement(HomeMentionHandoffCard, {
+          teammates: homeCandidates,
+          sendBlockedForConsent: true,
+          onOpenChannels: () => { handoffClicks += 1; },
+          onKeepPrivate: () => { keepPrivateClicks += 1; },
+        }),
+      ),
+    );
+  });
+  await flush();
+  const handoffCard = host.querySelector<HTMLElement>("[data-home-handoff-preview]");
+  assert(handoffCard?.getAttribute("role") === "alert", "held teammate mention in Home surfaces role=alert consent banner");
+  const openChannelsBtn = Array.from(host.querySelectorAll<HTMLButtonElement>("[data-home-handoff-preview] button")).find((b) => b.textContent?.includes("Open in Channels"));
+  const keepPrivateBtn = Array.from(host.querySelectorAll<HTMLButtonElement>("[data-home-handoff-preview] button")).find((b) => b.textContent?.includes("Keep private in Home"));
+  await React.act(async () => { openChannelsBtn?.click(); keepPrivateBtn?.click(); });
+  assert(handoffClicks === 1 && keepPrivateClicks === 1, "HomeMentionHandoffCard wires Open in Channels and Keep private in Home actions");
 
   await React.act(async () => root.unmount());
   host.remove();
