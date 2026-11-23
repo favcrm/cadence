@@ -53,6 +53,52 @@ struct PrivateDispatchProof {
     sha: Option<String>,
     body: String,
 }
+/// The issue read used to prepare a fresh job kickoff. The effective intake
+/// revision and scope are re-proved under the tracker lock at admission.
+pub(super) struct JobIssueSnapshot {
+    pm: crate::issue::Pm,
+    issue: String,
+    gated: Option<crate::issue::dispatch::GatedIssue>,
+    intake: Option<(String, String)>,
+}
+
+impl JobIssueSnapshot {
+    pub(super) fn lock(&self) -> Result<crate::issue::PmLock> {
+        self.pm.lock()
+    }
+
+    pub(super) fn revalidate(&self) -> Result<()> {
+        let live = crate::issue::dispatch::capture_issue(&self.pm, &self.issue)?;
+        let live_intake = match &live {
+            Some(issue) => {
+                let (_, body) = crate::issue::parse::split_front(&issue.source)?;
+                crate::issue::plan::gate_snapshot(&self.pm.dir, &issue.front, body)?
+                    .map(|revision| {
+                        Ok::<_, Error>((
+                            revision,
+                            crate::issue::plan::scope_digest(&issue.front, body)?,
+                        ))
+                    })
+                    .transpose()?
+            }
+            None => None,
+        };
+        if live_intake != self.intake
+            || (live_intake.is_some()
+                && live.as_ref().map(|issue| (&issue.project.key, &issue.dir))
+                    != self
+                        .gated
+                        .as_ref()
+                        .map(|issue| (&issue.project.key, &issue.dir)))
+        {
+            return Err(Error::invalid(
+                "plan_evidence_stale",
+                "task dispatch refused: approved intake scope changed while the kickoff was being prepared",
+            ));
+        }
+        Ok(())
+    }
+}
 
 impl Shared {
     // ---- Jobs: the work axis (docs/JOBS.md) ----
@@ -924,20 +970,21 @@ impl Shared {
         &self,
         plan: &crate::store::DispatchPlan,
         caller: Option<&str>,
+        issue_snapshot: Option<&JobIssueSnapshot>,
     ) -> Result<()> {
-        let Some(issue_id) = plan.job.issue_id.as_deref() else {
+        let Some(snapshot) = issue_snapshot else {
             return Ok(());
         };
-        let pm = self.pm()?;
-        let Some(gated) = crate::issue::dispatch::capture_issue(&pm, issue_id)? else {
+        let Some(gated) = &snapshot.gated else {
             return Ok(());
         };
+        let issue_id = &snapshot.issue;
         let app_paths =
             crate::issue::app_guard::apps_in_paths(gated.front.paths.iter().map(String::as_str));
         let mut authors: Vec<&str> = vec![plan.worker.alias.as_str(), plan.job.pm_alias.as_str()];
         authors.extend(caller.filter(|c| !c.is_empty()));
         let guard = crate::issue::app_guard::Ctx {
-            pm_dir: &pm.dir,
+            pm_dir: &snapshot.pm.dir,
             state_dir: Some(&self.state_dir),
             store: Some(&self.store),
         };
@@ -1939,6 +1986,37 @@ impl Shared {
         }))
     }
 
+    pub(super) fn capture_job_issue(
+        &self,
+        plan: &crate::store::DispatchPlan,
+    ) -> Result<Option<JobIssueSnapshot>> {
+        let Some(issue) = plan.job.issue_id.as_deref() else {
+            return Ok(None);
+        };
+        let pm = self.pm()?;
+        let gated = crate::issue::dispatch::capture_issue(&pm, issue)?;
+        let intake = match &gated {
+            Some(gated) => {
+                let (_, body) = crate::issue::parse::split_front(&gated.source)?;
+                crate::issue::plan::gate_snapshot(&pm.dir, &gated.front, body)?
+                    .map(|revision| {
+                        Ok::<_, Error>((
+                            revision,
+                            crate::issue::plan::scope_digest(&gated.front, body)?,
+                        ))
+                    })
+                    .transpose()?
+            }
+            None => None,
+        };
+        Ok(Some(JobIssueSnapshot {
+            pm,
+            issue: issue.to_string(),
+            gated,
+            intake,
+        }))
+    }
+
     /// `job dispatch` — bookkeeping plus the kickoff enqueue in one
     /// store transaction. Does not bypass the ready gate: `--ready` is
     /// claimed client-side exactly like `send --ready`.
@@ -1952,7 +2030,6 @@ impl Shared {
             .unattended_lock
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        self.plan_gate_task(task_id)?;
         // CAD-1846: capture the exact native task/job/worker and the proposed
         // kickoff revision/id before any source read. An accepted live
         // kickoff keeps that identity; only a fresh kickoff prepares context.
@@ -1961,6 +2038,7 @@ impl Shared {
             to.as_deref(),
             optional_str(params, "message"),
         )?;
+        self.plan_gate_task(task_id, !plan.duplicate)?;
         // The planned worker is the pre-transaction backend choice; the
         // fenced admission re-reads its identity, so a registry change
         // between here and the write refuses instead of retargeting.
@@ -1990,6 +2068,11 @@ impl Shared {
             Some(Value::Bool(value)) => *value,
             Some(_) => return Err(Error::rejected("no_lessons must be a boolean")),
         };
+        let issue_snapshot = if plan.duplicate {
+            None
+        } else {
+            self.capture_job_issue(&plan)?
+        };
         // A live accepted kickoff is admitted with its original identity and
         // selection: never recapture issue/spec sources for that retry.
         let delivery = if plan.duplicate {
@@ -1998,8 +2081,8 @@ impl Shared {
             // CAD-622: a fresh kickoff is a new authoring act — the app-team
             // guard runs before any context capture or queue write. A
             // duplicate is the accepted kickoff's own retry, not new work.
-            self.native_app_guard(&plan, optional_str(params, "by"))?;
-            Some(self.prepare_job_delivery(&plan, no_lessons)?)
+            self.native_app_guard(&plan, optional_str(params, "by"), issue_snapshot.as_ref())?;
+            Some(self.prepare_job_delivery(&plan, no_lessons, issue_snapshot.as_ref())?)
         };
         // CAD-1380 deferred commit: an assist-bound job's dispatch re-proves
         // the member's live authority at consume time — the approval gate
@@ -2130,9 +2213,17 @@ impl Shared {
                         Error::rejected("task dispatch refused: issue has no project directory")
                     })?
                     .join("project.yaml");
-                // The scoped tracker lock serializes supported issue moves and
-                // project policy writes through the database commit.
-                let _tracker = pm.lock_for_paths(&[issue_dir.clone(), policy])?;
+                // Intake evidence spans the tracker; use the full recovery
+                // fence there, and retain the existing scoped private lock
+                // for ordinary jobs and accepted replays.
+                let _tracker = if issue_snapshot.as_ref().is_some_and(|s| s.intake.is_some()) {
+                    pm.lock()?
+                } else {
+                    pm.lock_for_paths(&[issue_dir.clone(), policy])?
+                };
+                if let Some(snapshot) = &issue_snapshot {
+                    snapshot.revalidate()?;
+                }
                 let issue = plan.job.issue_id.as_deref().ok_or_else(|| {
                     Error::rejected("task dispatch refused: the private job has no issue")
                 })?;
@@ -2173,6 +2264,13 @@ impl Shared {
                     Some(&project),
                 )?
             } else {
+                let _tracker = issue_snapshot
+                    .as_ref()
+                    .map(JobIssueSnapshot::lock)
+                    .transpose()?;
+                if let Some(snapshot) = &issue_snapshot {
+                    snapshot.revalidate()?;
+                }
                 self.store.dispatch_task_planned(
                     &plan,
                     delivery,
@@ -2232,6 +2330,7 @@ impl Shared {
         &self,
         plan: &crate::store::DispatchPlan,
         no_lessons: bool,
+        issue_snapshot: Option<&JobIssueSnapshot>,
     ) -> Result<(String, store::IssueSelection)> {
         let legacy = |reason: String| -> Result<(String, store::IssueSelection)> {
             Ok((
@@ -2250,17 +2349,15 @@ impl Shared {
                 },
             ))
         };
-        let Some(issue_id) = plan.job.issue_id.as_deref() else {
+        if plan.job.issue_id.is_none() {
             return legacy("the job is not bound to a tracker issue".to_string());
-        };
-        let pm = self.pm()?;
-        // Capture the issue snapshot without re-running the parent policy
-        // gate: `plan_gate_task` already applied exactly that gate for every
-        // native caller. A named id no project holds keeps its legacy kickoff
-        // (`gate_id` documents that jobs need not name a tracker issue); an id
-        // a project holds but cannot be read/parsed fails closed.
-        let Some(gated) = crate::issue::dispatch::capture_issue(&pm, issue_id)? else {
-            self.refuse_known_opted_in_unheld(&pm, plan)?;
+        }
+        let snapshot = issue_snapshot.ok_or_else(|| {
+            Error::internal("issue-linked job delivery has no captured issue snapshot")
+        })?;
+        let pm = &snapshot.pm;
+        let Some(gated) = &snapshot.gated else {
+            self.refuse_known_opted_in_unheld(pm, plan)?;
             return legacy(
                 "no native issue context binding: the job's tracker issue is not \
                  held by a project"
@@ -2353,7 +2450,7 @@ impl Shared {
             Ok(())
         };
         let prepared = crate::issue::dispatch::job_context(
-            &pm,
+            pm,
             gated,
             crate::issue::dispatch::JobContext {
                 job: &plan.job,

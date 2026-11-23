@@ -311,14 +311,21 @@ approval and dispatch rules.
 
 `cadence plan show EPIC` reports the pinned commit, document digests and
 outcome scopes, with the reason if evidence is blocked. Exact retries return
-the existing epic. Unresolved unknowns prevent approval. Changes to cited
-sources or issue scope, or dropping a prerequisite covered by the intake,
-prevent new dispatch. Submit an updated plan file with `revises: EPIC`
-under `intake:` and have the operator approve it. A revision cannot revive
-unfinished work excluded by an earlier revision or retire an unfinished
-prerequisite that retained work still needs. Approval supersedes the old
-scope without stopping active work. Existing coordinator and worker
-admission rules still apply.
+the existing epic. Unresolved unknowns prevent approval. A new claim or
+kickoff requires closed prerequisites and unchanged approved scope and cited
+sources. A tracked module must also exist at the commit selected for the
+lane, including when you pass `--base`. For a prerequisite mapped by this
+intake, dropping it is not completion; a completed prerequisite omitted
+from a revision still has to match its last approved scope.
+
+To update the evidence, submit a plan file with `revises: EPIC` under
+`intake:` and have the operator approve it. Revise an approved intake
+directly, not through an intervening unapproved proposal. A revision
+cannot revive unfinished work excluded by an earlier revision or retire an
+unfinished prerequisite that retained work still needs. Approval supersedes
+the old scope without stopping active work. Fresh kickoff rechecks the
+approval before enqueue; retransmitting an accepted kickoff keeps its
+original receipt. Existing coordinator and worker admission rules still apply.
 
 ## Finding a command
 

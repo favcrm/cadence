@@ -1058,12 +1058,12 @@ impl Shared {
             .read()
             .unwrap_or_else(|e| e.into_inner());
         if automatic {
-            self.plan_gate_task(task_id)?;
             // CAD-1846: capture the exact planned worker/revision/message and
             // prepare the issue-linked job context outside the write
             // transaction. The monitor's own coverage/readiness/quota/queue
             // gates stay in the store's admission transaction, unchanged.
             let plan = self.store.plan_task_dispatch(task_id, None, None)?;
+            self.plan_gate_task(task_id, !plan.duplicate)?;
             if matches!(plan.task.state.as_str(), "dispatched" | "running") && !plan.duplicate {
                 return Err(Error::rejected(format!(
                     "Task '{task_id}' has no live kickoff — only draft or revising \
@@ -1072,19 +1072,31 @@ impl Shared {
             }
             // An accepted live kickoff keeps its original selection and never
             // recaptures moved sources; a fresh kickoff prepares them here.
+            let issue_snapshot = if plan.duplicate {
+                None
+            } else {
+                self.capture_job_issue(&plan)?
+            };
             let delivery = if plan.duplicate {
                 None
             } else {
                 // CAD-622: the automatic watcher is an authoring kickoff
                 // too — the job's PM and the planned worker are the
                 // authors, and the guard runs before the queue write.
-                self.native_app_guard(&plan, None)?;
-                Some(self.prepare_job_delivery(&plan, false)?)
+                self.native_app_guard(&plan, None, issue_snapshot.as_ref())?;
+                Some(self.prepare_job_delivery(&plan, false, issue_snapshot.as_ref())?)
             };
             // Hold the pending-request mutex across the store transaction.
             // The snapshot contains every alias, while the transaction
             // re-reads the task's current assignee before applying it, so an
             // approval arriving concurrently cannot be missed or bypassed.
+            let _tracker = issue_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.lock())
+                .transpose()?;
+            if let Some(snapshot) = &issue_snapshot {
+                snapshot.revalidate()?;
+            }
             let pending = self.pending.lock().unwrap();
             let pending_aliases: HashSet<String> = pending
                 .values()
@@ -1100,6 +1112,7 @@ impl Shared {
                     None,
                 )?;
             drop(pending);
+            drop(_tracker);
             let assignee = task.assignee.clone().ok_or_else(|| {
                 Error::internal("automatic dispatch returned a task without an assignee")
             })?;
@@ -1140,7 +1153,7 @@ impl Shared {
         }
         let task = self.store.task(task_id)?;
         let job = self.store.job(&task.job_id)?;
-        self.plan_gate_task(task_id)?;
+        self.plan_gate_task(task_id, false)?;
         if job.state != "open" || job.repo.as_deref() != Some(monitor.project.as_str()) {
             return Err(Error::rejected(format!(
                 "Task '{task_id}' is not in monitor project '{}' with an open job",
@@ -1261,10 +1274,27 @@ impl Shared {
         // above intact. The store re-fences the task, job and exact worker;
         // an accepted live kickoff could not reach here (it returned above).
         let plan = self.store.plan_task_dispatch(task_id, None, None)?;
+        self.plan_gate_task(task_id, !plan.duplicate)?;
+        let issue_snapshot = if plan.duplicate {
+            None
+        } else {
+            self.capture_job_issue(&plan)?
+        };
         // CAD-622: the explicit monitor handoff is the same fresh kickoff —
         // guard it before the queue write.
-        self.native_app_guard(&plan, None)?;
-        let delivery = Some(self.prepare_job_delivery(&plan, false)?);
+        let delivery = if plan.duplicate {
+            None
+        } else {
+            self.native_app_guard(&plan, None, issue_snapshot.as_ref())?;
+            Some(self.prepare_job_delivery(&plan, false, issue_snapshot.as_ref())?)
+        };
+        let _tracker = issue_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.lock())
+            .transpose()?;
+        if let Some(snapshot) = &issue_snapshot {
+            snapshot.revalidate()?;
+        }
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task_planned(
             &plan,
             delivery,
@@ -1273,6 +1303,7 @@ impl Shared {
             None,
             None,
         )?;
+        drop(_tracker);
         self.store.resolve_monitor_dispatch_blocked(
             monitor_id,
             task_id,

@@ -275,6 +275,11 @@ fn revision_retirements<'a>(
     let mut retiring = HashSet::new();
     let mut continuously_carried: HashSet<&str> =
         intake.outcomes.keys().map(String::as_str).collect();
+    let previous_approved = previous
+        .front
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.state == "approved");
     let mut cursor = Some(previous);
     while let Some(issue) = cursor {
         if !ancestors.insert(issue.front.id.as_str()) {
@@ -285,6 +290,14 @@ fn revision_retirements<'a>(
             .plan
             .as_ref()
             .ok_or_else(|| Error::rejected("invalid intake revision history"))?;
+        // A proposal cannot bridge an approval to a later revision: only a
+        // direct revision can supersede that approval in this transaction.
+        if !previous_approved && plan.state == "approved" {
+            return Err(Error::invalid(
+                "plan_revision_noncontinuous",
+                "revise the approved intake directly; an unapproved proposal cannot replace it",
+            ));
+        }
         for id in &plan.tickets {
             let id = id.as_str();
             if !intake.outcomes.contains_key(id) {

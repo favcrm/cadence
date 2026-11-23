@@ -53,13 +53,10 @@ fn automatic_upgrade_requested(method: &str, params: &Value) -> Result<bool> {
 }
 
 impl Shared {
-    /// CAD-360: the plan gate for every daemon dispatch of a task —
-    /// `task_dispatch` and both monitor paths. A task whose job is bound
-    /// to a tracker issue dispatches only if [`crate::issue::plan::gate_id`]
-    /// passes. Fail closed: a task or job that cannot be read, or a
-    /// tracker dir that cannot be resolved, refuses; only a job with no
-    /// issue, or an issue no project holds, passes unchecked.
-    pub(super) fn plan_gate_task(&self, task_id: &str) -> Result<()> {
+    /// CAD-360: fresh daemon task dispatches apply the plan gate. An accepted
+    /// replay skips only that gate; app ownership and unattended authority
+    /// remain enforced. An unheld issue retains the legacy unchecked policy.
+    pub(super) fn plan_gate_task(&self, task_id: &str, check_plan: bool) -> Result<()> {
         if self.store.app_task_owned(task_id)? {
             return Err(Error::rejected(
                 "app-owned tasks dispatch through the approved app run lifecycle",
@@ -76,7 +73,9 @@ impl Shared {
                 format!("tracker dir for {issue} cannot be resolved ({e}) — refused"),
             )
         })?;
-        crate::issue::plan::gate_id(&pm_dir, &issue)?;
+        if check_plan {
+            crate::issue::plan::gate_id(&pm_dir, &issue)?;
+        }
         // The exact standalone render authorizes canonical issue dispatch,
         // not a second, caller-authored job spec/assignee/worktree. Those
         // alternate task semantics have no native grant binding.

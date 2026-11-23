@@ -280,7 +280,7 @@ pub(crate) fn canonical_issue_spec_digest(
 /// never labels it a complete contract.
 pub(crate) fn job_context(
     pm: &Pm,
-    gated: GatedIssue,
+    gated: &GatedIssue,
     job: JobContext<'_>,
     no_lessons: bool,
 ) -> Result<Option<PreparedContext<'static>>> {
@@ -307,13 +307,13 @@ pub(crate) fn job_context(
     }
     let provider = target.provider;
     let endpoint_kind = target.endpoint_kind;
-    context_guard(pm, &project, &front, target, no_lessons, || {
+    context_guard(pm, project, front, target, no_lessons, || {
         // The caller's own scope proof runs only after this project is
         // confirmed opted in and its endpoint can receive context, and
         // before any spec byte is read: an opt-out dispatch never pays for
         // a lane proof, and its legacy kickoff needs none.
         if let Some(check) = admission_scope {
-            check(&project, &front)?;
+            check(project, front)?;
         }
         // The complete effective spec, approved and captured once. The
         // canonical locator must be the task's own lane, the captured issue
@@ -325,7 +325,7 @@ pub(crate) fn job_context(
             .as_deref()
             .unwrap_or(job_row.spec_path.as_str());
         let (captured_spec, spec_file, spec_scope) =
-            read_job_spec(&project, &dir, task, job_row, spec_path)?;
+            read_job_spec(project, dir, task, job_row, spec_path)?;
         let issue_file = std::fs::canonicalize(dir.join("issue.md")).ok();
         let canonical_issue_spec = issue_file.as_deref() == Some(spec_file.as_path());
         // Use the selected issue snapshot for both provenance and its request,
@@ -392,7 +392,7 @@ pub(crate) fn job_context(
             spec_scope,
         ));
         if spec_is_issue {
-            request.push_str(&parent_request);
+            request.push_str(parent_request);
             let mut additional = parent_items
                 .iter()
                 .filter(|item| !acceptance.iter().any(|task| task.text == item.text))
@@ -419,7 +419,7 @@ pub(crate) fn job_context(
                     "\n## Parent issue {}: {}\n\n",
                     front.id, front.title
                 ));
-                request.push_str(&parent_request);
+                request.push_str(parent_request);
                 if !request.ends_with('\n') {
                     request.push('\n');
                 }

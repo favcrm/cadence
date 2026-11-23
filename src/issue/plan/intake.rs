@@ -209,6 +209,15 @@ impl GoalIntake {
     /// Required context applies to the entire plan; optional documents only
     /// invalidate the outcomes that cite them. Unrelated commits are safe.
     pub(crate) fn require_sources(&self, project: &Project, issue: Option<&Front>) -> Result<()> {
+        self.require_sources_at(project, issue, None)
+    }
+
+    pub(super) fn require_sources_at(
+        &self,
+        project: &Project,
+        issue: Option<&Front>,
+        execution_base: Option<&str>,
+    ) -> Result<()> {
         let affected = || {
             self.outcomes.iter().filter(move |(id, _)| {
                 issue.is_none_or(|front| &front.id == *id || front.blocked_by.contains(id))
@@ -243,11 +252,21 @@ impl GoalIntake {
         let paths: std::collections::BTreeSet<&str> = affected()
             .flat_map(|(_, outcome)| outcome.paths.iter().map(String::as_str))
             .collect();
-        context::check_plan_paths(project, revision, paths).map_err(|(_, detail)| stale(detail))
+        context::check_plan_paths(project, revision, paths).map_err(|(_, detail)| stale(detail))?;
+        if let (Some(base), Some(front)) = (execution_base.filter(|base| *base != revision), issue)
+        {
+            let outcome = self
+                .outcomes
+                .get(&front.id)
+                .ok_or_else(|| stale(format!("{} has no recorded outcome", front.id)))?;
+            context::check_plan_paths(project, base, outcome.paths.iter().map(String::as_str))
+                .map_err(|(_, detail)| stale(format!("execution base {base}: {detail}")))?;
+        }
+        Ok(())
     }
 }
 
-fn scope_digest(front: &Front, body: &str) -> Result<String> {
+pub(crate) fn scope_digest(front: &Front, body: &str) -> Result<String> {
     // A claim, assignee or status change is operational, not new work.
     for path in &front.paths {
         areas::check_path(path)?;

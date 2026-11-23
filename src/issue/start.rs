@@ -379,7 +379,8 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
     }
     let (project, dir) = write::issue_dir(pm, id)?;
-    let (initial_front, _) = write::load_front(&dir)?;
+    let (initial_front, initial_body) = write::load_front(&dir)?;
+    let initial_intake = crate::issue::plan::gate_snapshot(&pm.dir, &initial_front, &initial_body)?;
     // CAD-202: a pty assignee whose pane cwd is deleted or outside the
     // project's repos refuses here, before anything is created.
     let mut cloud = false;
@@ -473,11 +474,14 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     // CAD-1191: lock 1 (short) — claim check, take-over and, for a new
     // lane, the claim record. Worktree work runs unlocked; lock 2
     // records the lane refs.
+    if initial_intake.is_some() {
+        crate::issue::lockseam::outside_lock("start-pre-claim");
+    }
     let lock = pm.lock()?;
     let (mut front, body) = write::load_front(&dir)?;
     // An intake revision can retire this scope while we resolve the lane.
     // Admit the current plan under the same tracker lock as the claim.
-    crate::issue::plan::gate(&pm.dir, &front, &body)?;
+    crate::issue::plan::gate_claim(&pm.dir, &front, &body, &base_sha)?;
     let front_id = front.id.clone();
     // CAD-383: a doing/review issue held by someone else refuses before
     // any lane is touched; a take-over is its own commit, made now.

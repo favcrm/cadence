@@ -45,6 +45,7 @@ mod doc;
 mod intake;
 
 pub use doc::{parse_plan, Dep, PlanDoc, Ticket};
+pub(crate) use intake::scope_digest;
 pub use intake::GoalIntake;
 
 /// Largest plan text `propose` accepts.
@@ -214,6 +215,25 @@ fn not_approved(epic: &str, state: &str, what: &str) -> Error {
 /// repo any local agent can write, so it stops mistakes and keeps the
 /// board honest; it does not stop a determined same-uid process.
 pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
+    gate_snapshot(pm_dir, front, body).map(drop)
+}
+
+/// Admission proof for callers preparing a fresh kickoff. The approved
+/// intake epic can change even when a carried issue's scope does not.
+pub(crate) fn gate_snapshot(pm_dir: &Path, front: &Front, body: &str) -> Result<Option<String>> {
+    admit(pm_dir, front, body, None)
+}
+
+pub(super) fn gate_claim(pm_dir: &Path, front: &Front, body: &str, base: &str) -> Result<()> {
+    admit(pm_dir, front, body, Some(base)).map(drop)
+}
+
+fn admit(
+    pm_dir: &Path,
+    front: &Front,
+    body: &str,
+    execution_base: Option<&str>,
+) -> Result<Option<String>> {
     if front.plan.is_some() {
         let epic = &front.id;
         return Err(Error::invalid(
@@ -225,7 +245,7 @@ pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
         ));
     }
     let Some((epic, plan)) = membership(pm_dir, front)? else {
-        return Ok(());
+        return Ok(None);
     };
     if plan.state != "approved" {
         return Err(not_approved(
@@ -245,12 +265,18 @@ pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
         ));
     }
     if plan.intake.is_some() {
-        verify_intake_dispatch(pm_dir, &epic, front, body)?;
+        return verify_intake_dispatch(pm_dir, &epic, front, body, execution_base).map(Some);
     }
-    Ok(())
+    Ok(None)
 }
 
-fn verify_intake_dispatch(pm_dir: &Path, epic: &str, front: &Front, body: &str) -> Result<()> {
+fn verify_intake_dispatch(
+    pm_dir: &Path,
+    epic: &str,
+    front: &Front,
+    body: &str,
+    execution_base: Option<&str>,
+) -> Result<String> {
     let mut issue = probe_issue(pm_dir, epic)?
         .ok_or_else(|| unreadable(epic, "goal-intake epic is missing"))?;
     let project = crate::issue::project::list(pm_dir)?
@@ -273,14 +299,9 @@ fn verify_intake_dispatch(pm_dir: &Path, epic: &str, front: &Front, body: &str) 
         let Some(next) = &intake.superseded_by else {
             intake.require_goal(&issue.body)?;
             intake.require_scope(front, body)?;
-            for id in &front.blocked_by {
-                if intake.outcomes.contains_key(id) {
-                    let dependency = board::load_issue(pm_dir, &project.key, id)
-                        .map_err(|e| unreadable(id, e))?;
-                    intake.require_scope(&dependency.front, &dependency.body)?;
-                }
-            }
-            return intake.require_sources(&project, Some(front));
+            require_intake_dependencies(pm_dir, &project.key, id, intake, front)?;
+            intake.require_sources_at(&project, Some(front), execution_base)?;
+            return Ok(issue.front.id);
         };
         let revision =
             board::load_issue(pm_dir, &project.key, next).map_err(|e| unreadable(next, e))?;
@@ -308,6 +329,66 @@ fn verify_intake_dispatch(pm_dir: &Path, epic: &str, front: &Front, body: &str) 
         }
         issue = revision;
     }
+}
+
+fn require_intake_dependencies(
+    pm_dir: &Path,
+    project: &str,
+    epic: &str,
+    intake: &GoalIntake,
+    front: &Front,
+) -> Result<()> {
+    let mut historical = Vec::new();
+    for id in &front.blocked_by {
+        let dependency = board::find_issue(pm_dir, id).map_err(|e| unreadable(id, e))?;
+        if !cadence_core::issue::is_closed(&dependency.front.status) {
+            return Err(Error::invalid(
+                "plan_dependency_unready",
+                format!("{} cannot start while prerequisite {id} is open", front.id),
+            ));
+        }
+        if intake.outcomes.contains_key(id) {
+            intake.require_scope(&dependency.front, &dependency.body)?;
+        } else if dependency.project == project && intake.revises.is_some() {
+            historical.push(dependency);
+        }
+    }
+    if historical.is_empty() {
+        return Ok(());
+    }
+    // A completed prerequisite may be omitted from a revision, not from a
+    // retained ticket's dependency evidence. Look up its last approved scope.
+    let mut visited = HashSet::new();
+    let mut successor = std::borrow::Cow::Borrowed(epic);
+    let mut previous = intake.revises.clone();
+    while !historical.is_empty() {
+        let Some(id) = previous else {
+            break;
+        };
+        if !visited.insert(id.clone()) {
+            return Err(unreadable(&id, "cyclic intake ancestry"));
+        }
+        let previous_epic =
+            board::load_issue(pm_dir, project, &id).map_err(|e| unreadable(&id, e))?;
+        let (state, record) = previous_epic
+            .front
+            .plan
+            .and_then(|plan| plan.intake.map(|intake| (plan.state, intake)))
+            .filter(|(_, record)| record.superseded_by.as_deref() == Some(successor.as_ref()))
+            .ok_or_else(|| unreadable(&id, "broken intake ancestry"))?;
+        if state == "approved" {
+            for index in (0..historical.len()).rev() {
+                let dependency = &historical[index];
+                if record.outcomes.contains_key(&dependency.front.id) {
+                    record.require_scope(&dependency.front, &dependency.body)?;
+                    historical.swap_remove(index);
+                }
+            }
+        }
+        successor = std::borrow::Cow::Owned(id);
+        previous = record.revises;
+    }
+    Ok(())
 }
 
 /// CAD-339: the master's dispatch gate — [`gate`], and the issue must

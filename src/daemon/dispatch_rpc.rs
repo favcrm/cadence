@@ -192,6 +192,28 @@ impl Shared {
         // outcome, so it never re-captures project context or adds metadata;
         // only an existing pinned selection keeps its conversation real.
         let already_accepted = self.store.message_exists(&mid)?;
+        // Bind the sender's already-rendered text to the same approved intake
+        // scope used by daemon-side context preparation. Request fields are
+        // corroboration only; the live tracker remains the authority.
+        let prepared_intake = if already_accepted {
+            None
+        } else {
+            issue::plan::gate_snapshot(&pm.dir, &front, issue_body)?
+                .map(|revision| {
+                    Ok::<_, Error>((revision, issue::plan::scope_digest(&front, issue_body)?))
+                })
+                .transpose()?
+        };
+        if let Some((revision, scope)) = &prepared_intake {
+            if optional_str(params, "intake_revision") != Some(revision.as_str())
+                || optional_str(params, "intake_scope") != Some(scope.as_str())
+            {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "dispatch send refused: kickoff was not prepared from the current approved intake scope",
+                ));
+            }
+        }
         // Keep an accepted pinned selection's native conversation real; a
         // legacy accepted mid gains no new metadata.
         if already_accepted && self.store.context_pin(&alias, &mid)?.is_some() {
@@ -267,14 +289,34 @@ impl Shared {
         }
         let gated = (matches!(&caller, AgentCaller::Agent(_)) || automatic)
             && self.unattended_issue_bound(&id)?;
-        let fresh_plan_send = !already_accepted && front.plan_epic.is_some();
-        // Grant→tracker order; keep canonical semantics and owner stable
-        // through enqueue. Resolve blocking reads/Git before the live helper,
-        // whose final expiry check must follow all dispatch setup waits.
-        let _tracker = (gated || fresh_plan_send).then(|| pm.lock()).transpose()?;
-        if fresh_plan_send {
-            let (live_front, live_body) = issue::write::load_front(&dir)?;
-            issue::plan::gate(&pm.dir, &live_front, &live_body)?;
+        // Grant→tracker order. A fresh intake send re-resolves the
+        // admitted snapshot under the tracker lock held through enqueue.
+        let revalidate_intake = prepared_intake.is_some();
+        let _tracker = (gated || revalidate_intake).then(|| pm.lock()).transpose()?;
+        if revalidate_intake {
+            let (live_project, live_dir) = issue::write::issue_dir(&pm, &id)?;
+            if live_dir != dir || live_project.key != project.key {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "dispatch send refused: issue moved while the kickoff was being prepared",
+                ));
+            }
+            let (live_front, live_body) = issue::write::load_front(&live_dir)?;
+            let live_revision = issue::plan::gate_snapshot(&pm.dir, &live_front, &live_body)?;
+            let live_intake = live_revision
+                .map(|revision| {
+                    Ok::<_, Error>((
+                        revision,
+                        issue::plan::scope_digest(&live_front, &live_body)?,
+                    ))
+                })
+                .transpose()?;
+            if live_intake != prepared_intake {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "dispatch send refused: approved intake scope changed while the kickoff was being prepared",
+                ));
+            }
         }
         let mut authorized_until = None;
         if gated {
@@ -322,6 +364,7 @@ impl Shared {
             selection,
             None,
         )?;
+        drop(_tracker);
         self.notify_agent(&alias);
         self.wake();
         let mut receipt = json!({"message": mid, "state": state, "duplicate": duplicate});

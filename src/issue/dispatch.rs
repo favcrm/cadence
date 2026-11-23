@@ -233,6 +233,7 @@ struct Preflight {
     project: crate::issue::project::Project,
     dir: PathBuf,
     front: Front,
+    intake_scope: Option<(String, String)>,
     items: Vec<AcceptanceItem>,
     acceptance: Value,
     acceptance_warning: Option<String>,
@@ -475,7 +476,11 @@ fn preflight(
         items,
         source,
         request,
-    } = gate_issue(pm, id, false)?;
+    } = capture_issue(pm, id)?.ok_or_else(|| {
+        Error::rejected(format!(
+            "Unknown issue '{id}' — `cadence issue ls` lists what exists"
+        ))
+    })?;
     // CAD-159: the CAD-238 section-scoped readback. No items warns;
     // it never refuses (PM decision, ADR-0002 §8.3).
     let acceptance_warning = items
@@ -653,6 +658,17 @@ fn preflight(
             reuse_job = job["id"].as_str().map(str::to_string);
         }
     }
+    // Accepted duplicates are settled by their existing provenance above.
+    // Fresh work binds the rendered text to this exact approved scope.
+    let (_, scope_body) = parse::split_front(&source)?;
+    let intake_scope = crate::issue::plan::gate_snapshot(&pm.dir, &front, scope_body)?
+        .map(|revision| {
+            Ok::<_, Error>((
+                revision,
+                crate::issue::plan::scope_digest(&front, scope_body)?,
+            ))
+        })
+        .transpose()?;
     // CAD-1822/CAD-1846: both entry points run the same mandatory pipeline.
     // The task contract and the project's required sources are validated
     // before `issue start`, so a refusal leaves no lane, branch, job or
@@ -728,7 +744,7 @@ fn preflight(
             let placeholder = "0".repeat(32);
             let prepared = job_context(
                 pm,
-                GatedIssue {
+                &GatedIssue {
                     project: project.clone(),
                     dir: dir.clone(),
                     front: front.clone(),
@@ -772,6 +788,7 @@ fn preflight(
         project,
         dir,
         front,
+        intake_scope,
         items,
         acceptance,
         acceptance_warning,
@@ -1180,6 +1197,7 @@ pub fn run(
         project,
         dir,
         front,
+        intake_scope,
         items,
         acceptance,
         acceptance_warning,
@@ -1458,6 +1476,10 @@ pub fn run(
         let mut send = json!({"alias": args.to, "text": body, "reply_to": reply_to,
                               "message": mid, "no_lessons": args.no_lessons,
                               "issue": front.id, "worktree": started["worktree"]});
+        if let Some((revision, scope)) = &intake_scope {
+            send["intake_revision"] = json!(revision);
+            send["intake_scope"] = json!(scope);
+        }
         if matches!(origin, DispatchOrigin::Automatic) {
             send["unattended"] = json!(true);
         }
