@@ -252,7 +252,7 @@ fn form_check(input: &FormCheckInput) -> FormCheckValue {
 pub struct DeliveryRequirementsInput {
     /// The exact `delivery:` section text, or absent when the project has none.
     pub policy: Option<String>,
-    /// CAD-2708: a stored `delivery:` section as a hosted owner saved it —
+    /// CAD-2715: a stored `delivery:` section as a hosted owner saved it —
     /// its YAML value or the section with its `delivery:` key — which the
     /// core wraps with `delivery::section_front`, the wrapper the CLI uses,
     /// so a host keeps no wrapper of its own. Refused together with `policy`.

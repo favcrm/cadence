@@ -1,0 +1,107 @@
+{
+  "input": {
+    "v": 1,
+    "op": "delivery.requirements.evaluate",
+    "input": {
+      "policy_section": "reviews:\n  review: {kind: agent, focus: general}\n  qa: {kind: agent, focus: browser-qa}\nrisk:\n  - require: [review]\n  - when: {paths: [\"src/components/nav/**\"]}\n    require: [review, qa]\n",
+      "approval": null,
+      "changes": [
+        {
+          "status": "M",
+          "old_mode": "100644",
+          "new_mode": "100644",
+          "path": "src/components/nav/SiteNav.tsx"
+        }
+      ],
+      "lines": 12,
+      "risk_paths": "[schema]\npaths = [\"sys/schema.rs\"]\n[trigger1]\npaths = [\"sys/auth.rs\"]\n[trigger3]\npaths = [\"secrets/**\"]\n[trigger4]\npaths = [\"sys/supply.lock\"]\n[trigger6]\npaths = [\"sys/rollout.rs\"]\n[trigger7]\npaths = [\"sys/rules/**\"]\n[operator]\npaths = [\"deploy/**\"]\n[browser_qa]\npaths = [\"ui/**\"]\n[routine]\npaths = [\"docs/**/*.md\"]\n",
+      "one_review_paths": "one_review_include = [\"src/**\", \"docs/**\"]\none_review_exclude = []\n",
+      "policy_owner_approved": true
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "delivery.requirements.evaluate",
+    "value": {
+      "policy": {
+        "heavy": {
+          "files_over": 10,
+          "lines_over": 800
+        },
+        "max_revise": 2,
+        "merge": {
+          "method": "squash",
+          "queue": true
+        },
+        "oversized": {
+          "files_over": 40,
+          "lines_over": 3000
+        },
+        "reviews": {
+          "qa": {
+            "focus": "browser-qa",
+            "kind": "agent"
+          },
+          "review": {
+            "focus": "general",
+            "kind": "agent"
+          }
+        },
+        "risk": [
+          {
+            "require": [
+              "review"
+            ],
+            "when": null
+          },
+          {
+            "require": [
+              "review",
+              "qa"
+            ],
+            "when": {
+              "files_over": null,
+              "lines_over": null,
+              "paths": [
+                "src/components/nav/**"
+              ]
+            }
+          }
+        ]
+      },
+      "policy_digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9",
+      "policy_note": null,
+      "policy_source": "approved",
+      "requirements": {
+        "activation": "no_profile",
+        "browser_qa": true,
+        "class": "consequential",
+        "full_checks": true,
+        "operator_approval": false,
+        "policy_digest": "sha256:b14fbdc14089219739e19a1764f22c90a2fc3ea64003c74f27a9bcaaa1e90fd9",
+        "reasons": [
+          "an approved delivery policy is in force",
+          "policy rule 0 applies: always",
+          "policy rule 1 applies: path src/components/nav/SiteNav.tsx",
+          "the approved policy decides: no trusted-list floor applies"
+        ],
+        "required_checks": [],
+        "required_reviews": [
+          {
+            "focus": "general",
+            "kind": "agent",
+            "name": "review"
+          },
+          {
+            "focus": "browser-qa",
+            "kind": "agent",
+            "name": "qa"
+          }
+        ],
+        "review_kind": "combined",
+        "reviews": 1,
+        "security_capable": false
+      }
+    }
+  }
+}

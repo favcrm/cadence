@@ -276,7 +276,7 @@ fn flag_absent_custom_policy_is_not_evaluated() {
     assert!(v["requirements"].get("required_reviews").is_none(), "{v}");
 }
 
-// ---- CAD-2708: `policy_section`, the stored section the core wraps -------
+// ---- CAD-2715: `policy_section`, the stored section the core wraps -------
 
 /// The input with `policy_section` in place of `policy`.
 fn section_input(section: &str, paths: &[&str], extra: Value) -> Value {
@@ -341,5 +341,13 @@ fn policy_with_policy_section_is_refused_as_contradictory() {
 fn a_malformed_policy_section_stays_strict() {
     let v = value(&section_input("bogus: 1\n", &["src/a.rs"], flag()));
     assert_eq!(v["policy_source"], "default", "{v}");
+    // Parsed and refused, not ignored: an ignored section has no note.
+    assert!(
+        v["policy_note"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("delivery_error"),
+        "{v}"
+    );
     assert_eq!(v["requirements"]["class"], "strict", "{v}");
 }

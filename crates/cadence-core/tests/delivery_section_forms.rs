@@ -52,6 +52,14 @@ fn policy_section_answers_as_the_wrapped_policy_for_every_stored_form() {
         for owner in [false, true] {
             let wrapped = evaluate(Value::from(section_front(text)), Value::Null, owner);
             let section = evaluate(Value::Null, Value::from(text), owner);
+            let answer: Value = serde_json::from_slice(&section).unwrap();
+            assert_eq!(answer["ok"], true, "{name} owner={owner}: {answer}");
+            if owner {
+                if let Some(digest) = form["digest"].as_str() {
+                    assert_eq!(answer["value"]["policy_source"], "approved", "{name}");
+                    assert_eq!(answer["value"]["policy_digest"], digest, "{name}");
+                }
+            }
             assert_eq!(
                 String::from_utf8(section).unwrap(),
                 String::from_utf8(wrapped).unwrap(),
