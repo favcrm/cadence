@@ -137,7 +137,8 @@
   outline-offset: 2px;
 }
 
-.wa-mode-tile:disabled {
+.wa-mode-tile:disabled,
+.wa-mode-tile[aria-disabled="true"] {
   opacity: 0.78;
   cursor: default;
 }
@@ -195,16 +196,17 @@
 
 .wa-cost-nudge-text {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   color: var(--color-ink-200);
   min-width: 0;
-  flex: 1;
+  flex: 1 1 16rem;
 }
 
 .wa-cost-nudge-icon {
   color: var(--color-warn);
   flex: none;
+  margin-top: 2px;
 }
 
 .wa-cost-nudge-actions {
@@ -212,6 +214,7 @@
   align-items: center;
   gap: 6px;
   flex: none;
+  flex-wrap: wrap;
 }
 
 /* Single focused connection card */
@@ -592,6 +595,33 @@
 
   .wa-mode-picker {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .wa-cost-nudge {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .wa-cost-nudge-text {
+    flex: none;
+  }
+
+  .wa-cost-nudge-actions {
+    justify-content: flex-start;
+  }
+
+  .wa-conn-head {
+    align-items: flex-start;
+  }
+
+  .wa-conn-identity {
+    flex: 1 1 100%;
+  }
+
+  .wa-conn-head-right {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .wa-row {

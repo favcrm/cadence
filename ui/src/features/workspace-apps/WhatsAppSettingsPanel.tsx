@@ -167,6 +167,8 @@ export default function WhatsAppSettingsPanel({
   changedRef.current = onSettingsChanged;
   const requestSeq = useRef(0);
   const lastInitialMode = useRef<WhatsAppProvider | null | undefined>(initialMode);
+  const linkedRadioRef = useRef<HTMLButtonElement | null>(null);
+  const officialRadioRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     modeInitializedRef.current = false;
@@ -266,8 +268,20 @@ export default function WhatsAppSettingsPanel({
     };
   }, [busyAction, linkedStateForPoll, loadSnapshot]);
 
+  useEffect(() => {
+    if (!linkedConfirm && !officialConfirmPause) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape" || busyAction !== null) return;
+      event.preventDefault();
+      setLinkedConfirm(null);
+      setOfficialConfirmPause(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [linkedConfirm, officialConfirmPause, busyAction]);
+
   const handleSelectMode = async (mode: WhatsAppProvider) => {
-    if (!snapshot) return;
+    if (!snapshot || busyAction !== null) return;
     setFocusedMode(mode);
     setActionError(null);
     setStatusNotice(null);
@@ -306,11 +320,18 @@ export default function WhatsAppSettingsPanel({
   };
 
   const handleModeKeyDown = (event: KeyboardEvent<HTMLButtonElement>, current: WhatsAppProvider) => {
-    if (event.key !== "ArrowRight" && event.key !== "ArrowDown" && event.key !== "ArrowLeft" && event.key !== "ArrowUp") {
-      return;
+    if (!snapshot || snapshot.viewer_role !== "owner" || busyAction !== null) return;
+    let next: WhatsAppProvider | null = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown" || event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      next = current === "linked" ? "official" : "linked";
+    } else if (event.key === "Home") {
+      next = "linked";
+    } else if (event.key === "End") {
+      next = "official";
     }
+    if (!next) return;
     event.preventDefault();
-    const next: WhatsAppProvider = current === "linked" ? "official" : "linked";
+    (next === "linked" ? linkedRadioRef : officialRadioRef).current?.focus();
     void handleSelectMode(next);
   };
 
@@ -468,11 +489,14 @@ export default function WhatsAppSettingsPanel({
         aria-label={t("Connection mode")}
       >
         <button
+          ref={linkedRadioRef}
           type="button"
           className="wa-mode-tile"
           role="radio"
           aria-checked={focusedMode === "linked"}
-          disabled={!isOwner || busy}
+          tabIndex={focusedMode === "linked" ? 0 : -1}
+          disabled={!isOwner}
+          aria-disabled={busy || undefined}
           onClick={() => void handleSelectMode("linked")}
           onKeyDown={(e) => handleModeKeyDown(e, "linked")}
         >
@@ -490,11 +514,14 @@ export default function WhatsAppSettingsPanel({
         </button>
 
         <button
+          ref={officialRadioRef}
           type="button"
           className="wa-mode-tile"
           role="radio"
           aria-checked={focusedMode === "official"}
-          disabled={!isOwner || busy}
+          tabIndex={focusedMode === "official" ? 0 : -1}
+          disabled={!isOwner}
+          aria-disabled={busy || undefined}
           onClick={() => void handleSelectMode("official")}
           onKeyDown={(e) => handleModeKeyDown(e, "official")}
         >
