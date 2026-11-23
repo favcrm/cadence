@@ -242,7 +242,9 @@ function matchesSetupScopes(actual: readonly string[], expected: string | undefi
 }
 
 function reviewableRead(pin: CustomMcpToolPin): boolean {
-  return pin.mode === "approval" && !pin.drifted && isToolReadOnlyHint(pin) && !isToolDestructiveHint(pin);
+  return pin.mode === "approval" && !pin.drifted &&
+    !["call_tool", "execute_tool", "run_tool", "use_tool"].includes(pin.tool_name.toLowerCase()) &&
+    isToolReadOnlyHint(pin) && !isToolDestructiveHint(pin);
 }
 
 function CustomMcpSetupCard({ entry, setup, density, conversation }: {
@@ -265,9 +267,11 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   const attempt = conversation ? readSetupAttempt(key, setup.endpointUrl) : null;
   const connId = attempt?.id;
   const endpoint = attempt?.endpoint ?? setup.endpointUrl;
-  const outcome = connId && callback?.connectionId === connId ? callback.outcome : null;
+  const outcome = connId && callback?.connectionId === connId &&
+    url.searchParams.get("mcp_attempt") === (attempt?.nonce || null) ? callback.outcome : null;
   const requiredScopes = setup.requiredScopes?.join(" ");
   url.search = withoutConnectParams(url.search);
+  url.searchParams.delete("mcp_attempt");
   url.searchParams.set("mcp_setup", String(entry.seq));
   const returnTo = url.href;
 
@@ -296,8 +300,8 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     return () => controller.abort();
   }, [connId, endpoint, outcome, requiredScopes, setup.label, resumed, recheck]);
 
-  function remember(id: string, endpointUrl: string) {
-    const value = `${id}\n${new URL(endpointUrl).href}\n${crypto.randomUUID()}`;
+  function remember(id: string, endpointUrl: string, nonce: string) {
+    const value = `${id}\n${new URL(endpointUrl).href}\n${nonce}`;
     // A same-origin tab can recover an attempt; restricted browsers still support same-tab return.
     try {
       window.localStorage.setItem(key, value);
@@ -309,7 +313,11 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   function liveCallback(expected: SetupAttempt): boolean {
     const live = new URL(window.location.href);
     const returned = customMcpReturn(live.search);
-    return live.pathname === url.pathname && live.searchParams.get("mcp_setup") === String(entry.seq) &&
+    return live.pathname === url.pathname &&
+      live.searchParams.get("conversation") === url.searchParams.get("conversation") &&
+      live.searchParams.get("ctx") === url.searchParams.get("ctx") &&
+      live.searchParams.get("mcp_setup") === String(entry.seq) &&
+      live.searchParams.get("mcp_attempt") === (expected.nonce || null) &&
       returned?.connectionId === expected.id && returned.outcome === callback?.outcome &&
       sameSetupAttempt(readSetupAttempt(key, setup.endpointUrl), expected);
   }
@@ -330,6 +338,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       const live = new URL(window.location.href);
       live.search = withoutConnectParams(live.search);
       live.searchParams.delete("mcp_setup");
+      live.searchParams.delete("mcp_attempt");
       navigate(`${live.pathname}${live.search}${live.hash}`, { replace: true });
     }
   }
@@ -351,7 +360,10 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     if (!connId || !attempt) return;
     void run(async () => {
       try {
-        const started = await api.customMcpOAuthStart(connId, { return_to: returnTo });
+        const nonce = crypto.randomUUID();
+        const retryReturnTo = new URL(returnTo);
+        retryReturnTo.searchParams.set("mcp_attempt", nonce);
+        const started = await api.customMcpOAuthStart(connId, { return_to: retryReturnTo.href });
         const authUrl = customMcpAuthorizationUrl(started);
         if (started.connection_id !== connId || authUrl === null) {
           setError("Server did not return a valid https:// authorization URL.");
@@ -366,7 +378,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
         }
         if (window.location.href !== originalHref ||
             !sameSetupAttempt(readSetupAttempt(key, setup.endpointUrl), attempt)) return;
-        remember(connId, endpoint);
+        remember(connId, endpoint, nonce);
         window.location.assign(authUrl);
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) forget(attempt);
@@ -465,7 +477,12 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       </div>
     );
   } else {
-    actions = <button type="button" className="btn btn-primary" disabled={!conversation} onClick={() => setDrawer("connect")}>{t("Connect {label}").replace("{label}", () => setup.label)}</button>;
+    actions = (
+      <div className="flex flex-wrap gap-2">
+        <button type="button" className="btn btn-primary" disabled={!conversation} onClick={() => setDrawer("connect")}>{t("Connect {label}").replace("{label}", () => setup.label)}</button>
+        <button type="button" className="btn btn-ghost" disabled={!conversation} onClick={() => setDrawer("edit")}>{t("Edit endpoint")}</button>
+      </div>
+    );
   }
 
   return (

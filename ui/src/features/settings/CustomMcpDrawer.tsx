@@ -74,7 +74,7 @@ export function CustomMcpConnectDrawer({
 }: {
   onClose: () => void;
   onConnected: (connection: CustomMcpConnectionSummary) => void;
-  onOAuthStarted: (connectionId: string, endpointUrl: string) => void;
+  onOAuthStarted: (connectionId: string, endpointUrl: string, nonce: string) => void;
   setup?: { label: string; endpointUrl: string; requiredScopes?: string[]; returnTo: string; editEndpoint?: boolean };
 }) {
   const t = useTranslate();
@@ -146,10 +146,14 @@ export function CustomMcpConnectDrawer({
     const requiredScopes = setup
       ? setup.requiredScopes ?? (authKind === "oauth_static" && scopes.length ? scopes : undefined)
       : undefined;
-    const returnTo = setup?.returnTo ?? (
-      typeof window !== "undefined"
-        ? `${window.location.origin}/settings/connections`
-        : undefined);
+    const nonce = setup ? crypto.randomUUID() : "";
+    const returnTo = setup
+      ? (() => {
+          const url = new URL(setup.returnTo);
+          url.searchParams.set("mcp_attempt", nonce);
+          return url.href;
+        })()
+      : typeof window !== "undefined" ? `${window.location.origin}/settings/connections` : undefined;
 
     setBusy(true);
     try {
@@ -187,7 +191,7 @@ export function CustomMcpConnectDrawer({
             return;
           }
         }
-        onOAuthStarted(reply.connection_id, new URL(endpointUrl.trim()).href);
+        onOAuthStarted(reply.connection_id, new URL(endpointUrl.trim()).href, nonce);
         setDiscoveryStep({
           authorizationUrl: safeUrl,
           connectionId: reply.connection_id,

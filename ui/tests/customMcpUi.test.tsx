@@ -263,8 +263,11 @@ async function main() {
       endpoint_url: sampleMcp.endpoint_url, required_scopes: ["mcp:read"] },
   } satisfies ThreadEntry;
   const receiptKey = "cadence:mcp-setup:thread-20:20";
-  async function openSetup(key: string, outcome = "connected", conversation = "thread-20") {
-    win.history.replaceState({}, "", `/home?mcp_setup=20&aos_connect=${outcome}&toolkit=custom_mcp&connection_id=${sampleMcp.id}`);
+  async function openSetup(key: string, outcome = "connected", conversation = "thread-20", callbackNonce?: string) {
+    const stored = win.localStorage.getItem(`cadence:mcp-setup:${conversation}:20`) ??
+      win.sessionStorage.getItem(`cadence:mcp-setup:${conversation}:20`);
+    const nonce = callbackNonce ?? stored?.split("\n")[2];
+    win.history.replaceState({}, "", `/home?mcp_setup=20&aos_connect=${outcome}&toolkit=custom_mcp&connection_id=${sampleMcp.id}${nonce ? `&mcp_attempt=${nonce}` : ""}`);
     await act(async () => {
       root.render(React.createElement(PageLocale, null, React.createElement(ImageConversation, {
         value: conversation,
@@ -330,6 +333,32 @@ async function main() {
   messageMode = "ok";
   resolveMessage = undefined;
 
+  win.localStorage.setItem(receiptKey, attemptReceipt);
+  messageWrites.length = 0;
+  messageMode = "deferred";
+  await openSetup("different-conversation-query");
+  await settle(() => assert(byText("button", "Continue in chat"), "query navigation send has verified connection"));
+  await act(async () => byText("button", "Continue in chat")!.click());
+  await settle(() => assert(resolveMessage && messageWrites.length === 1, "query navigation send is in flight"));
+  const otherConversation = win.location.search + "&conversation=another";
+  win.history.replaceState({}, "", `/home${otherConversation}#new`);
+  await act(async () => { resolveMessage!(jsonRes({ ok: true })); });
+  assert(win.location.search === otherConversation && win.location.hash === "#new", "late completion preserves another conversation");
+  messageMode = "ok";
+  resolveMessage = undefined;
+
+  win.localStorage.setItem(receiptKey, newerReceipt);
+  await openSetup("old-callback", "connected", "thread-20", "attempt-one");
+  assert(!byText("button", "Continue in chat"), "old callback cannot adopt a newer nonce for the same connection");
+  assert(win.localStorage.getItem(receiptKey) === newerReceipt, "old callback retains the newer receipt");
+
+  win.localStorage.removeItem(receiptKey);
+  await openSetup("edit-before-connection", "failed");
+  await act(async () => byText("button", "Edit endpoint")!.click());
+  assert(document.querySelector<HTMLInputElement>('input[type="url"]')?.readOnly === false, "endpoint can be edited before a connection exists");
+  await act(async () => root.render(React.createElement("div")));
+
+
   win.localStorage.setItem(receiptKey, `${sampleMcp.id}\n${sampleMcp.endpoint_url}`);
   await openSetup("different-thread", "connected", "another-thread");
   assert(!byText("button", "Continue in chat"), "return cannot resume another conversation");
@@ -345,7 +374,7 @@ async function main() {
     assert(!byText("button", "Continue in chat"), "unverified return has no continuation");
   }
 
-  const brokerAnnotations = { readOnlyHint: true, destructiveHint: true };
+  const brokerAnnotations = { readOnlyHint: true, destructiveHint: false };
   const readGuard = guardedMcpReadRequest.read_guard;
   const reviewedTool = {
     ...sampleMcp.tools[0],
@@ -361,8 +390,8 @@ async function main() {
   ] };
   await openSetup("recovered-tab");
   await settle(() => assert(byText("button", "Continue in chat"), "shared receipt recovers the exact active connection"));
-  assert(!document.querySelector('[aria-label="Enable read access: execute_tool"]'), "broker has no inline read promotion");
   await act(async () => byText("summary", "Review tool access")!.click());
+  assert(!document.querySelector('[aria-label="Enable read access: execute_tool"]'), "broker has no inline read promotion after disclosure");
   await act(async () => (document.querySelector('[aria-label="Enable read access: catalog.search"]') as HTMLButtonElement).click());
   await settle(() => assert(!text().includes("No tools can run automatically"), "enable updates the verified tool status"));
   assert(JSON.stringify(toolWrites) === JSON.stringify([guardedMcpReadRequest]),
