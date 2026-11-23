@@ -561,6 +561,7 @@ mod cad224_goal_intake_admission_acceptance;
 mod cad224_goal_intake_guards_acceptance;
 mod cad2259_fenced_default_kickoff_acceptance;
 mod cad2737_native_take_acceptance;
+mod cad2739_paid_settlement_acceptance;
 mod caller;
 mod cloud_hold;
 mod continuity;
