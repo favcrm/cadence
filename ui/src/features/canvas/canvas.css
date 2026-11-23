@@ -43,9 +43,12 @@
 
 /* Tabs (only with more than one view open): the mark and the short title, the open one underlined in the accent. */
 .cv-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; container: cv-main / inline-size; }
-.cv-tabrow { display: flex; align-items: center; min-width: 0; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-875); }
-.cv-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; gap: 4px; padding: 0 8px; scrollbar-width: thin; }
+.cv-tabrow { display: flex; flex-wrap: wrap; align-items: center; min-width: 0; border-bottom: 1px solid var(--color-ink-800); background: var(--color-ink-875); }
+.cv-tabs { display: flex; flex: 1 1 12rem; min-width: 0; overflow-x: auto; gap: 4px; padding: 0 8px; scrollbar-width: thin; }
 .cv-tab { display: inline-flex; flex-shrink: 0; align-items: center; max-width: 14rem; border-bottom: 2px solid transparent; color: var(--color-ink-400); }
+/* CAD-2682: the Browser tab and its dot stay whole; the other tabs scroll behind it. */
+.cv-tab[data-kind="session"] { position: sticky; right: 0; z-index: 1; background: var(--color-ink-875); }
+.cv-tab[data-kind="session"] .cv-tab-label { white-space: nowrap; }
 .cv-tab[data-active] { border-bottom-color: var(--color-accent); color: var(--color-ink-100); }
 .cv-tab-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 8px 4px 8px 8px; font-size: var(--text-micro); }
 .cv-tab-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -398,7 +401,7 @@
 .cv-divider[data-axis="cols"]::after { top: 50%; left: 2px; width: 2px; height: 36px; margin-top: -18px; }
 .cv-divider[data-axis="rows"]::after { left: 50%; top: 2px; height: 2px; width: 36px; margin-left: -18px; }
 .cv-divider:hover::after, .cv-divider:focus-visible::after { background: var(--color-accent); }
-.cv-divider:focus-visible { outline: none; }
+.cv-divider:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
 .cv-tab[data-paned] .cv-tab-title::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 9999px; background: var(--color-accent); vertical-align: middle; }
 .cv-tab[draggable="true"] { cursor: grab; }
 .cv-layout { display: flex; flex: none; align-items: center; gap: 8px; padding: 0 8px; }
@@ -414,6 +417,8 @@ button.cv-saved:hover { color: var(--color-ink-100); border-color: var(--color-i
 /* Drop zones sit above the frames (an iframe swallows a drop) and exist only while a tab is being dragged. */
 .cv-zones { position: absolute; inset: 0; z-index: 4; display: grid; grid-template-areas: "left replace right" "bottom bottom bottom"; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 7fr 3fr; gap: 6px; padding: 6px; background: color-mix(in srgb, var(--color-ink-900) 55%, transparent); }
 .cv-zone { display: grid; place-items: center; border: 1px dashed color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700)); border-radius: 10px; color: var(--color-ink-200); font-size: var(--text-label); text-align: center; }
+/* CAD-2682: a solid backing keeps the label legible over a frame's own text. */
+.cv-zone b { padding: 4px 10px; border: 1px solid var(--color-ink-700); border-radius: 6px; background: var(--color-ink-900); font-weight: 500; }
 .cv-zone[data-over] { border-style: solid; background: color-mix(in srgb, var(--color-accent) 22%, transparent); color: var(--color-ink-100); }
 .cv-zone[data-disabled] { opacity: 0.35; border-color: var(--color-ink-700); }
 /* "Move to tab" lives in the "⋯" of a pane at every width. */

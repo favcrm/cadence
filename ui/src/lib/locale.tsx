@@ -2489,6 +2489,8 @@ Object.assign(zhTW, {
   "Place below": "放到下方",
   "Replace the focused view": "取代目前檢視",
   "Opened in a pane": "已在窗格中開啟",
+  "Opened beside {view}": "已在「{view}」旁開啟",
+  "Opened below {view}": "已在「{view}」下方開啟",
   "All four panes are in use, so this opened as a background tab": "四個窗格已用完，因此在背景分頁開啟",
   // CAD-2471: an app view in the canvas.
   "App": "應用程式",
