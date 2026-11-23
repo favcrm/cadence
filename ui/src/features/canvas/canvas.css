@@ -47,7 +47,7 @@
 .cv-tabs { display: flex; flex: 1 1 12rem; min-width: 0; overflow-x: auto; gap: 4px; padding: 0 8px; scrollbar-width: thin; }
 .cv-tab { display: inline-flex; flex-shrink: 0; align-items: center; max-width: 14rem; border-bottom: 2px solid transparent; color: var(--color-ink-400); }
 /* CAD-2682: the Browser tab and its dot stay whole; the other tabs scroll behind it. */
-.cv-tab[data-kind="session"] { position: sticky; right: 0; z-index: 1; background: var(--color-ink-875); }
+.cv-tab[data-kind="session"] { position: sticky; right: 0; z-index: 1; background: var(--color-ink-875); box-shadow: 8px 0 0 var(--color-ink-875); }
 .cv-tab[data-kind="session"] .cv-tab-label { white-space: nowrap; }
 .cv-tab[data-active] { border-bottom-color: var(--color-accent); color: var(--color-ink-100); }
 .cv-tab-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 8px 4px 8px 8px; font-size: var(--text-micro); }

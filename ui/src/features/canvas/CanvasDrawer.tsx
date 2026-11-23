@@ -605,9 +605,16 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   // Moving to another page puts the board back as it was.
   useEffect(() => setExpanded(false), [pathname]);
 
-  // The active tab scrolls into view when it changes.
+  // The active tab scrolls into view when it changes, clear of the
+  // Browser tab pinned at the strip's right edge (CAD-2682).
   useEffect(() => {
-    rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const tab = rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.closest<HTMLElement>(".cv-tab");
+    if (!tab) return;
+    tab.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const pinned = tab.parentElement?.querySelector<HTMLElement>('.cv-tab[data-kind="session"]');
+    if (!pinned || pinned === tab || !tab.parentElement) return;
+    const hidden = tab.getBoundingClientRect().right - pinned.getBoundingClientRect().left;
+    if (hidden > 0) tab.parentElement.scrollLeft += hidden;
   }, [canvas.active, canvas.tabs.length, showBrowser, open]);
 
   const commit = useCallback((px: number) => {
