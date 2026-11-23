@@ -35,13 +35,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::protected_runtime::console::{self, OwnerConsole};
+use cadence_agent::daemon::console_port::{
+    self, AttachedConsole, ConsoleSubject, NativeTaskGuard, ProtectedConsoleProvider,
+    VerifiedConsoleSubject,
+};
 use crate::protected_runtime::ops::{
     AgentEnrollment, OpsFamily, OpsMethod, RuntimeCaller, RuntimeOpsHandler, RuntimeOpsListener,
 };
@@ -656,78 +659,6 @@ pub(crate) struct ProtectedRuntimeCoordinator {
     closing: AtomicBool,
 }
 
-/// The attachment returned for one agent: the private console plus the stable
-/// generation tag the adapter stamps on its events, and the closed caller
-/// identity the adapter binds a durable model task to.
-pub(crate) struct AttachedConsole {
-    pub(crate) console: OwnerConsole,
-    pub(crate) generation_tag: String,
-    pub(crate) runtime_id: String,
-    pub(crate) caller: RuntimeCaller,
-}
-
-/// The process-global console provider. The protected coordinator is a
-/// process-global authority (one daemon per process); the adapter reaches it
-/// without threading a new field through every adapter constructor.
-static CONSOLE_PROVIDER: OnceLock<Weak<dyn ProtectedConsoleProvider>> = OnceLock::new();
-
-/// One agent's closed console subject. Values come from the durable agent row
-/// the daemon already holds; nothing here is a request field.
-pub(crate) struct ConsoleSubject<'a> {
-    pub(crate) alias: &'a str,
-    pub(crate) agent_uid: &'a str,
-    pub(crate) created: f64,
-}
-
-/// A held native-model task binding. Dropping it ends the binding; `fence`
-/// stops new preparation for the turn when it settles or is interrupted.
-pub(crate) trait NativeTaskGuard: Send {
-    fn fence(&self, reason: &str);
-}
-
-/// The adapter-facing contract implemented by the coordinator.
-pub(crate) trait ProtectedConsoleProvider: Send + Sync {
-    fn open_console(
-        &self,
-        subject: ConsoleSubject<'_>,
-        stderr_log: &Path,
-    ) -> Result<AttachedConsole>;
-
-    fn bind_native_task(
-        &self,
-        caller: &RuntimeCaller,
-        client_message_id: &str,
-        server_message_id: &str,
-        turn_token: &str,
-    ) -> Result<Box<dyn NativeTaskGuard>>;
-
-    /// Stop exactly this agent's owned runtime. Best effort from a close path;
-    /// the owner fences first and only retires its own labelled container.
-    fn stop_agent(&self, agent_uid: &str, reason: &str);
-}
-
-/// Install the process-global provider (called once from [`initialize`]).
-fn install_console_provider(coordinator: &Arc<ProtectedRuntimeCoordinator>) -> Result<()> {
-    let provider: Arc<dyn ProtectedConsoleProvider> = coordinator.clone();
-    let weak: Weak<dyn ProtectedConsoleProvider> = Arc::downgrade(&provider);
-    CONSOLE_PROVIDER
-        .set(weak)
-        .map_err(|_| Error::internal("the protected console provider is already installed"))
-}
-
-/// The live provider, or a refusal. An active protected profile without a
-/// provider refuses — it never falls back to a host process.
-pub(crate) fn console_provider() -> Result<Arc<dyn ProtectedConsoleProvider>> {
-    CONSOLE_PROVIDER
-        .get()
-        .and_then(|weak| weak.upgrade())
-        .ok_or_else(|| {
-            Error::invalid(
-                "runtime_unqualified",
-                "no protected runtime coordinator is installed",
-            )
-        })
-}
 
 impl ProtectedRuntimeCoordinator {
     fn start(shared: &Arc<Shared>, prepared: PreparedProtection) -> Result<Arc<Self>> {
@@ -1007,44 +938,32 @@ impl ProtectedRuntimeCoordinator {
         let qualified = self
             .owner
             .read(|client| client.recheck(&handle.runtime_id, handle.generation))?;
-        self.eligibility.refresh(qualified)?;
-        self.attach_console(handle, stderr_log)
-    }
-
-    fn attach_console(&self, handle: &RuntimeHandle, stderr_log: &Path) -> Result<AttachedConsole> {
-        let client = self.owner.client()?;
-        let open = client.open_console(
-            &handle.runtime_id,
-            handle.generation,
-            &handle.recipient_nonce,
-        )?;
-        if open.node_pid != handle.node_pid || open.node_starttime != handle.node_starttime {
+        let identity = qualified.identity();
+        if identity.runtime_id != handle.runtime_id
+            || identity.agent_uid != handle.agent_uid
+            || identity.session_binding != handle.session_binding
+            || identity.runtime_generation != handle.generation
+            || identity.os_uid != handle.os_uid
+            || identity.node_pid != handle.node_pid
+            || identity.node_starttime != handle.node_starttime
+        {
             return Err(Error::rejected(
-                "owner console names a different measured guest",
+                "registered runtime no longer names this exact subject",
             ));
         }
-        let console = console::connect(
-            &open.path,
-            &open.token,
-            &handle.runtime_id,
-            handle.generation,
-            open.node_pid,
-            Some(stderr_log.to_path_buf()),
-        )?;
-        Ok(AttachedConsole {
-            console,
-            generation_tag: format!("{}-{}", handle.runtime_id, handle.generation),
-            runtime_id: handle.runtime_id.clone(),
-            caller: RuntimeCaller::registered(
-                handle.runtime_id.clone(),
-                handle.agent_uid.clone(),
-                handle.session_binding.clone(),
-                handle.generation,
-                handle.os_uid,
-                handle.node_pid,
-                handle.node_starttime,
-            ),
-        })
+        let subject = VerifiedConsoleSubject::from_qualified(&qualified);
+        self.eligibility.refresh(qualified)?;
+        self.attach_console(handle, subject, stderr_log)
+    }
+
+    fn attach_console(
+        &self,
+        handle: &RuntimeHandle,
+        subject: VerifiedConsoleSubject,
+        stderr_log: &Path,
+    ) -> Result<AttachedConsole> {
+        let client = self.owner.client()?;
+        console_port::attach_console(&client, subject, &handle.recipient_nonce, stderr_log)
     }
 
     /// The complete r5 cold bootstrap for one agent. Any stage that does not
@@ -1147,7 +1066,8 @@ impl ProtectedRuntimeCoordinator {
                 self.owner.invalidate();
             })?;
         let identity = qualified.identity();
-        if identity.agent_uid != agent_uid
+        if identity.runtime_id != prepared.runtime_id
+            || identity.agent_uid != agent_uid
             || identity.session_binding != session_binding
             || identity.runtime_generation != prepared.generation
             || identity.os_uid != prepared.os_uid
@@ -1182,8 +1102,9 @@ impl ProtectedRuntimeCoordinator {
             stop: Arc::clone(&stop),
             ops_path: prepared.ops_socket.clone(),
         };
+        let subject = VerifiedConsoleSubject::from_qualified(&qualified);
         self.eligibility.refresh(qualified)?;
-        let attached = self.attach_console(&handle, stderr_log)?;
+        let attached = self.attach_console(&handle, subject, stderr_log)?;
         self.insert_handle(handle);
         ops_guard.armed = false;
         launch_guard.armed = false;
@@ -1812,7 +1733,8 @@ pub(crate) fn initialize(shared: &Arc<Shared>, prepared: Option<PreparedProtecti
         return shared.install_protected(None);
     };
     let coordinator = ProtectedRuntimeCoordinator::start(shared, prepared)?;
-    install_console_provider(&coordinator)?;
+    let provider: Arc<dyn ProtectedConsoleProvider> = coordinator.clone();
+    console_port::install_console_provider(&provider)?;
     shared.install_protected(Some(
         Arc::clone(&coordinator) as Arc<dyn ProtectedOwnerClient>
     ))?;
