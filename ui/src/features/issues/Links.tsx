@@ -44,17 +44,17 @@ export function Links({
       .catch((err) => onError(err, "unlink"));
   };
   return (
-    <section className="card p-3.5 grid gap-2" aria-label={t("Links")}>
-      <div className="slabel">{t("Links")}</div>
+    <section className="grid grid-cols-[minmax(0,1fr)] gap-2" aria-label={t("Links")}>
+      <h2 className="text-cardtitle font-semibold text-ink-100 m-0">{t("Links")}</h2>
       {rows.length === 0 && references.length === 0 && (
         <p className="text-secondary text-ink-500 m-0">{t("No links yet.")}</p>
       )}
-      <dl className="grid grid-cols-[92px_minmax(0,1fr)] gap-x-2 gap-y-1.5">
+      <dl className="issue-link-list m-0">
         {rows.map((row) => (
-          <span key={`${row.label}-${row.id}`} className="contents">
-            <dt className="slabel">{t(row.label)}</dt>
-            <dd className="text-secondary min-w-0 flex items-center gap-1.5">
-              <span className="min-w-0 truncate">
+          <div key={`${row.label}-${row.id}`} className="contents">
+            <dt className="text-label text-ink-400">{t(row.label)}</dt>
+            <dd className="text-secondary m-0 min-w-0 flex items-start gap-1.5">
+              <span className="min-w-0">
                 {row.missing ? (
                   <span className="num text-ink-500">{row.id}</span>
                 ) : (
@@ -82,17 +82,14 @@ export function Links({
                 </Button>
               )}
             </dd>
-          </span>
+          </div>
         ))}
         {references.map((r, i) => (
-          <span key={`reference-${i}`} className="contents">
-            <dt className="slabel">
+          <div key={`reference-${i}`} className="contents">
+            <dt className="text-label text-ink-400">
               {r.kind === "note" ? t("Note") : t("Reference")}
             </dt>
-            <dd
-              className="text-secondary min-w-0 truncate"
-              title={r.url ?? r.path ?? r.label ?? undefined}
-            >
+            <dd className="text-secondary m-0 min-w-0">
               {r.url ? (
                 <SafeLink className="lnk" href={r.url}>
                   {r.label ?? r.url}
@@ -101,7 +98,7 @@ export function Links({
                 <span>{r.label ?? r.path}</span>
               )}
             </dd>
-          </span>
+          </div>
         ))}
       </dl>
       {!readOnly && (

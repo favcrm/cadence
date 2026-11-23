@@ -1,5 +1,5 @@
 import SafeLink from "../../ui/SafeLink";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Resource, type ResourceState } from "../../lib/cache";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
@@ -16,6 +16,7 @@ import SectionTabs from "../../ui/SectionTabs";
 import "./issues.css";
 import KickoffDialog from "./KickoffDialog";
 import IdeaCard from "../home/IdeaCard";
+import { stageLabel } from "../projects/work";
 import { LaneCard, type LanePayload } from "./LaneCard";
 import { LaneConversation } from "./LaneConversation";
 import { Activity } from "./Activity";
@@ -177,7 +178,8 @@ function PageBody({
   blocked: string | null;
   setKickoff: (open: boolean) => void;
 }) {
-  const { t, formatNumber } = useLocale();
+  const { t } = useLocale();
+  const fieldsId = useId();
   const items = acceptanceItems(detail.body);
   const rows = timelineRows(detail, history.data ?? []);
   const pr = prRef(detail.refs);
@@ -196,6 +198,7 @@ function PageBody({
   const files = detail.artifacts.filter((f) => !IMG.test(f.name));
   const [compose, setCompose] = useState<"ask" | "instruct">("ask");
   const [descriptionDraft, setDescriptionDraft] = useState<{ body: string; rev: string } | null>(null);
+  const editingDescription = hosted === true && !readOnly && descriptionDraft !== null;
   const [savingDescription, setSavingDescription] = useState(false);
   const [descriptionConflict, setDescriptionConflict] = useState(false);
   const descriptionStale = descriptionConflict || (descriptionDraft !== null && descriptionDraft.rev !== detail.rev);
@@ -249,11 +252,11 @@ function PageBody({
       <header className="flex flex-wrap items-end justify-between gap-4 px-4 lg:px-8 pt-5 pb-3">
         <div className="min-w-0">
           <div className="kicker">
-            <span className="num">{id}</span>
+            <span className="num normal-case">{id}</span>
             {" · "}
             {project}
           </div>
-          <h1 className="text-drawer font-semibold text-ink-100 tracking-tight mt-0.5">
+          <h1 className="issue-title font-semibold text-ink-100 tracking-tight mt-0.5">
             {detail.title}
           </h1>
           <div className="flex flex-wrap items-center gap-2 mt-2">
@@ -262,17 +265,19 @@ function PageBody({
             >
               {t(detail.status)}
             </span>
-            <span className="chip bg-ink-800 text-ink-400">
-              {t(detail.priority)}
-            </span>
-            {(detail.parent || detail.component) && (
-              <span className="chip bg-ink-800 text-ink-400">
-                {detail.parent ?? detail.component}
-              </span>
+            <span className="num text-label text-ink-400">{t(detail.priority)}</span>
+            {detail.work?.stage && (
+              <span className="text-label text-ink-400">{stageLabel(detail.work.stage, t)}</span>
             )}
+            {detail.component && (
+              <span className="text-label text-ink-400">{detail.component}</span>
+            )}
+            <a className="lnk text-label xl:hidden" href={`#${fieldsId}`}>
+              {t("Fields & links")}
+            </a>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2 ml-auto">
+        <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
           {!hosted && (
             <Button
               variant={blocked ? "secondary" : "primary"}
@@ -329,8 +334,8 @@ function PageBody({
         }))}
       />
 
-      <div className="grid xl:grid-cols-[minmax(0,1fr)_340px] items-start">
-        <main className="min-w-0 px-4 lg:px-8 py-5 grid gap-4">
+      <div className="grid grid-cols-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_340px] items-start">
+        <main className="min-w-0 px-4 lg:px-8 py-5 grid grid-cols-[minmax(0,1fr)] gap-5">
           {activeTab === "overview" && (detail.tags ?? []).includes("plan-ready") && (
             <section aria-label={t("Idea decision")}>
               <IdeaCard
@@ -347,27 +352,16 @@ function PageBody({
               lane={lane}
               checksDone={done}
               checksTotal={items.length}
+              checklistVisible={!editingDescription}
               blocked={blocked}
               hosted={hosted === true}
               codeDelivery={codeDelivery}
               stagedActions={stagedActions}
               tabHref={tabHref}
               onCompose={composeWith}
-              onKickoff={() => setKickoff(true)}
               onOpen={onOpen}
-            />
-          )}
-          {activeTab === "overview" && (
-            <section className="issue-description grid gap-4">
-              {items.length > 0 && (
-                <div className="issue-acceptance-progress">
-                  <span>{t("Acceptance")}</span>
-                  <strong className="num">
-                    {formatNumber(done)} {t("of")} {formatNumber(items.length)} {t("complete")}
-                  </strong>
-                </div>
-              )}
-              {hosted && !readOnly && descriptionDraft ? (
+            >
+              {editingDescription ? (
                 <form className="grid gap-2" onSubmit={(event) => {
                   event.preventDefault();
                   void saveDescription();
@@ -407,12 +401,10 @@ function PageBody({
                       </Button>
                     </div>
                   )}
-                  <div className="issue-reader max-w-[84ch] text-secondary text-ink-300">
-                    <Md text={detail.body} onOpen={onOpen} />
-                  </div>
+                  <Md text={detail.body} onOpen={onOpen} />
                 </>
               )}
-            </section>
+            </WorkResult>
           )}
           {activeTab === "activity" && (
             <Activity
@@ -458,7 +450,7 @@ function PageBody({
             />
           )}
         </main>
-        <aside className="grid gap-3 px-4 lg:px-8 xl:px-4 xl:pr-8 py-5 xl:border-l xl:border-ink-700 min-w-0">
+        <aside id={fieldsId} tabIndex={-1} className="issue-context grid grid-cols-[minmax(0,1fr)] gap-5 px-4 lg:px-8 xl:px-6 xl:pr-8 py-5 min-w-0">
           {!hosted && laneState && (
             <ReadNotice
               name="lane"
