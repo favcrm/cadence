@@ -30,11 +30,11 @@ pub(crate) enum ThreadAction {
         /// Most hits (1-10, default 5).
         #[arg(long, conflicts_with = "around")]
         limit: Option<u64>,
-        /// Entries before the hit (0-6, default 3).
-        #[arg(long, requires = "around")]
+        /// Entries before the hit (0-6, default 3); only with `--around`.
+        #[arg(long)]
         before: Option<u64>,
-        /// Entries after the hit (0-6, default 3).
-        #[arg(long, requires = "around")]
+        /// Entries after the hit (0-6, default 3); only with `--around`.
+        #[arg(long)]
         after: Option<u64>,
     },
 }

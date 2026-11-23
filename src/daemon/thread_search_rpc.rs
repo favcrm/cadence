@@ -27,6 +27,8 @@ use super::*;
 use crate::thread_search::{self as search, Query};
 
 #[cfg(all(test, feature = "test-seam"))]
+mod cad2663_refusal_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad2663_tests;
 
 /// Request fields `thread_search` accepts. Anything naming an agent, thread
@@ -38,6 +40,9 @@ const PURPOSE: &str = "thread search";
 const DOMAIN: &str = "agent-thread-search";
 /// Entries read per store batch while scanning.
 const BATCH: i64 = 200;
+
+/// Matching entries with their scores.
+type Found = Vec<(search::Score, store::ThreadEntry)>;
 
 /// One verified caller's searchable view of one thread.
 struct View<'a> {
@@ -270,11 +275,7 @@ impl Shared {
 
     /// Every match among the newest [`search::SCAN_MAX`] visible entries,
     /// best first: phrase, then words matched, then newest.
-    fn search_scan(
-        &self,
-        view: &mut View<'_>,
-        query: &Query,
-    ) -> Result<(Vec<(search::Score, store::ThreadEntry)>, usize, bool)> {
+    fn search_scan(&self, view: &mut View<'_>, query: &Query) -> Result<(Found, usize, bool)> {
         let mut found = Vec::new();
         let mut scanned = 0usize;
         let mut anchor = i64::MAX;

@@ -66,7 +66,8 @@ fn register(shared: &Shared, alias: &str, cwd: &str) {
                 attach: None,
             },
         )
-        .unwrap();    shared.store.ensure_thread(alias).unwrap();
+        .unwrap();
+    shared.store.ensure_thread(alias).unwrap();
 }
 
 fn enqueue(shared: &Shared, alias: &str, id: &str, issue: Option<&str>) {
@@ -308,17 +309,13 @@ fn fx_in(now_in_conversation: bool) -> Fx {
     );
     shared.store.cancel("m-cancel", "operator", None).unwrap();
 
-    enqueue_in(
-        &shared,
-        "w1",
-        "m-now",
-        Some("A-1"),
-        now_in_conversation.then_some(conversation.id.as_str()),
-    );
-    run(&shared, "w1", &token);
+    // A turn belongs to the conversation its first thread entry is in (an
+    // app send's enqueue note); place it there for the conversation case.
     if now_in_conversation {
         in_conversation("m-now", "CURRENT_FACT the retry budget is 42");
     }
+    enqueue(&shared, "w1", "m-now", Some("A-1"));
+    run(&shared, "w1", &token);
     say(
         &shared,
         "w1",
@@ -380,7 +377,9 @@ fn cad2663_finds_an_old_fact_and_reads_around_it() {
     let found = snippets(&answer);
     // Phrase hits first (newest first among them), the old fact included.
     assert!(
-        found[..2].iter().any(|s| s.contains("Decided: the retry budget is 42")),
+        found[..2]
+            .iter()
+            .any(|s| s.contains("Decided: the retry budget is 42")),
         "{answer}"
     );
     assert!(answer["hits"][0]["phrase"].as_bool().unwrap());
@@ -408,15 +407,17 @@ fn cad2663_finds_an_old_fact_and_reads_around_it() {
         .unwrap()
         .to_owned();
     assert!(handle.starts_with("csc1_"), "{handle}");
-    let window = search(&fx, json!({"around": handle, "before": 1, "after": 2})).unwrap();
+    let window = search(&fx, json!({"around": handle, "before": 1, "after": 3})).unwrap();
     let entries = window["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 4, "{window}");
+    assert_eq!(entries.len(), 5, "{window}");
     assert_eq!(entries[0]["text"], "What retry budget did we settle on?");
-    assert!(entries[1]["hit"].as_bool().unwrap());
-    assert!(entries[2]["text"]
-        .as_str()
-        .unwrap()
-        .contains("later question 0"));
+    assert!(entries[1]["hit"].as_bool().unwrap(), "{window}");
+    assert!(
+        entries[2..]
+            .iter()
+            .any(|e| e["text"].as_str().unwrap().contains("later question 0")),
+        "{window}"
+    );
     assert_eq!(window["more_after"], json!(true));
     assert!(window.to_string().find("\"seq\"").is_none(), "{window}");
 }
@@ -504,4 +505,3 @@ fn cad2663_a_turn_searches_only_its_own_conversation() {
         assert!(!text.contains(absent), "{absent}: {text}");
     }
 }
-

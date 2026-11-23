@@ -2607,6 +2607,38 @@ mod tests {
         );
     }
 
+    /// CAD-2663: `thread_search` sends only its query or hit handle, its
+    /// bounds and an optional turn pair. An agent, thread or conversation
+    /// argument is refused by name, so a call cannot leave its own thread.
+    #[test]
+    fn thread_search_refuses_agent_thread_and_conversation_arguments() {
+        let (method, params) =
+            thread_search_params(&json!({"query": "retry budget", "limit": 3})).unwrap();
+        assert_eq!(method, "thread_search");
+        assert_eq!(params, json!({"query": "retry budget", "limit": 3}));
+        let (_, around) =
+            thread_search_params(&json!({"around": "csc1_x", "before": 1, "after": 2})).unwrap();
+        assert_eq!(around, json!({"around": "csc1_x", "before": 1, "after": 2}));
+        for key in ["alias", "thread", "conversation", "project", "agent"] {
+            let mut args = json!({"query": "x"});
+            args[key] = json!("other");
+            let error = thread_search_params(&args).unwrap_err().to_string();
+            assert!(error.contains(key), "{key}: {error}");
+        }
+        assert!(thread_search_params(&json!({"query": "x", "limit": "3"})).is_err());
+        assert!(thread_search_params(&json!({"query": "x", "message": "m1"})).is_err());
+        let (_, turn) =
+            thread_search_params(&json!({"query": "x", "message": "m1", "token": "t1"})).unwrap();
+        assert_eq!(turn["message"], "m1");
+        assert!(static_tool_names().contains(&"thread_search"));
+        for phrase in ["exact fact", "say so instead", "around", "only your own"] {
+            assert!(
+                THREAD_SEARCH_DESCRIPTION.to_lowercase().contains(phrase),
+                "{phrase}"
+            );
+        }
+    }
+
     #[test]
     fn memory_tool_descriptions_say_when_to_call() {
         for phrase in [

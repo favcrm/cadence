@@ -2519,3 +2519,52 @@ fn memory_match_turn_refuses_named_scope_and_propose_takes_no_project() {
     };
     assert_eq!(project, None);
 }
+
+/// CAD-2663: `thread search` takes a query or a hit handle and its bounds;
+/// it has no flag that names an agent, thread or conversation. (Window
+/// bounds without `--around` are refused by the daemon.)
+#[test]
+fn thread_search_parses_a_query_or_a_hit_and_names_no_agent() {
+    let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+    let Ok(Commands::Thread {
+        action:
+            ThreadAction::Search {
+                query: Some(query),
+                limit: Some(3),
+                around: None,
+                ..
+            },
+    }) = parse(&[
+        "cadence",
+        "thread",
+        "search",
+        "retry budget 42",
+        "--limit",
+        "3",
+    ])
+    else {
+        panic!("a query search must parse");
+    };
+    assert_eq!(query, "retry budget 42");
+    assert!(matches!(
+        parse(&["cadence", "thread", "search", "--around", "csc1_x", "--before", "1"]),
+        Ok(Commands::Thread {
+            action: ThreadAction::Search {
+                around: Some(_),
+                before: Some(1),
+                ..
+            }
+        })
+    ));
+    for args in [
+        &["cadence", "thread", "search"][..],
+        &["cadence", "thread", "search", "x", "--around", "csc1_x"],
+        &[
+            "cadence", "thread", "search", "--around", "h", "--limit", "2",
+        ],
+        &["cadence", "thread", "search", "x", "--alias", "w2"],
+        &["cadence", "thread", "search", "x", "--conversation", "c1"],
+    ] {
+        assert!(parse(args).is_err(), "{args:?} must not parse");
+    }
+}
