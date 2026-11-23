@@ -2,50 +2,26 @@ export {};
 /**
  * CAD-2726: AccountMenu workspace switcher lazy-fetch, session cache & Billing shortcut.
  */
-declare function require(name: string): any;
+import {
+  assertCondition as assert,
+  assertEqual as equal,
+  createEventSignal,
+  installHostedDom,
+  waitForDom,
+} from "./hostedDom.fixture";
+import type { Meta } from "../src/lib/types";
 
-const { Window } = require("happy-dom");
-const win = new Window({ url: "https://acme.cadencecloud.app/" });
-for (const key of [
-  "window", "document", "navigator", "HTMLElement", "Node", "Event",
-  "KeyboardEvent", "location", "localStorage", "sessionStorage",
-]) {
-  Object.defineProperty(globalThis, key, {
-    value: key === "window" ? win : win[key],
-    configurable: true,
-    writable: true,
-  });
-}
-Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+declare function require<T>(name: string): T;
 
-const loader = require("module");
-const originalRequire = loader.prototype.require;
-loader.prototype.require = function (this: unknown, id: string) {
-  if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
-  if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
-  return originalRequire.apply(this, arguments);
-};
+const win = installHostedDom("https://acme.cadencecloud.app/");
 
-const React = require("react") as typeof import("react");
-const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
-const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
-const AccountMenu = (require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu")).default;
-type Meta = import("../src/lib/types").Meta;
-
-function assert(value: unknown, why: string): asserts value {
-  if (!value) throw new Error(`accountMenuWorkspaces test failed: ${why}`);
-}
-
-function equal(actual: unknown, expected: unknown, why: string): void {
-  if (actual !== expected) throw new Error(`${why}: expected ${String(expected)}, got ${String(actual)}`);
-}
-
-async function flush(): Promise<void> {
-  await React.act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
+const React = require<typeof import("react")>("react");
+const { createRoot } = require<typeof import("react-dom/client")>("react-dom/client");
+const { LocaleProvider } = require<typeof import("../src/lib/locale")>("../src/lib/locale");
+const { NavigationProvider } = require<typeof import("../screen-ui/src/navigation")>(
+  "../screen-ui/src/navigation",
+);
+const AccountMenu = require<typeof import("../src/ui/AccountMenu")>("../src/ui/AccountMenu").default;
 
 const adapter = {
   href: (path: string) => path,
@@ -69,6 +45,7 @@ const baseHosted = {
 async function main(): Promise<void> {
   const fetches: string[] = [];
   let wsStatus = 200;
+  let fetchSignal = createEventSignal<void>();
   let wsBody: unknown = {
     currentWorkspaceId: "ws_1",
     createWorkspaceUrl: "https://app-v2.agenticos.hk/register?mode=new",
@@ -123,6 +100,7 @@ async function main(): Promise<void> {
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const path = String(input);
     fetches.push(path);
+    queueMicrotask(() => fetchSignal.emit());
     return new Response(JSON.stringify(wsBody), {
       status: wsStatus,
       headers: { "Content-Type": "application/json" },
@@ -130,30 +108,25 @@ async function main(): Promise<void> {
   }) as typeof fetch;
 
   const mount = (meta: Meta, billingHref?: string) => {
+    fetchSignal = createEventSignal<void>();
     const host = document.createElement("div");
     document.body.append(host);
     const root = createRoot(host);
     React.act(() => {
       root.render(
-        React.createElement(
-          NavigationProvider,
-          {
-            adapter,
-            children: React.createElement(
-              LocaleProvider,
-              {
-                children: React.createElement(AccountMenu, {
-                  meta,
-                  onChange: () => undefined,
-                  trigger: "row",
-                  placement: "above-start",
-                  settingsHref: "/settings/preferences",
-                  billingHref,
-                }),
-              },
-            ),
-          },
-        ),
+        React.createElement(NavigationProvider, {
+          adapter,
+          children: React.createElement(LocaleProvider, {
+            children: React.createElement(AccountMenu, {
+              meta,
+              onChange: () => undefined,
+              trigger: "row",
+              placement: "above-start",
+              settingsHref: "/settings/preferences",
+              billingHref,
+            }),
+          }),
+        }),
       );
     });
     return {
@@ -170,9 +143,9 @@ async function main(): Promise<void> {
   // 1. Non-hosted board never fetches workspaces even when opened
   {
     fetches.length = 0;
-    const { trigger, panel, done } = mount({ ...baseHosted, hosted: false } as unknown as Meta);
+    const { host, trigger, panel, done } = mount({ ...baseHosted, hosted: false } as unknown as Meta);
     await React.act(async () => trigger().click());
-    await flush();
+    await waitForDom(React.act, host, () => Boolean(panel()), "native account menu panel");
     equal(fetches.filter((p) => p === "/api/account/workspaces").length, 0, "native board makes no workspaces read");
     assert(!panel()?.querySelector("[data-workspace-switcher]"), "switcher omitted on native board");
     done();
@@ -181,21 +154,31 @@ async function main(): Promise<void> {
   // 2. Hosted signed-in: zero reads while closed, lazy fetch once on open, cached on reopen
   {
     fetches.length = 0;
-    const { trigger, panel, done } = mount(baseHosted, "/settings/account");
-    await flush();
+    const { host, trigger, panel, done } = mount(baseHosted, "/settings/account");
     equal(fetches.filter((p) => p === "/api/account/workspaces").length, 0, "zero fetches while menu is closed");
 
     await React.act(async () => trigger().click());
-    await flush();
+    await waitForDom(
+      React.act,
+      host,
+      () => Boolean(panel()?.querySelector("[data-workspace-switcher]")),
+      "workspace switcher opens and renders",
+    );
     equal(fetches.filter((p) => p === "/api/account/workspaces").length, 1, "fetches workspaces lazily when opened");
 
     const switcher = panel()?.querySelector("[data-workspace-switcher]");
     assert(switcher, "workspace switcher renders when hosted response succeeds");
-    assert(switcher.textContent?.includes("Acme Lab") && switcher.textContent.includes("Current workspace"), "active workspace marked Current workspace");
+    assert(
+      switcher.textContent?.includes("Acme Lab") && switcher.textContent.includes("Current workspace"),
+      "active workspace marked Current workspace",
+    );
     const betaLink = switcher.querySelector('a[href="https://beta.cadencecloud.app/"]') as HTMLAnchorElement | null;
     assert(betaLink && betaLink.textContent?.includes("Beta Studio"), "safe peer workspace renders link");
     assert(betaLink.textContent?.includes("Workspace member"), "peer role shows Workspace member");
-    assert(switcher.textContent.includes("Prep Co") && !switcher.querySelector('a[href="https://prep.cadencecloud.app/"]'), "non-active workspace is non-clickable");
+    assert(
+      switcher.textContent.includes("Prep Co") && !switcher.querySelector('a[href="https://prep.cadencecloud.app/"]'),
+      "non-active workspace is non-clickable",
+    );
     assert(!switcher.querySelector('a[href^="javascript:"]'), "unsafe javascript workspace URL never rendered as anchor");
     const createLink = switcher.querySelector('a[href="https://app-v2.agenticos.hk/register?mode=new"]');
     assert(createLink && createLink.textContent?.includes("Create another workspace"), "create workspace link rendered");
@@ -205,8 +188,14 @@ async function main(): Promise<void> {
 
     // Close and reopen -> cache hit (still 1 fetch)
     await React.act(async () => trigger().click());
+    await waitForDom(React.act, host, () => !panel(), "account menu closes");
     await React.act(async () => trigger().click());
-    await flush();
+    await waitForDom(
+      React.act,
+      host,
+      () => Boolean(panel()?.querySelector("[data-workspace-switcher]")),
+      "workspace switcher renders from cache on reopen",
+    );
     equal(fetches.filter((p) => p === "/api/account/workspaces").length, 1, "cached across open/close");
     done();
   }
@@ -214,12 +203,17 @@ async function main(): Promise<void> {
   // 2b. zh-TW locale uses non-colliding translations
   {
     win.localStorage.setItem("cadence-locale", "zh-TW");
-    const { trigger, panel, done } = mount(
+    const { host, trigger, panel, done } = mount(
       { ...baseHosted, session: { ...baseHosted.session, id: "sess-ws-zh" } } as unknown as Meta,
       "/settings/account",
     );
     await React.act(async () => trigger().click());
-    await flush();
+    await waitForDom(
+      React.act,
+      host,
+      () => Boolean(panel()?.querySelector("[data-workspace-switcher]")),
+      "zh-TW workspace switcher",
+    );
     const switcher = panel()?.querySelector("[data-workspace-switcher]");
     assert(switcher, "zh-TW workspace switcher renders");
     assert(switcher.textContent?.includes("目前工作區"), "zh-TW Current workspace label shown");
@@ -234,9 +228,15 @@ async function main(): Promise<void> {
     fetches.length = 0;
     wsStatus = 404;
     wsBody = { error: { code: "not_found" } };
-    const { trigger, panel, done } = mount({ ...baseHosted, session: { ...baseHosted.session, id: "sess-ws-404" } } as unknown as Meta);
+    const { host, trigger, panel, done } = mount(
+      { ...baseHosted, session: { ...baseHosted.session, id: "sess-ws-404" } } as unknown as Meta,
+    );
     await React.act(async () => trigger().click());
-    await flush();
+    await waitForDom(React.act, host, () => Boolean(panel()), "404 account menu opens");
+    await fetchSignal.wait(React.act, "404 workspaces response");
+    await React.act(async () => {
+      await Promise.resolve();
+    });
     assert(panel() && !panel()?.querySelector("[data-workspace-switcher]"), "404 hides switcher without crashing menu");
     done();
   }

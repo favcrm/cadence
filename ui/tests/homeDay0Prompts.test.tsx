@@ -4,7 +4,7 @@ export {};
  * operational prompts once projects or agents exist.
  */
 import { streamFixture } from "./streamFixture";
-import type * as HappyDOM from "happy-dom";
+import { assertCondition as assert, installHostedDom, waitForDom } from "./hostedDom.fixture";
 import type * as ReactModule from "react";
 import type * as ReactDOM from "react-dom/client";
 import type * as HomeModule from "../src/features/home/Home";
@@ -13,44 +13,13 @@ import type * as Stores from "../src/lib/resources";
 
 declare function require<T>(name: string): T;
 
-const { Window } = require<typeof HappyDOM>("happy-dom");
-const win = new Window({ url: "https://acme.cadencecloud.app/" });
-for (const key of [
-  "window", "document", "navigator", "Node", "Element", "HTMLElement",
-  "HTMLInputElement", "HTMLTextAreaElement", "HTMLButtonElement", "HTMLFormElement",
-  "MutationObserver", "ResizeObserver", "getComputedStyle", "localStorage", "sessionStorage",
-] as const) {
-  Object.defineProperty(globalThis, key, {
-    value: key === "window" ? win : (win as unknown as Record<string, unknown>)[key],
-    configurable: true,
-    writable: true,
-  });
-}
-for (const key of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"] as const) {
-  Object.defineProperty(globalThis, key, {
-    value: (win as unknown as Record<string, (...a: unknown[]) => unknown>)[key].bind(win),
-    configurable: true,
-    writable: true,
-  });
-}
-Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-
-const loader = require<{ prototype: { require: (this: unknown, id: string) => unknown } }>("module");
-const originalRequire = loader.prototype.require;
-loader.prototype.require = function (this: unknown, id: string) {
-  if (id.endsWith(".css")) return {};
-  if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
-  if (id === "@hugeicons/react" || id === "remark-gfm") return { HugeiconsIcon: () => null };
-  if (id === "react-markdown") return { __esModule: true, default: () => null };
-  return originalRequire.call(this, id);
-};
+installHostedDom("https://acme.cadencecloud.app/", { stubMarkdown: true });
 
 const React = require<typeof ReactModule>("react");
 const { createRoot } = require<typeof ReactDOM>("react-dom/client");
 const Home = require<typeof HomeModule>("../src/features/home/Home").default;
 const { LocaleProvider } = require<typeof Locale>("../src/lib/locale");
 const { resources } = require<typeof Stores>("../src/lib/resources");
-const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
 
 const identity = { name: null, tone: null, look: "robot", revision: "fixture" };
 const masterPayload = {
@@ -77,18 +46,6 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.pathname === "/api/meta") return json({ operator: true, read_only: false });
   return json({});
-};
-
-function assert(value: unknown, why: string): asserts value {
-  if (!value) throw new Error(`homeDay0Prompts failed: ${why}`);
-}
-
-const settle = async () => {
-  for (let i = 0; i < 8; i++) {
-    await React.act(async () => {
-      await nextTurn();
-    });
-  }
 };
 
 async function main(): Promise<void> {
@@ -124,13 +81,17 @@ async function main(): Promise<void> {
       ),
     );
   });
-  await settle();
+  await waitForDom(
+    React.act,
+    host,
+    () =>
+      (host.querySelector('[data-empty="thread"]')?.textContent ?? "").includes(
+        "Help me set up my first project and break down the initial milestones.",
+      ),
+    "Day-0 prompts on empty workspace",
+  );
 
   const day0Text = host.querySelector('[data-empty="thread"]')?.textContent ?? "";
-  assert(
-    day0Text.includes("Help me set up my first project and break down the initial milestones."),
-    "renders Day-0 setup prompt when workspace is empty",
-  );
   assert(
     !day0Text.includes("What is every agent working on right now, and is anything stuck?"),
     "omits active-team prompt when workspace is empty",
@@ -155,12 +116,14 @@ async function main(): Promise<void> {
       ),
     );
   });
-  await settle();
-
-  const normalText = host.querySelector('[data-empty="thread"]')?.textContent ?? "";
-  assert(
-    normalText.includes("What is every agent working on right now, and is anything stuck?"),
-    "renders normal operational prompts once workspace has content",
+  await waitForDom(
+    React.act,
+    host,
+    () =>
+      (host.querySelector('[data-empty="thread"]')?.textContent ?? "").includes(
+        "What is every agent working on right now, and is anything stuck?",
+      ),
+    "operational prompts on populated workspace",
   );
 
   await React.act(async () => root.unmount());
