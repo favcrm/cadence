@@ -169,6 +169,16 @@ pub struct RunningChannelTurn {
     pub topic_id: Option<String>,
 }
 
+/// Server-derived channel/ticket `@mention` provenance bound atomically inside the enqueue tx.
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelPostRequestBinding<'a> {
+    pub post_id: &'a str,
+    pub agent_uid: &'a str,
+    pub origin_actor: &'a str,
+    pub authority_mode: &'a str,
+    pub bind_primary_topic_post: bool,
+}
+
 /// Stored mention outcomes and silent mode for a channel post.
 #[derive(Debug, Clone, Default)]
 pub struct HumanPostMeta {
@@ -1514,15 +1524,22 @@ impl Store {
 
     /// If `alias` is currently running a turn triggered by a channel or ticket
     /// `@mention` (or channel hop), return its provenance and originating channel `topic_id`.
+    /// Fails closed whenever any running message has `source='member'` even if
+    /// `human_room_post_requests` is absent, and prioritizes active `"member"` turns over
+    /// concurrent `"owner"` turns.
     pub fn running_channel_authority(&self, alias: &str) -> Result<Option<RunningChannelTurn>> {
         self.read_tx(|conn| {
             Ok(conn.query_opt(
-                "SELECT pr.origin_actor, pr.authority_mode, tp.topic_id
+                "SELECT COALESCE(pr.origin_actor, m.sender, ''),
+                        CASE WHEN m.source='member' OR pr.authority_mode='member' THEN 'member' ELSE pr.authority_mode END,
+                        tp.topic_id
                    FROM messages m
-                   JOIN human_room_post_requests pr ON pr.message_id=m.id
+                   LEFT JOIN human_room_post_requests pr ON pr.message_id=m.id
                    LEFT JOIN topic_posts tp ON tp.id=pr.post_id
                   WHERE m.alias=? AND m.state='running'
-                  ORDER BY (pr.authority_mode = 'member') DESC, m.seq DESC LIMIT 1",
+                    AND (pr.message_id IS NOT NULL OR m.source='member')
+                  ORDER BY (CASE WHEN m.source='member' OR pr.authority_mode='member' THEN 1 ELSE 0 END) DESC, m.seq DESC
+                  LIMIT 1",
                 [alias],
                 |r| {
                     Ok(RunningChannelTurn {
@@ -1682,31 +1699,29 @@ impl Store {
         })
     }
 
-    /// Record a request message dispatched for an agent `@mention` on `post_id`.
-    pub fn human_room_bind_post_request(
-        &self,
+    /// Record a request message dispatched for an agent `@mention` on `post_id` inside an active write tx.
+    pub(super) fn human_room_bind_post_request_in(
+        conn: &impl super::StoreConn,
         post_id: &str,
         agent_uid: &str,
         message_id: &str,
         origin_actor: &str,
         authority_mode: &str,
     ) -> Result<()> {
-        self.write_tx(|conn| {
-            conn.execute(
-                "INSERT OR IGNORE INTO human_room_post_requests
-                 (post_id,agent_uid,message_id,origin_actor,authority_mode,created)
-                 VALUES(?,?,?,?,?,?)",
-                params![
-                    post_id,
-                    agent_uid,
-                    message_id,
-                    origin_actor,
-                    authority_mode,
-                    now()
-                ],
-            )?;
-            Ok(())
-        })
+        conn.execute(
+            "INSERT OR IGNORE INTO human_room_post_requests
+             (post_id,agent_uid,message_id,origin_actor,authority_mode,created)
+             VALUES(?,?,?,?,?,?)",
+            params![
+                post_id,
+                agent_uid,
+                message_id,
+                origin_actor,
+                authority_mode,
+                now()
+            ],
+        )?;
+        Ok(())
     }
 
     /// True if `topic_posts.request_message` is currently unset for `post_id`.

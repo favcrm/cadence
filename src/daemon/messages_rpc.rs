@@ -16,6 +16,7 @@ pub(super) enum SendBinding<'a> {
         authorized_until: f64,
     },
     TopicPost(&'a str),
+    ChannelMention(crate::store::human_threads::ChannelPostRequestBinding<'a>),
 }
 
 /// CAD-565: the largest window one `message read` returns — Unicode
@@ -502,14 +503,15 @@ impl Shared {
         expected_uid: Option<&str>,
         binding: Option<SendBinding<'_>>,
     ) -> Result<Value> {
-        let (bound_lane, request_post) = match binding {
+        let (bound_lane, request_post, channel_binding) = match binding {
             Some(SendBinding::IssueLane {
                 issue,
                 worktree,
                 authorized_until,
-            }) => (Some((issue, worktree, authorized_until)), None),
-            Some(SendBinding::TopicPost(post)) => (None, Some(post)),
-            None => (None, None),
+            }) => (Some((issue, worktree, authorized_until)), None, None),
+            Some(SendBinding::TopicPost(post)) => (None, Some(post), None),
+            Some(SendBinding::ChannelMention(cb)) => (None, None, Some(cb)),
+            None => (None, None, None),
         };
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
@@ -969,7 +971,7 @@ impl Shared {
         if crate::master::is_master(&alias) && !self.store.message_exists(&message)? {
             self.master_send_preflight(&alias)?;
         }
-        let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
+        let (duplicate, state) = self.store.enqueue_steered_for_with_channel_binding(
             &alias,
             expected_uid,
             text,
@@ -990,6 +992,7 @@ impl Shared {
             bound_lane.map(|(_, _, until)| until),
             None,
             request_post,
+            channel_binding,
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

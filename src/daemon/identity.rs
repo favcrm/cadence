@@ -955,22 +955,16 @@ impl Shared {
         "health",
         "daemon_info",
         "agent_identity",
-        "agent_list",
-        "agent_show",
         "agent_profile_context",
         "topic_read",
         "topic_publish",
         "request_open",
         "request_wait",
         "request_close",
-        "message_read",
-        "message_list",
         "message_report",
-        "agent_requests",
         "agent_inbox",
         "agent_inbox_ack",
         "memory_match",
-        "memory_propose",
     ];
 
     /// CAD-384 / CAD-2711: apply `method`'s caller rule ([`caller_rule::RULES`])
@@ -1019,8 +1013,13 @@ impl Shared {
             Ok(())
         };
         if !rule.checks_connection() {
-            if let Ok(who) = self.connection_caller(peer_pid) {
-                check_member_authority(&who)?;
+            match self.connection_caller(peer_pid) {
+                Ok(who) => check_member_authority(&who)?,
+                Err(err) => {
+                    if !Self::MEMBER_CHANNEL_TURN_ALLOWED_RPCS.contains(&method) {
+                        return Err(err);
+                    }
+                }
             }
             return Ok(None);
         }

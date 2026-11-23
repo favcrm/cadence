@@ -860,12 +860,19 @@ impl Shared {
             args.topic,
             &format!("{}:{}", args.client_id, args.agent_uid),
         );
-        let binding = if *args.primary_unbound {
+        let bind_primary_topic_post = *args.primary_unbound;
+        if bind_primary_topic_post {
             *args.primary_unbound = false;
-            Some(super::messages_rpc::SendBinding::TopicPost(args.post_id))
-        } else {
-            None
-        };
+        }
+        let binding = Some(super::messages_rpc::SendBinding::ChannelMention(
+            crate::store::human_threads::ChannelPostRequestBinding {
+                post_id: args.post_id,
+                agent_uid: args.agent_uid,
+                origin_actor: args.origin_actor,
+                authority_mode: args.authority_mode,
+                bind_primary_topic_post,
+            },
+        ));
         let send = json!({
             "alias": args.agent_alias,
             "text": args.queued_text,
@@ -884,13 +891,6 @@ impl Shared {
             None,
             Some(args.agent_uid),
             binding,
-        )?;
-        self.store.human_room_bind_post_request(
-            args.post_id,
-            args.agent_uid,
-            &req_id,
-            args.origin_actor,
-            args.authority_mode,
         )?;
         Ok(req_id)
     }

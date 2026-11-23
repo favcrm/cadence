@@ -1351,3 +1351,203 @@ fn cad2711_indep_member_turn_blocks_disallowed_read_rpcs_and_concurrent_owner_sh
         );
     }
 }
+
+#[test]
+fn cad2711_indep_member_turn_blocks_memory_propose_cross_project_reads_redacts_health_and_fails_closed_on_bare_member_source(
+) {
+    let roster = Arc::new(Mutex::new(GrantRoster {
+        target_present: true,
+        ..GrantRoster::default()
+    }));
+    let (observer, _events) = queue_observer();
+    let rig = grant_rig(
+        Arc::new(AtomicBool::new(true)),
+        roster.clone(),
+        observer,
+        None,
+        None,
+    );
+    seed(&rig);
+    let _keys = initialize_queue_keyring(&rig);
+    let ana = login(&rig, "ana", "member");
+    roster.lock().unwrap().allowed_cookies = vec![ana.clone()];
+
+    let worker_uid = indep_register_agent(&rig, "indep-r6-worker");
+    let bare_uid = indep_register_agent(&rig, "indep-r6-bare");
+    let ana_actor =
+        crate::store::human_threads::VerifiedHuman::verified(&rig.issuer, ORG, "ana").unwrap();
+
+    let room = room_ok(
+        &rig,
+        &ana,
+        "POST",
+        "/api/human-threads/groups",
+        Some(json!({
+            "kind": "mixed_group",
+            "title": "Round 6 Gate",
+            "client_id": "indep-round6-room",
+            "humans": [],
+            "agents": [worker_uid.clone(), bare_uid]
+        })),
+    )["room"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let topic = indep_room_topic(&rig, &room);
+
+    // 1. Atomic pre-wake binding: posting a channel @mention persists
+    // `human_room_post_requests` immediately with the queued message.
+    let posted = room_post(
+        &rig,
+        &ana,
+        &room,
+        "indep-r6-post-1",
+        "Check round 6 @indep-r6-worker",
+    );
+    assert_room_post(&posted["post"]);
+    assert_eq!(posted["post"]["outcomes"][0]["kind"], "queued");
+    let post_id = posted["post"]["id"].as_str().unwrap();
+
+    let db = room_fixture_db(&rig);
+    let (bound_post_id, bound_agent_uid, bound_msg_id, origin_actor, authority_mode, msg_state): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = db
+        .query_row(
+            "SELECT pr.post_id, pr.agent_uid, pr.message_id, pr.origin_actor,
+                    pr.authority_mode, m.state
+               FROM human_room_post_requests pr
+               JOIN messages m ON m.id=pr.message_id
+              WHERE pr.post_id=?1",
+            [post_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(bound_post_id, post_id);
+    assert_eq!(bound_agent_uid, worker_uid);
+    assert!(!bound_msg_id.is_empty());
+    assert_eq!(origin_actor, ana_actor.id);
+    assert_eq!(authority_mode, "member");
+    assert_eq!(msg_state, "queued");
+
+    db.execute(
+        "UPDATE messages SET state='running' WHERE id=?1",
+        [bound_msg_id.as_str()],
+    )
+    .unwrap();
+
+    let scope = crate::memory::Scope {
+        paths: vec!["src/daemon/**".into()],
+        ..crate::memory::Scope::default()
+    };
+    let propose_params = crate::memory::cli::propose_params(&crate::memory::cli::Proposal {
+        project: Some("visible"),
+        kind: "gotcha",
+        scope: &scope,
+        source: Some("VIS-1"),
+        confidence: None,
+        from: None,
+        text: Some("Member proposal must be refused\n\n**Why:** test\n\n**How to apply:** test\n"),
+        id: Some("indep-r6-blocked-prop"),
+        nature: "judgement",
+        audience: "project",
+        roles: &[],
+        evidence_refs: &[],
+        verification_condition: None,
+    });
+
+    // 2. `memory_propose` and removed read/request RPCs are refused under a running member turn.
+    for (method, params) in [
+        ("memory_propose", propose_params.clone()),
+        ("agent_requests", json!({ "alias": "indep-r6-worker" })),
+        ("agent_list", json!({})),
+        ("agent_show", json!({ "alias": "indep-r6-worker" })),
+        ("message_list", json!({ "to": "indep-r6-worker" })),
+        ("message_read", json!({ "message": bound_msg_id.as_str() })),
+    ] {
+        let err = indep_agent_rpc(&rig, "indep-r6-worker", method, params)
+            .expect_err("running member turn must refuse removed/privileged RPC");
+        assert_eq!(
+            err.code(),
+            Some("member_authority_refused"),
+            "{method} returned unexpected error: {err:?}"
+        );
+    }
+    assert!(
+        !rig.pm
+            .join("visible/memory/indep-r6-blocked-prop.md")
+            .exists(),
+        "refused memory_propose must not write a memory file"
+    );
+
+    // 3. `health` redacts inflight/orphan telemetry for a member-turn agent while
+    // `Asserted::Operator` sees the live running turn in `update_waiting`.
+    let agent_health = indep_agent_rpc(&rig, "indep-r6-worker", "health", json!({}))
+        .expect("health remains readable during member turn");
+    assert_eq!(agent_health["state"], "ready");
+    assert_eq!(agent_health["update_waiting"], json!([]));
+    assert_eq!(agent_health["adopted_oldest"], json!([]));
+
+    let operator_health = scoped(Asserted::Operator, || {
+        crate::client::rpc(rig._dir.path(), "health", json!({}))
+    })
+    .expect("health must succeed for operator");
+    let waiting = operator_health["update_waiting"]
+        .as_array()
+        .expect("operator health update_waiting array");
+    assert!(
+        waiting.iter().any(|row| {
+            row["alias"] == "indep-r6-worker"
+                && row["message"] == bound_msg_id.as_str()
+                && row["state"] == "running"
+        }),
+        "expected running member turn in operator update_waiting: {waiting:?}"
+    );
+
+    // 4. Bare running `messages` row with `source='member'` and no `human_room_post_requests`
+    // binding still fails closed across `memory_propose`, `platform_accounts`, and `topic_read`.
+    db.execute(
+        "INSERT INTO messages(id, alias, body, source, state, created)
+         VALUES('indep-r6-bare-msg-1', 'indep-r6-bare', 'Bare member turn', 'member', 'running', 1000.0)",
+        [],
+    )
+    .unwrap();
+    let bare_bindings: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM human_room_post_requests WHERE message_id='indep-r6-bare-msg-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bare_bindings, 0);
+
+    for (method, params) in [
+        ("memory_propose", propose_params),
+        ("platform_accounts", json!({})),
+        (
+            "topic_read",
+            json!({ "topic": topic, "cursor_format": "opaque-v1" }),
+        ),
+    ] {
+        let err = indep_agent_rpc(&rig, "indep-r6-bare", method, params)
+            .expect_err("bare source='member' running message must fail closed");
+        assert_eq!(
+            err.code(),
+            Some("member_authority_refused"),
+            "bare member turn {method} returned unexpected error: {err:?}"
+        );
+    }
+}

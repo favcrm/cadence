@@ -3385,6 +3385,16 @@ impl Shared {
             // `pid` is the singleton-lock holder: `daemon start` tells
             // the child it spawned from a daemon that already ran.
             "health" => Ok({
+                let redact_inflight = match self.connection_caller(peer_pid) {
+                    Ok(caller_rule::Who::Agent(alias)) => self
+                        .store
+                        .running_channel_authority(&alias)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| t.authority_mode == "member"),
+                    Ok(_) => false,
+                    Err(_) => true,
+                };
                 let (adopted_live, adopted_oldest, adopted_reaped_total) =
                     crate::reaper::adopted_report(5);
                 json!({
@@ -3408,10 +3418,14 @@ impl Shared {
                 // Adopted orphans still running (never killed) and the
                 // adopted children reaped so far — CAD-308.
                 "adopted_live": adopted_live,
-                "adopted_oldest": adopted_oldest
-                    .iter()
-                    .map(|a| json!({"pid": a.pid, "comm": a.comm, "age_secs": a.age_secs}))
-                    .collect::<Vec<_>>(),
+                "adopted_oldest": if redact_inflight {
+                    json!([])
+                } else {
+                    json!(adopted_oldest
+                        .iter()
+                        .map(|a| json!({"pid": a.pid, "comm": a.comm, "age_secs": a.age_secs}))
+                        .collect::<Vec<_>>())
+                },
                 "adopted_reaped_total": adopted_reaped_total,
                 // CAD-538: the hosted lease, when held — provider, epoch,
                 // expiry and the fence reason after a loss.
@@ -3423,7 +3437,11 @@ impl Shared {
                 // CAD-561: a pending update and what it waits on, so
                 // `cadence daemon status` and the board's banner show it.
                 "pending_update": self.pending_update().map(|p| p.to_json()),
-                "update_waiting": self.inflight_turns().unwrap_or_default(),
+                "update_waiting": if redact_inflight {
+                    json!([])
+                } else {
+                    json!(self.inflight_turns().unwrap_or_default())
+                },
                 })
             }),
             // Build identity + process start — the deploy-drift check

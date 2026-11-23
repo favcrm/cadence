@@ -898,6 +898,59 @@ impl Store {
         selection: Option<IssueSelection>,
         request_post: Option<&str>,
     ) -> Result<(bool, String)> {
+        self.enqueue_steered_for_with_channel_binding(
+            alias,
+            expected_uid,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            steer,
+            refs,
+            app,
+            attachments,
+            conversation,
+            human,
+            media_refs,
+            authorized_until,
+            selection,
+            request_post,
+            None,
+        )
+    }
+
+    /// Variant of [`Self::enqueue_steered_for_with_conversation`] that binds a
+    /// channel/ticket `@mention` provenance row atomically inside the enqueue write tx
+    /// before any caller wakes the agent.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_steered_for_with_channel_binding(
+        &self,
+        alias: &str,
+        expected_uid: Option<&str>,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        conversation: Option<&str>,
+        human: Option<&Value>,
+        media_refs: Option<&Value>,
+        authorized_until: Option<f64>,
+        selection: Option<IssueSelection>,
+        request_post: Option<&str>,
+        channel_binding: Option<super::human_threads::ChannelPostRequestBinding<'_>>,
+    ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             if let Some(uid) = expected_uid {
@@ -966,6 +1019,19 @@ impl Store {
             )?;
             if let Some(post) = request_post {
                 super::topics::bind_request_in(&tx, post, id)?;
+            }
+            if let Some(cb) = channel_binding {
+                if cb.bind_primary_topic_post {
+                    super::topics::bind_request_in(&tx, cb.post_id, id)?;
+                }
+                Self::human_room_bind_post_request_in(
+                    &tx,
+                    cb.post_id,
+                    cb.agent_uid,
+                    id,
+                    cb.origin_actor,
+                    cb.authority_mode,
+                )?;
             }
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
