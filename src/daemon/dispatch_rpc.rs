@@ -280,11 +280,10 @@ impl Shared {
                     ))
                 }
                 None => {
-                    if prepared_intake.is_some() {
-                        let scope = issue::dispatch::intake_legacy_suffix(&issue_source)?;
-                        if !text.rsplit_once(scope.as_str()).is_some_and(|(_, tail)| {
-                            tail.is_empty() || tail.starts_with(" Lessons:")
-                        }) {
+                    if let Some((revision, digest)) = &prepared_intake {
+                        let suffix =
+                            issue::dispatch::intake_legacy_suffix(&issue_source, revision, digest)?;
+                        if !issue::dispatch::body_has_intake_scope(text, &suffix) {
                             return Err(Error::invalid(
                                 "plan_evidence_stale",
                                 "dispatch send refused: kickoff is missing its approved acceptance",

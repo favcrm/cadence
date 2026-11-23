@@ -453,7 +453,7 @@ impl Store {
             None
         };
         let intake_scope = intake_scope
-            .map(|scope| format!(" Approved intake scope: {}.", json!(scope)))
+            .map(|scope| format!(" Approved intake scope: {scope}."))
             .unwrap_or_default();
         let objective = flatten_controls(
             task.title

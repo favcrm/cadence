@@ -361,7 +361,11 @@ pub fn claim(
             }
         }
     }
-    let refreshed = !checked.foreign() && front.claim.as_ref().is_some_and(|c| c.by == by);
+    let refreshed = !checked.foreign()
+        && front
+            .claim
+            .as_ref()
+            .is_some_and(|c| c.by == by && c.stale.is_none());
     let entering_work = matches!(front.status.as_str(), "backlog" | "ready");
     if !refreshed || entering_work {
         crate::issue::plan::gate_direct_claim(&pm.dir, &front, &body, entering_work)?;

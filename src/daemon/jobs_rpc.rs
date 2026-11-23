@@ -62,7 +62,8 @@ pub(super) struct JobIssueSnapshot {
     intake: Option<(String, String)>,
     lane_binding: Option<(std::path::PathBuf, String, String)>,
     cloud_lane: bool,
-    spec_pin: Option<(std::path::PathBuf, String)>,
+    spec_pin: Option<(std::path::PathBuf, String, bool)>,
+    relative_spec_file: Option<std::path::PathBuf>,
 }
 
 impl JobIssueSnapshot {
@@ -133,8 +134,13 @@ impl JobIssueSnapshot {
                 "task dispatch refused: approved intake scope changed while the kickoff was being prepared",
             ));
         }
-        if let Some((path, expected)) = &self.spec_pin {
-            if sha256_file(path).as_deref() != Some(expected.as_str()) {
+        if let Some((path, expected, relative)) = &self.spec_pin {
+            let matches = if *relative {
+                crate::issue::dispatch::intake_spec_matches(path, expected)
+            } else {
+                sha256_file(path).as_deref() == Some(expected.as_str())
+            };
+            if !matches {
                 return Err(Error::rejected(
                     "task dispatch refused: independent spec changed while preparing the kickoff",
                 ));
@@ -2149,23 +2155,37 @@ impl Shared {
         } else {
             None
         };
+        let mut relative_spec_file = None;
         let spec_pin = if intake.is_some() && plan.task.spec_path.is_none() {
-            let issue = gated
-                .as_ref()
-                .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
-            let spec = std::path::Path::new(&plan.job.spec_path);
-            let canonical = spec
-                .canonicalize()
-                .ok()
-                .zip(issue.dir.join("issue.md").canonicalize().ok())
-                .is_some_and(|(spec, issue)| spec == issue);
-            if canonical {
-                None
-            } else {
-                plan.job
-                    .spec_sha256
+            if let Some(digest) = &plan.job.spec_sha256 {
+                let issue = gated
                     .as_ref()
-                    .map(|digest| (spec.to_path_buf(), digest.clone()))
+                    .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+                let raw = std::path::Path::new(&plan.job.spec_path);
+                let relative = !raw.is_absolute();
+                let spec = if relative {
+                    let path = crate::issue::dispatch::intake_spec_pin(
+                        &issue.project,
+                        &plan.task,
+                        &plan.job,
+                    )?;
+                    relative_spec_file = Some(path.clone());
+                    path
+                } else {
+                    raw.to_path_buf()
+                };
+                let canonical = spec
+                    .canonicalize()
+                    .ok()
+                    .zip(issue.dir.join("issue.md").canonicalize().ok())
+                    .is_some_and(|(spec, issue)| spec == issue);
+                if canonical {
+                    None
+                } else {
+                    Some((spec, digest.clone(), relative))
+                }
+            } else {
+                None
             }
         } else {
             None
@@ -2178,6 +2198,7 @@ impl Shared {
             lane_binding,
             cloud_lane,
             spec_pin,
+            relative_spec_file,
         }))
     }
 
@@ -2669,6 +2690,7 @@ impl Shared {
             },
             no_lessons,
             approved_items,
+            snapshot.relative_spec_file.as_deref(),
         )?;
         let Some(prepared) = prepared else {
             return legacy("the assigned project is not opted in to agent delivery".to_string());

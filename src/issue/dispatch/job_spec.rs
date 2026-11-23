@@ -133,6 +133,61 @@ fn spec_scope_error(path: &str, why: &str) -> Error {
     .error()
 }
 
+/// Resolve a spec locator against the same project and task bases used by
+/// the scoped reader. A relative job locator is never relative to the daemon.
+fn spec_candidate(
+    declared: &[PathBuf],
+    task: &store::Task,
+    job: &store::Job,
+    spec_path: &str,
+) -> Result<PathBuf> {
+    let issue_id = job.issue_id.as_deref().unwrap_or_default();
+    let raw = Path::new(spec_path);
+    if raw.is_absolute() {
+        return Ok(raw.to_path_buf());
+    }
+    let base = if task.spec_path.is_some() {
+        task_spec_base(declared, task.worktree.as_deref(), issue_id)
+    } else {
+        default_spec_base(declared, job.repo.as_deref())
+    };
+    let Some(base) = base else {
+        return Err(spec_scope_error(
+            spec_path,
+            "a relative spec has no approved task lane or declared repository",
+        ));
+    };
+    Ok(base.join(raw))
+}
+
+/// Resolve a relative job locator to the same canonical file used by the
+/// scoped kickoff reader. Absolute legacy locators remain untouched.
+pub(crate) fn intake_spec_pin(
+    project: &crate::issue::project::Project,
+    task: &store::Task,
+    job: &store::Job,
+) -> Result<PathBuf> {
+    let raw = Path::new(&job.spec_path);
+    if raw.is_absolute() {
+        return Ok(raw.to_path_buf());
+    }
+    let candidate = spec_candidate(&start::declared_repos(project), task, job, &job.spec_path)?;
+    Ok(candidate.canonicalize().unwrap_or(candidate))
+}
+
+/// Re-read a canonical relative-job pin without following replaced symlinks
+/// or reading more than the context reader's bound.
+pub(crate) fn intake_spec_matches(path: &Path, expected: &str) -> bool {
+    let Ok(relative) = path.strip_prefix("/") else {
+        return false;
+    };
+    Root::open(Path::new("/"))
+        .and_then(|root| root.read(relative, crate::context_pack::MAX_COMBINED_BYTES as u64))
+        .ok()
+        .flatten()
+        .is_some_and(|text| content_digest(text.as_bytes()) == expected)
+}
+
 /// Approve and read one job task spec. The canonical target must be the
 /// task's own lane, the captured issue directory, or a tracked file of a
 /// declared project repository; anything else is a scope conflict before a
@@ -149,23 +204,7 @@ fn read_job_spec(
 ) -> Result<(String, PathBuf, &'static str)> {
     let declared = start::declared_repos(project);
     let issue_id = job.issue_id.as_deref().unwrap_or_default();
-    let raw = Path::new(spec_path);
-    let candidate = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        let base = if task.spec_path.is_some() {
-            task_spec_base(&declared, task.worktree.as_deref(), issue_id)
-        } else {
-            default_spec_base(&declared, job.repo.as_deref())
-        };
-        let Some(base) = base else {
-            return Err(spec_scope_error(
-                spec_path,
-                "a relative spec has no approved task lane or declared repository",
-            ));
-        };
-        base.join(raw)
-    };
+    let candidate = spec_candidate(&declared, task, job, spec_path)?;
     let file = candidate.canonicalize().map_err(|error| {
         Error::rejected(format!(
             "context refused: spec-unavailable: the task spec {spec_path} could not be \
@@ -282,6 +321,7 @@ pub(crate) fn job_context(
     job: JobContext<'_>,
     no_lessons: bool,
     approved_issue_items: Option<&[AcceptanceItem]>,
+    bound_spec: Option<&Path>,
 ) -> Result<Option<PreparedContext<'static>>> {
     let GatedIssue {
         project,
@@ -325,6 +365,11 @@ pub(crate) fn job_context(
             .unwrap_or(job_row.spec_path.as_str());
         let (captured_spec, spec_file, spec_scope) =
             read_job_spec(project, dir, task, job_row, spec_path)?;
+        if bound_spec.is_some_and(|expected| expected != spec_file.as_path()) {
+            return Err(Error::rejected(
+                "task dispatch refused: independent spec changed while preparing the kickoff",
+            ));
+        }
         let issue_file = std::fs::canonicalize(dir.join("issue.md")).ok();
         let canonical_issue_spec = issue_file.as_deref() == Some(spec_file.as_path());
         // Use the selected issue snapshot for both provenance and its request,

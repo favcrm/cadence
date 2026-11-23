@@ -267,6 +267,42 @@ pub(crate) fn resolve_lane(
         ))),
     }
 }
+/// Resolve a sandbox lane from its one open tracker branch, not the current title.
+pub(crate) fn resolve_cloud_lane(
+    front: &Front,
+    name: Option<&str>,
+    root: &Path,
+) -> Result<(PathBuf, String)> {
+    let branches: Vec<_> = front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "branch" && r.closed != Some(true))
+        .collect();
+    match branches.as_slice() {
+        [] => resolve_lane(front, name, root),
+        [branch] => {
+            let branch = branch
+                .path
+                .as_deref()
+                .ok_or_else(|| Error::rejected("open cloud branch has no path"))?;
+            model::check_ref_value(branch)?;
+            if let Some(name) = name {
+                let (_, wanted) = layout::issue_names(&front.id, &front.title, Some(name))?;
+                if wanted != branch {
+                    return Err(Error::rejected(format!(
+                        "{} already has an open cloud branch {branch}; --name {name} would start another lane",
+                        front.id
+                    )));
+                }
+            }
+            Ok((root.to_path_buf(), branch.to_string()))
+        }
+        _ => Err(Error::rejected(format!(
+            "{} has multiple open branch refs — refusing to guess a cloud lane",
+            front.id
+        ))),
+    }
+}
 
 /// `front` with the lane's branch and worktree refs recorded open —
 /// an existing ref of the same value is re-opened (never duplicated),
@@ -433,7 +469,11 @@ pub(super) fn run_with_verified_job(
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let (initial_lane, initial_branch) = resolve_lane(&initial_front, args.name.as_deref(), &root)?;
+    let (initial_lane, initial_branch) = if cloud {
+        resolve_cloud_lane(&initial_front, args.name.as_deref(), &root)?
+    } else {
+        resolve_lane(&initial_front, args.name.as_deref(), &root)?
+    };
     let initial_open = open_worktrees(&initial_front);
     let initial_branch_exists = git(
         &root,
@@ -530,7 +570,11 @@ pub(super) fn run_with_verified_job(
     // reuses it (re-applying the cargo target) rather than minting a
     // second lane from the title.
     let open = open_worktrees(&front);
-    let (wt_dir, branch) = resolve_lane(&front, args.name.as_deref(), &root)?;
+    let (wt_dir, branch) = if cloud {
+        resolve_cloud_lane(&front, args.name.as_deref(), &root)?
+    } else {
+        resolve_lane(&front, args.name.as_deref(), &root)?
+    };
     // A reused lane's values come from the tracker and the checkout —
     // never re-record one git would read as an option (CAD-144).
     model::check_ref_value(&branch)?;
@@ -577,7 +621,10 @@ pub(super) fn run_with_verified_job(
             .iter()
             .filter(|r| r.kind == "branch" && r.closed != Some(true))
             .collect();
-        if branches.len() != 1 || branches[0].path.as_deref() != Some(branch.as_str()) {
+        if branches.len() != 1
+            || branches[0].path.as_deref() != Some(branch.as_str())
+            || branch != initial_branch
+        {
             return Err(Error::rejected(
                 "verified cloud draft branch binding changed",
             ));

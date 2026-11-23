@@ -34,7 +34,9 @@ use self::early_kickoff::{
     early_kickoff, message_refs, message_row, row_mode, same_path, spec_locator, DispatchMode,
     EarlyDispatch, EarlyKickoff,
 };
-pub(crate) use self::job_spec::{canonical_issue_spec_digest, job_context};
+pub(crate) use self::job_spec::{
+    canonical_issue_spec_digest, intake_spec_matches, intake_spec_pin, job_context,
+};
 pub use self::kickoff::parse_acceptance_listing;
 pub(crate) use self::kickoff::{
     acceptance_listing, inline_listing, intake_acceptance, outstanding_items,
@@ -260,11 +262,28 @@ pub(crate) fn intake_request(request: &str, source: &str) -> Result<String> {
     ))
 }
 
-pub(crate) fn intake_legacy_suffix(source: &str) -> Result<String> {
+pub(crate) fn intake_scope_marker(revision: &str, digest: &str) -> String {
+    format!(" [Cadence intake scope: revision={revision} digest={digest}]")
+}
+
+pub(crate) fn intake_legacy_suffix(source: &str, revision: &str, digest: &str) -> Result<String> {
     let (_, body) = parse::split_front(source)?;
     let scope = parse::acceptance_scope(body)
         .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?;
-    intake_acceptance(scope)
+    Ok(format!(
+        "{}{}",
+        intake_acceptance(scope)?,
+        intake_scope_marker(revision, digest)
+    ))
+}
+
+pub(crate) fn body_has_intake_scope(text: &str, suffix: &str) -> bool {
+    text.rsplit_once(suffix).is_some_and(|(_, tail)| {
+        tail.is_empty()
+            || tail
+                .strip_prefix(" Lessons: ")
+                .is_some_and(|path| !path.is_empty() && path.ends_with('.') && !path.contains('\n'))
+    })
 }
 
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
@@ -635,7 +654,11 @@ fn preflight(
     // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;
+    let (wt_dir, branch) = if endpoint_kind == "sandbox" && args.job_spec.is_some() {
+        start::resolve_cloud_lane(&front, args.name.as_deref(), &root)?
+    } else {
+        start::resolve_lane(&front, args.name.as_deref(), &root)?
+    };
     let early_lane = if endpoint_kind == "sandbox" && args.job_spec.is_some() {
         &root
     } else {
@@ -761,20 +784,24 @@ fn preflight(
             }
         }
     }
-    let intake_plain = if intake_scope.is_some() {
-        Some(intake_acceptance(
-            parse::acceptance_scope(scope_body)
-                .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?,
-        )?)
+    let intake_plain = intake_scope
+        .as_ref()
+        .map(|(revision, digest)| intake_legacy_suffix(&source, revision, digest))
+        .transpose()?;
+    let base_sha = if endpoint_kind == "sandbox" && reuse_job.is_some() {
+        reuse_job
+            .as_ref()
+            .and_then(|(job, _)| job["base_ref"].as_str())
+            .ok_or_else(|| Error::rejected("verified cloud draft has no base"))?
+            .to_string()
     } else {
-        None
+        start::resolve_base(
+            &root,
+            args.base.as_deref(),
+            start::configured_integration(&project, &root)?,
+        )?
+        .sha
     };
-    let base = start::resolve_base(
-        &root,
-        args.base.as_deref(),
-        start::configured_integration(&project, &root)?,
-    )?;
-    let base_sha = base.sha.clone();
     // CAD-1822/CAD-1846: both entry points run the same mandatory pipeline.
     // The task contract and the project's required sources are validated
     // before `issue start`, so a refusal leaves no lane, branch, job or
@@ -895,6 +922,7 @@ fn preflight(
                 },
                 args.no_lessons,
                 intake_scope.as_ref().map(|_| items.as_slice()),
+                None,
             )?;
             if prepared.is_some() {
                 // The daemon re-selects and pins the same mandatory contract
@@ -1238,17 +1266,17 @@ fn duplicate(
             let same = msg["body"].as_str().is_some_and(|previous| {
                 if let Some(scope) = intake_suffix {
                     if next_contract_digest.is_none() {
-                        return previous.rsplit_once(" Approved issue acceptance Markdown (including qualifiers): ")
-                            .is_some_and(|(_, saved)| {
-                                let expected = scope.strip_prefix("Approved issue acceptance Markdown (including qualifiers): ").unwrap_or(scope);
-                                saved == expected || saved.strip_prefix(expected).is_some_and(|tail| tail.starts_with(" Lessons:"))
-                            });
+                        return body_has_intake_scope(previous, scope);
                     }
                     return previous.ends_with(next)
-                        || previous.split_once(next).is_some_and(|(_, tail)| tail.starts_with(" Lessons:"));
+                        || previous
+                            .split_once(next)
+                            .is_some_and(|(_, tail)| tail.starts_with(" Lessons:"));
                 }
                 previous == next
-                    || previous.strip_prefix(next).is_some_and(|suffix| suffix.starts_with(" Lessons:"))
+                    || previous
+                        .strip_prefix(next)
+                        .is_some_and(|suffix| suffix.starts_with(" Lessons:"))
             });
             let same_contract = match next_contract_digest {
                 Some(next) => {
