@@ -204,8 +204,6 @@ pub(super) struct EarlyDispatch<'a> {
     pub(super) repo_root: &'a Path,
     pub(super) lane: &'a Path,
     pub(super) branch: &'a str,
-    pub(super) cloud_job: bool,
-    pub(super) name: Option<&'a str>,
     pub(super) job_locator: Option<&'a Path>,
 }
 
@@ -379,16 +377,6 @@ pub(super) fn early_kickoff(d: &EarlyDispatch<'_>) -> Result<EarlyKickoff> {
             Some(row) => Err(busy_error(&d.front.id, d.lane, DispatchMode::Job, &row)),
             None => Ok(EarlyKickoff::None),
         };
-    };
-    let cloud_dispatch;
-    let d = if d.cloud_job {
-        cloud_dispatch = EarlyDispatch {
-            branch: crate::issue::start::recorded_cloud_branch(d.front, d.name, &binding.task)?,
-            ..*d
-        };
-        &cloud_dispatch
-    } else {
-        d
     };
     let job_id = binding.job["id"].as_str().unwrap_or_default().to_string();
     let task_id = binding.task["id"].as_str().unwrap_or_default().to_string();

@@ -267,23 +267,28 @@ pub(crate) fn resolve_lane(
         ))),
     }
 }
-/// An open native draft names its branch; the tracker must still record it.
-pub(super) fn recorded_cloud_branch<'a>(
-    front: &Front,
-    name: Option<&str>,
-    task: &'a Value,
-) -> Result<&'a str> {
-    let branch = task["branch"]
-        .as_str()
-        .ok_or_else(|| Error::rejected("verified cloud job has no branch"))?;
-    model::check_ref_value(branch)?;
-    if !front
+/// A sandbox has a branch, not a host worktree. A replacement job keeps
+/// the sole open branch; branch history does not depend on the issue title.
+pub(super) fn resolve_cloud_branch(front: &Front, name: Option<&str>) -> Result<(String, bool)> {
+    let mut branches = front
         .refs
         .iter()
-        .any(|r| r.kind == "branch" && r.closed != Some(true) && r.path.as_deref() == Some(branch))
-    {
-        return Err(Error::rejected("verified cloud job branch binding changed"));
+        .filter(|r| r.kind == "branch" && r.closed != Some(true));
+    let Some(recorded) = branches.next() else {
+        return layout::issue_names(&front.id, &front.title, name)
+            .map(|(_, branch)| (branch, false));
+    };
+    if branches.next().is_some() {
+        return Err(Error::rejected(format!(
+            "{} has multiple open branch refs — refusing to guess a cloud lane",
+            front.id
+        )));
     }
+    let branch = recorded
+        .path
+        .as_deref()
+        .ok_or_else(|| Error::rejected("open cloud branch has no path"))?;
+    model::check_ref_value(branch)?;
     if let Some(name) = name {
         let (_, wanted) = layout::issue_names(&front.id, &front.title, Some(name))?;
         if wanted != branch {
@@ -293,7 +298,7 @@ pub(super) fn recorded_cloud_branch<'a>(
             )));
         }
     }
-    Ok(branch)
+    Ok((branch.to_string(), true))
 }
 
 /// `front` with the lane's branch and worktree refs recorded open —
@@ -464,32 +469,33 @@ pub(super) fn run_with_verified_job(
     let root = resolve_repo(&project, args.repo.as_deref(), &cwd)?;
     let cloud_draft = verified_draft.filter(|_| cloud).map(|(_, task)| task);
     let cloud_reuse = cloud_draft.is_some();
-    let (initial_lane, initial_branch) = if let Some(task) = cloud_draft {
-        (
-            root.clone(),
-            recorded_cloud_branch(&initial_front, args.name.as_deref(), task)?.to_string(),
-        )
+    let (initial_lane, initial_branch) = if cloud {
+        let (branch, _) = resolve_cloud_branch(&initial_front, args.name.as_deref())?;
+        (root.clone(), branch)
     } else {
         resolve_lane(&initial_front, args.name.as_deref(), &root)?
     };
     let initial_open = open_worktrees(&initial_front);
-    let initial_branch_exists = git(
-        &root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{initial_branch}"),
-        ],
-    )
-    .is_ok();
-    refuse_terminal_lifecycle_record(
-        &root,
-        &initial_lane,
-        &initial_front,
-        &initial_branch,
-        initial_branch_exists,
-    )?;
+    let initial_branch_exists = !cloud
+        && git(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{initial_branch}"),
+            ],
+        )
+        .is_ok();
+    if !cloud {
+        refuse_terminal_lifecycle_record(
+            &root,
+            &initial_lane,
+            &initial_front,
+            &initial_branch,
+            initial_branch_exists,
+        )?;
+    }
     let initial_lane_str = initial_lane.to_string_lossy().into_owned();
     let initial_refs_recorded = initial_front
         .refs
@@ -499,14 +505,18 @@ pub(super) fn run_with_verified_job(
             .refs
             .iter()
             .any(|r| r.kind == "worktree" && r.path.as_deref() == Some(initial_lane_str.as_str()));
-    let initial_lifecycle_record = worktree::lifecycle::recoverable_record(
-        &root,
-        &initial_lane,
-        "development",
-        "cadence issue start",
-        Some(&initial_branch),
-        Some(&initial_front.id),
-    )?;
+    let initial_lifecycle_record = if cloud {
+        None
+    } else {
+        worktree::lifecycle::recoverable_record(
+            &root,
+            &initial_lane,
+            "development",
+            "cadence issue start",
+            Some(&initial_branch),
+            Some(&initial_front.id),
+        )?
+    };
     let initial_reuse = initial_branch_exists
         && (!initial_open.is_empty()
             || initial_refs_recorded
@@ -568,13 +578,18 @@ pub(super) fn run_with_verified_job(
     // reuses it (re-applying the cargo target) rather than minting a
     // second lane from the title.
     let open = open_worktrees(&front);
-    let (wt_dir, branch) = if let Some(task) = cloud_draft {
-        (
-            root.clone(),
-            recorded_cloud_branch(&front, args.name.as_deref(), task)?.to_string(),
-        )
+    let (wt_dir, branch, cloud_branch_recorded) = if cloud {
+        let (branch, recorded) = resolve_cloud_branch(&front, args.name.as_deref())?;
+        if branch != initial_branch
+            || cloud_draft
+                .is_some_and(|task| !recorded || task["branch"].as_str() != Some(branch.as_str()))
+        {
+            return Err(Error::rejected("verified cloud job branch binding changed"));
+        }
+        (root.clone(), branch, recorded)
     } else {
-        resolve_lane(&front, args.name.as_deref(), &root)?
+        let (lane, branch) = resolve_lane(&front, args.name.as_deref(), &root)?;
+        (lane, branch, false)
     };
     // A reused lane's values come from the tracker and the checkout —
     // never re-record one git would read as an option (CAD-144).
@@ -595,26 +610,30 @@ pub(super) fn run_with_verified_job(
             .iter()
             .any(|r| r.kind == kind && r.path.as_deref() == Some(target))
     };
-    let dir_exists = wt_dir.is_dir();
-    let branch_exists = git(
-        &root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
-    .is_ok();
-    refuse_terminal_lifecycle_record(&root, &wt_dir, &front, &branch, branch_exists)?;
-    let lifecycle_record = worktree::lifecycle::recoverable_record(
-        &root,
-        &wt_dir,
-        "development",
-        "cadence issue start",
-        Some(&branch),
-        Some(&front.id),
-    )?;
+    let (dir_exists, branch_exists, lifecycle_record) = if cloud {
+        (false, false, None)
+    } else {
+        let branch_exists = git(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_ok();
+        refuse_terminal_lifecycle_record(&root, &wt_dir, &front, &branch, branch_exists)?;
+        let record = worktree::lifecycle::recoverable_record(
+            &root,
+            &wt_dir,
+            "development",
+            "cadence issue start",
+            Some(&branch),
+            Some(&front.id),
+        )?;
+        (wt_dir.is_dir(), branch_exists, record)
+    };
     let reuse = cloud_reuse
         || branch_exists
             && (!open.is_empty()
@@ -731,9 +750,20 @@ pub(super) fn run_with_verified_job(
             claimed.claim = Some(claim::new_claim(&requester, None));
         }
         claim_at = claimed.claim.as_ref().map(|c| c.at.clone());
+        let record_cloud_branch = cloud && !cloud_branch_recorded;
+        if record_cloud_branch {
+            claimed.refs.push(write::new_ref(
+                "branch",
+                &branch,
+                Some("cloud sandbox lane"),
+                None,
+                None,
+            ));
+        }
         if claimed.status != front.status
             || claimed.owner != front.owner
             || claimed.claim != front.claim
+            || record_cloud_branch
         {
             let committed = write::save_front(&dir, &claimed, &body).and_then(|_| {
                 write::commit_who(
@@ -781,19 +811,6 @@ pub(super) fn run_with_verified_job(
             "claim": claim_out,
             "cloud": true,
         });
-        if !cloud_reuse {
-            write::add_ref(
-                pm,
-                id,
-                "branch",
-                &branch,
-                Some("cloud sandbox lane"),
-                None,
-                None,
-                None,
-                actor,
-            )?;
-        }
         if let Some(warning) = &base_warning {
             eprintln!("cadence: {warning}");
             out["base"]["warning"] = json!(warning);

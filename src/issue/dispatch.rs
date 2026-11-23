@@ -657,9 +657,15 @@ fn preflight(
     // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;
     let cloud_job = endpoint_kind == "sandbox" && args.job_spec.is_some();
-    let early_lane = if cloud_job { &root } else { &wt_dir };
+    let (wt_dir, branch) = if cloud_job {
+        (
+            root.clone(),
+            start::resolve_cloud_branch(&front, args.name.as_deref())?.0,
+        )
+    } else {
+        start::resolve_lane(&front, args.name.as_deref(), &root)?
+    };
     // CAD-1846: an accepted kickoff is answered from the daemon's own rows
     // before any source capture, contract render, lane setup or job creation.
     // Only a fresh dispatch pays for sources, and only the native guards
@@ -679,10 +685,8 @@ fn preflight(
         reply_to: &reply_to,
         show: &show,
         repo_root: &root,
-        lane: early_lane,
+        lane: &wt_dir,
         branch: &branch,
-        cloud_job,
-        name: args.name.as_deref(),
         job_locator: job_locator.as_deref(),
     })? {
         EarlyKickoff::None => {}
@@ -704,20 +708,13 @@ fn preflight(
                     .ok()
                     .flatten()
             };
-            let reported_branch = if cloud_job {
-                task.as_ref()
-                    .and_then(|task| task["branch"].as_str())
-                    .unwrap_or(&branch)
-            } else {
-                &branch
-            };
             let mut out = json!({
                 "issue": front.id,
                 "worker": args.to,
                 "reply_to": reply_to,
                 "note": note,
-                "worktree": early_lane,
-                "branch": reported_branch,
+                "worktree": wt_dir,
+                "branch": branch,
                 "base": {
                     "ref": Value::Null,
                     "sha": existing_base.as_deref().filter(|base| {
@@ -789,14 +786,7 @@ fn preflight(
             }
         }
     }
-    let branch = if cloud_job {
-        reuse_job
-            .as_ref()
-            .and_then(|(_, task)| task["branch"].as_str())
-            .unwrap_or(&branch)
-    } else {
-        &branch
-    };
+    let branch = branch.as_str();
     let intake_plain = if args.job_spec.is_none() {
         intake_scope
             .as_ref()

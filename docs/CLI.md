@@ -329,6 +329,9 @@ original receipt. Existing coordinator and worker admission rules still apply.
 A job kickoff pins that revision's complete issue acceptance for
 task-bound follow-ups. Separately authored task criteria still apply
 where compatible; they do not expand the approved issue scope.
+Renewing a stale claim rechecks the same evidence, even for its previous holder.
+Sandbox jobs use a branch without creating a host worktree. A verified draft
+reuses its pinned base; a new job keeps the issue's single open sandbox branch.
 
 ## Finding a command
 
