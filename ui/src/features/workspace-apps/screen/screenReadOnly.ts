@@ -24,7 +24,7 @@ export const READ_ONLY_OPERATIONS: readonly string[] = [
   "whatsapp.status", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages",
   "whatsapp.reply.status", "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.status",
   "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate", "whatsapp.broadcast.results",
-  "whatsapp.draft.show", "campaign-work.show", "calendar.query", "records.aggregate",
+  "whatsapp.draft.show", "campaign-work.show", "calendar.query", "records.aggregate", "works.query", "works.get",
 ];
 
 /** The receipt a read-only mount is held to: operations narrowed to reads. */

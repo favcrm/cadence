@@ -535,6 +535,11 @@ impl ScreenOperation {
                 // applies the same member row visibility as records.list.
                 // Native still refuses to execute it.
                 | Self::RecordsAggregate
+                // CAD-2683: Works reads. Every other Works operation stays a
+                // write (create, patch, trash, restore, request_review) or a
+                // host slot (review, export) and is refused here.
+                | Self::WorksQuery
+                | Self::WorksGet
         )
     }
     pub fn args_limit(self) -> usize {
@@ -2195,6 +2200,32 @@ mod tests {
 
         let unknown = records_declaration(BODY, &[MAY_RECORDS_CALL], &["calendar.update"]);
         assert!(validate_map(&unknown, &bodies).is_err());
+    }
+
+    /// CAD-2683: a read-only screen admits `works.query` and `works.get`;
+    /// every other Works operation (writes and the two slots) is refused.
+    #[test]
+    fn works_reads_are_screen_reads_and_every_works_write_and_slot_is_not() {
+        assert!(ScreenOperation::WorksQuery.is_screen_read());
+        assert!(ScreenOperation::WorksGet.is_screen_read());
+        assert!(!ScreenOperation::WorksQuery.is_slot());
+        assert!(!ScreenOperation::WorksGet.is_slot());
+        for op in [
+            ScreenOperation::WorksCreate,
+            ScreenOperation::WorksPatch,
+            ScreenOperation::WorksTrash,
+            ScreenOperation::WorksRestore,
+            ScreenOperation::WorksRequestReview,
+            ScreenOperation::WorksReview,
+            ScreenOperation::WorksExport,
+        ] {
+            assert!(
+                !op.is_screen_read(),
+                "{op:?} must stay refused on a read-only mount"
+            );
+        }
+        assert!(ScreenOperation::WorksReview.is_slot());
+        assert!(ScreenOperation::WorksExport.is_slot());
     }
 
     /// CAD-2402: `routines.list` is a CALL that parses with `records.call`
