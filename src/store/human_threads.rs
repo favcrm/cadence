@@ -511,13 +511,13 @@ fn insert_post(
     silent: bool,
 ) -> Result<(TopicPost, bool)> {
     let post = post_id(topic, client_id);
+    let requested_silent = silent || super::mentions::starts_with_note(body);
     if let Some(existing) = Store::human_post_in(conn, &post)? {
         let meta_silent = conn.query_opt(
             "SELECT silent FROM human_room_post_meta WHERE post_id=?",
             [existing.id.as_str()],
             |r| r.get::<_, i64>(0).map(|v| v != 0),
         )?;
-        let requested_silent = silent || super::mentions::starts_with_note(body);
         if existing.body != body
             || existing.sender_uid.as_deref() != Some(sender_uid)
             || meta_silent.is_some_and(|s| s != requested_silent)
@@ -533,13 +533,18 @@ fn insert_post(
          VALUES(?,?,?,?,?,?)",
         params![post, topic, sender_uid, sender, body, now()],
     )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO human_room_post_meta(post_id,silent,outcomes_json)
+         VALUES(?,?,'')",
+        params![post, i64::from(requested_silent)],
+    )?;
     let saved =
         Store::human_post_in(conn, &post)?.ok_or_else(|| Error::internal("posted row missing"))?;
     // CAD-1423: the one fresh-commit point for human and agent replies. The
     // intent names the real sender uid, so no caller fabricates a human.
     // CAD-2711: silent notes (`/note` or explicit `silent: true`) record in
     // transcript only without generating bell or push intents.
-    if !silent && !super::mentions::starts_with_note(body) {
+    if !requested_silent {
         notification_intents(conn, topic, sender_uid, &saved)?;
     }
     Ok((saved, true))
@@ -1511,20 +1516,9 @@ impl Store {
         })
     }
 
-    /// True if `human_room_post_meta` already persisted outcomes for `post_id`.
-    pub fn human_room_has_post_meta(&self, post_id: &str) -> Result<bool> {
-        self.read_tx(|conn| {
-            Ok(conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM human_room_post_meta WHERE post_id=?)",
-                [post_id],
-                |r| r.get(0),
-            )?)
-        })
-    }
-
-    /// If `alias` is currently running a turn triggered by a channel or ticket
+    /// If `alias` is currently running or submitting a turn triggered by a channel or ticket
     /// `@mention` (or channel hop), return its provenance and originating channel `topic_id`.
-    /// Fails closed whenever any running message has `source='member'` even if
+    /// Fails closed whenever any active message has `source='member'` even if
     /// `human_room_post_requests` is absent, and prioritizes active `"member"` turns over
     /// concurrent `"owner"` turns.
     pub fn running_channel_authority(&self, alias: &str) -> Result<Option<RunningChannelTurn>> {
@@ -1536,7 +1530,7 @@ impl Store {
                    FROM messages m
                    LEFT JOIN human_room_post_requests pr ON pr.message_id=m.id
                    LEFT JOIN topic_posts tp ON tp.id=pr.post_id
-                  WHERE m.alias=? AND m.state='running'
+                  WHERE m.alias=? AND m.state IN ('submitting', 'running')
                     AND (pr.message_id IS NOT NULL OR m.source='member')
                   ORDER BY (CASE WHEN m.source='member' OR pr.authority_mode='member' THEN 1 ELSE 0 END) DESC, m.seq DESC
                   LIMIT 1",
@@ -1585,7 +1579,9 @@ impl Store {
         })
     }
 
-    /// Read stored mention metadata for one post id, if committed.
+    /// Read stored mention metadata for one post id once outcomes are finalized.
+    /// Rows pre-seeded by `insert_post` with an empty `outcomes_json` remain
+    /// pending (`None`) so partial-dispatch retries still recover cleanly.
     pub fn human_room_post_meta(&self, post_id: &str) -> Result<Option<HumanPostMeta>> {
         self.read_tx(|conn| {
             let row = conn.query_opt(
@@ -1593,9 +1589,14 @@ impl Store {
                 [post_id],
                 |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, String>(1)?)),
             )?;
-            Ok(row.map(|(silent, raw)| HumanPostMeta {
-                silent,
-                outcomes: serde_json::from_str(&raw).unwrap_or_default(),
+            Ok(row.and_then(|(silent, raw)| {
+                if raw.is_empty() {
+                    return None;
+                }
+                Some(HumanPostMeta {
+                    silent,
+                    outcomes: serde_json::from_str(&raw).unwrap_or_default(),
+                })
             }))
         })
     }

@@ -4220,6 +4220,7 @@ Object.assign(zhTW, {
   "selected": "已選擇",
   "members": "位成員",
   "Searching…": "搜尋中…",
+  "Close new conversation": "關閉新對話",
 });
 
 // CAD-2718: Host-owned WhatsApp Business Settings UI (either Linked device or Official API).

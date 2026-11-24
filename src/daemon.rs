@@ -3411,12 +3411,13 @@ impl Shared {
             // the child it spawned from a daemon that already ran.
             "health" => Ok({
                 let redact_inflight = match self.connection_caller(peer_pid) {
-                    Ok(caller_rule::Who::Agent(alias)) => self
-                        .store
-                        .running_channel_authority(&alias)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|t| t.authority_mode == "member"),
+                    Ok(caller_rule::Who::Agent(alias)) => {
+                        match self.store.running_channel_authority(&alias) {
+                            Ok(Some(t)) => t.authority_mode == "member",
+                            Ok(None) => false,
+                            Err(_) => true,
+                        }
+                    }
                     Ok(_) => false,
                     Err(_) => true,
                 };
