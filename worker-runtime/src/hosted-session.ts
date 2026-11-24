@@ -87,6 +87,7 @@ import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import { readSessionSummary } from "./session-summary.ts";
 import { readSessionTranscript } from "./session-transcript.ts";
+import { renderSummarySource } from "./summary-source.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
 import { projectedThreadEntries, readAllRecords } from "./transcript.ts";
@@ -237,9 +238,10 @@ export class HostedSession<
     // Pi's token-based cut may fall inside the current operation, including
     // an artifact read. Decline rather than silently summarize that input.
     this.registry.install({
-      name: "hosted-preserve-active-operation",
+      name: "hosted-compaction",
       hooks: [
         hook(CompactionTask, {
+          renderCompactionSource: renderSummarySource,
           beforeCompact: async (candidate, api, context) => {
             try {
               const conversation = await this.harness.conversation(this.harness.session().id);

@@ -231,11 +231,11 @@ overflow-triggered compaction per generation. The selected summary must not
 consume the current operation; if a safe cut is unavailable, it is declined.
 A long summary source is split into complete messages for the gateway's
 per-message limit, without discarding its content.
-Before splitting, the runtime redacts tool diagnostics and marks failed calls
-as transient so a summary does not turn a past failure into a standing rule.
-It rewrites only standalone assistant give-up claims about a tool whose latest
-attributed call failed. Ambiguous call batches get a retry note without naming
-a tool. User text and the stored transcript are unchanged (CAD-2744, CAD-2745).
+The runtime shapes the source from Pi's pinned messages before serialization.
+It redacts structured tool diagnostics and rewrites standalone assistant
+give-up claims only when the tool's latest known call failed. A successful
+retry clears that failure. User text, including pasted role labels, and the
+stored transcript are unchanged (CAD-2744, CAD-2745).
 
 The summary is a separately funded model request, identified by the actual
 durable compaction task and its pinned checkpoint tail, not by a concurrent

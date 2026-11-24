@@ -15537,6 +15537,21 @@ __export(exports_x509_transport_state_browser, {
   rememberX509Credential: () => rememberX509Credential,
   rememberX509OAuthError: () => rememberX509OAuthError
 });
+// node_modules/@earendil-works/pi-durable/dist/entries.js
+function defineEntry(kind) {
+  if (typeof kind !== "string" || kind.length === 0)
+    throw new TypeError("Entry kind must be a non-empty string");
+  return {
+    kind,
+    is: (entry) => entry !== undefined && entry.kind === kind
+  };
+}
+var UserEntry = defineEntry("pi.user");
+var AssistantEntry = defineEntry("pi.assistant");
+var SystemEntry = defineEntry("pi.system");
+var ToolResultEntry = defineEntry("pi.tool-result");
+var ResetEntry = defineEntry("pi.reset");
+var CompactionEntry = defineEntry("pi.compaction");
 // node_modules/@earendil-works/pi-durable/dist/harness/compaction.js
 init_estimate();
 
@@ -15624,22 +15639,6 @@ function isRetryableAssistantError(message) {
     return false;
   return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
 }
-
-// node_modules/@earendil-works/pi-durable/dist/entries.js
-function defineEntry(kind) {
-  if (typeof kind !== "string" || kind.length === 0)
-    throw new TypeError("Entry kind must be a non-empty string");
-  return {
-    kind,
-    is: (entry) => entry !== undefined && entry.kind === kind
-  };
-}
-var UserEntry = defineEntry("pi.user");
-var AssistantEntry = defineEntry("pi.assistant");
-var SystemEntry = defineEntry("pi.system");
-var ToolResultEntry = defineEntry("pi.tool-result");
-var ResetEntry = defineEntry("pi.reset");
-var CompactionEntry = defineEntry("pi.compaction");
 
 // node_modules/@earendil-works/pi-durable/dist/tasks.js
 function defineTask(definition) {
@@ -30348,25 +30347,10 @@ var CompactionTask = defineTask({
         serialize: serializeConversation
       };
       let rendered;
-      let renderFailed = false;
       await runtime.hooks.each("renderCompactionSource", async (hook) => {
-        if (rendered !== undefined || renderFailed)
-          return;
-        try {
+        if (rendered === undefined)
           rendered = await hook(source, runtime, context);
-        } catch {
-          runtime.signal.throwIfAborted();
-          renderFailed = true;
-        }
       });
-      if (renderFailed) {
-        const message = "Compaction source could not be safely rendered";
-        await runtime.commit(async (tx) => {
-          failCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId, message);
-          return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "source_error" } } } };
-        }, context);
-        return;
-      }
       const now = runtime.now();
       const messages = [
         { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
@@ -50627,296 +50611,6 @@ function createAI(settings) {
   });
 }
 
-// src/summary-tool-errors.ts
-var TOOL_ERROR_REDACTED = "the call failed; its error text is left out of this summary";
-var TOOL_ERROR_TEXT_OMITTED = "(tool error text omitted)";
-var TOOL_ERROR_CODE_OMITTED = "(tool error code omitted)";
-var SUMMARY_PREFIX2 = "The conversation history before this point was compacted into the following summary:";
-var MIN_ECHO_CHARS = 16;
-var ERROR_CODE = /^[A-Za-z][A-Za-z0-9_.-]{5,}$/;
-var ROLE = String.raw`\[(?:User|Assistant|Assistant tool calls|Tool result)\]: `;
-var SEGMENT_START = new RegExp(String.raw`(?:^|\n\n|<conversation>\n)(?=${ROLE})`, "g");
-var CONVERSATION_END = `
-</conversation>`;
-var HARNESS_OPEN = "<harness>";
-var HARNESS_CLOSE = "</harness>";
-var MAX_BLOCK = 2000;
-var DIAGNOSTIC = /^\[(info|warn|error)\] ?(.*)$/;
-function segments(text) {
-  const end = text.lastIndexOf(CONVERSATION_END);
-  const limit = end < 0 ? text.length : end;
-  const starts = [];
-  for (const match of text.matchAll(SEGMENT_START)) {
-    const at = match.index + match[0].length;
-    if (at < limit && (starts.length === 0 || starts.at(-1) < at))
-      starts.push(at);
-  }
-  return starts.map((start, index) => {
-    const next = starts[index + 1];
-    const stop = next === undefined ? limit : next - 2;
-    const role = /^\[([^\]]+)\]: /.exec(text.slice(start))[1];
-    return { role, start, end: Math.max(start, stop) };
-  });
-}
-function eachBlock(body, open, close, rewrite) {
-  let out = "";
-  let from = 0;
-  let at = 0;
-  for (;; ) {
-    const start = body.indexOf(open, at);
-    if (start < 0)
-      break;
-    const inner = start + open.length;
-    const window2 = body.slice(inner, inner + MAX_BLOCK + close.length);
-    const end = window2.indexOf(close);
-    const nested = window2.indexOf(HARNESS_OPEN);
-    if (end < 0 || nested >= 0 && nested < end) {
-      at = inner;
-      continue;
-    }
-    out += body.slice(from, start) + rewrite(window2.slice(0, end));
-    from = at = inner + end + close.length;
-  }
-  return out + body.slice(from);
-}
-function redactHarness(body, removed) {
-  return eachBlock(body, `${HARNESS_OPEN}
-`, `
-${HARNESS_CLOSE}`, (inner) => {
-    const block = `${HARNESS_OPEN}
-${inner}
-${HARNESS_CLOSE}`;
-    const lines = inner.split(`
-`);
-    const out = [];
-    let inError = false;
-    let message = [];
-    const flush = () => {
-      if (inError)
-        removed.add(message.join(`
-`).trim());
-      message = [];
-    };
-    for (const line of lines) {
-      const diagnostic = DIAGNOSTIC.exec(line);
-      if (diagnostic) {
-        flush();
-        inError = diagnostic[1] === "error";
-        if (inError) {
-          message = [diagnostic[2]];
-          out.push(`[error] ${TOOL_ERROR_REDACTED}`);
-        } else
-          out.push(line);
-      } else if (inError) {
-        message.push(line);
-      } else
-        out.push(line);
-    }
-    flush();
-    const shaped = `<harness>
-${out.join(`
-`)}
-</harness>`;
-    return shaped === block ? block : shaped;
-  });
-}
-function redactQuotedHarness(body, removed) {
-  return eachBlock(body, HARNESS_OPEN, HARNESS_CLOSE, (inner) => quotedBlock(inner, removed));
-}
-function quotedBlock(inner, removed) {
-  const parts = inner.split(/(\[(?:info|warn|error)\])/);
-  let changed = false;
-  for (let index = 1;index < parts.length; index += 2) {
-    if (parts[index] !== "[error]")
-      continue;
-    const text = parts[index + 1] ?? "";
-    const message = text.trim();
-    if (message === "" || message === TOOL_ERROR_REDACTED)
-      continue;
-    removed.add(message);
-    const trailing = text.slice(text.trimEnd().length);
-    parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
-    changed = true;
-  }
-  return `${HARNESS_OPEN}${changed ? parts.join("") : inner}${HARNESS_CLOSE}`;
-}
-function escape2(text) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-function scrubEchoes(body, removed) {
-  const messages = [...removed].filter((message) => message.length >= MIN_ECHO_CHARS && message !== TOOL_ERROR_REDACTED).sort((a, b) => b.length - a.length);
-  let out = body;
-  for (const message of messages)
-    out = out.split(message).join(TOOL_ERROR_TEXT_OMITTED);
-  const codes = new Set;
-  for (const message of removed) {
-    const colon = message.indexOf(": ");
-    const code = colon < 0 ? "" : message.slice(0, colon);
-    if (ERROR_CODE.test(code) && /[_\d]/.test(code))
-      codes.add(code);
-  }
-  for (const code of codes)
-    out = out.replace(new RegExp(String.raw`(?<![\w-])${escape2(code)}(?![\w-])`, "g"), TOOL_ERROR_CODE_OMITTED);
-  return out;
-}
-function redactToolErrors(text) {
-  if (!text.includes("<harness>"))
-    return text;
-  const parts = segments(text);
-  if (parts.length === 0)
-    return text;
-  const removed = new Set;
-  const isEarlierSummary = (part) => part.role === "User" && text.startsWith(SUMMARY_PREFIX2, part.start + "[User]: ".length);
-  const bodies = parts.map((part) => {
-    const body = text.slice(part.start, part.end);
-    if (part.role === "Tool result")
-      return redactHarness(body, removed);
-    if (isEarlierSummary(part))
-      return redactQuotedHarness(body, removed);
-    return body;
-  });
-  if (removed.size === 0)
-    return text;
-  const shaped = bodies.map((body, index) => {
-    const part = parts[index];
-    return part.role === "Assistant" || isEarlierSummary(part) ? scrubEchoes(body, removed) : body;
-  });
-  let out = text.slice(0, parts[0].start);
-  parts.forEach((part, index) => {
-    out += shaped[index];
-    const next = parts[index + 1];
-    out += text.slice(part.end, next === undefined ? part.end : next.start);
-  });
-  return out + text.slice(parts.at(-1).end);
-}
-
-// src/summary-tool-failures.ts
-var TRANSIENT_FAILURE_NOTE = "[Runtime note]: Tool failures above are transient runtime events, not facts about the tools. " + "Record at most that an earlier call failed and that the next turn should try it again normally.";
-var CALLS_PREFIX = "[Assistant tool calls]: ";
-var ASSISTANT_PREFIX = "[Assistant]: ";
-var USER_PREFIX = "[User]: ";
-var FAILED_LINE = `
-[error] ${TOOL_ERROR_REDACTED}
-`;
-var IDENTIFIER = /^[A-Za-z_][\w.-]*$/;
-var SENTENCE = /(?:[^.!?\n]|[.!?](?!\s|$))+[.!?]?/g;
-var WORD = /[A-Za-z_](?:[\w-]|\.(?=[\w.-]))*/g;
-var TOOL = String.raw`[\x60]?([A-Za-z_][\w.-]*)[\x60]?`;
-var ACTION = "call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|open(?:ing)?|re-?call(?:ing)?";
-var AVOID = new RegExp(String.raw`^(?:(?:(?:I|we) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not) (?:keep |try to )?(?:${ACTION})|avoid) ${TOOL}(?: again| for now| until (?:it )?(?:is fixed|is resolved|works|fixed|resolved))?$`, "i");
-var TIME2 = "right now|currently|at the moment|for now|any ?more|still|today";
-var OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED].map((marker) => marker.replace(/[()]/g, "\\$&")).join("|");
-var BROKEN = new RegExp(String.raw`^${TOOL} (?:(?:does not work|doesn't work|won't work|is broken|is not working|isn't working|keeps failing|keeps refusing)(?: (?:${TIME2}|though)| with (?:${OMITTED_ERROR})(?:: (?:${OMITTED_ERROR}))?|, avoid it)?|(?:is unavailable|is not available|isn't available) (?:${TIME2}))$`, "i");
-var USER_RULE = /\b(?:avoid|stop|skip|never|don'?t|do not|must not|should not)\b/i;
-var isFailed = (result) => result.includes(`<harness>
-`) && result.includes(FAILED_LINE);
-function claimTool(sentence) {
-  const claim = sentence.trim().replace(/[.!]$/, "");
-  return AVOID.exec(claim)?.[1] ?? BROKEN.exec(claim)?.[1];
-}
-function callNames(list) {
-  const names = [];
-  let start = 0;
-  let depth = 0;
-  let inString = false;
-  for (let at = 0;at < list.length; at++) {
-    const char = list[at];
-    if (inString) {
-      if (char === "\\")
-        at++;
-      else if (char === '"')
-        inString = false;
-    } else if (char === '"')
-      inString = true;
-    else if (char === "(") {
-      if (depth === 0) {
-        const name = list.slice(start, at).trim();
-        if (IDENTIFIER.test(name))
-          names.push(name);
-      }
-      depth++;
-    } else if (char === ")")
-      depth = Math.max(0, depth - 1);
-    else if (char === ";" && depth === 0)
-      start = at + 1;
-  }
-  return names;
-}
-function userRuleWords(text, parts) {
-  const words = new Set;
-  for (const part of parts) {
-    if (part.role !== "User" || text.startsWith(SUMMARY_PREFIX2, part.start + USER_PREFIX.length))
-      continue;
-    for (const sentence of text.slice(part.start + USER_PREFIX.length, part.end).match(SENTENCE) ?? [])
-      if (USER_RULE.test(sentence))
-        for (const word of sentence.match(WORD) ?? [])
-          words.add(word);
-  }
-  return words;
-}
-function rewrite(body, failed, userRules) {
-  return body.replace(SENTENCE, (sentence) => {
-    const tool = claimTool(sentence);
-    if (tool === undefined || !failed.has(tool) || userRules.has(tool))
-      return sentence;
-    const leading = sentence.slice(0, sentence.length - sentence.trimStart().length);
-    return `${leading}An earlier ${tool} call failed; try it again normally.`;
-  });
-}
-function settleToolFailures(text) {
-  if (!text.includes(FAILED_LINE))
-    return text;
-  const parts = segments(text);
-  if (parts.length === 0)
-    return text;
-  const userRules = userRuleWords(text, parts);
-  const failed = new Set;
-  let anyFailed = false;
-  let group = null;
-  const settle = () => {
-    if (group && group.results.length === group.names.length) {
-      const { names, results } = group;
-      names.forEach((name, index) => {
-        if (results[index])
-          failed.add(name);
-        else
-          failed.delete(name);
-      });
-    }
-    group = null;
-  };
-  const bodies = parts.map((part) => {
-    const body = text.slice(part.start, part.end);
-    if (part.role === "Tool result") {
-      const failure = isFailed(body);
-      if (failure)
-        anyFailed = true;
-      group?.results.push(failure);
-      return body;
-    }
-    settle();
-    if (part.role === "Assistant tool calls")
-      group = { names: callNames(body.slice(CALLS_PREFIX.length)), results: [] };
-    else if (part.role === "Assistant" && failed.size > 0)
-      return ASSISTANT_PREFIX + rewrite(body.slice(ASSISTANT_PREFIX.length), failed, userRules);
-    return body;
-  });
-  settle();
-  if (!anyFailed)
-    return text;
-  let out = text.slice(0, parts[0].start);
-  parts.forEach((part, index) => {
-    out += bodies[index];
-    const next = parts[index + 1];
-    out += text.slice(part.end, next === undefined ? part.end : next.start);
-  });
-  out += text.slice(parts.at(-1).end);
-  const end = out.lastIndexOf(CONVERSATION_END);
-  return end < 0 ? out : `${out.slice(0, end)}
-
-${TRANSIENT_FAILURE_NOTE}${out.slice(end)}`;
-}
-
 // src/model.ts
 var MODEL_CONTEXT_WINDOW = 128000;
 var HOSTED_COMPACTION_POLICY = {
@@ -51030,12 +50724,10 @@ function splitSummaryMessages(input) {
   if (source === null)
     return input;
   const { system, user } = source;
-  const text = settleToolFailures(redactToolErrors(shortenToolCallArguments(source.text)));
+  const text = source.text;
   const limit = 64000;
-  if (text === source.text && text.length <= limit)
-    return input;
   if (text.length <= limit)
-    return { ...input, messages: [system, { ...user, content: text }] };
+    return input;
   const messages = [system];
   for (let start = 0;start < text.length; ) {
     let end = Math.min(start + limit, text.length);
@@ -51059,35 +50751,6 @@ function summarySource(input) {
   if (Array.isArray(user.content) && user.content.length === 1 && user.content[0]?.type === "text" && typeof user.content[0].text === "string")
     return { system, user, text: user.content[0].text };
   return null;
-}
-var TOOL_CALLS_PREFIX = "[Assistant tool calls]: ";
-var TOOL_CALL_STRING_KEPT = 1000;
-var JSON_STRING = /"(?:[^"\\]|\\[\s\S])*"/g;
-function shortenToolCallArguments(text) {
-  if (!text.includes(TOOL_CALLS_PREFIX))
-    return text;
-  return text.split(`
-
-`).map((part) => !part.startsWith(TOOL_CALLS_PREFIX) ? part : part.replace(JSON_STRING, (literal) => shortenJsonString(literal))).join(`
-
-`);
-}
-function shortenJsonString(literal) {
-  const body = literal.slice(1, -1);
-  if (body.length <= 2 * TOOL_CALL_STRING_KEPT + 200)
-    return literal;
-  let head = TOOL_CALL_STRING_KEPT;
-  const slashes = /\\*$/.exec(body.slice(0, head))[0].length;
-  if (slashes % 2 === 1)
-    head--;
-  head = cutText(body, head).length;
-  let tail = body.length - TOOL_CALL_STRING_KEPT;
-  if (body[tail - 1] === "\\" && /\\*$/.exec(body.slice(0, tail))[0].length % 2 === 1)
-    tail++;
-  const low = body.charCodeAt(tail);
-  if (low >= 56320 && low <= 57343)
-    tail++;
-  return `"${body.slice(0, head)}[... ${tail - head} more characters omitted]${body.slice(tail)}"`;
 }
 var SUMMARY_BODY_BYTES = 256 * 1024;
 function requestBytes(input) {
@@ -57630,6 +57293,223 @@ function readSessionTranscript(sql, objectId, sessionId, after, project) {
   }
 }
 
+// src/summary-tool-errors.ts
+var TOOL_ERROR_REDACTED = "the call failed; its error text is left out of this summary";
+var TOOL_ERROR_TEXT_OMITTED = "(tool error text omitted)";
+var TOOL_ERROR_CODE_OMITTED = "(tool error code omitted)";
+var MIN_ECHO_CHARS = 16;
+var ERROR_CODE = /^[A-Za-z][A-Za-z0-9_.-]{5,}$/;
+var HARNESS_OPEN = "<harness>";
+var HARNESS_CLOSE = "</harness>";
+var MAX_BLOCK = 2000;
+function eachBlock(body, open, close, rewrite) {
+  let out = "";
+  let from = 0;
+  let at = 0;
+  for (;; ) {
+    const start = body.indexOf(open, at);
+    if (start < 0)
+      break;
+    const inner = start + open.length;
+    const window2 = body.slice(inner, inner + MAX_BLOCK + close.length);
+    const end = window2.indexOf(close);
+    const nested = window2.indexOf(HARNESS_OPEN);
+    if (end < 0 || nested >= 0 && nested < end) {
+      at = inner;
+      continue;
+    }
+    out += body.slice(from, start) + rewrite(window2.slice(0, end));
+    from = at = inner + end + close.length;
+  }
+  return out + body.slice(from);
+}
+function redactQuotedHarness(body, removed) {
+  return eachBlock(body, HARNESS_OPEN, HARNESS_CLOSE, (inner) => quotedBlock(inner, removed));
+}
+function quotedBlock(inner, removed) {
+  const parts = inner.split(/(\[(?:info|warn|error)\])/);
+  let changed = false;
+  for (let index = 1;index < parts.length; index += 2) {
+    if (parts[index] !== "[error]")
+      continue;
+    const text = parts[index + 1] ?? "";
+    const message = text.trim();
+    if (message === "" || message === TOOL_ERROR_REDACTED)
+      continue;
+    removed.add(message);
+    const trailing = text.slice(text.trimEnd().length);
+    parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
+    changed = true;
+  }
+  return `${HARNESS_OPEN}${changed ? parts.join("") : inner}${HARNESS_CLOSE}`;
+}
+function escape2(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function errorEchoScrubber(removed) {
+  const messages = [...removed].filter((message) => message.length >= MIN_ECHO_CHARS && message !== TOOL_ERROR_REDACTED).sort((a, b) => b.length - a.length);
+  const codes = new Set;
+  for (const message of removed) {
+    const colon = message.indexOf(": ");
+    const code = colon < 0 ? "" : message.slice(0, colon);
+    if (ERROR_CODE.test(code) && /[_\d]/.test(code))
+      codes.add(code);
+  }
+  const patterns = [...codes].map((code) => new RegExp(String.raw`(?<![\w-])${escape2(code)}(?![\w-])`, "g"));
+  return (body) => {
+    for (const message of messages)
+      body = body.split(message).join(TOOL_ERROR_TEXT_OMITTED);
+    for (const pattern of patterns)
+      body = body.replace(pattern, TOOL_ERROR_CODE_OMITTED);
+    return body;
+  };
+}
+
+// src/summary-tool-failures.ts
+var TRANSIENT_FAILURE_NOTE = "[Runtime note]: Past tool failures are runtime events, not standing facts about the tools. " + "Keep user restrictions and scoped limits; otherwise the next turn should try again normally if needed.";
+var TOOL = String.raw`[\x60]?([A-Za-z_][\w.-]*)[\x60]?`;
+var ACTION = "call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|open(?:ing)?|re-?call(?:ing)?";
+var AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not|must not|should not) (?:keep |try to )?(?:${ACTION})|avoid)`;
+var AVOID = new RegExp(String.raw`^${AVOID_ACTION} ${TOOL}(?: again| for now| until (?:it )?(?:is fixed|is resolved|works|fixed|resolved))?$`, "i");
+var TIME2 = "right now|currently|at the moment|for now|any ?more|still|today";
+var OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED].map((marker) => marker.replace(/[()]/g, "\\$&")).join("|");
+var BROKEN = new RegExp(String.raw`^${TOOL} (?:(?:does not work|doesn't work|won't work|is broken|is not working|isn't working|keeps failing|keeps refusing)(?: (?:${TIME2}|though)| with (?:${OMITTED_ERROR})(?:: (?:${OMITTED_ERROR}))?|, avoid it)?|(?:is unavailable|is not available|isn't available) (?:${TIME2}))$`, "i");
+var SENTENCE = /(?:[^.!?]|[.!?](?!\s|$))+[.!?]?/g;
+var USER_RULE = new RegExp(String.raw`^${AVOID_ACTION} ${TOOL}(?=\s|[.!?,;:]|$)`, "i");
+function collectUserToolRestrictions(text, restricted) {
+  for (const match of text.matchAll(SENTENCE)) {
+    const name = USER_RULE.exec(match[0].trim().replace(/[.!?]$/, ""))?.[1];
+    if (name !== undefined)
+      restricted.add(name);
+  }
+}
+function claimTool(sentence) {
+  const claim = sentence.trim().replace(/[.!]$/, "");
+  return AVOID.exec(claim)?.[1] ?? BROKEN.exec(claim)?.[1];
+}
+function rewriteGiveUps(body, failed, userRules) {
+  return body.replace(SENTENCE, (sentence) => {
+    const tool = claimTool(sentence);
+    if (tool === undefined || !failed.has(tool) || userRules.has(tool))
+      return sentence;
+    const leading = sentence.slice(0, sentence.length - sentence.trimStart().length);
+    return `${leading}An earlier ${tool} call failed; try it again normally.`;
+  });
+}
+
+// src/summary-source.ts
+var renderSummarySource = ({ entries, messages, serialize }) => {
+  const included = new Set(messages);
+  const errors = new Set;
+  const priorSummaries = new Map;
+  const outcomes = new Map;
+  for (const entry of entries) {
+    const message = entry.model?.[0];
+    if (!message || !included.has(message))
+      continue;
+    if (CompactionEntry.is(entry) && message.role === "user") {
+      priorSummaries.set(message, mapUserText(message, (text) => redactQuotedHarness(text, errors)));
+    } else if (ToolResultEntry.is(entry) && message.role === "toolResult") {
+      const diagnostics = entry.data?.diagnostics ?? [];
+      const failed = message.isError || diagnostics.some((item) => item.severity === "error");
+      let shaped = message;
+      if (failed && diagnostics.length > 0) {
+        const last = message.content.at(-1);
+        const render = (scrub) => `<harness>
+${diagnostics.map(({ severity, message }) => `[${severity}] ${scrub && severity === "error" ? TOOL_ERROR_REDACTED : message}`).join(`
+`)}
+</harness>`;
+        if (last?.type === "text" && last.text === render(false)) {
+          for (const item of diagnostics)
+            if (item.severity === "error")
+              errors.add(item.message.trim());
+          shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
+        }
+      }
+      outcomes.set(message, { failed, shaped });
+    }
+  }
+  const userRules = new Set;
+  for (const message of messages) {
+    if (message.role === "user" && !priorSummaries.has(message)) {
+      if (typeof message.content === "string")
+        collectUserToolRestrictions(message.content, userRules);
+      else
+        for (const block of message.content) {
+          if (block.type === "text")
+            collectUserToolRestrictions(block.text, userRules);
+        }
+    }
+  }
+  const scrubEchoes = errorEchoScrubber(errors);
+  const failed = new Set;
+  let anyFailed = false;
+  const shaped = messages.map((message) => {
+    if (message.role === "toolResult") {
+      const outcome = outcomes.get(message);
+      if (outcome?.failed) {
+        failed.add(message.toolName);
+        anyFailed = true;
+      } else
+        failed.delete(message.toolName);
+      return outcome?.shaped ?? message;
+    } else if (message.role === "assistant") {
+      const text = [];
+      for (const part of message.content)
+        if (part.type === "text")
+          text.push(part.text);
+      const before = text.join(`
+`);
+      const redacted = scrubEchoes(before);
+      const after = failed.size === 0 ? redacted : rewriteGiveUps(redacted, failed, userRules);
+      for (const part of message.content)
+        if (part.type === "toolCall")
+          failed.delete(part.name);
+      if (after !== before) {
+        return { ...message, content: [{ type: "text", text: after }, ...message.content.filter((part) => part.type !== "text")] };
+      }
+    } else if (message.role === "user") {
+      const prior = priorSummaries.get(message);
+      if (prior !== undefined)
+        return mapUserText(prior, scrubEchoes);
+    }
+    return message;
+  });
+  const source = serialize(shaped, shortenArgument);
+  return anyFailed ? `${source}
+
+${TRANSIENT_FAILURE_NOTE}` : source;
+};
+function mapUserText(message, transform) {
+  const content = typeof message.content === "string" ? transform(message.content) : message.content.map((block) => block.type === "text" ? { ...block, text: transform(block.text) } : block);
+  return { ...message, content };
+}
+function shortenArgument(json) {
+  if (json.length <= 2202)
+    return json;
+  return json.replace(/"(?:[^"\\]|\\[\s\S])*"/g, (literal) => {
+    const body = literal.slice(1, -1);
+    if (body.length <= 2200)
+      return literal;
+    let head = 1000;
+    if (/\\*$/.exec(body.slice(0, head))[0].length % 2 === 1)
+      head--;
+    if (splitsPair(body, head))
+      head--;
+    let tail = body.length - 1000;
+    if (body[tail - 1] === "\\" && /\\*$/.exec(body.slice(0, tail))[0].length % 2 === 1)
+      tail++;
+    if (splitsPair(body, tail))
+      tail++;
+    return `"${body.slice(0, head)}[... ${tail - head} more characters omitted]${body.slice(tail)}"`;
+  });
+}
+function splitsPair(text, at) {
+  const high = text.charCodeAt(at - 1);
+  const low = text.charCodeAt(at);
+  return high >= 55296 && high <= 56319 && low >= 56320 && low <= 57343;
+}
+
 // src/hosted-session.ts
 var RESOLVED_MODEL_KEY = "tenant_resolved_model";
 function engineViewChanges(ops) {
@@ -57715,9 +57595,10 @@ class HostedSession extends DurableObject {
     const skillsEnabled = options.builtInSkills !== false;
     this.registry.install(skillsEnabled ? runtimeProfile : skillFreeRuntimeProfile);
     this.registry.install({
-      name: "hosted-preserve-active-operation",
+      name: "hosted-compaction",
       hooks: [
         hook(CompactionTask, {
+          renderCompactionSource: renderSummarySource,
           beforeCompact: async (candidate, api, context) => {
             try {
               const conversation = await this.harness.conversation(this.harness.session().id);
