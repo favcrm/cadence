@@ -1,4 +1,4 @@
-/** CAD-2744: scrub tool error echoes and diagnostic quotes in prior summaries. */
+/** CAD-2744: scrub rendered tool diagnostics, historical quotes and their echoes. */
 
 export const TOOL_ERROR_REDACTED = "the call failed; its error text is left out of this summary";
 export const TOOL_ERROR_TEXT_OMITTED = "(tool error text omitted)";
@@ -49,24 +49,30 @@ function eachBlock(body: string, open: string, close: string, rewrite: (inner: s
  * line.
  */
 export function redactQuotedHarness(body: string, removed: Set<string>): string {
-  return eachBlock(body, HARNESS_OPEN, HARNESS_CLOSE, (inner) => quotedBlock(inner, removed));
+  return redactHarnessBlocks(body, removed, HARNESS_OPEN, HARNESS_CLOSE, /(\[(?:info|warn|error)\])/);
 }
 
-function quotedBlock(inner: string, removed: Set<string>): string {
-  // ["before", "[warn]", " w ", "[error]", " msg ", …]: split on the tags is linear.
-  const parts = inner.split(/(\[(?:info|warn|error)\])/);
-  let changed = false;
-  for (let index = 1; index < parts.length; index += 2) {
-    if (parts[index] !== "[error]") continue;
-    const text = parts[index + 1] ?? "";
-    const message = text.trim();
-    if (message === "" || message === TOOL_ERROR_REDACTED) continue;
-    removed.add(message);
-    const trailing = text.slice(text.trimEnd().length);
-    parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
-    changed = true;
-  }
-  return `${HARNESS_OPEN}${changed ? parts.join("") : inner}${HARNESS_CLOSE}`;
+/** Explicitly failed tools can return rendered diagnostics without a separate metadata array. */
+export function redactFailedOutput(body: string, removed: Set<string>): string {
+  return redactHarnessBlocks(body, removed, `${HARNESS_OPEN}\n`, `\n${HARNESS_CLOSE}`, /^(\[(?:info|warn|error)\])/m);
+}
+
+function redactHarnessBlocks(body: string, removed: Set<string>, open: string, close: string, diagnostic: RegExp): string {
+  return eachBlock(body, open, close, (inner) => {
+    const parts = inner.split(diagnostic);
+    let changed = false;
+    for (let index = 1; index < parts.length; index += 2) {
+      if (parts[index] !== "[error]") continue;
+      const text = parts[index + 1] ?? "";
+      const message = text.trim();
+      if (message === "" || message === TOOL_ERROR_REDACTED) continue;
+      removed.add(message);
+      const trailing = text.slice(text.trimEnd().length);
+      parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
+      changed = true;
+    }
+    return `${open}${changed ? parts.join("") : inner}${close}`;
+  });
 }
 
 function escape(text: string): string {

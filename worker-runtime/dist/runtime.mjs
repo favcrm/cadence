@@ -57324,24 +57324,31 @@ function eachBlock(body, open, close, rewrite) {
   return out + body.slice(from);
 }
 function redactQuotedHarness(body, removed) {
-  return eachBlock(body, HARNESS_OPEN, HARNESS_CLOSE, (inner) => quotedBlock(inner, removed));
+  return redactHarnessBlocks(body, removed, HARNESS_OPEN, HARNESS_CLOSE, /(\[(?:info|warn|error)\])/);
 }
-function quotedBlock(inner, removed) {
-  const parts = inner.split(/(\[(?:info|warn|error)\])/);
-  let changed = false;
-  for (let index = 1;index < parts.length; index += 2) {
-    if (parts[index] !== "[error]")
-      continue;
-    const text = parts[index + 1] ?? "";
-    const message = text.trim();
-    if (message === "" || message === TOOL_ERROR_REDACTED)
-      continue;
-    removed.add(message);
-    const trailing = text.slice(text.trimEnd().length);
-    parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
-    changed = true;
-  }
-  return `${HARNESS_OPEN}${changed ? parts.join("") : inner}${HARNESS_CLOSE}`;
+function redactFailedOutput(body, removed) {
+  return redactHarnessBlocks(body, removed, `${HARNESS_OPEN}
+`, `
+${HARNESS_CLOSE}`, /^(\[(?:info|warn|error)\])/m);
+}
+function redactHarnessBlocks(body, removed, open, close, diagnostic) {
+  return eachBlock(body, open, close, (inner) => {
+    const parts = inner.split(diagnostic);
+    let changed = false;
+    for (let index = 1;index < parts.length; index += 2) {
+      if (parts[index] !== "[error]")
+        continue;
+      const text = parts[index + 1] ?? "";
+      const message = text.trim();
+      if (message === "" || message === TOOL_ERROR_REDACTED)
+        continue;
+      removed.add(message);
+      const trailing = text.slice(text.trimEnd().length);
+      parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
+      changed = true;
+    }
+    return `${open}${changed ? parts.join("") : inner}${close}`;
+  });
 }
 function escape2(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -57370,27 +57377,29 @@ var TRANSIENT_FAILURE_NOTE = "[Runtime note]: Past tool failures are runtime eve
 var TOOL = String.raw`[\x60]?([A-Za-z_][\w.-]*)[\x60]?`;
 var ACTION = "call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|open(?:ing)?|re-?call(?:ing)?";
 var AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not|must not|should not) (?:keep |try to )?(?:${ACTION})|avoid)`;
-var AVOID = new RegExp(String.raw`^${AVOID_ACTION} ${TOOL}(?: again| for now| until (?:it )?(?:is fixed|is resolved|works|fixed|resolved))?$`, "i");
+var AVOID = new RegExp(String.raw`^${AVOID_ACTION} ${TOOL}(?: (again|for now|until (?:it )?(?:is fixed|is resolved|works|fixed|resolved)))?$`, "i");
 var TIME2 = "right now|currently|at the moment|for now|any ?more|still|today";
 var OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED].map((marker) => marker.replace(/[()]/g, "\\$&")).join("|");
 var BROKEN = new RegExp(String.raw`^${TOOL} (?:(?:does not work|doesn't work|won't work|is broken|is not working|isn't working|keeps failing|keeps refusing)(?: (?:${TIME2}|though)| with (?:${OMITTED_ERROR})(?:: (?:${OMITTED_ERROR}))?|, avoid it)?|(?:is unavailable|is not available|isn't available) (?:${TIME2}))$`, "i");
 var SENTENCE = /(?:[^.!?]|[.!?](?!\s|$))+[.!?]?/g;
-var USER_RULE = new RegExp(String.raw`^${AVOID_ACTION} ${TOOL}(?=\s|[.!?,;:]|$)`, "i");
+function restrictionKey(match) {
+  const condition = match[2]?.toLowerCase().replace(/^until (?:it )?(?:is )?/, "until ");
+  return condition === undefined ? match[1] : `${match[1]}
+${condition}`;
+}
 function collectUserToolRestrictions(text, restricted) {
   for (const match of text.matchAll(SENTENCE)) {
-    const name = USER_RULE.exec(match[0].trim().replace(/[.!?]$/, ""))?.[1];
-    if (name !== undefined)
-      restricted.add(name);
+    const rule = AVOID.exec(match[0].trim().replace(/[.!]$/, "").replace(/\s+/g, " "));
+    if (rule !== null)
+      restricted.add(restrictionKey(rule));
   }
-}
-function claimTool(sentence) {
-  const claim = sentence.trim().replace(/[.!]$/, "");
-  return AVOID.exec(claim)?.[1] ?? BROKEN.exec(claim)?.[1];
 }
 function rewriteGiveUps(body, failed, userRules) {
   return body.replace(SENTENCE, (sentence) => {
-    const tool = claimTool(sentence);
-    if (tool === undefined || !failed.has(tool) || userRules.has(tool))
+    const claim = sentence.trim().replace(/[.!]$/, "");
+    const avoid = AVOID.exec(claim);
+    const tool = avoid?.[1] ?? BROKEN.exec(claim)?.[1];
+    if (tool === undefined || !failed.has(tool) || userRules.has(tool) || avoid !== null && userRules.has(restrictionKey(avoid)))
       return sentence;
     const leading = sentence.slice(0, sentence.length - sentence.trimStart().length);
     return `${leading}An earlier ${tool} call failed; try it again normally.`;
@@ -57426,19 +57435,20 @@ ${diagnostics.map(({ severity, message }) => `[${severity}] ${scrub && severity 
           shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
         }
       }
+      if (message.isError) {
+        const before = visibleText(shaped.content);
+        const redacted = redactFailedOutput(before, errors);
+        if (redacted !== before)
+          shaped = { ...shaped, content: [{ type: "text", text: redacted }] };
+      }
       outcomes.set(message, { failed, shaped });
     }
   }
   const userRules = new Set;
   for (const message of messages) {
     if (message.role === "user" && !priorSummaries.has(message)) {
-      if (typeof message.content === "string")
-        collectUserToolRestrictions(message.content, userRules);
-      else
-        for (const block of message.content) {
-          if (block.type === "text")
-            collectUserToolRestrictions(block.text, userRules);
-        }
+      const text = typeof message.content === "string" ? message.content : visibleText(message.content);
+      collectUserToolRestrictions(text, userRules);
     }
   }
   const scrubEchoes = errorEchoScrubber(errors);
@@ -57454,12 +57464,7 @@ ${diagnostics.map(({ severity, message }) => `[${severity}] ${scrub && severity 
         failed.delete(message.toolName);
       return outcome?.shaped ?? message;
     } else if (message.role === "assistant") {
-      const text = [];
-      for (const part of message.content)
-        if (part.type === "text")
-          text.push(part.text);
-      const before = text.join(`
-`);
+      const before = visibleText(message.content);
       const redacted = scrubEchoes(before);
       const after = failed.size === 0 ? redacted : rewriteGiveUps(redacted, failed, userRules);
       for (const part of message.content)
@@ -57480,6 +57485,16 @@ ${diagnostics.map(({ severity, message }) => `[${severity}] ${scrub && severity 
 
 ${TRANSIENT_FAILURE_NOTE}` : source;
 };
+function visibleText(blocks) {
+  let text;
+  for (const block of blocks) {
+    if (block.type !== "text" || block.text === undefined)
+      continue;
+    text = text === undefined ? block.text : `${text}
+${block.text}`;
+  }
+  return text ?? "";
+}
 function mapUserText(message, transform) {
   const content = typeof message.content === "string" ? transform(message.content) : message.content.map((block) => block.type === "text" ? { ...block, text: transform(block.text) } : block);
   return { ...message, content };

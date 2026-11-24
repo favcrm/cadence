@@ -1,6 +1,6 @@
 import type { Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { CompactionEntry, ToolResultEntry, type CompactionHooks } from "@earendil-works/pi-durable";
-import { errorEchoScrubber, redactQuotedHarness, TOOL_ERROR_REDACTED } from "./summary-tool-errors.ts";
+import { errorEchoScrubber, redactFailedOutput, redactQuotedHarness, TOOL_ERROR_REDACTED } from "./summary-tool-errors.ts";
 import { collectUserToolRestrictions, rewriteGiveUps, TRANSIENT_FAILURE_NOTE } from "./summary-tool-failures.ts";
 
 /** Shape only Pi's pinned compaction source, never the transcript or its retained tail. */
@@ -30,6 +30,11 @@ export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({
           shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
         }
       }
+      if (message.isError) {
+        const before = visibleText(shaped.content);
+        const redacted = redactFailedOutput(before, errors);
+        if (redacted !== before) shaped = { ...shaped, content: [{ type: "text", text: redacted }] };
+      }
       outcomes.set(message, { failed, shaped });
     }
   }
@@ -37,10 +42,8 @@ export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({
   const userRules = new Set<string>();
   for (const message of messages) {
     if (message.role === "user" && !priorSummaries.has(message)) {
-      if (typeof message.content === "string") collectUserToolRestrictions(message.content, userRules);
-      else for (const block of message.content) {
-        if (block.type === "text") collectUserToolRestrictions(block.text, userRules);
-      }
+      const text = typeof message.content === "string" ? message.content : visibleText(message.content);
+      collectUserToolRestrictions(text, userRules);
     }
   }
 
@@ -58,9 +61,7 @@ export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({
       } else failed.delete(message.toolName);
       return outcome?.shaped ?? message;
     } else if (message.role === "assistant") {
-      const text: string[] = [];
-      for (const part of message.content) if (part.type === "text") text.push(part.text);
-      const before = text.join("\n");
+      const before = visibleText(message.content);
       const redacted = scrubEchoes(before);
       const after = failed.size === 0 ? redacted : rewriteGiveUps(redacted, failed, userRules);
       // A fresh call supersedes older evidence about that tool. Its typed
@@ -78,6 +79,15 @@ export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({
   const source = serialize(shaped, shortenArgument);
   return anyFailed ? `${source}\n\n${TRANSIENT_FAILURE_NOTE}` : source;
 };
+
+function visibleText(blocks: readonly { type: string; text?: string }[]): string {
+  let text: string | undefined;
+  for (const block of blocks) {
+    if (block.type !== "text" || block.text === undefined) continue;
+    text = text === undefined ? block.text : `${text}\n${block.text}`;
+  }
+  return text ?? "";
+}
 
 function mapUserText(message: UserMessage, transform: (text: string) => string): UserMessage {
   const content = typeof message.content === "string" ? transform(message.content)

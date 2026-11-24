@@ -14,7 +14,14 @@ it("preserves a user restriction without exempting related publication policy", 
   collectUserToolRestrictions("Do not publish the page before checking it with canvas_open.", restricted);
   expect(rewriteGiveUps(text, failed, restricted)).toBe("An earlier canvas_open call failed; try it again normally.");
   collectUserToolRestrictions("Never call canvas_open on the production board.", restricted);
+  expect(rewriteGiveUps(`canvas_open does not work right now. ${text}`, failed, restricted)).toBe(
+    "An earlier canvas_open call failed; try it again normally. An earlier canvas_open call failed; try it again normally.",
+  );
+  collectUserToolRestrictions("Don't call\ncanvas_open until fixed.", restricted);
   expect(rewriteGiveUps(text, failed, restricted)).toBe(text);
+  expect(rewriteGiveUps("canvas_open does not work right now.", failed, restricted)).toBe(
+    "An earlier canvas_open call failed; try it again normally.",
+  );
 });
 
 it("keeps corrections, facts, and scoped limits after a failed call", () => {
