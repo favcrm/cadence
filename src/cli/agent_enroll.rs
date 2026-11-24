@@ -18,6 +18,7 @@ pub(crate) enum EnrollAction {
     /// Poll this CLI login's enrollment state.
     Status,
     /// List CLI enrollment requests for this workspace (owner + `audit.approve`).
+    #[command(alias = "ls")]
     List,
     /// Approve a pending CLI enrollment request as a profile (owner + `audit.approve`).
     Approve {
@@ -185,6 +186,13 @@ pub(crate) fn run_native(action: &EnrollAction) -> Result<i32> {
 mod tests {
     use super::*;
 
+    struct UnbindActor;
+    impl Drop for UnbindActor {
+        fn drop(&mut self) {
+            cadence_agent::remote_cli::unbind_cli_actor();
+        }
+    }
+
     fn managed_env<T>(f: impl FnOnce() -> T) -> T {
         let _lock = crate::cli::org::tests::RESOLVE_ENV
             .lock()
@@ -298,12 +306,6 @@ mod tests {
         let _lock = crate::cli::org::tests::RESOLVE_ENV
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        struct UnbindActor;
-        impl Drop for UnbindActor {
-            fn drop(&mut self) {
-                cadence_agent::remote_cli::unbind_cli_actor();
-            }
-        }
         let _unbind = UnbindActor;
         let env_bare = crate::cli::org::tests::EnvGuard::bare();
         env_bare.write_registry(&crate::cli::org::tests::remote_registry(
@@ -375,6 +377,7 @@ mod tests {
     fn managed_env_caller_is_refused_before_org_resolve() {
         use crate::cli::org::tests::{remote_registry, EnvGuard, EP_A, RESOLVE_ENV};
         let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _unbind = UnbindActor;
         let env = EnvGuard::bare();
         env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
         std::env::set_var("CADENCE_ALIAS", "synthetic-worker");
@@ -407,6 +410,7 @@ mod tests {
     fn omitted_org_is_refused_through_dispatch_and_client_only_routes() {
         use crate::cli::org::tests::{remote_registry, EnvGuard, EP_A, RESOLVE_ENV};
         let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _unbind = UnbindActor;
         let env = EnvGuard::bare();
         env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
         for args in [
