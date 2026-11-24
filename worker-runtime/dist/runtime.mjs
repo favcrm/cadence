@@ -57373,6 +57373,7 @@ function errorEchoScrubber(removed) {
 }
 
 // src/summary-prose.ts
+var REPORTING_LEAD_IN = /^\s*(?:(?:the|a|an|this|that|our|its)[ \t]+(?:(?!(?:if|unless|until|when|whenever|while|before|after|only|that|which|who|because|provided|assuming|since|as|whether)\b)[A-Za-z][\w-]*[ \t]+){1,3}|(?:i|we|it|they|you)[ \t]+)(?:say|says|said|return|returns|returned|read|reads|report|reports|reported|write|writes|wrote|show|shows|showed|display|displays|displayed)(?:[ \t]*[,:])?[ \t]*$/i;
 function* proseClauses(text, semicolons) {
   let start = 0;
   let quoted = false;
@@ -57424,7 +57425,11 @@ function* proseClauses(text, semicolons) {
       if (!unclosedQuotes?.has(kind) && !literalQuote(mark, text[opener - 1])) {
         const end = quoteEnd(text, at + 1, close, escaped);
         if (end !== undefined) {
-          quoted = true;
+          const terminal = end - (text[end - 2] === "\\" ? 3 : 2);
+          if (!quoted && terminal > at && /[.!?]/.test(text[terminal]) && /\s/.test(text[end] ?? "") && REPORTING_LEAD_IN.test(text.slice(start, opener))) {
+            start = end;
+          } else
+            quoted = true;
           at = end;
           continue;
         }

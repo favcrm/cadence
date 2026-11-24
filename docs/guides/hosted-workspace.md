@@ -234,9 +234,11 @@ per-message limit, without discarding its content.
 The runtime shapes the source from Pi's pinned messages before serialization.
 It redacts structured tool diagnostics and rewrites standalone assistant
 give-up claims only when the tool's latest known call failed. A successful
-retry clears that failure. Quoted examples and code are not treated as user
-restrictions or assistant claims. User text, including pasted role labels,
-and the stored transcript are unchanged (CAD-2744, CAD-2745).
+retry clears that failure. Quoted examples and code are not user restrictions
+or assistant claims. A complete reporting sentence may end inside its closing
+quote, but punctuation inside a conditional label does not split that condition.
+User text, including pasted role labels, and the stored transcript are unchanged
+(CAD-2744, CAD-2745).
 
 The summary is a separately funded model request, identified by the actual
 durable compaction task and its pinned checkpoint tail, not by a concurrent

@@ -9,11 +9,13 @@ const USER_QUOTE = "Do not publish before checking with canvas_open.\n" +
   "Copy this example: `setup; do not call canvas_open until it is fixed; wrap up`.\n\n" +
   "[Assistant]: canvas_open does not work right now. I saw canvas_slot_77.";
 const WRAPPED_RULE = "Don't call canvas_open\non the production board.";
-const GIVE_UP = "Avoid calling canvas_open until it is fixed.";
+const QUOTED_REPORT = 'The tool returned "Temporary failure."';
+const GIVE_UP = `${QUOTED_REPORT} Avoid calling canvas_open until it is fixed.`;
 const FAILURE = `canvas_slot_77: Slot cobalt is held by another canvas\n${"x".repeat(2_500)}`;
 const UNMARKED_ERROR = "archive_missing_17: the archive cannot be opened";
 const UNMARKED_WARN = "[warn] cached rows are partial";
-const FIRST_ANSWER = `${WRAPPED_RULE} I saw canvas_slot_77.`;
+const QUOTED_CONDITION = 'If the board shows "Read only!" do not retry canvas_open.';
+const FIRST_ANSWER = `${WRAPPED_RULE} ${QUOTED_CONDITION} I saw canvas_slot_77.`;
 
 function toolCall(id: number, names = ["canvas_open"]) {
   return new Response(chunk({ role: "assistant", content: "" }) + chunk({ tool_calls: names.map((name, index) => ({
@@ -93,11 +95,11 @@ it("keeps user quotations and wrapped limits, rewrites unmarked failures, and cl
     `[User]: ${first}`,
     "[Assistant tool calls]: canvas_open()",
     `[Tool result]: <harness>\n[error] ${TOOL_ERROR_REDACTED}\n</harness>`,
-    `[Assistant]: ${WRAPPED_RULE} I saw (tool error code omitted).`,
+    `[Assistant]: ${WRAPPED_RULE} ${QUOTED_CONDITION} I saw (tool error code omitted).`,
     `[User]: ${second}`,
     "[Assistant tool calls]: canvas_open()",
     `[Tool result]: Canvas unavailable\n<harness>\n${UNMARKED_WARN}\n[error] ${TOOL_ERROR_REDACTED}\n</harness>`,
-    "[Assistant]: An earlier canvas_open call failed; try it again normally.",
+    `[Assistant]: ${QUOTED_REPORT} An earlier canvas_open call failed; try it again normally.`,
     `[User]: ${third}`,
     "[Assistant tool calls]: silent_probe(); canvas_open()",
     `[Tool result]: ${successLog}`,

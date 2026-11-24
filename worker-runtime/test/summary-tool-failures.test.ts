@@ -78,15 +78,34 @@ it("only rewrites the unquoted claim beside an assistant's example", () => {
   for (const quote of [
     'The guide says: "Run once. Do not retry canvas_open. Use the backup".',
     'The guide says: "Run once. Do not retry canvas_open. Use the backup."\n\n',
+    'The tool returned "Temporary failure."',
+    'The changelog says, "The staging deploy finished."',
+    String.raw`The log reads: \"Temporary failure.\"`,
   ]) {
     const text = `${quote} canvas_open does not work right now.`;
     expect(rewriteGiveUps(text, failed, new Map())).toBe(`${quote} An earlier canvas_open call failed; try it again normally.`);
   }
 });
 
+it("recognizes a user restriction in a new sentence after a complete report", () => {
+  const restriction = "Do not retry canvas_open.";
+  const restricted = new Map<string, Set<string>>();
+  collectUserToolRestrictions(`The tool returned "Temporary failure." ${restriction}`, restricted);
+  expect(rewriteGiveUps(restriction, failed, restricted)).toBe(restriction);
+});
+
 it("never makes the consequence after a quoted label a standalone claim", () => {
-  const text = 'If the board shows "Read only!" do not retry canvas_open.';
-  expect(rewriteGiveUps(text, failed, new Map())).toBe(text);
+  for (const text of [
+    'If the board shows "Read only!" do not retry canvas_open.',
+    'When the tool reports "Read only." Do not retry canvas_open.',
+    'The board only if it shows "Read only!" Do not retry canvas_open.',
+  ]) {
+    const restricted = new Map<string, Set<string>>();
+    collectUserToolRestrictions(text, restricted);
+    expect(rewriteGiveUps(text, failed, new Map())).toBe(text);
+    expect(rewriteGiveUps("Do not retry canvas_open.", failed, restricted))
+      .toBe("An earlier canvas_open call failed; try it again normally.");
+  }
 });
 
 it("keeps scanning after inch marks and unmatched inline delimiters", () => {
