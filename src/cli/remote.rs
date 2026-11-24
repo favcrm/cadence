@@ -2746,28 +2746,31 @@ where
     // diagnostics are still refused for managed callers outright — never
     // narrowed to "no grant" and never silently allowed. Operators on their
     // own shell are unaffected.
-    if (matches!(&command, Commands::Settings { .. })
+    if matches!(&command, Commands::Settings { .. })
         || matches!(
             &command,
             Commands::Master {
                 action: MasterAction::Status { .. } | MasterAction::Resume { .. },
             }
-        ))
-        && (target.identity.is_some()
-            || std::env::var_os("CADENCE_ALIAS").is_some()
-            || std::env::var_os("CADENCE_GRANT_TOKEN").is_some())
+        )
     {
-        return Err(Error::invalid(
-            "settings_agent_session_required",
-            format!(
-                "remote `{}` refused for a managed caller: the call would spend the \
-             stored owner login, and owner-class settings authority is never \
-             delegated to an agent credential; the operator runs this from a plain \
-             shell, or grant-bound ops run on the local daemon (`cadence \
-             settings agents grant request …`)",
-                name(&command)
-            ),
-        ));
+        if target.identity.is_some()
+            || std::env::var_os("CADENCE_ALIAS").is_some()
+            || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+        {
+            return Err(Error::invalid(
+                "settings_agent_session_required",
+                format!(
+                    "remote `{}` refused for a managed caller: the call would spend the \
+                 stored owner login, and owner-class settings authority is never \
+                 delegated to an agent credential; the operator runs this from a plain \
+                 shell, or grant-bound ops run on the local daemon (`cadence \
+                 settings agents grant request …`)",
+                    name(&command)
+                ),
+            ));
+        }
+        cadence_agent::remote_cli::refuse_non_human_actor(Some(&target), name(&command))?;
     }
     // CAD-1586: resource commands carry their payloads directly through the
     // explicit `settings_agents` verb before the generic
@@ -3033,6 +3036,9 @@ where
     if let Some(verb) = connection_owner_verb(&command) {
         refuse_managed(&target, verb)?;
     }
+    let non_human_actor = target.identity.is_some()
+        || cadence_agent::remote_cli::cli_actor_is_non_human()
+        || cadence_agent::remote_cli::saved_login_is_assistant_only(&target);
     let mut command = command;
     if let Commands::Agent {
         action: AgentAction::Profile { action },
@@ -3041,14 +3047,14 @@ where
         // CAD-2101: refused in the client before any request exists; the
         // board cannot tell a managed agent on its owner's login from the
         // owner (docs/guides/hosted-workspace.md).
-        super::agent_profile::refuse_managed_write(action, target.identity.is_some())?;
+        super::agent_profile::refuse_managed_write(action, non_human_actor)?;
         super::agent_profile::resolve_latest(&target, action, wake_timeout)?;
     }
     if let Commands::WorkspaceSkill { action } = &command {
         // CAD-2396: approve and revoke are an owner's decision, refused for a
         // managed caller before any request exists; the board cannot tell a
         // managed agent on its owner's login from the owner.
-        super::workspace_skill::refuse_managed_decision(action, target.identity.is_some())?;
+        super::workspace_skill::refuse_managed_decision(action, non_human_actor)?;
     }
     if let Commands::Issue { action } = &command {
         if issue_text::needs_human(action) {

@@ -2949,6 +2949,8 @@ struct CliSession {
     device_label: String,
     idle_expires_at: u64,
     absolute_expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor_mode: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -3603,17 +3605,7 @@ fn validate_renewal_response(
         || body["credential"]["access_token"]
             .as_str()
             .is_none_or(|v| !valid_token(v, "hct_"))
-        || !exact_object(
-            &body["cli_session"],
-            &[
-                "session_id",
-                "refresh_token",
-                "generation",
-                "device_label",
-                "idle_expires_at",
-                "absolute_expires_at",
-            ],
-        )
+        || !valid_renewed_cli_session_shape(&body["cli_session"], old_session.actor_mode.as_deref())
         || body["cli_session"]["session_id"] != old_session.session_id
         || body["cli_session"]["generation"].as_u64() != pending.expected_generation.checked_add(1)
         || body["cli_session"]["device_label"] != old_session.device_label
@@ -3638,7 +3630,7 @@ fn validate_renewal_response(
         return Err(reject("remote renewal returned an invalid access expiry"));
     }
     let metadata = &body["cli_session"];
-    if metadata.as_object().is_none_or(|m| m.len() != 6)
+    if !valid_renewed_cli_session_shape(metadata, old_session.actor_mode.as_deref())
         || metadata["idle_expires_at"]
             .as_u64()
             .is_none_or(|t| t <= at || t > old_session.absolute_expires_at)
@@ -3647,6 +3639,34 @@ fn validate_renewal_response(
         return Err(reject("remote renewal returned invalid session expiry"));
     }
     Ok(())
+}
+
+fn valid_renewed_cli_session_shape(value: &Value, prior_actor_mode: Option<&str>) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    let required = [
+        "session_id",
+        "refresh_token",
+        "generation",
+        "device_label",
+        "idle_expires_at",
+        "absolute_expires_at",
+    ];
+    if !required.iter().all(|key| map.contains_key(*key))
+        || map
+            .keys()
+            .any(|key| !required.contains(&key.as_str()) && key != "actor_mode")
+    {
+        return false;
+    }
+    match map.get("actor_mode") {
+        None => prior_actor_mode.is_none(),
+        Some(Value::String(mode)) if matches!(mode.as_str(), "human" | "assistant") => {
+            prior_actor_mode.is_none_or(|prior| prior == mode.as_str())
+        }
+        Some(_) => false,
+    }
 }
 
 /// CAD-1853: which saved consent a renewal may rotate. The purpose comes
@@ -4229,13 +4249,29 @@ fn upload_artifact_in(
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| reject("unable to create a request id"))?;
     let request_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let managed_pane = agent.is_some();
+    let mut reissued_actor = false;
     loop {
         request_timeout(deadline, AUTH_TIMEOUT).map_err(|_| waking())?;
-        let cred = match custody_agent {
-            Some(slot) => agent_credential::bearer(slot, target, dir, deadline, &note, false)?
-                .map(|(credential, _)| credential)
-                .ok_or_else(agent_credential::platform_agent_required)?,
-            None => renewed_credential(dir, target, deadline)?,
+        let (cred, actor_source) = match custody_agent {
+            Some(slot) => (
+                agent_credential::bearer(slot, target, dir, deadline, &note, false)?
+                    .map(|(credential, _)| credential)
+                    .ok_or_else(agent_credential::platform_agent_required)?,
+                None,
+            ),
+            None if managed_pane => (renewed_credential(dir, target, deadline)?, None),
+            None => {
+                let (c, src) = actor_credential::bearer_for(
+                    target,
+                    dir,
+                    deadline,
+                    Surface::Cli,
+                    "artifact_put",
+                    None,
+                )?;
+                (c, Some(src))
+            }
         };
         if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
             return Err(reject(
@@ -4245,6 +4281,16 @@ fn upload_artifact_in(
         }
         let (status, retry_after, body) =
             artifact_upload_once(target, &cred, upload, &request_id, deadline)?;
+        if status == 401
+            && !reissued_actor
+            && actor_source.as_ref().is_some_and(|src| src.is_cached())
+        {
+            if let Some(src) = actor_source {
+                src.invalidate_cached();
+            }
+            reissued_actor = true;
+            continue;
+        }
         if explicit_mutation_uncertainty(body.as_ref()).is_some() {
             return Err(artifact_outcome_unknown());
         }
@@ -4456,6 +4502,7 @@ fn upload_template_in(
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| reject("unable to create a request id"))?;
     let request_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let managed_pane = agent.is_some();
     let mut on_agent = agent_credential::applies(agent, target, Surface::Cli, "template_upload");
     let mut reissued = false;
     loop {
@@ -4465,13 +4512,26 @@ fn upload_template_in(
             None => None,
         };
         let using_agent = agent_pair.is_some();
-        let from_cache = agent_pair
+        let from_agent_cache = agent_pair
             .as_ref()
             .is_some_and(|(_, src)| matches!(src, agent_credential::Source::Cached));
-        let cred = match agent_pair {
-            Some((c, _)) => c,
-            None => renewed_credential(dir, target, deadline)?,
+        let (cred, actor_source) = match agent_pair {
+            Some((c, _)) => (c, None),
+            None if managed_pane => (renewed_credential(dir, target, deadline)?, None),
+            None => {
+                let (c, src) = actor_credential::bearer_for(
+                    target,
+                    dir,
+                    deadline,
+                    Surface::Cli,
+                    "template_upload",
+                    None,
+                )?;
+                (c, Some(src))
+            }
         };
+        let from_cache =
+            from_agent_cache || actor_source.as_ref().is_some_and(|src| src.is_cached());
         if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "cli.write") {
             return Err(reject(
                 "template upload needs the cli.write capability, which this remote login lacks — nothing was sent",
@@ -4495,7 +4555,7 @@ fn upload_template_in(
             }
             continue;
         }
-        let rej_cache = using_agent
+        let rej_cache = (using_agent || actor_source.as_ref().is_some_and(|src| src.is_cached()))
             && from_cache
             && !reissued
             && match &answered {
@@ -4506,6 +4566,9 @@ fn upload_template_in(
         if rej_cache {
             if let Some(slot) = on_agent {
                 slot.invalidate();
+            }
+            if let Some(src) = actor_source {
+                src.invalidate_cached();
             }
             reissued = true;
             continue;
@@ -6956,10 +7019,11 @@ fn call_verb_until_retry(
     if require_agent && on_agent.is_none() {
         return Err(agent_credential::platform_agent_required());
     }
+    let managed_pane = agent.is_some();
     let mut reissued = false;
     loop {
         request_timeout(deadline, AUTH_TIMEOUT)?;
-        let (agent_cred, from_cache) = match on_agent {
+        let (agent_cred, from_agent_cache) = match on_agent {
             Some(slot) => {
                 match agent_credential::bearer(
                     slot,
@@ -6983,10 +7047,18 @@ fn call_verb_until_retry(
             None => (None, false),
         };
         let using_agent = agent_cred.is_some();
-        let cred = match agent_cred {
-            Some(cred) => cred,
-            None => renewed_credential(dir, target, deadline)?,
+        let (cred, actor_source) = match agent_cred {
+            Some(cred) => (cred, None),
+            None if managed_pane => (renewed_credential(dir, target, deadline)?, None),
+            None => {
+                let op = arguments.get("operation").and_then(Value::as_str);
+                let (c, src) =
+                    actor_credential::bearer_for(target, dir, deadline, surface, verb, op)?;
+                (c, Some(src))
+            }
         };
+        let from_cache =
+            from_agent_cache || actor_source.as_ref().is_some_and(|src| src.is_cached());
         // A login that records its capabilities must hold the wiki scope the
         // action needs; a legacy login with none is left to the server's check.
         if matches!(surface, Surface::Wiki) && !cred.capabilities.is_empty() {
@@ -7077,7 +7149,8 @@ fn call_verb_until_retry(
         // revocation) is dropped and re-minted once. A freshly minted bearer is
         // the agent's own refusal and stays final, and a 401 is answered before
         // the verb runs, so the retry cannot double-apply a write.
-        let rejected_cached = using_agent
+        let rejected_cached = (using_agent
+            || actor_source.as_ref().is_some_and(|src| src.is_cached()))
             && from_cache
             && !reissued
             && match &answered {
@@ -7088,6 +7161,9 @@ fn call_verb_until_retry(
         if rejected_cached {
             if let Some(slot) = on_agent {
                 slot.invalidate();
+            }
+            if let Some(src) = actor_source {
+                src.invalidate_cached();
             }
             reissued = true;
             continue;
@@ -8139,6 +8215,15 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
     )))
 }
 
+mod actor_credential;
+#[doc(hidden)]
+#[cfg(any(debug_assertions, feature = "test-seam"))]
+pub use actor_credential::unbind_cli_actor;
+pub use actor_credential::{
+    bind_cli_actor, cli_actor, cli_actor_is_non_human, detect_unmanaged_actor,
+    refuse_non_human_actor, saved_login_is_assistant_only, valid_profile_id, CliActor,
+    CliActorMode,
+};
 mod agent_credential;
 pub use agent_credential::{bind_managed_session, bound_session, AgentSlot};
 // The test seam is absent from a release or CI-profile build; only a debug
