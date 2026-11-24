@@ -86,8 +86,26 @@ pub struct Kickoff<'a> {
     pub profile_id: Option<&'a str>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnSpec {
+    pub runner_id: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub repo: String,
+    pub profile_id: Option<String>,
+}
+
+pub(super) enum PickupTarget {
+    Seat { alias: String, repo_root: PathBuf },
+    Spawn { spec: SpawnSpec, repo_root: PathBuf },
+}
+
+pub(super) type SpawnActorMut<'a> =
+    &'a mut dyn FnMut(&SpawnSpec, &Path, &str) -> Result<(String, String)>;
+
 #[derive(Clone)]
-struct Assignment {
+pub(super) struct Assignment {
     assignment_id: String,
     organization_id: String,
     issue_id: String,
@@ -101,6 +119,8 @@ struct Assignment {
     client_agent_id: Option<String>,
     /// The profile the board recorded for this claim, when it recorded one.
     profile_id: Option<String>,
+    target_agent_id: Option<String>,
+    spawn: Option<SpawnSpec>,
     guidance: Option<Value>,
     reported_head_sha: Option<String>,
     text: Option<String>,
@@ -1764,6 +1784,34 @@ impl<H: CoordHttp> Coordinator<H> {
     where
         F: FnMut(&Kickoff) -> Result<Value>,
     {
+        let mut no_spawn = |_: &SpawnSpec, _: &Path, _: &str| -> Result<(String, String)> {
+            Err(Error::rejected("spawn target is not enabled in this mode"))
+        };
+        self.activate_target(
+            assignment,
+            root,
+            name,
+            Some(alias),
+            None,
+            &mut no_spawn,
+            deliver,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn activate_target<F>(
+        &mut self,
+        assignment: &Assignment,
+        root: &Path,
+        name: Option<&str>,
+        seat_alias: Option<&str>,
+        spawn_spec: Option<&SpawnSpec>,
+        spawn_actor: SpawnActorMut<'_>,
+        deliver: &mut F,
+    ) -> Result<Value>
+    where
+        F: FnMut(&Kickoff) -> Result<Value>,
+    {
         self.ensure_active()?;
         let client_agent_id = self.client_agent_id()?;
         let claimed = if assignment.state == "blocked" {
@@ -1865,8 +1913,21 @@ impl<H: CoordHttp> Coordinator<H> {
             let message_id = self.reserve_kickoff(&current)?;
             let (_origin_assignment, origin_claim, origin_generation) =
                 self.origin_for_message(&message_id)?;
+            let (target_alias, spawned_adapter) = if let Some(spec) = spawn_spec {
+                match spawn_actor(spec, &dir, &current.assignment_id) {
+                    Ok((alias, adapter)) => (alias, Some(adapter)),
+                    Err(error) => return Err(self.activation_failure(&current, error)),
+                }
+            } else {
+                (
+                    seat_alias
+                        .ok_or_else(|| Error::rejected("local target alias is missing"))?
+                        .to_string(),
+                    None,
+                )
+            };
             let kickoff = Kickoff {
-                alias,
+                alias: &target_alias,
                 issue_id: &current.issue_id,
                 assignment_id: &current.assignment_id,
                 worktree: &path,
@@ -1902,8 +1963,11 @@ impl<H: CoordHttp> Coordinator<H> {
                     } else {
                         json!({"receipt": value})
                     };
-                    receipt["alias"] = json!(alias);
+                    receipt["alias"] = json!(&target_alias);
                     receipt["message"] = json!(message);
+                    if let Some(adapter) = spawned_adapter {
+                        receipt["spawned_adapter"] = json!(adapter);
+                    }
                     receipt
                 }
                 Err(error) => {
@@ -2375,6 +2439,47 @@ impl<H: CoordHttp> Coordinator<H> {
             }));
         };
         let root = worktree::main_root(Path::new(&stored))?;
+        let mut no_spawn = |_: &SpawnSpec, _: &Path, _: &str| -> Result<(String, String)> {
+            Err(Error::rejected("spawn target is not enabled in this mode"))
+        };
+        let mut resolve = |_row: &Assignment| -> Result<Option<PickupTarget>> {
+            Ok(Some(PickupTarget::Seat {
+                alias: alias.clone(),
+                repo_root: root.clone(),
+            }))
+        };
+        self.pickup_rows_routed(
+            rows,
+            name,
+            resume_blocked,
+            Some(&alias),
+            &mut resolve,
+            &mut no_spawn,
+            deliver,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn pickup_rows_routed<F>(
+        &mut self,
+        rows: Vec<Assignment>,
+        name: Option<&str>,
+        resume_blocked: bool,
+        summary_alias: Option<&str>,
+        resolve: &mut dyn FnMut(&Assignment) -> Result<Option<PickupTarget>>,
+        spawn_actor: SpawnActorMut<'_>,
+        deliver: &mut F,
+    ) -> Result<Value>
+    where
+        F: FnMut(&Kickoff) -> Result<Value>,
+    {
+        let subject = self.subject_id.clone().ok_or_else(|| {
+            Error::invalid(
+                "config_required",
+                "this workspace login has no directory subject",
+            )
+        })?;
+        let client_agent_id = self.client_agent_id()?;
         let mut claimed = Vec::new();
         let mut refused = Vec::new();
         for row in rows {
@@ -2432,7 +2537,39 @@ impl<H: CoordHttp> Coordinator<H> {
                 }));
                 continue;
             }
-            match self.activate(&row, &root, name, &alias, deliver) {
+            let target = match resolve(&row) {
+                Ok(Some(target)) => target,
+                Ok(None) => continue,
+                Err(error) => {
+                    refused.push(json!({
+                        "assignment_id": row.assignment_id,
+                        "error": error.to_string(),
+                        "code": error.code(),
+                    }));
+                    continue;
+                }
+            };
+            let result = match target {
+                PickupTarget::Seat { alias, repo_root } => self.activate_target(
+                    &row,
+                    &repo_root,
+                    name,
+                    Some(&alias),
+                    None,
+                    spawn_actor,
+                    deliver,
+                ),
+                PickupTarget::Spawn { spec, repo_root } => self.activate_target(
+                    &row,
+                    &repo_root,
+                    name,
+                    None,
+                    Some(&spec),
+                    spawn_actor,
+                    deliver,
+                ),
+            };
+            match result {
                 Ok(value) => claimed.push(value),
                 Err(error) => refused.push(json!({
                     "assignment_id": row.assignment_id,
@@ -2444,7 +2581,7 @@ impl<H: CoordHttp> Coordinator<H> {
         Ok(json!({
             "configured": true,
             "target": subject,
-            "alias": alias,
+            "alias": summary_alias,
             "client_agent_id": client_agent_id,
             "claimed": claimed,
             "refused": refused,

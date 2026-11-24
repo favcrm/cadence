@@ -40,6 +40,10 @@ mod bridge_tests {
                 repo: None,
                 name: None,
                 fyi_only: false,
+                allow_spawn: false,
+                spawn_repos: vec![],
+                harnesses: vec![],
+                max_concurrent: None,
             }
             .bridge(),
             Some(local_agent::LocalAgentAction::Connect { .. })
@@ -765,6 +769,22 @@ pub(crate) enum AgentAction {
         /// Register this explicit agent for FYI only; preserve the assignment default.
         #[arg(long, conflicts_with = "cloud")]
         fyi_only: bool,
+        /// Opt-in to spawning local harness workers from the hosted board.
+        #[arg(long, conflicts_with = "cloud")]
+        allow_spawn: bool,
+        /// Allowlisted repo binding (`name=path` or `path`) for hosted spawn; repeatable.
+        #[arg(
+            long = "spawn-repo",
+            value_name = "NAME=PATH|PATH",
+            conflicts_with = "cloud"
+        )]
+        spawn_repos: Vec<String>,
+        /// Allowlisted harnesses for hosted spawn (comma-separated, e.g. omp,pi,claude,codex).
+        #[arg(long, value_delimiter = ',', conflicts_with = "cloud")]
+        harnesses: Vec<String>,
+        /// Maximum concurrent spawned lanes allowed on this runner.
+        #[arg(long, conflicts_with = "cloud")]
+        max_concurrent: Option<u32>,
     },
     /// Keep picking up later assignments until disconnected or interrupted.
     Watch,
@@ -829,12 +849,20 @@ impl AgentAction {
                 repo,
                 name,
                 fyi_only,
+                allow_spawn,
+                spawn_repos,
+                harnesses,
+                max_concurrent,
                 ..
             } => L::Connect {
                 alias: alias.clone(),
                 repo: repo.clone(),
                 name: name.clone(),
                 fyi_only: *fyi_only,
+                allow_spawn: *allow_spawn,
+                spawn_repos: spawn_repos.clone(),
+                harnesses: harnesses.clone(),
+                max_concurrent: *max_concurrent,
             },
             Self::Directory { after_id } => L::Directory {
                 after_id: after_id.clone(),

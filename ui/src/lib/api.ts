@@ -53,6 +53,9 @@ import type {
   TempChannelDecidePayload,
   TempChannelDecision,
   TempChannelRotatePeerPayload,
+  HostedLocalDaemonsResponse,
+  HostedLocalDispatchRequest,
+  HostedLocalDispatchResponse,
   Health,
   ProjectTimeline,
   ProtectedEntry,
@@ -1972,4 +1975,9 @@ export const api = {
     post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/unfence`, body),
   laneReassign: (id: string, body: { provider: string; model?: string; effort?: string; note?: string }) =>
     post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/reassign`, body),
+  /** CAD-2746: owner-only connected local daemons directory. */
+  localDaemons: (signal?: AbortSignal) => get<HostedLocalDaemonsResponse>("/api/local-agents", signal),
+  /** CAD-2746: owner-only hosted issue -> connected daemon dispatch. */
+  localDispatch: (id: string, body: HostedLocalDispatchRequest) =>
+    post<HostedLocalDispatchResponse>(`/api/issues/${encodeURIComponent(id)}/local-dispatch`, body),
 };

@@ -49,7 +49,7 @@ export type ProjectSection = "overview" | "timeline" | "issues" | "epics" | "mil
  *  list, so nothing links there. `matchRoute` still parses the URL — dropping
  *  it would turn a stale link into "nothing lives here"; `settingsRedirect`
  *  moves it off a board whose `/api/meta` does not name it. */
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "security" | "general" | "custody" | "members" | "documents";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates" | "preferences" | "security" | "general" | "custody" | "members" | "documents" | "daemons";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). `trash`
  *  is the operator's deleted-landing browser (CAD-2018); its selector is a
  *  server-issued `.trash/…` value, never a logical wiki path. */
@@ -321,6 +321,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "general") return { screen: "settings", section: "general" };
       if (a === "members") return { screen: "settings", section: "members" };
       if (a === "documents") return { screen: "settings", section: "documents" };
+      if (a === "daemons") return { screen: "settings", section: "daemons" };
       if (a === "custody") return { screen: "settings", section: "custody" };
       if (a === "templates") return { screen: "settings", section: "templates" };
       if (a === "connections") {
@@ -435,6 +436,7 @@ export function routePath(route: Route): string {
       if (route.section === "general") return "/settings/general";
       if (route.section === "members") return "/settings/members";
       if (route.section === "documents") return "/settings/documents";
+      if (route.section === "daemons") return "/settings/daemons";
       if (route.section === "custody") return "/settings/custody";
       if (route.section === "templates") return "/settings/templates";
       return "/settings";

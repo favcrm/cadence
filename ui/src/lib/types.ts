@@ -2344,3 +2344,72 @@ export interface TempChannelClosePayload {
   channel: TempChannelSummary;
   message: TempChannelMessage | null;
 }
+
+export type HostedLocalHarness = "omp" | "pi" | "claude" | "codex" | "cursor" | "devin";
+
+export interface HostedLocalAgentActivity {
+  status: "idle" | "busy" | "blocked" | "offline";
+  summary?: string | null;
+  issue_id?: string | null;
+  updated_at?: string | null;
+}
+
+export interface HostedLocalRunnerSpawnManifest {
+  spawn_allowed: boolean;
+  repos: string[];
+  harnesses: HostedLocalHarness[];
+  max_concurrent: number;
+  active_lanes: number;
+}
+
+export interface HostedLocalDaemonAgent {
+  agent_id: string;
+  label: string;
+  adapter: string;
+  delivery: "push" | "turn" | "pull";
+  client_agent_id: string;
+  default_assignment_alias: boolean;
+  registration_state: "current" | "expired" | "revoked";
+  presence: "online" | "offline";
+  activity: HostedLocalAgentActivity;
+}
+
+export interface HostedLocalDaemonRunner {
+  runner_id: string;
+  host_label: string | null;
+  platform: string | null;
+  owner_subject_id: string;
+  presence: "online" | "offline";
+  registration_state: "current" | "expired" | "revoked";
+  spawn_manifest: HostedLocalRunnerSpawnManifest;
+  agents: HostedLocalDaemonAgent[];
+}
+
+export interface HostedLocalDaemonsResponse {
+  version: string;
+  runners: HostedLocalDaemonRunner[];
+}
+
+export interface HostedLocalDispatchSpawnSpec {
+  runner_id: string;
+  provider: HostedLocalHarness;
+  model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  repo: string;
+  profile_id?: string;
+}
+
+export type HostedLocalDispatchRequest =
+  | { idempotency_key: string; mode: "seat"; target_agent_id: string; note?: string }
+  | { idempotency_key: string; mode: "spawn"; spawn: HostedLocalDispatchSpawnSpec; note?: string };
+
+export interface HostedLocalDispatchResponse {
+  assignment: {
+    assignment_id: string;
+    issue_id: string;
+    state: string;
+    target_agent_id?: string;
+    spawn?: HostedLocalDispatchSpawnSpec;
+  };
+  replayed: boolean;
+}

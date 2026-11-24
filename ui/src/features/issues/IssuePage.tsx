@@ -17,6 +17,7 @@ import { buildMentionCandidates } from "../mentions/candidates";
 import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import "./issues.css";
 import KickoffDialog from "./KickoffDialog";
+import HostedDispatchDialog from "./HostedDispatchDialog";
 import IdeaCard from "../home/IdeaCard";
 import { stageLabel } from "../projects/work";
 import { LaneCard, type LanePayload } from "./LaneCard";
@@ -115,6 +116,16 @@ function IssueWorkspace(props: Props) {
         blocked={kickoffWhy}
         setKickoff={setKickoff}
       />
+      {kickoff && props.hosted && props.canLocalDispatch && (
+        <HostedDispatchDialog
+          id={detail.id}
+          title={detail.title}
+          daemonsHref={props.daemonsHref}
+          onClose={() => setKickoff(false)}
+          onDispatched={() => void resources.issue(detail.id).invalidate()}
+          onToast={props.onToast}
+        />
+      )}
       {kickoff && !props.hosted && (
         <KickoffDialog
           id={detail.id}
@@ -168,6 +179,7 @@ function PageBody({
   onOpen,
   setKickoff,
   hosted,
+  canLocalDispatch,
   managedFiles,
   projectRepos,
   stagedActions,
@@ -282,6 +294,11 @@ function PageBody({
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
+          {hosted && canLocalDispatch && (
+            <Button variant="primary" onClick={() => setKickoff(true)}>
+              {t("Dispatch")}
+            </Button>
+          )}
           {!hosted && (
             <Button
               variant={blocked ? "secondary" : "primary"}
