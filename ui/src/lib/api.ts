@@ -1551,11 +1551,16 @@ export const api = {
     ),
   customMcpAcceptDrift: (
     id: string,
-    tools?: Array<{ tool_name: string; mode: CustomMcpToolMode }>,
+    body?:
+      | Array<{ tool_name: string; mode: CustomMcpToolMode }>
+      | {
+          tools?: Array<{ tool_name: string; mode: CustomMcpToolMode }>;
+          tool_names?: string[];
+        },
   ) =>
     post<CustomMcpConnectionPayload>(
       `/api/connections/mcp/${encodeURIComponent(id)}/accept-drift`,
-      tools ? { tools } : {},
+      Array.isArray(body) ? { tools: body } : (body ?? {}),
     ),
   customMcpRotateAuth: (
     id: string,

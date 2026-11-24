@@ -505,6 +505,99 @@ async function main() {
   await settle(() => assert(text().includes("could not verify"), "in-flight preset fails closed on older server"));
   assert(messageWrites.length === 0, "missing trusted wrapper never resumes");
 
+  // CAD-2759 / AOS-738: Last checked metadata + per-tool drift accept preserves unrelated mode drafts.
+  const acceptPayloads: Array<Record<string, unknown>> = [];
+  let driftedConn: Record<string, unknown> = {
+    ...sampleMcp,
+    status: "needs_review",
+    pending_revision: 3,
+    instructions_drifted: true,
+    pending_server_instructions: "Updated instructions",
+    last_checked_at: 1_795_000_050_000,
+    last_check_outcome: "changes_found",
+    tools_summary: { total: 3, read: 0, approval: 3, off: 0, drifted: 2 },
+    tools: [
+      {
+        ...sampleMcp.tools[0],
+        drifted: true,
+        pending_change: "changed",
+        pending_description: "Create an invoice draft with currency.",
+        pending_tool_digest: "sha256:tool1_v2",
+      },
+      {
+        tool_name: "legacy_export",
+        description: "Old export.",
+        input_schema: { type: "object", properties: {} },
+        annotations: { readOnlyHint: true },
+        tool_digest: "sha256:old",
+        mode: "approval",
+        drifted: true,
+        pending_change: "removed",
+        pending_description: null,
+        pending_tool_digest: "__removed__",
+        updated_at: 1_795_000_000_000,
+      },
+      {
+        tool_name: "list_customers",
+        description: "List customers.",
+        input_schema: { type: "object", properties: {} },
+        annotations: { readOnlyHint: true },
+        tool_digest: "sha256:cust",
+        mode: "approval",
+        drifted: false,
+        pending_description: null,
+        pending_tool_digest: null,
+        updated_at: 1_795_000_000_000,
+      },
+    ],
+  };
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    if (url.endsWith("/api/connections/mcp") && method === "GET") return jsonRes({ connections: [driftedConn] });
+    if (url.endsWith(`/api/connections/mcp/${sampleMcp.id}/accept-drift`) && method === "POST") {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      acceptPayloads.push(body);
+      driftedConn = {
+        ...driftedConn,
+        snapshot_revision: 3,
+        tools_summary: { total: 3, read: 0, approval: 3, off: 0, drifted: 1 },
+        tools: (driftedConn.tools as Array<Record<string, unknown>>).map((pin) =>
+          pin.tool_name === "create_invoice"
+            ? { ...pin, drifted: false, pending_change: null, pending_description: null }
+            : pin,
+        ),
+      };
+      return jsonRes({ connection: driftedConn });
+    }
+    if (url.endsWith("/api/connections")) return jsonRes({ connections: platformRows });
+    if (url.endsWith("/api/connection-providers")) return jsonRes({ providers: [] });
+    if (url.endsWith("/api/agents")) return jsonRes({ agents: [{ alias: "nova" }] });
+    return jsonRes({ ok: true });
+  }) as typeof fetch;
+
+  await act(async () => { root.render(React.createElement(Connections, { viewer: { operator: true, readOnly: false }, hostedBoard: true })); });
+  await settle(() => assert(text().includes("Drift review"), "shows drifted server row"));
+  await act(async () => (host.querySelector('[data-connections-group="custom-mcp"] button') as HTMLButtonElement).click());
+  await settle(() => {
+    const drawer = document.querySelector('[data-drawer="custom-mcp"]')?.textContent ?? "";
+    assert(drawer.includes("Last checked") && drawer.includes("Changes found"), "shows Last checked & outcome chip");
+    assert(drawer.includes("Changed") && drawer.includes("Removed upstream"), "shows Changed and Removed upstream chips");
+  });
+  await act(async () => {
+    const listGroup = document.querySelector('[role="radiogroup"][aria-label^="list_customers"]');
+    const offBtn = Array.from(listGroup?.querySelectorAll("button") ?? []).find((b) => b.textContent === "Off") as HTMLButtonElement | undefined;
+    offBtn?.click();
+  });
+  await act(async () => (document.querySelector('button[aria-label="Accept create_invoice"]') as HTMLButtonElement).click());
+  await settle(() => {
+    assert(acceptPayloads.length === 1 && JSON.stringify(acceptPayloads[0]) === JSON.stringify({ tool_names: ["create_invoice"] }), "per-tool accept sends tool_names");
+    assert(document.querySelector('[data-drawer="custom-mcp"]')?.textContent?.includes("Accepted change for create_invoice"), "shows partial accept feedback");
+    const listGroup = document.querySelector('[role="radiogroup"][aria-label^="list_customers"]');
+    const offBtn = Array.from(listGroup?.querySelectorAll("button") ?? []).find((b) => b.textContent === "Off");
+    assert(offBtn?.getAttribute("aria-checked") === "true", "unrelated dirty mode draft preserved across partial accept");
+  });
+
   globalThis.fetch = innerFetch;
   await act(async () => root.unmount());
   console.log("customMcpUi: ok");

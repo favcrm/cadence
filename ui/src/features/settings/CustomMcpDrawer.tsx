@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
 import { routinesApi } from "../agents/routinesApi";
 import { useTranslate } from "../../lib/locale";
@@ -9,6 +9,7 @@ import type {
   CustomMcpConnectionSummary,
   CustomMcpOAuthDiscovery,
   CustomMcpToolMode,
+  CustomMcpToolPin,
 } from "../../lib/types";
 import Button from "../../ui/Button";
 import { IconCheck, IconLock, IconRefresh, IconWarning } from "../../ui/icons";
@@ -18,7 +19,11 @@ import {
   customMcpAuthLabel,
   customMcpAuthOptionLabel,
   customMcpAuthorizationUrl,
+  customMcpCheckedText,
+  customMcpCheckOutcomeView,
   customMcpErrorText,
+  customMcpPendingAnnotationRisk,
+  customMcpPendingChangeLabel,
   customMcpStatusView,
   customMcpSyncedText,
   customMcpToolModeLabel,
@@ -42,7 +47,7 @@ function statusChipClass(tone: "ok" | "warn" | "fail" | "muted"): string {
   }
 }
 
-function MetaRow({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
+function MetaRow({ label, value, mono = true }: { label: string; value: ReactNode; mono?: boolean }) {
   return (
     <div className="flex flex-wrap gap-x-2">
       <dt className="text-ink-500">{label}</dt>
@@ -448,10 +453,30 @@ export function CustomMcpInspectDrawer({
     };
   }, [canEdit, connection.id]);
 
+  const prevModesRef = useRef<{ id: string; modes: Record<string, CustomMcpToolMode> }>({
+    id: connection.id,
+    modes: Object.fromEntries((connection.tools ?? []).map((pin) => [pin.tool_name, pin.mode])),
+  });
+
   useEffect(() => {
-    setModeDraft(
-      Object.fromEntries((connection.tools ?? []).map((pin) => [pin.tool_name, pin.mode])),
-    );
+    const nextModes = Object.fromEntries((connection.tools ?? []).map((pin) => [pin.tool_name, pin.mode]));
+    if (prevModesRef.current.id !== connection.id) {
+      prevModesRef.current = { id: connection.id, modes: nextModes };
+      setModeDraft(nextModes);
+      return;
+    }
+    const prevModes = prevModesRef.current.modes;
+    setModeDraft((cur) => {
+      const merged: Record<string, CustomMcpToolMode> = {};
+      for (const pin of connection.tools ?? []) {
+        const draft = cur[pin.tool_name];
+        const prevMode = prevModes[pin.tool_name];
+        const hadUnsavedEdit = draft !== undefined && prevMode !== undefined && draft !== prevMode;
+        merged[pin.tool_name] = hadUnsavedEdit && pin.mode === prevMode ? draft : pin.mode;
+      }
+      return merged;
+    });
+    prevModesRef.current = { id: connection.id, modes: nextModes };
   }, [connection.id, connection.snapshot_revision, connection.pending_revision, connection.tools]);
 
   useEffect(() => {
@@ -519,9 +544,30 @@ export function CustomMcpInspectDrawer({
   };
 
   const acceptDrift = () => runAction("drift", async () => {
-    const res = await api.customMcpAcceptDrift(connection.id, changedTools.length > 0 ? changedTools : undefined);
+    const res = await api.customMcpAcceptDrift(connection.id, changedTools.length > 0 ? { tools: changedTools } : {});
     onUpdated(res.connection);
     setFeedback({ ok: true, text: t("Pending changes accepted into a new pinned revision.") });
+  });
+
+  const acceptToolDrift = (pin: CustomMcpToolPin) => runAction(`drift:${pin.tool_name}`, async () => {
+    const draftMode = modeDraft[pin.tool_name];
+    const includeMode =
+      pin.pending_change !== "removed" && draftMode !== undefined && draftMode !== pin.mode;
+    const res = await api.customMcpAcceptDrift(connection.id, {
+      tool_names: [pin.tool_name],
+      ...(includeMode ? { tools: [{ tool_name: pin.tool_name, mode: draftMode }] } : {}),
+    });
+    onUpdated(res.connection);
+    const stillPending =
+      res.connection.status === "needs_review" ||
+      res.connection.tools_summary.drifted > 0 ||
+      res.connection.instructions_drifted;
+    setFeedback({
+      ok: true,
+      text: stillPending
+        ? t("Accepted change for {tool}. Remaining changes still await review.").replace("{tool}", pin.tool_name)
+        : t("Pending changes accepted into a new pinned revision."),
+    });
   });
 
   const reconnectOAuth = () => runAction("oauth", async () => {
@@ -654,6 +700,8 @@ export function CustomMcpInspectDrawer({
     </div>
   );
 
+  const checkOutcome = customMcpCheckOutcomeView(connection.last_check_outcome);
+
   const toolsPanel = (
     <div className="space-y-3 min-w-0">
       {okBanner}
@@ -677,6 +725,19 @@ export function CustomMcpInspectDrawer({
           <MetaRow label={t("Endpoint")} value={connection.endpoint_url} />
           <MetaRow label={t("Snapshot")} value={`v${connection.snapshot_revision}${connection.server_name ? ` · ${connection.server_name}` : ""}${connection.server_version ? ` (${connection.server_version})` : ""}`} />
           <MetaRow label={t("Last synced")} value={customMcpSyncedText(connection.last_synced_at)} />
+          {(connection.last_checked_at != null || checkOutcome) && (
+            <MetaRow
+              label={t("Last checked")}
+              value={(
+                <span className="inline-flex flex-wrap items-center gap-1.5">
+                  <span className="num">{customMcpCheckedText(connection.last_checked_at ?? null)}</span>
+                  {checkOutcome && (
+                    <span className={`chip ${statusChipClass(checkOutcome.tone)}`}>{t(checkOutcome.label)}</span>
+                  )}
+                </span>
+              )}
+            />
+          )}
         </dl>
         {canEdit && (
           <Button size="sm" variant="secondary" loading={busyAction === "sync"} disabled={busyAction !== null} icon={<IconRefresh size={13} />} onClick={() => void syncTools()}>
@@ -707,11 +768,16 @@ export function CustomMcpInspectDrawer({
             <IconWarning size={14} /><span>{t("Server contract drift detected")}</span>
           </div>
           <p className="text-micro text-ink-200 break-words">
-            {t("Changed tools and server instructions are held back until an owner reviews them. Previously auto-read tools that changed have failed closed to Ask approval.")}
+            {t("Unchanged tools keep working while drifted tools and instructions wait for owner review. Previously auto-read tools that changed have failed closed to Ask approval.")}
           </p>
+          {connection.instructions_drifted && (
+            <p className="text-micro text-warn break-words">
+              {t("Includes pending upstream server instructions.")}
+            </p>
+          )}
           {canEdit && (
             <Button size="sm" variant="primary" loading={busyAction === "drift"} disabled={busyAction !== null} onClick={() => void acceptDrift()}>
-              {busyAction === "drift" ? t("Accepting…") : t("Accept drift & pin revision")}
+              {busyAction === "drift" ? t("Accepting…") : t("Accept all changes & pin revision")}
             </Button>
           )}
         </div>
@@ -723,37 +789,62 @@ export function CustomMcpInspectDrawer({
           {tools.map((pin) => {
             const currentMode = modeDraft[pin.tool_name] ?? pin.mode;
             const params = schemaParamSummary(pin.input_schema);
+            const isRemovedDrift = pin.drifted && pin.pending_change === "removed";
+            const riskNote = customMcpPendingAnnotationRisk(pin);
+            const rowBusyKey = `drift:${pin.tool_name}`;
             return (
-              <li key={pin.tool_name} className="custmcp-tool" data-drifted={pin.drifted ? "true" : undefined}>
+              <li key={pin.tool_name} className="custmcp-tool" data-drifted={pin.drifted ? "true" : undefined} data-pending-change={pin.pending_change ?? undefined}>
                 <div className="flex flex-wrap items-start justify-between gap-2 min-w-0">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                       <code className="num text-label font-medium text-ink-100 break-all">{pin.tool_name}</code>
                       {isToolReadOnlyHint(pin) && <span className="chip bg-ink-800 text-ink-300">{t("Read-only hint")}</span>}
                       {isToolDestructiveHint(pin) && <span className="chip custmcp-chip-warn">{t("Destructive hint")}</span>}
-                      {pin.drifted && <span className="chip custmcp-chip-warn">{t("Drifted")}</span>}
+                      {pin.drifted && <span className="chip custmcp-chip-warn">{t(customMcpPendingChangeLabel(pin.pending_change))}</span>}
                     </div>
                     {pin.description && <p className="text-micro text-ink-400 mt-1 break-words">{pin.description}</p>}
                     {pin.drifted && pin.pending_description !== null && (
                       <p className="text-micro text-warn mt-1 break-words">{t("Pending description")}: {pin.pending_description}</p>
                     )}
+                    {isRemovedDrift && (
+                      <p className="text-micro text-warn mt-1 break-words">{t("Removed upstream. Accepting removes this tool from the pinned snapshot.")}</p>
+                    )}
+                    {riskNote && (
+                      <p className="text-micro text-warn mt-1 break-words">{t(riskNote)}</p>
+                    )}
                     {params.length > 0 && <p className="text-micro text-ink-500 mt-1 num break-words">{t("Args")}: {params.join(", ")}</p>}
                   </div>
-                  {canEdit ? (
-                    <div className="custmcp-mode-group" role="radiogroup" aria-label={`${pin.tool_name} ${t("mode")}`}>
-                      {(["off", "approval", "read"] as const).map((modeOpt) => (
-                        <button
-                          key={modeOpt} type="button" role="radio" aria-checked={currentMode === modeOpt}
-                          disabled={busyAction !== null} className="custmcp-mode-btn"
-                          onClick={() => setModeDraft((cur) => ({ ...cur, [pin.tool_name]: modeOpt }))}
-                        >
-                          {t(customMcpToolModeLabel(modeOpt))}
-                        </button>
-                      ))}
-                    </div>
-                  ) : (
-                    <span className="chip bg-ink-800 text-ink-300 shrink-0">{t(customMcpToolModeLabel(pin.mode))}</span>
-                  )}
+                  <div className="flex flex-col items-end gap-1.5 shrink-0">
+                    {canEdit ? (
+                      <div className="custmcp-mode-group" role="radiogroup" aria-label={`${pin.tool_name} ${t("mode")}`}>
+                        {(["off", "approval", "read"] as const).map((modeOpt) => (
+                          <button
+                            key={modeOpt} type="button" role="radio" aria-checked={currentMode === modeOpt}
+                            disabled={busyAction !== null || isRemovedDrift} className="custmcp-mode-btn"
+                            onClick={() => setModeDraft((cur) => ({ ...cur, [pin.tool_name]: modeOpt }))}
+                          >
+                            {t(customMcpToolModeLabel(modeOpt))}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="chip bg-ink-800 text-ink-300 shrink-0">{t(customMcpToolModeLabel(pin.mode))}</span>
+                    )}
+                    {canEdit && pin.drifted && (
+                      <Button
+                        size="sm"
+                        variant={isRemovedDrift ? "danger" : "secondary"}
+                        loading={busyAction === rowBusyKey}
+                        disabled={busyAction !== null}
+                        aria-label={`${t(isRemovedDrift ? "Remove tool" : "Accept")} ${pin.tool_name}`}
+                        onClick={() => void acceptToolDrift(pin)}
+                      >
+                        {busyAction === rowBusyKey
+                          ? t(isRemovedDrift ? "Removing…" : "Accepting…")
+                          : t(isRemovedDrift ? "Remove tool" : "Accept")}
+                      </Button>
+                    )}
+                  </div>
                 </div>
               </li>
             );
@@ -790,9 +881,14 @@ export function CustomMcpInspectDrawer({
           <p className="text-label text-ink-400">{t("This server did not report initialize.instructions.")}</p>
         )}
         {connection.instructions_drifted && (
-          <div className="rounded border border-warn/40 bg-warn/10 p-2.5 space-y-1">
+          <div className="rounded border border-warn/40 bg-warn/10 p-2.5 space-y-2">
             <p className="text-micro font-medium text-warn">{t("Pending upstream instructions (not yet pinned)")}</p>
             <pre className="custmcp-pre" tabIndex={0}>{connection.pending_server_instructions ?? t("(cleared upstream)")}</pre>
+            {canEdit && (
+              <Button size="sm" variant="primary" loading={busyAction === "drift"} disabled={busyAction !== null} onClick={() => void acceptDrift()}>
+                {busyAction === "drift" ? t("Accepting…") : t("Accept all changes & pin revision")}
+              </Button>
+            )}
           </div>
         )}
       </section>
