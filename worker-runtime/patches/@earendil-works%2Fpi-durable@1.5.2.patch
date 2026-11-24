@@ -1,8 +1,7 @@
 diff --git a/dist/harness/compaction.js b/dist/harness/compaction.js
-index 54f3ef34ddf1bf85e3ad9c41bdbd216c081a476f..e148d7209cc2dec3f5e49485f5b27c49d83b8adb 100644
 --- a/dist/harness/compaction.js
 +++ b/dist/harness/compaction.js
-@@ -111,12 +111,22 @@ export const CompactionTask = defineTask({
+@@ -111,12 +111,38 @@ export const CompactionTask = defineTask({
              // The context at `tail` is immutable, so this is the range `select` chose.
              const view = await runtime.context(runtime.conversationId, context, { at: tail });
              const cut = view.entries.findIndex((entry) => entry.id === firstKept);
@@ -12,10 +11,26 @@ index 54f3ef34ddf1bf85e3ad9c41bdbd216c081a476f..e148d7209cc2dec3f5e49485f5b27c49
 +                serialize: serializeConversation,
 +            };
 +            let rendered;
++            let renderFailed = false;
 +            await runtime.hooks.each("renderCompactionSource", async (hook) => {
-+                if (rendered === undefined)
++                if (rendered !== undefined || renderFailed)
++                    return;
++                try {
 +                    rendered = await hook(source, runtime, context);
++                } catch {
++                    // The generic hook runner logs and swallows errors; never fall back to raw source here.
++                    runtime.signal.throwIfAborted();
++                    renderFailed = true;
++                }
 +            });
++            if (renderFailed) {
++                const message = "Compaction source could not be safely rendered";
++                await runtime.commit(async (tx) => {
++                    failCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId, message);
++                    return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "source_error" } } } };
++                }, context);
++                return;
++            }
              const now = runtime.now();
              const messages = [
                  { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
@@ -26,7 +41,7 @@ index 54f3ef34ddf1bf85e3ad9c41bdbd216c081a476f..e148d7209cc2dec3f5e49485f5b27c49
                      timestamp: now,
                  },
              ];
-@@ -324,9 +334,9 @@ function summaryFailure(message) {
+@@ -324,9 +350,9 @@ function summaryFailure(message) {
      return "Summarization produced no text";
  }
  /** The summarizer's user message: the serialized conversation, the prompt, and any instructions. */
@@ -38,7 +53,7 @@ index 54f3ef34ddf1bf85e3ad9c41bdbd216c081a476f..e148d7209cc2dec3f5e49485f5b27c49
  }
  /**
   * Messages as plain text, so the summarizer reads a transcript instead of continuing it. System messages are omitted.
-@@ -334,7 +344,7 @@ function summaryPrompt(messages, instructions) {
+@@ -334,7 +360,7 @@ function summaryPrompt(messages, instructions) {
   * the live context (a block that does not match its request is dropped), so including it can make the request larger
   * than the context it summarizes. Visible text, tool calls, and tool results record what happened.
   */
@@ -47,7 +62,7 @@ index 54f3ef34ddf1bf85e3ad9c41bdbd216c081a476f..e148d7209cc2dec3f5e49485f5b27c49
      const parts = [];
      for (const message of messages) {
          if (message.role === "user") {
-@@ -347,7 +357,7 @@ export function serializeConversation(messages) {
+@@ -347,7 +373,7 @@ export function serializeConversation(messages) {
              const calls = message.content.flatMap((content) => content.type === "toolCall"
                  ? [
                      `${content.name}(${Object.entries(content.arguments)

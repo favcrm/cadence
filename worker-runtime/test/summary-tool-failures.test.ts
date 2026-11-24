@@ -8,6 +8,19 @@ it("replaces standalone give-ups about the exact failed tool", () => {
   expect(rewriteGiveUps(text, failed, new Map())).toBe("An earlier canvas_open call failed; try it again normally. An earlier canvas_open call failed; try it again normally. my_canvas_open is broken right now.");
 });
 
+it("neutralizes a whole compound give-up without splitting off facts or conditions", () => {
+  const compound = "Do not keep retrying canvas_open; stop and avoid calling it until it works.";
+  expect(rewriteGiveUps(compound, failed, new Map()))
+    .toBe("An earlier canvas_open call failed; try it again normally.");
+  expect(rewriteGiveUps(compound, new Set(), new Map())).toBe(compound);
+  const mixed = [
+    "Do not keep retrying canvas_open; production remains read-only.",
+    "If the board is read-only; do not retry canvas_open.",
+    `The assistant wrote: "${compound}"`,
+  ].join("\n\n");
+  expect(rewriteGiveUps(mixed, failed, new Map())).toBe(mixed);
+});
+
 it("preserves a user restriction without exempting related publication policy", () => {
   const text = "Avoid calling canvas_open until it is fixed.";
   const restricted = new Map<string, Set<string>>();
@@ -29,6 +42,17 @@ it("keeps a paraphrased no-retry instruction and summarizes status without recom
   collectUserToolRestrictions("Do not call canvas_open again.", restricted);
   expect(rewriteGiveUps("Do not retry canvas_open. canvas_open does not work right now.", failed, restricted))
     .toBe("Do not retry canvas_open. An earlier canvas_open call failed.");
+});
+
+it.each([
+  "Skip calling canvas_open for now.",
+  "Avoid calling canvas_open until it works.",
+])("does not narrow the user's no-retry rule to an assistant's temporary limit: %p", (text) => {
+  const restricted = new Map<string, Set<string>>();
+  collectUserToolRestrictions("Do not call canvas_open again.", restricted);
+  expect(rewriteGiveUps(text, failed, restricted)).toBe(
+    "An earlier canvas_open call failed. The user said not to call canvas_open again.",
+  );
 });
 
 it("keeps a user restriction on either side of a top-level semicolon", () => {

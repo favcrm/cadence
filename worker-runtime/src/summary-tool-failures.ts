@@ -11,9 +11,13 @@ export const TRANSIENT_FAILURE_NOTE =
 const TOOL = String.raw`[\x60]?(?<tool>[A-Za-z_][\w.-]*)[\x60]?`;
 const ACTION = "call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|open(?:ing)?|re-?call(?:ing)?";
 const AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not|must not|should not) (?:keep |try to )?(?<action>${ACTION})|avoid)`;
-const AVOID = new RegExp(
-  String.raw`^${AVOID_ACTION} ${TOOL}(?: (?<condition>again|for now|until (?:it )?(?:is fixed|is resolved|works|fixed|resolved)))?$`,
-  "i",
+const LIMIT = "again|for now|until (?:it )?(?:is fixed|is resolved|works|fixed|resolved)";
+const AVOID_CLAIM = String.raw`${AVOID_ACTION} ${TOOL}(?: (?<condition>${LIMIT}))?`;
+const AVOID = new RegExp(`^${AVOID_CLAIM}$`, "i");
+// This continuation only repeats the preceding directive about the same tool.
+// Do not split assistant prose at arbitrary semicolons.
+const GIVE_UP = new RegExp(
+  String.raw`^${AVOID_CLAIM}(?:[ \t]*;[ \t]*(?:stop and )?avoid (?:${ACTION}) it(?: (?:${LIMIT}))?)?$`, "i",
 );
 const TIME = "right now|currently|at the moment|for now|any ?more|still|today";
 const OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED]
@@ -48,13 +52,18 @@ export function rewriteGiveUps(body: string, failed: ReadonlySet<string>, userRu
     const leading = sentence.length - sentence.trimStart().length;
     const trimmed = sentence.trim();
     const claim = trimmed.replace(/[.!]$/, "");
-    const avoid = AVOID.exec(claim)?.groups;
+    const avoid = GIVE_UP.exec(claim)?.groups;
     const tool = avoid?.tool ?? BROKEN.exec(claim)?.groups?.tool;
     if (tool === undefined || !failed.has(tool)) continue;
     const scopes = userRules.get(tool);
     if (avoid && (scopes?.has("") || scopes?.has(restrictionScope(avoid)))) continue;
     out += body.slice(from, start + leading);
-    out += `An earlier ${tool} call failed${scopes ? "." : "; try it again normally."}`;
+    out += `An earlier ${tool} call failed`;
+    if (!scopes) out += "; try it again normally.";
+    // A failure-derived "for now" or "until fixed" does not relax a user's
+    // unqualified no-repeat rule. Keep the stronger limit explicit.
+    else if (avoid && scopes.has("again")) out += `. The user said not to call ${tool} again.`;
+    else out += ".";
     from = start + leading + trimmed.length;
   }
   return from === 0 ? body : out + body.slice(from);

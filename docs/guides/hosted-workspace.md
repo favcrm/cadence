@@ -232,9 +232,11 @@ consume the current operation; if a safe cut is unavailable, it is declined.
 A long summary source is split into complete messages for the gateway's
 per-message limit, without discarding its content.
 The runtime shapes the source from Pi's pinned messages before serialization.
-It redacts structured tool diagnostics and rewrites standalone assistant
-give-up claims only when the tool's latest known call failed. A successful
-retry clears that failure. Quoted examples and code are not user restrictions
+It redacts structured tool diagnostics and refuses to send a summary request
+if the stored diagnostics disagree with their rendered error block. It rewrites
+standalone assistant give-ups only when the tool's latest known call failed.
+A successful retry clears that failure. A temporary give-up cannot relax a
+user's explicit no-repeat rule. Quoted examples and code are not user restrictions
 or assistant claims. A complete reporting sentence may end inside its closing
 quote, but punctuation inside a conditional label does not split that condition.
 User text, including pasted role labels, and the stored transcript are unchanged

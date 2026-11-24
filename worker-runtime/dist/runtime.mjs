@@ -30347,10 +30347,25 @@ var CompactionTask = defineTask({
         serialize: serializeConversation
       };
       let rendered;
+      let renderFailed = false;
       await runtime.hooks.each("renderCompactionSource", async (hook) => {
-        if (rendered === undefined)
+        if (rendered !== undefined || renderFailed)
+          return;
+        try {
           rendered = await hook(source, runtime, context);
+        } catch {
+          runtime.signal.throwIfAborted();
+          renderFailed = true;
+        }
       });
+      if (renderFailed) {
+        const message = "Compaction source could not be safely rendered";
+        await runtime.commit(async (tx) => {
+          failCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId, message);
+          return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "source_error" } } } };
+        }, context);
+        return;
+      }
       const now = runtime.now();
       const messages = [
         { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
@@ -57581,7 +57596,10 @@ var TRANSIENT_FAILURE_NOTE = "[Runtime note]: Past tool failures are runtime eve
 var TOOL = String.raw`[\x60]?(?<tool>[A-Za-z_][\w.-]*)[\x60]?`;
 var ACTION = "call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|open(?:ing)?|re-?call(?:ing)?";
 var AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not|must not|should not) (?:keep |try to )?(?<action>${ACTION})|avoid)`;
-var AVOID = new RegExp(String.raw`^${AVOID_ACTION} ${TOOL}(?: (?<condition>again|for now|until (?:it )?(?:is fixed|is resolved|works|fixed|resolved)))?$`, "i");
+var LIMIT = "again|for now|until (?:it )?(?:is fixed|is resolved|works|fixed|resolved)";
+var AVOID_CLAIM = String.raw`${AVOID_ACTION} ${TOOL}(?: (?<condition>${LIMIT}))?`;
+var AVOID = new RegExp(`^${AVOID_CLAIM}$`, "i");
+var GIVE_UP = new RegExp(String.raw`^${AVOID_CLAIM}(?:[ \t]*;[ \t]*(?:stop and )?avoid (?:${ACTION}) it(?: (?:${LIMIT}))?)?$`, "i");
 var TIME2 = "right now|currently|at the moment|for now|any ?more|still|today";
 var OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED].map((marker) => marker.replace(/[()]/g, "\\$&")).join("|");
 var BROKEN = new RegExp(String.raw`^${TOOL} (?:(?:does not work|doesn't work|won't work|is broken|is not working|isn't working|keeps failing|keeps refusing)(?: (?:${TIME2}|though)| with (?:${OMITTED_ERROR})(?:: (?:${OMITTED_ERROR}))?|, avoid it)?|(?:is unavailable|is not available|isn't available) (?:${TIME2}))$`, "i");
@@ -57612,7 +57630,7 @@ function rewriteGiveUps(body, failed, userRules) {
     const leading = sentence.length - sentence.trimStart().length;
     const trimmed = sentence.trim();
     const claim = trimmed.replace(/[.!]$/, "");
-    const avoid = AVOID.exec(claim)?.groups;
+    const avoid = GIVE_UP.exec(claim)?.groups;
     const tool = avoid?.tool ?? BROKEN.exec(claim)?.groups?.tool;
     if (tool === undefined || !failed.has(tool))
       continue;
@@ -57620,7 +57638,13 @@ function rewriteGiveUps(body, failed, userRules) {
     if (avoid && (scopes?.has("") || scopes?.has(restrictionScope(avoid))))
       continue;
     out += body.slice(from, start + leading);
-    out += `An earlier ${tool} call failed${scopes ? "." : "; try it again normally."}`;
+    out += `An earlier ${tool} call failed`;
+    if (!scopes)
+      out += "; try it again normally.";
+    else if (avoid && scopes.has("again"))
+      out += `. The user said not to call ${tool} again.`;
+    else
+      out += ".";
     from = start + leading + trimmed.length;
   }
   return from === 0 ? body : out + body.slice(from);
@@ -57640,20 +57664,22 @@ var renderSummarySource = ({ entries, messages, serialize }) => {
       priorSummaries.set(message, mapUserText(message, (text) => redactQuotedHarness(text, errors)));
     } else if (ToolResultEntry.is(entry) && message.role === "toolResult") {
       const diagnostics = entry.data?.diagnostics ?? [];
-      const failed = message.isError || diagnostics.some((item) => item.severity === "error");
+      const hasDiagnosticError = diagnostics.some((item) => item.severity === "error");
+      const failed = message.isError || hasDiagnosticError;
       let shaped = message;
-      if (failed && diagnostics.length > 0) {
+      if (hasDiagnosticError) {
         const last = message.content.at(-1);
         const render = (scrub) => `<harness>
 ${diagnostics.map(({ severity, message }) => `[${severity}] ${scrub && severity === "error" ? TOOL_ERROR_REDACTED : message}`).join(`
 `)}
 </harness>`;
-        if (last?.type === "text" && last.text === render(false)) {
-          for (const item of diagnostics)
-            if (item.severity === "error")
-              errors.add(item.message.trim());
-          shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
+        if (last?.type !== "text" || last.text !== render(false)) {
+          throw new Error("Compaction source has an inconsistent tool diagnostic.");
         }
+        for (const item of diagnostics)
+          if (item.severity === "error")
+            errors.add(item.message.trim());
+        shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
       }
       if (message.isError) {
         const before = visibleText(shaped.content);

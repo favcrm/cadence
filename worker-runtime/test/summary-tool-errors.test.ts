@@ -1,9 +1,11 @@
 import { expect, it } from "bun:test";
 import {
-  errorEchoScrubber, redactQuotedHarness, TOOL_ERROR_REDACTED,
+  errorEchoScrubber, redactFailedOutput, redactQuotedHarness,
+  TOOL_ERROR_REDACTED, TOOL_ERROR_TEXT_OMITTED,
 } from "../src/summary-tool-errors.ts";
 
 const message = "page_missing_7q: no such wiki page at that path";
+const harness = (...lines: string[]) => `<harness>\n${lines.join("\n")}\n</harness>`;
 
 it("scrubs an earlier summary's diagnostic quote and echoed message, keeping warnings and business facts", () => {
   const errors = new Set<string>();
@@ -35,4 +37,40 @@ it("bounds scanning of repeated unclosed quote markers", () => {
   const started = performance.now();
   expect(redactQuotedHarness(summary, new Set())).toBe(summary);
   expect(performance.now() - started).toBeLessThan(500);
+});
+
+it("scrubs multiline diagnostics without dropping the surrounding tool output or warning", () => {
+  const diagnostic = `${message}\n[stderr] archive index could not be read`;
+  const errors = new Set<string>();
+  const output = `12 rows\n${harness(`[error] ${diagnostic}`, "[warn] output shortened")}\nDone.`;
+  expect(redactFailedOutput(output, errors)).toBe(
+    `12 rows\n${harness(`[error] ${TOOL_ERROR_REDACTED}`, "[warn] output shortened")}\nDone.`,
+  );
+  expect(errorEchoScrubber(errors)(`Saw ${diagnostic} on retry.`)).toBe(
+    `Saw ${TOOL_ERROR_TEXT_OMITTED} on retry.`,
+  );
+});
+
+it("does not swallow a later valid result after an unclosed diagnostic", () => {
+  const unclosed = `Rows read: 12\n<harness>\n[error] ${message.slice(0, 20)}`;
+  expect(redactFailedOutput(unclosed, new Set())).toBe(unclosed);
+  const output = `${unclosed}\n${harness(`[error] ${message}`)}`;
+  expect(redactFailedOutput(output, new Set())).toBe(
+    `${unclosed}\n${harness(`[error] ${TOOL_ERROR_REDACTED}`)}`,
+  );
+});
+
+it.each([
+  harness("[warn] output shortened"),
+  harness(`[error] ${TOOL_ERROR_REDACTED}`),
+])("leaves non-errors and an already redacted diagnostic unchanged: %p", (output) => {
+  const errors = new Set<string>();
+  expect(redactFailedOutput(output, errors)).toBe(output);
+  expect(redactQuotedHarness(output, errors)).toBe(output);
+  expect(errorEchoScrubber(errors)(output)).toBe(output);
+});
+
+it("leaves an oversized historical quote unchanged when it cannot be a serialized diagnostic", () => {
+  const summary = `Board budget HK$18,450.\n<harness>[error] ${"z".repeat(2_100)}</harness>`;
+  expect(redactQuotedHarness(summary, new Set())).toBe(summary);
 });

@@ -19,16 +19,20 @@ export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({
       priorSummaries.set(message, mapUserText(message, (text) => redactQuotedHarness(text, errors)));
     } else if (ToolResultEntry.is(entry) && message.role === "toolResult") {
       const diagnostics = entry.data?.diagnostics ?? [];
-      const failed = message.isError || diagnostics.some((item) => item.severity === "error");
+      const hasDiagnosticError = diagnostics.some((item) => item.severity === "error");
+      const failed = message.isError || hasDiagnosticError;
       let shaped = message;
-      if (failed && diagnostics.length > 0) {
+      if (hasDiagnosticError) {
         const last = message.content.at(-1);
         const render = (scrub: boolean) => `<harness>\n${diagnostics.map(({ severity, message }) =>
           `[${severity}] ${scrub && severity === "error" ? TOOL_ERROR_REDACTED : message}`).join("\n")}\n</harness>`;
-        if (last?.type === "text" && last.text === render(false)) {
-          for (const item of diagnostics) if (item.severity === "error") errors.add(item.message.trim());
-          shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
+        // Pi appends this exact block even when isError is false. If the pinned
+        // record disagrees, do not send unverified diagnostic text to the model.
+        if (last?.type !== "text" || last.text !== render(false)) {
+          throw new Error("Compaction source has an inconsistent tool diagnostic.");
         }
+        for (const item of diagnostics) if (item.severity === "error") errors.add(item.message.trim());
+        shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
       }
       if (message.isError) {
         const before = visibleText(shaped.content);

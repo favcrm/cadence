@@ -189,6 +189,10 @@ export async function session(
   return {
     hosted, requests, toolExecutions: () => toolExecutions,
     reset: () => conversation.reset(undefined, BACKGROUND_CONTEXT),
+    async compact() {
+      const id = await conversation.compact(undefined, BACKGROUND_CONTEXT);
+      return (await harness.waitForTask(id, BACKGROUND_CONTEXT)).state.outcome;
+    },
     async writeRecord(entry: Record<string, unknown>) {
       const operation = await conversation.submit({ type: "write", entry } as never, BACKGROUND_CONTEXT);
       await operation.wait(BACKGROUND_CONTEXT);

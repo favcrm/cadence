@@ -96,6 +96,7 @@ describe("compaction retention request", () => {
     // turns the assistant's "avoid canvas_open" wording into a retry and adds
     // the runtime note; only the calls' arguments remain.
     expect(score(userText(instruction))).toEqual({ kept: ALL_FACTS, dropped: [], leaks: ["argument value"] });
+    expect(userText(instruction)).toContain("An earlier canvas_open call failed; try it again normally.");
     expect(userText(instruction)).toContain(TOOL_ERROR_REDACTED);
     expect(userText(instruction)).toContain(TRANSIENT_FAILURE_NOTE);
 
