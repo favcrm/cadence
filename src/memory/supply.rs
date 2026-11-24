@@ -202,8 +202,10 @@ pub(super) fn supply_view(
 /// Signed lessons on disk for CAD-2662 tests: an accepted record with two
 /// distinct worker reviews and a PM finalization over its own digest, so
 /// retrieval qualifies it exactly as it would a reviewed lesson.
-#[cfg(test)]
-pub(crate) mod fixture {
+#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg_attr(not(test), doc(hidden))]
+#[cfg_attr(not(test), allow(clippy::unwrap_used))]
+pub mod fixture {
     use std::path::{Path, PathBuf};
 
     use super::super::{
@@ -240,7 +242,7 @@ pub(crate) mod fixture {
 
     /// An accepted, retrievable lesson of `project`. `body` is its Markdown
     /// body and `scope` what it applies to; all three are signed.
-    pub(crate) fn signed_lesson(project: &str, id: &str, body: &str, scope: Scope) -> Memory {
+    pub fn signed_lesson(project: &str, id: &str, body: &str, scope: Scope) -> Memory {
         let author = proof("author", 1);
         let mut mem = Memory {
             project: project.to_string(),
@@ -286,7 +288,7 @@ pub(crate) mod fixture {
     }
 
     /// A project with an empty memory folder under `pm_dir`.
-    pub(crate) fn project(pm_dir: &Path, key: &str, prefix: &str) {
+    pub fn project(pm_dir: &Path, key: &str, prefix: &str) {
         let dir = pm_dir.join(key);
         std::fs::create_dir_all(dir.join("memory")).unwrap();
         std::fs::write(
@@ -297,7 +299,7 @@ pub(crate) mod fixture {
     }
 
     /// Write `mem` into `key`'s memory folder.
-    pub(crate) fn write(pm_dir: &Path, key: &str, mem: &Memory) {
+    pub fn write(pm_dir: &Path, key: &str, mem: &Memory) {
         std::fs::write(
             pm_dir
                 .join(key)
@@ -311,7 +313,7 @@ pub(crate) mod fixture {
     /// The fixture both CAD-2662 suites use: `alpha` holds a project-wide
     /// lesson, a stale one and one scoped to `src/adapter/**`; `beta` holds
     /// a project-wide lesson that must never reach an `alpha` caller.
-    pub(crate) fn two_projects(pm_dir: &Path) {
+    pub fn two_projects(pm_dir: &Path) {
         project(pm_dir, "alpha", "A");
         project(pm_dir, "beta", "B");
         let body = |marker: &str| format!("{marker}\n\n**Why:** e\n\n**How to apply:** a\n");

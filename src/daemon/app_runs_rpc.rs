@@ -92,9 +92,9 @@ pub(super) fn local_execution_contract(
             .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
     )?;
     crate::issue::app::validate_storage_members(&manifest, files.keys().map(String::as_str))?;
-    manifest
-        .requires
-        .check(&cadence_core::app_compat::host(cadence_agent::HOST_VERSION)?)?;
+    manifest.requires.check(&cadence_core::app_compat::host(
+        cadence_agent::HOST_VERSION,
+    )?)?;
     if !manifest.connections.is_empty() {
         return Err(Error::rejected(
             "local text execution does not support connection capabilities",
@@ -1146,7 +1146,10 @@ impl Shared {
                 Err(_) => None,
             };
             crate::issue::write::confirm_committed_selected_issue(
-                &pm, _lock.as_ref(), issue_id, &reserved,
+                &pm,
+                _lock.as_ref(),
+                issue_id,
+                &reserved,
             )?;
             let bound = self
                 .store
@@ -1536,8 +1539,12 @@ impl Shared {
             type Files = std::collections::BTreeMap<String, String>;
             type Held<'a> = Option<(&'a Value, &'a Files)>;
             let snap = |f: &mut dyn FnMut(
-                &Value, &Files, &workspace::RuntimeSnapshot<'_>, Held<'_>,
-            ) -> Result<()>| -> Result<()> {
+                &Value,
+                &Files,
+                &workspace::RuntimeSnapshot<'_>,
+                Held<'_>,
+            ) -> Result<()>|
+             -> Result<()> {
                 if let Some(original) = &reference_original {
                     workspace::with_runtime_snapshot_pair_proof(
                         &pm,
@@ -1549,7 +1556,9 @@ impl Shared {
                     )
                 } else {
                     workspace::with_runtime_snapshot_proof(
-                        &pm, install, |bundle, files, snapshot| f(bundle, files, snapshot, None),
+                        &pm,
+                        install,
+                        |bundle, files, snapshot| f(bundle, files, snapshot, None),
                     )
                 }
             };

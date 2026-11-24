@@ -216,7 +216,8 @@ impl Shared {
         let permit = operation
             .witness(super::custody_rpc::CustodyUse::Connections, record)
             .map_err(|_| ProjectionFault::Unavailable)?;
-        let bytes = self.load_credential_witnessed(&permit)
+        let bytes = self
+            .load_credential_witnessed(&permit)
             .map_err(|_| ProjectionFault::Unavailable)?;
         platform::smtp::project_custody(&bytes)
     }

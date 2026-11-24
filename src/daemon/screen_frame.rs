@@ -1,5 +1,5 @@
-use serde_json::json;
 use crate::error::{Error, Result};
+use serde_json::json;
 /// CAD-1123 HP1: the host UI kit every frame document carries — the
 /// board's generated tokens (`design/tokens.css`, kept in step with
 /// `ui/src/styles.css` by `scripts/design-kit --check`), the design kit's

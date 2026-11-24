@@ -283,7 +283,8 @@ fn checklist_rows(
 }
 
 /// The full approved checklist section, including Markdown qualifiers.
-pub(crate) fn acceptance_scope(body: &str) -> Option<&str> {
+#[doc(hidden)]
+pub fn acceptance_scope(body: &str) -> Option<&str> {
     match acceptance_sections(body).as_slice() {
         [section] => Some(&body[section.heading_end..section.end]),
         _ => None,

@@ -204,7 +204,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn wiki_transfer_job(&self, job_id: &str) -> Result<Option<JobHead>> {
+    #[doc(hidden)]
+    pub fn wiki_transfer_job(&self, job_id: &str) -> Result<Option<JobHead>> {
         self.read_tx(|conn| {
             let row = conn
                 .query_opt(
@@ -230,7 +231,8 @@ impl Store {
 
     /// A finish receipt can commit immediately before the daemon loses its
     /// in-memory index wake. Boot re-enqueues one coalesced freshness check.
-    pub(crate) fn wiki_transfer_index_recovery_needed(&self) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn wiki_transfer_index_recovery_needed(&self) -> Result<bool> {
         self.read_tx(|conn| {
             conn.query_opt(
                 "SELECT 1 FROM wiki_transfer_jobs WHERE index_kicked=1 LIMIT 1",
@@ -253,11 +255,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn wiki_transfer_entry(
-        &self,
-        job_id: &str,
-        entry_id: &str,
-    ) -> Result<Option<EntryRow>> {
+    #[doc(hidden)]
+    pub fn wiki_transfer_entry(&self, job_id: &str, entry_id: &str) -> Result<Option<EntryRow>> {
         self.read_tx(|conn| {
             conn.query_opt(
                 &format!("{ENTRY_SQL} WHERE job_id=? AND entry_id=?"),

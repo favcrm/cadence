@@ -57,10 +57,7 @@ pub fn object_with<'a>(
     Ok(m)
 }
 
-pub fn string<'a>(
-    m: &'a serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<&'a str> {
+pub fn string<'a>(m: &'a serde_json::Map<String, serde_json::Value>, key: &str) -> Result<&'a str> {
     m.get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| Error::rejected(format!("'{key}' is missing or not a string")))
@@ -83,10 +80,7 @@ pub fn safe_u64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Re
 }
 
 /// A positive JS-safe integer (revisions/generations).
-pub fn positive_u64(
-    m: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<u64> {
+pub fn positive_u64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<u64> {
     let n = safe_u64(m, key)?;
     if n == 0 {
         return Err(Error::rejected(format!("'{key}' must be positive")));

@@ -105,7 +105,8 @@ pub const IMPORT_BYTES: usize = 2 * 1024 * 1024;
 /// One import intent, exactly as the daemon proved it. A struct rather
 /// than seven positional arguments: the fields are all identity or
 /// custody material and are easy to transpose.
-pub(crate) struct MediaImport<'a> {
+#[doc(hidden)]
+pub struct MediaImport<'a> {
     pub install: &'a str,
     pub context: &'a str,
     pub creator: &'a str,
@@ -583,7 +584,8 @@ impl Store {
     /// and a refused attempt reserves nothing. `creator` is the
     /// caller-proven attribution, already in the catalog's closed
     /// tagged form.
-    pub(crate) fn app_media_import(&self, intent: MediaImport<'_>) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_media_import(&self, intent: MediaImport<'_>) -> Result<Value> {
         let MediaImport {
             install,
             context,
@@ -1201,7 +1203,8 @@ impl Store {
     /// Sealed-write-tx entry for `app_media_publish`: opens the store's
     /// own write tx (closure latch + lease fence re-checked inside the
     /// conn lock) and runs [`Self::app_media_publish_in`].
-    pub(crate) fn app_media_publish(
+    #[doc(hidden)]
+    pub fn app_media_publish(
         &self,
         asset_id: &str,
         expected_revision: i64,
@@ -1325,8 +1328,9 @@ pub struct MediaOriginalProof {
     pub(crate) slot: String,
     /// The run-frozen binding proof the CURRENT binding must still match.
     pub(crate) proof: crate::store::app_bindings::BindingProof,
-    /// The closed stored `original_artifact` descriptor.
-    pub(crate) reference: String,
+    /// The closed set `original_artifact` descriptor — resolved inside Store.
+    #[doc(hidden)]
+    pub reference: String,
     /// Canonical `sha256:<64 lowercase hex>` of the original.
     pub(crate) sha256: String,
     /// The declared original byte count.

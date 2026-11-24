@@ -46,14 +46,14 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use super::{required_str, Shared};
-use crate::error::{Error, Result};
-use crate::issue::app_screen_pkg;
-use crate::operator_auth::Origin;
 #[cfg(test)]
 use super::screen_frame::{
     render_checked_package_frame_html, render_frame_html, render_package_frame_html,
 };
+use super::{required_str, Shared};
+use crate::error::{Error, Result};
+use crate::issue::app_screen_pkg;
+use crate::operator_auth::Origin;
 
 /// One outstanding frame capability. `session` is the VERIFIED minting
 /// session's display id — resolved through `Auth` from the request's

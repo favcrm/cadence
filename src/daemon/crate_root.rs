@@ -187,6 +187,7 @@ mod protected_management_rpc;
 // Both compile only under `test-seam`; production carries neither.
 #[cfg(all(test, feature = "test-seam"))]
 mod automatic_upgrade_consent;
+mod bootstrap_files;
 #[cfg(all(test, unix, feature = "test-seam"))]
 mod cached_return_tests;
 #[cfg(all(test, unix, feature = "test-seam"))]
@@ -204,19 +205,18 @@ mod delivery_requirements_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
-mod form_rpc;
-mod hire_rpc;
-mod idea_rpc;
-mod identity;
-mod lane_relaunch;
-mod bootstrap_files;
 #[cfg(all(test, feature = "test-seam"))]
 mod endpoints_gate_test;
 mod endpoints_rpc;
+mod form_rpc;
+mod hire_rpc;
 mod human_current;
 mod human_threads_rpc;
+mod idea_rpc;
+mod identity;
 #[doc(hidden)]
 pub mod jobs_rpc;
+mod lane_relaunch;
 mod lane_rpc;
 mod master_rpc;
 mod master_session_rpc;
@@ -373,11 +373,11 @@ use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;
 
-/// CAD-339: the daemon methods a master connection may call.
-pub use master_rpc::MASTER_ALLOWED;
 /// The operator-price refusal predicate shared with the board HTTP server.
 #[doc(hidden)]
 pub use app_capabilities_rpc::operator_price_refusal;
+/// CAD-339: the daemon methods a master connection may call.
+pub use master_rpc::MASTER_ALLOWED;
 #[doc(hidden)]
 pub use screen_frame::{
     render_checked_package_frame_html, render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION,
@@ -4019,7 +4019,8 @@ impl Shared {
                             .iter()
                             .filter_map(|message| message.task_id.as_deref())
                             .collect::<Vec<_>>();
-                        let scope = self.project_scope_for_caller(&AgentCaller::Agent(alias.clone()));
+                        let scope =
+                            self.project_scope_for_caller(&AgentCaller::Agent(alias.clone()));
                         let task_issues = self.store.task_issue_bindings(&task_ids);
                         let private_denials =
                             self.private_job_denials_for_read(params, None, None, peer_pid);
@@ -6873,12 +6874,13 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     // One fixed path-only record also governs standalone artifact exclusion.
     // An in-process option cannot silently disagree with that admitted record.
-    let configured =
-        crate::platform::encrypted_config::load_paths(state_dir, Some(&pm_dir_of(&opts.provider_env)?))?;
+    let configured = crate::platform::encrypted_config::load_paths(
+        state_dir,
+        Some(&pm_dir_of(&opts.provider_env)?),
+    )?;
     match (&opts.encrypted_custody, configured.as_ref()) {
         (Some(selected), Some(record))
-            if selected.key_file == record.key_file
-                && selected.vault_dir == record.vault_dir => {}
+            if selected.key_file == record.key_file && selected.vault_dir == record.vault_dir => {}
         (Some(_), _) => {
             return Err(Error::invalid(
                 "storage_unavailable",
@@ -7209,7 +7211,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // never outlives the daemon.
     let wiki_index_worker = {
         let index = Arc::clone(&shared.wiki_index);
-        match crate::thread_budget::spawn_named("wiki-index-refresh".to_string(), move || index.run()) {
+        match crate::thread_budget::spawn_named("wiki-index-refresh".to_string(), move || {
+            index.run()
+        }) {
             Ok(handle) => Some(handle),
             Err(e) => {
                 eprintln!("cadence: wiki index refresh not started: {e}");

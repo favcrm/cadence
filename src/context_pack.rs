@@ -220,7 +220,8 @@ impl TaskContract {
     /// Completed plain-dispatch comparison only. Tracker bookkeeping changes
     /// the raw source revision, not necessarily the actionable contract.
     /// This never replaces provenance, manifest identity or residency proofs.
-    pub(crate) fn semantic_digest(&self) -> String {
+    #[doc(hidden)]
+    pub fn semantic_digest(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"cadence-task-content-v1");
         let field = |hasher: &mut Sha256, value: &str| {

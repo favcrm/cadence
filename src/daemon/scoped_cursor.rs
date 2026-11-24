@@ -314,11 +314,7 @@ impl ScopedCursorCodec {
 
     /// Seal one nonnegative position under exactly this binding using the
     /// active key and a fresh OS-CSPRNG nonce.
-    pub fn seal(
-        &self,
-        position: i64,
-        binding: &CursorBinding<'_>,
-    ) -> Result<String, CursorError> {
+    pub fn seal(&self, position: i64, binding: &CursorBinding<'_>) -> Result<String, CursorError> {
         if position < 0 {
             return Err(CursorError);
         }
@@ -350,11 +346,7 @@ impl ScopedCursorCodec {
     /// Open a cursor under exactly one binding. Any tamper, another key,
     /// domain, direction, filter, resource, principal or workspace, or a
     /// negative/out-of-range position is the same generic refusal.
-    pub fn open(
-        &self,
-        token: &str,
-        binding: &CursorBinding<'_>,
-    ) -> Result<i64, CursorError> {
+    pub fn open(&self, token: &str, binding: &CursorBinding<'_>) -> Result<i64, CursorError> {
         let binding_digest = self.binding_digest(binding)?;
         let mut envelope = [0u8; ENVELOPE_BYTES];
         decode_envelope(token, &mut envelope)?;

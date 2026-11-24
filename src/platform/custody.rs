@@ -63,8 +63,9 @@ impl Custody {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn file(dir: PathBuf) -> Self {
+    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg_attr(not(test), doc(hidden))]
+    pub fn file(dir: PathBuf) -> Self {
         Self {
             legacy: LegacyBackend::File(dir),
             vault: None,

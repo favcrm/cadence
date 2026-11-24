@@ -478,7 +478,8 @@ impl Store {
 
     /// Prepared native context is consumed by the original monitor admission
     /// transaction; readiness, approvals and queue occupancy are not prechecks.
-    pub(crate) fn dispatch_automatic_monitor_task_planned(
+    #[doc(hidden)]
+    pub fn dispatch_automatic_monitor_task_planned(
         &self,
         monitor_id: &str,
         plan: &DispatchPlan,
@@ -1130,6 +1131,52 @@ impl Store {
 
     pub fn ack_monitor_alert(&self, id: &str, seq: i64, by: &str) -> Result<MonitorAlert> {
         self.write_tx(|tx| self.ack_monitor_alert_in(&*tx, id, seq, by))
+    }
+
+    /// Check native authority and mutate one alert in a single fenced write.
+    /// Callers must already hold tracker and enrollment locks in that order.
+    /// `render_alert` stays inside the transaction so a cursor render error
+    /// rolls the mutation back.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn ack_scoped_monitor_alert<I, R: 'static>(
+        &self,
+        agent_alias: &str,
+        monitor_id: &str,
+        seq: i64,
+        by: &str,
+        fetch_panes: bool,
+        verify_panes: impl FnOnce(Option<Vec<(String, u32, Option<u64>)>>) -> Result<I>,
+        verify_agent: impl FnOnce(&crate::store::Agent, I) -> Result<()>,
+        verify_monitor: impl FnOnce(&ProjectMonitorView, &crate::store::PrivateJobDenials) -> Result<()>,
+        render_alert: impl FnOnce(&MonitorAlert) -> Result<R>,
+    ) -> Result<R> {
+        self.write_tx(|tx| {
+            let pane_rows = if fetch_panes {
+                Some(self.pty_pane_pids_in(&*tx)?)
+            } else {
+                None
+            };
+            let identity_state = verify_panes(pane_rows)?;
+            let agent = self.agent_in(&*tx, agent_alias)?;
+            verify_agent(&agent, identity_state)?;
+            let current = self.project_monitor_view_in(&*tx, monitor_id)?;
+            let denied = self
+                .private_job_denials_in(&*tx, crate::store::PrivateJobReader::Agent(agent_alias))?;
+            verify_monitor(&current, &denied)?;
+            let alert = self.monitor_alert_in(&*tx, seq)?;
+            if !current
+                .coverage
+                .iter()
+                .any(|(task, _)| task == &alert.task_id)
+            {
+                return Err(Error::rejected(
+                    "monitor alert acknowledgement refused: alert is outside current coverage",
+                ));
+            }
+            let alert = self.ack_monitor_alert_in(&*tx, monitor_id, seq, by)?;
+            render_alert(&alert)
+        })
     }
 
     /// [`Self::ack_monitor_alert`] on an already-open write transaction, so

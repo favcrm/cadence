@@ -76,6 +76,10 @@ native-fixture-admission = []
 # against real AOS test handlers; never part of ordinary `cargo test`.
 cli-runtime-test = ["test-seam"]
 
+# Debug dev-dependency test hook exposing raw Store transaction helpers to
+# sibling test crates without widening production APIs. Never compiled in release.
+store-test-support = []
+
 # CAD-1727: the one integration-test binary; the remaining `tests/*.rs`
 # files are its modules. cad1703 keeps its `#![cfg(feature = "test-seam")]`
 # gate as a module attribute, so no required-features entry is needed.

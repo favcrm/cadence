@@ -644,3 +644,15 @@ mod cad1962_media_asset_detail;
 mod effect_lifecycle;
 mod social_publish;
 mod workspace_settings;
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn seed_pi_fixture_policy_sets_default_master_model() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open_for_schema_tests(&dir.path().join("t.sqlite3")).unwrap();
+    crate::test_seam::seed_pi_fixture_policy(&store, "fixture/model").unwrap();
+    let settings = store.settings().unwrap();
+    let pi = serde_json::to_value(settings.doc.pi.unwrap()).unwrap();
+    assert_eq!(pi["models"]["allow"], json!(["fixture/model"]));
+    assert_eq!(pi["models"]["default"]["master"], json!("fixture/model"));
+}

@@ -137,7 +137,8 @@ impl DeviceLoginConfig {
     /// The config's own consistency: a valid issuer + workspace AND a
     /// well-formed non-empty allowlist. Used by both the write and the
     /// read path so a hand-edited file fails closed the same way.
-    pub(crate) fn check(&self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn check(&self) -> Result<()> {
         DeviceConfig::new(&self.issuer, &self.org)?;
         validate_subjects(&self.subjects)
     }

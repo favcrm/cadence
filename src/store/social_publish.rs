@@ -500,7 +500,8 @@ impl Store {
     /// CAD-1123 HP4: the artifact a run's independent reviewer approved —
     /// the one the publish material re-proves. Ordered like the material's
     /// own review lookup, so both name the same artifact.
-    pub(crate) fn app_run_approved_artifact(&self, run_id: &str) -> Result<String> {
+    #[doc(hidden)]
+    pub fn app_run_approved_artifact(&self, run_id: &str) -> Result<String> {
         self.conn()
             .query_row(
                 "SELECT artifact_id FROM app_run_reviews WHERE run_id=? AND decision='approve' ORDER BY step_id LIMIT 1",
@@ -637,7 +638,8 @@ impl Store {
     /// CAD-1020: `processing` rows for the driver's status reconcile, as
     /// `(intent_id, request, updated)`. `after` is a rotating cursor, so a
     /// bounded sweep reaches every row over successive ticks.
-    pub(crate) fn social_publish_processing(
+    #[doc(hidden)]
+    pub fn social_publish_processing(
         &self,
         limit: usize,
         after: Option<&str>,
@@ -659,7 +661,8 @@ impl Store {
     /// review itself) and requires artifact/asset digests to equal frozen.
     /// Any failure returns false: hold for a new human decision.
     /// Explicit-mode intents return true; operator recheck owns them.
-    pub(crate) fn social_publish_material_current(&self, intent_id: &str) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn social_publish_material_current(&self, intent_id: &str) -> Result<bool> {
         let shown = read_row(&self.conn(), intent_id)?;
         let frozen = &shown["intent"]["frozen"];
         let artifact = frozen["artifact_id"].as_str();
@@ -694,11 +697,8 @@ impl Store {
     /// caller proves current authority through `eligible` (grant, binding,
     /// app/context eligibility and unchanged digests at dispatch): a false
     /// verdict leaves the row queued. Exactly one claimant wins.
-    pub(crate) fn social_publish_claim_due<F>(
-        &self,
-        now_epoch: i64,
-        eligible: F,
-    ) -> Result<Option<Value>>
+    #[doc(hidden)]
+    pub fn social_publish_claim_due<F>(&self, now_epoch: i64, eligible: F) -> Result<Option<Value>>
     where
         F: FnOnce(&super::WriteTxn<'_>, &str, &Value) -> Result<bool>,
     {
@@ -778,7 +778,8 @@ impl Store {
     /// claimant wins and a wrong scope never claims; a second click, a
     /// racing `claim_due` or a cancel reads a non-queued row and yields
     /// `None`.
-    pub(crate) fn social_publish_claim_id(
+    #[doc(hidden)]
+    pub fn social_publish_claim_id(
         &self,
         intent_id: &str,
         install_id: &str,

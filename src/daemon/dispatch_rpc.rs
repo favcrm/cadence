@@ -30,10 +30,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::caller_rule::{may_mutate_agent, AgentCaller, AgentMutation};
 use super::{optional_str, reject_identity_fields, required_str, Shared};
 use crate::error::{Error, Result};
 use crate::issue::{self, claim};
-use super::caller_rule::{may_mutate_agent, AgentCaller, AgentMutation};
 use crate::store;
 
 impl Shared {

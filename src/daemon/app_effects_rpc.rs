@@ -1602,7 +1602,7 @@ impl Shared {
                 let row = self
                     .store
                     .app_effect_claim(id, digest, |conn, current| {
-                        let material = crate::store::Store::app_publication_material_in(
+                        let material = crate::store::Store::app_publication_material_tx(
                             conn,
                             required_str(current, "run_id")?,
                             required_str(current, "artifact_id")?,

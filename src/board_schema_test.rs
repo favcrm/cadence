@@ -14,6 +14,12 @@ pub(crate) fn assert_matches(file: &str, def: &str, producer: Value) {
     }
     let schema = json!({"$ref": format!("#/$defs/{def}"), "$defs": defs});
     let validator = jsonschema::validator_for(&schema).unwrap();
-    let errors: Vec<String> = validator.iter_errors(&producer).map(|e| e.to_string()).collect();
-    assert!(errors.is_empty(), "{def} drifted from its producer: {errors:?}\n{producer}");
+    let errors: Vec<String> = validator
+        .iter_errors(&producer)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{def} drifted from its producer: {errors:?}\n{producer}"
+    );
 }

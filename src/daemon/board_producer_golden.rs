@@ -49,7 +49,20 @@ fn fixture() -> (tempfile::TempDir, Arc<Shared>) {
             model_policy: None,
         })
         .unwrap();
-    crate::test_seam::seed_pi_fixture_policy(&shared.store, "fixture/model").unwrap();
+    let mut settings = shared.store.settings().unwrap();
+    settings.doc.pi = Some(
+        serde_json::from_value(serde_json::json!({
+            "models": {
+                "allow": ["fixture/model"],
+                "default": {"master": "fixture/model"}
+            }
+        }))
+        .unwrap(),
+    );
+    shared
+        .store
+        .save_settings(settings.revision, settings.doc, "test-seam-fixture")
+        .unwrap();
     (dir, shared)
 }
 

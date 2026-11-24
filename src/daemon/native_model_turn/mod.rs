@@ -411,174 +411,99 @@ impl NativeModelBroker {
         let shared = self.shared()?;
         let route = self.route()?.clone();
 
-        struct Prepared {
-            request_id: String,
-            request_index: i64,
-            configuration_id: String,
-            configuration_revision: i64,
-            snapshot_id: String,
-            loaded_receipt_id: String,
-        }
-
         let workspace = evidence.workspace_id.clone();
         let agent_uid = evidence.agent_uid.clone();
         let task_id = task.durable_task_id.clone();
         let index = i64::try_from(parsed.request_index)
             .map_err(|_| Error::invalid("invalid_request", "the request index is out of range"))?;
-        let prepared = shared.store.write_tx(move |tx| {
-            let authority = crate::store::connection_dispatch::authority_in(tx)?;
-            if !authority.enabled || !authority.ever_enabled || authority.fenced {
-                return Err(refused(
-                    "runtime_unqualified",
-                    "protected custody is not enabled on this store",
-                ));
-            }
-            if authority.workspace_id != workspace {
-                return Err(refused(
-                    "loaded_state_mismatch",
-                    "the protected workspace changed",
-                ));
-            }
-            let live = durable::task_by_id_in(tx, &task_id)?
-                .ok_or_else(|| refused("runtime_revoked", "the model task is unknown"))?;
-            if live.state != durable::TASK_ACTIVE {
-                return Err(refused("runtime_revoked", "the model task is fenced"));
-            }
-            if let Some(existing) =
-                durable::request_by_index_in(tx, &workspace, &agent_uid, &task_id, index)?
-            {
-                return Ok(Prepared {
-                    request_id: existing.request_id,
-                    request_index: existing.request_index,
-                    configuration_id: existing.configuration_id,
-                    configuration_revision: existing.configuration_revision,
-                    snapshot_id: existing.snapshot_id,
-                    loaded_receipt_id: existing.loaded_receipt_id,
-                });
-            }
-            let max = durable::max_request_index_in(tx, &task_id)?;
-            let next = max.map(|value| value + 1).unwrap_or(0);
-            if index != next {
-                return Err(refused(
-                    "invalid_request",
-                    "the request index is not the contiguous next index",
-                ));
-            }
-            let agent = durable::agent_facts_by_uid_in(tx, &agent_uid)?
-                .ok_or_else(|| refused("principal_required", "the agent is unknown"))?;
-            let model = agent
-                .model
-                .as_deref()
-                .ok_or_else(|| refused("route_unavailable", "no native model is configured"))?;
-            let role = role_of(&agent.role);
-            let role_policy = crate::store::connection_dispatch::role_model_policy_in(tx)?;
-            let model_id = ModelId::try_from(model.to_string()).map_err(|_| {
-                refused(
-                    "route_unavailable",
-                    "the configured native model is malformed",
-                )
-            })?;
-            if !native_model_allowed(role, &model_id, role_policy.as_ref(), &route) {
-                return Err(refused(
-                    "operation_not_granted",
-                    "the configured native model is not allowed for this role",
-                ));
-            }
-            crate::store::connection_dispatch::require_native_model_provider_in(
-                tx,
-                model_id.as_str(),
-                catalog_model_id(model_id.as_str(), &route.provider),
+        let evidence_for_cfg = evidence.clone();
+        let prepared =
+            shared.store.prepare_native_model_request(
+                &workspace,
+                &agent_uid,
+                &task_id,
+                index,
                 &route.provider,
+                now_ms,
+                |agent, role_policy| {
+                    let model = agent.model.as_deref().ok_or_else(|| {
+                        refused("route_unavailable", "no native model is configured")
+                    })?;
+                    let role = role_of(&agent.role);
+                    let model_id = ModelId::try_from(model.to_string()).map_err(|_| {
+                        refused(
+                            "route_unavailable",
+                            "the configured native model is malformed",
+                        )
+                    })?;
+                    if !native_model_allowed(role, &model_id, role_policy, &route) {
+                        return Err(refused(
+                            "operation_not_granted",
+                            "the configured native model is not allowed for this role",
+                        ));
+                    }
+                    let bare = catalog_model_id(model_id.as_str(), &route.provider).to_string();
+                    Ok((model_id.as_str().to_string(), bare))
+                },
+                |agent, source, revision| {
+                    let model = agent.model.as_deref().ok_or_else(|| {
+                        refused("route_unavailable", "no native model is configured")
+                    })?;
+                    require_source_account(&route, &source.account)?;
+                    let resolved = route
+                        .resolve(model, agent.effort.as_deref(), Some(source.origin.as_str()))
+                        .map_err(|_| {
+                            refused(
+                                "route_unavailable",
+                                "the configured native model route is unavailable",
+                            )
+                        })?;
+                    let configuration_id = uuid::Uuid::new_v4().to_string();
+                    let approved_tools = approved_tool_bindings(&route)?;
+                    let configuration = durable::ConfigurationRow {
+                        configuration_id,
+                        revision,
+                        workspace_id: evidence_for_cfg.workspace_id.clone(),
+                        agent_uid: evidence_for_cfg.agent_uid.clone(),
+                        session_binding: evidence_for_cfg.session_binding.clone(),
+                        runtime_id: evidence_for_cfg.runtime_id.clone(),
+                        runtime_generation: i64::try_from(evidence_for_cfg.runtime_generation)
+                            .map_err(|_| Error::internal("runtime generation out of range"))?,
+                        owner_epoch: i64::try_from(evidence_for_cfg.owner_epoch)
+                            .map_err(|_| Error::internal("owner epoch out of range"))?,
+                        role: agent.role.clone(),
+                        model: model.to_string(),
+                        model_uid: resolved.model_uid.clone(),
+                        effort: resolved.effort.clone(),
+                        provider: route.provider.clone(),
+                        source_id: source.source_id.clone(),
+                        source_revision: source.revision,
+                        account: source.account.clone(),
+                        origin: resolved.origin.clone(),
+                        destination: destination(&route, &resolved.origin),
+                        billing_route: match route.backend {
+                            RouteBackend::Devin(_) => "subscription",
+                            RouteBackend::AgenticOs { .. } => "gateway",
+                        }
+                        .to_string(),
+                        sdk_graph_digest: evidence_for_cfg.sdk_graph_digest.clone(),
+                        approved_tools_json: approved_tools,
+                        manifest_digest: evidence_for_cfg.manifest_digest.clone(),
+                        snapshot_id: evidence_for_cfg.snapshot_id.clone(),
+                        snapshot_expires_ms: i64::try_from(evidence_for_cfg.snapshot_expires_ms)
+                            .map_err(|_| Error::internal("snapshot expiry out of range"))?,
+                        loaded_receipt_id: evidence_for_cfg.loaded_receipt_id.clone(),
+                        max_output_tokens: resolved.max_output_tokens as i64,
+                        created_ms: now_ms(),
+                    };
+                    Ok((
+                        configuration,
+                        NativeBillingProjectionV1::NOT_DISPATCHED
+                            .to_json()
+                            .to_string(),
+                    ))
+                },
             )?;
-            let source =
-                durable::active_source_in(tx, &workspace, &route.provider)?.ok_or_else(|| {
-                    refused(
-                        "auth_unavailable",
-                        "no positive-human native model source is linked",
-                    )
-                })?;
-            require_source_account(&route, &source.account)?;
-            let resolved = route
-                .resolve(model, agent.effort.as_deref(), Some(source.origin.as_str()))
-                .map_err(|_| {
-                    refused(
-                        "route_unavailable",
-                        "the configured native model route is unavailable",
-                    )
-                })?;
-            let revision = durable::next_configuration_revision_in(tx, &agent_uid)?;
-            let configuration_id = uuid::Uuid::new_v4().to_string();
-            let approved_tools = approved_tool_bindings(&route)?;
-            let configuration = durable::ConfigurationRow {
-                configuration_id: configuration_id.clone(),
-                revision,
-                workspace_id: workspace.clone(),
-                agent_uid: agent_uid.clone(),
-                session_binding: evidence.session_binding.clone(),
-                runtime_id: evidence.runtime_id.clone(),
-                runtime_generation: i64::try_from(evidence.runtime_generation)
-                    .map_err(|_| Error::internal("runtime generation out of range"))?,
-                owner_epoch: i64::try_from(evidence.owner_epoch)
-                    .map_err(|_| Error::internal("owner epoch out of range"))?,
-                role: agent.role.clone(),
-                model: model.to_string(),
-                model_uid: resolved.model_uid.clone(),
-                effort: resolved.effort.clone(),
-                provider: route.provider.clone(),
-                source_id: source.source_id.clone(),
-                source_revision: source.revision,
-                account: source.account.clone(),
-                origin: resolved.origin.clone(),
-                destination: destination(&route, &resolved.origin),
-                billing_route: match route.backend {
-                    RouteBackend::Devin(_) => "subscription",
-                    RouteBackend::AgenticOs { .. } => "gateway",
-                }
-                .to_string(),
-                sdk_graph_digest: evidence.sdk_graph_digest.clone(),
-                approved_tools_json: approved_tools,
-                manifest_digest: evidence.manifest_digest.clone(),
-                snapshot_id: evidence.snapshot_id.clone(),
-                snapshot_expires_ms: i64::try_from(evidence.snapshot_expires_ms)
-                    .map_err(|_| Error::internal("snapshot expiry out of range"))?,
-                loaded_receipt_id: evidence.loaded_receipt_id.clone(),
-                max_output_tokens: resolved.max_output_tokens as i64,
-                created_ms: now_ms(),
-            };
-            let stored = durable::put_configuration_in(tx, &configuration)?;
-            let request_id = uuid::Uuid::new_v4().to_string();
-            let row = durable::RequestRow {
-                request_id: request_id.clone(),
-                workspace_id: workspace.clone(),
-                agent_uid: agent_uid.clone(),
-                durable_task_id: task_id.clone(),
-                request_index: index,
-                configuration_id: stored.configuration_id.clone(),
-                configuration_revision: stored.revision,
-                snapshot_id: stored.snapshot_id.clone(),
-                loaded_receipt_id: stored.loaded_receipt_id.clone(),
-                source_id: stored.source_id.clone(),
-                account: stored.account.clone(),
-                state: durable::STATE_PREPARED.to_string(),
-                input_digest: None,
-                assistant_json: None,
-                usage_json: None,
-                error_json: None,
-                billing_json: NativeBillingProjectionV1::NOT_DISPATCHED
-                    .to_json()
-                    .to_string(),
-                created_ms: now_ms(),
-            };
-            durable::insert_prepared_in(tx, &row)?;
-            Ok(Prepared {
-                request_id,
-                request_index: index,
-                configuration_id: stored.configuration_id,
-                configuration_revision: stored.revision,
-                snapshot_id: stored.snapshot_id,
-                loaded_receipt_id: stored.loaded_receipt_id,
-            })
-        })?;
         Ok(json!({
             "v": 1,
             "request_id": prepared.request_id,
@@ -892,153 +817,83 @@ impl NativeModelBroker {
                 )
             })?;
         let admission_reader = &admission;
-        let committed = shared.store.write_tx(move |tx| {
-            admission_reader.require().map_err(|_| {
-                refused(
-                    "runtime_revoked",
-                    "the runtime witness expired before commitment",
-                )
-            })?;
-            let now = now_ms();
-            let authority = crate::store::connection_dispatch::authority_in(tx)?;
-            if !authority.enabled || authority.fenced {
-                return Err(refused(
-                    "runtime_unqualified",
-                    "protected custody is not enabled on this store",
-                ));
-            }
-            if authority.workspace_id != workspace {
-                return Err(refused(
-                    "loaded_state_mismatch",
-                    "the protected workspace changed",
-                ));
-            }
-            let live = durable::task_by_id_in(tx, &task_id)?
-                .ok_or_else(|| refused("runtime_revoked", "the model task is unknown"))?;
-            if live.state != durable::TASK_ACTIVE {
-                return Err(refused("runtime_revoked", "the model task is fenced"));
-            }
-            let current = durable::configuration_in(tx, &configuration_id)?
-                .ok_or_else(|| refused("stale_configuration", "the configuration is unknown"))?;
-            if current.revision != configuration_revision || current.snapshot_expires_ms <= now {
-                return Err(refused(
-                    "stale_configuration",
-                    "the model configuration changed",
-                ));
-            }
-            let loaded = crate::store::connection_dispatch::current_snapshot_in(
-                tx,
-                &agent_uid,
-                evidence.runtime_generation,
-                now as u64,
-            )?
-            .ok_or_else(|| {
-                refused(
-                    "loaded_state_mismatch",
-                    "the loaded protected state is no longer current",
-                )
-            })?;
-            if loaded.snapshot.snapshot_id.as_str() != current.snapshot_id
-                || loaded.receipt.loaded_receipt_id.as_str() != current.loaded_receipt_id
-                || loaded.authorization_revision != authority.authorization_revision
-            {
-                return Err(refused(
-                    "loaded_state_mismatch",
-                    "the issued authority changed before commitment",
-                ));
-            }
-            let agent = durable::agent_facts_by_uid_in(tx, &agent_uid)?
-                .ok_or_else(|| refused("principal_required", "the agent is unknown"))?;
-            if agent.role != current.role || agent.model.as_deref() != Some(current.model.as_str())
-            {
-                return Err(refused(
-                    "stale_configuration",
-                    "the agent role or model changed before commitment",
-                ));
-            }
-            let model_id = ModelId::try_from(current.model)
-                .map_err(|_| refused("stale_configuration", "the configured model is malformed"))?;
-            let role_policy = crate::store::connection_dispatch::role_model_policy_in(tx)?;
-            if !native_model_allowed(role_of(&agent.role), &model_id, role_policy.as_ref(), route) {
-                return Err(refused(
-                    "operation_not_granted",
-                    "the configured model is not allowed for this role",
-                ));
-            }
-            crate::store::connection_dispatch::require_native_model_provider_in(
-                tx,
-                model_id.as_str(),
-                catalog_model_id(model_id.as_str(), &route.provider),
-                &route.provider,
-            )?;
-            let resolved = route.resolve(
-                model_id.as_str(),
-                agent.effort.as_deref(),
-                Some(current.origin.as_str()),
-            )?;
-            if resolved.model_uid != current.model_uid
-                || resolved.origin != current.origin
-                || resolved.effort != current.effort
-                || resolved.provider != current.provider
-                || destination(route, &resolved.origin) != current.destination
-                || i64::from(resolved.max_output_tokens) != current.max_output_tokens
-            {
-                return Err(refused(
-                    "stale_configuration",
-                    "the effective model route changed before commitment",
-                ));
-            }
-            require_source_account(route, &current.account)?;
-            let source_row = durable::source_in(tx, &workspace, &source_id)?
-                .ok_or_else(|| refused("auth_unavailable", "the model source is unknown"))?;
-            if source_row.state != durable::SOURCE_ACTIVE
-                || source_row.revision != source_revision
-                || source_row.account != current.account
-                || source_row.origin != current.origin
-                || source_row.provider != current.provider
-            {
-                return Err(refused(
-                    "auth_unavailable",
-                    "the model source changed or is not active",
-                ));
-            }
-            let usage = durable::window_usage_in(tx, &workspace, &agent_uid, &source_id, now)?;
-            if usage.agent_requests >= i64::from(limits.agent.requests_per_minute)
-                || usage.account_requests >= i64::from(limits.account.requests_per_minute)
-                || usage.workspace_requests >= i64::from(limits.workspace.requests_per_minute)
-            {
-                return Err(refused(
-                    "rate_limit",
-                    "the native model request rate limit is exhausted",
-                ));
-            }
-            if usage.agent_unresolved >= i64::from(limits.agent.unresolved)
-                || usage.account_unresolved >= i64::from(limits.account.unresolved)
-                || usage.workspace_unresolved >= i64::from(limits.workspace.unresolved)
-            {
-                return Err(refused(
-                    "concurrency_limit",
-                    "the native model concurrency limit is exhausted",
-                ));
-            }
-            let row = durable::request_in(tx, &request_id)?
-                .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
-            if row.state != durable::STATE_PREPARED {
-                return Ok(None);
-            }
-            if let Some(existing) = &row.input_digest {
-                if existing != &digest {
+        let committed = shared.store.commit_native_model_request(
+            &workspace,
+            &agent_uid,
+            evidence.runtime_generation,
+            &task_id,
+            &configuration_id,
+            configuration_revision,
+            &source_id,
+            source_revision,
+            &request_id,
+            &digest,
+            &route.provider,
+            now_ms(),
+            || {
+                admission_reader.require().map(|_| ()).map_err(|_| {
+                    refused(
+                        "runtime_revoked",
+                        "the runtime witness expired before commitment",
+                    )
+                })
+            },
+            |agent, role_policy, current| {
+                let model_id = ModelId::try_from(current.model.clone()).map_err(|_| {
+                    refused("stale_configuration", "the configured model is malformed")
+                })?;
+                if !native_model_allowed(role_of(&agent.role), &model_id, role_policy, route) {
                     return Err(refused(
-                        "idempotency_conflict",
-                        "the model request was already bound to different input",
+                        "operation_not_granted",
+                        "the configured model is not allowed for this role",
                     ));
                 }
-                return Ok(None);
-            }
-            durable::freeze_input_in(tx, &request_id, &digest)?;
-            durable::commit_request_in(tx, &request_id, now)?;
-            Ok(Some(resolved))
-        })?;
+                let bare = catalog_model_id(model_id.as_str(), &route.provider).to_string();
+                Ok((model_id.as_str().to_string(), bare))
+            },
+            |agent, current| {
+                let resolved = route.resolve(
+                    current.model.as_str(),
+                    agent.effort.as_deref(),
+                    Some(current.origin.as_str()),
+                )?;
+                if resolved.model_uid != current.model_uid
+                    || resolved.origin != current.origin
+                    || resolved.effort != current.effort
+                    || resolved.provider != current.provider
+                    || destination(route, &resolved.origin) != current.destination
+                    || i64::from(resolved.max_output_tokens) != current.max_output_tokens
+                {
+                    return Err(refused(
+                        "stale_configuration",
+                        "the effective model route changed before commitment",
+                    ));
+                }
+                require_source_account(route, &current.account)?;
+                Ok(resolved)
+            },
+            |usage| {
+                if usage.agent_requests >= i64::from(limits.agent.requests_per_minute)
+                    || usage.account_requests >= i64::from(limits.account.requests_per_minute)
+                    || usage.workspace_requests >= i64::from(limits.workspace.requests_per_minute)
+                {
+                    return Err(refused(
+                        "rate_limit",
+                        "the native model request rate limit is exhausted",
+                    ));
+                }
+                if usage.agent_unresolved >= i64::from(limits.agent.unresolved)
+                    || usage.account_unresolved >= i64::from(limits.account.unresolved)
+                    || usage.workspace_unresolved >= i64::from(limits.workspace.unresolved)
+                {
+                    return Err(refused(
+                        "concurrency_limit",
+                        "the native model concurrency limit is exhausted",
+                    ));
+                }
+                Ok(())
+            },
+        )?;
         let Some(resolved) = committed else {
             let current = shared
                 .store
@@ -1246,52 +1101,38 @@ impl NativeModelBroker {
                 {
                     // The upstream turn completed; a result refusal retains
                     // the usage observation if the provider supplied one.
-                    let row = shared.store.write_tx(|tx| {
-                        let row = durable::request_in(tx, &request_id)?
-                            .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
-                        durable::settle_request_in(
-                            tx,
-                            &row,
-                            durable::STATE_RESULT_REFUSED,
-                            // A screened/unauthorised assistant is never
-                            // persisted: the credential echo must not reach
-                            // core SQLite or WAL.
-                            None,
-                            usage_json.as_deref(),
-                            Some(
-                                ClosedModelTurnErrorV1::result_refused()
-                                    .to_json()
-                                    .to_string()
-                                    .as_str(),
-                            ),
-                            &billing.to_json().to_string(),
-                            auth_requests,
-                            inference_requests,
-                            now,
-                        )?;
-                        durable::request_in(tx, &request_id)?
-                            .ok_or_else(|| Error::internal("the request vanished"))
-                    })?;
-                    return receipt(&row);
-                }
-                let row = shared.store.write_tx(|tx| {
-                    let row = durable::request_in(tx, &request_id)?
-                        .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
-                    durable::settle_request_in(
-                        tx,
-                        &row,
-                        durable::STATE_DONE,
-                        Some(assistant.to_json().to_string().as_str()),
-                        usage_json.as_deref(),
+                    let row = shared.store.settle_native_model_request(
+                        &request_id,
+                        durable::STATE_RESULT_REFUSED,
+                        // A screened/unauthorised assistant is never
+                        // persisted: the credential echo must not reach
+                        // core SQLite or WAL.
                         None,
+                        usage_json.as_deref(),
+                        Some(
+                            ClosedModelTurnErrorV1::result_refused()
+                                .to_json()
+                                .to_string()
+                                .as_str(),
+                        ),
                         &billing.to_json().to_string(),
                         auth_requests,
                         inference_requests,
                         now,
                     )?;
-                    durable::request_in(tx, &request_id)?
-                        .ok_or_else(|| Error::internal("the request vanished"))
-                })?;
+                    return receipt(&row);
+                }
+                let row = shared.store.settle_native_model_request(
+                    &request_id,
+                    durable::STATE_DONE,
+                    Some(assistant.to_json().to_string().as_str()),
+                    usage_json.as_deref(),
+                    None,
+                    &billing.to_json().to_string(),
+                    auth_requests,
+                    inference_requests,
+                    now,
+                )?;
                 let _ = input_digest;
                 let _ = configuration;
                 receipt(&row)
@@ -1300,24 +1141,17 @@ impl NativeModelBroker {
                 // The child screened its own output against the minted token:
                 // the inference really ran and consumed usage, but no
                 // assistant content is persisted or projected.
-                let row = shared.store.write_tx(|tx| {
-                    let row = durable::request_in(tx, &request_id)?
-                        .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
-                    durable::settle_request_in(
-                        tx,
-                        &row,
-                        durable::STATE_RESULT_REFUSED,
-                        None,
-                        Some(usage.to_json().to_string().as_str()),
-                        Some(error.to_json().to_string().as_str()),
-                        &billing.to_json().to_string(),
-                        auth_requests,
-                        inference_requests,
-                        now,
-                    )?;
-                    durable::request_in(tx, &request_id)?
-                        .ok_or_else(|| Error::internal("the request vanished"))
-                })?;
+                let row = shared.store.settle_native_model_request(
+                    &request_id,
+                    durable::STATE_RESULT_REFUSED,
+                    None,
+                    Some(usage.to_json().to_string().as_str()),
+                    Some(error.to_json().to_string().as_str()),
+                    &billing.to_json().to_string(),
+                    auth_requests,
+                    inference_requests,
+                    now,
+                )?;
                 receipt(&row)
             }
             sdk::ChildOutcome::Refused { error, .. } => {
@@ -1326,37 +1160,9 @@ impl NativeModelBroker {
                     // pre-admission refusal: the operation was already
                     // admitted. Keep the real (empty) usage and refuse the
                     // result.
-                    shared.store.write_tx(|tx| {
-                        let row = durable::request_in(tx, &request_id)?
-                            .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
-                        durable::settle_request_in(
-                            tx,
-                            &row,
-                            durable::STATE_RESULT_REFUSED,
-                            None,
-                            None,
-                            Some(error.to_json().to_string().as_str()),
-                            &billing.to_json().to_string(),
-                            auth_requests,
-                            inference_requests,
-                            now,
-                        )?;
-                        durable::request_in(tx, &request_id)?
-                            .ok_or_else(|| Error::internal("the request vanished"))
-                    })?
-                } else {
-                    self.settle_refused(shared, &request_id, *error)?
-                };
-                receipt(&row)
-            }
-            sdk::ChildOutcome::Unknown { error, .. } => {
-                let row = shared.store.write_tx(|tx| {
-                    let row = durable::request_in(tx, &request_id)?
-                        .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
-                    durable::settle_request_in(
-                        tx,
-                        &row,
-                        durable::STATE_UNKNOWN,
+                    shared.store.settle_native_model_request(
+                        &request_id,
+                        durable::STATE_RESULT_REFUSED,
                         None,
                         None,
                         Some(error.to_json().to_string().as_str()),
@@ -1364,10 +1170,24 @@ impl NativeModelBroker {
                         auth_requests,
                         inference_requests,
                         now,
-                    )?;
-                    durable::request_in(tx, &request_id)?
-                        .ok_or_else(|| Error::internal("the request vanished"))
-                })?;
+                    )?
+                } else {
+                    self.settle_refused(shared, &request_id, *error)?
+                };
+                receipt(&row)
+            }
+            sdk::ChildOutcome::Unknown { error, .. } => {
+                let row = shared.store.settle_native_model_request(
+                    &request_id,
+                    durable::STATE_UNKNOWN,
+                    None,
+                    None,
+                    Some(error.to_json().to_string().as_str()),
+                    &billing.to_json().to_string(),
+                    auth_requests,
+                    inference_requests,
+                    now,
+                )?;
                 let _ = evidence;
                 receipt(&row)
             }
@@ -1380,28 +1200,19 @@ impl NativeModelBroker {
         request_id: &str,
         error: ClosedModelTurnErrorV1,
     ) -> Result<durable::RequestRow> {
-        let now = now_ms();
-        let request_id = request_id.to_string();
-        shared.store.write_tx(move |tx| {
-            let row = durable::request_in(tx, &request_id)?
-                .ok_or_else(|| refused("invalid_request", "the request is unknown"))?;
-            durable::settle_request_in(
-                tx,
-                &row,
-                durable::STATE_REFUSED,
-                None,
-                None,
-                Some(error.to_json().to_string().as_str()),
-                &NativeBillingProjectionV1::NOT_DISPATCHED
-                    .to_json()
-                    .to_string(),
-                0,
-                0,
-                now,
-            )?;
-            durable::request_in(tx, &request_id)?
-                .ok_or_else(|| Error::internal("the request vanished"))
-        })
+        shared.store.settle_native_model_request(
+            request_id,
+            durable::STATE_REFUSED,
+            None,
+            None,
+            Some(error.to_json().to_string().as_str()),
+            &NativeBillingProjectionV1::NOT_DISPATCHED
+                .to_json()
+                .to_string(),
+            0,
+            0,
+            now_ms(),
+        )
     }
 
     fn mark_unknown(
@@ -1412,23 +1223,16 @@ impl NativeModelBroker {
         inference_requests: i64,
         _usage: i64,
     ) -> Result<durable::RequestRow> {
-        let now = now_ms();
-        let request_id = request_id.to_string();
-        shared.store.write_tx(move |tx| {
-            durable::note_unknown_in(
-                tx,
-                &request_id,
-                auth_requests,
-                inference_requests,
-                &ClosedModelTurnErrorV1::outcome_unknown()
-                    .to_json()
-                    .to_string(),
-                &NativeBillingProjectionV1::UNKNOWN.to_json().to_string(),
-                now,
-            )?;
-            durable::request_in(tx, &request_id)?
-                .ok_or_else(|| Error::internal("the request vanished"))
-        })
+        shared.store.mark_native_model_request_unknown(
+            request_id,
+            auth_requests,
+            inference_requests,
+            &ClosedModelTurnErrorV1::outcome_unknown()
+                .to_json()
+                .to_string(),
+            &NativeBillingProjectionV1::UNKNOWN.to_json().to_string(),
+            now_ms(),
+        )
     }
 
     fn result(&self, caller: &RuntimeCaller, args: &Value) -> Result<Value> {
@@ -1713,33 +1517,27 @@ impl NativeModelBroker {
         };
         let reference = vault.write_row(&identity, bytes.as_slice())?;
         let now = now_ms();
-        let source_id_for_tx = source_id.clone();
-        let workspace_for_tx = workspace.clone();
-        let origin_for_tx = origin.clone();
-        let account_for_tx = account.clone();
-        let model_uid_map_for_tx = model_uid_map.clone();
-        let reference_for_tx = reference.clone();
-        let key_id_for_tx = key_id.to_vec();
         let action = if rotated { "rotated" } else { "linked" };
+        let actor = format!("human:{}", attempt.request_id());
         let existing_revision = existing.as_ref().map(|source| source.revision);
         // The exact row this commit produces. The checkpoint binds this
         // binding, so it is derived before the mutation and verified against
         // the row that actually commits.
         let next = durable::SourceRow {
-            source_id: source_id.clone(),
+            source_id,
             workspace_id: workspace.clone(),
             provider: route.provider.clone(),
-            account: account.clone(),
+            account,
             revision,
-            origin: origin.clone(),
+            origin,
             origin_kind: if kind == "credentials" {
                 durable::ORIGIN_CREDENTIALS.to_string()
             } else {
                 durable::ORIGIN_PINNED.to_string()
             },
             catalog_revision,
-            model_uid_map: model_uid_map.clone(),
-            vault_reference: reference.clone(),
+            model_uid_map,
+            vault_reference: reference,
             key_id: key_id.to_vec(),
             state: durable::SOURCE_ACTIVE.to_string(),
             created_ms: existing
@@ -1751,52 +1549,26 @@ impl NativeModelBroker {
         let binding = material_digest_for_runtime(&next, &workspace)?;
         let digest = Digest::try_from(binding.clone())
             .map_err(|_| Error::internal("source binding digest is malformed"))?;
+        let workspace_for_verify = workspace.clone();
         // One commit and one external acknowledgement. A lost acknowledgement
         // fences protected admission and answers `outcome_unknown`; the
         // mutation is never re-run.
-        let stored = shared.store.protected_management_commit(
+        let stored = shared.store.protected_save_native_model_source(
             &workspace,
             owner_epoch,
             digest,
-            move |tx| {
-                if let Some(expected) = existing_revision {
-                    durable::rotate_source_in(
-                        tx,
-                        &workspace_for_tx,
-                        &source_id_for_tx,
-                        expected,
-                        &account_for_tx,
-                        &origin_for_tx,
-                        if kind == "credentials" {
-                            durable::ORIGIN_CREDENTIALS
-                        } else {
-                            durable::ORIGIN_PINNED
-                        },
-                        catalog_revision,
-                        &model_uid_map_for_tx,
-                        &reference_for_tx,
-                        &key_id_for_tx,
-                        now,
-                    )?;
-                } else {
-                    durable::insert_source_in(tx, &next)?;
-                }
-                durable::source_history_in(
-                    tx,
-                    &source_id_for_tx,
-                    revision,
-                    action,
-                    &format!("human:{}", attempt.request_id()),
-                    now,
-                )?;
-                let stored = durable::source_in(tx, &workspace_for_tx, &source_id_for_tx)?
-                    .ok_or_else(|| Error::internal("the native model source vanished"))?;
-                if material_digest_for_runtime(&stored, &workspace_for_tx)? != binding {
+            existing_revision,
+            next,
+            action,
+            &actor,
+            now,
+            move |stored| {
+                if material_digest_for_runtime(stored, &workspace_for_verify)? != binding {
                     return Err(Error::internal(
                         "the native model source binding changed under its commit",
                     ));
                 }
-                Ok(stored)
+                Ok(())
             },
         )?;
         Ok(json!({
@@ -1847,17 +1619,17 @@ impl NativeModelBroker {
         let binding = material_digest_for_runtime(&expected, &workspace)?;
         let digest = Digest::try_from(binding.clone())
             .map_err(|_| Error::internal("source binding digest is malformed"))?;
-        let workspace_for_tx = workspace.clone();
-        shared
-            .store
-            .protected_management_commit(&workspace, owner_epoch, digest, move |tx| {
-                let current = durable::source_in(tx, &workspace_for_tx, &id)?
-                    .ok_or_else(|| refused("auth_unavailable", "the model source is unknown"))?;
-                durable::set_source_state_in(tx, &workspace_for_tx, &id, &state, now)?;
-                durable::source_history_in(tx, &id, current.revision, action, "owner", now)?;
-                let fenced = durable::source_in(tx, &workspace_for_tx, &id)?
-                    .ok_or_else(|| Error::internal("the native model source vanished"))?;
-                if material_digest_for_runtime(&fenced, &workspace_for_tx)? != binding {
+        let workspace_for_verify = workspace.clone();
+        shared.store.protected_fence_native_model_source(
+            &workspace,
+            &id,
+            owner_epoch,
+            digest,
+            &state,
+            action,
+            now,
+            move |fenced| {
+                if material_digest_for_runtime(fenced, &workspace_for_verify)? != binding {
                     // Never commit a fence that a concurrent rotation made
                     // stale; the transaction rolls back, nothing was applied.
                     return Err(refused(
@@ -1866,7 +1638,8 @@ impl NativeModelBroker {
                     ));
                 }
                 Ok(())
-            })
+            },
+        )
     }
 }
 

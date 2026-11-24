@@ -32,8 +32,13 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 
-#[cfg(all(test, target_os = "linux", feature = "test-seam"))]
-pub(crate) mod custody6_hooks;
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "store-test-support"))
+))]
+#[cfg_attr(not(test), doc(hidden))]
+pub mod custody6_hooks;
 
 /// The custody-tag prefix written into `platform_credentials.custody`
 /// for a vault-backed record. The full reference is `TAG_PREFIX` +
@@ -115,9 +120,14 @@ pub struct ExpectedIdentity {
 /// One vault row's public metadata — everything except the
 /// ciphertext-bearing plaintext fields. `reference` is the full
 /// `encrypted-sqlite-v1:<hex>` locator string.
-#[cfg(all(test, unix, feature = "test-seam"))]
+#[cfg(all(
+    unix,
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "store-test-support"))
+))]
+#[cfg_attr(not(test), doc(hidden))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RowMetadata {
+pub struct RowMetadata {
     pub reference: String,
     pub workspace_id: String,
     pub connection_id: String,
@@ -1096,8 +1106,13 @@ impl EncryptedVault {
     /// Bounded public metadata for every row naming `connection_id` —
     /// test/diagnostic inspection under the manager's serialization.
     /// No plaintext, no secret-bearing field is returned.
-    #[cfg(all(test, unix, feature = "test-seam"))]
-    pub(crate) fn rows_for(&self, connection_id: &str) -> Result<Vec<RowMetadata>> {
+    #[cfg(all(
+        unix,
+        feature = "test-seam",
+        any(test, all(debug_assertions, feature = "store-test-support"))
+    ))]
+    #[cfg_attr(not(test), doc(hidden))]
+    pub fn rows_for(&self, connection_id: &str) -> Result<Vec<RowMetadata>> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.fenced {
             return Err(invalid(

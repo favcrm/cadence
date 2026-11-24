@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS app_tool_claims(
 pub const RESULT_BYTES: usize = 256 * 1024;
 pub const ASSET_BYTES: usize = 2 * 1024 * 1024;
 
-pub(crate) struct AppToolUpload<'a> {
+#[doc(hidden)]
+pub struct AppToolUpload<'a> {
     pub id: &'a str,
     pub request: &'a str,
     pub install: &'a str,
@@ -50,7 +51,8 @@ pub(crate) struct AppToolUpload<'a> {
     pub bytes: &'a [u8],
 }
 
-pub(crate) struct AppToolRecord<'a> {
+#[cfg_attr(all(debug_assertions, feature = "store-test-support"), doc(hidden))]
+pub struct AppToolRecord<'a> {
     pub id: &'a str,
     pub request: &'a str,
     pub install: &'a str,
@@ -244,9 +246,9 @@ impl Store {
     ) -> Result<AppToolClaimReceipt<'a>> {
         self.write_tx(|conn| {
             let tx = &*conn;
-            #[cfg(test)]
+            #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
             let fixture = workspace.is_store_fixture();
-            #[cfg(not(test))]
+            #[cfg(not(any(test, all(debug_assertions, feature = "store-test-support"))))]
             let fixture = false;
             if !fixture {
                 let scope =
@@ -422,7 +424,15 @@ impl Store {
             let claimed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM app_tool_claims WHERE request_id=? AND call_id=?
                  AND install_id=? AND alias=? AND slot=? AND binding_digest=? AND input_digest=?)",
-                params![request, id, install, alias, slot, binding_digest, input_digest],
+                params![
+                    request,
+                    id,
+                    install,
+                    alias,
+                    slot,
+                    binding_digest,
+                    input_digest
+                ],
                 |r| r.get(0),
             )?;
             if !claimed {
@@ -482,8 +492,9 @@ impl Store {
     }
 
     // Existing custody fixtures exercise the low-level checked store path.
-    #[cfg(test)]
-    pub(crate) fn app_tool_record(&self, record: AppToolRecord<'_>) -> Result<Value> {
+    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg_attr(not(test), doc(hidden))]
+    pub fn app_tool_record(&self, record: AppToolRecord<'_>) -> Result<Value> {
         self.app_tool_record_in(record)
     }
 
@@ -493,7 +504,8 @@ impl Store {
     /// sniffed/decoded/normalised them, and the receipt is always attached
     /// to one app context by the daemon. The id/request are daemon-minted;
     /// the receipt is content-addressed and bounded exactly like a tool asset.
-    pub(crate) fn app_tool_upload_record(&self, upload: AppToolUpload<'_>) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_tool_upload_record(&self, upload: AppToolUpload<'_>) -> Result<Value> {
         let AppToolUpload {
             id,
             request,

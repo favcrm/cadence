@@ -592,11 +592,11 @@ impl Shared {
 
     fn enforce_member_turn_topic_scope(
         &self,
-        caller: &crate::peer::AgentCaller,
+        caller: &super::caller_rule::AgentCaller,
         topic: &crate::store::Topic,
         verb: &str,
     ) -> Result<()> {
-        let crate::peer::AgentCaller::Agent(alias) = caller else {
+        let super::caller_rule::AgentCaller::Agent(alias) = caller else {
             return Ok(());
         };
         let Some(turn) = self.store.running_channel_authority(alias)? else {

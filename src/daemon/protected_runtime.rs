@@ -41,15 +41,15 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
+use crate::protected_runtime::ops::{OpsFamily, OpsMethod, RuntimeCaller, RuntimeOpsHandler};
+use crate::protected_runtime::owner_link::{OwnerBootAuthority as BootAuthority, OwnerLink};
+use crate::protected_runtime::{CurrentEligibility, LocalProfile, RuntimeStatus};
+use crate::store::Store;
 use cadence_agent::daemon::console_port::{
     self, AttachedConsole, ConsoleSubject, NativeTaskGuard, ProtectedConsoleProvider,
     VerifiedConsoleSubject,
 };
-use crate::protected_runtime::ops::{OpsFamily, OpsMethod, RuntimeCaller, RuntimeOpsHandler};
-use crate::protected_runtime::{CurrentEligibility, LocalProfile, RuntimeStatus};
-use crate::protected_runtime::owner_link::{OwnerBootAuthority as BootAuthority, OwnerLink};
 use cadence_core::connection_dispatch::primitives::{Digest, Ident, Revision};
-use crate::store::Store;
 
 use super::protected_connections::{
     OwnerEligibility, ProfileRegistryManifest, ProtectedOwnerClient,
@@ -66,7 +66,6 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// Upper bound on the selector registry file.
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
-
 
 // ---------------------------------------------------------------------------
 // Prepared protection (before boot-time authorizing writes)
@@ -96,7 +95,6 @@ pub(crate) enum PreparedBoot {
     /// fixed closed reason.
     MetadataOnly { code: &'static str },
 }
-
 
 impl PreparedProtection {
     /// Decide the boot authority from the authenticated owner witness and the
@@ -757,9 +755,7 @@ impl ProtectedRuntimeCoordinator {
                 "registered runtime no longer names this exact subject",
             ));
         }
-        let qualified = self
-            .owner
-            .recheck(&handle.runtime_id, handle.generation)?;
+        let qualified = self.owner.recheck(&handle.runtime_id, handle.generation)?;
         let identity = qualified.identity();
         if identity.runtime_id != handle.runtime_id
             || identity.agent_uid != handle.agent_uid
@@ -1258,14 +1254,7 @@ impl BrokerFenceTarget for ProtectedRuntimeCoordinator {
         stream: &std::os::unix::net::UnixStream,
         owner_epoch: u64,
     ) -> Result<()> {
-        let client = self
-            .owner
-            .client
-            .read()
-            .map_err(|_| Error::rejected("owner channel state is unavailable"))?
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| Error::rejected("owner channel is not authenticated"))?;
+        let client = self.owner.connected_client()?;
         client.verify_owner_callback(stream, owner_epoch)
     }
 

@@ -26,25 +26,43 @@ pub struct RuntimeSnapshot<'a> {
     install: &'a str,
     digest: &'a str,
     files: &'a BTreeMap<String, String>,
-    #[cfg(test)]
+    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
     fixture: bool,
 }
 
 impl RuntimeSnapshot<'_> {
-    pub fn install(&self) -> &str { self.install }
-    pub fn digest(&self) -> &str { self.digest }
-    #[cfg(test)]
-    pub(crate) fn store_fixture() -> RuntimeSnapshot<'static> {
-        static FILES: std::sync::LazyLock<BTreeMap<String, String>> = std::sync::LazyLock::new(BTreeMap::new);
-        RuntimeSnapshot { install: "", digest: "", files: &FILES, fixture: true }
+    pub fn install(&self) -> &str {
+        self.install
     }
-    #[cfg(test)]
-    pub(crate) fn is_store_fixture(&self) -> bool { self.fixture }
+    pub fn digest(&self) -> &str {
+        self.digest
+    }
+    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg_attr(not(test), doc(hidden))]
+    pub fn store_fixture() -> RuntimeSnapshot<'static> {
+        static FILES: std::sync::LazyLock<BTreeMap<String, String>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        RuntimeSnapshot {
+            install: "",
+            digest: "",
+            files: &FILES,
+            fixture: true,
+        }
+    }
+    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg_attr(not(test), doc(hidden))]
+    pub fn is_store_fixture(&self) -> bool {
+        self.fixture
+    }
     pub fn declares_read_or_draft(&self, slot: &str) -> bool {
-        self.files.get("app.md")
+        self.files
+            .get("app.md")
             .and_then(|text| app::parse_manifest(text).ok())
-            .is_some_and(|manifest| manifest.capabilities.get(slot)
-                .is_some_and(|need| need.validate().is_ok() && matches!(need.effect.as_str(), "read" | "draft")))
+            .is_some_and(|manifest| {
+                manifest.capabilities.get(slot).is_some_and(|need| {
+                    need.validate().is_ok() && matches!(need.effect.as_str(), "read" | "draft")
+                })
+            })
     }
 }
 
@@ -54,9 +72,16 @@ pub fn with_runtime_snapshot_proof<T>(
     callback: impl for<'a> FnOnce(&Value, &BTreeMap<String, String>, &RuntimeSnapshot<'a>) -> Result<T>,
 ) -> Result<T> {
     with_runtime_snapshot(pm, id, |description, files| {
-        let digest = description["digest"].as_str()
+        let digest = description["digest"]
+            .as_str()
             .ok_or_else(|| Error::rejected("installation digest is missing"))?;
-        let proof = RuntimeSnapshot { install: id, digest, files, #[cfg(test)] fixture: false };
+        let proof = RuntimeSnapshot {
+            install: id,
+            digest,
+            files,
+            #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+            fixture: false,
+        };
         callback(description, files, &proof)
     })
 }
@@ -71,9 +96,16 @@ pub fn with_runtime_snapshot_pair_proof<T>(
     ) -> Result<T>,
 ) -> Result<T> {
     with_runtime_snapshot_pair(pm, caller, producer, |(description, files), producer| {
-        let digest = description["digest"].as_str()
+        let digest = description["digest"]
+            .as_str()
             .ok_or_else(|| Error::rejected("installation digest is missing"))?;
-        let proof = RuntimeSnapshot { install: caller, digest, files, #[cfg(test)] fixture: false };
+        let proof = RuntimeSnapshot {
+            install: caller,
+            digest,
+            files,
+            #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+            fixture: false,
+        };
         callback((description, files, &proof), producer)
     })
 }
@@ -509,11 +541,7 @@ pub fn remove_guarded(
 
 /// [`restore`] with a guard re-run under the PM lock before the first write
 /// (CAD-1374). An already-live install returns before the guard: no effect.
-pub fn restore_guarded(
-    pm: &Pm,
-    install_id: &str,
-    guard: &dyn Fn() -> Result<()>,
-) -> Result<Value> {
+pub fn restore_guarded(pm: &Pm, install_id: &str, guard: &dyn Fn() -> Result<()>) -> Result<Value> {
     let id = InstallationId::parse(install_id)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;

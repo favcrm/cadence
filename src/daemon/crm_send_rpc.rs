@@ -990,7 +990,7 @@ impl Shared {
             // rows so mid-send mutations are deterministic.
             #[cfg(feature = "test-seam")]
             if let Some(gate) = &self.crm_send_row_gate {
-                gate.take();
+                cadence_agent::send_row_gate_take(gate);
             }
             let deliveries = records.app_campaign_deliveries(context, send_id)?;
             let now_ms = started.elapsed().as_millis() as u64;

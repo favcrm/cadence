@@ -35,7 +35,9 @@ fn schema_only_board_types_match_their_producers() {
         serde_json::to_value(&opened.session).unwrap(),
     );
     // A login-link session has no user and no account: both keys stay `null`.
-    let nonce = auth.mint(crate::operator_auth::Origin::Loopback, 1_000).unwrap();
+    let nonce = auth
+        .mint(crate::operator_auth::Origin::Loopback, 1_000)
+        .unwrap();
     let link = auth
         .open(&nonce, crate::operator_auth::Origin::Loopback, "ua", 1_000)
         .unwrap()

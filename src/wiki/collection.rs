@@ -53,7 +53,8 @@ pub fn get(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str) -> Result<Val
     state_value(pm, state_dir, caller, &root, &meta, rev)
 }
 
-pub(crate) fn put(
+#[doc(hidden)]
+pub fn put(
     pm: &Pm,
     state_dir: &Path,
     caller: &Caller,

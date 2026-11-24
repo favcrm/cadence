@@ -18,7 +18,9 @@ pub(crate) fn load_credential(
     let record = store
         .platform_credential(platform, account)?
         .ok_or_else(|| {
-            Error::rejected(format!("no credential is enrolled for {platform}/{account}"))
+            Error::rejected(format!(
+                "no credential is enrolled for {platform}/{account}"
+            ))
         })?;
     let bytes = custody.load(&record.custody, &crate::platform::Key { platform, account })?;
     if crate::secret::fingerprint(&bytes) != record.fingerprint {

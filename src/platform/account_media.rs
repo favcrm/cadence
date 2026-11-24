@@ -81,9 +81,7 @@ pub fn validate_quote_source(
     Ok(())
 }
 
-pub fn current_identity(
-    config: &Value,
-) -> std::result::Result<AccountImageIdentity, String> {
+pub fn current_identity(config: &Value) -> std::result::Result<AccountImageIdentity, String> {
     let account = config["account"]
         .as_str()
         .ok_or("account image source is absent")?;

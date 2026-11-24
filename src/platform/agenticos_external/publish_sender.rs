@@ -841,11 +841,18 @@ pub fn attach_publish_sender(
     } else {
         None
     };
-    let admission = opts.provider_deployments.as_ref().or(loaded.as_ref())
+    let admission = opts
+        .provider_deployments
+        .as_ref()
+        .or(loaded.as_ref())
         .and_then(|metadata| metadata.verified())
         .and_then(|metadata| metadata.hosted_media());
     attach_publish_sender_with(
-        state_dir, opts.social_publish_sender, opts.social_media_importer, opts.social_media_resolver, admission,
+        state_dir,
+        opts.social_publish_sender,
+        opts.social_media_importer,
+        opts.social_media_resolver,
+        admission,
     )
 }
 
@@ -1296,9 +1303,13 @@ mod tests {
             crate::platform::deployments::DeploymentMetadata::parse(HOSTED_PUBLISH.as_bytes())
                 .unwrap();
         assert!(attach_publish_sender_with(
-            dir.path(), &mut opts.social_publish_sender, &mut opts.social_media_importer,
-            &mut opts.social_media_resolver, metadata.hosted_media(),
-        ).is_err());
+            dir.path(),
+            &mut opts.social_publish_sender,
+            &mut opts.social_media_importer,
+            &mut opts.social_media_resolver,
+            metadata.hosted_media(),
+        )
+        .is_err());
         clean_env();
     }
 

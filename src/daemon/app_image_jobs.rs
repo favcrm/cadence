@@ -96,7 +96,7 @@ pub mod test_probe {
 impl Shared {
     /// The deadline (epoch seconds) of a job window opened now.
     pub(super) fn image_job_deadline(&self) -> f64 {
-        crate::store::now() + self.image_job_window.as_secs_f64()
+        crate::store::now_public() + self.image_job_window.as_secs_f64()
     }
 
     /// One worker per call id: the registry refuses a second runner, so a
@@ -274,7 +274,7 @@ impl Shared {
             };
             let reason = failure.reason;
             match reason.settle() {
-                ImageSettle::Retry if crate::store::now() < job.deadline => {
+                ImageSettle::Retry if crate::store::now_public() < job.deadline => {
                     #[cfg(feature = "test-seam")]
                     super::test_events::completed(
                         &self.state_dir,

@@ -22,8 +22,51 @@ pub struct RuntimeCaller {
 }
 
 impl RuntimeCaller {
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn registered(
+        runtime_id: String,
+        agent_uid: String,
+        session_binding: String,
+        runtime_generation: u64,
+        os_uid: u32,
+        peer_pid: u32,
+        peer_starttime: u64,
+    ) -> Self {
+        Self::registered_impl(
+            runtime_id,
+            agent_uid,
+            session_binding,
+            runtime_generation,
+            os_uid,
+            peer_pid,
+            peer_starttime,
+        )
+    }
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     #[allow(dead_code)]
     pub(crate) fn registered(
+        runtime_id: String,
+        agent_uid: String,
+        session_binding: String,
+        runtime_generation: u64,
+        os_uid: u32,
+        peer_pid: u32,
+        peer_starttime: u64,
+    ) -> Self {
+        Self::registered_impl(
+            runtime_id,
+            agent_uid,
+            session_binding,
+            runtime_generation,
+            os_uid,
+            peer_pid,
+            peer_starttime,
+        )
+    }
+    #[allow(dead_code)]
+    fn registered_impl(
         runtime_id: String,
         agent_uid: String,
         session_binding: String,

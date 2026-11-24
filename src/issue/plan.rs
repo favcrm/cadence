@@ -45,7 +45,8 @@ mod doc;
 mod intake;
 
 pub use doc::{parse_plan, Dep, PlanDoc, Ticket};
-pub(crate) use intake::scope_digest;
+#[doc(hidden)]
+pub use intake::scope_digest;
 pub use intake::GoalIntake;
 
 /// Largest plan text `propose` accepts.
@@ -220,11 +221,13 @@ pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
 
 /// Admission proof for callers preparing a fresh kickoff. The approved
 /// intake epic can change even when a carried issue's scope does not.
-pub(crate) fn gate_snapshot(pm_dir: &Path, front: &Front, body: &str) -> Result<Option<String>> {
+#[doc(hidden)]
+pub fn gate_snapshot(pm_dir: &Path, front: &Front, body: &str) -> Result<Option<String>> {
     admit(pm_dir, front, body, None)
 }
 
-pub(crate) fn gate_snapshot_at_base(
+#[doc(hidden)]
+pub fn gate_snapshot_at_base(
     pm_dir: &Path,
     front: &Front,
     body: &str,

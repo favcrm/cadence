@@ -205,6 +205,17 @@ impl Store {
     /// Completion receipts describe the actual accepted historical turns.
     /// Retiring those endpoints does not alter their recorded acceptance.
     /// The installation, context and binding are nevertheless current here.
+    #[doc(hidden)]
+    pub fn app_publication_material_tx(
+        tx: &super::WriteTxn<'_>,
+        id: &str,
+        artifact: &str,
+        bundle: &str,
+        slot: &str,
+    ) -> Result<Value> {
+        Self::app_publication_material_in(tx, id, artifact, bundle, slot)
+    }
+
     pub(crate) fn app_publication_material_in(
         conn: &impl super::StoreConn,
         id: &str,
@@ -512,7 +523,8 @@ impl Store {
     /// provider call and read-back run with none held and lock 2 re-checks
     /// authority before recording (CAD-1258). This method drops SQLite before
     /// any adapter is called.
-    pub(crate) fn app_effect_claim<F>(
+    #[doc(hidden)]
+    pub fn app_effect_claim<F>(
         &self,
         id: &str,
         digest: &str,

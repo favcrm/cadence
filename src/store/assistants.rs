@@ -1191,10 +1191,7 @@ impl Store {
     /// reveal its tasks. The operator never reaches this query, so it stays
     /// recoverable.
     #[doc(hidden)]
-    pub fn private_job_denials(
-        &self,
-        reader: PrivateJobReader<'_>,
-    ) -> Result<PrivateJobDenials> {
+    pub fn private_job_denials(&self, reader: PrivateJobReader<'_>) -> Result<PrivateJobDenials> {
         let conn = self.conn();
         self.private_job_denials_in(&conn, reader)
     }
@@ -1461,10 +1458,7 @@ impl Store {
     /// required for admission; only the effects of a still-unfinished
     /// request may proceed.
     #[doc(hidden)]
-    pub fn assist_queue_promotion_unambiguous(
-        &self,
-        record: &AssistRequestQueued,
-    ) -> Result<bool> {
+    pub fn assist_queue_promotion_unambiguous(&self, record: &AssistRequestQueued) -> Result<bool> {
         if record.planned_job_id.is_empty() {
             return Ok(false);
         }

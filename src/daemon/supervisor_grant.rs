@@ -2250,11 +2250,7 @@ impl BrokerFenceListener {
     pub fn listen_production(_profile: &LocalProfile) -> Result<Self> {
         Err(Error::rejected("broker fence listener is Linux-only"))
     }
-    pub fn serve(
-        self: std::sync::Arc<Self>,
-        _target: std::sync::Arc<dyn BrokerFenceTarget>,
-    ) {
-    }
+    pub fn serve(self: std::sync::Arc<Self>, _target: std::sync::Arc<dyn BrokerFenceTarget>) {}
 }
 
 fn wall_clock_seconds() -> Result<u64> {

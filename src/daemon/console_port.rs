@@ -11,7 +11,6 @@ use crate::protected_runtime::RuntimeCaller;
 pub struct AttachedConsole {
     pub(crate) console: OwnerConsole,
     pub(crate) generation_tag: String,
-    pub(crate) runtime_id: String,
     pub(crate) caller: RuntimeCaller,
 }
 
@@ -27,7 +26,11 @@ pub trait NativeTaskGuard: Send {
 }
 
 pub trait ProtectedConsoleProvider: Send + Sync {
-    fn open_console(&self, subject: ConsoleSubject<'_>, stderr_log: &Path) -> Result<AttachedConsole>;
+    fn open_console(
+        &self,
+        subject: ConsoleSubject<'_>,
+        stderr_log: &Path,
+    ) -> Result<AttachedConsole>;
     fn bind_native_task(
         &self,
         caller: &RuntimeCaller,
@@ -54,7 +57,12 @@ pub fn console_provider() -> Result<Arc<dyn ProtectedConsoleProvider>> {
     CONSOLE_PROVIDER
         .get()
         .and_then(|weak| weak.upgrade())
-        .ok_or_else(|| Error::invalid("runtime_unqualified", "no protected runtime coordinator is installed"))
+        .ok_or_else(|| {
+            Error::invalid(
+                "runtime_unqualified",
+                "no protected runtime coordinator is installed",
+            )
+        })
 }
 
 /// An identity copied only from an owner-issued qualified runtime. Fields are
@@ -72,7 +80,9 @@ pub struct VerifiedConsoleSubject {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl VerifiedConsoleSubject {
-    pub fn from_qualified(qualified: &crate::protected_runtime::qualified::QualifiedRuntime) -> Self {
+    pub fn from_qualified(
+        qualified: &crate::protected_runtime::qualified::QualifiedRuntime,
+    ) -> Self {
         let identity = qualified.identity();
         Self {
             runtime_id: identity.runtime_id.clone(),
@@ -97,7 +107,9 @@ pub fn attach_console(
 ) -> Result<AttachedConsole> {
     let open = client.open_console(&subject.runtime_id, subject.generation, recipient_nonce)?;
     if open.node_pid != subject.node_pid || open.node_starttime != subject.node_starttime {
-        return Err(Error::rejected("owner console names a different measured guest"));
+        return Err(Error::rejected(
+            "owner console names a different measured guest",
+        ));
     }
     let console = crate::protected_runtime::console::connect(
         &open.path,
@@ -110,7 +122,6 @@ pub fn attach_console(
     Ok(AttachedConsole {
         console,
         generation_tag: format!("{}-{}", subject.runtime_id, subject.generation),
-        runtime_id: subject.runtime_id.clone(),
         caller: RuntimeCaller::registered(
             subject.runtime_id,
             subject.agent_uid,

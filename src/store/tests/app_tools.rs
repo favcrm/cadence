@@ -1,9 +1,6 @@
 use super::*;
 use crate::store::app_tools::{AppToolClaim, AppToolRecord};
 
-static WORKSPACE: std::sync::LazyLock<crate::issue::app_catalog::workspace::RuntimeSnapshot<'static>> =
-    std::sync::LazyLock::new(crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture);
-
 fn fresh() -> (TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_for_schema_tests(&dir.path().join("t.sqlite3")).unwrap();
@@ -12,8 +9,6 @@ fn fresh() -> (TempDir, Store) {
 
 fn claim<'a>(request: &'a str) -> AppToolClaim<'a> {
     AppToolClaim {
-        workspace: &WORKSPACE,
-        context: None,
         request,
         install: "install1",
         alias: "instagram.read",
@@ -125,8 +120,6 @@ fn soc54_source_reads_are_selected_before_the_history_bound() {
         let is_source = i < 3;
         store
             .app_tool_claim(AppToolClaim {
-                workspace: &WORKSPACE,
-                context: None,
                 request,
                 install: "install1",
                 alias: if is_source {

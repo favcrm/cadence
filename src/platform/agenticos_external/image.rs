@@ -375,9 +375,7 @@ pub fn uploaded_image_mime(bytes: &[u8], media_type: &str) -> Result<&'static st
     Ok(mime)
 }
 
-pub fn normalize_uploaded_image(
-    bytes: &[u8],
-) -> Result<(Vec<u8>, &'static str, u32, u32), Fault> {
+pub fn normalize_uploaded_image(bytes: &[u8]) -> Result<(Vec<u8>, &'static str, u32, u32), Fault> {
     if bytes.is_empty() || bytes.len() > ASSET_LIMIT {
         return Err((
             ImageFault::TooLarge,

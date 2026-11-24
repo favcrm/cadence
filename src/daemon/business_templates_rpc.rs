@@ -125,7 +125,11 @@ impl Shared {
                     return Err(Error::rejected(format!("template '{name}' v{version} is a legacy DOCX template and cannot sample as HTML")));
                 }
                 let out = if let Some(admission) = &self.hosted_business_documents {
-                    crate::business_export::hosted::export_sample(admission, &source, &draft.context())?
+                    crate::business_export::hosted::export_sample(
+                        admission,
+                        &source,
+                        &draft.context(),
+                    )?
                 } else {
                     crate::business_export::export_sample(&source, &draft.context())?
                 };

@@ -26,11 +26,11 @@ use super::{
     optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
 };
 
+use super::caller_rule::AgentCaller;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report};
 use crate::master::{self, ALIAS};
-use super::caller_rule::AgentCaller;
 use crate::store;
 // Readers and protected writers share the file/digest/params publication boundary.
 pub(super) static MASTER_IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

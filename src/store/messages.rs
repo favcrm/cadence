@@ -40,20 +40,22 @@ pub type ActorTake = (Take, Option<NativeTurnClaim>);
 
 // Deterministic cost evidence for recurring read paths. Thread-local so
 // unrelated parallel tests cannot add to a caller's measurement.
-#[cfg(test)]
+#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
 thread_local! {
     static DECODED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn take_decoded_messages() -> usize {
+#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg_attr(not(test), doc(hidden))]
+pub fn take_decoded_messages() -> usize {
     DECODED_MESSAGES.with(|n| n.replace(0))
 }
 
 /// The correlated worker result needed by the delivery router, without
 /// decoding a kickoff body on every pending-turn check.
 #[derive(Debug)]
-pub(crate) struct WorkerTurn {
+#[doc(hidden)]
+pub struct WorkerTurn {
     pub id: String,
     pub state: String,
     pub sha: Option<String>,
@@ -113,7 +115,7 @@ pub struct Message {
 }
 
 pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
-    #[cfg(test)]
+    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
     DECODED_MESSAGES.with(|n| n.set(n.get() + 1));
     let result: Option<String> = row.get("result")?;
     Ok(Message {
@@ -901,7 +903,8 @@ impl Store {
     /// `authorized_until` is daemon-derived and checked after acquiring
     /// the queue writer. Ordinary sends pass `None`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn enqueue_steered_for_with_conversation(
+    #[doc(hidden)]
+    pub fn enqueue_steered_for_with_conversation(
         &self,
         alias: &str,
         expected_uid: Option<&str>,
@@ -953,7 +956,8 @@ impl Store {
     /// channel/ticket `@mention` provenance row atomically inside the enqueue write tx
     /// before any caller wakes the agent.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn enqueue_steered_for_with_channel_binding(
+    #[doc(hidden)]
+    pub fn enqueue_steered_for_with_channel_binding(
         &self,
         alias: &str,
         expected_uid: Option<&str>,
@@ -1979,7 +1983,8 @@ impl Store {
     /// The caller already holds its record-scoped PM lock. Keep current native
     /// ownership and assignment fenced through the local file save, not Git
     /// hooks or network work. The caller restores the file if this tx fails.
-    pub(crate) fn with_memory_feedback(
+    #[doc(hidden)]
+    pub fn with_memory_feedback(
         &self,
         expected: &Agent,
         id: &str,
@@ -1992,7 +1997,8 @@ impl Store {
     /// CAD-2662: the issue this native agent's current owned active turn is
     /// bound to — the same fence `with_memory_feedback` applies, for a
     /// read-only lesson lookup. `purpose` names the refused operation.
-    pub(crate) fn owned_issue_turn(
+    #[doc(hidden)]
+    pub fn owned_issue_turn(
         &self,
         expected: &Agent,
         id: &str,
@@ -2007,7 +2013,8 @@ impl Store {
     /// CAD-2663: this native agent's current owned active turn, with no
     /// issue or role requirement — the identity half of the fence below, for
     /// a read of the agent's own thread. Refusals start with `purpose`.
-    pub(crate) fn owned_turn(
+    #[doc(hidden)]
+    pub fn owned_turn(
         &self,
         expected: &Agent,
         id: &str,
@@ -2300,6 +2307,14 @@ impl Store {
     pub fn take_queued(&self, alias: &str) -> Result<Take> {
         self.take_queued_app_proven(alias, None)
     }
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn take_queued_app_proven(&self, alias: &str, proof: Option<(&str, &str)>) -> Result<Take> {
+        self.take_queued_inner(alias, proof, false)
+            .map(|(take, _)| take)
+    }
+
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn take_queued_app_proven(
         &self,
         alias: &str,
@@ -2309,7 +2324,8 @@ impl Store {
             .map(|(take, _)| take)
     }
 
-    pub(crate) fn take_queued_for_actor(
+    #[doc(hidden)]
+    pub fn take_queued_for_actor(
         &self,
         alias: &str,
         proof: Option<(&str, &str)>,
@@ -3255,7 +3271,8 @@ impl Store {
     /// bodies. Retain `messages`' registration boundary and non-terminal
     /// clock-step behavior. Old malformed result JSON counts as no result,
     /// as it does in `row_message`, rather than failing the whole snapshot.
-    pub(crate) fn parked_message_count(&self, alias: &str) -> Result<i64> {
+    #[doc(hidden)]
+    pub fn parked_message_count(&self, alias: &str) -> Result<i64> {
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
         Ok(conn.query_row(
@@ -3393,11 +3410,8 @@ impl Store {
     /// `send_issue_followup` writes one, tagged server-side). Only rows
     /// carrying the lane's `issue`/`worktree` tags count: an untagged
     /// `review` row is ordinary mail, never this worker's turn.
-    pub(crate) fn worker_issue_turn(
-        &self,
-        issue: &str,
-        worker: &str,
-    ) -> Result<Option<WorkerTurn>> {
+    #[doc(hidden)]
+    pub fn worker_issue_turn(&self, issue: &str, worker: &str) -> Result<Option<WorkerTurn>> {
         self.read_worker_turn(
             "SELECT id,state,CASE WHEN state='completed' THEN result END \
              FROM messages WHERE alias=?1 AND issue=?2 AND worktree IS NOT NULL \
@@ -3413,7 +3427,8 @@ impl Store {
     /// from that native queue record; they never take a caller's or a
     /// follow-up's own claim, so `source='dispatch'` rows only — never
     /// a `source='review'` row a follow-up itself wrote.
-    pub(crate) fn worker_issue_lane(&self, issue: &str, worker: &str) -> Result<Option<String>> {
+    #[doc(hidden)]
+    pub fn worker_issue_lane(&self, issue: &str, worker: &str) -> Result<Option<String>> {
         let conn = self.conn();
         conn.query_row(
             "SELECT worktree FROM messages WHERE alias=?1 AND issue=?2 \

@@ -137,49 +137,70 @@ CREATE TRIGGER IF NOT EXISTS protected_management_attempts_no_delete
 ";
 
 /// How long a request may wait for its human before it expires.
-pub(crate) const REQUEST_TTL_MS: i64 = 30 * 60 * 1000;
+/// How long an open credential request lives before expiring.
+#[doc(hidden)]
+pub const REQUEST_TTL_MS: i64 = 30 * 60 * 1000;
 
 /// How long one issued form nonce stays usable.
-pub(crate) const NONCE_TTL_MS: i64 = 60 * 1000;
+#[doc(hidden)]
+pub const NONCE_TTL_MS: i64 = 60 * 1000;
 
 /// The largest credential the trusted form may submit.
-pub(crate) const MAX_SECRET_BYTES: usize = 65_536;
+#[doc(hidden)]
+pub const MAX_SECRET_BYTES: usize = 65_536;
 
 /// Fixed state words (r3 §F3).
-pub(crate) const STATE_PENDING: &str = "pending";
-pub(crate) const STATE_SUBMITTING: &str = "submitting";
-pub(crate) const STATE_DONE: &str = "done";
-pub(crate) const STATE_CANCELLED: &str = "cancelled";
-pub(crate) const STATE_EXPIRED: &str = "expired";
-pub(crate) const STATE_UNKNOWN: &str = "unknown";
+#[doc(hidden)]
+pub const STATE_PENDING: &str = "pending";
+#[doc(hidden)]
+pub const STATE_SUBMITTING: &str = "submitting";
+#[doc(hidden)]
+pub const STATE_DONE: &str = "done";
+#[doc(hidden)]
+pub const STATE_CANCELLED: &str = "cancelled";
+#[doc(hidden)]
+pub const STATE_EXPIRED: &str = "expired";
+#[doc(hidden)]
+pub const STATE_UNKNOWN: &str = "unknown";
 
 /// Fixed status words the entry page and chat card speak.
-pub(crate) const STATUS_AWAITING_HUMAN: &str = "awaiting_human";
-pub(crate) const STATUS_SUBMITTING: &str = "submitting";
-pub(crate) const STATUS_SAVED: &str = "saved";
-pub(crate) const STATUS_VERIFIED: &str = "verified";
-pub(crate) const STATUS_REFUSED: &str = "refused";
-pub(crate) const STATUS_CANCELLED: &str = "cancelled";
-pub(crate) const STATUS_EXPIRED: &str = "expired";
-pub(crate) const STATUS_UNKNOWN: &str = "unknown";
+#[doc(hidden)]
+pub const STATUS_AWAITING_HUMAN: &str = "awaiting_human";
+#[doc(hidden)]
+pub const STATUS_SUBMITTING: &str = "submitting";
+#[doc(hidden)]
+pub const STATUS_SAVED: &str = "saved";
+#[doc(hidden)]
+pub const STATUS_VERIFIED: &str = "verified";
+#[doc(hidden)]
+pub const STATUS_REFUSED: &str = "refused";
+#[doc(hidden)]
+pub const STATUS_CANCELLED: &str = "cancelled";
+#[doc(hidden)]
+pub const STATUS_EXPIRED: &str = "expired";
+#[doc(hidden)]
+pub const STATUS_UNKNOWN: &str = "unknown";
 
 /// The fixed human verb a request allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CredentialVerb {
+#[doc(hidden)]
+pub enum CredentialVerb {
     Enroll,
     Rotate,
     Verify,
 }
 
 impl CredentialVerb {
-    pub(crate) fn as_str(self) -> &'static str {
+    #[doc(hidden)]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Enroll => "enroll",
             Self::Rotate => "rotate",
             Self::Verify => "verify",
         }
     }
-    pub(crate) fn parse(value: &str) -> Result<Self> {
+    #[doc(hidden)]
+    pub fn parse(value: &str) -> Result<Self> {
         match value {
             "enroll" => Ok(Self::Enroll),
             "rotate" => Ok(Self::Rotate),
@@ -195,7 +216,8 @@ impl CredentialVerb {
 /// A fresh request. Every field is an identifier or the protected context
 /// digest; no credential or human-entered metadata appears here.
 #[derive(Clone, Debug)]
-pub(crate) struct NewCredentialRequest {
+#[doc(hidden)]
+pub struct NewCredentialRequest {
     pub provider: String,
     pub verb: CredentialVerb,
     pub connection_id: Option<String>,
@@ -218,7 +240,8 @@ pub(crate) struct NewCredentialRequest {
 
 /// One durable request row, metadata only.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct CredentialRequest {
+#[doc(hidden)]
+pub struct CredentialRequest {
     pub request_id: String,
     pub request_revision: i64,
     pub provider: String,
@@ -268,7 +291,8 @@ impl CredentialRequest {
     }
     /// Metadata-only wire shape. Never carries a credential, digest, entry
     /// session binding or pre-submit transport/username value.
-    pub(crate) fn to_json(&self, now_ms: i64) -> Value {
+    #[doc(hidden)]
+    pub fn to_json(&self, now_ms: i64) -> Value {
         let state = self.effective_state(now_ms);
         let status = if state == STATE_EXPIRED && self.state == STATE_PENDING {
             STATUS_EXPIRED
@@ -310,13 +334,15 @@ impl CredentialRequest {
 /// turns this into the private `VerifiedHumanAttemptV1`; it is never
 /// serialized.
 #[derive(Clone, Debug)]
-pub(crate) struct ClaimedCredentialAttempt {
+#[doc(hidden)]
+pub struct ClaimedCredentialAttempt {
     pub request: CredentialRequest,
     pub attempt_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttemptOutcome {
+#[doc(hidden)]
+pub enum AttemptOutcome {
     Applied,
     Refused,
     Unknown,
@@ -416,14 +442,17 @@ fn current_revision_matches(request: &CredentialRequest, tx: &impl StoreConn) ->
 /// The exact isolated-form shapes that belong to the native-model source, not
 /// a business Connection. They route to the model broker and never create a
 /// Connection/vault row.
-pub(crate) const NATIVE_MODEL_SHAPES: &[&str] =
+#[doc(hidden)]
+pub const NATIVE_MODEL_SHAPES: &[&str] =
     &["native-model-api-key", "native-model-devin-credentials"];
 
-pub(crate) fn is_native_model_shape(shape: Option<&str>) -> bool {
+#[doc(hidden)]
+pub fn is_native_model_shape(shape: Option<&str>) -> bool {
     shape.is_some_and(|shape| NATIVE_MODEL_SHAPES.contains(&shape))
 }
 
-pub(crate) fn provider_shape_allowed(provider: &str, shape: Option<&str>) -> bool {
+#[doc(hidden)]
+pub fn provider_shape_allowed(provider: &str, shape: Option<&str>) -> bool {
     match (provider, shape) {
         ("agenticos", Some("native-model-api-key")) => true,
         ("agenticos", _) => false,
@@ -588,7 +617,8 @@ impl Store {
     /// Create one metadata-only request. The caller has already resolved
     /// the live protected context through the parent runtime owner; this
     /// store never invents an epoch or falls back to metadata.
-    pub(crate) fn create_credential_request(
+    #[doc(hidden)]
+    pub fn create_credential_request(
         &self,
         new: NewCredentialRequest,
         now_ms: i64,
@@ -654,13 +684,15 @@ impl Store {
     }
 
     /// One request, metadata only.
-    pub(crate) fn credential_request(&self, request_id: &str) -> Result<Option<CredentialRequest>> {
+    #[doc(hidden)]
+    pub fn credential_request(&self, request_id: &str) -> Result<Option<CredentialRequest>> {
         let conn = self.conn();
         load_request(&*conn, request_id)
     }
 
     /// Requests asked from one conversation, newest first.
-    pub(crate) fn credential_requests_for_conversation(
+    #[doc(hidden)]
+    pub fn credential_requests_for_conversation(
         &self,
         conversation_id: &str,
         limit: i64,
@@ -677,7 +709,8 @@ impl Store {
     }
 
     /// The most recent requests, metadata only.
-    pub(crate) fn recent_credential_requests(&self, limit: i64) -> Result<Vec<CredentialRequest>> {
+    #[doc(hidden)]
+    pub fn recent_credential_requests(&self, limit: i64) -> Result<Vec<CredentialRequest>> {
         let limit = limit.clamp(1, 50);
         let conn = self.conn();
         conn.query_vec(
@@ -692,7 +725,8 @@ impl Store {
     /// raw 256-bit value is returned exactly once; only its digest is
     /// stored. Any earlier unclaimed nonce for the same request/session is
     /// invalidated so only the newest form can submit.
-    pub(crate) fn issue_credential_nonce(
+    #[doc(hidden)]
+    pub fn issue_credential_nonce(
         &self,
         request_id: &str,
         session_binding: &str,
@@ -778,7 +812,8 @@ impl Store {
     /// Claim one nonce and open its attempt in the same transaction —
     /// before the daemon forwards anything. Every failure is a fixed code;
     /// a lost claim can never be retried into a second mutation.
-    pub(crate) fn claim_credential_attempt(
+    #[doc(hidden)]
+    pub fn claim_credential_attempt(
         &self,
         request_id: &str,
         nonce: &str,
@@ -969,7 +1004,8 @@ impl Store {
     /// Close a claimed attempt. The request returns to `pending` after a
     /// definite refusal so the human may try a new form; a lost or
     /// ambiguous outcome stays `unknown` and is never retried.
-    pub(crate) fn finish_credential_attempt(
+    #[doc(hidden)]
+    pub fn finish_credential_attempt(
         &self,
         request_id: &str,
         attempt_id: &str,
@@ -1042,7 +1078,8 @@ impl Store {
 
     /// Cancel an open request. A claimed attempt may be in flight and is
     /// never promised undone.
-    pub(crate) fn cancel_credential_request(
+    #[doc(hidden)]
+    pub fn cancel_credential_request(
         &self,
         request_id: &str,
         now_ms: i64,
@@ -1090,7 +1127,8 @@ impl Store {
     /// Issue ONE 60s one-use nonce for a typed management action, bound to the
     /// live authenticated owner session, the action and the exact canonical
     /// parameters digest. No GET mints state and no nonce is reusable.
-    pub(crate) fn issue_management_nonce(
+    #[doc(hidden)]
+    pub fn issue_management_nonce(
         &self,
         action: &str,
         params_digest: &str,
@@ -1154,7 +1192,8 @@ impl Store {
     /// Claim the exact nonce once before the mutation. Every binding is
     /// re-checked; a replayed, expired or changed attempt refuses.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // the attempt row mirrors the table
-    pub(crate) fn claim_management_attempt(
+    #[doc(hidden)]
+    pub fn claim_management_attempt(
         &self,
         nonce: &str,
         expected_attempt_id: &str,
@@ -1244,7 +1283,8 @@ impl Store {
 
     /// Record the terminal attempt status. `applied` means the mutation AND
     /// its external checkpoint succeeded; unknown is never success.
-    pub(crate) fn finish_management_attempt(
+    #[doc(hidden)]
+    pub fn finish_management_attempt(
         &self,
         attempt_id: &str,
         applied: bool,
@@ -1278,7 +1318,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn management_attempt(&self, attempt_id: &str) -> Result<Option<ManagementAttempt>> {
+    #[doc(hidden)]
+    pub fn management_attempt(&self, attempt_id: &str) -> Result<Option<ManagementAttempt>> {
         let conn = self.conn();
         Ok(conn.query_opt(
             "SELECT attempt_id,action,state,result_code,expires_at_ms \
@@ -1299,7 +1340,8 @@ impl Store {
 
 /// One durable protected-management attempt. Metadata only.
 #[derive(Clone, Debug)]
-pub(crate) struct ManagementAttempt {
+#[doc(hidden)]
+pub struct ManagementAttempt {
     pub attempt_id: String,
     pub action: String,
     pub state: String,

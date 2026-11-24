@@ -1078,7 +1078,8 @@ impl Store {
     /// by approved upgrade carries. Each carry rewrites `bundle_digest` and
     /// nothing else. Any other move, a gap, or a malformed carry record
     /// returns `Ok(false)` — the caller keeps refusing.
-    pub(crate) fn app_binding_upgrade_carried(
+    #[doc(hidden)]
+    pub fn app_binding_upgrade_carried(
         &self,
         install: &str,
         context: Option<&str>,

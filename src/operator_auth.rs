@@ -142,7 +142,6 @@ impl Row {
     }
 }
 
-
 #[derive(Serialize, Deserialize, Default)]
 struct SessionsFile {
     sessions: Vec<Row>,
@@ -303,10 +302,12 @@ impl Auth {
     /// records `sha256(nonce)`. `public` is refused outright — those
     /// sessions are born only of a verified platform assertion, never a
     /// login link (CAD-526).
+    #[cfg(test)]
     pub fn mint(&mut self, origin: Origin, now: i64) -> Result<String> {
         self.mint_scoped(origin, LinkScope::Board, now)
     }
 
+    #[cfg(test)]
     pub(crate) fn mint_scoped(
         &mut self,
         origin: Origin,
@@ -480,6 +481,7 @@ impl Auth {
     /// ([`crate::device_login::REMOTE_IDLE_SECS`] idle,
     /// [`crate::device_login::REMOTE_ABSOLUTE_SECS`] absolute), never
     /// the on-host values. Link sessions (no user) are untouched.
+    #[cfg(test)]
     pub fn open_device(
         &mut self,
         user: BoardUser,
@@ -571,6 +573,7 @@ impl Auth {
     /// Open a `public` session for a verified platform user (CAD-526).
     /// `None` is the refusal — the `jti` was seen before (the daemon
     /// maps it to the contract's `assertion_replayed`).
+    #[cfg(test)]
     pub fn open_public(
         &mut self,
         user: BoardUser,
@@ -594,6 +597,7 @@ impl Auth {
     /// checked the assertion against. The row's `scope` (CAD-1412) is
     /// derived from that typed realm — verified issuer and company,
     /// never a request field.
+    #[cfg(test)]
     pub fn open_public_bound(
         &mut self,
         user: BoardUser,
@@ -956,6 +960,7 @@ impl Auth {
     }
 
     /// End every session whose display id is `id`.
+    #[cfg(test)]
     pub fn revoke_id(&mut self, id: &str) -> Result<usize> {
         self.revoke_id_with_intent(id, |_| Ok(()))
     }
@@ -1053,6 +1058,7 @@ impl Auth {
     /// CAD-1006: the frame-capability consume path proves the consuming
     /// request's session resolves to the id the mint was bound to — a
     /// revoked session id fails closed. `now` is the operator clock.
+    #[cfg(test)]
     pub fn live_session_id(&mut self, id: &str, now: i64) -> Result<bool> {
         if self.prune(now) {
             self.persist()?;

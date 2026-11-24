@@ -38,7 +38,6 @@ use crate::backup::portable::{
     export_portable, export_portable_snapshot_selected, inspect_portable, restore_inactive,
     PortableExportOptions, PortableRestoreOptions, Scope,
 };
-use cadence_agent::daemon::scoped_cursor::{CursorBinding, CursorDirection};
 use crate::daemon::{ServeOptions, Shared};
 use crate::delivery::private::{self as private_delivery, VerifiedJobOrigin};
 use crate::issue::{write as issue_write, Pm};
@@ -46,6 +45,7 @@ use crate::platform::fixture_scoped_cursor_codec;
 use crate::rollout::db_file;
 use crate::store::{ConversationKind, NewAgent, Store};
 use crate::test_seam::Asserted;
+use cadence_agent::daemon::scoped_cursor::{CursorBinding, CursorDirection};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -415,9 +415,10 @@ fn cad2215_portable_import_cannot_reuse_source_cursor_binding() {
 
     // The same admitted key material cannot make the imported namespace open
     // the source token, and the source fingerprint does not verify there.
-    let imported_codec = fixture_scoped_cursor_codec(&state, Some(tracker.as_path()), &imported_workspace)
-        .expect("the same admitted record loads")
-        .expect("the same keys build a codec for the imported namespace");
+    let imported_codec =
+        fixture_scoped_cursor_codec(&state, Some(tracker.as_path()), &imported_workspace)
+            .expect("the same admitted record loads")
+            .expect("the same keys build a codec for the imported namespace");
     assert_ne!(
         imported_codec.keyring_fingerprint(),
         source_fingerprint.as_str(),

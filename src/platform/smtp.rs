@@ -26,8 +26,13 @@
 //! acceptance/refusal only — never delivery, never reads. There is
 //! no bulk path in this ticket.
 
-#[cfg(all(test, unix, feature = "test-seam"))]
-pub(crate) mod test_artifact_adapter;
+#[cfg(all(
+    unix,
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "store-test-support"))
+))]
+#[cfg_attr(not(test), doc(hidden))]
+pub mod test_artifact_adapter;
 
 use super::connections::{CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor};
 use crate::contract_fixture::ToolTable;

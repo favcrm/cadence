@@ -753,7 +753,8 @@ impl Store {
     /// There is no creator setter: the only way a creator lands is a
     /// verified argument at creation.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn app_run_create_attributed(
+    #[doc(hidden)]
+    pub fn app_run_create_attributed(
         &self,
         request: LocalRunRequest<'_>,
         context: Option<&super::app_contexts::ContextProof>,

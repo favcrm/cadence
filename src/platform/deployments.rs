@@ -113,13 +113,20 @@ fn reviewed_media_pin(pin: &str) -> Option<&'static str> {
 /// Only validated image metadata can produce this construction proof. It
 /// authorizes one fixed internal media door, not arbitrary HTTP or a lease.
 #[derive(Clone, Debug)]
-pub(crate) struct HostedMediaAdmission {
+#[cfg_attr(all(debug_assertions, feature = "store-test-support"), doc(hidden))]
+pub struct HostedMediaAdmission {
     /// The reviewed manifest pin the image metadata asserted — only
     /// `MANIFEST_PIN` (@3) or `TEXT_MANIFEST_PIN` (@4), never a free string.
     pin: &'static str,
 }
 
 impl HostedMediaAdmission {
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn pin(&self) -> &'static str {
+        self.pin
+    }
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn pin(&self) -> &'static str {
         self.pin
     }
@@ -278,12 +285,23 @@ impl DeploymentMetadata {
     /// Obtain the image or sandbox provenance established by a disk loader.
     /// Parsing metadata alone never creates this capability.
     pub fn verified(&self) -> Option<VerifiedDeploymentMetadata<'_>> {
-        self.disk_validated.then_some(VerifiedDeploymentMetadata(self))
+        self.disk_validated
+            .then_some(VerifiedDeploymentMetadata(self))
     }
 
     /// The MEDIA assertion grants media only. CAD-1158: an explicit
     /// transport match, so an SMTP-only assertion never yields a media
     /// admission (the find-first-transport pitfall).
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn hosted_media(&self) -> Option<HostedMediaAdmission> {
+        self.providers
+            .iter()
+            .find(|entry| matches!(entry.transport, Some(DeploymentTransport::HostedMediaLease)))
+            .and_then(|entry| reviewed_media_pin(&entry.manifest_pin))
+            .map(|pin| HostedMediaAdmission { pin })
+    }
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn hosted_media(&self) -> Option<HostedMediaAdmission> {
         self.providers
             .iter()
@@ -364,6 +382,12 @@ impl VerifiedDeploymentMetadata<'_> {
         self.0.hosted_company_master()
     }
 
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn hosted_media(&self) -> Option<HostedMediaAdmission> {
+        self.0.hosted_media()
+    }
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn hosted_media(&self) -> Option<HostedMediaAdmission> {
         self.0.hosted_media()
     }

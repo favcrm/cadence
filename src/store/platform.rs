@@ -1159,7 +1159,8 @@ impl Store {
     /// on that lock (CAD-577 review 344, note 3). A proposer that observed
     /// the pre-revoke approval still passes the old digest here; the
     /// re-read sees the revoke and subtracts instead of merging.
-    pub(crate) fn app_grants_reconcile(
+    #[doc(hidden)]
+    pub fn app_grants_reconcile(
         &self,
         app: &str,
         digest: Option<&str>,
@@ -1187,7 +1188,8 @@ impl Store {
     /// Record an approval and derive its grants in one transaction, so a
     /// concurrent reconcile cannot observe the grants without the
     /// approval that justifies them.
-    pub(crate) fn app_approve_with_grants(
+    #[doc(hidden)]
+    pub fn app_approve_with_grants(
         &self,
         approval: Value,
         app: &str,
@@ -1210,7 +1212,8 @@ impl Store {
     /// Record a withdrawn approval and subtract its derived grants in
     /// one transaction (CAD-577). The approval write and the grant
     /// write cannot land apart.
-    pub(crate) fn app_revoke_with_record(
+    #[doc(hidden)]
+    pub fn app_revoke_with_record(
         &self,
         approval: Value,
         app: &str,
@@ -1242,7 +1245,8 @@ impl Store {
     /// subtracting only scopes the kept install (or another app) does
     /// not still derive. The approval event is left alone — the caller
     /// uses this when that approval already binds to `install_id`.
-    pub(crate) fn app_grants_drop_other_installs(
+    #[doc(hidden)]
+    pub fn app_grants_drop_other_installs(
         &self,
         app: &str,
         install_id: &str,

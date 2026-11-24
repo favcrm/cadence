@@ -15,13 +15,14 @@ use runtime_guard::read_seam;
 pub use runtime_guard::{
     install_builtin_guarded, remove_guarded, remove_preview, restore_guarded, update_check,
     with_completed_bundle_snapshot, with_runtime_read, with_runtime_snapshot,
-    with_runtime_snapshot_pair, with_runtime_snapshot_proof, with_runtime_snapshot_pair_proof,
+    with_runtime_snapshot_pair, with_runtime_snapshot_pair_proof, with_runtime_snapshot_proof,
     RuntimeSnapshot,
 };
 
 /// Only this source-owned marker proves a request failed before its first
 /// authoritative mutation. A transport status or an error string cannot do so.
-pub(crate) fn hosted_mutation_outcome(
+#[doc(hidden)]
+pub fn hosted_mutation_outcome(
     result: Result<Value>,
     mutation_started: bool,
     operation_id: Option<&str>,

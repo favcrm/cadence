@@ -553,7 +553,6 @@ pub struct Opened {
     pub session: SessionView,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,6 +29,11 @@ use std::sync::Arc;
 
 use super::Store;
 
+#[cfg(all(not(debug_assertions), feature = "store-test-support"))]
+compile_error!(
+    "feature `store-test-support` exposes raw Store test transactions and must never be compiled into a release build"
+);
+
 #[path = "owner.rs"]
 pub(crate) mod owner;
 
@@ -970,6 +975,20 @@ impl Store {
     /// closure. The authorizer stays Disarmed, so even facade DML verbs
     /// refuse; only the guard opens/finishes the deferred read transaction.
     /// Owned results cannot carry a prepared statement outside the snapshot.
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn read_tx<R>(&self, f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>) -> Result<R>
+    where
+        R: 'static,
+    {
+        self.sealed_tx(GuardState::DISARMED, true, f)
+    }
+
+    /// A consistent read snapshot remains available after lease loss or
+    /// closure. The authorizer stays Disarmed, so even facade DML verbs
+    /// refuse; only the guard opens/finishes the deferred read transaction.
+    /// Owned results cannot carry a prepared statement outside the snapshot.
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn read_tx<R>(
         &self,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
@@ -1404,7 +1423,11 @@ impl Store {
     /// store refuses), and the callback never reaches a `Connection`/
     /// `Statement`/tx-boundary. Test/seam only — never a production
     /// writer.
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(any(
+        test,
+        feature = "test-seam",
+        all(debug_assertions, feature = "store-test-support")
+    ))]
     #[allow(dead_code)]
     #[doc(hidden)]
     pub fn fixture_write<R>(
@@ -1831,7 +1854,8 @@ impl Store {
 /// inherent wrappers that flatten errors for prose callers; `StoreConn`
 /// is how a business `*_in` helper written once runs on a read guard, a
 /// live `Transaction`, and the sealed write facade alike.
-pub(crate) trait StoreConn {
+#[doc(hidden)]
+pub trait StoreConn {
     fn execute(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<usize>;
     fn execute_batch(&self, sql: &str) -> rusqlite::Result<()>;
     fn query_row<T>(

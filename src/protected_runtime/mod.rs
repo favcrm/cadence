@@ -91,9 +91,9 @@ pub use client::RootOwnerClient;
 #[doc(hidden)]
 pub use ops::RuntimeCaller;
 #[doc(hidden)]
-pub use qualified::QualifiedRuntime;
-#[doc(hidden)]
 pub use profile::LocalProfile;
+#[doc(hidden)]
+pub use qualified::QualifiedRuntime;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use qualified::{CurrentEligibility, RuntimeStatus};
 pub(crate) use store::{CheckpointAck, CheckpointV1};

@@ -21,14 +21,17 @@ pub use settings_authority::{ProfileBody, SettingsDoc, SettingsSnapshot};
 /// CAD-1085: the native protected Connection authority (config, reviewed
 /// operation policy, manifest, one-use approval, quotes, immutable dispatch
 /// rows, settlement and the metadata-only protected ledger).
-pub(crate) mod connection_dispatch;
+#[doc(hidden)]
+pub mod connection_dispatch;
 /// CAD-1085: metadata-only human credential requests and their one-use entry
 /// attempts.
-pub(crate) mod credential_requests;
+#[doc(hidden)]
+pub mod credential_requests;
 /// CAD-1085: the broker-private native-model source/task/configuration/
 /// request rows. Registered here so they share the one forward migration and
 /// the protected authority journal.
-pub(crate) mod native_model_turn;
+#[doc(hidden)]
+pub mod native_model_turn;
 mod platform;
 #[doc(hidden)]
 pub use platform::{scope_list, scope_name};
@@ -38,9 +41,6 @@ pub use platform::{
     SCOPE_REVOKED_EVENT,
 };
 mod effects;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[doc(hidden)]
-pub use effects::effect_bind_in;
 pub use effects::{
     presser_json, DraftRow, EffectKey, EffectRow, EFFECT_CANCELLED_EVENT, EFFECT_DECIDED_EVENT,
     EFFECT_EXECUTED_EVENT, EFFECT_FAILED_EVENT, EFFECT_NEEDS_YOU_EVENT, EFFECT_REQUESTED_EVENT,
@@ -104,8 +104,9 @@ pub mod routines;
 pub mod workspace_settings;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
 mod messages;
-#[cfg(test)]
-pub(crate) use messages::take_decoded_messages;
+#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg_attr(not(test), doc(hidden))]
+pub use messages::take_decoded_messages;
 pub use messages::{
     report_timeout_secs, IssueSelection, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
     DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES, NUDGE_SOURCE,
@@ -171,6 +172,10 @@ mod schema;
 /// CAD-2215: the nullable `connection_metadata.cursor_keyring_fingerprint`
 /// bind for the explicit operator initialization.
 pub(crate) mod scoped_cursor_keys;
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub mod seal;
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
 pub(crate) mod seal;
 pub(crate) use scoped_cursor_keys::CursorKeyringInit;
 pub(crate) mod wiki_transfers;
@@ -183,10 +188,20 @@ pub use seal::OpenMode;
 // callers: every method is `pub(crate)` except the read/DML verbs
 // `execute`/`execute_batch`/`query_row`/`query_map` a hook legitimately
 // needs, and there is no `commit`/`rollback`/`Connection` escape.
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub use seal::StoreConn;
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+pub(crate) use seal::StoreConn;
 pub use seal::WriteTxn;
-pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx, StoreConn};
-#[cfg(all(test, target_os = "linux", feature = "test-seam"))]
-pub(crate) mod cad1128_commit_refusal;
+pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx};
+#[cfg(all(
+    target_os = "linux",
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "store-test-support"))
+))]
+#[cfg_attr(not(test), doc(hidden))]
+pub mod cad1128_commit_refusal;
 #[cfg(test)]
 mod tests;
 
@@ -195,6 +210,16 @@ mod tests;
 /// reader (`audit`, `issue retro`, `doctor host`) share one WAL store.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub fn now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
 pub(crate) fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -244,7 +269,8 @@ pub struct Store {
     /// Test seam (CAD-694): the `shutdown_entries` retry backoff
     /// multiplier in milliseconds — production 50; tests set 0 so the
     /// retry bound is proven without wall-clock sleeps.
-    pub(crate) shutdown_backoff_ms: u64,
+    #[doc(hidden)]
+    pub shutdown_backoff_ms: u64,
     /// CAD-1011: the producer-closure guard state shared with this
     /// connection's SQLite authorizer — arm level + tx-control phase,
     /// driven under `conn`'s mutex so a prepared write can never step
@@ -316,8 +342,9 @@ impl Store {
     /// reads it before and after a call and asserts it did not move, to
     /// prove a callback switched to the lock-free
     /// `workspace::with_runtime_read` writes nothing. Compiled out of release.
-    #[cfg(test)]
-    pub(crate) fn total_changes_for_test(&self) -> u64 {
+    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg_attr(not(test), doc(hidden))]
+    pub fn total_changes_for_test(&self) -> u64 {
         self.conn().total_changes()
     }
 
@@ -427,6 +454,16 @@ impl Store {
         &self.db_identity
     }
 
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn write_tx<R>(&self, f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>) -> Result<R>
+    where
+        R: 'static,
+    {
+        self.write_tx_checkpointed(true, f)
+    }
+
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn write_tx<R>(
         &self,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
@@ -581,10 +618,8 @@ impl Store {
     /// `Unknown`), so `protected_open` is always false — the refusal is
     /// written so the hook path fails closed the day a protected open
     /// becomes reachable, not because one exists now.
-    pub(crate) fn set_shutdown_entries_hook(
-        &mut self,
-        hook: Option<ShutdownEntriesHook>,
-    ) -> Result<()> {
+    #[doc(hidden)]
+    pub fn set_shutdown_entries_hook(&mut self, hook: Option<ShutdownEntriesHook>) -> Result<()> {
         if self.protected_open && hook.is_some() {
             return Err(Error::rejected(
                 "shutdown_entries hook cannot be registered on a \

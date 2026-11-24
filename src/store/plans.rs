@@ -380,7 +380,8 @@ impl Store {
     /// Optional job read: `Ok(None)` only when no row exists. Any other
     /// store failure propagates, so a caller can never mistake a failed
     /// read for an absent job.
-    pub(crate) fn job_opt(&self, id: &str) -> Result<Option<Job>> {
+    #[doc(hidden)]
+    pub fn job_opt(&self, id: &str) -> Result<Option<Job>> {
         let conn = self.conn();
         match conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job) {
             Ok(job) => Ok(Some(job)),
@@ -523,7 +524,8 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub(crate) fn has_open_job_for_issue(&self, issue: &str) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn has_open_job_for_issue(&self, issue: &str) -> Result<bool> {
         Ok(self
             .conn()
             .query_opt(OPEN_JOB_FOR_ISSUE, [issue], |_| Ok(()))?
@@ -621,11 +623,7 @@ impl Store {
     /// the stored job/task columns. A payload field that is missing or
     /// unreadable stays `None` so the caller refuses rather than guesses.
     #[doc(hidden)]
-    pub fn task_history_events(
-        &self,
-        job: &str,
-        task: &str,
-    ) -> Result<Vec<TaskHistoryEvent>> {
+    pub fn task_history_events(&self, job: &str, task: &str) -> Result<Vec<TaskHistoryEvent>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
                 "SELECT kind,alias,payload FROM events
@@ -727,7 +725,8 @@ impl Store {
     }
 
     /// The issue binding of each assigned, non-terminal task in the fleet.
-    pub(crate) fn open_task_issue_bindings(
+    #[doc(hidden)]
+    pub fn open_task_issue_bindings(
         &self,
     ) -> Result<std::collections::HashMap<String, Option<String>>> {
         self.read_tx(|conn| {
@@ -1166,7 +1165,8 @@ impl Store {
     /// Admit a daemon-prepared delivery with the existing native job guards.
     /// The optional delivery is consumed only for a genuinely new kickoff;
     /// an accepted duplicate retains its original message and selection.
-    pub(crate) fn dispatch_task_planned(
+    #[doc(hidden)]
+    pub fn dispatch_task_planned(
         &self,
         plan: &DispatchPlan,
         delivery: Option<PreparedJobKickoff>,

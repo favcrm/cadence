@@ -142,7 +142,7 @@ fn check_run_binding(
     slot: &str,
     binding_digest: &str,
 ) -> Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
     if workspace.is_store_fixture() {
         return Ok(());
     }
@@ -152,11 +152,13 @@ fn check_run_binding(
             [run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         ).optional()?.ok_or_else(|| Error::rejected("app capability run is unavailable"))?;
     let snapshot: Value = serde_json::from_str(&snapshot)?;
-    if install != workspace.install() || bundle != workspace.digest()
+    if install != workspace.install()
+        || bundle != workspace.digest()
         || approved.as_deref() != Some(digest.as_str())
         || app_runs::material_digest(&snapshot) != digest
         || snapshot["capabilities"][slot]["digest"].as_str() != Some(binding_digest)
-        || !snapshot["workflow"]["capability_slots"].as_array()
+        || !snapshot["workflow"]["capability_slots"]
+            .as_array()
             .is_some_and(|slots| slots.iter().any(|item| item.as_str() == Some(slot)))
     {
         return Err(Error::rejected("app capability snapshot binding changed"));
@@ -353,11 +355,7 @@ impl Store {
     }
 
     #[doc(hidden)]
-    pub fn app_capability_result_for_slot(
-        &self,
-        run: &str,
-        slot: &str,
-    ) -> Result<Option<Value>> {
+    pub fn app_capability_result_for_slot(&self, run: &str, slot: &str) -> Result<Option<Value>> {
         let id = self
             .conn()
             .query_row(

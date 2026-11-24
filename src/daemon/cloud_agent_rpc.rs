@@ -841,10 +841,7 @@ impl Shared {
                 || (registered.is_none() && self.store.alias_has_cloud_content(alias)?)
             {
                 // Missing cloud authority never supplies caller authority.
-                if matches!(
-                    self.agent_caller(peer_pid, verb)?,
-                    AgentCaller::Agent(_)
-                ) {
+                if matches!(self.agent_caller(peer_pid, verb)?, AgentCaller::Agent(_)) {
                     self.cloud_peer_isolation(peer_pid)?;
                 }
                 let (derived, ordinary) = self.store.cloud_projection_rows(alias, message_id)?;
@@ -1006,9 +1003,7 @@ impl Shared {
         }
         let (viewer, operator) = match self.agent_caller(peer_pid, "cloud read")? {
             AgentCaller::Operator => (None, true),
-            AgentCaller::Agent(caller) => {
-                (Some(self.store.agent(&caller)?.uid), false)
-            }
+            AgentCaller::Agent(caller) => (Some(self.store.agent(&caller)?.uid), false),
         };
         // Delivery eligibility comes first: unrelated readers keep ordinary
         // mail without attempting cloud access. Each eligible origin below

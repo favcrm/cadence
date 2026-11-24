@@ -22,10 +22,14 @@ mod encrypted_fs;
 /// CAD-2215: the fixed owner-selected path-only scoped-cursor keyring
 /// record. `pub(crate)` — no platform/custody surface re-exports it.
 pub(crate) mod scoped_cursor_config;
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub use encrypted_fs::Directories as ControlledDirectories;
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+pub(crate) use encrypted_fs::Directories as ControlledDirectories;
 #[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub use scoped_cursor_config::fixture_codec as fixture_scoped_cursor_codec;
-pub(crate) use encrypted_fs::Directories as ControlledDirectories;
 /// CAD-1128: the encrypted-SQLite custody vault. `pub(crate)` — the
 /// manager and its key material are daemon-internal; no public
 /// platform/custody re-export exposes them.
@@ -67,9 +71,12 @@ pub struct AttachView<'a> {
     pub hosted_email: &'a mut Option<hosted_email::HostedEmail>,
     pub hosted_whatsapp: &'a mut Option<hosted_whatsapp::HostedWhatsapp>,
     pub smtp_internal: &'a mut Option<smtp_internal::SmtpInternal>,
-    pub social_publish_sender: &'a mut Option<std::sync::Arc<dyn agenticos_external::publish::PublishSender>>,
-    pub social_media_importer: &'a mut Option<std::sync::Arc<agenticos_external::media_import::MediaImporter>>,
-    pub social_media_resolver: &'a mut Option<std::sync::Arc<agenticos_external::media_import::MediaResolver>>,
+    pub social_publish_sender:
+        &'a mut Option<std::sync::Arc<dyn agenticos_external::publish::PublishSender>>,
+    pub social_media_importer:
+        &'a mut Option<std::sync::Arc<agenticos_external::media_import::MediaImporter>>,
+    pub social_media_resolver:
+        &'a mut Option<std::sync::Arc<agenticos_external::media_import::MediaResolver>>,
 }
 
 impl PlatformRegistry for AttachView<'_> {
@@ -91,19 +98,26 @@ pub(crate) struct TestComposition {
     pub hosted_email: Option<hosted_email::HostedEmail>,
     pub hosted_whatsapp: Option<hosted_whatsapp::HostedWhatsapp>,
     pub smtp_internal: Option<smtp_internal::SmtpInternal>,
-    pub social_publish_sender: Option<std::sync::Arc<dyn agenticos_external::publish::PublishSender>>,
-    pub social_media_importer: Option<std::sync::Arc<agenticos_external::media_import::MediaImporter>>,
-    pub social_media_resolver: Option<std::sync::Arc<agenticos_external::media_import::MediaResolver>>,
+    pub social_publish_sender:
+        Option<std::sync::Arc<dyn agenticos_external::publish::PublishSender>>,
+    pub social_media_importer:
+        Option<std::sync::Arc<agenticos_external::media_import::MediaImporter>>,
+    pub social_media_resolver:
+        Option<std::sync::Arc<agenticos_external::media_import::MediaResolver>>,
 }
 
 #[cfg(test)]
 impl PlatformRegistry for TestComposition {
-    fn platforms_mut(&mut self) -> &mut PlatformMap { &mut self.platforms }
+    fn platforms_mut(&mut self) -> &mut PlatformMap {
+        &mut self.platforms
+    }
 }
 
 #[cfg(test)]
 impl LocalRegistry for TestComposition {
-    fn outbox_dir_mut(&mut self) -> &mut Option<std::path::PathBuf> { &mut self.outbox_dir }
+    fn outbox_dir_mut(&mut self) -> &mut Option<std::path::PathBuf> {
+        &mut self.outbox_dir
+    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
+use crate::error::{Error, Result};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
-use serde_json::Value;
-use crate::error::{Error, Result};
 
 const FILE: &str = "app-teams.json";
 #[doc(hidden)]

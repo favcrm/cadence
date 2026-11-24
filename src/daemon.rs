@@ -25,18 +25,18 @@ pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRec
 #[doc(hidden)]
 #[path = "daemon/monitor_scope.rs"]
 pub mod monitor_scope;
-pub(crate) use screen_frame::{render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION};
 #[cfg(test)]
 pub(crate) use screen_frame::render_package_frame_html;
-#[doc(hidden)]
-#[path = "daemon/screen_frame.rs"]
-pub mod screen_frame;
+pub(crate) use screen_frame::{render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION};
 #[doc(hidden)]
 #[path = "daemon/scoped_cursor.rs"]
 pub mod scoped_cursor;
 #[doc(hidden)]
 #[path = "daemon/scoped_cursor_config.rs"]
 pub mod scoped_cursor_config;
+#[doc(hidden)]
+#[path = "daemon/screen_frame.rs"]
+pub mod screen_frame;
 #[doc(hidden)]
 #[path = "daemon/social_effect_id.rs"]
 pub mod social_effect_id;

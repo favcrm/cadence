@@ -3,10 +3,10 @@
 //! every workflow worker role from here, so an app (or a forged request) can
 //! never name them. Stored beside the daemon's other state as one small
 //! file; a corrupt file refuses (it is never read as "no team").
+use super::app_team_state::{load, parse, path, team_of, Team, LOCK};
 use super::*;
 use crate::issue::app_catalog::workspace;
 use std::collections::BTreeMap;
-use super::app_team_state::{load, parse, path, team_of, Team, LOCK};
 
 const ROLES_MAX: usize = 8;
 

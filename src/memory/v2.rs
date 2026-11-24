@@ -456,7 +456,8 @@ pub(super) fn transition_locked(
     )
 }
 
-pub(crate) fn classify(
+#[doc(hidden)]
+pub fn classify(
     pm: &Pm,
     project: Option<&str>,
     slug: &str,
@@ -552,7 +553,8 @@ fn feedback_after_save_for_test() {
 /// Holds the tracker lock before native ownership is fenced. Only the atomic
 /// file save runs under Store's writer; Git hooks run afterwards, without that
 /// mutex. A failed native transaction restores the file before any Git commit.
-pub(crate) struct FeedbackWrite<'a> {
+#[doc(hidden)]
+pub struct FeedbackWrite<'a> {
     pm: &'a Pm,
     lock: PmLock,
     mem: Memory,
@@ -563,7 +565,8 @@ pub(crate) struct FeedbackWrite<'a> {
 }
 
 impl<'a> FeedbackWrite<'a> {
-    pub(crate) fn lock(
+    #[doc(hidden)]
+    pub fn lock(
         pm: &'a Pm,
         project: &str,
         slug: &str,
@@ -591,11 +594,8 @@ impl<'a> FeedbackWrite<'a> {
         })
     }
 
-    pub(crate) fn save(
-        &mut self,
-        evidence: Option<&str>,
-        proof: NativeFeedbackProof,
-    ) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn save(&mut self, evidence: Option<&str>, proof: NativeFeedbackProof) -> Result<Value> {
         if proof.project != self.mem.project || proof.digest != self.digest {
             return Err(Error::rejected(
                 "feedback proof does not match the locked memory revision and project",
@@ -641,7 +641,8 @@ impl<'a> FeedbackWrite<'a> {
         )
     }
 
-    pub(crate) fn finish(mut self, outcome: Result<Value>) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn finish(mut self, outcome: Result<Value>) -> Result<Value> {
         let mut response = match outcome {
             Ok(response) => response,
             Err(error) => return Err(self.abort(error)),

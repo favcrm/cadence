@@ -54,7 +54,8 @@ pub fn main_root(dir: &Path) -> Result<PathBuf> {
 
 /// Confirm that a development path is a canonical, registered worktree of
 /// `root` and has the expected branch before an idempotent reuse.
-pub(crate) fn validate_registered_branch(root: &Path, lane: &Path, branch: &str) -> Result<()> {
+#[doc(hidden)]
+pub fn validate_registered_branch(root: &Path, lane: &Path, branch: &str) -> Result<()> {
     let meta = std::fs::symlink_metadata(lane)?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Err(Error::rejected(format!(

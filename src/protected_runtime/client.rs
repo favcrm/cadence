@@ -79,25 +79,63 @@ pub struct OwnerEvidence {
 }
 
 impl OwnerEvidence {
-    pub fn workspace_id(&self) -> &str { &self.workspace_id }
-    pub fn agent_uid(&self) -> &str { &self.agent_uid }
-    pub fn session_binding(&self) -> &str { &self.session_binding }
-    pub fn custody_domain(&self) -> &'static str { self.custody_domain }
-    pub fn custody_epoch(&self) -> u64 { self.custody_epoch }
-    pub fn owner_epoch(&self) -> u64 { self.owner_epoch }
-    pub fn runtime_generation(&self) -> u64 { self.runtime_generation }
-    pub fn enrollment_id(&self) -> &str { &self.enrollment_id }
-    pub fn phase(&self) -> &str { &self.phase }
-    pub fn fenced(&self) -> bool { self.fenced }
-    pub fn fenced_reason(&self) -> Option<&str> { self.fenced_reason.as_deref() }
-    pub fn loaded_receipt_id(&self) -> &str { &self.loaded_receipt_id }
-    pub fn observed_registry_digest(&self) -> &str { &self.observed_registry_digest }
-    pub fn node_pid(&self) -> u32 { self.node_pid }
-    pub fn node_starttime(&self) -> u64 { self.node_starttime }
-    pub fn os_uid(&self) -> u32 { self.os_uid }
-    pub fn container_id(&self) -> &str { &self.container_id }
-    pub fn image_digest(&self) -> &str { &self.image_digest }
-    pub fn profile_digest(&self) -> &str { &self.profile_digest }
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn agent_uid(&self) -> &str {
+        &self.agent_uid
+    }
+    pub fn session_binding(&self) -> &str {
+        &self.session_binding
+    }
+    pub fn custody_domain(&self) -> &'static str {
+        self.custody_domain
+    }
+    pub fn custody_epoch(&self) -> u64 {
+        self.custody_epoch
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn runtime_generation(&self) -> u64 {
+        self.runtime_generation
+    }
+    pub fn enrollment_id(&self) -> &str {
+        &self.enrollment_id
+    }
+    pub fn phase(&self) -> &str {
+        &self.phase
+    }
+    pub fn fenced(&self) -> bool {
+        self.fenced
+    }
+    pub fn fenced_reason(&self) -> Option<&str> {
+        self.fenced_reason.as_deref()
+    }
+    pub fn loaded_receipt_id(&self) -> &str {
+        &self.loaded_receipt_id
+    }
+    pub fn observed_registry_digest(&self) -> &str {
+        &self.observed_registry_digest
+    }
+    pub fn node_pid(&self) -> u32 {
+        self.node_pid
+    }
+    pub fn node_starttime(&self) -> u64 {
+        self.node_starttime
+    }
+    pub fn os_uid(&self) -> u32 {
+        self.os_uid
+    }
+    pub fn container_id(&self) -> &str {
+        &self.container_id
+    }
+    pub fn image_digest(&self) -> &str {
+        &self.image_digest
+    }
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
 }
 
 /// The root owner's authenticated prestart witness / ledger floor. Secret
@@ -113,12 +151,24 @@ pub struct PrestartEligibility {
 }
 
 impl PrestartEligibility {
-    pub fn workspace_id(&self) -> &str { &self.workspace_id }
-    pub fn owner_epoch(&self) -> u64 { self.owner_epoch }
-    pub fn database_epoch(&self) -> u64 { self.database_epoch }
-    pub fn restore_state(&self) -> &str { &self.restore_state }
-    pub fn min_sequence(&self) -> u64 { self.min_sequence }
-    pub fn min_digest(&self) -> &str { &self.min_digest }
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn database_epoch(&self) -> u64 {
+        self.database_epoch
+    }
+    pub fn restore_state(&self) -> &str {
+        &self.restore_state
+    }
+    pub fn min_sequence(&self) -> u64 {
+        self.min_sequence
+    }
+    pub fn min_digest(&self) -> &str {
+        &self.min_digest
+    }
 }
 
 /// The authenticated selector for one owned-console attachment. Private
@@ -358,9 +408,13 @@ impl RootOwnerClient {
             || prepared.server_generation != request.server_generation
             || prepared.owner_epoch != request.expected_owner_epoch
         {
-            return Err(Error::rejected("owner allocation does not match the requested subject"));
+            return Err(Error::rejected(
+                "owner allocation does not match the requested subject",
+            ));
         }
-        *prepared.listener_enrollment.lock()
+        *prepared
+            .listener_enrollment
+            .lock()
             .map_err(|_| Error::internal("operations enrollment lock poisoned"))? =
             Some(super::ops::AgentEnrollment {
                 runtime_id: prepared.runtime_id.clone(),
@@ -533,11 +587,7 @@ impl RootOwnerClient {
     /// fresh `recheck` that must agree. This is the typed surface the protected
     /// dispatch eligibility adapter consumes; it never certifies readiness by
     /// itself and never synthesizes a timestamp or epoch on failure.
-    pub fn owner_evidence(
-        &self,
-        runtime_id: &str,
-        generation: u64,
-    ) -> Result<OwnerEvidence> {
+    pub fn owner_evidence(&self, runtime_id: &str, generation: u64) -> Result<OwnerEvidence> {
         let status = self.observe(runtime_id)?;
         let qualified = self.recheck(runtime_id, generation)?;
         let identity = qualified.identity();
@@ -663,12 +713,7 @@ impl RootOwnerClient {
         })
     }
 
-    pub fn fence(
-        &self,
-        runtime_id: &str,
-        generation: u64,
-        reason: &str,
-    ) -> Result<FenceAck> {
+    pub fn fence(&self, runtime_id: &str, generation: u64, reason: &str) -> Result<FenceAck> {
         let data = self.call(
             "fence",
             serde_json::json!({

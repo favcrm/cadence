@@ -62,15 +62,13 @@ use crate::error::{Error, Result};
 
 mod isolation;
 
+#[doc(hidden)]
+pub use isolation::validate_workspace_isolated;
 pub use isolation::{
     create_home_dir, create_private_tree, refuse_real_home, workspace_for_instance,
 };
 use isolation::{refuse_symlinked_ancestry, refuse_symlinked_under};
-pub(crate) use isolation::{
-    validate_policy_for_env, workspace_for_provider_env,
-};
-#[doc(hidden)]
-pub use isolation::validate_workspace_isolated;
+pub(crate) use isolation::{validate_policy_for_env, workspace_for_provider_env};
 
 /// Marker file inside a home root declaring the new layout. The
 /// migration writes it; the content is the layout version.
@@ -685,7 +683,11 @@ fn test_guard(dir: PathBuf, rel: &str, leaf: &str) -> Result<PathBuf> {
     test_guard_in(dir, real_home().as_deref(), rel, leaf)
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(any(
+    test,
+    feature = "test-seam",
+    all(debug_assertions, feature = "store-test-support")
+))]
 fn test_guard_in(dir: PathBuf, real: Option<&Path>, rel: &str, leaf: &str) -> Result<PathBuf> {
     match real {
         Some(real) => {
@@ -729,8 +731,9 @@ pub fn guard_tracker(dir: PathBuf) -> Result<PathBuf> {
 }
 
 /// [`guard_tracker`] with the real home passed in (pure; for tests).
-#[cfg(test)]
-pub(crate) fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
+#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg_attr(not(test), doc(hidden))]
+pub fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
     test_guard_in(dir, real, ".", "pm")
 }
 
@@ -739,7 +742,11 @@ pub(crate) fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<Path
 /// canonicalised (so a symlink is followed before any `..` after it is
 /// applied, exactly as the OS would); `.` and `..` are folded
 /// lexically only in the not-yet-existing tail.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(any(
+    test,
+    feature = "test-seam",
+    all(debug_assertions, feature = "store-test-support")
+))]
 fn resolve_for_compare(p: &Path) -> PathBuf {
     use std::path::Component;
     let abs = if p.is_absolute() {
@@ -769,7 +776,11 @@ fn resolve_for_compare(p: &Path) -> PathBuf {
     abs
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(any(
+    test,
+    feature = "test-seam",
+    all(debug_assertions, feature = "store-test-support")
+))]
 fn refuse_under(dir: PathBuf, root: &Path) -> Result<PathBuf> {
     let root = resolve_for_compare(root);
     if resolve_for_compare(&dir).starts_with(&root) {
@@ -796,8 +807,9 @@ fn real_home() -> Option<PathBuf> {
 
 /// One lock for every CAD-1922 test that rewrites process environment, in
 /// this module and in `sandbox`: they share `HOME` and `CADENCE_*`.
-#[cfg(test)]
-pub(crate) static CAD1922_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg_attr(not(test), doc(hidden))]
+pub static CAD1922_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod guard_tests {

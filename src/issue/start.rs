@@ -22,12 +22,10 @@ use crate::worktree::{self, layout};
 
 mod base;
 
-use base::{branch_base, resolve_existing_base, worktree_branch};
 pub use base::declared_repos;
+use base::{branch_base, resolve_existing_base, worktree_branch};
 #[doc(hidden)]
-pub use base::{
-    configured_integration, intake_branch_creation_base, resolve_base, resolve_repo,
-};
+pub use base::{configured_integration, intake_branch_creation_base, resolve_base, resolve_repo};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
 /// [--assignee <alias>]`.

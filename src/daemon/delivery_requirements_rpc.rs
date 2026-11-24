@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use super::Shared;
 pub(super) use crate::daemon::delivery_classifier::branch_segment;
 use crate::daemon::delivery_classifier::{
-    api, classify_from, default_branch, gh, pr_view, require_queue_authority,
-    GhRead, RequirementInputs,
+    api, classify_from, default_branch, gh, pr_view, require_queue_authority, GhRead,
+    RequirementInputs,
 };
 use crate::error::{Error, Result};
 use crate::issue::{self, delivery_policy};

@@ -12,7 +12,9 @@
 //! private-project availability.
 
 use super::*;
-use crate::daemon::scoped_cursor::{CursorBinding, CursorDirection, CursorError, ScopedCursorCodec, KEY_BYTES};
+use crate::daemon::scoped_cursor::{
+    CursorBinding, CursorDirection, CursorError, ScopedCursorCodec, KEY_BYTES,
+};
 use crate::test_seam::Asserted;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};

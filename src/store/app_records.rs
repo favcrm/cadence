@@ -402,7 +402,8 @@ pub struct RecordStore {
     conn: Mutex<Connection>,
 }
 
-pub(crate) struct AssistantOperationUpdate<'a> {
+#[doc(hidden)]
+pub struct AssistantOperationUpdate<'a> {
     pub operation_id: &'a str,
     pub context: &'a str,
     pub expected_revision: i64,
@@ -414,7 +415,8 @@ pub(crate) struct AssistantOperationUpdate<'a> {
     pub error: Option<&'a str>,
 }
 
-pub(crate) struct AssistantPermissionWrite<'a> {
+#[doc(hidden)]
+pub struct AssistantPermissionWrite<'a> {
     pub permission_id: &'a str,
     pub context: &'a str,
     pub action_id: &'a str,
@@ -447,7 +449,8 @@ fn read_assistant_operation(
 }
 
 impl RecordStore {
-    pub(crate) fn install(&self) -> &str {
+    #[doc(hidden)]
+    pub fn install(&self) -> &str {
         &self.install_id
     }
     /// Open (creating and initializing when missing) the
@@ -1116,6 +1119,24 @@ impl RecordStore {
         })
     }
 
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn conn(&self) -> MutexGuard<'_, Connection> {
+        match self.conn.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.conn.clear_poison();
+                if !guard.is_autocommit() {
+                    let _ = guard.execute_batch("ROLLBACK");
+                }
+                eprintln!("record store: connection lock poisoned; recovered");
+                guard
+            }
+        }
+    }
+
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         match self.conn.lock() {
             Ok(guard) => guard,
@@ -2745,7 +2766,8 @@ impl RecordStore {
         read_assistant_operation(&conn, operation_id, context)
     }
 
-    pub(crate) fn app_assistant_operation_set(
+    #[doc(hidden)]
+    pub fn app_assistant_operation_set(
         &self,
         update: AssistantOperationUpdate<'_>,
     ) -> Result<Value> {
@@ -2935,7 +2957,8 @@ impl RecordStore {
         Ok(out)
     }
 
-    pub(crate) fn app_assistant_permission_save(
+    #[doc(hidden)]
+    pub fn app_assistant_permission_save(
         &self,
         permission: AssistantPermissionWrite<'_>,
     ) -> Result<Value> {

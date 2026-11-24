@@ -6,7 +6,9 @@ use cadence_core::connection_dispatch::ledger::{CheckpointAckV1, CheckpointV1, L
 use cadence_core::connection_dispatch::primitives::{Counter, Digest, Revision};
 
 use crate::error::{Error, Result};
-use crate::store::connection_dispatch::{BootAuthority, ExternalFloorV1, ProtectedCheckpointContext, ProtectedCheckpointWriter};
+use crate::store::connection_dispatch::{
+    BootAuthority, ExternalFloorV1, ProtectedCheckpointContext, ProtectedCheckpointWriter,
+};
 use crate::store::Store;
 
 use super::client::PrestartEligibility;
@@ -42,10 +44,18 @@ impl OwnerLink {
     }
 
     pub fn client(&self) -> Result<Arc<RootOwnerClient>> {
-        if let Some(client) = self.client.read().ok().and_then(|guard| guard.as_ref().cloned()) {
+        if let Some(client) = self
+            .client
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+        {
             return Ok(client);
         }
-        let client = Arc::new(RootOwnerClient::connect(&self.profile, self.generation.clone())?);
+        let client = Arc::new(RootOwnerClient::connect(
+            &self.profile,
+            self.generation.clone(),
+        )?);
         if let Ok(mut guard) = self.client.write() {
             *guard = Some(Arc::clone(&client));
         }
@@ -58,6 +68,16 @@ impl OwnerLink {
         }
     }
 
+    #[doc(hidden)]
+    pub fn connected_client(&self) -> Result<Arc<RootOwnerClient>> {
+        self.client
+            .read()
+            .map_err(|_| Error::rejected("owner channel state is unavailable"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Error::rejected("owner channel is not authenticated"))
+    }
+
     /// Idempotent reads reconnect once; mutations must use the client directly.
     fn read<T>(&self, f: impl Fn(&RootOwnerClient) -> Result<T>) -> Result<T> {
         let client = self.client()?;
@@ -68,7 +88,11 @@ impl OwnerLink {
                 let fresh = self.client()?;
                 f(&fresh).map_err(|second| {
                     if matches!(second.kind(), "unknown") {
-                        Error::unknown(format!("owner recheck failed after reconnect: {} / {}", first.kind(), second.kind()))
+                        Error::unknown(format!(
+                            "owner recheck failed after reconnect: {} / {}",
+                            first.kind(),
+                            second.kind()
+                        ))
                     } else {
                         second
                     }
@@ -91,23 +115,33 @@ impl OwnerLink {
 
     /// Install the real owner-backed checkpoint writer, including before the owner is online.
     pub fn install_checkpoint(self: &Arc<Self>, store: &Store) -> Result<()> {
-        store.install_protected_checkpoint(Arc::new(OwnerCheckpoint { link: Arc::clone(self) }))
+        store.install_protected_checkpoint(Arc::new(OwnerCheckpoint {
+            link: Arc::clone(self),
+        }))
     }
 
     /// Compare an authenticated, profile-bound witness with the actual local ledger.
-    pub fn current_authority(&self, store: &Store, require_enabled: bool) -> Result<(PrestartEligibility, OwnerBootAuthority)> {
+    pub fn current_authority(
+        &self,
+        store: &Store,
+        require_enabled: bool,
+    ) -> Result<(PrestartEligibility, OwnerBootAuthority)> {
         let witness = self.client()?.prestart_eligibility()?;
         if witness.workspace_id() != self.profile.workspace_id()
             || witness.database_epoch() != self.profile.database_epoch()
             || witness.restore_state() != "stable"
         {
-            return Err(Error::invalid("runtime_unqualified", "the live owner does not authorize this database lineage"));
+            return Err(Error::invalid(
+                "runtime_unqualified",
+                "the live owner does not authorize this database lineage",
+            ));
         }
         let floor = ExternalFloorV1 {
             workspace_id: witness.workspace_id().to_string(),
             min_sequence: witness.min_sequence(),
-            min_digest: Digest::try_from(witness.min_digest().to_string())
-                .map_err(|_| Error::invalid("runtime_unqualified", "the owner floor is malformed"))?,
+            min_digest: Digest::try_from(witness.min_digest().to_string()).map_err(|_| {
+                Error::invalid("runtime_unqualified", "the owner floor is malformed")
+            })?,
         };
         let authority = if require_enabled {
             store.protected_boot_preflight(&floor)?
@@ -127,22 +161,39 @@ struct OwnerCheckpoint {
 }
 
 impl ProtectedCheckpointWriter for OwnerCheckpoint {
-    fn context(&self, workspace_id: &str, database_epoch: Revision) -> Result<ProtectedCheckpointContext> {
+    fn context(
+        &self,
+        workspace_id: &str,
+        database_epoch: Revision,
+    ) -> Result<ProtectedCheckpointContext> {
         let witness = self.link.read(|client| client.prestart_eligibility())?;
         if witness.workspace_id() != workspace_id
             || witness.database_epoch() != database_epoch.get()
             || witness.restore_state() != "stable"
         {
-            return Err(Error::invalid("runtime_unqualified", "the live owner does not authorize this core history"));
+            return Err(Error::invalid(
+                "runtime_unqualified",
+                "the live owner does not authorize this core history",
+            ));
         }
         Ok(ProtectedCheckpointContext {
-            owner_epoch: Revision::new(witness.owner_epoch()).map_err(|_| Error::invalid("runtime_unqualified", "the owner epoch is malformed"))?,
-            minimum_sequence: Counter::new(witness.min_sequence()).map_err(|_| Error::invalid("runtime_unqualified", "the owner minimum is malformed"))?,
-            minimum_digest: Digest::try_from(witness.min_digest().to_string()).map_err(|_| Error::invalid("runtime_unqualified", "the owner minimum is malformed"))?,
+            owner_epoch: Revision::new(witness.owner_epoch()).map_err(|_| {
+                Error::invalid("runtime_unqualified", "the owner epoch is malformed")
+            })?,
+            minimum_sequence: Counter::new(witness.min_sequence()).map_err(|_| {
+                Error::invalid("runtime_unqualified", "the owner minimum is malformed")
+            })?,
+            minimum_digest: Digest::try_from(witness.min_digest().to_string()).map_err(|_| {
+                Error::invalid("runtime_unqualified", "the owner minimum is malformed")
+            })?,
         })
     }
 
-    fn checkpoint(&self, checkpoint: &CheckpointV1, prefix: &[LedgerRecordV1]) -> Result<CheckpointAckV1> {
+    fn checkpoint(
+        &self,
+        checkpoint: &CheckpointV1,
+        prefix: &[LedgerRecordV1],
+    ) -> Result<CheckpointAckV1> {
         self.link.client()?.checkpoint(checkpoint, prefix, 1)
     }
 

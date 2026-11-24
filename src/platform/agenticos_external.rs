@@ -133,6 +133,17 @@ impl AgenticosExternalAdapter {
         Self::new(valid_base(base)?, deployment_pin, Transport::ExternalBearer)
     }
 
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn hosted_media(admission: super::deployments::HostedMediaAdmission) -> Result<Self> {
+        Self::new(
+            "http://api.internal".into(),
+            Some(admission.pin()),
+            Transport::HostedMediaLease,
+        )
+    }
+
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn hosted_media(
         admission: super::deployments::HostedMediaAdmission,
     ) -> Result<Self> {
@@ -1662,7 +1673,6 @@ pub fn register_with_deployment_pin(
     Ok(())
 }
 
-
 /// Trusted hosted metadata alone admits the credentialless media door.
 /// Otherwise external access remains opt-in per daemon. Caller URL settings
 /// and conflicting pre-registration cannot replace a hosted transport.
@@ -1673,7 +1683,12 @@ pub fn attach(opts: &mut impl super::PlatformComposition) -> Result<()> {
         *opts.provider_deployments = super::deployments::load()?;
     }
     // Cache the validated metadata so all composition readers share it.
-    if let Some(admission) = opts.provider_deployments.as_ref().and_then(|value| value.verified()).and_then(|value| value.hosted_media()) {
+    if let Some(admission) = opts
+        .provider_deployments
+        .as_ref()
+        .and_then(|value| value.verified())
+        .and_then(|value| value.hosted_media())
+    {
         if std::env::var_os("CADENCE_AGENTICOS_EXTERNAL_URL").is_some() {
             return Err(Error::rejected(
                 "hosted media conflicts with external URL composition",
@@ -1699,7 +1714,9 @@ pub fn attach(opts: &mut impl super::PlatformComposition) -> Result<()> {
         return Ok(());
     };
     let base = valid_base(&base)?;
-    let pin = opts.provider_deployments.as_ref()
+    let pin = opts
+        .provider_deployments
+        .as_ref()
         .and_then(|value| value.pin(PLATFORM, &base));
     register_with_deployment_pin(opts.platforms, &base, pin)
 }
@@ -1981,6 +1998,10 @@ pub mod board_fixture {
     pub const TEXT_MANIFEST_PIN: &str = super::TEXT_MANIFEST_PIN;
     pub const IMAGE_TOOL: &str = super::IMAGE_TOOL;
 
+    pub fn media_quote() -> Value {
+        json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"media:sha256:test-quote"})
+    }
+
     #[derive(Clone, Debug)]
     pub struct DoorRequest {
         pub method: String,
@@ -2069,10 +2090,10 @@ pub mod board_fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::board_fixture::{
         hosted_adapter, hosted_with_pin, json_response, media_door, price_view, DoorRequest,
     };
+    use super::*;
 
     fn authority() -> Value {
         json!({"schema":1,"install_id":"install1","slot":"source","inputs":{"profile_handle":"juicysuite_crm"},"binding":{"config":{
@@ -2380,9 +2401,8 @@ mod tests {
     }
 
     pub(super) fn media_quote() -> Value {
-        json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"media:sha256:test-quote"})
+        super::board_fixture::media_quote()
     }
-
 
     /// CAD-1392 acceptance (owned by the independent reviewer, not the
     /// batching implementer): under the deferred-join pattern — sequential
@@ -2505,7 +2525,6 @@ mod tests {
         assert_eq!(seen2[0].idem.as_deref(), Some("app-call-image-2"));
     }
 
-
     pub(super) fn job_view(
         id: &str,
         status: &str,
@@ -2593,7 +2612,6 @@ mod tests {
             worker.join().unwrap();
         }
     }
-
 
     fn hosted_text_proof() -> Value {
         let mut proof = text_authority("text");

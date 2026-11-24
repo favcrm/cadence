@@ -58,6 +58,8 @@ pub mod daemon;
 pub mod delegation;
 pub mod delivery;
 // CAD-777: board sign-in through the AgenticOS device grant.
+#[cfg(test)]
+mod board_schema_test;
 pub mod device_login;
 pub mod devin_catalog;
 pub mod doctor;
@@ -125,11 +127,14 @@ pub mod slots;
 pub mod store;
 pub mod tailnet_proof;
 #[cfg(test)]
-mod board_schema_test;
-#[cfg(test)]
 pub(crate) mod test_ports;
 pub mod test_queue;
 pub mod test_seam;
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub fn send_row_gate_take(gate: &test_seam::SendRowGate) {
+    gate.take();
+}
 pub mod thread_search;
 pub mod ui;
 pub mod update;

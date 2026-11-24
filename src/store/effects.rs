@@ -28,8 +28,7 @@ use super::{now, Store, WriteTxn};
 /// CAD-1085: stamp the private protected-dispatch binding on a staged effect
 /// inside the caller's transaction. Idempotent for the same binding; a
 /// different binding is a conflict. It grants nothing.
-#[doc(hidden)]
-pub fn effect_bind_in(tx: &WriteTxn<'_>, effect_id: &str, binding: &str) -> Result<()> {
+pub(crate) fn effect_bind_in(tx: &WriteTxn<'_>, effect_id: &str, binding: &str) -> Result<()> {
     let changed = tx.execute_raw(
         "UPDATE platform_effects SET connection_operation_binding=?2, updated_at=?3 \
          WHERE effect_id=?1 AND (connection_operation_binding IS NULL \

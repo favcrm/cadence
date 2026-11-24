@@ -15,21 +15,23 @@ mod console_macros;
 
 // The daemon shares the agent's state and domain types; it does not compile a
 // second copy of them. Keep existing crate-relative source paths at the mount.
+#[cfg(all(test, feature = "test-seam"))]
+use cadence_agent::briefing;
+#[cfg(not(test))]
+use cadence_agent::ui;
 use cadence_agent::{
     adapter, agent_roles, agent_settings, agent_uid, app_assistant, assistant_actor,
     attachment_image, audit, backup, board_identity, board_membership, business_export,
     business_templates, cli_actor, client, cloud_agent, confine, context_pack, continuity,
     contract_fixture, delegation, delivery, device_login, devin_catalog, doctor, error, fd_fs,
-    gh_guard, home, inbox, issue, issuer_transport, lease, local_assignment, managed_section, master,
-    master_perm, memory, model_defaults, needs_dismiss, notify_bridge, notify_host, overview,
-    peer, pi_policy, proc, project_policy, protected_runtime, proto, reaper, remote_cli,
+    gh_guard, home, inbox, issue, issuer_transport, lease, local_assignment, managed_section,
+    master, master_perm, memory, model_defaults, needs_dismiss, notify_bridge, notify_host,
+    overview, peer, pi_policy, proc, project_policy, protected_runtime, proto, reaper, remote_cli,
     review, rollout, runner, sandbox, secret, skill, slots, store, test_queue, test_seam,
     thread_search, update, web_push, wiki, worktree, Error, Result,
 };
 #[cfg(test)]
-use cadence_agent::{briefing, web_publish};
-#[cfg(not(test))]
-use cadence_agent::ui;
+use cadence_agent::{web_publish, web_sites};
 
 #[path = "../../../src/operator_auth.rs"]
 mod operator_auth;
@@ -66,8 +68,10 @@ mod cad2215_portable_cursor_acceptance;
 #[cfg(test)]
 mod ui {
     pub(crate) use cadence_agent::ui::*;
+    #[cfg(feature = "test-seam")]
     pub(crate) use cadence_ui::ServeOpts;
 
+    #[cfg(feature = "test-seam")]
     pub(crate) fn serve(
         state_dir: &std::path::Path,
         pm_dir: &std::path::Path,

@@ -18636,7 +18636,8 @@ mod cad2019_html_templates_acceptance {
     #[cfg(feature = "test-seam")]
     #[test]
     fn daemon_rpc_lifecycle_enforces_gates_and_revision() {
-        use cadence_agent::{adapter::ProviderEnv, daemon::*, test_seam::*};
+        use cadence_agent::{adapter::ProviderEnv, test_seam::*};
+        use cadence_daemon::{ServeOptions, Shared};
         let d = tempfile::tempdir().unwrap();
         let pm = d.path().join("pm");
         cadence_agent::issue::Pm::init(&pm).unwrap();

@@ -54,7 +54,48 @@ impl RuntimeCaller {
     /// Never used for request admission: the listener is the only producer of
     /// a caller for an operations connection, and this exists so the adapter
     /// can bind the durable model task to the same exact subject.
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn registered(
+        runtime_id: String,
+        agent_uid: String,
+        session_binding: String,
+        runtime_generation: u64,
+        os_uid: u32,
+        peer_pid: u32,
+        peer_starttime: u64,
+    ) -> Self {
+        Self::registered_impl(
+            runtime_id,
+            agent_uid,
+            session_binding,
+            runtime_generation,
+            os_uid,
+            peer_pid,
+            peer_starttime,
+        )
+    }
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn registered(
+        runtime_id: String,
+        agent_uid: String,
+        session_binding: String,
+        runtime_generation: u64,
+        os_uid: u32,
+        peer_pid: u32,
+        peer_starttime: u64,
+    ) -> Self {
+        Self::registered_impl(
+            runtime_id,
+            agent_uid,
+            session_binding,
+            runtime_generation,
+            os_uid,
+            peer_pid,
+            peer_starttime,
+        )
+    }
+    fn registered_impl(
         runtime_id: String,
         agent_uid: String,
         session_binding: String,

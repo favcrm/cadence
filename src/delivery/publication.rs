@@ -342,7 +342,8 @@ pub struct VerifiedPublisher {
 }
 
 impl VerifiedPublisher {
-    pub(crate) fn operator() -> Self {
+    #[doc(hidden)]
+    pub fn operator() -> Self {
         Self { _private: () }
     }
 

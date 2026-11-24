@@ -523,10 +523,8 @@ impl<'a> TurnMessage<'a> {
         self.id
     }
 
-    pub(crate) fn from_actor(
-        id: &'a str,
-        claim: Option<&'a crate::store::NativeTurnClaim>,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn from_actor(id: &'a str, claim: Option<&'a crate::store::NativeTurnClaim>) -> Self {
         Self { id, claim }
     }
 }

@@ -443,7 +443,8 @@ const WATCHES: &[Watch] = &[
 ];
 
 /// Current wall-clock epoch milliseconds.
-pub(crate) fn now_ms() -> Result<i64> {
+#[doc(hidden)]
+pub fn now_ms() -> Result<i64> {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| Error::internal("the system clock is ahead of the epoch"))?;
@@ -911,7 +912,8 @@ pub(super) fn seal_authority_changes_in(tx: &WriteTxn<'_>) -> Result<LedgerHeadV
 
 /// The single authoritative protected state row.
 #[derive(Clone, Debug)]
-pub(crate) struct Authority {
+#[doc(hidden)]
+pub struct Authority {
     pub workspace_id: String,
     pub database_epoch: Revision,
     pub ledger_head: LedgerHeadV1,
@@ -948,7 +950,18 @@ pub(super) fn protection_required_in(conn: &impl StoreConn) -> Result<bool> {
     }
 }
 
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub fn authority_in(conn: &impl StoreConn) -> Result<Authority> {
+    authority_in_impl(conn)
+}
+
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
 pub(crate) fn authority_in(conn: &impl StoreConn) -> Result<Authority> {
+    authority_in_impl(conn)
+}
+
+fn authority_in_impl(conn: &impl StoreConn) -> Result<Authority> {
     let (
         workspace_id,
         authorization_revision,
@@ -1025,7 +1038,8 @@ pub(crate) fn config_limits_in(conn: &impl StoreConn) -> Result<OwnerLimitsV1> {
     })
 }
 
-pub(crate) struct ConnectionRow {
+#[doc(hidden)]
+pub struct ConnectionRow {
     pub connection_id: String,
     pub account: String,
     pub platform: String,
@@ -1060,7 +1074,8 @@ pub(crate) fn connection_row_in(
     .map_err(sql_error)
 }
 
-pub(crate) struct PolicyRow {
+#[doc(hidden)]
+pub struct PolicyRow {
     pub connection_id: String,
     pub credential_revision: i64,
     pub policy_revision: i64,
@@ -1457,7 +1472,8 @@ fn state_str(state: DispatchStateV1) -> &'static str {
 
 /// Trusted-adapter admission facts: what only the daemon can observe. Every
 /// other input is read from the actual rows inside the commit transaction.
-pub(crate) struct AdmissionFactsV1 {
+#[doc(hidden)]
+pub struct AdmissionFactsV1 {
     pub dispatch_id: UuidV1,
     pub request_id: UuidV1,
     pub now_ms: EpochMs,
@@ -1479,7 +1495,8 @@ pub(crate) struct AdmissionFactsV1 {
 /// The result of the authoritative commit transaction. `commit` is data; the
 /// caller's permission to execute comes only from its own in-memory permit.
 #[allow(clippy::large_enum_variant)] // one commit outcome per dispatch, matched once
-pub(crate) enum CommitOutcome {
+#[doc(hidden)]
+pub enum CommitOutcome {
     Committed(DispatchCommitV1),
     Duplicate(ExistingDispatchStatusV1),
 }
@@ -1982,7 +1999,8 @@ fn finish_prepared_in(
     Ok(commit)
 }
 
-pub(crate) struct DispatchRow {
+#[doc(hidden)]
+pub struct DispatchRow {
     pub commit: DispatchCommitV1,
     pub receipt: Option<DispatchReceiptV1>,
     pub state: DispatchStateV1,
@@ -2349,7 +2367,8 @@ pub(crate) fn verify_checkpoint_head_in(head: &LedgerHeadV1, ack: &CheckpointAck
 /// owner's CURRENT external watermark, which the next suffix must follow
 /// exactly.
 #[derive(Clone, Debug)]
-pub(crate) struct ProtectedCheckpointContext {
+#[doc(hidden)]
+pub struct ProtectedCheckpointContext {
     pub owner_epoch: Revision,
     pub minimum_sequence: Counter,
     pub minimum_digest: Digest,
@@ -2359,7 +2378,8 @@ pub(crate) struct ProtectedCheckpointContext {
 /// installs it before boot-time authorizing writes; the store uses it only
 /// AFTER a writer transaction committed and released the database lock. It
 /// carries no credential and cannot construct readiness.
-pub(crate) trait ProtectedCheckpointWriter: Send + Sync {
+#[doc(hidden)]
+pub trait ProtectedCheckpointWriter: Send + Sync {
     /// Live authenticated owner witness: workspace/database lineage, a stable
     /// restore state, the live owner epoch and the current external watermark.
     fn context(
@@ -2398,7 +2418,8 @@ pub(crate) trait ProtectedCheckpointWriter: Send + Sync {
 /// manifest, active Connection policies, credential revisions, the durable
 /// clock floor and the authorization revision — is read from the actual rows
 /// inside the issuing transaction; ids and times are minted here.
-pub(crate) struct SnapshotIssueFactsV1 {
+#[doc(hidden)]
+pub struct SnapshotIssueFactsV1 {
     pub snapshot_id: UuidV1,
     pub loaded_receipt_id: UuidV1,
     pub now_ms: EpochMs,
@@ -2411,7 +2432,8 @@ pub(crate) struct SnapshotIssueFactsV1 {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IssuedSnapshotV1 {
+#[doc(hidden)]
+pub struct IssuedSnapshotV1 {
     pub snapshot: SnapshotV1,
     pub receipt: LoadedReceiptV1,
 }
@@ -2419,13 +2441,15 @@ pub(crate) struct IssuedSnapshotV1 {
 /// The exact issued rows one final admission re-loads. It is evidence, not a
 /// permit: the dispatcher still crosses the full planner and commit.
 #[derive(Clone, Debug)]
-pub(crate) struct LoadedSnapshot {
+#[doc(hidden)]
+pub struct LoadedSnapshot {
     pub snapshot: SnapshotV1,
     pub receipt: LoadedReceiptV1,
     pub authorization_revision: Revision,
 }
 
-pub(crate) struct ProfileSnapshotIssueFactsV1 {
+#[doc(hidden)]
+pub struct ProfileSnapshotIssueFactsV1 {
     pub snapshot_id: UuidV1,
     pub loaded_receipt_id: UuidV1,
     pub now_ms: EpochMs,
@@ -2782,7 +2806,8 @@ pub(crate) fn current_snapshot_in(
 /// The external restore watermark a protected boot must satisfy. Supplied by
 /// the measured owner/control authority; never by a local file or flag.
 #[derive(Clone, Debug)]
-pub(crate) struct ExternalFloorV1 {
+#[doc(hidden)]
+pub struct ExternalFloorV1 {
     pub workspace_id: String,
     pub min_sequence: u64,
     pub min_digest: Digest,
@@ -2792,7 +2817,8 @@ pub(crate) struct ExternalFloorV1 {
 /// database readable while withholding protected execution; it is never a
 /// fallback to legacy protected custody.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BootAuthority {
+#[doc(hidden)]
+pub enum BootAuthority {
     Ready,
     MetadataOnly(&'static str),
 }
@@ -2864,11 +2890,20 @@ fn boot_preflight_in(
 // Management writers (the daemon proves operator/human authority first)
 // ---------------------------------------------------------------------------
 
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub fn set_config_in(tx: &WriteTxn<'_>, enabled: bool, limits: &OwnerLimitsV1) -> Result<()> {
+    set_config_in_impl(tx, enabled, limits)
+}
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
 pub(crate) fn set_config_in(
     tx: &WriteTxn<'_>,
     enabled: bool,
     limits: &OwnerLimitsV1,
 ) -> Result<()> {
+    set_config_in_impl(tx, enabled, limits)
+}
+fn set_config_in_impl(tx: &WriteTxn<'_>, enabled: bool, limits: &OwnerLimitsV1) -> Result<()> {
     let raw = serde_json::to_string(limits).map_err(|_| refused())?;
     tx.execute_raw(
         "UPDATE connection_dispatch_config SET enabled=?1,ever_enabled=(ever_enabled OR ?1),\
@@ -2879,7 +2914,16 @@ pub(crate) fn set_config_in(
     Ok(())
 }
 
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub fn set_manifest_in(tx: &WriteTxn<'_>, manifest: &ManifestV1) -> Result<()> {
+    set_manifest_in_impl(tx, manifest)
+}
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
 pub(crate) fn set_manifest_in(tx: &WriteTxn<'_>, manifest: &ManifestV1) -> Result<()> {
+    set_manifest_in_impl(tx, manifest)
+}
+fn set_manifest_in_impl(tx: &WriteTxn<'_>, manifest: &ManifestV1) -> Result<()> {
     let raw = serde_json::to_string(manifest).map_err(|_| refused())?;
     let existing: Option<(i64, String)> = tx
         .query_opt(
@@ -2914,7 +2958,40 @@ pub(crate) fn set_manifest_in(tx: &WriteTxn<'_>, manifest: &ManifestV1) -> Resul
     Ok(())
 }
 
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub fn set_policy_in(
+    tx: &WriteTxn<'_>,
+    connection_id: &str,
+    credential_revision: u64,
+    policy: &OperationPolicyV1,
+    policy_digest: &str,
+) -> Result<()> {
+    set_policy_in_impl(
+        tx,
+        connection_id,
+        credential_revision,
+        policy,
+        policy_digest,
+    )
+}
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
 pub(crate) fn set_policy_in(
+    tx: &WriteTxn<'_>,
+    connection_id: &str,
+    credential_revision: u64,
+    policy: &OperationPolicyV1,
+    policy_digest: &str,
+) -> Result<()> {
+    set_policy_in_impl(
+        tx,
+        connection_id,
+        credential_revision,
+        policy,
+        policy_digest,
+    )
+}
+fn set_policy_in_impl(
     tx: &WriteTxn<'_>,
     connection_id: &str,
     credential_revision: u64,
@@ -3045,7 +3122,8 @@ pub(crate) fn put_approval_in(
 /// The frozen recipient and EXACT committed message bytes one approval binds.
 /// Read only inside the trusted adapter; never a public projection.
 /// The frozen approval payload plus its consumed dispatch, recipient and body.
-pub(crate) type ApprovalMaterialV1 = (SendApprovalV1, Option<String>, String, Vec<u8>);
+#[doc(hidden)]
+pub type ApprovalMaterialV1 = (SendApprovalV1, Option<String>, String, Vec<u8>);
 
 pub(crate) fn approval_material_in(
     conn: &impl StoreConn,
@@ -3074,7 +3152,8 @@ impl Store {
     /// The authoritative protected state, read from actual rows. The monotone
     /// PROCESS admission fence is always reflected in `fenced`, even when the
     /// durable fence row could not be written.
-    pub(crate) fn protected_authority(&self) -> Result<Authority> {
+    #[doc(hidden)]
+    pub fn protected_authority(&self) -> Result<Authority> {
         let mut authority = self.read_tx(|conn| authority_in(&*conn))?;
         if self.admission_fenced() {
             authority.fenced = true;
@@ -3087,7 +3166,8 @@ impl Store {
     /// process admission fence is re-checked INSIDE the writer transaction so
     /// an unacknowledged earlier authorizing outcome can never be followed by
     /// a new admission.
-    pub(crate) fn protected_commit(
+    #[doc(hidden)]
+    pub fn protected_commit(
         &self,
         facts: AdmissionFactsV1,
         request: AdmissionRequestV1,
@@ -3100,7 +3180,8 @@ impl Store {
     }
 
     /// Settle one dispatch in its own short CAS transaction.
-    pub(crate) fn protected_settle(
+    #[doc(hidden)]
+    pub fn protected_settle(
         &self,
         commit: DispatchCommitV1,
         outcome: ValidatedOutcomeV1,
@@ -3110,7 +3191,8 @@ impl Store {
 
     /// The commit and receipt of an already-committed dispatch belonging to
     /// this requester, for reconciliation and re-authorization by the caller.
-    pub(crate) fn protected_reconcile(
+    #[doc(hidden)]
+    pub fn protected_reconcile(
         &self,
         dispatch_id: &str,
         request_id: &str,
@@ -3124,7 +3206,8 @@ impl Store {
     /// suffixes keep the exchange inside the owner's frame no matter how long
     /// the retained ledger is; a concurrent later checkpoint is answered with
     /// a real owner receipt for this older head, never a fabricated ACK.
-    pub(crate) fn protected_acknowledge_commit(
+    #[doc(hidden)]
+    pub fn protected_acknowledge_commit(
         &self,
         commit: &DispatchCommitV1,
         owner_epoch: Revision,
@@ -3157,7 +3240,8 @@ impl Store {
     /// the normal guarded-recovery/authorizing checkpoint carries this record.
     /// A store that cannot record the selection refuses installation rather
     /// than running half-gated.
-    pub(crate) fn install_protected_checkpoint(
+    #[doc(hidden)]
+    pub fn install_protected_checkpoint(
         &self,
         writer: Arc<dyn ProtectedCheckpointWriter>,
     ) -> Result<()> {
@@ -3178,14 +3262,16 @@ impl Store {
         })
     }
 
-    pub(crate) fn protected_checkpoint_installed(&self) -> bool {
+    #[doc(hidden)]
+    pub fn protected_checkpoint_installed(&self) -> bool {
         self.protected_checkpoint.get().is_some()
     }
 
     /// Issue one immutable snapshot plus its contained loaded receipt from the
     /// actual approved rows. Server UUIDs and times only. This is execution
     /// material, so a process admission fence refuses it.
-    pub(crate) fn protected_issue_snapshot(
+    #[doc(hidden)]
+    pub fn protected_issue_snapshot(
         &self,
         facts: SnapshotIssueFactsV1,
     ) -> Result<IssuedSnapshotV1> {
@@ -3198,7 +3284,8 @@ impl Store {
 
     /// Issue one immutable profile snapshot plus its contained loaded receipt
     /// for native-model turns when no active business policy exists yet.
-    pub(crate) fn protected_issue_profile_snapshot(
+    #[doc(hidden)]
+    pub fn protected_issue_profile_snapshot(
         &self,
         facts: ProfileSnapshotIssueFactsV1,
     ) -> Result<IssuedSnapshotV1> {
@@ -3210,7 +3297,8 @@ impl Store {
     }
 
     /// Load exactly the issued selector pair a caller named.
-    pub(crate) fn protected_load_snapshot(
+    #[doc(hidden)]
+    pub fn protected_load_snapshot(
         &self,
         snapshot_id: &str,
         receipt_id: &str,
@@ -3220,7 +3308,8 @@ impl Store {
 
     /// The newest still-live issued pair for one exact runtime subject. Used
     /// only to reuse current immutable material; it never mints authority.
-    pub(crate) fn protected_current_snapshot(
+    #[doc(hidden)]
+    pub fn protected_current_snapshot(
         &self,
         agent_uid: &str,
         runtime_generation: u64,
@@ -3231,7 +3320,8 @@ impl Store {
 
     /// The newest still-live issued pair for one stable agent, without a
     /// runtime generation. Used only to revalidate held material.
-    pub(crate) fn protected_current_snapshot_for_agent(
+    #[doc(hidden)]
+    pub fn protected_current_snapshot_for_agent(
         &self,
         agent_uid: &str,
         now_ms: u64,
@@ -3259,7 +3349,8 @@ impl Store {
 
     /// The single approved manifest bound to an active reviewed policy. An
     /// ambiguous or absent answer is a refusal, never a guess.
-    pub(crate) fn protected_single_approved_manifest(&self) -> Result<Option<Ident>> {
+    #[doc(hidden)]
+    pub fn protected_single_approved_manifest(&self) -> Result<Option<Ident>> {
         self.read_tx(|conn| {
             let digest: Option<String> = conn
                 .query_opt(
@@ -3276,7 +3367,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn protected_has_active_policy(&self) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn protected_has_active_policy(&self) -> Result<bool> {
         self.read_tx(|conn| {
             let active: i64 = conn
                 .query_row(
@@ -3290,7 +3382,8 @@ impl Store {
     }
 
     /// The frozen recipient and exact committed bytes of one approval.
-    pub(crate) fn protected_approval_material(
+    #[doc(hidden)]
+    pub fn protected_approval_material(
         &self,
         approval_id: &str,
     ) -> Result<Option<ApprovalMaterialV1>> {
@@ -3300,11 +3393,8 @@ impl Store {
     /// Requests in the sliding quote-read window for one principal and the
     /// whole workspace. Counted from the durable quote rows; no cached
     /// counter can drift.
-    pub(crate) fn protected_quote_counts(
-        &self,
-        principal_key: &str,
-        now_ms: u64,
-    ) -> Result<(u64, u64)> {
+    #[doc(hidden)]
+    pub fn protected_quote_counts(&self, principal_key: &str, now_ms: u64) -> Result<(u64, u64)> {
         self.read_tx(|conn| {
             let lower = now_ms.saturating_sub(60_000) as i64;
             let now = now_ms as i64;
@@ -3333,10 +3423,8 @@ impl Store {
 
     /// The protected boot decision for an already-open, unrecovered store.
     /// Reads only; never repairs or advances the chain.
-    pub(crate) fn protected_boot_preflight(
-        &self,
-        floor: &ExternalFloorV1,
-    ) -> Result<BootAuthority> {
+    #[doc(hidden)]
+    pub fn protected_boot_preflight(&self, floor: &ExternalFloorV1) -> Result<BootAuthority> {
         if self.admission_fenced() {
             // A process admission fence outlives any durable row that failed to
             // persist; execution must never be authorized afterwards.
@@ -3353,10 +3441,8 @@ impl Store {
     /// This never grants runtime or provider execution authority, and it stays
     /// available after a process admission fence so an operator can reconcile;
     /// [`Self::protected_authority`] reports that fence truthfully.
-    pub(crate) fn protected_history_preflight(
-        &self,
-        floor: &ExternalFloorV1,
-    ) -> Result<BootAuthority> {
+    #[doc(hidden)]
+    pub fn protected_history_preflight(&self, floor: &ExternalFloorV1) -> Result<BootAuthority> {
         if !self.protected_checkpoint_installed() {
             return Ok(BootAuthority::MetadataOnly("checkpoint_uninstalled"));
         }
@@ -3366,7 +3452,8 @@ impl Store {
     /// Append one explicit management journal record — used by key
     /// activation/unlock/lock, which change no authorizing row — and require
     /// its external acknowledgement.
-    pub(crate) fn protected_record_management(
+    #[doc(hidden)]
+    pub fn protected_record_management(
         &self,
         workspace_id: &str,
         owner_epoch: Revision,
@@ -3388,7 +3475,8 @@ impl Store {
     /// Checkpoint the CURRENT head and require the authenticated
     /// acknowledgement. Called after an authorizing management mutation has
     /// committed and released the lock.
-    pub(crate) fn protected_checkpoint_head(
+    #[doc(hidden)]
+    pub fn protected_checkpoint_head(
         &self,
         workspace_id: &str,
         owner_epoch: Revision,
@@ -3410,7 +3498,46 @@ impl Store {
     /// immutable head before acknowledging success. A missing/lost
     /// acknowledgement fences further protected admission and answers
     /// `outcome_unknown`; the callback is never re-run.
+    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[doc(hidden)]
+    pub fn protected_management_commit<F, R: 'static>(
+        &self,
+        workspace_id: &str,
+        owner_epoch: Revision,
+        runtime_binding_digest: Digest,
+        mutation: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&WriteTxn<'_>) -> Result<R>,
+    {
+        self.protected_management_commit_impl(
+            workspace_id,
+            owner_epoch,
+            runtime_binding_digest,
+            mutation,
+        )
+    }
+
+    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
     pub(crate) fn protected_management_commit<F, R: 'static>(
+        &self,
+        workspace_id: &str,
+        owner_epoch: Revision,
+        runtime_binding_digest: Digest,
+        mutation: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&WriteTxn<'_>) -> Result<R>,
+    {
+        self.protected_management_commit_impl(
+            workspace_id,
+            owner_epoch,
+            runtime_binding_digest,
+            mutation,
+        )
+    }
+
+    fn protected_management_commit_impl<F, R: 'static>(
         &self,
         workspace_id: &str,
         owner_epoch: Revision,
@@ -3430,6 +3557,107 @@ impl Store {
         })?;
         self.checkpoint_authority_head(workspace_id, owner_epoch, runtime_binding_digest, head)?;
         Ok(value)
+    }
+
+    /// Sealed management commit helpers — keep raw `WriteTxn` and SQL helpers
+    /// inside `cadence-agent` while preserving the single checkpointed transaction.
+    #[doc(hidden)]
+    pub fn protected_commit_config(
+        &self,
+        workspace_id: &str,
+        owner_epoch: Revision,
+        binding: Digest,
+        enabled: bool,
+        limits: OwnerLimitsV1,
+    ) -> Result<()> {
+        self.protected_management_commit(workspace_id, owner_epoch, binding, move |tx| {
+            set_config_in(tx, enabled, &limits)
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn protected_commit_manifest(
+        &self,
+        workspace_id: &str,
+        owner_epoch: Revision,
+        binding: Digest,
+        manifest: ManifestV1,
+    ) -> Result<()> {
+        self.protected_management_commit(workspace_id, owner_epoch, binding, move |tx| {
+            set_manifest_in(tx, &manifest)
+        })
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn protected_commit_policy(
+        &self,
+        workspace_id: &str,
+        owner_epoch: Revision,
+        binding: Digest,
+        connection_id: String,
+        credential_revision: u64,
+        policy: OperationPolicyV1,
+        policy_digest: String,
+    ) -> Result<()> {
+        self.protected_management_commit(workspace_id, owner_epoch, binding, move |tx| {
+            set_policy_in(
+                tx,
+                &connection_id,
+                credential_revision,
+                &policy,
+                &policy_digest,
+            )
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn protected_commit_checkpoint(
+        &self,
+        workspace_id: &str,
+        owner_epoch: Revision,
+        binding: Digest,
+    ) -> Result<()> {
+        self.protected_management_commit(workspace_id, owner_epoch, binding, |_tx| Ok(()))
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn protected_stage_send_approval(
+        &self,
+        workspace_id: &str,
+        owner_epoch: Revision,
+        binding: Digest,
+        approval: SendApprovalV1,
+        principal_key: String,
+        recipient: String,
+        body: Vec<u8>,
+        source_id: String,
+        connection_id: String,
+        credential_revision: Revision,
+        authorization_revision: Revision,
+    ) -> Result<SendApprovalV1> {
+        let workspace = workspace_id.to_string();
+        self.protected_management_commit(workspace_id, owner_epoch, binding, move |tx| {
+            put_approval_in(tx, &approval, &principal_key, &recipient, &body)?;
+            let stored =
+                approval_material_in(tx, approval.approval_id.as_str())?.ok_or_else(|| {
+                    Error::invalid("approval_required", "a current human approval is required")
+                })?;
+            let operation_binding = effect_operation_binding(
+                &workspace,
+                &approval.principal_digest,
+                &connection_id,
+                credential_revision,
+                authorization_revision,
+                approval.policy_revision,
+                &source_id,
+                &stored.0.source_digest,
+                &stored.0.body_digest,
+            );
+            super::effects::effect_bind_in(tx, &source_id, operation_binding.as_str())?;
+            Ok(stored.0)
+        })
     }
 
     /// Ordinary app/grant/settings/background writers use the same external
@@ -3636,7 +3864,8 @@ impl Store {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(crate) fn admission_fenced(&self) -> bool {
+    #[doc(hidden)]
+    pub fn admission_fenced(&self) -> bool {
         self.admission_fence
             .load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -3680,13 +3909,15 @@ impl Store {
         ))
     }
 
-    pub(crate) fn protected_quote(&self, quote_id: &str) -> Result<Option<ModelQuoteV1>> {
+    #[doc(hidden)]
+    pub fn protected_quote(&self, quote_id: &str) -> Result<Option<ModelQuoteV1>> {
         self.read_tx(|conn| quote_row_in(&*conn, quote_id))
     }
 
     /// The process activation a quote was observed under. A restart mints a
     /// new activation, so a pre-restart quote is never usable.
-    pub(crate) fn protected_quote_activation(&self, quote_id: &str) -> Result<Option<String>> {
+    #[doc(hidden)]
+    pub fn protected_quote_activation(&self, quote_id: &str) -> Result<Option<String>> {
         self.read_tx(|conn| {
             Ok(conn
                 .query_opt(
@@ -3698,18 +3929,18 @@ impl Store {
         })
     }
 
-    pub(crate) fn protected_connection_row(
-        &self,
-        connection_id: &str,
-    ) -> Result<Option<ConnectionRow>> {
+    #[doc(hidden)]
+    pub fn protected_connection_row(&self, connection_id: &str) -> Result<Option<ConnectionRow>> {
         self.read_tx(|conn| connection_row_in(&*conn, connection_id))
     }
 
-    pub(crate) fn protected_policy_row(&self, connection_id: &str) -> Result<Option<PolicyRow>> {
+    #[doc(hidden)]
+    pub fn protected_policy_row(&self, connection_id: &str) -> Result<Option<PolicyRow>> {
         self.read_tx(|conn| policy_row_in(&*conn, connection_id))
     }
 
-    pub(crate) fn protected_grants(
+    #[doc(hidden)]
+    pub fn protected_grants(
         &self,
         agent_uid: &str,
         platform: &str,
@@ -3718,13 +3949,15 @@ impl Store {
         self.read_tx(|conn| grants_in(&*conn, agent_uid, platform, account))
     }
 
-    pub(crate) fn protected_role_model_policy(
+    #[doc(hidden)]
+    pub fn protected_role_model_policy(
         &self,
     ) -> Result<Option<cadence_core::connection_dispatch::RoleModelPolicyV1>> {
         self.read_tx(|conn| role_model_policy_in(&*conn))
     }
 
-    pub(crate) fn protected_put_quote(
+    #[doc(hidden)]
+    pub fn protected_put_quote(
         &self,
         quote: ModelQuoteV1,
         principal_key: String,
@@ -3733,13 +3966,15 @@ impl Store {
         self.write_tx(move |tx| put_quote_in(tx, &quote, &principal_key, &process_activation))
     }
 
-    pub(crate) fn protected_manifest(&self, manifest_id: &str) -> Result<Option<ManifestV1>> {
+    #[doc(hidden)]
+    pub fn protected_manifest(&self, manifest_id: &str) -> Result<Option<ManifestV1>> {
         self.read_tx(|conn| Ok(manifest_row_in(&*conn, manifest_id)?.map(|(row, _)| row)))
     }
 
     /// The stable agent UID recorded for one alias, if any. An absent/legacy
     /// row answers `None` and never authorizes protected use.
-    pub(crate) fn agent_uid_for_alias(&self, alias: &str) -> Result<Option<String>> {
+    #[doc(hidden)]
+    pub fn agent_uid_for_alias(&self, alias: &str) -> Result<Option<String>> {
         self.read_tx(|conn| {
             Ok(conn
                 .query_opt("SELECT uid FROM agents WHERE alias=?1", [alias], |row| {
@@ -3753,7 +3988,8 @@ impl Store {
     /// returned: enabled/unfenced store, an active reviewed policy and — for
     /// an agent operation — exactly one stamped grant for this stable UID on
     /// this exact Connection account. Reads only; never mints a permit.
-    pub(crate) fn protected_read_authorized(
+    #[doc(hidden)]
+    pub fn protected_read_authorized(
         &self,
         principal_key: &str,
         agent_uid: Option<&str>,

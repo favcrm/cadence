@@ -236,7 +236,8 @@ impl Pm {
     /// then refuse once the lease fence trips and `commit` stamps the
     /// epoch. `pub(crate)`: only daemon code attaches; the CLI stays
     /// lease-free.
-    pub(crate) fn attach_lease(&mut self, lease: crate::lease::PmLease) {
+    #[doc(hidden)]
+    pub fn attach_lease(&mut self, lease: crate::lease::PmLease) {
         self.lease = Some(lease);
     }
 

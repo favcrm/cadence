@@ -466,9 +466,7 @@ pub fn host_overrides(pm_dir: &Path) -> Option<HostOverrides> {
 /// `pm.yaml [host]`: `Ok(None)` when there is no file or no table,
 /// `Err` naming the problem when the table is present but unusable —
 /// a bad value or an unknown (misspelled) key.
-pub fn read_host_overrides(
-    pm_dir: &Path,
-) -> std::result::Result<Option<HostOverrides>, String> {
+pub fn read_host_overrides(pm_dir: &Path) -> std::result::Result<Option<HostOverrides>, String> {
     let Ok(text) = std::fs::read_to_string(pm_dir.join("pm.yaml")) else {
         return Ok(None);
     };

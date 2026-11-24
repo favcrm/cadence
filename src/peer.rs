@@ -130,10 +130,7 @@ impl PeerTies {
     /// Every registered pane (`(alias, pane_pid)`) the peer is tied to,
     /// sorted by alias and deduplicated — deterministic, never map
     /// order.
-    pub fn agents<'a>(
-        &self,
-        panes: impl IntoIterator<Item = (&'a str, u32)>,
-    ) -> Vec<String> {
+    pub fn agents<'a>(&self, panes: impl IntoIterator<Item = (&'a str, u32)>) -> Vec<String> {
         let tied: BTreeSet<&str> = panes
             .into_iter()
             .filter(|(alias, pane_pid)| self.tied_to(alias, *pane_pid))
@@ -346,6 +343,17 @@ pub fn operator_proof(
 /// Set in the environment of a coding agent's process and its shells.
 /// `spawn_daemon_run` and the board's start remove them: a long-running
 /// service started from an agent's shell is not that agent.
+#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[doc(hidden)]
+pub const AGENT_RUNTIME_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "PI_CODING_AGENT",
+    "PI_SESSION_ID",
+];
+#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
 pub(crate) const AGENT_RUNTIME_MARKERS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
@@ -1394,5 +1402,4 @@ mod tests {
             assert_eq!(exact.1, own_uid, "{bind}");
         }
     }
-
 }

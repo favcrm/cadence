@@ -33,7 +33,10 @@ mod tests {
         let marker = dir.path().join("killed");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\ncase \"$*\" in\n  *kill-session*) touch '{}' ;;\nesac\n", marker.display()),
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *kill-session*) touch '{}' ;;\nesac\n",
+                marker.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -12,7 +12,10 @@ pub(crate) use links::{apply_link, new_ref};
 /// The hook may return an artificial error (simulating an uncertain
 /// commit) but cannot fabricate success or alter production, which is
 /// compiled without this module.
-#[cfg(all(test, feature = "test-seam"))]
+#[cfg(all(
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "store-test-support"))
+))]
 pub mod keyed_commit_seam {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -620,7 +623,10 @@ pub fn add_comment_keyed(
             // Test-only: after a genuine commit success the hook may
             // produce a synthetic uncertain-commit error, which must flow
             // through the same cleanup/unknown handler below.
-            #[cfg(all(test, feature = "test-seam"))]
+            #[cfg(all(
+                feature = "test-seam",
+                any(test, all(debug_assertions, feature = "store-test-support"))
+            ))]
             let result = match result {
                 Ok(foreign) => keyed_commit_seam::fire(&pm.dir).map(|()| foreign),
                 Err(e) => Err(e),

@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use super::{required_str, Shared};
 use crate::daemon::protected_connections::ManagementEvidence;
 use crate::error::{Error, Result};
-use crate::store::connection_dispatch::{set_config_in, set_manifest_in, set_policy_in, Authority};
+use crate::store::connection_dispatch::Authority;
 use cadence_core::connection_dispatch::dto::{ManifestV1, OperationPolicyV1, OwnerLimitsV1};
 use cadence_core::connection_dispatch::primitives::Digest;
 
@@ -275,11 +275,12 @@ pub(super) fn execute(
                     .ok_or_else(|| Error::invalid("invalid_request", "the limits are missing"))?,
             )
             .map_err(|_| Error::invalid("invalid_request", "the limits are not finite"))?;
-            shared.store.protected_management_commit(
+            shared.store.protected_commit_config(
                 &workspace,
                 eligibility.owner_epoch,
                 management_binding("config", &workspace)?,
-                |tx| set_config_in(tx, enabled, &limits),
+                enabled,
+                limits,
             )?;
             Ok(json!({"action": "config", "enabled": enabled}))
         }
@@ -294,11 +295,11 @@ pub(super) fn execute(
             .map_err(|_| Error::invalid("invalid_request", "the manifest is malformed"))?;
             cadence_core::connection_dispatch::dto::validate_manifest_v1(&manifest)
                 .map_err(|_| Error::invalid("invalid_request", "the manifest is malformed"))?;
-            shared.store.protected_management_commit(
+            shared.store.protected_commit_manifest(
                 &workspace,
                 eligibility.owner_epoch,
                 management_binding("manifest", &workspace)?,
-                |tx| set_manifest_in(tx, &manifest),
+                manifest.clone(),
             )?;
             Ok(
                 json!({"action": "manifest", "manifest_id": manifest.manifest_id, "revision": manifest.revision}),
@@ -377,19 +378,14 @@ pub(super) fn execute(
                     ));
                 }
             }
-            shared.store.protected_management_commit(
+            shared.store.protected_commit_policy(
                 &workspace,
                 eligibility.owner_epoch,
                 management_binding("policy", &workspace)?,
-                |tx| {
-                    set_policy_in(
-                        tx,
-                        &connection_id,
-                        credential_revision,
-                        &policy,
-                        &policy_digest,
-                    )
-                },
+                connection_id.clone(),
+                credential_revision,
+                policy.clone(),
+                policy_digest,
             )?;
             Ok(
                 json!({"action": "policy", "connection_id": connection_id, "policy_revision": policy.policy_revision}),
@@ -440,11 +436,10 @@ pub(super) fn execute(
             }
             // The grant writer committed its own journalled transaction; the
             // external floor must acknowledge it before this reports success.
-            shared.store.protected_management_commit(
+            shared.store.protected_commit_checkpoint(
                 &workspace,
                 eligibility.owner_epoch,
                 management_binding(action, &workspace)?,
-                |_tx| Ok(()),
             )?;
             Ok(json!({"action": action, "agent": agent, "platform": platform, "account": account}))
         }
@@ -473,11 +468,10 @@ pub(super) fn execute(
                 &record.connection_id,
                 record.credential_revision,
             )?;
-            shared.store.protected_management_commit(
+            shared.store.protected_commit_checkpoint(
                 &workspace,
                 eligibility.owner_epoch,
                 management_binding("revoke_credential", &workspace)?,
-                |_tx| Ok(()),
             )?;
             Ok(json!({"action": "revoke_credential", "connection_id": connection_id}))
         }

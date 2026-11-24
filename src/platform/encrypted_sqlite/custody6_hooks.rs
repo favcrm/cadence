@@ -1,6 +1,10 @@
 // Independent test owner: cad1085-security. Test-only sole-manager observations.
 // Mount as pub(crate) mod custody6_hooks in encrypted_sqlite.rs, cfg below.
-#[cfg(not(all(test, target_os = "linux", feature = "test-seam")))]
+#[cfg(not(all(
+    target_os = "linux",
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "store-test-support"))
+)))]
 compile_error!("custody6 hooks must never enter ordinary/release artifacts");
 
 use super::{EncryptedVault, Error, Result};
@@ -11,7 +15,8 @@ use std::sync::{
 };
 
 #[derive(Debug)]
-pub(crate) struct Policy {
+#[doc(hidden)]
+pub struct Policy {
     pub journal: String,
     pub synchronous: i64,
     pub temp_store: i64,
@@ -31,9 +36,11 @@ struct Counts {
     all: AtomicU64,
 }
 #[derive(Clone)]
-pub(crate) struct SqlProbe(Arc<Counts>);
+#[doc(hidden)]
+pub struct SqlProbe(Arc<Counts>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SqlCounts {
+#[doc(hidden)]
+pub struct SqlCounts {
     pub begin: u64,
     pub insert: u64,
     pub commit: u64,
@@ -41,7 +48,7 @@ pub(crate) struct SqlCounts {
     pub all: u64,
 }
 impl SqlProbe {
-    pub(crate) fn counts(&self) -> SqlCounts {
+    pub fn counts(&self) -> SqlCounts {
         SqlCounts {
             begin: self.0.begin.load(Ordering::SeqCst),
             insert: self.0.insert.load(Ordering::SeqCst),
@@ -53,7 +60,7 @@ impl SqlProbe {
 }
 impl EncryptedVault {
     // Queries the actual existing connection. Never opens/clones a vault reader.
-    pub(crate) fn custody6_policy(&self) -> Result<Policy> {
+    pub fn custody6_policy(&self) -> Result<Policy> {
         let i = self
             .inner
             .lock()
@@ -71,7 +78,7 @@ impl EncryptedVault {
             has_key: i.key.is_some(),
         })
     }
-    pub(crate) fn custody6_probe(&self, deny_rollback: bool) -> Result<SqlProbe> {
+    pub fn custody6_probe(&self, deny_rollback: bool) -> Result<SqlProbe> {
         let i = self
             .inner
             .lock()
@@ -127,7 +134,7 @@ impl EncryptedVault {
         }));
         Ok(SqlProbe(counts))
     }
-    pub(crate) fn custody6_clear_probe(&self) -> Result<()> {
+    pub fn custody6_clear_probe(&self) -> Result<()> {
         let i = self
             .inner
             .lock()
@@ -137,7 +144,7 @@ impl EncryptedVault {
         Ok(())
     }
     // Deliberate real policy violation, distinct from a fake refusal injection.
-    pub(crate) fn custody6_downgrade_sync(&self) -> Result<()> {
+    pub fn custody6_downgrade_sync(&self) -> Result<()> {
         let i = self
             .inner
             .lock()

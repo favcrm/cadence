@@ -29,6 +29,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::caller_rule::AgentCaller;
 use super::delivery_requirements_rpc::{self, RoutineReadiness};
 use super::identity::scope_allows_delivery;
 use super::{
@@ -41,7 +42,6 @@ use crate::delivery::{
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report, Pm};
 use crate::master;
-use super::caller_rule::AgentCaller;
 use crate::store;
 
 /// Longest decline reason.
