@@ -5373,13 +5373,13 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
         // AOS-727: an agent reviewer's own verdict, refused before it is recorded.
         ("audit_verdict_project", Some("reviewer_profile_not_eligible")) => Some((
             "reviewer_profile_not_eligible",
-            "this agent's profile is not an active, owner-granted reviewer; the workspace \
-             owner must give it the role `reviewer`. Nothing was recorded",
+            "this agent's profile is not active, so its verdicts cannot count; the workspace \
+             owner must reactivate it or use an active profile. Nothing was recorded",
         )),
         ("audit_verdict_project", Some("reviewer_is_author")) => Some((
             "reviewer_is_author",
             "this agent's profile worked on the ticket, so it cannot review it; use a \
-             reviewer profile that did not. Nothing was recorded",
+             profile that did not. Nothing was recorded",
         )),
         ("audit_verdict_project", Some("agent_review_kind_not_allowed")) => Some((
             "agent_review_kind_not_allowed",
