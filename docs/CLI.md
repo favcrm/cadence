@@ -769,6 +769,10 @@ same-UID sandbox is not eligible.
   Open its trusted credential-entry link and enter the scoped device bearer.
   Do not pass it on the command line or put it in Pi configuration.
 
+Before Pi receives a prompt, Cadence binds the model task to the actor's
+current durable take of that message. An earlier attempt or a message ID
+on its own cannot open a task.
+
 Cadence sends one bounded gateway request for the admitted model turn. It
 uses the broker's durable request id for idempotency. The protected guest
 receives the terminal model receipt, not upstream connection headers or a

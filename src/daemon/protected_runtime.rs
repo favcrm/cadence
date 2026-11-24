@@ -697,7 +697,7 @@ pub(crate) trait ProtectedConsoleProvider: Send + Sync {
         &self,
         caller: &RuntimeCaller,
         client_message_id: &str,
-        server_message_id: &str,
+        claim: &crate::store::NativeTurnClaim,
         turn_token: &str,
     ) -> Result<Box<dyn NativeTaskGuard>>;
 
@@ -1679,7 +1679,7 @@ impl ProtectedConsoleProvider for ProtectedRuntimeCoordinator {
         &self,
         caller: &RuntimeCaller,
         client_message_id: &str,
-        server_message_id: &str,
+        claim: &crate::store::NativeTurnClaim,
         turn_token: &str,
     ) -> Result<Box<dyn NativeTaskGuard>> {
         let shared = self
@@ -1687,12 +1687,7 @@ impl ProtectedConsoleProvider for ProtectedRuntimeCoordinator {
             .upgrade()
             .ok_or_else(|| Error::invalid("runtime_unqualified", "the daemon is shutting down"))?;
         let broker = shared.native_model()?;
-        let binding = super::native_model_turn::NativeModelTaskBinding {
-            client_message_id: client_message_id.to_string(),
-            server_message_id: server_message_id.to_string(),
-            turn_token: turn_token.to_string(),
-        };
-        let guard = broker.bind_task(caller, &binding)?;
+        let guard = broker.bind_task(caller, client_message_id, claim, turn_token)?;
         Ok(Box::new(BoundModelTask { guard }))
     }
 

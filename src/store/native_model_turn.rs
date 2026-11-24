@@ -1,10 +1,10 @@
 //! CAD-1085: durable authority for the bounded keyless native model turn.
 //!
 //! This module owns every row the native model broker admits, freezes or
-//! settles. It mints nothing: a row is written only inside the caller's
-//! [`crate::store::WriteTxn`], so the existing authority journal seals the
-//! change and the caller checkpoints the committed head before any private
-//! SDK child may run. There is no second ledger.
+//! settles. The binding path re-proves the durable actor take under the
+//! existing authority journal; management and admission checkpoint the
+//! committed head before any private SDK child may run. There is no
+//! second ledger.
 //!
 //! What the tables are:
 //!
@@ -26,10 +26,12 @@
 //! the broker bounds to `i64::MAX`; canonical wire strings are produced by the
 //! broker, not stored as formatted numbers.
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 use rusqlite::OptionalExtension;
 
-use crate::store::seal::{StoreConn, WriteTxn};
+use crate::store::seal::{GuardState, StoreConn, WriteTxn};
 
 /// The five tables this module contributes to schema 57. The migration
 /// owner folds [`SCHEMA_V57`] into the same forward step as the protected
@@ -488,10 +490,22 @@ pub(crate) fn task_by_id_in(
     .map_err(|_| storage("the native model task is unavailable"))
 }
 
+/// Only a committed binding can produce this Store-local fence target.
+pub(crate) struct NativeTaskLease {
+    store: Arc<GuardState>,
+    task_id: String,
+}
+
+impl NativeTaskLease {
+    pub(crate) fn id(&self) -> &str {
+        &self.task_id
+    }
+}
+
 /// Insert the task, or return the existing one for a duplicate durable
 /// message delivery. A fenced task stays fenced: a redelivered message does
 /// not reopen inference authority.
-pub(crate) fn bind_task_in(tx: &WriteTxn<'_>, row: &TaskRow) -> Result<TaskRow> {
+fn bind_task_in(tx: &WriteTxn<'_>, row: &TaskRow) -> Result<TaskRow> {
     tx.execute_raw(
         "INSERT INTO native_model_tasks(durable_task_id,workspace_id,agent_uid,\
          session_binding,client_message_id,server_message_id,turn_token,state,created_ms) \
@@ -518,7 +532,7 @@ pub(crate) fn bind_task_in(tx: &WriteTxn<'_>, row: &TaskRow) -> Result<TaskRow> 
     .ok_or_else(|| refused("the native model task could not be bound"))
 }
 
-pub(crate) fn fence_task_in(
+fn fence_task_in(
     tx: &WriteTxn<'_>,
     durable_task_id: &str,
     reason: &str,
@@ -994,32 +1008,6 @@ pub(crate) fn window_usage_in(
 // Durable message binding
 // ---------------------------------------------------------------------------
 
-/// The durable message row facts the broker revalidates before binding a task.
-#[derive(Clone, Debug)]
-pub(crate) struct DurableMessage {
-    pub alias: String,
-    pub state: String,
-    pub turn_id: Option<String>,
-}
-
-pub(crate) fn durable_message_in(
-    conn: &impl StoreConn,
-    message_id: &str,
-) -> Result<Option<DurableMessage>> {
-    conn.query_opt(
-        "SELECT alias,state,turn_id FROM messages WHERE id=?1",
-        [message_id],
-        |row| {
-            Ok(DurableMessage {
-                alias: row.get(0)?,
-                state: row.get(1)?,
-                turn_id: row.get(2)?,
-            })
-        },
-    )
-    .map_err(|_| storage("the durable message is unavailable"))
-}
-
 /// Agent role and configured model/effort, re-derived by stable UID on every
 /// prepare and final admission. Nothing here is caller input.
 #[derive(Clone, Debug)]
@@ -1096,8 +1084,110 @@ impl crate::store::Store {
         self.read_tx(|conn| agent_facts_by_uid_in(&*conn, uid))
     }
 
-    pub(crate) fn native_model_message(&self, message_id: &str) -> Result<Option<DurableMessage>> {
-        self.read_tx(|conn| durable_message_in(&*conn, message_id))
+    /// Re-prove the actor's exact take and bind the task in one writer
+    /// critical section, before the protected adapter can send its prompt.
+    pub(crate) fn bind_claimed_native_task(
+        &self,
+        claim: &super::NativeTurnClaim,
+        candidate: &TaskRow,
+    ) -> Result<(TaskRow, NativeTaskLease)> {
+        let bound = self.write_tx(|tx| {
+            let message = tx
+                .query_opt(
+                    "SELECT m.seq,m.alias,m.state,m.turn_id,a.uid FROM messages m
+                     JOIN agents a ON a.alias=m.alias AND a.provider='pi' AND a.endpoint_kind='managed'
+                     JOIN connection_metadata w ON w.singleton=1
+                     WHERE m.id=?1 AND w.workspace_id=?2",
+                    [&candidate.client_message_id, &candidate.workspace_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .map_err(|_| storage("the durable message is unavailable"))?
+                .ok_or_else(|| {
+                    Error::invalid("principal_required", "the durable message does not exist")
+                })?;
+            let (seq, alias, state, turn_id, uid) = message;
+            if uid != candidate.agent_uid
+                || candidate.client_message_id != candidate.server_message_id
+                || !claim.belongs_to(self, &uid, seq)
+            {
+                return Err(Error::invalid(
+                    "principal_required",
+                    "the durable actor take is not bound to this message and agent",
+                ));
+            }
+            if !matches!(state.as_str(), "submitting" | "running") {
+                let _ = Self::event(
+                    tx,
+                    &alias,
+                    "native_task_binding_refused",
+                    serde_json::json!({"message": candidate.client_message_id, "state": state}),
+                );
+                return Ok(None);
+            }
+            let submission = tx.query_opt(
+                "SELECT seq FROM events WHERE alias=?1 AND kind='submitting' AND seq>=?3
+                 AND json_extract(payload,'$.message')=?2 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![alias, candidate.client_message_id, claim.submission_seq()],
+                |r| r.get::<_, i64>(0),
+            )?;
+            if submission != Some(claim.submission_seq()) {
+                return Err(Error::invalid("runtime_revoked", "the actor take changed"));
+            }
+            if turn_id.as_deref().is_some_and(|turn| turn != candidate.turn_token) {
+                return Err(Error::invalid(
+                    "runtime_revoked",
+                    "the durable message belongs to another turn",
+                ));
+            }
+            let live = bind_task_in(tx, candidate)?;
+            if live.state != TASK_ACTIVE {
+                return Err(Error::invalid("runtime_revoked", "the model task is fenced"));
+            }
+            if live.session_binding != candidate.session_binding
+                || live.agent_uid != candidate.agent_uid
+                || live.turn_token != candidate.turn_token
+            {
+                return Err(Error::invalid(
+                    "principal_required",
+                    "the durable message belongs to another runtime or turn",
+                ));
+            }
+            Ok(Some(live))
+        })?;
+        let task = bound.ok_or_else(|| {
+            Error::invalid(
+                "runtime_revoked",
+                "the durable message is no longer running",
+            )
+        })?;
+        let lease = NativeTaskLease {
+            store: Arc::clone(&self.seal_state),
+            task_id: task.durable_task_id.clone(),
+        };
+        Ok((task, lease))
+    }
+
+    pub(crate) fn fence_claimed_native_task(
+        &self,
+        lease: &NativeTaskLease,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.seal_state, &lease.store) {
+            return Err(Error::invalid(
+                "principal_required",
+                "the native model task lease belongs to another store",
+            ));
+        }
+        self.write_tx(|tx| fence_task_in(tx, lease.id(), reason, now_ms))
     }
 }
 

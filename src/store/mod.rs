@@ -104,6 +104,7 @@ pub use messages::{
     report_timeout_secs, IssueSelection, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
     DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES, NUDGE_SOURCE,
 };
+pub(crate) use messages::{ActorTake, NativeTurnClaim};
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
 mod endpoint;

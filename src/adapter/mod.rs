@@ -494,6 +494,30 @@ impl Probe {
     }
 }
 
+/// A turn's client message and, on a protected path, its durable actor take.
+/// A caller-supplied message id alone cannot authorize a protected turn.
+pub struct TurnMessage<'a> {
+    id: &'a str,
+    claim: Option<&'a crate::store::NativeTurnClaim>,
+}
+
+impl<'a> TurnMessage<'a> {
+    pub fn unclaimed(id: &'a str) -> Self {
+        Self { id, claim: None }
+    }
+
+    pub fn id(&self) -> &str {
+        self.id
+    }
+
+    pub(crate) fn from_actor(
+        id: &'a str,
+        claim: Option<&'a crate::store::NativeTurnClaim>,
+    ) -> Self {
+        Self { id, claim }
+    }
+}
+
 /// What `agent recover-submit` found and did on the pane (CAD-152).
 /// Never carries the draft or the message body — only the check that
 /// decided and the probe verdicts around it.
@@ -614,14 +638,14 @@ pub trait ProviderAdapter: Send + Sync {
         &self,
         prompt: &str,
         slot: Option<&str>,
-        client_message_id: &str,
+        message: TurnMessage<'_>,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         let prompt = match slot {
             Some(slot) => without_turn_slot(prompt, slot),
             None => prompt.to_string(),
         };
-        self.run_turn(&prompt, client_message_id, on_started)
+        self.run_turn(&prompt, message.id(), on_started)
     }
     /// CAD-565: pre-write screening of the stored `body` — distinct
     /// from the check on the paste itself. A pty pane now receives a

@@ -146,14 +146,6 @@ pub(crate) struct NativeModelRuntimeEvidence {
     pub loaded_receipt_id: String,
 }
 
-/// The server-derived task binding the adapter takes before a Pi prompt.
-#[derive(Clone, Debug)]
-pub(crate) struct NativeModelTaskBinding {
-    pub client_message_id: String,
-    pub server_message_id: String,
-    pub turn_token: String,
-}
-
 /// The broker. Holds only a `Weak` back-reference to the daemon, so there is
 /// no `Arc` cycle and no second authority cache.
 pub(crate) struct NativeModelBroker {
@@ -1472,12 +1464,13 @@ impl NativeModelBroker {
     pub(crate) fn bind_task(
         &self,
         caller: &RuntimeCaller,
-        binding: &NativeModelTaskBinding,
+        client_message_id: &str,
+        claim: &crate::store::NativeTurnClaim,
+        turn_token: &str,
     ) -> Result<NativeModelTaskGuard> {
         for (value, what) in [
-            (&binding.client_message_id, "client message"),
-            (&binding.server_message_id, "server message"),
-            (&binding.turn_token, "turn token"),
+            (client_message_id, "client message"),
+            (turn_token, "turn token"),
         ] {
             if value.is_empty() || value.len() > 200 || value.bytes().any(|b| b.is_ascii_control())
             {
@@ -1489,72 +1482,20 @@ impl NativeModelBroker {
         }
         let evidence = self.measured(caller)?;
         let shared = self.shared()?;
-        let message = shared
-            .store
-            .native_model_message(&binding.client_message_id)?
-            .ok_or_else(|| refused("principal_required", "the durable message does not exist"))?;
-        let message_agent = shared
-            .store
-            .agent(&message.alias)
-            .map_err(|_| refused("principal_required", "the durable message owner is unknown"))?;
-        if message_agent.uid != evidence.agent_uid {
-            return Err(refused(
-                "principal_required",
-                "the durable message belongs to another agent",
-            ));
-        }
-        if !matches!(message.state.as_str(), "queued" | "submitting" | "running") {
-            let _ = shared.store.event_public(
-                &message.alias,
-                "native_task_binding_refused",
-                serde_json::json!({
-                    "message": binding.client_message_id,
-                    "state": message.state,
-                }),
-            );
-            return Err(refused(
-                "runtime_revoked",
-                "the durable message is no longer running",
-            ));
-        }
-        if let Some(turn) = &message.turn_id {
-            if turn != &binding.turn_token {
-                return Err(refused(
-                    "runtime_revoked",
-                    "the durable message belongs to another turn",
-                ));
-            }
-        }
-        let workspace = evidence.workspace_id.clone();
-        let agent_uid = evidence.agent_uid.clone();
-        let session_binding = evidence.session_binding.clone();
-        let client_message_id = binding.client_message_id.clone();
-        let server_message_id = binding.server_message_id.clone();
-        let turn_token = binding.turn_token.clone();
+        // Both IDs name the same message on the owned console protocol.
+        // The Store checks the exact actor attempt in the task's write.
         let candidate = durable::TaskRow {
             durable_task_id: uuid::Uuid::new_v4().to_string(),
-            workspace_id: workspace.clone(),
-            agent_uid: agent_uid.clone(),
-            session_binding: session_binding.clone(),
-            client_message_id: client_message_id.clone(),
-            server_message_id,
-            turn_token: turn_token.clone(),
+            workspace_id: evidence.workspace_id.clone(),
+            agent_uid: evidence.agent_uid.clone(),
+            session_binding: evidence.session_binding.clone(),
+            client_message_id: client_message_id.to_owned(),
+            server_message_id: client_message_id.to_owned(),
+            turn_token: turn_token.to_owned(),
             state: durable::TASK_ACTIVE.to_string(),
             created_ms: now_ms(),
         };
-        let task = shared.store.write_tx(move |tx| {
-            let live = durable::bind_task_in(tx, &candidate)?;
-            if live.state != durable::TASK_ACTIVE {
-                return Err(refused("runtime_revoked", "the model task is fenced"));
-            }
-            Ok(live)
-        })?;
-        if task.agent_uid != agent_uid || task.session_binding != session_binding {
-            return Err(refused(
-                "principal_required",
-                "the durable message belongs to another runtime",
-            ));
-        }
+        let (task, lease) = shared.store.bind_claimed_native_task(claim, &candidate)?;
         let key = Self::runtime_key(&evidence.runtime_id, &evidence.session_binding);
         {
             let mut active = self
@@ -1569,12 +1510,12 @@ impl NativeModelBroker {
                     ));
                 }
             }
-            active.insert(key.clone(), task.clone());
+            active.insert(key.clone(), task);
         }
         Ok(NativeModelTaskGuard {
             shared: Arc::downgrade(&shared),
             active: Arc::clone(&self.active),
-            task_id: task.durable_task_id,
+            lease,
             runtime_key: key,
             fenced: Mutex::new(false),
         })
@@ -1934,7 +1875,7 @@ impl NativeModelBroker {
 pub(crate) struct NativeModelTaskGuard {
     shared: Weak<Shared>,
     active: Arc<Mutex<HashMap<String, durable::TaskRow>>>,
-    task_id: String,
+    lease: durable::NativeTaskLease,
     runtime_key: String,
     fenced: Mutex<bool>,
 }
@@ -1950,17 +1891,14 @@ impl NativeModelTaskGuard {
         }
         *fenced = true;
         if let Some(shared) = self.shared.upgrade() {
-            let task_id = self.task_id.clone();
-            let reason = reason.to_string();
-            let now = now_ms();
             let _ = shared
                 .store
-                .write_tx(move |tx| durable::fence_task_in(tx, &task_id, &reason, now));
+                .fence_claimed_native_task(&self.lease, reason, now_ms());
         }
         if let Ok(mut active) = self.active.lock() {
             if active
                 .get(&self.runtime_key)
-                .map(|task| task.durable_task_id == self.task_id)
+                .map(|task| task.durable_task_id == self.lease.id())
                 .unwrap_or(false)
             {
                 active.remove(&self.runtime_key);

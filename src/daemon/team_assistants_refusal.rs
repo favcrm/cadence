@@ -5996,7 +5996,7 @@ fn queued_member_turn_refused_by_original_credential_at_claim() {
         format!("cred-{sub}"),
         "the queued stamp is not the ORIGINAL issuing credential"
     );
-    let taken = fx.shared.take_app_aware(&rt.alias).unwrap();
+    let (taken, _) = fx.shared.take_app_aware(&rt.alias).unwrap();
     let crate::store::Take::Message(taken) = taken else {
         panic!("live queued member turn was not taken");
     };
@@ -6051,7 +6051,7 @@ fn queued_member_turn_refused_by_original_credential_at_claim() {
         "the local binding must remain active for this original-credential case"
     );
 
-    let claimed = fx.shared.take_app_aware(&rt.alias).unwrap();
+    let (claimed, _) = fx.shared.take_app_aware(&rt.alias).unwrap();
     assert!(
         !matches!(claimed, crate::store::Take::Message(_)),
         "a queued turn whose original credential is dead was taken as runnable"
