@@ -4449,3 +4449,13 @@ const CAD2743_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2743_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2755_ZHTW: Record<string, string> = {
+  "Run {tool} on {connection}?": "要在 {connection} 執行 {tool} 嗎？",
+  "Show input": "顯示輸入內容",
+  "Always allow": "一律允許",
+  "Always allowed": "已一律允許",
+};
+for (const [key, value] of Object.entries(CAD2755_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

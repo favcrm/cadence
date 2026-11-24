@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "../../../lib/locale";
 import StagedWriteDetail, { noticeText } from "../../decisions/StagedWriteDetail";
-import { failureReason, isolate, outcomeOf, sourceLine } from "../../decisions/stagedWrite";
+import { failureReason, isolate, outcomeOf, sourceLine, type StagedWrite } from "../../decisions/stagedWrite";
+import { api } from "../../../lib/api";
+import { customMcpErrorText } from "../../settings/customMcpView";
+import InlineToolDecision, { isInlineTool, type InlineEntry, type InlineVerb } from "./InlineToolDecision";
 import { conversationDecisions, useDecisions, type DecisionsStore } from "../../decisions/useDecisions";
 
 /** The caller keys this component by the selected, server-proven conversation. */
@@ -11,6 +14,7 @@ export default function ConversationDecisions({
   onPendingChange,
   onReview,
   store: shared,
+  canAlwaysAllow = false,
 }: {
   conversation: string;
   revision: number | string;
@@ -18,11 +22,39 @@ export default function ConversationDecisions({
   onReview?: () => void;
   /** CAD-2364: the pane's store for this conversation, so its answers' chips read the same list. */
   store?: DecisionsStore;
+  /** CAD-2755: the viewer is the workspace owner, so a custom MCP card offers Always allow. */
+  canAlwaysAllow?: boolean;
 }) {
   const t = useTranslate();
   const [store] = useState(() => shared ?? conversationDecisions(conversation));
   const decisions = useDecisions(true, store);
   const [review, setReview] = useState<{ queue: string[]; at: number } | null>(null);
+  const [inline, setInline] = useState<Record<string, InlineEntry>>({});
+  const patchInline = (id: string, next: InlineEntry) => setInline((cur) => ({ ...cur, [id]: next }));
+
+  const decideInline = async (write: StagedWrite, verb: InlineVerb) => {
+    patchInline(write.id, { write, busy: true, note: undefined });
+    const result = await store.decide(write.id, verb === "reject" ? "deny" : "approve");
+    if (result !== "decided") {
+      const note = result === "access" ? t("Only the workspace owner can decide this request.")
+        : result === "elsewhere" ? t("Already decided elsewhere. See Feed.")
+        : t("{title}: the result could not be confirmed. See Feed.").replace("{title}", () => write.title);
+      patchInline(write.id, { write, busy: false, note });
+      return;
+    }
+    if (verb === "reject") return patchInline(write.id, { write, busy: false, done: "Rejected" });
+    if (verb === "approve" || write.customMcp == null) return patchInline(write.id, { write, busy: false, done: "Approved" });
+    try {
+      await api.customMcpUpdateTools(write.customMcp.connectionId, [{ tool_name: write.customMcp.tool, mode: "read" }]);
+      patchInline(write.id, { write, busy: false, done: "Always allowed" });
+    } catch (e: unknown) {
+      // The call stays approved once; only the standing permission was refused.
+      patchInline(write.id, { write, busy: false, done: "Approved", note: t(customMcpErrorText(e)) });
+    }
+  };
+  const inlineCard = (entry: InlineEntry) => (
+    <InlineToolDecision key={entry.write.id} entry={entry} canAlwaysAllow={canAlwaysAllow} t={t} onDecide={(verb) => void decideInline(entry.write, verb)} />
+  );
   const opener = useRef<HTMLElement | null>(null);
   const activity = useRef<HTMLElement | null>(null);
   const historySummary = useRef<HTMLElement | null>(null);
@@ -61,7 +93,7 @@ export default function ConversationDecisions({
   return (
     <>
       {decisions.notice && review === null && <p className="m-0 text-label text-ink-300" role="status">{noticeText(decisions.notice, t)}</p>}
-      {(decisions.phase === "error" || decisions.phase === "unavailable" || decisions.pending.length > 0) && (
+      {(decisions.phase === "error" || decisions.phase === "unavailable" || decisions.pending.length > 0 || Object.keys(inline).length > 0) && (
         <section ref={activity} className="app-assistant-activity" aria-label={t("Decisions")} tabIndex={-1}>
           {decisions.phase === "error" && (
             <p className="text-label text-fail" role="alert">
@@ -73,6 +105,7 @@ export default function ConversationDecisions({
             <p className="text-label text-fail" role="alert">{t("Decisions are unavailable.")}</p>
           )}
           {decisions.pending.map((write) => {
+            if (isInlineTool(write)) return inlineCard(inline[write.id] ?? { write, busy: false });
             const source = sourceLine(write, t);
             return (
               <article className="app-assistant-card" key={write.id} data-chat-staged>
@@ -87,6 +120,9 @@ export default function ConversationDecisions({
               </article>
             );
           })}
+          {Object.values(inline)
+            .filter((entry) => !decisions.pending.some((row) => row.id === entry.write.id))
+            .map(inlineCard)}
         </section>
       )}
       {decisions.decided.length > 0 && (
