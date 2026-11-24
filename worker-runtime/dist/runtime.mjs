@@ -55871,6 +55871,7 @@ function intentGuard(refusal) {
 // src/loop-guard.ts
 var DEFAULT_LOOP_GUARD_LIMIT = 4;
 var DEFAULT_ERROR_LOOP_LIMIT = 3;
+var LOOP_GUARD_WARNING_CODE = "loop_guard_warning";
 function normalizeErrorSignature(message) {
   const firstLine = message.split(`
 `).map((line) => line.trim()).find((line) => line !== "") ?? "";
@@ -56018,7 +56019,7 @@ function loopGuardExtension(guard) {
             ...result,
             diagnostics: [
               ...result.diagnostics ?? [],
-              { severity: "warn", code: "loop_guard_warning", message: outcome.warn }
+              { severity: "warn", code: LOOP_GUARD_WARNING_CODE, message: outcome.warn }
             ]
           };
         }
@@ -57651,6 +57652,9 @@ function rewriteGiveUps(body, failed, userRules) {
 }
 
 // src/summary-source.ts
+function isLoopWarning(item) {
+  return item.severity === "warn" && item.code === LOOP_GUARD_WARNING_CODE;
+}
 var renderSummarySource = ({ entries, messages, serialize }) => {
   const included = new Set(messages);
   const errors = new Set;
@@ -57667,19 +57671,30 @@ var renderSummarySource = ({ entries, messages, serialize }) => {
       const hasDiagnosticError = diagnostics.some((item) => item.severity === "error");
       const failed = message.isError || hasDiagnosticError;
       let shaped = message;
-      if (hasDiagnosticError) {
+      if (hasDiagnosticError || diagnostics.some(isLoopWarning)) {
         const last = message.content.at(-1);
-        const render = (scrub) => `<harness>
-${diagnostics.map(({ severity, message }) => `[${severity}] ${scrub && severity === "error" ? TOOL_ERROR_REDACTED : message}`).join(`
+        const render = (lines) => `<harness>
+${lines.join(`
 `)}
 </harness>`;
-        if (last?.type !== "text" || last.text !== render(false)) {
+        const original = render(diagnostics.map(({ severity, message }) => `[${severity}] ${message}`));
+        if (last?.type !== "text" || last.text !== original) {
           throw new Error("Compaction source has an inconsistent tool diagnostic.");
         }
-        for (const item of diagnostics)
-          if (item.severity === "error")
+        const lines = [];
+        for (const item of diagnostics) {
+          const loopWarning = isLoopWarning(item);
+          if (item.severity === "error" || loopWarning)
             errors.add(item.message.trim());
-        shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
+          if (!loopWarning) {
+            const text = item.severity === "error" ? TOOL_ERROR_REDACTED : item.message;
+            lines.push(`[${item.severity}] ${text}`);
+          }
+        }
+        const content = message.content.slice(0, -1);
+        if (lines.length > 0)
+          content.push({ type: "text", text: render(lines) });
+        shaped = { ...message, content };
       }
       if (message.isError) {
         const before = visibleText(shaped.content);

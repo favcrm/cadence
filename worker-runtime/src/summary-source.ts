@@ -1,7 +1,12 @@
 import type { Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
-import { CompactionEntry, ToolResultEntry, type CompactionHooks } from "@earendil-works/pi-durable";
+import { CompactionEntry, ToolResultEntry, type CompactionHooks, type ToolDiagnostic } from "@earendil-works/pi-durable";
 import { errorEchoScrubber, redactFailedOutput, redactQuotedHarness, TOOL_ERROR_REDACTED } from "./summary-tool-errors.ts";
 import { collectUserToolRestrictions, rewriteGiveUps, TRANSIENT_FAILURE_NOTE } from "./summary-tool-failures.ts";
+import { LOOP_GUARD_WARNING_CODE } from "./loop-guard.ts";
+
+function isLoopWarning(item: ToolDiagnostic): boolean {
+  return item.severity === "warn" && item.code === LOOP_GUARD_WARNING_CODE;
+}
 
 /** Shape only Pi's pinned compaction source, never the transcript or its retained tail. */
 export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({ entries, messages, serialize }) => {
@@ -22,17 +27,28 @@ export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({
       const hasDiagnosticError = diagnostics.some((item) => item.severity === "error");
       const failed = message.isError || hasDiagnosticError;
       let shaped = message;
-      if (hasDiagnosticError) {
+      if (hasDiagnosticError || diagnostics.some(isLoopWarning)) {
         const last = message.content.at(-1);
-        const render = (scrub: boolean) => `<harness>\n${diagnostics.map(({ severity, message }) =>
-          `[${severity}] ${scrub && severity === "error" ? TOOL_ERROR_REDACTED : message}`).join("\n")}\n</harness>`;
+        const render = (lines: string[]) => `<harness>\n${lines.join("\n")}\n</harness>`;
+        const original = render(diagnostics.map(({ severity, message }) => `[${severity}] ${message}`));
         // Pi appends this exact block even when isError is false. If the pinned
         // record disagrees, do not send unverified diagnostic text to the model.
-        if (last?.type !== "text" || last.text !== render(false)) {
+        if (last?.type !== "text" || last.text !== original) {
           throw new Error("Compaction source has an inconsistent tool diagnostic.");
         }
-        for (const item of diagnostics) if (item.severity === "error") errors.add(item.message.trim());
-        shaped = { ...message, content: [...message.content.slice(0, -1), { type: "text", text: render(true) }] };
+        const lines: string[] = [];
+        for (const item of diagnostics) {
+          // Loop-guard warnings guide the current turn, not future attempts.
+          const loopWarning = isLoopWarning(item);
+          if (item.severity === "error" || loopWarning) errors.add(item.message.trim());
+          if (!loopWarning) {
+            const text = item.severity === "error" ? TOOL_ERROR_REDACTED : item.message;
+            lines.push(`[${item.severity}] ${text}`);
+          }
+        }
+        const content = message.content.slice(0, -1);
+        if (lines.length > 0) content.push({ type: "text", text: render(lines) });
+        shaped = { ...message, content };
       }
       if (message.isError) {
         const before = visibleText(shaped.content);
