@@ -573,6 +573,8 @@ fn make_kickoff<'a>(worktree: &'a str, profile_id: Option<&'a str>) -> Kickoff<'
         subject_id: Some(SUBJECT_ID),
         issuer: Some(ISSUER),
         profile_id,
+        action: "dispatch",
+        note: None,
     }
 }
 

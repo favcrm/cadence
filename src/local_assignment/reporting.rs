@@ -1057,6 +1057,8 @@ mod tests {
             subject_id: Some("user_member"),
             issuer: Some("https://hosted-report.invalid"),
             profile_id: None,
+            action: "dispatch",
+            note: None,
         }
     }
 

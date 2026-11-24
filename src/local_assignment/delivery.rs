@@ -875,13 +875,28 @@ fn kickoff_line(
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .take(180)
         .collect();
+    let lead = if kickoff.action == "resume" {
+        "Resumed hosted issue"
+    } else {
+        "Hosted issue"
+    };
     let mut line = format!(
-        "Hosted issue {} ({title}). Read {} for this assignment's issue, comments, and wiki index. Use its org selector explicitly for hosted ticket/wiki actions, verify organization_id and audience, and do not change global org selection. Worktree: {}. A managed endpoint ends its final answer with SHA:<40-or-64-lowercase-hex>. A PTY explicit reporter uses cadence message result {} --token <turn_id> --text '<summary>' --sha <40-or-64-lowercase-hex>.",
+        "{lead} {} ({title}). Read {} for this assignment's issue, comments, and wiki index. Use its org selector explicitly for hosted ticket/wiki actions, verify organization_id and audience, and do not change global org selection. Worktree: {}. A managed endpoint ends its final answer with SHA:<40-or-64-lowercase-hex>. A PTY explicit reporter uses cadence message result {} --token <turn_id> --text '<summary>' --sha <40-or-64-lowercase-hex>.",
         kickoff.issue_id,
         note.display(),
         kickoff.worktree,
         kickoff.message_id
     );
+    if let Some(guidance) = kickoff.note.map(str::trim).filter(|text| !text.is_empty()) {
+        let sanitized: String = guidance
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .take(800)
+            .collect();
+        if !sanitized.is_empty() {
+            line.push_str(&format!(" Guidance: {sanitized}"));
+        }
+    }
     if let Some(pkg) = staged {
         line.push_str(&format!(
             " Private app package_ref: {} ({}) for updater {}.",
@@ -961,6 +976,8 @@ fn issue_context(target: &RemoteTarget, kickoff: &Kickoff, wake_timeout: u64) ->
         "assignment_id": kickoff.assignment_id,
         "claim_id": kickoff.claim_id,
         "generation": kickoff.generation,
+        "action": kickoff.action,
+        "note": kickoff.note,
         "issue": issue,
         "issue_title": issue_title,
         "comments": history,

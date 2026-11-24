@@ -2170,6 +2170,8 @@ pub(super) mod tests {
             subject_id: Some("user_claimant"),
             issuer: Some("https://issuer.example/original"),
             profile_id: None,
+            action: "dispatch",
+            note: None,
         };
         cadence_agent::local_assignment::reporting::store_kickoff_binding(
             dir,
@@ -2310,6 +2312,8 @@ pub(super) mod tests {
             subject_id: Some("user_claimant"),
             issuer: Some("https://issuer.example/original"),
             profile_id: None,
+            action: "dispatch",
+            note: None,
         };
         cadence_agent::local_assignment::reporting::store_kickoff_binding(
             &dir,

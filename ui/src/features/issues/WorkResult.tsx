@@ -9,6 +9,7 @@ import type { IssueDetail, TaskReport } from "../../lib/types";
 import { composerBlocked, type LanePayload } from "./lane";
 import { WriteGate } from "../auth/WriteGate";
 import { isolate, outcomeOf, type StagedWrite } from "../decisions/stagedWrite";
+import HostedLocalAssignmentCard from "./HostedLocalAssignmentCard";
 import {
   deployRefs,
   hostedAssignmentText,
@@ -131,10 +132,14 @@ export function WorkResult({
   checklistVisible = true,
   blocked,
   hosted = false,
+  canLocalDispatch = false,
+  readOnly = false,
   codeDelivery,
   stagedActions,
   tabHref,
   onCompose,
+  onAssignmentMutated,
+  onToast,
   children,
   onOpen,
 }: {
@@ -145,10 +150,14 @@ export function WorkResult({
   checklistVisible?: boolean;
   blocked: string | null;
   hosted?: boolean;
+  canLocalDispatch?: boolean;
+  readOnly?: boolean;
   codeDelivery: boolean;
   stagedActions?: readonly StagedWrite[];
   tabHref: (tab: IssueTab) => string;
   onCompose: (mode: "ask" | "instruct") => void;
+  onAssignmentMutated?: () => void;
+  onToast?: (msg: string) => void;
   children: ReactNode;
   onOpen: (id: string) => void;
 }) {
@@ -404,6 +413,16 @@ export function WorkResult({
                   : t("No lane yet")}
           </dd>
         </dl>
+        {hosted && !laneView && latestAssignment && (
+          <HostedLocalAssignmentCard
+            issueId={detail.id}
+            assignment={latestAssignment}
+            canLocalDispatch={canLocalDispatch}
+            readOnly={readOnly}
+            onMutated={onAssignmentMutated}
+            onToast={onToast}
+          />
+        )}
       </section>
 
       <div ref={briefRef} className="issue-description issue-reader min-w-0 max-w-[84ch] text-body text-ink-300">

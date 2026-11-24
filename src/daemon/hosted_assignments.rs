@@ -1,6 +1,6 @@
 //! Explicit operator configuration and daemon-owned workspace event workers.
 use super::*;
-use crate::local_assignment::{events, reporting::ReportDriver, SpawnSpec};
+use crate::local_assignment::{events, reporting::ReportDriver, ResumeSpec, SpawnSpec};
 use crate::remote_cli::RemoteTarget;
 
 impl Shared {
@@ -66,6 +66,136 @@ impl Shared {
         })?;
         self.launch_actor(&alias)?;
         Ok((alias, format!("{provider}/{kind}")))
+    }
+
+    pub(super) fn resume_hosted_worker(
+        self: &Arc<Self>,
+        spec: &ResumeSpec,
+        alias: &str,
+        worktree: &Path,
+        is_seat: bool,
+    ) -> Result<String> {
+        let agent = self.store.agent_opt(alias)?.ok_or_else(|| {
+            Error::invalid(
+                "resume_agent_not_found",
+                format!("local agent '{alias}' is no longer registered"),
+            )
+        })?;
+        if agent.archived_at.is_some() {
+            return Err(Error::invalid(
+                "resume_agent_not_found",
+                format!("local agent '{alias}' is archived"),
+            ));
+        }
+        let agent_cwd = std::fs::canonicalize(Path::new(&agent.cwd)).map_err(|_| {
+            Error::invalid(
+                "resume_worktree_missing",
+                format!("working directory for local agent '{alias}' no longer exists"),
+            )
+        })?;
+        let expected_wt = std::fs::canonicalize(worktree).map_err(|_| {
+            Error::invalid(
+                "resume_worktree_missing",
+                "recorded lane worktree directory no longer exists",
+            )
+        })?;
+        if is_seat {
+            let agent_root = crate::worktree::main_root(&agent_cwd).map_err(|_| {
+                Error::invalid(
+                    "resume_worktree_mismatch",
+                    format!("seat agent '{alias}' cwd is not a git repository"),
+                )
+            })?;
+            let expected_root = crate::worktree::main_root(&expected_wt).map_err(|_| {
+                Error::invalid(
+                    "resume_worktree_mismatch",
+                    "recorded lane worktree is not inside a git repository",
+                )
+            })?;
+            if agent_root != expected_root {
+                return Err(Error::invalid(
+                    "resume_worktree_mismatch",
+                    format!("seat agent '{alias}' repository does not match the recorded lane"),
+                ));
+            }
+        } else if agent_cwd != expected_wt {
+            return Err(Error::invalid(
+                "resume_worktree_mismatch",
+                format!("spawned worker '{alias}' cwd does not match the recorded worktree"),
+            ));
+        }
+        refuse_fenced_default(alias, &agent.state, self.store.has_unknown(alias)?)?;
+
+        let mut launch = serde_json::Map::new();
+        if spec.model.is_some() || spec.effort.is_some() {
+            self.kickoff_launch_policy(
+                &agent.provider,
+                &agent.endpoint_kind,
+                spec.model.as_deref(),
+                spec.effort.as_deref(),
+            )?;
+            if let Some(model) = spec.model.as_deref() {
+                launch.insert("model".to_string(), json!(model));
+            }
+            if let Some(effort) = spec.effort.as_deref() {
+                launch.insert("effort".to_string(), json!(effort));
+            }
+            crate::adapter::registry::validate_launch_params(
+                &agent.provider,
+                &agent.endpoint_kind,
+                &Value::Object(launch.clone()),
+            )?;
+        }
+
+        let owned = self.lifecycle.lock().unwrap().owned(alias);
+        if owned {
+            let live = agent.endpoint.is_some()
+                || matches!(agent.state.as_str(), "idle" | "running" | "waiting_input");
+            if !live {
+                return Err(Error::busy_coded(
+                    "agent_transitioning",
+                    format!("local agent '{alias}' is still starting or stopping; retry shortly"),
+                ));
+            }
+            let current_model = agent
+                .params
+                .as_ref()
+                .and_then(|p| p.get("model"))
+                .and_then(Value::as_str);
+            let current_effort = agent
+                .params
+                .as_ref()
+                .and_then(|p| p.get("effort"))
+                .and_then(Value::as_str);
+            let model_changed = spec
+                .model
+                .as_deref()
+                .is_some_and(|m| Some(m) != current_model);
+            let effort_changed = spec
+                .effort
+                .as_deref()
+                .is_some_and(|e| Some(e) != current_effort);
+            if model_changed || effort_changed {
+                return Err(Error::invalid(
+                    "agent_live_override_refused",
+                    format!(
+                        "local agent '{alias}' is currently live; stop it or omit model/effort changes to resume its active session"
+                    ),
+                ));
+            }
+        } else {
+            if !launch.is_empty() {
+                self.store.set_params(alias, &Value::Object(launch))?;
+            }
+            let started = self.try_resume(alias)?;
+            if !started {
+                return Err(Error::invalid(
+                    "resume_failed",
+                    format!("local agent '{alias}' could not be resumed"),
+                ));
+            }
+        }
+        Ok(format!("{}/{}", agent.provider, agent.endpoint_kind))
     }
 
     pub(super) fn rpc_hosted_local_agent(
@@ -314,6 +444,39 @@ impl Shared {
                             },
                         );
 
+                        let shared_resume = self.clone();
+                        let active_for_resume = Arc::clone(&active_lanes);
+                        let resume_worker: events::ResumeWorkerFn = Arc::new(
+                            move |spec: &ResumeSpec,
+                                  alias: &str,
+                                  worktree: &Path,
+                                  assignment_id: &str,
+                                  is_seat: bool| {
+                                if !is_seat {
+                                    let mut lanes =
+                                        active_for_resume.lock().unwrap_or_else(|e| e.into_inner());
+                                    reserve_spawn_slot(&mut lanes, assignment_id, max_spawn_lanes)?;
+                                    if let Some(entry) = lanes.get_mut(assignment_id) {
+                                        entry.alias = alias.to_string();
+                                    }
+                                }
+                                match shared_resume
+                                    .resume_hosted_worker(spec, alias, worktree, is_seat)
+                                {
+                                    Ok(adapter) => Ok(adapter),
+                                    Err(err) => {
+                                        if !is_seat {
+                                            active_for_resume
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .remove(assignment_id);
+                                        }
+                                        Err(err)
+                                    }
+                                }
+                            },
+                        );
+
                         let active_for_kickoff = Arc::clone(&active_lanes);
                         let on_kickoff =
                             Arc::new(move |alias: &str, assignment_id: &str, issue_id: &str| {
@@ -336,6 +499,7 @@ impl Shared {
                             send,
                             snapshot,
                             spawn_worker,
+                            resume_worker,
                             on_kickoff,
                             on_terminal,
                             notify,
@@ -504,6 +668,7 @@ mod tests {
     use super::{
         active_issue_for_alias, build_agent_activity_snapshot, record_hosted_kickoff,
         refuse_fenced_default, reserve_spawn_slot, spawn_agent_instructions, ActiveHostedLane,
+        ServeOptions, Shared,
     };
     use std::collections::BTreeMap;
 
@@ -594,5 +759,74 @@ mod tests {
         assert_eq!(err.code(), Some("runner_at_capacity"));
         lanes.remove("hla_1");
         assert!(reserve_spawn_slot(&mut lanes, "hla_2", 1).is_ok());
+    }
+
+    #[test]
+    fn cad2777_resume_hosted_worker_enforces_worktree_and_resumes_stopped_worker() {
+        let dir = tempfile::Builder::new().prefix("c2777").tempdir().unwrap();
+        let pm = dir.path().join("pm");
+        crate::issue::Pm::init(&pm).unwrap();
+        let wt_a = dir.path().join("wt-a");
+        let wt_b = dir.path().join("wt-b");
+        std::fs::create_dir_all(&wt_a).unwrap();
+        std::fs::create_dir_all(&wt_b).unwrap();
+        let opts = ServeOptions::default();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd_a = wt_a.to_string_lossy().into_owned();
+        shared
+            .store
+            .register_agent(&crate::store::NewAgent {
+                alias: "fake-abc123",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: &cwd_a,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared.store.set_enabled("fake-abc123", false).unwrap();
+
+        let spec = crate::local_assignment::ResumeSpec {
+            runner_id: "lri_00000000-0000-4000-8000-000000000001".into(),
+            prior_assignment_id: Some("hla_00000000-0000-4000-8000-000000000001".into()),
+            lane_alias: Some("fake-abc123".into()),
+            target_agent_id: None,
+            model: None,
+            effort: None,
+        };
+
+        // Cross-worktree mismatch fails closed
+        let mismatch = shared
+            .resume_hosted_worker(&spec, "fake-abc123", &wt_b, false)
+            .unwrap_err();
+        assert_eq!(mismatch.code(), Some("resume_worktree_mismatch"));
+
+        // Matching worktree invokes try_resume and enables the stopped worker
+        let adapter = shared
+            .resume_hosted_worker(&spec, "fake-abc123", &wt_a, false)
+            .unwrap();
+        assert_eq!(adapter, "fake/fake");
+        assert!(shared.store.agent("fake-abc123").unwrap().enabled);
+
+        // Shut down spawned actor thread cleanly before tempdir cleanup
+        shared
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        shared.wake();
+        let ctls: Vec<_> = shared
+            .lifecycle
+            .lock()
+            .unwrap()
+            .agents
+            .values()
+            .cloned()
+            .collect();
+        shared.stop_ctls(&ctls);
     }
 }

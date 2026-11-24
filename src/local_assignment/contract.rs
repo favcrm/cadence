@@ -109,8 +109,8 @@ fn forbidden_path_key(value: &Value) -> bool {
 
 fn forbidden_assignment_key(object: &serde_json::Map<String, Value>) -> bool {
     object.iter().any(|(key, child)| {
-        if key == "spawn" {
-            // `spawn` is validated separately with an exact allowlist of scalar fields;
+        if key == "spawn" || key == "resume" {
+            // `spawn` and `resume` are validated separately with exact scalar allowlists;
             // every other key stays subject to recursive path/custody denial.
             return false;
         }
@@ -196,6 +196,91 @@ fn parse_spawn_spec(value: Option<&Value>) -> Result<Option<super::SpawnSpec>> {
         effort,
         repo,
         profile_id,
+    }))
+}
+
+fn parse_resume_spec(value: Option<&Value>) -> Result<Option<super::ResumeSpec>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| Error::rejected("assignment resume field is not the contract"))?;
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "runner_id"
+                | "prior_assignment_id"
+                | "lane_alias"
+                | "target_agent_id"
+                | "model"
+                | "effort"
+        ) {
+            return Err(Error::rejected(
+                "assignment resume contains an unknown or disallowed field",
+            ));
+        }
+    }
+    let runner_id = obj
+        .get("runner_id")
+        .and_then(Value::as_str)
+        .filter(|id| prefixed_id(id, "lri_"))
+        .ok_or_else(|| Error::rejected("assignment resume runner_id is invalid"))?
+        .to_string();
+    let prior_assignment_id = match obj.get("prior_assignment_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if prefixed_id(id, "hla_") => Some(id.clone()),
+        _ => {
+            return Err(Error::rejected(
+                "assignment resume prior_assignment_id is invalid",
+            ))
+        }
+    };
+    let lane_alias = match obj.get("lane_alias") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(alias)) => Some(alias_name(alias)?),
+        _ => return Err(Error::rejected("assignment resume lane_alias is invalid")),
+    };
+    let target_agent_id = match obj.get("target_agent_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if prefixed_id(id, "lag_") => Some(id.clone()),
+        _ => {
+            return Err(Error::rejected(
+                "assignment resume target_agent_id is invalid",
+            ))
+        }
+    };
+    if prior_assignment_id.is_none() && lane_alias.is_none() && target_agent_id.is_none() {
+        return Err(Error::rejected(
+            "assignment resume must identify a prior assignment, lane alias, or seat",
+        ));
+    }
+    let model = match obj.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m))
+            if !m.trim().is_empty()
+                && m.len() <= 160
+                && !m.bytes().any(|byte| byte.is_ascii_control()) =>
+        {
+            Some(m.trim().to_string())
+        }
+        _ => return Err(Error::rejected("assignment resume model is invalid")),
+    };
+    let effort = match obj.get("effort") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(e)) if VALID_EFFORTS.contains(&e.as_str()) => Some(e.clone()),
+        _ => return Err(Error::rejected("assignment resume effort is invalid")),
+    };
+    Ok(Some(super::ResumeSpec {
+        runner_id,
+        prior_assignment_id,
+        lane_alias,
+        target_agent_id,
+        model,
+        effort,
     }))
 }
 
@@ -386,6 +471,27 @@ impl Assignment {
             }
             row["spawn"] = obj;
         }
+        if let Some(resume) = &self.resume {
+            let mut obj = json!({
+                "runner_id": resume.runner_id,
+            });
+            if let Some(prior) = &resume.prior_assignment_id {
+                obj["prior_assignment_id"] = json!(prior);
+            }
+            if let Some(lane_alias) = &resume.lane_alias {
+                obj["lane_alias"] = json!(lane_alias);
+            }
+            if let Some(target_agent_id) = &resume.target_agent_id {
+                obj["target_agent_id"] = json!(target_agent_id);
+            }
+            if let Some(model) = &resume.model {
+                obj["model"] = json!(model);
+            }
+            if let Some(effort) = &resume.effort {
+                obj["effort"] = json!(effort);
+            }
+            row["resume"] = obj;
+        }
         if let Some(kind) = &self.unsupported_kind {
             row["kind"] = json!(kind);
         }
@@ -470,7 +576,7 @@ pub(super) const CLIENT_FEATURES_HEADER: &str = "X-Cadence-Client-Features";
 /// It does not announce work kinds, so a board must not send this client a
 /// non-dev row. `unsupported_kind` is the defence if one arrives anyway.
 pub(super) const CLIENT_FEATURES: &str =
-    "assignment-unknown-keys,event-unknown-types,target-agent,daemon-spawn";
+    "assignment-unknown-keys,event-unknown-types,target-agent,daemon-spawn,daemon-resume";
 
 pub(super) fn parse_assignment(value: &Value) -> Result<Assignment> {
     let Some(object) = value.as_object() else {
@@ -549,7 +655,7 @@ pub(super) fn parse_assignment(value: &Value) -> Result<Assignment> {
         || !hosted_id(organization_id)
         || !hosted_id(issue_id)
         || !hosted_id(created_by)
-        || !matches!(action, "dispatch" | "start")
+        || !matches!(action, "dispatch" | "start" | "resume")
         || !matches!(
             state,
             "waiting" | "queued" | "running" | "blocked" | "failed" | "result" | "cancelled"
@@ -627,6 +733,12 @@ pub(super) fn parse_assignment(value: &Value) -> Result<Assignment> {
         }
     };
     let spawn = parse_spawn_spec(value.get("spawn"))?;
+    let resume = parse_resume_spec(value.get("resume"))?;
+    if (action == "resume") != resume.is_some() || (resume.is_some() && spawn.is_some()) {
+        return Err(Error::rejected(
+            "assignment action does not match its resume/spawn target",
+        ));
+    }
     Ok(Assignment {
         unsupported_kind,
         assignment_id: assignment_id.to_string(),
@@ -643,6 +755,7 @@ pub(super) fn parse_assignment(value: &Value) -> Result<Assignment> {
         profile_id,
         target_agent_id,
         spawn,
+        resume,
         guidance: parse_guidance(value)?,
         reported_head_sha,
         text: optional_text(value, "text")?,
@@ -734,5 +847,60 @@ mod contract_tests {
             parse_assignment(&bad_top).is_err(),
             "top-level repo key remains forbidden"
         );
+    }
+
+    #[test]
+    fn cad2777_parses_resume_spec_and_announces_daemon_resume() {
+        assert!(CLIENT_FEATURES
+            .split(',')
+            .any(|feat| feat == "daemon-resume"));
+
+        let mut row = base_assignment();
+        row["action"] = json!("resume");
+        row["resume"] = json!({
+            "runner_id": "lri_00000000-0000-4000-8000-000000000003",
+            "prior_assignment_id": "hla_00000000-0000-4000-8000-000000000010",
+            "lane_alias": "omp-abc123",
+            "model": "sonnet-4",
+            "effort": "high",
+        });
+        let parsed = parse_assignment(&row).expect("resume assignment parses");
+        assert_eq!(parsed.action, "resume");
+        let spec = parsed.resume.as_ref().expect("resume populated");
+        assert_eq!(
+            spec.prior_assignment_id.as_deref(),
+            Some("hla_00000000-0000-4000-8000-000000000010")
+        );
+        assert_eq!(spec.lane_alias.as_deref(), Some("omp-abc123"));
+        assert_eq!(spec.model.as_deref(), Some("sonnet-4"));
+        assert_eq!(spec.effort.as_deref(), Some("high"));
+        assert_eq!(parsed.to_json()["resume"]["lane_alias"], "omp-abc123");
+
+        // action=resume without resume spec refuses
+        let mut missing_spec = base_assignment();
+        missing_spec["action"] = json!("resume");
+        assert!(parse_assignment(&missing_spec).is_err());
+
+        // resume with unknown key or forbidden path key refuses
+        let mut bad_field = row.clone();
+        bad_field["resume"]["worktree"] = json!("/tmp/evil");
+        assert!(parse_assignment(&bad_field).is_err());
+
+        // resume with no locator refuses
+        let mut no_locator = base_assignment();
+        no_locator["action"] = json!("resume");
+        no_locator["resume"] = json!({
+            "runner_id": "lri_00000000-0000-4000-8000-000000000003",
+        });
+        assert!(parse_assignment(&no_locator).is_err());
+
+        // resume + spawn combined refuses
+        let mut both = row;
+        both["spawn"] = json!({
+            "runner_id": "lri_00000000-0000-4000-8000-000000000003",
+            "provider": "omp",
+            "repo": "fav-limited/cadence",
+        });
+        assert!(parse_assignment(&both).is_err());
     }
 }

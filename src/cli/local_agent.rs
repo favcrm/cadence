@@ -487,6 +487,8 @@ mod context_snapshots {
             subject_id: None,
             issuer: None,
             profile_id: None,
+            action: "dispatch",
+            note: None,
         };
         let first = write_note(dir.path(), &kickoff, &json!({"issue": "original work"}))
             .expect("first context");

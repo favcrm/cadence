@@ -54,8 +54,10 @@ import type {
   TempChannelDecision,
   TempChannelRotatePeerPayload,
   HostedLocalDaemonsResponse,
+  HostedLocalCancelRequest,
   HostedLocalDispatchRequest,
   HostedLocalDispatchResponse,
+  HostedLocalRetryRequest,
   Health,
   ProjectTimeline,
   ProtectedEntry,
@@ -1992,4 +1994,10 @@ export const api = {
   /** CAD-2746: owner-only hosted issue -> connected daemon dispatch. */
   localDispatch: (id: string, body: HostedLocalDispatchRequest) =>
     post<HostedLocalDispatchResponse>(`/api/issues/${encodeURIComponent(id)}/local-dispatch`, body),
+  /** CAD-2777: owner-only cancel of an active hosted local assignment. */
+  localDispatchCancel: (id: string, body: HostedLocalCancelRequest) =>
+    post<HostedLocalDispatchResponse>(`/api/issues/${encodeURIComponent(id)}/local-dispatch/cancel`, body),
+  /** CAD-2777: owner-only retry of a blocked hosted local assignment. */
+  localDispatchRetry: (id: string, body: HostedLocalRetryRequest) =>
+    post<HostedLocalDispatchResponse>(`/api/issues/${encodeURIComponent(id)}/local-dispatch/retry`, body),
 };
