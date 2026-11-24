@@ -53,6 +53,122 @@ struct PrivateDispatchProof {
     sha: Option<String>,
     body: String,
 }
+/// The issue read used to prepare a fresh job kickoff. The effective intake
+/// revision and scope are re-proved under the tracker lock at admission.
+pub(super) struct JobIssueSnapshot {
+    pm: crate::issue::Pm,
+    issue: String,
+    gated: Option<crate::issue::dispatch::GatedIssue>,
+    intake: Option<(String, String)>,
+    lane_binding: Option<(std::path::PathBuf, String, String)>,
+    cloud_lane: bool,
+    spec_pin: Option<(std::path::PathBuf, String, bool)>,
+    relative_spec_file: Option<std::path::PathBuf>,
+}
+
+impl JobIssueSnapshot {
+    pub(super) fn has_intake(&self) -> bool {
+        self.intake.is_some()
+    }
+
+    pub(super) fn lock(&self) -> Result<crate::issue::PmLock> {
+        if self.intake.is_some() {
+            crate::issue::lockseam::outside_lock("intake-pre-enqueue");
+        }
+        self.pm.lock()
+    }
+
+    pub(super) fn revalidate(&self, shared: &Shared) -> Result<()> {
+        let live = crate::issue::dispatch::capture_issue(&self.pm, &self.issue)?;
+        let live_intake = match &live {
+            Some(issue) => {
+                let (_, body) = crate::issue::parse::split_front(&issue.source)?;
+                let revision = if let Some(binding) = &self.lane_binding {
+                    let current = if self.cloud_lane {
+                        cloud_intake_lane(
+                            &issue.project,
+                            &issue.front,
+                            &binding.0,
+                            &binding.1,
+                            &binding.2,
+                        )?
+                    } else {
+                        shared.intake_lane_base(&issue.project, &issue.front)?
+                    };
+                    if &current != binding {
+                        return Err(Error::invalid(
+                            "plan_evidence_stale",
+                            "task dispatch refused: issue lane or base changed while preparing the kickoff",
+                        ));
+                    }
+                    crate::issue::plan::gate_snapshot_at_base(
+                        &self.pm.dir,
+                        &issue.front,
+                        body,
+                        &binding.2,
+                    )?
+                } else {
+                    crate::issue::plan::gate_snapshot(&self.pm.dir, &issue.front, body)?
+                };
+                revision
+                    .map(|revision| {
+                        Ok::<_, Error>((
+                            revision,
+                            crate::issue::plan::scope_digest(&issue.front, body)?,
+                        ))
+                    })
+                    .transpose()?
+            }
+            None => None,
+        };
+        if live_intake != self.intake
+            || (live_intake.is_some()
+                && live.as_ref().map(|issue| (&issue.project.key, &issue.dir))
+                    != self
+                        .gated
+                        .as_ref()
+                        .map(|issue| (&issue.project.key, &issue.dir)))
+        {
+            return Err(Error::invalid(
+                "plan_evidence_stale",
+                "task dispatch refused: approved intake scope changed while the kickoff was being prepared",
+            ));
+        }
+        if let Some((path, expected, relative)) = &self.spec_pin {
+            let matches = if *relative {
+                crate::issue::dispatch::intake_spec_matches(path, expected)
+            } else {
+                sha256_file(path).as_deref() == Some(expected.as_str())
+            };
+            if !matches {
+                return Err(Error::rejected(
+                    "task dispatch refused: independent spec changed while preparing the kickoff",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn cloud_intake_lane(
+    project: &crate::issue::project::Project,
+    front: &crate::issue::model::Front,
+    repo: &std::path::Path,
+    branch: &str,
+    base: &str,
+) -> Result<(std::path::PathBuf, String, String)> {
+    let root = crate::worktree::main_root(repo)?;
+    if !crate::issue::start::declared_repos(project).contains(&root)
+        || crate::issue::cloud::open_lane_branch(front).ok().flatten() != Some(branch)
+        || base.is_empty()
+    {
+        return Err(Error::invalid(
+            "plan_evidence_stale",
+            "intake cloud task repository, branch or base cannot be proven",
+        ));
+    }
+    Ok((root, branch.to_string(), base.to_string()))
+}
 
 impl Shared {
     // ---- Jobs: the work axis (docs/JOBS.md) ----
@@ -924,20 +1040,21 @@ impl Shared {
         &self,
         plan: &crate::store::DispatchPlan,
         caller: Option<&str>,
+        issue_snapshot: Option<&JobIssueSnapshot>,
     ) -> Result<()> {
-        let Some(issue_id) = plan.job.issue_id.as_deref() else {
+        let Some(snapshot) = issue_snapshot else {
             return Ok(());
         };
-        let pm = self.pm()?;
-        let Some(gated) = crate::issue::dispatch::capture_issue(&pm, issue_id)? else {
+        let Some(gated) = &snapshot.gated else {
             return Ok(());
         };
+        let issue_id = &snapshot.issue;
         let app_paths =
             crate::issue::app_guard::apps_in_paths(gated.front.paths.iter().map(String::as_str));
         let mut authors: Vec<&str> = vec![plan.worker.alias.as_str(), plan.job.pm_alias.as_str()];
         authors.extend(caller.filter(|c| !c.is_empty()));
         let guard = crate::issue::app_guard::Ctx {
-            pm_dir: &pm.dir,
+            pm_dir: &snapshot.pm.dir,
             state_dir: Some(&self.state_dir),
             store: Some(&self.store),
         };
@@ -1939,6 +2056,145 @@ impl Shared {
         }))
     }
 
+    pub(super) fn capture_job_issue(
+        &self,
+        plan: &crate::store::DispatchPlan,
+    ) -> Result<Option<JobIssueSnapshot>> {
+        let Some(issue) = plan.job.issue_id.as_deref() else {
+            return Ok(None);
+        };
+        let pm = self.pm()?;
+        let gated = crate::issue::dispatch::capture_issue(&pm, issue)?;
+        let intake = match &gated {
+            Some(gated) => {
+                let (_, body) = crate::issue::parse::split_front(&gated.source)?;
+                crate::issue::plan::gate_snapshot(&pm.dir, &gated.front, body)?
+                    .map(|revision| {
+                        Ok::<_, Error>((
+                            revision,
+                            crate::issue::plan::scope_digest(&gated.front, body)?,
+                        ))
+                    })
+                    .transpose()?
+            }
+            None => None,
+        };
+        let cloud_lane = plan.worker.endpoint_kind == "sandbox" && intake.is_some();
+        let lane_binding = if intake.is_some() {
+            let gated = gated
+                .as_ref()
+                .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+            if cloud_lane {
+                let repo = plan.job.repo.as_deref().ok_or_else(|| {
+                    Error::invalid("plan_evidence_stale", "intake cloud job has no repository")
+                })?;
+                let branch = plan.task.branch.as_deref().ok_or_else(|| {
+                    Error::invalid("plan_evidence_stale", "intake cloud task has no branch")
+                })?;
+                let base = plan.task.base_sha.as_deref().ok_or_else(|| {
+                    Error::invalid("plan_evidence_stale", "intake cloud task has no base")
+                })?;
+                let repo = std::path::Path::new(repo);
+                let binding = cloud_intake_lane(&gated.project, &gated.front, repo, branch, base)?;
+                if plan.job.base_ref.as_deref() != Some(base)
+                    || plan
+                        .task
+                        .worktree
+                        .as_deref()
+                        .and_then(|path| std::path::Path::new(path).canonicalize().ok())
+                        .as_ref()
+                        != Some(&binding.0)
+                {
+                    return Err(Error::invalid(
+                        "plan_evidence_stale",
+                        "intake cloud task and job bindings differ",
+                    ));
+                }
+                Some(binding)
+            } else {
+                let binding = self.intake_lane_base(&gated.project, &gated.front)?;
+                let root = crate::worktree::main_root(&binding.0)?;
+                let worktree = plan.task.worktree.as_deref().ok_or_else(|| {
+                    Error::invalid("plan_evidence_stale", "intake task has no bound worktree")
+                })?;
+                let task_lane = crate::worktree::layout::worktree_dir(&root, worktree)
+                    .canonicalize()
+                    .map_err(|e| {
+                        Error::invalid(
+                            "plan_evidence_stale",
+                            format!("intake task worktree cannot be resolved: {e}"),
+                        )
+                    })?;
+                if task_lane != binding.0
+                    || plan.task.branch.as_deref() != Some(binding.1.as_str())
+                    || plan.task.base_sha.as_deref() != Some(binding.2.as_str())
+                {
+                    return Err(Error::invalid(
+                        "plan_evidence_stale",
+                        "intake task worktree, branch or base does not match the issue's bound lane",
+                    ));
+                }
+                if let Some(repo) = plan.job.repo.as_deref() {
+                    let job_root = crate::worktree::main_root(std::path::Path::new(repo))?;
+                    if job_root != root {
+                        return Err(Error::invalid(
+                            "plan_evidence_stale",
+                            "intake job repository does not match the issue's bound lane",
+                        ));
+                    }
+                }
+                Some(binding)
+            }
+        } else {
+            None
+        };
+        let mut relative_spec_file = None;
+        let spec_pin = if intake.is_some() && plan.task.spec_path.is_none() {
+            if let Some(digest) = &plan.job.spec_sha256 {
+                let issue = gated
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+                let raw = std::path::Path::new(&plan.job.spec_path);
+                let relative = !raw.is_absolute();
+                let spec = if relative {
+                    let path = crate::issue::dispatch::intake_spec_pin(
+                        &issue.project,
+                        &plan.task,
+                        &plan.job,
+                    )?;
+                    relative_spec_file = Some(path.clone());
+                    path
+                } else {
+                    raw.to_path_buf()
+                };
+                let canonical = spec
+                    .canonicalize()
+                    .ok()
+                    .zip(issue.dir.join("issue.md").canonicalize().ok())
+                    .is_some_and(|(spec, issue)| spec == issue);
+                if canonical {
+                    None
+                } else {
+                    Some((spec, digest.clone(), relative))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Some(JobIssueSnapshot {
+            pm,
+            issue: issue.to_string(),
+            gated,
+            intake,
+            lane_binding,
+            cloud_lane,
+            spec_pin,
+            relative_spec_file,
+        }))
+    }
+
     /// `job dispatch` — bookkeeping plus the kickoff enqueue in one
     /// store transaction. Does not bypass the ready gate: `--ready` is
     /// claimed client-side exactly like `send --ready`.
@@ -1952,7 +2208,6 @@ impl Shared {
             .unattended_lock
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        self.plan_gate_task(task_id)?;
         // CAD-1846: capture the exact native task/job/worker and the proposed
         // kickoff revision/id before any source read. An accepted live
         // kickoff keeps that identity; only a fresh kickoff prepares context.
@@ -1961,6 +2216,7 @@ impl Shared {
             to.as_deref(),
             optional_str(params, "message"),
         )?;
+        self.plan_gate_task(task_id, !plan.duplicate)?;
         // The planned worker is the pre-transaction backend choice; the
         // fenced admission re-reads its identity, so a registry change
         // between here and the write refuses instead of retargeting.
@@ -1990,6 +2246,11 @@ impl Shared {
             Some(Value::Bool(value)) => *value,
             Some(_) => return Err(Error::rejected("no_lessons must be a boolean")),
         };
+        let issue_snapshot = if plan.duplicate {
+            None
+        } else {
+            self.capture_job_issue(&plan)?
+        };
         // A live accepted kickoff is admitted with its original identity and
         // selection: never recapture issue/spec sources for that retry.
         let delivery = if plan.duplicate {
@@ -1998,8 +2259,8 @@ impl Shared {
             // CAD-622: a fresh kickoff is a new authoring act — the app-team
             // guard runs before any context capture or queue write. A
             // duplicate is the accepted kickoff's own retry, not new work.
-            self.native_app_guard(&plan, optional_str(params, "by"))?;
-            Some(self.prepare_job_delivery(&plan, no_lessons)?)
+            self.native_app_guard(&plan, optional_str(params, "by"), issue_snapshot.as_ref())?;
+            Some(self.prepare_job_delivery(&plan, no_lessons, issue_snapshot.as_ref())?)
         };
         // CAD-1380 deferred commit: an assist-bound job's dispatch re-proves
         // the member's live authority at consume time — the approval gate
@@ -2130,9 +2391,17 @@ impl Shared {
                         Error::rejected("task dispatch refused: issue has no project directory")
                     })?
                     .join("project.yaml");
-                // The scoped tracker lock serializes supported issue moves and
-                // project policy writes through the database commit.
-                let _tracker = pm.lock_for_paths(&[issue_dir.clone(), policy])?;
+                // Intake evidence spans the tracker; use the full recovery
+                // fence there, and retain the existing scoped private lock
+                // for ordinary jobs and accepted replays.
+                let _tracker = if issue_snapshot.as_ref().is_some_and(|s| s.intake.is_some()) {
+                    pm.lock()?
+                } else {
+                    pm.lock_for_paths(&[issue_dir.clone(), policy])?
+                };
+                if let Some(snapshot) = &issue_snapshot {
+                    snapshot.revalidate(self)?;
+                }
                 let issue = plan.job.issue_id.as_deref().ok_or_else(|| {
                     Error::rejected("task dispatch refused: the private job has no issue")
                 })?;
@@ -2173,6 +2442,13 @@ impl Shared {
                     Some(&project),
                 )?
             } else {
+                let _tracker = issue_snapshot
+                    .as_ref()
+                    .map(JobIssueSnapshot::lock)
+                    .transpose()?;
+                if let Some(snapshot) = &issue_snapshot {
+                    snapshot.revalidate(self)?;
+                }
                 self.store.dispatch_task_planned(
                     &plan,
                     delivery,
@@ -2232,35 +2508,103 @@ impl Shared {
         &self,
         plan: &crate::store::DispatchPlan,
         no_lessons: bool,
-    ) -> Result<(String, store::IssueSelection)> {
-        let legacy = |reason: String| -> Result<(String, store::IssueSelection)> {
-            Ok((
+        issue_snapshot: Option<&JobIssueSnapshot>,
+    ) -> Result<store::PreparedJobKickoff> {
+        let approved_items = issue_snapshot
+            .filter(|snapshot| snapshot.intake.is_some())
+            .and_then(|snapshot| snapshot.gated.as_ref())
+            .map(|issue| issue.items.as_slice());
+        let approved_scope = if let Some(snapshot) = issue_snapshot.filter(|s| s.intake.is_some()) {
+            let issue = snapshot
+                .gated
+                .as_ref()
+                .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+            let (_, body) = crate::issue::parse::split_front(&issue.source)?;
+            Some(
+                crate::issue::parse::acceptance_scope(body)
+                    .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?,
+            )
+        } else {
+            None
+        };
+        let intake_acceptance = approved_scope
+            .map(crate::issue::dispatch::intake_acceptance)
+            .transpose()?;
+        let legacy = |reason: String| -> Result<store::PreparedJobKickoff> {
+            let mut effective;
+            let task = if approved_items.is_some() {
+                effective = plan.task.clone();
+                let approved = intake_acceptance
+                    .clone()
+                    .ok_or_else(|| Error::internal("approved intake has no scope"))?;
+                effective.acceptance = Some(crate::issue::dispatch::with_independent_acceptance(
+                    approved,
+                    plan.task.acceptance.as_deref(),
+                )?);
+                &effective
+            } else {
+                &plan.task
+            };
+            let scoped_cloud = issue_snapshot.filter(|snapshot| {
+                snapshot.intake.is_some()
+                    && plan.task.spec_path.is_none()
+                    && !std::path::Path::new(&plan.job.spec_path).is_absolute()
+                    && matches!(
+                        (
+                            plan.worker.provider.as_str(),
+                            plan.worker.endpoint_kind.as_str()
+                        ),
+                        ("devin", "cloud") | ("sandbox", "sandbox")
+                    )
+            });
+            let body = if let Some(snapshot) = scoped_cloud {
+                let gated = snapshot
+                    .gated
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("approved intake has no issue snapshot"))?;
+                let spec = crate::issue::dispatch::capture_intake_cloud_spec(
+                    gated,
+                    &plan.task,
+                    &plan.job,
+                    snapshot.relative_spec_file.as_deref(),
+                )?;
+                store::captured_cloud_kickoff(
+                    &plan.job,
+                    task,
+                    plan.revision,
+                    &plan.worker.provider,
+                    &plan.worker.endpoint_kind,
+                    &spec,
+                )?
+            } else {
                 store::job_kickoff(
                     &plan.job,
-                    &plan.task,
+                    task,
                     plan.revision,
                     &plan.message_id,
                     &plan.worker.provider,
                     &plan.worker.endpoint_kind,
                     false,
-                )?,
-                store::IssueSelection::Disabled {
+                )?
+            };
+            Ok(store::PreparedJobKickoff {
+                body,
+                selection: store::IssueSelection::Disabled {
                     task: plan.task.id.clone(),
                     reason,
                 },
-            ))
+                intake_acceptance: intake_acceptance.clone(),
+            })
         };
-        let Some(issue_id) = plan.job.issue_id.as_deref() else {
+        if plan.job.issue_id.is_none() {
             return legacy("the job is not bound to a tracker issue".to_string());
-        };
-        let pm = self.pm()?;
-        // Capture the issue snapshot without re-running the parent policy
-        // gate: `plan_gate_task` already applied exactly that gate for every
-        // native caller. A named id no project holds keeps its legacy kickoff
-        // (`gate_id` documents that jobs need not name a tracker issue); an id
-        // a project holds but cannot be read/parsed fails closed.
-        let Some(gated) = crate::issue::dispatch::capture_issue(&pm, issue_id)? else {
-            self.refuse_known_opted_in_unheld(&pm, plan)?;
+        }
+        let snapshot = issue_snapshot.ok_or_else(|| {
+            Error::internal("issue-linked job delivery has no captured issue snapshot")
+        })?;
+        let pm = &snapshot.pm;
+        let Some(gated) = &snapshot.gated else {
+            self.refuse_known_opted_in_unheld(pm, plan)?;
             return legacy(
                 "no native issue context binding: the job's tracker issue is not \
                  held by a project"
@@ -2282,6 +2626,14 @@ impl Shared {
         let scope = |project: &crate::issue::project::Project,
                      front: &crate::issue::model::Front|
          -> Result<()> {
+            if snapshot.cloud_lane {
+                let binding = snapshot
+                    .lane_binding
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("approved cloud intake has no lane binding"))?;
+                cloud_intake_lane(project, front, &binding.0, &binding.1, &binding.2)?;
+                return Ok(());
+            }
             let lane = self.dispatch_lane("job dispatch", project, front)?;
             let lane_root = crate::worktree::main_root(&lane).map_err(|error| {
                 crate::context_pack::Refusal::ScopeConflict {
@@ -2353,7 +2705,7 @@ impl Shared {
             Ok(())
         };
         let prepared = crate::issue::dispatch::job_context(
-            &pm,
+            pm,
             gated,
             crate::issue::dispatch::JobContext {
                 job: &plan.job,
@@ -2364,14 +2716,17 @@ impl Shared {
                 admission_scope: Some(&scope),
             },
             no_lessons,
+            approved_items,
+            snapshot.relative_spec_file.as_deref(),
         )?;
         let Some(prepared) = prepared else {
             return legacy("the assigned project is not opted in to agent delivery".to_string());
         };
-        Ok((
-            prepared.body.into_owned(),
-            store::IssueSelection::Pin(prepared.manifest.pin_payload(&plan.message_id)),
-        ))
+        Ok(store::PreparedJobKickoff {
+            body: prepared.body.into_owned(),
+            selection: store::IssueSelection::Pin(prepared.manifest.pin_payload(&plan.message_id)),
+            intake_acceptance,
+        })
     }
 
     /// CAD-1846: a job whose tracker id no project holds is normally legacy

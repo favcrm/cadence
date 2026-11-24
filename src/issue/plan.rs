@@ -42,8 +42,11 @@ use crate::issue::parse;
 use crate::issue::{board, write, Pm};
 
 mod doc;
+mod intake;
 
 pub use doc::{parse_plan, Dep, PlanDoc, Ticket};
+pub(crate) use intake::scope_digest;
+pub use intake::GoalIntake;
 
 /// Largest plan text `propose` accepts.
 pub const MAX_PLAN_BYTES: usize = 256 * 1024;
@@ -76,6 +79,11 @@ pub fn propose(
     }
     let warnings = crate::secret::guard_with("plan", text, allow)?;
     let doc = parse_plan(text)?;
+    if workflow.is_some() && doc.intake.is_some() {
+        return Err(Error::rejected(
+            "goal intake must be an ordinary file proposal, not a workflow render",
+        ));
+    }
     if doc.tickets.len() > MAX_TICKETS {
         return Err(Error::rejected(format!(
             "Plan has {} tickets — a plan carries at most {MAX_TICKETS}; split it",
@@ -207,6 +215,65 @@ fn not_approved(epic: &str, state: &str, what: &str) -> Error {
 /// repo any local agent can write, so it stops mistakes and keeps the
 /// board honest; it does not stop a determined same-uid process.
 pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
+    gate_snapshot(pm_dir, front, body).map(drop)
+}
+
+/// Admission proof for callers preparing a fresh kickoff. The approved
+/// intake epic can change even when a carried issue's scope does not.
+pub(crate) fn gate_snapshot(pm_dir: &Path, front: &Front, body: &str) -> Result<Option<String>> {
+    admit(pm_dir, front, body, None)
+}
+
+pub(crate) fn gate_snapshot_at_base(
+    pm_dir: &Path,
+    front: &Front,
+    body: &str,
+    base: &str,
+) -> Result<Option<String>> {
+    admit(pm_dir, front, body, Some(base))
+}
+
+pub(super) fn gate_claim(pm_dir: &Path, front: &Front, body: &str, base: &str) -> Result<()> {
+    gate_snapshot_at_base(pm_dir, front, body, base).map(drop)
+}
+
+/// Claim without opening a lane. Only fresh intake admission needs scope
+/// proof; ordinary plans retain their existing status-transition rule.
+pub(super) fn gate_direct_claim(
+    pm_dir: &Path,
+    front: &Front,
+    body: &str,
+    entering_work: bool,
+) -> Result<()> {
+    if front
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.intake.is_some())
+    {
+        return gate(pm_dir, front, body);
+    }
+    if !entering_work && front.plan_epic.is_none() {
+        return Ok(());
+    }
+    match membership(pm_dir, front)? {
+        Some((epic, plan)) if plan.intake.is_some() => {
+            admit_member(pm_dir, front, body, None, &epic, &plan).map(drop)
+        }
+        Some((epic, plan)) if entering_work && plan.state != "approved" => Err(not_approved(
+            &epic,
+            &plan.state,
+            &format!("{} stays in backlog until then", front.id),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn admit(
+    pm_dir: &Path,
+    front: &Front,
+    body: &str,
+    execution_base: Option<&str>,
+) -> Result<Option<String>> {
     if front.plan.is_some() {
         let epic = &front.id;
         return Err(Error::invalid(
@@ -218,11 +285,22 @@ pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
         ));
     }
     let Some((epic, plan)) = membership(pm_dir, front)? else {
-        return Ok(());
+        return Ok(None);
     };
+    admit_member(pm_dir, front, body, execution_base, &epic, &plan)
+}
+
+fn admit_member(
+    pm_dir: &Path,
+    front: &Front,
+    body: &str,
+    execution_base: Option<&str>,
+    epic: &str,
+    plan: &model::Plan,
+) -> Result<Option<String>> {
     if plan.state != "approved" {
         return Err(not_approved(
-            &epic,
+            epic,
             &plan.state,
             &format!("{} cannot start before its plan is approved", front.id),
         ));
@@ -236,6 +314,130 @@ pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
                 front.id, front.id
             ),
         ));
+    }
+    if plan.intake.is_some() {
+        return verify_intake_dispatch(pm_dir, epic, front, body, execution_base).map(Some);
+    }
+    Ok(None)
+}
+
+fn verify_intake_dispatch(
+    pm_dir: &Path,
+    epic: &str,
+    front: &Front,
+    body: &str,
+    execution_base: Option<&str>,
+) -> Result<String> {
+    let mut issue = probe_issue(pm_dir, epic)?
+        .ok_or_else(|| unreadable(epic, "goal-intake epic is missing"))?;
+    let project = crate::issue::project::list(pm_dir)?
+        .into_iter()
+        .find(|project| project.key == issue.project)
+        .ok_or_else(|| unreadable(epic, "its project is missing"))?;
+    let mut visited = HashSet::new();
+    loop {
+        let id = &issue.front.id;
+        if !visited.insert(id.clone()) {
+            return Err(unreadable(id, "cyclic intake revisions"));
+        }
+        let intake = issue
+            .front
+            .plan
+            .as_ref()
+            .filter(|plan| plan.state == "approved")
+            .and_then(|plan| plan.intake.as_ref())
+            .ok_or_else(|| unreadable(id, "intake approval evidence is missing"))?;
+        let Some(next) = &intake.superseded_by else {
+            intake.require_goal(&issue.body)?;
+            intake.require_scope(front, body)?;
+            require_intake_dependencies(pm_dir, &project.key, id, intake, front)?;
+            intake.require_sources_at(&project, Some(front), execution_base)?;
+            return Ok(issue.front.id);
+        };
+        let revision =
+            board::load_issue(pm_dir, &project.key, next).map_err(|e| unreadable(next, e))?;
+        let carries = revision
+            .front
+            .plan
+            .as_ref()
+            .filter(|plan| plan.state == "approved")
+            .and_then(|plan| plan.intake.as_ref())
+            .is_some_and(|next| {
+                next.revises.as_deref() == Some(id.as_str())
+                    && next
+                        .outcomes
+                        .get(&front.id)
+                        .is_some_and(|outcome| outcome.reused)
+            });
+        if !carries {
+            return Err(Error::invalid(
+                "plan_evidence_stale",
+                format!(
+                    "{id} was superseded by {next}; {} is not in that scope",
+                    front.id
+                ),
+            ));
+        }
+        issue = revision;
+    }
+}
+
+fn require_intake_dependencies(
+    pm_dir: &Path,
+    project: &str,
+    epic: &str,
+    intake: &GoalIntake,
+    front: &Front,
+) -> Result<()> {
+    let mut historical = Vec::new();
+    for id in &front.blocked_by {
+        let dependency = board::find_issue(pm_dir, id).map_err(|e| unreadable(id, e))?;
+        if !cadence_core::issue::is_closed(&dependency.front.status) {
+            return Err(Error::invalid(
+                "plan_dependency_unready",
+                format!("{} cannot start while prerequisite {id} is open", front.id),
+            ));
+        }
+        if intake.outcomes.contains_key(id) {
+            intake.require_scope(&dependency.front, &dependency.body)?;
+        } else if dependency.project == project && intake.revises.is_some() {
+            historical.push(dependency);
+        }
+    }
+    if historical.is_empty() {
+        return Ok(());
+    }
+    // A completed prerequisite may be omitted from a revision, not from a
+    // retained ticket's dependency evidence. Look up its last approved scope.
+    let mut visited = HashSet::new();
+    let mut successor = std::borrow::Cow::Borrowed(epic);
+    let mut previous = intake.revises.clone();
+    while !historical.is_empty() {
+        let Some(id) = previous else {
+            break;
+        };
+        if !visited.insert(id.clone()) {
+            return Err(unreadable(&id, "cyclic intake ancestry"));
+        }
+        let previous_epic =
+            board::load_issue(pm_dir, project, &id).map_err(|e| unreadable(&id, e))?;
+        let (state, record) = previous_epic
+            .front
+            .plan
+            .and_then(|plan| plan.intake.map(|intake| (plan.state, intake)))
+            .filter(|(_, record)| record.superseded_by.as_deref() == Some(successor.as_ref()))
+            .ok_or_else(|| unreadable(&id, "broken intake ancestry"))?;
+        if state == "approved" {
+            for index in (0..historical.len()).rev() {
+                let dependency = &historical[index];
+                if record.outcomes.contains_key(&dependency.front.id) {
+                    record.require_scope(&dependency.front, &dependency.body)?;
+                    historical.swap_remove(index);
+                }
+            }
+        }
+        successor = std::borrow::Cow::Owned(id);
+        previous = record.revises;
     }
     Ok(())
 }
@@ -331,6 +533,15 @@ pub fn progress(tickets: &[(&str, Option<&str>)]) -> (u64, u64) {
         })
 }
 
+fn plan_outcome_ids(plan: &model::Plan) -> impl Iterator<Item = &String> {
+    plan.tickets.iter().chain(
+        plan.intake
+            .iter()
+            .flat_map(|intake| intake.outcomes.iter())
+            .filter_map(|(id, outcome)| outcome.reused.then_some(id)),
+    )
+}
+
 /// The plan block of an epic's JSON — `Value::Null` when the issue is
 /// not a plan. Tickets are the plan's own list and carry their derived status; progress is
 /// size-weighted ([`progress`]).
@@ -339,16 +550,14 @@ pub fn plan_json(epic: &board::View, views_by_id: &HashMap<String, &board::View>
         return Value::Null;
     };
     // The approved list, not whatever is parented today.
-    let kids: Vec<&&board::View> = plan
-        .tickets
-        .iter()
+    let kids: Vec<&&board::View> = plan_outcome_ids(plan)
         .filter_map(|id| views_by_id.get(id))
         .collect();
     let tickets: Vec<Value> = kids
         .iter()
         .map(|k| {
             let f = &k.issue.front;
-            json!({
+            let mut ticket = json!({
                 "id": f.id,
                 "title": f.title,
                 "status": k.status,
@@ -357,7 +566,16 @@ pub fn plan_json(epic: &board::View, views_by_id: &HashMap<String, &board::View>
                 "owner": f.owner,
                 "blocked_by": f.blocked_by,
                 "acceptance": parse::acceptance_items(&k.issue.body).len(),
-            })
+            });
+            if plan
+                .intake
+                .as_ref()
+                .and_then(|intake| intake.outcomes.get(&f.id))
+                .is_some_and(|outcome| outcome.reused)
+            {
+                ticket["reused"] = json!(true);
+            }
+            ticket
         })
         .collect();
     let pairs: Vec<(&str, Option<&str>)> = kids
@@ -372,7 +590,7 @@ pub fn plan_json(epic: &board::View, views_by_id: &HashMap<String, &board::View>
             (s.to_string(), json!(n))
         })
         .collect();
-    json!({
+    let mut result = json!({
         "state": plan.state,
         "proposed_by": plan.proposed_by,
         "proposed_at": plan.proposed_at,
@@ -386,7 +604,11 @@ pub fn plan_json(epic: &board::View, views_by_id: &HashMap<String, &board::View>
             "ratio": ratio(done, total),
             "counts": counts,
         },
-    })
+    });
+    if let Some(intake) = &plan.intake {
+        result["intake"] = json!(intake);
+    }
+    result
 }
 
 fn ratio(done: u64, total: u64) -> f64 {
@@ -435,7 +657,7 @@ pub fn ls(
             let f = &v.issue.front;
             let p = f.plan.as_ref().unwrap();
             let kids: Vec<&&board::View> =
-                p.tickets.iter().filter_map(|id| by_id.get(id)).collect();
+                plan_outcome_ids(p).filter_map(|id| by_id.get(id)).collect();
             let pairs: Vec<(&str, Option<&str>)> = kids
                 .iter()
                 .map(|k| (k.status.as_str(), k.issue.front.size.as_deref()))
@@ -492,18 +714,48 @@ pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     let view = by_id
         .get(id)
         .ok_or_else(|| Error::rejected(format!("Unknown issue '{id}'")))?;
-    if view.issue.front.plan.is_none() {
+    let Some(plan) = &view.issue.front.plan else {
         return Err(Error::rejected(format!(
             "{id} is not a plan — `cadence plan propose` creates one"
         )));
-    }
-    Ok(json!({
+    };
+    let mut result = json!({
         "id": id,
         "project": view.issue.project,
         "title": view.issue.front.title,
         "status": view.status,
         "plan": plan_json(view, &by_id),
-    }))
+    });
+    if let Some(intake) = &plan.intake {
+        let evidence = (|| -> Result<()> {
+            if let Some(next) = &intake.superseded_by {
+                return Err(Error::invalid(
+                    "plan_superseded",
+                    format!("plan {id} was superseded by {next}"),
+                ));
+            }
+            intake.require_goal(&view.issue.body)?;
+            for outcome in intake.outcomes.keys() {
+                let issue = &by_id
+                    .get(outcome)
+                    .ok_or_else(|| unreadable(outcome, "outcome issue is missing"))?
+                    .issue;
+                intake.require_scope(&issue.front, &issue.body)?;
+            }
+            let project = crate::issue::project::list(&pm.dir)?
+                .into_iter()
+                .find(|project| project.key == view.issue.project)
+                .ok_or_else(|| unreadable(id, "its project is missing"))?;
+            intake.require_sources(&project, None)
+        })();
+        result["intake_evidence"] = match evidence {
+            Ok(()) => json!({"state": "current"}),
+            Err(error) => {
+                json!({"state": "blocked", "code": error.code(), "reason": error.to_string()})
+            }
+        };
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

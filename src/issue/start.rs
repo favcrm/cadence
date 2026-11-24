@@ -23,7 +23,9 @@ use crate::worktree::{self, layout};
 mod base;
 
 use base::{branch_base, resolve_existing_base, worktree_branch};
-pub(crate) use base::{configured_integration, declared_repos, resolve_base, resolve_repo};
+pub(crate) use base::{
+    configured_integration, declared_repos, intake_branch_creation_base, resolve_base, resolve_repo,
+};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
 /// [--assignee <alias>]`.
@@ -265,6 +267,24 @@ pub(crate) fn resolve_lane(
         ))),
     }
 }
+/// A sandbox has a branch, not a host worktree. A replacement job keeps
+/// the sole open branch; branch history does not depend on the issue title.
+pub(super) fn resolve_cloud_branch(front: &Front, name: Option<&str>) -> Result<(String, bool)> {
+    let Some(branch) = crate::issue::cloud::open_lane_branch(front)? else {
+        return layout::issue_names(&front.id, &front.title, name)
+            .map(|(_, branch)| (branch, false));
+    };
+    if let Some(name) = name {
+        let (_, wanted) = layout::issue_names(&front.id, &front.title, Some(name))?;
+        if wanted != branch {
+            return Err(Error::rejected(format!(
+                "{} already has an open cloud branch {branch}; --name {name} would start another lane",
+                front.id
+            )));
+        }
+    }
+    Ok((branch.to_string(), true))
+}
 
 /// `front` with the lane's branch and worktree refs recorded open —
 /// an existing ref of the same value is re-opened (never duplicated),
@@ -343,6 +363,18 @@ fn check_job(state_dir: &Path, job: &JobArgs) -> Result<(PathBuf, String, String
 }
 
 pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -> Result<Value> {
+    run_with_verified_job(pm, id, args, actor, state_dir, None)
+}
+
+pub(super) fn run_with_verified_job(
+    pm: &Pm,
+    id: &str,
+    args: &StartArgs,
+    actor: &str,
+    state_dir: &Path,
+    verified_draft: Option<(&Value, &Value)>,
+) -> Result<Value> {
+    let verified_job = verified_draft.map(|(job, _)| job);
     // Daemon reachability + spec readability are checked before any
     // filesystem or tracker mutation — a `--job` that cannot be opened
     // must leave nothing behind.
@@ -379,10 +411,25 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
     }
     let (project, dir) = write::issue_dir(pm, id)?;
-    // CAD-360: the plan gate, before anything is created — `issue
-    // start`, `dispatch` and `dispatch --job` all come through here.
     let (initial_front, initial_body) = write::load_front(&dir)?;
-    crate::issue::plan::gate(&pm.dir, &initial_front, &initial_body)?;
+    let initial_intake = crate::issue::plan::gate_snapshot(&pm.dir, &initial_front, &initial_body)?;
+    if let (Some(job), Some((_, spec, raw_digest))) = (verified_job, &job_probe) {
+        let canonical = Path::new(spec)
+            .canonicalize()
+            .ok()
+            .zip(dir.join("issue.md").canonicalize().ok())
+            .is_some_and(|(spec, issue)| spec == issue);
+        if !(canonical && initial_intake.is_some()) {
+            let digest =
+                crate::issue::dispatch::canonical_issue_spec_digest(pm, id, Path::new(spec), true)?
+                    .unwrap_or_else(|| raw_digest.clone());
+            if job["spec_sha256"].as_str() != Some(digest.as_str()) {
+                return Err(Error::rejected(
+                    "draft job spec changed; reopen or restore the pinned spec",
+                ));
+            }
+        }
+    }
     // CAD-202: a pty assignee whose pane cwd is deleted or outside the
     // project's repos refuses here, before anything is created.
     let mut cloud = false;
@@ -405,25 +452,35 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let (initial_lane, initial_branch) = resolve_lane(&initial_front, args.name.as_deref(), &root)?;
+    let cloud_draft = verified_draft.filter(|_| cloud).map(|(_, task)| task);
+    let cloud_reuse = cloud_draft.is_some();
+    let (initial_lane, initial_branch) = if cloud {
+        let (branch, _) = resolve_cloud_branch(&initial_front, args.name.as_deref())?;
+        (root.clone(), branch)
+    } else {
+        resolve_lane(&initial_front, args.name.as_deref(), &root)?
+    };
     let initial_open = open_worktrees(&initial_front);
-    let initial_branch_exists = git(
-        &root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{initial_branch}"),
-        ],
-    )
-    .is_ok();
-    refuse_terminal_lifecycle_record(
-        &root,
-        &initial_lane,
-        &initial_front,
-        &initial_branch,
-        initial_branch_exists,
-    )?;
+    let initial_branch_exists = !cloud
+        && git(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{initial_branch}"),
+            ],
+        )
+        .is_ok();
+    if !cloud {
+        refuse_terminal_lifecycle_record(
+            &root,
+            &initial_lane,
+            &initial_front,
+            &initial_branch,
+            initial_branch_exists,
+        )?;
+    }
     let initial_lane_str = initial_lane.to_string_lossy().into_owned();
     let initial_refs_recorded = initial_front
         .refs
@@ -433,19 +490,28 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             .refs
             .iter()
             .any(|r| r.kind == "worktree" && r.path.as_deref() == Some(initial_lane_str.as_str()));
-    let initial_lifecycle_record = worktree::lifecycle::recoverable_record(
-        &root,
-        &initial_lane,
-        "development",
-        "cadence issue start",
-        Some(&initial_branch),
-        Some(&initial_front.id),
-    )?;
+    let initial_lifecycle_record = if cloud {
+        None
+    } else {
+        worktree::lifecycle::recoverable_record(
+            &root,
+            &initial_lane,
+            "development",
+            "cadence issue start",
+            Some(&initial_branch),
+            Some(&initial_front.id),
+        )?
+    };
     let initial_reuse = initial_branch_exists
         && (!initial_open.is_empty()
             || initial_refs_recorded
             || initial_lifecycle_record.is_some());
-    let (base, base_sha, base_warning) = if initial_reuse && args.base.is_none() {
+    let (base, base_sha, base_warning) = if cloud_reuse {
+        let base = verified_job
+            .and_then(|job| job["base_ref"].as_str())
+            .ok_or_else(|| Error::rejected("verified cloud draft has no base"))?;
+        (base.to_string(), base.to_string(), None)
+    } else if initial_reuse && args.base.is_none() {
         let (name, sha) = resolve_existing_base(&root, &initial_branch)?;
         (name, sha, None)
     } else {
@@ -476,6 +542,9 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     // CAD-1191: lock 1 (short) — claim check, take-over and, for a new
     // lane, the claim record. Worktree work runs unlocked; lock 2
     // records the lane refs.
+    if initial_intake.is_some() {
+        crate::issue::lockseam::outside_lock("start-pre-claim");
+    }
     let lock = pm.lock()?;
     let (mut front, body) = write::load_front(&dir)?;
     let front_id = front.id.clone();
@@ -490,27 +559,23 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "issue start",
         || claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2)),
     )?;
-    // A cloud start's admission is a read-only AOS probe, before the
-    // take-over commit and before the ordinary new-lane claim. A denied
-    // company leaves the tracker untouched.
-    if cloud {
-        client::rpc(state_dir, "cloud_probe", json!({}))?;
-    }
-    if let Some(t) = &checked.take_over {
-        let mut taken = front.clone();
-        taken.claim = Some(claim::new_claim(&requester, Some(t.reason.clone())));
-        taken.owner = Some(new_owner.clone().unwrap_or_else(|| requester.clone()));
-        let (text, subject) = claim::take_over_record(&requester, t);
-        write::commit_front_with_comment(
-            pm, &dir, &front, &taken, &body, &requester, "claim", &text, &subject, actor,
-        )?;
-        front = taken;
-    }
     // CAD-274: an open worktree ref IS the issue's lane — a re-start
     // reuses it (re-applying the cargo target) rather than minting a
     // second lane from the title.
     let open = open_worktrees(&front);
-    let (wt_dir, branch) = resolve_lane(&front, args.name.as_deref(), &root)?;
+    let (wt_dir, branch, cloud_branch_recorded) = if cloud {
+        let (branch, recorded) = resolve_cloud_branch(&front, args.name.as_deref())?;
+        if branch != initial_branch
+            || cloud_draft
+                .is_some_and(|task| !recorded || task["branch"].as_str() != Some(branch.as_str()))
+        {
+            return Err(Error::rejected("verified cloud job branch binding changed"));
+        }
+        (root.clone(), branch, recorded)
+    } else {
+        let (lane, branch) = resolve_lane(&front, args.name.as_deref(), &root)?;
+        (lane, branch, false)
+    };
     // A reused lane's values come from the tracker and the checkout —
     // never re-record one git would read as an option (CAD-144).
     model::check_ref_value(&branch)?;
@@ -530,41 +595,75 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             .iter()
             .any(|r| r.kind == kind && r.path.as_deref() == Some(target))
     };
-    let first_recorded = |kind: &str| {
-        front
-            .refs
-            .iter()
-            .find(|r| r.kind == kind)
-            .and_then(|r| r.path.clone())
+    let (dir_exists, branch_exists, lifecycle_record) = if cloud {
+        (false, false, None)
+    } else {
+        let branch_exists = git(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_ok();
+        refuse_terminal_lifecycle_record(&root, &wt_dir, &front, &branch, branch_exists)?;
+        let record = worktree::lifecycle::recoverable_record(
+            &root,
+            &wt_dir,
+            "development",
+            "cadence issue start",
+            Some(&branch),
+            Some(&front.id),
+        )?;
+        (wt_dir.is_dir(), branch_exists, record)
     };
-    let dir_exists = wt_dir.is_dir();
-    let branch_exists = git(
-        &root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
-    .is_ok();
-    refuse_terminal_lifecycle_record(&root, &wt_dir, &front, &branch, branch_exists)?;
-    let lifecycle_record = worktree::lifecycle::recoverable_record(
-        &root,
-        &wt_dir,
-        "development",
-        "cadence issue start",
-        Some(&branch),
-        Some(&front.id),
-    )?;
-    let reuse = branch_exists
-        && (!open.is_empty()
-            || recorded("branch", &branch) && recorded("worktree", &wt_str)
-            || lifecycle_record.is_some());
+    let reuse = cloud_reuse
+        || branch_exists
+            && (!open.is_empty()
+                || recorded("branch", &branch) && recorded("worktree", &wt_str)
+                || lifecycle_record.is_some());
     if initial_reuse && !reuse && args.base.is_none() {
         return Err(Error::rejected(
             "the recorded lane changed while issue start was waiting; retry to refresh and pin the default base",
         ));
+    }
+    let pinned_base = if cloud_reuse {
+        base_sha.clone()
+    } else if reuse && initial_intake.is_some() {
+        match lifecycle_record.as_ref().and_then(|r| r.base_sha.as_ref()) {
+            Some(recorded) => recorded.clone(),
+            None => intake_branch_creation_base(&root, &branch)?,
+        }
+    } else if branch_exists {
+        branch_base(&root, &branch, &base_sha)
+    } else {
+        base_sha.clone()
+    };
+    let lane_base_sha = if reuse {
+        pinned_base.clone()
+    } else {
+        base_sha.clone()
+    };
+    // Validate the actual selected lane under the same tracker lock as
+    // claim, including a reused checkout that ignores an explicit --base.
+    crate::issue::plan::gate_claim(&pm.dir, &front, &body, &lane_base_sha)?;
+    // A cloud start's admission is a read-only AOS probe, before the
+    // take-over commit and before the ordinary new-lane claim. A denied
+    // company leaves the tracker untouched.
+    if cloud {
+        client::rpc(state_dir, "cloud_probe", json!({}))?;
+    }
+    if let Some(t) = &checked.take_over {
+        let mut taken = front.clone();
+        taken.claim = Some(claim::new_claim(&requester, Some(t.reason.clone())));
+        taken.owner = Some(new_owner.clone().unwrap_or_else(|| requester.clone()));
+        let (text, subject) = claim::take_over_record(&requester, t);
+        write::commit_front_with_comment(
+            pm, &dir, &front, &taken, &body, &requester, "claim", &text, &subject, actor,
+        )?;
+        front = taken;
     }
     let repo_label = root
         .file_name()
@@ -575,15 +674,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         .clone()
         .or_else(|| new_owner.clone())
         .unwrap_or_else(|| requester.clone());
-    let pinned_base = if branch_exists {
-        branch_base(&root, &branch, &base_sha)
-    } else {
-        base_sha.clone()
-    };
-    let lane_base_sha = if reuse {
-        pinned_base.clone()
-    } else {
-        base_sha.clone()
+    let first_recorded = |kind: &str| {
+        front
+            .refs
+            .iter()
+            .find(|r| r.kind == kind)
+            .and_then(|r| r.path.clone())
     };
     let checkout_record = || {
         let mut record = worktree::lifecycle::new_record(worktree::lifecycle::CheckoutSpec {
@@ -639,9 +735,20 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             claimed.claim = Some(claim::new_claim(&requester, None));
         }
         claim_at = claimed.claim.as_ref().map(|c| c.at.clone());
+        let record_cloud_branch = cloud && !cloud_branch_recorded;
+        if record_cloud_branch {
+            claimed.refs.push(write::new_ref(
+                "branch",
+                &branch,
+                Some(crate::issue::cloud::CLOUD_BRANCH_LABEL),
+                None,
+                None,
+            ));
+        }
         if claimed.status != front.status
             || claimed.owner != front.owner
             || claimed.claim != front.claim
+            || record_cloud_branch
         {
             let committed = write::save_front(&dir, &claimed, &body).and_then(|_| {
                 write::commit_who(
@@ -689,36 +796,32 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             "claim": claim_out,
             "cloud": true,
         });
-        write::add_ref(
-            pm,
-            id,
-            "branch",
-            &branch,
-            Some("cloud sandbox lane"),
-            None,
-            None,
-            None,
-            actor,
-        )?;
         if let Some(warning) = &base_warning {
             eprintln!("cadence: {warning}");
             out["base"]["warning"] = json!(warning);
         }
         if let (Some(job), Some((job_state_dir, spec, spec_sha256))) = (&args.job, &job_probe) {
-            let task_acceptance =
-                crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body));
-            let created_job = client::rpc(
-                job_state_dir,
-                "job_new",
-                json!({"pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
-                       "title": front.title, "issue": front.id,
-                       "repo": root, "base_ref": lane_base_sha,
-                       "task_worktree": root.to_string_lossy(),
-                       "task_branch": branch,
-                       "task_base_sha": lane_base_sha,
-                       "task_assignee": job.assignee,
-                       "task_acceptance": task_acceptance}),
-            )?;
+            let task_acceptance = if initial_intake.is_some() {
+                None
+            } else {
+                crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body))
+            };
+            let created_job = if let Some(job) = verified_job {
+                json!({"job": {"id": job["id"]}})
+            } else {
+                client::rpc(
+                    job_state_dir,
+                    "job_new",
+                    json!({"pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
+                           "title": front.title, "issue": front.id,
+                           "repo": root, "base_ref": lane_base_sha,
+                           "task_worktree": root.to_string_lossy(),
+                           "task_branch": branch,
+                           "task_base_sha": lane_base_sha,
+                           "task_assignee": job.assignee,
+                           "task_acceptance": task_acceptance}),
+                )?
+            };
             let job_id = created_job["job"]["id"]
                 .as_str()
                 .unwrap_or_default()
@@ -996,23 +1099,26 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         out["base"]["warning"] = json!(warning);
     }
     if let (Some(job), Some((state_dir, spec, spec_sha256))) = (&args.job, job_probe) {
-        // CAD-159: the issue's acceptance items ride the scoped task,
-        // so the daemon's `job dispatch` kickoff lists them — all of
-        // them, never a pointer (CAD-160): the kickoff refuses a list
-        // that cannot fit rather than dropping it.
-        let task_acceptance =
-            crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body));
-        let created_job = client::rpc(
-            &state_dir,
-            "job_new",
-            json!({"job": job.id, "pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
-                   "title": front.title, "issue": front.id,
-                   "repo": root, "base_ref": lane_base_sha,
-                   "task_worktree": wt_name, "task_branch": branch,
-                   "task_base_sha": lane_base_sha,
-                   "task_assignee": job.assignee,
-                   "task_acceptance": task_acceptance}),
-        )?;
+        let task_acceptance = if initial_intake.is_some() {
+            None
+        } else {
+            crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body))
+        };
+        let created_job = if let Some(job) = verified_job {
+            json!({"job": {"id": job["id"]}})
+        } else {
+            client::rpc(
+                &state_dir,
+                "job_new",
+                json!({"job": job.id, "pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
+                       "title": front.title, "issue": front.id,
+                       "repo": root, "base_ref": lane_base_sha,
+                       "task_worktree": wt_name, "task_branch": branch,
+                       "task_base_sha": lane_base_sha,
+                       "task_assignee": job.assignee,
+                       "task_acceptance": task_acceptance}),
+            )?
+        };
         let job_id = created_job["job"]["id"]
             .as_str()
             .unwrap_or_default()

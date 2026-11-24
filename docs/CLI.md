@@ -294,6 +294,45 @@ The default `cadence --help` lists nouns. Actions sit under them.
 - `message send` is the canonical enqueue. `cadence send` still parses.
 - Dispatch stays `cadence dispatch <id> --to <alias>`. It starts an issue, so it is not under `agent`.
 
+### Goal-intake plans
+
+On a native tracker, use `cadence plan propose --project KEY --file PLAN.md`
+to submit a goal for operator review. Add `intake:` to the normal plan
+frontmatter, with `constraints` (an explicit list), `success_criteria` (at
+least one), and optional `unknowns`. Put `sources:` (registered project
+context document IDs) and `paths:` (tracked module paths) immediately under
+each ticket heading. Use the nearest tracked directory for a new file. Every
+outcome needs an Acceptance checklist; `reuse: ISSUE-ID` maps it to an
+existing issue in this project. It must already declare the mapped paths
+and acceptance criteria. Reuse counts toward progress but does not assign it,
+edit it, or grant permission to run it under this plan. A new outcome can
+depend on it by section number or issue ID; that dependency retains its own
+approval and dispatch rules.
+
+`cadence plan show EPIC` reports the pinned commit, document digests and
+outcome scopes, with the reason if evidence is blocked. Exact retries return
+the existing epic. Unresolved unknowns prevent approval. A new claim or
+kickoff requires closed prerequisites and unchanged approved scope and cited
+sources. A tracked module must also exist at the commit selected for the
+lane, including when you pass `--base`. For a prerequisite mapped by this
+intake, dropping it is not completion; a completed prerequisite omitted
+from a revision still has to match its last approved scope.
+
+To update the evidence, submit a plan file with `revises: EPIC` under
+`intake:` and have the operator approve it. Revise an approved intake
+directly, not through an intervening unapproved proposal. A revision
+cannot revive unfinished work excluded by an earlier revision or retire an
+unfinished prerequisite that retained work still needs. Approval supersedes
+the old scope without stopping active work. Fresh kickoff rechecks the
+approval before enqueue; retransmitting an accepted kickoff keeps its
+original receipt. Existing coordinator and worker admission rules still apply.
+A job kickoff pins that revision's complete issue acceptance for
+task-bound follow-ups. Separately authored task criteria still apply
+where compatible; they do not expand the approved issue scope.
+Renewing a stale claim rechecks the same evidence, even for its previous holder.
+Sandbox jobs use a branch without creating a host worktree. A verified draft
+reuses its pinned base; a new job keeps the issue's single open sandbox branch.
+
 ## Finding a command
 
 `cadence commands` and `cadence schema` are offline. They do not open a

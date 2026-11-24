@@ -556,6 +556,9 @@ mod cad2215_scoped_alert_acceptance;
 mod cad2215_scoped_cursor_acceptance;
 #[cfg(feature = "test-seam")]
 mod cad2215_task_detail_scope_acceptance;
+#[cfg(feature = "test-seam")]
+mod cad224_goal_intake_admission_acceptance;
+mod cad224_goal_intake_guards_acceptance;
 mod cad2259_fenced_default_kickoff_acceptance;
 mod caller;
 mod cloud_hold;

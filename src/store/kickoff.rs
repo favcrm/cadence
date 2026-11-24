@@ -161,7 +161,36 @@ pub(super) fn cloud_kickoff_body(
     let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
     let raw = std::fs::read_to_string(spec)
         .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
-    let cleaned = omit_host_paths(&flatten_controls(&raw));
+    cloud_kickoff_body_with_spec(job, task, revision, ceiling, &raw)
+}
+
+/// Render an already captured spec instead of reopening its locator.
+pub(crate) fn captured_cloud_kickoff(
+    job: &Job,
+    task: &Task,
+    revision: i64,
+    provider: &str,
+    endpoint_kind: &str,
+    spec: &str,
+) -> Result<String> {
+    cloud_kickoff_body_with_spec(
+        job,
+        task,
+        revision,
+        kickoff_ceiling(provider, endpoint_kind),
+        spec,
+    )
+}
+
+fn cloud_kickoff_body_with_spec(
+    job: &Job,
+    task: &Task,
+    revision: i64,
+    ceiling: usize,
+    raw: &str,
+) -> Result<String> {
+    let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
+    let cleaned = omit_host_paths(&flatten_controls(raw));
     let mut scope = String::new();
     if let Some(branch) = &task.branch {
         scope.push_str(&format!(" branch {}", flatten_controls(branch)));

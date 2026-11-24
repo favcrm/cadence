@@ -470,7 +470,6 @@ impl Shared {
                     && f.owner.as_deref().is_none_or(|o| o == agent.alias)
                     && !f.paths.is_empty()
                     && f.paths.iter().all(|p| areas::check_path(p).is_ok())
-                    && issue::plan::gate(&pm.dir, f, &i.body).is_ok()
             })
             .collect();
         let rank = |i: &Issue| {
@@ -504,6 +503,11 @@ impl Shared {
                         .any(|p| files.iter().any(|f| areas::overlaps(p, f)))
             });
             if overlap {
+                continue;
+            }
+            // A goal-intake gate may re-read tracked source evidence. Only
+            // prove it for candidates that passed the existing cheap guards.
+            if issue::plan::gate(&pm.dir, &cand.front, &cand.body).is_err() {
                 continue;
             }
             // The pick was safe; the dispatch itself may still refuse —

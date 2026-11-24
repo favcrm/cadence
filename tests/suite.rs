@@ -19554,3 +19554,655 @@ mod cad2494_acceptance {
         gate(&repo, &head, json!({}), vec![]).refused("review");
     }
 }
+
+#[test]
+fn cad224_intake_replay_and_stale_source_blocks_dispatch() {
+    use cadence_agent::issue::{plan, write, Pm};
+    use cadence_agent::secret::Allowlist;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repo).args(args);
+        let output = cadence_agent::reaper::output(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("source");
+    std::fs::create_dir_all(repo.join("docs/cadence")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.name", "Acceptance"]);
+    git(
+        &repo,
+        &["config", "user.email", "acceptance@example.invalid"],
+    );
+    std::fs::write(repo.join("docs/scope.md"), "Original scope\n").unwrap();
+    std::fs::write(repo.join("src/module.rs"), "// tracked module\n").unwrap();
+    std::fs::write(
+        repo.join("docs/cadence/project-context.yaml"),
+        "schema: 1\nproject: cadence\ndocuments:\n  - id: scope\n    kind: scope\n    path: docs/scope.md\n    title: Scope\n    required: true\n    roles: []\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "Initial source"]);
+
+    let pm_path = tmp.path().join("pm");
+    let pm = Pm::init(&pm_path).unwrap();
+    write::project_add(
+        &pm,
+        "cadence",
+        "CAD",
+        &[repo.to_string_lossy().into_owned()],
+        &[],
+        &[],
+        None,
+    )
+    .unwrap();
+    write::new_issue(
+        &pm,
+        tmp.path(),
+        Some("cadence"),
+        "Existing work",
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "acceptance",
+    )
+    .unwrap();
+    cadence_agent::issue::edit::edit(
+        &pm,
+        "CAD-1",
+        &cadence_agent::issue::edit::EditSpec {
+            set: vec!["paths=src/module.rs".into()],
+            acceptance: Some("- [ ] Existing integration is accounted for\n".into()),
+            ..Default::default()
+        },
+        "acceptance",
+        None,
+    )
+    .unwrap();
+    let existing = pm.dir.join("cadence/CAD-1/issue.md");
+    let original = std::fs::read(&existing).unwrap();
+    let draft = r#"---
+title: Deliver the scoped outcome
+goal: Deliver the planned capability
+intake:
+  constraints: [Keep the existing integration]
+  success_criteria: [The capability is available]
+  unknowns: [Confirm the integration detail]
+---
+
+## Reuse existing work
+sources: scope
+paths: src/module.rs
+reuse: CAD-1
+
+### Acceptance
+- [ ] Existing integration is accounted for
+
+## Implement the capability
+sources: scope
+paths: src/module.rs
+depends_on: 1
+
+### Acceptance
+- [ ] Capability is available
+"#;
+    let allow = Allowlist::default();
+    let result = plan::propose(&pm, "cadence", draft, None, &allow, "acceptance", &|| {
+        Ok(Default::default())
+    })
+    .unwrap();
+    let epic = result["epic"].as_str().unwrap().to_owned();
+    let tickets = result["tickets"].as_array().unwrap();
+    let fresh: Vec<_> = tickets
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|id| *id != "CAD-1")
+        .collect();
+    assert_eq!(fresh.len(), 1, "{result}");
+    let fresh = fresh[0].to_owned();
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
+    let fresh_text =
+        std::fs::read_to_string(pm.dir.join("cadence").join(&fresh).join("issue.md")).unwrap();
+    let (fresh_front, _) = cadence_agent::issue::parse::parse_issue(&fresh_text).unwrap();
+    assert!(fresh_front.blocked_by.iter().any(|id| id == "CAD-1"));
+    drop(pm);
+
+    let pm = Pm::at(&pm_path).unwrap();
+    let replay = plan::propose(&pm, "cadence", draft, None, &allow, "acceptance", &|| {
+        Ok(Default::default())
+    })
+    .unwrap();
+    assert_eq!(replay["epic"], epic);
+    assert_eq!(replay["tickets"], result["tickets"]);
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
+    let issue_count = || {
+        std::fs::read_dir(pm.dir.join("cadence"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("CAD-"))
+            .count()
+    };
+    let count = issue_count();
+    let missing = draft.replace("sources: scope", "sources: missing");
+    assert!(plan::propose(
+        &pm,
+        "cadence",
+        &missing,
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .is_err());
+    assert_eq!(issue_count(), count);
+    let mismatched = draft.replace(
+        "Existing integration is accounted for",
+        "A different integration is accounted for",
+    );
+    assert!(plan::propose(
+        &pm,
+        "cadence",
+        &mismatched,
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .is_err());
+    assert_eq!(issue_count(), count);
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
+
+    let manifest = repo.join("docs/cadence/project-context.yaml");
+    let valid_manifest = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        valid_manifest.replace("project: cadence", "project: other"),
+    )
+    .unwrap();
+    git(&repo, &["add", "docs/cadence/project-context.yaml"]);
+    git(&repo, &["commit", "-qm", "Conflicting project context"]);
+    let conflicting = draft.replace("Deliver the scoped outcome", "A different outcome");
+    let refusal = plan::propose(
+        &pm,
+        "cadence",
+        &conflicting,
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_context_unavailable"),
+        "{refusal:?}"
+    );
+    assert_eq!(issue_count(), count);
+    std::fs::write(&manifest, valid_manifest).unwrap();
+    git(&repo, &["add", "docs/cadence/project-context.yaml"]);
+    git(&repo, &["commit", "-qm", "Restore project context"]);
+
+    let refusal = write::decide_plan(&pm, &epic, true, "operator", None).unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_unknowns_unresolved"),
+        "{refusal:?}"
+    );
+    assert!(plan::gate_id(&pm.dir, &fresh).is_err());
+    assert_eq!(issue_count(), count);
+
+    let resolved = draft.replace(
+        "  unknowns: [Confirm the integration detail]",
+        &format!("  unknowns: []\n  revises: {epic}"),
+    );
+    let revised = plan::propose(
+        &pm,
+        "cadence",
+        &resolved,
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap();
+    let revised_epic = revised["epic"].as_str().unwrap();
+    assert_ne!(revised_epic, epic);
+    let revised_tickets: Vec<_> = revised["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|id| *id != "CAD-1")
+        .collect();
+    assert_eq!(revised_tickets.len(), 1, "{revised}");
+    let fresh = revised_tickets[0];
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
+    write::decide_plan(&pm, revised_epic, true, "operator", None).unwrap();
+    drop(pm);
+    let pm = Pm::at(&pm_path).unwrap();
+    let refusal = plan::gate_id(&pm.dir, fresh).unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_dependency_unready"),
+        "{refusal:?}"
+    );
+    assert!(refusal.to_string().contains("CAD-1"), "{refusal:?}");
+    let revised_text =
+        std::fs::read_to_string(pm.dir.join("cadence").join(fresh).join("issue.md")).unwrap();
+    let (revised_front, _) = cadence_agent::issue::parse::parse_issue(&revised_text).unwrap();
+    let blocked = cadence_agent::issue::blocked::check_ready(&pm.dir, &revised_front)
+        .unwrap_err()
+        .to_string();
+    assert!(blocked.contains("CAD-1"), "{blocked}");
+
+    let linked = r#"---
+title: Deliver linked outcomes
+goal: Deliver both outcomes
+intake:
+  constraints: [Preserve the integration]
+  success_criteria: [Both outcomes are available]
+  unknowns: []
+---
+
+## Prerequisite
+sources: scope
+paths: src/module.rs
+
+### Acceptance
+- [ ] Prerequisite is available
+
+## Dependent
+sources: scope
+paths: src/module.rs
+depends_on: 1
+
+### Acceptance
+- [ ] Dependent outcome is available
+"#;
+    let linked_plan = plan::propose(&pm, "cadence", linked, None, &allow, "acceptance", &|| {
+        Ok(Default::default())
+    })
+    .unwrap();
+    let linked_epic = linked_plan["epic"].as_str().unwrap();
+    let prerequisite = linked_plan["tickets"][0].as_str().unwrap();
+    let dependent = linked_plan["tickets"][1].as_str().unwrap();
+    write::decide_plan(&pm, linked_epic, true, "operator", None).unwrap();
+    let refusal = plan::gate_id(&pm.dir, dependent).unwrap_err();
+    assert_eq!(
+        refusal.code(),
+        Some("plan_dependency_unready"),
+        "{refusal:?}"
+    );
+    assert!(refusal.to_string().contains(prerequisite), "{refusal:?}");
+    cadence_agent::issue::edit::edit(
+        &pm,
+        prerequisite,
+        &cadence_agent::issue::edit::EditSpec {
+            set: vec!["status=dropped".into()],
+            ..Default::default()
+        },
+        "acceptance",
+        None,
+    )
+    .unwrap();
+    let refusal = plan::gate_id(&pm.dir, dependent).unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+    let dependent_text =
+        std::fs::read_to_string(pm.dir.join("cadence").join(dependent).join("issue.md")).unwrap();
+    let (dependent_front, _) = cadence_agent::issue::parse::parse_issue(&dependent_text).unwrap();
+    assert!(dependent_front.claim.is_none());
+
+    // The reused prerequisite is complete before testing source drift, so
+    // that later refusal cannot be the unrelated readiness gate.
+    let existing_text = std::fs::read_to_string(&existing).unwrap();
+    let (mut existing_front, existing_body) =
+        cadence_agent::issue::parse::parse_issue(&existing_text).unwrap();
+    existing_front.status = "done".into();
+    std::fs::write(
+        &existing,
+        cadence_agent::issue::parse::render(&existing_front, &existing_body).unwrap(),
+    )
+    .unwrap();
+    git(&pm.dir, &["add", "cadence/CAD-1/issue.md"]);
+    git(
+        &pm.dir,
+        &[
+            "-c",
+            "user.name=Acceptance",
+            "-c",
+            "user.email=acceptance@example.invalid",
+            "commit",
+            "-qm",
+            "Complete reused prerequisite",
+        ],
+    );
+    plan::gate_id(&pm.dir, fresh).unwrap();
+
+    std::fs::write(repo.join("docs/scope.md"), "Revised scope\n").unwrap();
+    git(&repo, &["add", "docs/scope.md"]);
+    git(&repo, &["commit", "-qm", "Revise scope"]);
+    let refusal = plan::gate_id(&pm.dir, fresh).unwrap_err();
+    assert_eq!(refusal.code(), Some("plan_evidence_stale"), "{refusal:?}");
+}
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad224_completed_plain_dispatch_compares_full_approved_scope() {
+    use cadence_agent::issue::{plan, write, Pm};
+    use cadence_agent::memory::{
+        semantic_digest, FinalizationReceipt, Front, IdentityProof, Memory, ReviewReceipt, Scope,
+    };
+    use cadence_agent::secret::Allowlist;
+    use cadence_agent::store::{NewAgent, Store};
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+
+    struct Daemon(Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn git(repo: &Path, args: &[&str]) {
+        let output =
+            cadence_agent::reaper::output(Command::new("git").arg("-C").arg(repo).args(args))
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fn proof(alias: &str, registration: u64) -> IdentityProof {
+        IdentityProof {
+            alias: alias.into(),
+            registration,
+            generation: format!("gen-{registration}"),
+            process_start: registration + 100,
+            role: if alias == "pm" { "pm" } else { "worker" }.into(),
+            uid: None,
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("source");
+    let state = root.path().join("state");
+    let pm_path = root.path().join("pm");
+    std::fs::create_dir_all(repo.join("docs/cadence")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.name", "Acceptance"]);
+    git(
+        &repo,
+        &["config", "user.email", "acceptance@example.invalid"],
+    );
+    std::fs::write(repo.join("src/module.rs"), "// tracked\n").unwrap();
+    std::fs::write(repo.join("docs/scope.md"), "Approved source\n").unwrap();
+    std::fs::write(
+        repo.join("docs/cadence/project-context.yaml"),
+        "schema: 1\nproject: cadence\ndocuments:\n  - id: scope\n    kind: scope\n    path: docs/scope.md\n    title: Scope\n    required: true\n    roles: []\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "Initial source"]);
+    let pm = Pm::init(&pm_path).unwrap();
+    write::project_add(
+        &pm,
+        "cadence",
+        "CAD",
+        &[repo.to_string_lossy().into_owned()],
+        &[],
+        &[],
+        None,
+    )
+    .unwrap();
+
+    // Use the repository's signed legacy-memory fixture contract, so the
+    // native dispatch creates its own actual lessons sidecar and suffix.
+    let author = proof("author", 1);
+    let mut lesson = Memory {
+        project: "cadence".into(),
+        front: Front {
+            id: "dispatch-lesson".into(),
+            kind: "rule".into(),
+            status: "accepted".into(),
+            scope: Scope { project: true, ..Default::default() },
+            source: Some("CAD-1".into()),
+            confidence: "medium".into(),
+            created: "2026-01-01T00:00:00Z".into(),
+            verified_at: None,
+            stale: None,
+            supersedes: None,
+            author: Some(author.alias.clone()),
+            author_proof: Some(author),
+            contributors: vec![],
+            review_cycle: 1,
+            active_operation: None,
+            reviews: vec![],
+            finalizations: vec![],
+            policy: None,
+        },
+        body: "Keep the existing integration.\n\n**Why:** It is relied upon.\n\n**How to apply:** Preserve it.\n".into(),
+        path: Default::default(),
+    };
+    let digest = semantic_digest(&lesson);
+    for reviewer in [proof("worker-a", 2), proof("worker-b", 3)] {
+        lesson.front.reviews.push(ReviewReceipt {
+            reviewer: reviewer.alias.clone(),
+            identity: reviewer.stable_id(),
+            generation: reviewer.generation,
+            process_start: reviewer.process_start,
+            role: reviewer.role,
+            operation: "accept".into(),
+            cycle: 1,
+            digest: digest.clone(),
+            verdict: "pass".into(),
+            evidence: "independent evidence".into(),
+            recorded_at: "2026-01-01T00:00:00Z".into(),
+        });
+    }
+    lesson.front.finalizations.push(FinalizationReceipt {
+        operation: "accept".into(),
+        cycle: 1,
+        digest,
+        finalizer: proof("pm", 4),
+        finalized_at: "2026-01-01T00:00:00Z".into(),
+    });
+    assert!(cadence_agent::memory::retrieval_status(&lesson).0);
+    let memory_file = pm.dir.join("cadence/memory/dispatch-lesson.md");
+    std::fs::create_dir_all(memory_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &memory_file,
+        format!(
+            "---\n{}---\n\n{}",
+            serde_yaml::to_string(&lesson.front).unwrap(),
+            lesson.body
+        ),
+    )
+    .unwrap();
+    pm.commit(&[memory_file], "Record accepted lesson").unwrap();
+
+    let criterion = "Approved intake acceptance: preserve the integration";
+    let draft = format!(
+        "---\ntitle: Deliver capability\ngoal: Deliver capability\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Capability available]\n  unknowns: []\n---\n\n## Implement capability\nsources: scope\npaths: src/module.rs\n\n### Acceptance\n- [ ] {criterion}\n"
+    );
+    let allow = Allowlist::default();
+    let proposed = plan::propose(&pm, "cadence", &draft, None, &allow, "acceptance", &|| {
+        Ok(Default::default())
+    })
+    .unwrap();
+    let first_epic = proposed["epic"].as_str().unwrap();
+    let issue = proposed["tickets"][0].as_str().unwrap();
+    write::decide_plan(&pm, first_epic, true, "operator", None).unwrap();
+    let (_, issue_dir) = write::issue_dir(&pm, issue).unwrap();
+    let body = std::fs::read_to_string(issue_dir.join("issue.md")).unwrap();
+    let qualified = body.replace(
+        &format!("- [ ] {criterion}\n"),
+        &format!("- [ ] {criterion}\n  Under normal traffic\n"),
+    );
+    assert_ne!(qualified, body);
+    std::fs::write(issue_dir.join("issue.md"), qualified).unwrap();
+    pm.commit(&[issue_dir.join("issue.md")], "Qualify capability")
+        .unwrap();
+    let revision = |previous: &str| {
+        format!(
+        "---\ntitle: Carry capability\ngoal: Deliver capability\nintake:\n  constraints: [Preserve integration]\n  success_criteria: [Capability available]\n  unknowns: []\n  revises: {previous}\n---\n\n## Implement capability\nsources: scope\npaths: src/module.rs\nreuse: {issue}\n\n### Acceptance\n- [ ] {criterion}\n"
+    )
+    };
+    let second = plan::propose(
+        &pm,
+        "cadence",
+        &revision(first_epic),
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap();
+    let second_epic = second["epic"].as_str().unwrap();
+    write::decide_plan(&pm, second_epic, true, "operator", None).unwrap();
+
+    let cli = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.env("CADENCE_STATE_DIR", &state)
+            .env("CADENCE_PM_DIR", &pm_path)
+            .env("CADENCE_TEST_AS", "operator")
+            .env("CADENCE_TEST_SEAM", "1")
+            .env("HOME", root.path())
+            .current_dir(&repo);
+        cmd
+    };
+    let log = std::fs::File::create(root.path().join("daemon.log")).unwrap();
+    let daemon = Daemon(
+        cadence_agent::reaper::spawn(
+            cli()
+                .args(["daemon", "run"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log)),
+        )
+        .unwrap(),
+    );
+    let health =
+        cadence_agent::client::rpc_relay(&state, "health", json!({})).unwrap_or_else(|error| {
+            panic!(
+                "{error}: {}",
+                std::fs::read_to_string(root.path().join("daemon.log")).unwrap()
+            )
+        });
+    assert_eq!(health["pid"], daemon.0.id());
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    for alias in ["worker", "dispatcher"] {
+        store
+            .register_agent(&NewAgent {
+                alias,
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: repo.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+    }
+    let dispatch = || -> Value {
+        let output = cadence_agent::reaper::output(cli().args([
+            "dispatch",
+            issue,
+            "--to",
+            "worker",
+            "--reply-to",
+            "dispatcher",
+            "--base",
+            "HEAD",
+        ]))
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "dispatch failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = dispatch();
+    assert_eq!(first["dispatched"], true, "{first}");
+    let first_id = first["message"].as_str().unwrap();
+    let message = store.message(first_id).unwrap().unwrap();
+    assert!(message.body.contains(criterion), "{}", message.body);
+    assert!(
+        message.body.contains("Under normal traffic"),
+        "{}",
+        message.body
+    );
+    assert!(message.body.contains(" Lessons: "), "{}", message.body);
+    assert!(first["lessons_file"].as_str().is_some(), "{first}");
+    assert_eq!(store.queued_count("worker").unwrap(), 1);
+    store
+        .finish(
+            &message,
+            "completed",
+            &json!({"sha": first["base"]["sha"], "via": "report"}),
+            None,
+        )
+        .unwrap();
+    assert_eq!(store.queued_count("worker").unwrap(), 0);
+    let replay = dispatch();
+    assert_eq!(replay["duplicate_kind"], "reported", "{replay}");
+    assert_eq!(replay["message"], first_id, "{replay}");
+    assert_eq!(replay["dispatched"], false, "{replay}");
+    assert_eq!(store.queued_count("worker").unwrap(), 0);
+
+    let body = std::fs::read_to_string(issue_dir.join("issue.md")).unwrap();
+    let changed = body.replace("Under normal traffic", "Under exceptional traffic");
+    assert_ne!(changed, body);
+    std::fs::write(issue_dir.join("issue.md"), changed).unwrap();
+    pm.commit(&[issue_dir.join("issue.md")], "Change capability qualifier")
+        .unwrap();
+    let third = plan::propose(
+        &pm,
+        "cadence",
+        &revision(second_epic),
+        None,
+        &allow,
+        "acceptance",
+        &|| Ok(Default::default()),
+    )
+    .unwrap();
+    write::decide_plan(&pm, third["epic"].as_str().unwrap(), true, "operator", None).unwrap();
+    let fresh = dispatch();
+    assert_eq!(fresh["dispatched"], true, "{fresh}");
+    assert_ne!(fresh["message"], first_id, "{fresh}");
+    assert_eq!(store.queued_count("worker").unwrap(), 1);
+    let new_message = store
+        .message(fresh["message"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(new_message.body.contains(criterion), "{}", new_message.body);
+    assert!(
+        new_message.body.contains("Under exceptional traffic"),
+        "{}",
+        new_message.body
+    );
+    assert_eq!(store.message(first_id).unwrap().unwrap().state, "completed");
+}

@@ -592,6 +592,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
             decided_at: None,
             reason: None,
             workflow: None,
+            intake: None,
         });
         // A proposed plan is in shape whatever a stage field claims.
         f.stage = Some("release".into());
@@ -835,6 +836,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
             decided_at: Some("2026-09-02T00:00:00Z".into()),
             reason: None,
             workflow: None,
+            intake: None,
         });
         assert_eq!(moves(&p, false), vec![("verify".to_string(), true, false)]);
         for state in ["proposed", "rejected"] {
@@ -877,6 +879,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
             decided_at: None,
             reason: None,
             workflow: None,
+            intake: None,
         });
         let err = plan_allows_moves(&f).unwrap_err().to_string();
         assert!(err.contains("CAD-2 is a proposed plan"), "{err}");
@@ -963,6 +966,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
             decided_at: None,
             reason: None,
             workflow: None,
+            intake: None,
         });
         let vs = views(Path::new("/no-notes"), vec![e]);
         let s = stage_of(&vs[0].issue.front, &cfg, false);

@@ -133,6 +133,61 @@ fn spec_scope_error(path: &str, why: &str) -> Error {
     .error()
 }
 
+/// Resolve a spec locator against the same project and task bases used by
+/// the scoped reader. A relative job locator is never relative to the daemon.
+fn spec_candidate(
+    declared: &[PathBuf],
+    task: &store::Task,
+    job: &store::Job,
+    spec_path: &str,
+) -> Result<PathBuf> {
+    let issue_id = job.issue_id.as_deref().unwrap_or_default();
+    let raw = Path::new(spec_path);
+    if raw.is_absolute() {
+        return Ok(raw.to_path_buf());
+    }
+    let base = if task.spec_path.is_some() {
+        task_spec_base(declared, task.worktree.as_deref(), issue_id)
+    } else {
+        default_spec_base(declared, job.repo.as_deref())
+    };
+    let Some(base) = base else {
+        return Err(spec_scope_error(
+            spec_path,
+            "a relative spec has no approved task lane or declared repository",
+        ));
+    };
+    Ok(base.join(raw))
+}
+
+/// Resolve a relative job locator to the same canonical file used by the
+/// scoped kickoff reader. Absolute legacy locators remain untouched.
+pub(crate) fn intake_spec_pin(
+    project: &crate::issue::project::Project,
+    task: &store::Task,
+    job: &store::Job,
+) -> Result<PathBuf> {
+    let raw = Path::new(&job.spec_path);
+    if raw.is_absolute() {
+        return Ok(raw.to_path_buf());
+    }
+    let candidate = spec_candidate(&start::declared_repos(project), task, job, &job.spec_path)?;
+    Ok(candidate.canonicalize().unwrap_or(candidate))
+}
+
+/// Re-read a canonical relative-job pin without following replaced symlinks
+/// or reading more than the context reader's bound.
+pub(crate) fn intake_spec_matches(path: &Path, expected: &str) -> bool {
+    let Ok(relative) = path.strip_prefix("/") else {
+        return false;
+    };
+    Root::open(Path::new("/"))
+        .and_then(|root| root.read(relative, crate::context_pack::MAX_COMBINED_BYTES as u64))
+        .ok()
+        .flatten()
+        .is_some_and(|text| content_digest(text.as_bytes()) == expected)
+}
+
 /// Approve and read one job task spec. The canonical target must be the
 /// task's own lane, the captured issue directory, or a tracked file of a
 /// declared project repository; anything else is a scope conflict before a
@@ -149,23 +204,7 @@ fn read_job_spec(
 ) -> Result<(String, PathBuf, &'static str)> {
     let declared = start::declared_repos(project);
     let issue_id = job.issue_id.as_deref().unwrap_or_default();
-    let raw = Path::new(spec_path);
-    let candidate = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        let base = if task.spec_path.is_some() {
-            task_spec_base(&declared, task.worktree.as_deref(), issue_id)
-        } else {
-            default_spec_base(&declared, job.repo.as_deref())
-        };
-        let Some(base) = base else {
-            return Err(spec_scope_error(
-                spec_path,
-                "a relative spec has no approved task lane or declared repository",
-            ));
-        };
-        base.join(raw)
-    };
+    let candidate = spec_candidate(&declared, task, job, spec_path)?;
     let file = candidate.canonicalize().map_err(|error| {
         Error::rejected(format!(
             "context refused: spec-unavailable: the task spec {spec_path} could not be \
@@ -238,6 +277,46 @@ fn read_job_spec(
     Ok((text, file, label))
 }
 
+/// Capture a repo-relative default job spec for an intake cloud kickoff
+/// without granting the locator authority to read outside the approved scope.
+/// Canonical issue specs use the approved issue snapshot, not their old raw
+/// digest; independent specs must still match the job's immutable byte pin.
+pub(crate) fn capture_intake_cloud_spec(
+    gated: &GatedIssue,
+    task: &store::Task,
+    job: &store::Job,
+    bound_spec: Option<&Path>,
+) -> Result<String> {
+    let (text, file, _) = read_job_spec(&gated.project, &gated.dir, task, job, &job.spec_path)?;
+    if bound_spec.is_some_and(|expected| expected != file.as_path()) {
+        return Err(Error::rejected(
+            "task dispatch refused: independent spec changed while preparing the kickoff",
+        ));
+    }
+    let canonical_issue = gated
+        .dir
+        .join("issue.md")
+        .canonicalize()
+        .ok()
+        .is_some_and(|issue| issue == file);
+    if canonical_issue {
+        return Ok(gated.source.clone());
+    }
+    let expected = job.spec_sha256.as_deref().ok_or_else(|| {
+        Error::rejected(
+            "task dispatch refused: a relative independent intake cloud spec has no immutable digest",
+        )
+    })?;
+    if content_digest(text.as_bytes()) != expected {
+        return Err(Error::rejected(format!(
+            "context refused: spec-changed: the task spec {} no longer matches the revision \
+             the job was opened with — reopen the task or restore the pinned spec; nothing was queued",
+            file.display()
+        )));
+    }
+    Ok(text)
+}
+
 /// Canonical issue specs contain mutable tracker metadata that is not part
 /// of their effective spec. Pin every body byte, including all criteria;
 /// retain the separate raw source digest in the delivery manifest.
@@ -271,18 +350,18 @@ pub(crate) fn canonical_issue_spec_digest(
     )))
 }
 
-/// CAD-1846: the same mandatory pipeline for an issue-linked job task.
-/// The caller proves the job's issue binding and real lane from its own
-/// captured rows; this captures the complete effective spec once, the
-/// parent issue's complete prose and the task's own acceptance, and
-/// builds the contract at the job task's identity. `None` means the
-/// project has not opted in — the caller renders the legacy kickoff and
-/// never labels it a complete contract.
+/// CAD-1846: the mandatory pipeline for an issue-linked job task. The caller
+/// proves its captured issue binding and lane. Intake admissions supply the
+/// approved issue checklist; other tasks keep their recorded acceptance.
+/// `None` means the project has not opted in and the caller renders the
+/// legacy kickoff instead.
 pub(crate) fn job_context(
     pm: &Pm,
-    gated: GatedIssue,
+    gated: &GatedIssue,
     job: JobContext<'_>,
     no_lessons: bool,
+    approved_issue_items: Option<&[AcceptanceItem]>,
+    bound_spec: Option<&Path>,
 ) -> Result<Option<PreparedContext<'static>>> {
     let GatedIssue {
         project,
@@ -307,13 +386,13 @@ pub(crate) fn job_context(
     }
     let provider = target.provider;
     let endpoint_kind = target.endpoint_kind;
-    context_guard(pm, &project, &front, target, no_lessons, || {
+    context_guard(pm, project, front, target, no_lessons, || {
         // The caller's own scope proof runs only after this project is
         // confirmed opted in and its endpoint can receive context, and
         // before any spec byte is read: an opt-out dispatch never pays for
         // a lane proof, and its legacy kickoff needs none.
         if let Some(check) = admission_scope {
-            check(&project, &front)?;
+            check(project, front)?;
         }
         // The complete effective spec, approved and captured once. The
         // canonical locator must be the task's own lane, the captured issue
@@ -325,7 +404,12 @@ pub(crate) fn job_context(
             .as_deref()
             .unwrap_or(job_row.spec_path.as_str());
         let (captured_spec, spec_file, spec_scope) =
-            read_job_spec(&project, &dir, task, job_row, spec_path)?;
+            read_job_spec(project, dir, task, job_row, spec_path)?;
+        if bound_spec.is_some_and(|expected| expected != spec_file.as_path()) {
+            return Err(Error::rejected(
+                "task dispatch refused: independent spec changed while preparing the kickoff",
+            ));
+        }
         let issue_file = std::fs::canonicalize(dir.join("issue.md")).ok();
         let canonical_issue_spec = issue_file.as_deref() == Some(spec_file.as_path());
         // Use the selected issue snapshot for both provenance and its request,
@@ -336,10 +420,10 @@ pub(crate) fn job_context(
             captured_spec.as_str()
         };
         let spec_digest = content_digest(spec.as_bytes());
-        // The job's recorded digest still gates its own spec. The working
-        // bytes may be dirty; this digest is the captured data revision, not
-        // a claim that the file matches HEAD.
-        if task.spec_path.is_none() {
+        // Independent specs and ordinary jobs retain their byte pin. For an
+        // intake's canonical issue file the admitted scope supersedes the old
+        // raw body digest, which can change when a criterion is checked off.
+        if task.spec_path.is_none() && !(canonical_issue_spec && approved_issue_items.is_some()) {
             if let Some(expected) = job_row.spec_sha256.as_deref() {
                 let canonical_digest = if canonical_issue_spec {
                     Some(content_digest(parse::split_front(spec)?.1.as_bytes()))
@@ -356,11 +440,12 @@ pub(crate) fn job_context(
                 }
             }
         }
-        // Do not re-embed tracker frontmatter or criteria already represented
-        // by the native task. A task-specific checklist may differ from the
-        // canonical spec's checklist, whose other requirements remain mandatory.
+        // Task acceptance is independent of the approved issue scope.
         let spec_is_issue = canonical_issue_spec || spec.as_bytes() == source.as_bytes();
-        let acceptance = task_acceptance(task);
+        let mut acceptance = task_acceptance(task);
+        if let Some(items) = approved_issue_items {
+            acceptance.extend(items.iter().cloned());
+        }
         let title = task
             .title
             .as_deref()
@@ -392,7 +477,7 @@ pub(crate) fn job_context(
             spec_scope,
         ));
         if spec_is_issue {
-            request.push_str(&parent_request);
+            request.push_str(parent_request);
             let mut additional = parent_items
                 .iter()
                 .filter(|item| !acceptance.iter().any(|task| task.text == item.text))
@@ -419,10 +504,25 @@ pub(crate) fn job_context(
                     "\n## Parent issue {}: {}\n\n",
                     front.id, front.title
                 ));
-                request.push_str(&parent_request);
+                request.push_str(parent_request);
                 if !request.ends_with('\n') {
                     request.push('\n');
                 }
+            }
+        }
+        if approved_issue_items.is_some() {
+            let (_, issue_body) = parse::split_front(source)?;
+            let scope = parse::acceptance_scope(issue_body)
+                .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?;
+            request.push_str("\n## Approved issue acceptance (including qualifiers)\n\n");
+            request.push_str(scope);
+            request.push('\n');
+        }
+        if approved_issue_items.is_some() {
+            if let Some(recorded) = task.acceptance.as_deref().filter(|s| !s.trim().is_empty()) {
+                request.push_str("\n## Independent task acceptance (where compatible)\n\n");
+                request.push_str(recorded);
+                request.push('\n');
             }
         }
         contract.request = request;

@@ -333,6 +333,7 @@ fn issue_detail_with_history_notes_and_plan_bytes_are_unchanged() {
         decided_at: Some("2026-09-02T00:00:00Z".into()),
         reason: None,
         workflow: None,
+        intake: None,
     });
     let mut task = new("CAD-3", Some("CAD-1"));
     task.front.size = Some("S".into());

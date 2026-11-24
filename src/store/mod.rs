@@ -93,7 +93,7 @@ pub use topics::{
 };
 mod inbox;
 mod kickoff;
-pub(crate) use kickoff::last_sha_line;
+pub(crate) use kickoff::{captured_cloud_kickoff, last_sha_line};
 pub mod routines;
 pub mod workspace_settings;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
@@ -154,7 +154,7 @@ pub mod crm_smtp;
 mod plans;
 pub mod social_publish;
 pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
-pub(crate) use plans::{DispatchPlan, TaskHistoryEvent};
+pub(crate) use plans::{DispatchPlan, PreparedJobKickoff, TaskHistoryEvent};
 mod quota;
 mod schema;
 /// CAD-2215: the nullable `connection_metadata.cursor_keyring_fingerprint`

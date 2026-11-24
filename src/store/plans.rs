@@ -299,10 +299,16 @@ impl DispatchPlan {
     }
 }
 
+pub(crate) struct PreparedJobKickoff {
+    pub(crate) body: String,
+    pub(crate) selection: super::messages::IssueSelection,
+    pub(crate) intake_acceptance: Option<String>,
+}
+
 pub(super) struct DispatchPreparation<'a> {
     pub(super) plan: &'a DispatchPlan,
     /// Absent only when the captured plan already names an accepted kickoff.
-    pub(super) delivery: Option<(String, super::messages::IssueSelection)>,
+    pub(super) delivery: Option<PreparedJobKickoff>,
     /// The ticket's project at this dispatch, recorded in the durable
     /// `task_dispatched` event so a later recovery never re-derives it from
     /// the ticket's current location.
@@ -429,6 +435,26 @@ impl Store {
         } else {
             crate::issue::dispatch::inline_listing(&outstanding)
         };
+        // The approved intake scope belongs to this exact kickoff, not to
+        // the independently maintained task criteria or a later dispatch.
+        let intake_scope = if let Some(message) = task.dispatch_message.as_deref() {
+            self.conn()
+                .query_opt(
+                    "SELECT json_extract(payload, '$.intake_acceptance') FROM events
+                 WHERE job_id=? AND task_id=? AND kind='task_dispatched'
+                   AND json_extract(payload, '$.message')=?
+                   AND json_extract(payload, '$.revision')=?
+                   AND json_extract(payload, '$.assignee')=? LIMIT 1",
+                    params![job.id, task.id, message, task.revision, recipient],
+                    |row| row.get::<_, Option<String>>(0),
+                )?
+                .flatten()
+        } else {
+            None
+        };
+        let intake_scope = intake_scope
+            .map(|scope| format!(" Approved intake scope: {scope}."))
+            .unwrap_or_default();
         let objective = flatten_controls(
             task.title
                 .as_deref()
@@ -439,7 +465,7 @@ impl Store {
             format!(
                 "{text} — Task {} (job {}) is still open; this message amends it and does \
                  not replace it. Objective: {objective}. Spec: {}. Outstanding criteria: \
-                 {criteria}.",
+                 {criteria}.{intake_scope}",
                 task.id,
                 job.id,
                 flatten_controls(spec)
@@ -1138,7 +1164,7 @@ impl Store {
     pub(crate) fn dispatch_task_planned(
         &self,
         plan: &DispatchPlan,
-        delivery: Option<(String, super::messages::IssueSelection)>,
+        delivery: Option<PreparedJobKickoff>,
         by: &str,
         expect: Option<&AssistDispatchExpect>,
         stall_secs: Option<i64>,
@@ -1363,19 +1389,24 @@ impl Store {
                     .plan
                     .verify_current(&task, &job, &worker, revision, &kickoff)?;
             }
-            let (body, selection) = match prepared {
+            let (body, selection, intake_acceptance) = match prepared {
                 Some(prepared) => {
-                    let (body, selection) = prepared.delivery.ok_or_else(|| {
+                    let delivery = prepared.delivery.ok_or_else(|| {
                         Error::rejected(format!(
                             "Task '{}' no longer has the captured live kickoff — retry to \
                              select its new task context before dispatch",
                             prepared.plan.task.id
                         ))
                     })?;
-                    (body, Some(selection))
+                    (
+                        delivery.body,
+                        Some(delivery.selection),
+                        delivery.intake_acceptance,
+                    )
                 }
                 None => (
                     kickoff_body(&job, &task, revision, &kickoff, &worker)?,
+                    None,
                     None,
                 ),
             };
@@ -1422,17 +1453,20 @@ impl Store {
             }
             tx.execute(
                 "UPDATE tasks SET state='dispatched',revision=?,assignee=?,
-                         dispatch_message=?,head_sha=NULL,error=NULL,updated=?
-                         WHERE id=?",
+                         dispatch_message=?,head_sha=NULL,error=NULL,updated=? WHERE id=?",
                 params![revision, assignee, kickoff, now(), task_id],
             )?;
+            let mut payload = json!({"task": task_id, "job": job.id, "assignee": assignee,
+                                     "revision": revision, "message": kickoff, "by": by,
+                                     "project": project});
+            if let Some(scope) = intake_acceptance {
+                payload["intake_acceptance"] = json!(scope);
+            }
             Self::event_scoped(
                 &tx,
                 &job.pm_alias,
                 "task_dispatched",
-                json!({"task": task_id, "job": job.id, "assignee": assignee,
-                               "revision": revision, "message": kickoff, "by": by,
-                               "project": project}),
+                payload,
                 Some(&job.id),
                 Some(task_id),
             )?;

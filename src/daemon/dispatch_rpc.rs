@@ -192,6 +192,28 @@ impl Shared {
         // outcome, so it never re-captures project context or adds metadata;
         // only an existing pinned selection keeps its conversation real.
         let already_accepted = self.store.message_exists(&mid)?;
+        // Bind the sender's already-rendered text to the same approved intake
+        // scope used by daemon-side context preparation. Request fields are
+        // corroboration only; the live tracker remains the authority.
+        let prepared_intake = if already_accepted {
+            None
+        } else {
+            issue::plan::gate_snapshot(&pm.dir, &front, &issue_body)?
+                .map(|revision| {
+                    Ok::<_, Error>((revision, issue::plan::scope_digest(&front, &issue_body)?))
+                })
+                .transpose()?
+        };
+        if let Some((revision, scope)) = &prepared_intake {
+            if optional_str(params, "intake_revision") != Some(revision.as_str())
+                || optional_str(params, "intake_scope") != Some(scope.as_str())
+            {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "dispatch send refused: kickoff was not prepared from the current approved intake scope",
+                ));
+            }
+        }
         // Keep an accepted pinned selection's native conversation real; a
         // legacy accepted mid gains no new metadata.
         if already_accepted && self.store.context_pin(&alias, &mid)?.is_some() {
@@ -225,6 +247,11 @@ impl Shared {
             };
             let make = || {
                 let (request, items) = issue::parse::task_request(issue_body);
+                let request = if prepared_intake.is_some() {
+                    issue::dispatch::intake_request(&request, &issue_source)?
+                } else {
+                    request
+                };
                 let contract = crate::context_pack::TaskContract::new(
                     &front.id,
                     &front.title,
@@ -252,10 +279,23 @@ impl Shared {
                         prepared.manifest.pin_payload(&mid),
                     ))
                 }
-                None => Some(store::IssueSelection::Disabled {
-                    task: id.clone(),
-                    reason: "the assigned project is not opted in to agent delivery".to_string(),
-                }),
+                None => {
+                    if let Some((revision, digest)) = &prepared_intake {
+                        let suffix =
+                            issue::dispatch::intake_legacy_suffix(&issue_source, revision, digest)?;
+                        if !issue::dispatch::body_has_intake_scope(text, &suffix) {
+                            return Err(Error::invalid(
+                                "plan_evidence_stale",
+                                "dispatch send refused: kickoff is missing its approved acceptance",
+                            ));
+                        }
+                    }
+                    Some(store::IssueSelection::Disabled {
+                        task: id.clone(),
+                        reason: "the assigned project is not opted in to agent delivery"
+                            .to_string(),
+                    })
+                }
             }
         };
         // CAD-1586: a dispatch is a master-target send too — the same
@@ -267,10 +307,48 @@ impl Shared {
         }
         let gated = (matches!(&caller, AgentCaller::Agent(_)) || automatic)
             && self.unattended_issue_bound(&id)?;
-        // Grant→tracker order; keep canonical semantics and owner stable
-        // through enqueue. Resolve blocking reads/Git before the live helper,
-        // whose final expiry check must follow all dispatch setup waits.
-        let _tracker = gated.then(|| pm.lock()).transpose()?;
+        // Grant→tracker order. A fresh intake send re-resolves the
+        // admitted snapshot under the tracker lock held through enqueue.
+        let revalidate_intake = prepared_intake.is_some();
+        if revalidate_intake {
+            issue::lockseam::outside_lock("intake-pre-enqueue");
+        }
+        let _tracker = (gated || revalidate_intake)
+            .then(|| pm.lock())
+            .transpose()?;
+        if revalidate_intake {
+            let (live_project, live_dir) = issue::write::issue_dir(&pm, &id)?;
+            if live_dir != dir || live_project.key != project.key {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "dispatch send refused: issue moved while the kickoff was being prepared",
+                ));
+            }
+            let (live_front, live_body) = issue::write::load_front(&live_dir)?;
+            let (live_lane, _, base) = self.intake_lane_base(&live_project, &live_front)?;
+            if live_lane != worktree {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "dispatch send refused: issue lane changed while the kickoff was being prepared",
+                ));
+            }
+            let live_revision =
+                issue::plan::gate_snapshot_at_base(&pm.dir, &live_front, &live_body, &base)?;
+            let live_intake = live_revision
+                .map(|revision| {
+                    Ok::<_, Error>((
+                        revision,
+                        issue::plan::scope_digest(&live_front, &live_body)?,
+                    ))
+                })
+                .transpose()?;
+            if live_intake != prepared_intake {
+                return Err(Error::invalid(
+                    "plan_evidence_stale",
+                    "dispatch send refused: approved intake scope changed while the kickoff was being prepared",
+                ));
+            }
+        }
         let mut authorized_until = None;
         if gated {
             let (live_front, _) = issue::write::load_front(&dir)?;
@@ -317,6 +395,7 @@ impl Shared {
             selection,
             None,
         )?;
+        drop(_tracker);
         self.notify_agent(&alias);
         self.wake();
         let mut receipt = json!({"message": mid, "state": state, "duplicate": duplicate});
@@ -324,6 +403,47 @@ impl Shared {
             receipt["warning"] = json!(warning);
         }
         Ok(receipt)
+    }
+
+    /// Prove the exact issue lane and its original bound base without fetching
+    /// or inferring a base from a branch's current tip.
+    pub(super) fn intake_lane_base(
+        &self,
+        project: &issue::project::Project,
+        front: &issue::model::Front,
+    ) -> Result<(PathBuf, String, String)> {
+        let lane = self.dispatch_lane("intake dispatch", project, front)?;
+        let root = crate::worktree::main_root(&lane)?;
+        let mut branch_refs = front
+            .refs
+            .iter()
+            .filter(|r| r.kind == "branch" && r.closed != Some(true));
+        let branch = match (branch_refs.next(), branch_refs.next()) {
+            (Some(recorded), None) => recorded.path.as_deref(),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            Error::invalid(
+                "plan_evidence_stale",
+                "intake dispatch refused: issue lane has no unique recorded branch",
+            )
+        })?;
+        crate::worktree::validate_registered_branch(&root, &lane, branch).map_err(|error| {
+            Error::invalid(
+                "plan_evidence_stale",
+                format!(
+                    "intake dispatch refused: issue lane is not a registered worktree ({error})"
+                ),
+            )
+        })?;
+        let base = issue::dispatch::original_lane_base(&root, &lane, branch, &front.id)?
+            .ok_or_else(|| {
+                Error::invalid(
+                    "plan_evidence_stale",
+                    "intake dispatch refused: issue lane's original base cannot be proven",
+                )
+            })?;
+        Ok((lane, branch.to_string(), base))
     }
 
     /// The lane a dispatch binds, resolved daemon-side: the issue's
