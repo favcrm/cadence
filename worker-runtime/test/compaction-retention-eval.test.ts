@@ -2,6 +2,7 @@
 // (`evals/compaction-retention.eval.ts`) calls a paid model and never runs here.
 import { describe, expect, it } from "bun:test";
 import { SUMMARY_INSTRUCTION } from "../src/model.ts";
+import { TOOL_ERROR_REDACTED } from "../src/summary-tool-errors.ts";
 import {
   captureSummaryRequest, FACTS, LEAK_MARKERS, score, withoutInstruction,
 } from "../evals/compaction-retention/fixture.ts";
@@ -89,9 +90,14 @@ describe("compaction retention request", () => {
       JSON.stringify((request.messages as Array<{ content: unknown }>)[0]!.content);
     expect(system(instruction)).toContain(JSON.stringify(SUMMARY_INSTRUCTION).slice(1, -1));
 
-    // The source holds every fact and every failure detail, so a summary
-    // that drops a fact or keeps a leak did so itself.
-    expect(score(userText(instruction))).toEqual({ kept: ALL_FACTS, dropped: [], leaks: ALL_LEAKS });
+    // The source holds every fact, so a summary that drops one did so
+    // itself. CAD-2744: the tool's error code and text are removed before the
+    // model sees them; the calls' arguments and the assistant's own "keeps
+    // refusing" wording remain for the instruction to handle.
+    expect(score(userText(instruction))).toEqual({
+      kept: ALL_FACTS, dropped: [], leaks: ["argument value", "standing failure claim"],
+    });
+    expect(userText(instruction)).toContain(TOOL_ERROR_REDACTED);
 
     const control = withoutInstruction(instruction);
     expect(system(control)).not.toContain(SUMMARY_INSTRUCTION.slice(0, 40));

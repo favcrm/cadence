@@ -55235,6 +55235,169 @@ function masterState(model, status, conversationId, metadata) {
   return state;
 }
 
+// src/summary-tool-errors.ts
+var TOOL_ERROR_REDACTED = "the call failed; its error text is left out of this summary";
+var TOOL_ERROR_TEXT_OMITTED = "(tool error text omitted)";
+var TOOL_ERROR_CODE_OMITTED = "(tool error code omitted)";
+var SUMMARY_PREFIX2 = "The conversation history before this point was compacted into the following summary:";
+var MIN_ECHO_CHARS = 16;
+var ERROR_CODE = /^[A-Za-z][A-Za-z0-9_.-]{5,}$/;
+var ROLE = String.raw`\[(?:User|Assistant|Assistant tool calls|Tool result)\]: `;
+var SEGMENT_START = new RegExp(String.raw`(?:^|\n\n|<conversation>\n)(?=${ROLE})`, "g");
+var CONVERSATION_END = `
+</conversation>`;
+var HARNESS_OPEN = "<harness>";
+var HARNESS_CLOSE = "</harness>";
+var MAX_BLOCK = 2000;
+var DIAGNOSTIC = /^\[(info|warn|error)\] ?(.*)$/;
+function segments(text) {
+  const end = text.lastIndexOf(CONVERSATION_END);
+  const limit = end < 0 ? text.length : end;
+  const starts = [];
+  for (const match of text.matchAll(SEGMENT_START)) {
+    const at = match.index + match[0].length;
+    if (at < limit && (starts.length === 0 || starts.at(-1) < at))
+      starts.push(at);
+  }
+  return starts.map((start, index) => {
+    const next = starts[index + 1];
+    const stop = next === undefined ? limit : next - 2;
+    const role = /^\[([^\]]+)\]: /.exec(text.slice(start))[1];
+    return { role, start, end: Math.max(start, stop) };
+  });
+}
+function eachBlock(body, open, close, rewrite) {
+  let out = "";
+  let from = 0;
+  let at = 0;
+  for (;; ) {
+    const start = body.indexOf(open, at);
+    if (start < 0)
+      break;
+    const inner = start + open.length;
+    const window2 = body.slice(inner, inner + MAX_BLOCK + close.length);
+    const end = window2.indexOf(close);
+    const nested = window2.indexOf(HARNESS_OPEN);
+    if (end < 0 || nested >= 0 && nested < end) {
+      at = inner;
+      continue;
+    }
+    out += body.slice(from, start) + rewrite(window2.slice(0, end));
+    from = at = inner + end + close.length;
+  }
+  return out + body.slice(from);
+}
+function redactHarness(body, removed) {
+  return eachBlock(body, `${HARNESS_OPEN}
+`, `
+${HARNESS_CLOSE}`, (inner) => {
+    const block = `${HARNESS_OPEN}
+${inner}
+${HARNESS_CLOSE}`;
+    const lines = inner.split(`
+`);
+    const out = [];
+    let inError = false;
+    let message = [];
+    const flush = () => {
+      if (inError)
+        removed.add(message.join(`
+`).trim());
+      message = [];
+    };
+    for (const line of lines) {
+      const diagnostic = DIAGNOSTIC.exec(line);
+      if (diagnostic) {
+        flush();
+        inError = diagnostic[1] === "error";
+        if (inError) {
+          message = [diagnostic[2]];
+          out.push(`[error] ${TOOL_ERROR_REDACTED}`);
+        } else
+          out.push(line);
+      } else if (inError) {
+        message.push(line);
+      } else
+        out.push(line);
+    }
+    flush();
+    const shaped = `<harness>
+${out.join(`
+`)}
+</harness>`;
+    return shaped === block ? block : shaped;
+  });
+}
+function redactQuotedHarness(body, removed) {
+  return eachBlock(body, HARNESS_OPEN, HARNESS_CLOSE, (inner) => quotedBlock(inner, removed));
+}
+function quotedBlock(inner, removed) {
+  const parts = inner.split(/(\[(?:info|warn|error)\])/);
+  let changed = false;
+  for (let index = 1;index < parts.length; index += 2) {
+    if (parts[index] !== "[error]")
+      continue;
+    const text = parts[index + 1] ?? "";
+    const message = text.trim();
+    if (message === "" || message === TOOL_ERROR_REDACTED)
+      continue;
+    removed.add(message);
+    const trailing = text.slice(text.trimEnd().length);
+    parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
+    changed = true;
+  }
+  return `${HARNESS_OPEN}${changed ? parts.join("") : inner}${HARNESS_CLOSE}`;
+}
+function escape2(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function scrubEchoes(body, removed) {
+  const messages = [...removed].filter((message) => message.length >= MIN_ECHO_CHARS && message !== TOOL_ERROR_REDACTED).sort((a, b) => b.length - a.length);
+  let out = body;
+  for (const message of messages)
+    out = out.split(message).join(TOOL_ERROR_TEXT_OMITTED);
+  const codes = new Set;
+  for (const message of removed) {
+    const colon = message.indexOf(": ");
+    const code = colon < 0 ? "" : message.slice(0, colon);
+    if (ERROR_CODE.test(code) && /[_\d]/.test(code))
+      codes.add(code);
+  }
+  for (const code of codes)
+    out = out.replace(new RegExp(String.raw`(?<![\w-])${escape2(code)}(?![\w-])`, "g"), TOOL_ERROR_CODE_OMITTED);
+  return out;
+}
+function redactToolErrors(text) {
+  if (!text.includes("<harness>"))
+    return text;
+  const parts = segments(text);
+  if (parts.length === 0)
+    return text;
+  const removed = new Set;
+  const isEarlierSummary = (part) => part.role === "User" && text.startsWith(SUMMARY_PREFIX2, part.start + "[User]: ".length);
+  const bodies = parts.map((part) => {
+    const body = text.slice(part.start, part.end);
+    if (part.role === "Tool result")
+      return redactHarness(body, removed);
+    if (isEarlierSummary(part))
+      return redactQuotedHarness(body, removed);
+    return body;
+  });
+  if (removed.size === 0)
+    return text;
+  const shaped = bodies.map((body, index) => {
+    const part = parts[index];
+    return part.role === "Assistant" || isEarlierSummary(part) ? scrubEchoes(body, removed) : body;
+  });
+  let out = text.slice(0, parts[0].start);
+  parts.forEach((part, index) => {
+    out += shaped[index];
+    const next = parts[index + 1];
+    out += text.slice(part.end, next === undefined ? part.end : next.start);
+  });
+  return out + text.slice(parts.at(-1).end);
+}
+
 // src/model.ts
 var MODEL_CONTEXT_WINDOW = 128000;
 var HOSTED_COMPACTION_POLICY = {
@@ -55348,7 +55511,7 @@ function splitSummaryMessages(input) {
   if (source === null)
     return input;
   const { system, user } = source;
-  const text = shortenToolCallArguments(source.text);
+  const text = redactToolErrors(shortenToolCallArguments(source.text));
   const limit = 64000;
   if (text === source.text && text.length <= limit)
     return input;

@@ -7,6 +7,8 @@
  *
  * It sends the summary request the hosted runtime would send, twice per run:
  * "instruction" as shipped (CAD-2658) and "control" without the instruction.
+ * Both arms are captured after the runtime shapes the request, so both carry
+ * the CAD-2744 tool-error redaction; compare against an older build for that.
  * It calls a paid model, so it never runs in `bun test` or CI; the scorer and
  * the captured request are covered offline by
  * `test/compaction-retention-eval.test.ts`.
