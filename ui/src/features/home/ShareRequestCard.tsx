@@ -6,7 +6,7 @@ import { TurnCard, type CardDensity, type CardStatus } from "../../ui/TurnCard";
 import { WriteGate } from "../auth/WriteGate";
 import { optionsLine } from "../canvas/viewParams";
 import { plainText } from "./chatCards";
-import { alreadyText, declinedLine, decideShareRequest, parseShareRequestEntry, readShareRequest, type ShareCardModel } from "./shareRequest";
+import { alreadyText, confirmShareOffer, declinedLine, decideShareRequest, parseShareOfferEntry, parseShareRequestEntry, readShareRequest, type ConfirmOfferOutcome, type ShareCardModel, type ShareOffer } from "./shareRequest";
 import type { ThreadEntry } from "./thread";
 
 /**
@@ -60,7 +60,86 @@ function useLiveRequest(model: ShareCardModel | null): [ShareCardModel | null, (
   return [current, setLive];
 }
 
+function ShareOfferCard({ offer, density }: { offer: ShareOffer; density: CardDensity }) {
+  const t = useTranslate();
+  const locale = useLocaleTag();
+  const writeBlock = useContext(WriteGate);
+  const [result, setResult] = useState<ConfirmOfferOutcome | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [expired, setExpired] = useState(() => Date.parse(offer.expiresAt) <= Date.now());
+  const inFlight = useRef(false);
+  useEffect(() => {
+    let timer = 0;
+    const schedule = () => {
+      const delay = Date.parse(offer.expiresAt) - Date.now();
+      if (delay <= 0) { setExpired(true); return; }
+      timer = window.setTimeout(schedule, Math.min(delay, 2_147_483_647));
+    };
+    schedule();
+    return () => window.clearTimeout(timer);
+  }, [offer.expiresAt]);
+  const state = offer.status === "offered"
+    ? result ?? (expired ? "expired" : "offered")
+    : offer.status === "submitting" ? result ?? "submitting" : offer.status;
+  const check = state === "submitting" || state === "unknown";
+  const actionable = state === "offered" || check;
+  const confirm = async () => {
+    if (inFlight.current || busy || !actionable || writeBlock !== null ||
+        (state === "offered" && Date.parse(offer.expiresAt) <= Date.now())) return;
+    inFlight.current = true;
+    setBusy(true);
+    const next = await confirmShareOffer(offer);
+    setResult(check && next === "unavailable" ? "unknown" : next);
+    inFlight.current = false;
+    setBusy(false);
+    requestThreadReload();
+  };
+  const options = optionsLine(offer.params, locale, t, (name, value) => {
+    if (name === "columns" && value === "monthly") return t("Monthly");
+    if (name === "compare" && value === "prior_year") return t("Prior year");
+    return `${name.replaceAll("_", " ")}: ${JSON.stringify(value)}`;
+  });
+  const messages: Record<ShareOffer["status"] | ConfirmOfferOutcome, string> = {
+    offered: "Report request not sent. Confirm it to ask an owner for a PDF.",
+    submitting: "The result is unknown. Check this same request without sending a duplicate.",
+    sent: "Waiting for an owner. You'll hear back here.",
+    already_requested: "A request for this report is already pending.",
+    expired: "This offer has expired. Ask for the report again.",
+    failed: "This request could not be sent. Ask for the report again.",
+    missing: "This offer is no longer available. Ask for the report again.",
+    inactive: "This offer is no longer active or the report has changed. Ask for the report again.",
+    unavailable: "The request could not be confirmed or owners are unavailable. Ask for the report again.",
+    access: "You can't confirm this request.",
+    unknown: "The result is unknown. Check this same request without sending a duplicate.",
+  };
+  const statusText = busy ? "Sending" : check ? "Delivery unconfirmed" : state === "sent" ? "Pending"
+    : state === "already_requested" ? "Already pending" : state === "offered" ? "Not sent"
+    : state === "expired" ? "Expired" : "Unavailable";
+  return (
+    <TurnCard kind="share" className="card chatcard sharecard" bodyClassName="chatcard-body" density={density}
+      data-kind="share_request" data-share-state={busy ? "submitting" : state}
+      label={t("Share request card")} kindLabel={t("Share request")}
+      subject={<span className="viewcard-title" title={offer.title}>{offer.title}</span>}
+      status={{ text: t(statusText), tone: state === "sent" || state === "already_requested" ? "ok" : "warn" }}
+      footer={writeBlock === null ? <button type="button" className="btn btn-primary" data-share-confirm
+        aria-busy={busy || undefined} disabled={busy || !actionable} onClick={() => void confirm()}>
+        {t(busy ? "Sending request…" : check ? "Check request" : "Confirm request")}
+      </button> : null}>
+      <p className="text-label text-ink-300 viewcard-place" title={`${offer.appLabel} · ${offer.viewLabel}`}>{offer.appLabel} · {offer.viewLabel}</p>
+      {options === "" ? null : <p className="text-label text-ink-300 viewcard-params break-words" data-share-options>{options}</p>}
+      {offer.reason === undefined ? null : <p className="text-label text-ink-300 break-words" data-share-reason>“{offer.reason}”</p>}
+      <p className="text-label text-ink-200 break-words" data-share-outcome role="status">{t(busy ? "Sending request…" : messages[state])}</p>
+      {writeBlock === null ? null : <p className="text-label text-warn break-words">{writeBlock}</p>}
+    </TurnCard>
+  );
+}
+
 export function ShareRequestCard({ entry, density = "full" }: { entry: ThreadEntry; density?: CardDensity }) {
+  const offer = parseShareOfferEntry(entry);
+  return offer ? <ShareOfferCard key={offer.id} offer={offer} density={density} /> : <RegularShareRequestCard entry={entry} density={density} />;
+}
+
+function RegularShareRequestCard({ entry, density = "full" }: { entry: ThreadEntry; density?: CardDensity }) {
   const t = useTranslate();
   const locale = useLocaleTag();
   const writeBlock = useContext(WriteGate);

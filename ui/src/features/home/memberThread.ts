@@ -143,7 +143,7 @@ export interface MemberThreadState extends ThreadState {
   history?: MemberHistoryObservation;
   /** Opaque server positions; numeric render ordering below never leaves the browser. */
   memberPosition?: { forward: string | null; before: string | null };
-  /** AOS-711: a card was rewritten in place; the next read replaces the held rows with the newest page, not only what is after the cursor. */
+  /** A share card was rewritten in place; reload the held window, not only rows after the cursor. */
   tailReload?: true;
 }
 
@@ -237,10 +237,22 @@ async function memberLoadThread(current: MemberThreadState | null): Promise<Memb
     const page = memberPage(await api.memberAssistHistory({ tail: true, limit: MEMBER_PAGE_LIMIT }));
     state = foldMemberPage(state, page, "tail");
   } else if (state.tailReload) {
-    // Start over from the newest page. A decided share request adds a file row after its card, which
-    // renumbers every later row's `csrid_`, so rows already held cannot be matched by id.
+    // A shared file can renumber later `csrid_`s. Rebuild the window rather
+    // than merging old rows with shifted IDs. Read back to the oldest held
+    // position so an offer confirmed on an earlier page stays in the chat.
+    const oldest = (state.entries[0] as MemberEntry | undefined)?.memberId;
     const page = memberPage(await api.memberAssistHistory({ tail: true, limit: MEMBER_PAGE_LIMIT }));
     state = foldMemberPage({ ...EMPTY_THREAD, pending: state.pending, replySeq: state.replySeq, conversation: state.conversation }, page, "tail");
+    let foundOldest = page.entries.some((row) => row.id === oldest);
+    while (oldest && !foundOldest && state.moreBefore) {
+      const earlier = await fetchMemberEarlier(state);
+      if (!earlier || earlier.page.entries.length === 0) break;
+      state = applyMemberEarlier(state, earlier);
+      if (state.memberPosition?.before === earlier.before) {
+        throw new ApiError("member history did not advance its earlier cursor", 0);
+      }
+      foundOldest = earlier.page.entries.some((row) => row.id === oldest);
+    }
   } else {
     for (let i = 0; i < 2; i++) {
       const after = state.memberPosition?.forward ?? null;

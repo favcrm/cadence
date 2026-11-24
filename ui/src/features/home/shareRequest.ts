@@ -109,6 +109,60 @@ export function parseShareRequestEntry(entry: { role: string; kind: string; payl
   return entry.kind === "share_request" && entry.role === "agent" ? parseShareRequestPayload(entry.payload) : null;
 }
 
+export interface ShareOffer {
+  id: string;
+  status: "offered" | "expired" | "submitting" | "failed" | "already_requested";
+  conversation: string;
+  appLabel: string;
+  viewLabel: string;
+  title: string;
+  params?: RouteParams;
+  reason?: string;
+  expiresAt: string;
+}
+
+/** Transitional offer; invalid or future versions retain the entry's safe text fallback. */
+export function parseShareOfferEntry(entry: { role: string; kind: string; payload?: Record<string, unknown> | null }): ShareOffer | null {
+  const p = entry.payload;
+  if (entry.role !== "agent" || entry.kind !== "share_request" || !isObject(p) || p.v !== 1 ||
+      !only(p, ["v", "id", "status", "conversation", "app", "app_label", "view", "view_label", "title", "expires_at"], ["params", "reason"])) return null;
+  const { id, status, conversation, app, app_label, view, view_label, title, params, reason, expires_at } = p;
+  if (typeof id !== "string" || !/^sro_[0-9a-f]{32}$/.test(id) ||
+      typeof conversation !== "string" || !/^tc_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(conversation) ||
+      typeof status !== "string" || !["offered", "expired", "submitting", "failed", "already_requested"].includes(status) ||
+      typeof app !== "string" || !APP.test(app) || typeof view !== "string" || !VIEW.test(view) ||
+      !plain(app_label, 60) || !plain(view_label, 60) || !plain(title, 120) || !iso(expires_at) ||
+      ("reason" in p && !plain(reason, 500)) ||
+      ("params" in p && !routeParams(params))) return null;
+  return { id, status: status as ShareOffer["status"], conversation, appLabel: app_label, viewLabel: view_label, title,
+    expiresAt: expires_at, ...(params === undefined ? {} : { params: params as RouteParams }),
+    ...(reason === undefined ? {} : { reason: reason as string }) };
+}
+
+export type ConfirmOfferOutcome = "sent" | "already_requested" | "missing" | "inactive" | "expired" | "unavailable" | "access" | "unknown";
+
+/** Explicit check and confirm both address the same durable operation. */
+export async function confirmShareOffer(offer: ShareOffer): Promise<ConfirmOfferOutcome> {
+  try {
+    const { status, reply } = await withPrivateOperation(async (operation) => {
+      const response = await operation.fetch(`/api/share-requests/offers/${offer.id}/confirm?conversation=${encodeURIComponent(offer.conversation)}`, {
+        method: "POST", credentials: "same-origin", headers: { accept: "application/json" },
+      });
+      return { status: response.status, reply: await response.json().catch(() => null) as unknown };
+    });
+    if (status === 401 || status === 403) return "access";
+    if (status === 404) return "missing";
+    if (status === 409) return "inactive";
+    if (status === 410) return "expired";
+    if (status === 503 && isObject(reply) && isObject(reply.error) && reply.error.code === "owners_unavailable") return "unavailable";
+    if (status >= 200 && status < 300 && isObject(reply) && reply.ok === true &&
+        (reply.outcome === "sent" || reply.outcome === "already_requested")) return reply.outcome;
+  } catch {
+    // The server may have accepted the request before the connection failed.
+  }
+  return "unknown";
+}
+
 /** `name=value&...` (percent-encoded) as a view's params; none is `undefined`, a set the app would refuse is null. */
 export function paramsOfQuery(query: string): RouteParams | undefined | null {
   const q = new URLSearchParams(query);

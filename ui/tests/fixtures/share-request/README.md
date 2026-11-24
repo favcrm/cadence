@@ -8,11 +8,13 @@ Schemas: `packages/contracts/src/share-request.ts`. Names, numbers and ids are m
 
 ## What a share request is
 
-A member's Nova offers "ask an owner" after `canvas_open` refused `owner_only`;
-if the member agrees it calls the `share_request` tool `{app, view, params?, reason?}`.
-The request is the app, the view and its params, exactly, and the reason. No
-access changes. If an owner shares it, the host renders that view as the owner
-into a read-only PDF, stores it as a private file of the member (nobody else in
+A member's Nova offers to ask an owner after `canvas_open` refuses `owner_only`.
+The `share_request` tool prepares the exact report settings and reason but sends
+nothing. The member presses **Confirm request** on the card. Chat cannot send
+or invalidate an offer. If delivery is uncertain, **Check request** uses the
+same offer rather than creating another request. No access changes. If an
+owner shares it, the host renders that view as the owner into a read-only PDF,
+stores it as a private file of the member (nobody else in
 the workspace can open it), and the member's thread shows it as an ordinary
 `artifact` card. The viewer and download are the existing file viewer.
 
@@ -31,6 +33,8 @@ then sees their existing card.
    thread has the `artifact` entry right after the card
    (`artifact-card-after-shared.json`): draw "Shared by `decided_by`" on the
    card and open the file in the canvas from the artifact card.
+   `card-offered.json` has an `sro_` offer ID, an originating `conversation`,
+   and `expires_at`. On delivery the same entry becomes the pending request.
 2. **Owner To do item**, a staged action in EVERY owner's Home queue,
    `GET /api/assist/actions` on the owner's Home conversation (`owner-item-*.json`;
    `tool: "share_request"`, `input` is `shareRequestActionInputSchema`).
@@ -42,6 +46,7 @@ then sees their existing card.
    `/api/assist/actions/:id/approve` leaves the row pending (`retry`), and
    `/deny` answers 404, because neither can see the shared request.
 3. **Decisions**, board session, same origin:
+   - `POST /api/share-requests/offers/:id/confirm?conversation=<tc_id>` is a same-origin, authenticated member write with no body. Only the originating member and conversation can confirm. Returns `{ok:true,outcome:"sent"|"already_requested"}`.
    - `GET  /api/share-requests/:id` the request (`{ok, request: <card payload>}`), for its member or any owner.
    - `POST /api/share-requests/:id/share` owner only, no body. Renders and stores the PDF as the owner at this moment, then answers `decision-shared.json`. A render failure answers `503 snapshot_unavailable` and the request stays pending for everyone. The snapshot is frozen at this moment and never updates.
    - `POST /api/share-requests/:id/decline` owner only, body `decline-body.json` (`note` optional, at most 500 chars, blank is none). Answers `decision-declined.json`.

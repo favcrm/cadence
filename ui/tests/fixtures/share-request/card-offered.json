@@ -1,0 +1,24 @@
+{
+  "role": "agent",
+  "kind": "share_request",
+  "text": "Report request not sent. Confirm it on the board to ask an owner for a PDF.",
+  "payload": {
+    "v": 1,
+    "id": "sro_0123456789abcdef0123456789abcdef",
+    "status": "offered",
+    "conversation": "tc_12345678-1234-4123-8123-123456789abc",
+    "app": "accounting",
+    "app_label": "Accounting",
+    "view": "pnl",
+    "view_label": "Profit and loss",
+    "title": "Profit and loss",
+    "params": {
+      "from": "2026-07-01",
+      "to": "2026-09-30",
+      "columns": "monthly",
+      "compare": "prior_year"
+    },
+    "reason": "November planning meeting",
+    "expires_at": "2099-11-25T00:00:00.000Z"
+  }
+}
