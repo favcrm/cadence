@@ -106,6 +106,10 @@ progress feed without resending the message.
 If the last working update did not identify the send, Home asks the same feed
 for its current state before showing activity for another message.
 
+The Atlas conversation header in Home shows a shortened **Conversation ID**
+when the current chat has an ID. **Copy ID** copies the full value. Share it
+with the workspace URL for support; the ID does not grant access to the chat.
+
 In hosted Home, type `/skills` and press Enter to browse approved workspace
 skills without sending a message. Selecting a skill inserts `/skill:<name>`
 in the draft. Send it with your request, or type the command directly. The
