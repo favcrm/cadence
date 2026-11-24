@@ -5,12 +5,12 @@ const failed = new Set(["canvas_open"]);
 
 it("replaces standalone give-ups about the exact failed tool", () => {
   const text = "canvas_open does not work right now. Avoid calling `canvas_open` until it is fixed. my_canvas_open is broken right now.";
-  expect(rewriteGiveUps(text, failed, new Set())).toBe("An earlier canvas_open call failed; try it again normally. An earlier canvas_open call failed; try it again normally. my_canvas_open is broken right now.");
+  expect(rewriteGiveUps(text, failed, new Map())).toBe("An earlier canvas_open call failed; try it again normally. An earlier canvas_open call failed; try it again normally. my_canvas_open is broken right now.");
 });
 
 it("preserves a user restriction without exempting related publication policy", () => {
   const text = "Avoid calling canvas_open until it is fixed.";
-  const restricted = new Set<string>();
+  const restricted = new Map<string, Set<string>>();
   collectUserToolRestrictions("Do not publish the page before checking it with canvas_open.", restricted);
   expect(rewriteGiveUps(text, failed, restricted)).toBe("An earlier canvas_open call failed; try it again normally.");
   collectUserToolRestrictions("Never call canvas_open on the production board.", restricted);
@@ -20,8 +20,22 @@ it("preserves a user restriction without exempting related publication policy", 
   collectUserToolRestrictions("Don't call\ncanvas_open until fixed.", restricted);
   expect(rewriteGiveUps(text, failed, restricted)).toBe(text);
   expect(rewriteGiveUps("canvas_open does not work right now.", failed, restricted)).toBe(
-    "An earlier canvas_open call failed; try it again normally.",
+    "An earlier canvas_open call failed.",
   );
+});
+
+it("keeps a paraphrased no-retry instruction and summarizes status without recommending retry", () => {
+  const restricted = new Map<string, Set<string>>();
+  collectUserToolRestrictions("Do not call canvas_open again.", restricted);
+  expect(rewriteGiveUps("Do not retry canvas_open. canvas_open does not work right now.", failed, restricted))
+    .toBe("Do not retry canvas_open. An earlier canvas_open call failed.");
+});
+
+it("keeps a user restriction before a separate instruction", () => {
+  const restricted = new Map<string, Set<string>>();
+  collectUserToolRestrictions("Don't call canvas_open until it is fixed; use the backup dashboard instead.", restricted);
+  const restatement = "Don't call canvas_open until it is fixed.";
+  expect(rewriteGiveUps(restatement, failed, restricted)).toBe(restatement);
 });
 
 it("keeps corrections, facts, and scoped limits after a failed call", () => {
@@ -37,12 +51,12 @@ it("keeps corrections, facts, and scoped limits after a failed call", () => {
     "Don't call canvas_open\non the production board.",
     "canvas_open failed once. The headline uses no emoji.",
   ].join("\n");
-  expect(rewriteGiveUps(text, failed, new Set())).toBe(text);
+  expect(rewriteGiveUps(text, failed, new Map())).toBe(text);
 });
 
 it("scans a long assistant message with many near-matches in bounded time", () => {
   const text = "canvas_open is broken until fixed ".repeat(20_000);
   const started = performance.now();
-  expect(rewriteGiveUps(text, failed, new Set())).toBe(text);
+  expect(rewriteGiveUps(text, failed, new Map())).toBe(text);
   expect(performance.now() - started).toBeLessThan(500);
 });

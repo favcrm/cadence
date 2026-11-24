@@ -39,7 +39,7 @@ export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({
     }
   }
 
-  const userRules = new Set<string>();
+  const userRules = new Map<string, Set<string>>();
   for (const message of messages) {
     if (message.role === "user" && !priorSummaries.has(message)) {
       const text = typeof message.content === "string" ? message.content : visibleText(message.content);
