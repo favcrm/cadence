@@ -54,6 +54,7 @@ pub mod web_push;
 // platform double, not a live adapter. Hidden from the public API docs.
 #[doc(hidden)]
 pub mod contract_fixture;
+#[path = "daemon_shared.rs"]
 pub mod daemon;
 pub mod delegation;
 pub mod delivery;
