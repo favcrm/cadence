@@ -248,6 +248,7 @@ var RECORD_CALL_VERBS = [
 	"routines.list",
 	"connections.assets",
 	"connections.connect",
+	"connections.ads.campaigns",
 	"catalog.call",
 	"catalog.status"
 ];

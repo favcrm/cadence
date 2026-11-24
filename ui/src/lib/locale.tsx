@@ -265,6 +265,7 @@ Object.assign(zhTW, {
   "Read workspace routines": "讀取工作區的例行工作",
   "Read connected account lists": "讀取已連結的帳號清單",
   "Start connecting a workspace account": "啟動連結工作區帳號",
+  "Import existing ad campaigns and 7-day reporting from connected ad accounts": "從已連結的廣告帳號匯入現有廣告活動與近 7 天成效報表",
   "Run a granted platform tool with app data": "使用應用程式資料執行已授權的平台工具",
   "Send a test email through the configured account": "透過已設定的帳戶傳送測試電郵",
   "Loads images from": "從以下來源載入圖片",
