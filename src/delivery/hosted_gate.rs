@@ -3486,6 +3486,18 @@ mod tests {
             verdicts_with(&mut mock_board(true, false, &mut reads), &binding(), true).unwrap();
         assert_eq!(reads.len(), 2, "{reads:?}");
         assert_eq!(doc["verdicts"].as_array().unwrap().len(), 2);
+        // Knows bodies, not agent reviews (a board from before AOS-727):
+        // 2 reads, the second keeps include_body, and the text survives.
+        let mut reads = Vec::new();
+        let (doc, _) =
+            verdicts_with(&mut mock_board(false, true, &mut reads), &binding(), true).unwrap();
+        assert_eq!(reads.len(), 2, "{reads:?}");
+        assert!(
+            !reads[1].contains_key("include_agent_reviews")
+                && reads[1].contains_key("include_body")
+        );
+        assert_eq!(doc["verdicts"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["bodies"], "included");
         // Knows both: one read with text.
         let mut reads = Vec::new();
         let (doc, _) =
