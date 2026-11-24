@@ -5,6 +5,12 @@ name: CI cache warming
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact main commit approved for the test dependency seed
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -20,13 +26,10 @@ jobs:
   # no pull_request and no merge_group job sees the key: a queued PR's build
   # scripts and tests run in the gates, which only ever read the cache.
   # Nothing `needs` it and it never fails the run.
-  # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
-  # per profile, each with its own target dir and the shared key the gates
-  # restore (gate-test-ld2: test; gate-release: build + ui;
-  # gc2: clippy). The rust-cache step precedes `ci-sccache enable`
-  # exactly as in the gates, because the cache key hashes RUST* env vars and
-  # enable exports RUSTC_WRAPPER. An exact hit already has the dependency
-  # artifacts; on a miss the builds populate them even without sccache.
+  # CAD-926: this job saves the release, release-full and clippy GitHub
+  # dependency caches on main pushes. The rust-cache step precedes
+  # `ci-sccache enable` in both this job and the gates because it hashes
+  # RUST* env vars, including RUSTC_WRAPPER if already set.
   cache-warm:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: instabox-medium
@@ -98,6 +101,43 @@ jobs:
       - name: sccache statistics
         if: ${{ !cancelled() }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
+
+  # CAD-2749: explicitly seed the test dependency cache once, not per merge.
+  # Match changed-tests' runner, toolchain and key before setting linker flags.
+  test-seed-pilot:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    concurrency: gate-test-ld2-seed-pilot
+    runs-on: instabox-medium
+    timeout-minutes: 25
+    steps:
+      - name: Require the requested main commit
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          if [ "$EXPECTED_SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::The dispatch does not point to the requested main commit."
+            exit 1
+          fi
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: scripts/ci-rust-toolchain --profile minimal
+      - id: test-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-test-ld2
+          save-if: true
+          cache-workspace-crates: false
+          cache-on-failure: false
+      - name: Enable the changed-tests linker
+        if: steps.test-cache.outputs.cache-hit != 'true'
+        run: sh scripts/ci-fast-linker enable
+      - name: Build the changed-tests graph without running tests
+        if: steps.test-cache.outputs.cache-hit != 'true'
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo test --locked --features test-seam --lib --test suite --no-run
 
   # CAD-1551: warm both cross-build dependency profiles on merged code only.
   # The test profile optimizes dependencies differently from dev, so test
