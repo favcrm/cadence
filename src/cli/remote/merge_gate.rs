@@ -183,6 +183,9 @@ pub(super) fn merge_gate(
                 profile,
             )
             .map_err(|error| {
+                if source.is_none() {
+                    return error;
+                }
                 scope_hint(
                     error,
                     &saved_capabilities(target),

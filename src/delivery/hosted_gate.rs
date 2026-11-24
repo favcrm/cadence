@@ -750,9 +750,18 @@ pub fn review_producer(
         "profile-assisted"
     };
     let verb = if let Some(source) = source {
-        if source.trim().is_empty()
+        let trimmed = source.trim();
+        if trimmed.is_empty()
+            || source.len() > 200
             || source.chars().any(char::is_control)
-            || human_only != profiles.is_empty()
+            || trimmed.eq_ignore_ascii_case("user")
+            || trimmed.eq_ignore_ascii_case("daemon")
+        {
+            return Err(refuse(
+                "--source must give the owner's producer evidence (1–200 UTF-8 bytes)",
+            ));
+        }
+        if human_only != profiles.is_empty()
             || profiles.len() > 16
             || profiles.windows(2).any(|pair| pair[0] == pair[1])
             || profiles.iter().any(|profile| {
