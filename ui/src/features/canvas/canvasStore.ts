@@ -603,7 +603,9 @@ export function defaultWidth(kind: TabKind, viewport: number): number {
 }
 
 function defaultRange(kind: TabKind): [number, number, number] {
-  return kind === "app" || kind === "html" || kind === "csv" || kind === "pdf" || kind === "workbook" ? [0.55, 560, 960] : [0.45, 480, 760];
+  // The sheet scrolls horizontally, so its default can leave room for chat at 1024px.
+  if (kind === "workbook") return [0.45, MIN_WIDTH, 960];
+  return kind === "app" || kind === "html" || kind === "csv" || kind === "pdf" ? [0.55, 560, 960] : [0.45, 480, 760];
 }
 
 /** The default width, held to its kind's floor even where 60% of the
