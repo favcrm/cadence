@@ -4,6 +4,7 @@ import { meteredBinding } from "../src/model.ts";
 import {
   redactToolErrors, TOOL_ERROR_CODE_OMITTED, TOOL_ERROR_REDACTED, TOOL_ERROR_TEXT_OMITTED,
 } from "../src/summary-tool-errors.ts";
+import { TRANSIENT_FAILURE_NOTE } from "../src/summary-tool-failures.ts";
 
 const PROMPT = "The messages above are a conversation to summarize.\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 const source = (...parts: string[]) => `<conversation>\n${parts.join("\n\n")}\n</conversation>\n\n${PROMPT}`;
@@ -170,7 +171,8 @@ describe("CAD-2744: the attested summary request", () => {
     expect(parts.length).toBeGreaterThan(1);
     expect(parts.every((part) => part.content.length <= 64_000)).toBe(true);
     const joined = parts.map((part) => part.content).join("");
-    expect(joined).toBe(redactToolErrors(text));
+    expect(joined).toContain(`[Tool result]: ${harness(`[error] ${TOOL_ERROR_REDACTED}`)}`);
+    expect(joined).toContain(`${filler}\n\n[Assistant]: Saw ${TOOL_ERROR_TEXT_OMITTED}.\n\n${TRANSIENT_FAILURE_NOTE}\n</conversation>`);
     expect(joined).not.toContain("no such wiki page");
   });
 

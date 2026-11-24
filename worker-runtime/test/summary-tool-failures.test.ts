@@ -78,9 +78,25 @@ describe("CAD-2745: failed tool calls stay transient in the summary source", () 
     expect(out).toContain(`[Assistant]: ${AGAIN("canvas_open")} Don't run helper on prod, helper is broken.`);
   });
 
-  it("does not attribute a group whose results do not match its calls", () => {
-    const text = source(call("screenshot", "canvas_open"), failed, "[Assistant]: canvas_open does not work. Avoid screenshot until fixed.");
-    expect(settleToolFailures(text)).toBe(text);
+  it("adds the retry note without blaming either tool when a result is missing", () => {
+    const keep = "[Assistant]: canvas_open does not work. Avoid calling screenshot until it is fixed.";
+    const text = source(call("screenshot", "canvas_open"), failed, keep);
+    expect(settleToolFailures(text)).toBe(text.replace("\n</conversation>", `\n\n${TRANSIENT_FAILURE_NOTE}\n</conversation>`));
+  });
+
+  it("keeps corrections, operational facts, and scoped instructions after a failure", () => {
+    const keep = [
+      "Stop using the old slug q9 and pass slug q10 to canvas_open.",
+      "Don't run the migration yet; canvas_open will show the draft board 7 once you approve.",
+      "Don't open the archived board 12 with canvas_open, it would unarchive it.",
+      "Never try to call canvas_open with a board id from another workspace, ids are scoped.",
+      "canvas_open refuses archived boards by design, so I picked board 8.",
+      "I'll keep the draft in board 7 until the import is working; canvas_open can show it.",
+      "canvas_open is unavailable for archived boards.",
+      "canvas_open does not work right now; the draft is saved in board 7.",
+    ].join("\n");
+    const out = settleToolFailures(source(call("canvas_open"), failed, `[Assistant]: ${keep}`));
+    expect(out).toContain(`[Assistant]: ${keep}\n\n${TRANSIENT_FAILURE_NOTE}`);
   });
 
   it("counts only CAD-2744's failure line, not an [error] log line beside a warning", () => {

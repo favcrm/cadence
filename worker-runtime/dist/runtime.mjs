@@ -50799,16 +50799,21 @@ var FAILED_LINE = `
 [error] ${TOOL_ERROR_REDACTED}
 `;
 var IDENTIFIER = /^[A-Za-z_][\w.-]*$/;
-var SENTENCE = /[^.!?\n]+[.!?]?/g;
-var WORD = /[A-Za-z_][\w-]*/g;
-var AVOID_USE = /\b(?:avoid|stop|skip|never|don'?t|do not)\b(?:\W{1,10}\w{1,30}){0,2}?\W{1,10}(?:call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|try(?:ing)?|open(?:ing)?|re-?call(?:ing)?)\b/i;
-var BROKEN = /\b(?:does ?n[o']t|doesn'?t|can'?t|cannot|won'?t|isn'?t|is not)\s{1,3}(?:work|working|open)\b|\b(?:broken|not working|keeps? (?:failing|refusing)|refus(?:es|ing))\b|\buntil\b[^.!?\n]{0,30}\b(?:fixed|resolved|works|working)\b/i;
-var UNAVAILABLE = /\b(?:unavailable|not available)\b/i;
-var TIME_CUE = /\b(?:right now|currently|at the moment|for now|any ?more|still|today)\b/i;
+var SENTENCE = /(?:[^.!?\n]|[.!?](?!\s|$))+[.!?]?/g;
+var WORD = /[A-Za-z_](?:[\w-]|\.(?=[\w.-]))*/g;
+var TOOL = String.raw`[\x60]?([A-Za-z_][\w.-]*)[\x60]?`;
+var ACTION = "call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|open(?:ing)?|re-?call(?:ing)?";
+var AVOID = new RegExp(String.raw`^(?:(?:(?:I|we) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not) (?:keep |try to )?(?:${ACTION})|avoid) ${TOOL}(?: again| for now| until (?:it )?(?:is fixed|is resolved|works|fixed|resolved))?$`, "i");
+var TIME2 = "right now|currently|at the moment|for now|any ?more|still|today";
+var OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED].map((marker) => marker.replace(/[()]/g, "\\$&")).join("|");
+var BROKEN = new RegExp(String.raw`^${TOOL} (?:(?:does not work|doesn't work|won't work|is broken|is not working|isn't working|keeps failing|keeps refusing)(?: (?:${TIME2}|though)| with (?:${OMITTED_ERROR})(?:: (?:${OMITTED_ERROR}))?|, avoid it)?|(?:is unavailable|is not available|isn't available) (?:${TIME2}))$`, "i");
 var USER_RULE = /\b(?:avoid|stop|skip|never|don'?t|do not|must not|should not)\b/i;
 var isFailed = (result) => result.includes(`<harness>
 `) && result.includes(FAILED_LINE);
-var isStandingClaim = (sentence) => AVOID_USE.test(sentence) || BROKEN.test(sentence) || UNAVAILABLE.test(sentence) && TIME_CUE.test(sentence);
+function claimTool(sentence) {
+  const claim = sentence.trim().replace(/[.!]$/, "");
+  return AVOID.exec(claim)?.[1] ?? BROKEN.exec(claim)?.[1];
+}
 function callNames(list) {
   const names = [];
   let start = 0;
@@ -50851,8 +50856,8 @@ function userRuleWords(text, parts) {
 }
 function rewrite(body, failed, userRules) {
   return body.replace(SENTENCE, (sentence) => {
-    const tool = (sentence.match(WORD) ?? []).find((word) => failed.has(word));
-    if (tool === undefined || userRules.has(tool) || !isStandingClaim(sentence))
+    const tool = claimTool(sentence);
+    if (tool === undefined || !failed.has(tool) || userRules.has(tool))
       return sentence;
     const leading = sentence.slice(0, sentence.length - sentence.trimStart().length);
     return `${leading}An earlier ${tool} call failed; try it again normally.`;
@@ -50869,20 +50874,24 @@ function settleToolFailures(text) {
   let anyFailed = false;
   let group = null;
   const settle = () => {
-    if (group && group.results.length === group.names.length)
-      group.names.forEach((name, index) => {
-        if (group.results[index]) {
+    if (group && group.results.length === group.names.length) {
+      const { names, results } = group;
+      names.forEach((name, index) => {
+        if (results[index])
           failed.add(name);
-          anyFailed = true;
-        } else
+        else
           failed.delete(name);
       });
+    }
     group = null;
   };
   const bodies = parts.map((part) => {
     const body = text.slice(part.start, part.end);
     if (part.role === "Tool result") {
-      group?.results.push(isFailed(body));
+      const failure = isFailed(body);
+      if (failure)
+        anyFailed = true;
+      group?.results.push(failure);
       return body;
     }
     settle();
