@@ -361,6 +361,16 @@ impl GatedIssue {
     pub fn front(&self) -> &Front {
         &self.front
     }
+
+    #[doc(hidden)]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    #[doc(hidden)]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
 }
 
 /// One issue read: the project and folder that hold it, its frontmatter, its

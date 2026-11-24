@@ -300,10 +300,11 @@ impl DispatchPlan {
     }
 }
 
-pub(crate) struct PreparedJobKickoff {
-    pub(crate) body: String,
-    pub(crate) selection: super::messages::IssueSelection,
-    pub(crate) intake_acceptance: Option<String>,
+#[doc(hidden)]
+pub struct PreparedJobKickoff {
+    pub body: String,
+    pub selection: super::messages::IssueSelection,
+    pub intake_acceptance: Option<String>,
 }
 
 pub(super) struct DispatchPreparation<'a> {

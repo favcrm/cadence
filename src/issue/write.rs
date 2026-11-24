@@ -44,7 +44,9 @@ pub(crate) use edit::{
 };
 pub(crate) use new::next_id;
 pub use new::{master_issue_new_limits, new_issue};
-pub(crate) use plan::{check_structure, create_granted_plan, GrantedPreview};
+pub(crate) use plan::check_structure;
+#[doc(hidden)]
+pub use plan::{create_granted_plan, GrantedPreview};
 pub use plan::granted_semantics;
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;

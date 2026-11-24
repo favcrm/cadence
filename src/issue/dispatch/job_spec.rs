@@ -162,7 +162,8 @@ fn spec_candidate(
 
 /// Resolve a relative job locator to the same canonical file used by the
 /// scoped kickoff reader. Absolute legacy locators remain untouched.
-pub(crate) fn intake_spec_pin(
+#[doc(hidden)]
+pub fn intake_spec_pin(
     project: &crate::issue::project::Project,
     task: &store::Task,
     job: &store::Job,
@@ -177,7 +178,8 @@ pub(crate) fn intake_spec_pin(
 
 /// Re-read a canonical relative-job pin without following replaced symlinks
 /// or reading more than the context reader's bound.
-pub(crate) fn intake_spec_matches(path: &Path, expected: &str) -> bool {
+#[doc(hidden)]
+pub fn intake_spec_matches(path: &Path, expected: &str) -> bool {
     let Ok(relative) = path.strip_prefix("/") else {
         return false;
     };
@@ -281,7 +283,8 @@ fn read_job_spec(
 /// without granting the locator authority to read outside the approved scope.
 /// Canonical issue specs use the approved issue snapshot, not their old raw
 /// digest; independent specs must still match the job's immutable byte pin.
-pub(crate) fn capture_intake_cloud_spec(
+#[doc(hidden)]
+pub fn capture_intake_cloud_spec(
     gated: &GatedIssue,
     task: &store::Task,
     job: &store::Job,

@@ -409,7 +409,8 @@ pub fn granted_semantics(front: &Front, body: &str) -> String {
 /// The reserved ids and canonical semantics of a grant admission,
 /// computed under the PM lock before any tracker file exists — the
 /// daemon records them as the durable intent inside the same lock.
-pub(crate) struct GrantedPreview {
+#[doc(hidden)]
+pub struct GrantedPreview {
     pub epic: String,
     pub tickets: Vec<String>,
     /// Canonical semantics per issue id — [`granted_semantics`].
@@ -437,7 +438,8 @@ pub(crate) struct GrantedPreview {
 /// second plan is never allocated; anything else → `unattended_diverged`,
 /// the caller marks the intent held.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn create_granted_plan(
+#[doc(hidden)]
+pub fn create_granted_plan(
     pm: &Pm,
     project_key: &str,
     doc: &crate::issue::plan::PlanDoc,

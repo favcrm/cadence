@@ -251,20 +251,18 @@ impl Store {
             if !fixture {
                 let scope =
                     context.map_or_else(|| "installation".to_owned(), |id| format!("context:{id}"));
-                let config: Option<String> = tx
-                    .query_row(
-                        "SELECT config FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=?
+                let config: Option<String> = tx.query_opt(
+                    "SELECT config FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=?
                      AND digest=? AND state='configured' AND json_extract(config,'$.bundle_digest')=?",
-                        params![
-                            claim.install,
-                            scope,
-                            claim.slot,
-                            claim.binding_digest,
-                            workspace.digest()
-                        ],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
+                    params![
+                        claim.install,
+                        scope,
+                        claim.slot,
+                        claim.binding_digest,
+                        workspace.digest()
+                    ],
+                    |r| r.get(0),
+                )?;
                 let current = config
                     .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                     .is_some_and(|config| {

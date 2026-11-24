@@ -165,7 +165,8 @@ pub(super) fn cloud_kickoff_body(
 }
 
 /// Render an already captured spec instead of reopening its locator.
-pub(crate) fn captured_cloud_kickoff(
+#[doc(hidden)]
+pub fn captured_cloud_kickoff(
     job: &Job,
     task: &Task,
     revision: i64,

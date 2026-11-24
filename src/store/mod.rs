@@ -39,7 +39,8 @@ pub use platform::{
 };
 mod effects;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use effects::effect_bind_in;
+#[doc(hidden)]
+pub use effects::effect_bind_in;
 pub use effects::{
     presser_json, DraftRow, EffectKey, EffectRow, EFFECT_CANCELLED_EVENT, EFFECT_DECIDED_EVENT,
     EFFECT_EXECUTED_EVENT, EFFECT_FAILED_EVENT, EFFECT_NEEDS_YOU_EVENT, EFFECT_REQUESTED_EVENT,
@@ -96,7 +97,9 @@ pub use topics::{
 };
 mod inbox;
 mod kickoff;
-pub(crate) use kickoff::{captured_cloud_kickoff, last_sha_line};
+#[doc(hidden)]
+pub use kickoff::captured_cloud_kickoff;
+pub(crate) use kickoff::last_sha_line;
 pub mod routines;
 pub mod workspace_settings;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
@@ -107,7 +110,8 @@ pub use messages::{
     report_timeout_secs, IssueSelection, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
     DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES, NUDGE_SOURCE,
 };
-pub(crate) use messages::{ActorTake, NativeTurnClaim};
+#[doc(hidden)]
+pub use messages::{ActorTake, NativeTurnClaim};
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
 mod endpoint;

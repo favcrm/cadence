@@ -15,7 +15,8 @@ use super::{now, Sender, Store};
 
 /// Proof of this Store's exact durable take, not merely a message id.
 /// Only the actor's take can produce this value; ordinary reads cannot.
-pub(crate) struct NativeTurnClaim {
+#[doc(hidden)]
+pub struct NativeTurnClaim {
     store: Arc<super::seal::GuardState>,
     agent_uid: String,
     message_seq: i64,
@@ -34,7 +35,8 @@ impl NativeTurnClaim {
     }
 }
 
-pub(crate) type ActorTake = (Take, Option<NativeTurnClaim>);
+#[doc(hidden)]
+pub type ActorTake = (Take, Option<NativeTurnClaim>);
 
 // Deterministic cost evidence for recurring read paths. Thread-local so
 // unrelated parallel tests cannot add to a caller's measurement.
