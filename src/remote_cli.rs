@@ -356,24 +356,6 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
     }
 }
 
-/// AOS-727 / CAD-2740: whether this profile write names the role `reviewer`
-/// (an update setting `role`, or a hire from the `reviewer` catalogue role).
-/// Making a profile a reviewer lets its verdicts count, so the board wants the
-/// same `audit.approve` login as `audit identities set`; the board's own rule
-/// (trim, case-insensitive) is mirrored. Reactivating an archived reviewer
-/// names no role here, so it is not detected and the board refuses it by name.
-fn grants_reviewer(verb: &str, arguments: &Map<String, Value>) -> bool {
-    let field = match verb {
-        "agent_profile_update" => "role",
-        "agent_profile_create" => "catalogue",
-        _ => return false,
-    };
-    arguments
-        .get(field)
-        .and_then(Value::as_str)
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("reviewer"))
-}
-
 /// What one attempted hosted call can change, and — for a mutation — the read
 /// that reconciles an answer which does not prove its effect.
 ///
@@ -3984,7 +3966,6 @@ fn call_once(
                 .unwrap_or_default(),
         )],
         Surface::Cli if verb == REMOTE_MASTER_STATUS_VERB => &["settings.read"],
-        Surface::Cli if grants_reviewer(verb, arguments) => &["cli.write", "audit.approve"],
         Surface::Cli => cli_requested_scopes(verb),
         Surface::Wiki if verb == "write" => &["wiki.write"],
         Surface::Wiki => &["wiki.read"],
@@ -5389,16 +5370,6 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "not_permitted",
             "this login may not read that profile; nothing was read",
         )),
-        // AOS-727 / CAD-2740: making a profile an active reviewer lets its
-        // verdicts count, so it needs the owner's `audit.approve` login.
-        ("agent_profile_create" | "agent_profile_update", Some("reviewer_grant_required")) => {
-            Some((
-                "reviewer_grant_required",
-                "making a profile a reviewer needs a live owner login that holds \
-                 `audit.approve` (`cadence login --audit-approve`), the same authority as \
-                 `audit identities set`. Nothing was written",
-            ))
-        }
         // AOS-727: an agent reviewer's own verdict, refused before it is recorded.
         ("audit_verdict_project", Some("reviewer_profile_not_eligible")) => Some((
             "reviewer_profile_not_eligible",

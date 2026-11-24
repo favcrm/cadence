@@ -3815,72 +3815,10 @@ fn cad2740_board_without_agent_reviews_gets_a_typed_refusal_only_when_asked() {
     assert!(result.unwrap_err().to_string().contains("Release order"));
 }
 
-/// CAD-2740: a reviewer grant asks for `audit.approve`; any other profile
-/// write keeps `cli.write` alone, so a login without it is not newly refused.
-#[test]
-fn cad2740_only_a_reviewer_profile_write_requests_audit_approve() {
-    // The scopes the client asked the relay to mint, read from the request
-    // it sent (any answer will do: the refusal is not what is under test).
-    let scopes = |verb: &str, args: Value| {
-        let (_, requests) = run(
-            vec![(
-                403,
-                "",
-                json!({"ok": false, "error": {"code": "not_permitted"}}),
-            )],
-            verb,
-            args.as_object().unwrap().clone(),
-            10,
-        );
-        requests[0]["body"]["requested_scopes"].clone()
-    };
-    let both = json!(["cli.write", "audit.approve"]);
-    let write = json!(["cli.write"]);
-    for role in ["reviewer", " Reviewer ", "REVIEWER"] {
-        assert_eq!(
-            scopes(
-                "agent_profile_update",
-                json!({"id": "ap_1", "expectedRevision": 1, "role": role})
-            ),
-            both,
-            "{role:?}"
-        );
-    }
-    assert_eq!(
-        scopes(
-            "agent_profile_create",
-            json!({"alias": "rev", "catalogue": "reviewer"})
-        ),
-        both
-    );
-    for (verb, args) in [
-        (
-            "agent_profile_update",
-            json!({"id": "ap_1", "expectedRevision": 1, "role": "Planner"}),
-        ),
-        (
-            "agent_profile_update",
-            json!({"id": "ap_1", "expectedRevision": 1, "name": "reviewer"}),
-        ),
-        (
-            "agent_profile_update",
-            json!({"id": "ap_1", "expectedRevision": 1, "status": "archived"}),
-        ),
-        (
-            "agent_profile_create",
-            json!({"alias": "reviewer", "catalogue": "accountant"}),
-        ),
-    ] {
-        assert_eq!(scopes(verb, args.clone()), write, "{verb} {args}");
-    }
-}
-
-/// CAD-2740: the board's four agent-reviewer refusals print their names.
+/// CAD-2740: the board's agent-reviewer refusals print their names.
 #[test]
 fn cad2740_agent_reviewer_refusals_are_named() {
     for (verb, code) in [
-        ("agent_profile_update", "reviewer_grant_required"),
-        ("agent_profile_create", "reviewer_grant_required"),
         ("audit_verdict_project", "reviewer_profile_not_eligible"),
         ("audit_verdict_project", "reviewer_is_author"),
         ("audit_verdict_project", "agent_review_kind_not_allowed"),
