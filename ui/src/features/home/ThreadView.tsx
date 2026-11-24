@@ -12,6 +12,7 @@ import ArtifactCard from "../canvas/ArtifactCard";
 import ImageBlock from "../canvas/ImageBlock";
 import VideoBlock from "../canvas/VideoBlock";
 import { useImageConversation } from "../canvas/imageConversation";
+import { openWorkbook } from "../canvas/canvasStore";
 import { hostedOrigin } from "../auth/hosted";
 import AttachmentMedia, { openAttachmentInTab } from "./AttachmentMedia";
 import PdfPageAction, { PdfPageTarget } from "./PdfPageAction";
@@ -774,6 +775,14 @@ function AttachmentRows({ files, sent = false }: { files: EntryAttachment[]; sen
                 </button>
               );
             }
+          }
+          if (sent && hosted && conversation !== null && f.mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
+            return (
+              <button key={f.id} type="button" className="sentchip" data-kind="text"
+                title={`${title} — ${t("Preview workbook")}`} onClick={() => openWorkbook(conversation, f)}>
+                {body}
+              </button>
+            );
           }
           return (
             <span key={f.id} className="sentchip" data-kind={fileKind(f.mime)} title={title}>

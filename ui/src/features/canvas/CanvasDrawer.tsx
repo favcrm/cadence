@@ -20,6 +20,8 @@ import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
 import { makeAskRef } from "./askRefs";
 import AppViewBody from "./AppViewBody";
 import RecordViewBody from "./RecordViewBody";
+import WorkbookPreview from "./workbook/WorkbookPreview";
+import { attachmentHref } from "../home/AttachmentMedia";
 import BrowserPanel, { BrowserTabLabel } from "./BrowserPanel";
 import { canvasChrome, setCanvasFull, setChatPeek, useCanvasChrome } from "./canvasChrome";
 import { effective, MULTI_MIN_WIDTH } from "./canvasLayout";
@@ -27,6 +29,7 @@ import LayoutSwitcher from "./LayoutSwitcher";
 import PaneStage, { TAB_DRAG_TYPE } from "./PaneStage";
 import { closeBrowserDrawer, focusBrowser, hideBrowser, isBrowserPanelShown, tabVisible, useBrowserTab } from "./browserStore";
 import {
+  canvasSnapshot,
   clampWidth,
   closeDrawer,
   defaultWidthFor,
@@ -604,6 +607,10 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
   }, [open]);
   // Moving to another page puts the board back as it was.
   useEffect(() => setExpanded(false), [pathname]);
+  // Attachment bytes belong to the chat page, including while another page loads.
+  useLayoutEffect(() => {
+    for (const tab of canvasSnapshot().tabs) if (tab.workbook) closeTab(tab.id);
+  }, [pathname]);
 
   // The active tab stays in view, clear of the Browser tab pinned at the
   // strip's right edge (CAD-2682): when it changes, and whenever the strip
@@ -836,6 +843,38 @@ export default function CanvasDrawer({ hosted = false, templateReviewEnabled = f
                 onClose={closeAll}
                 onPaneClose={paneClose}
               />
+            ) : x.workbook && hosted && !showBrowser && x.workbook.conversation === canvas.conversation ? (
+              <>
+                <header className="cv-head">
+                  {sheet ? (
+                    <button type="button" className="cv-iconbtn cv-back" onClick={closeAll} aria-label={t("Back to chat")}>
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                        <path d="m15 18-6-6 6-6" />
+                      </svg>
+                    </button>
+                  ) : null}
+                  <span className="arttype">XLSX</span>
+                  <span className="cv-title">
+                    <b title={x.title}>{x.title}</b>
+                    <span className="cv-appview-sub">{t("read-only")}</span>
+                  </span>
+                  {!sheet ? (
+                    <>
+                      <button type="button" className="cv-iconbtn" onClick={() => setExpanded((v) => !v)} disabled={!canExpand} aria-pressed={expanded} aria-label={t("Expand canvas")} title={t("Expand canvas")}>
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                          {expanded ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
+                        </svg>
+                      </button>
+                      <button type="button" className="cv-iconbtn" onClick={paneClose ?? closeAll} aria-label={t(paneClose ? "Close pane" : "Close canvas")} title={paneClose ? t("Close pane — the view stays in the tabs") : undefined}>
+                        <IconClose size={12} />
+                      </button>
+                    </>
+                  ) : null}
+                </header>
+                <div className="cv-body" data-canvas-body data-workbook-preview>
+                  <WorkbookPreview key={x.id} href={attachmentHref(x.workbook.id, x.workbook.conversation)} title={x.title} />
+                </div>
+              </>
             ) : x.record ? (
               <RecordViewBody
                 key={x.id}
