@@ -1544,10 +1544,11 @@ export const api = {
       `/api/connections/mcp/${encodeURIComponent(id)}/tools`,
       { tools: [{ tool_name: toolName, mode: "read" }], read_guard: readGuard },
     ),
-  customMcpAllowCatalogReads: (id: string, snapshot_revision: number) =>
+  customMcpAllowCatalogReads: (id: string, snapshot_revision: number, operation?: PrivateOperation) =>
     post<CustomMcpConnectionPayload>(
       `/api/connections/mcp/${encodeURIComponent(id)}/allow-catalog-reads`,
       { snapshot_revision },
+      operation,
     ),
   customMcpAcceptDrift: (
     id: string,

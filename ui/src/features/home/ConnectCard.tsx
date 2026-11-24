@@ -303,6 +303,10 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
 type SetupAttempt = { id: string; endpoint: string; nonce: string; profile?: "emw_catalog_v1" };
 const EMW_ENDPOINT = "https://emw-mcp.simplebuild.site/";
 
+function resumeEmwCatalog(id: string): string {
+  return `EMW catalog connection ${id} is ready. If my request in this chat is waiting for an EMW catalog read, finish only that read using catalog.search. If I only asked to connect, confirm that it is connected without running any tools.`;
+}
+
 function parseSetupAttempt(value: string | null, endpoint: string): SetupAttempt | null {
   try {
     const [id, savedEndpoint = endpoint, nonce = "", profile] = (value ?? "").split("\n");
@@ -529,7 +533,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       if (!liveCallback(attempt)) return;
       const sent = await sendToMaster(
         presetAttempt
-          ? `EMW catalog connection ${connId} is ready. If my request in this chat is waiting for an EMW catalog read, finish only that read using catalog.search. If I only asked to connect, confirm that it is connected without running any tools.`
+          ? resumeEmwCatalog(connId)
           : `Custom MCP connection ${connId} is connected. Continue my original request using only currently permitted tools. If a tool is unavailable, explain what access is needed.`,
         message, undefined, undefined, conversation, operation,
       );
@@ -583,6 +587,28 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       remember(reply.connection_id, EMW_ENDPOINT, nonce, "emw_catalog_v1");
       setAuthorizationUrl(safeUrl);
     });
+  }
+
+  function allowExistingCatalog() {
+    const selected = existingCatalog;
+    if (!conversation || !isEmw || !profileAvailable || selected?.standing_read_access !== "confirm") return;
+    void run(() => usingPrivateOperation(undefined, async (operation) => {
+      const { connection: allowed } = await api.customMcpAllowCatalogReads(selected.id, selected.snapshot_revision, operation);
+      if (window.location.href !== originalHref) return;
+      if (allowed.id !== selected.id || !allowed.connected_by_you || allowed.endpoint_url !== EMW_ENDPOINT ||
+          allowed.standing_read_profile !== "emw_catalog_v1" || allowed.standing_read_access !== "allowed") {
+        throw new Error("Cadence could not verify this Custom MCP connection.");
+      }
+      setExistingCatalog(allowed);
+      const message = await setupMessageId(conversation, entry.seq, {
+        id: allowed.id, endpoint: EMW_ENDPOINT, nonce: "standing-consent",
+      });
+      if (window.location.href !== originalHref) return;
+      const sent = await sendToMaster(
+        resumeEmwCatalog(allowed.id), message, undefined, undefined, conversation, operation,
+      );
+      if (!sent.ok) setError(sent.error);
+    }));
   }
 
   function enableRead(pin: CustomMcpToolPin) {
@@ -662,11 +688,14 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   } else if (isEmw && profileAvailable === null) {
     status = "Checking connection…";
   } else if (isEmw && profileAvailable && existingCatalog) {
+    const canAllow = existingCatalog.standing_read_access === "confirm";
     status = existingCatalog.standing_read_access === "allowed" ? "Connected · Catalog read access"
       : existingCatalog.status === "auth_expired" ? "OAuth sign-in expired. Sign in again."
-      : existingCatalog.standing_read_access === "confirm" ? "Use your existing EMW sign-in in Connections."
+      : canAllow ? "Use your existing sign-in and make this connection personal. Atlas can read the catalog until you disconnect."
       : "Catalog access is not ready. Check this connection.";
-    actions = <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>;
+    actions = canAllow
+      ? <button type="button" className="btn btn-primary" disabled={!conversation || busy} onClick={allowExistingCatalog}>{t("Allow Atlas catalog reads")}</button>
+      : <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>;
   } else if (isEmw && profileAvailable) {
     actions = <button type="button" className="btn btn-primary" disabled={!conversation || busy} onClick={connectEmw}>{t("Connect EMW for catalog reads")}</button>;
   } else {

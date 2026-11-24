@@ -120,6 +120,7 @@ async function main() {
   const toolWrites: unknown[] = [];
   let standingProfile = false;
   const creates: Array<Record<string, unknown>> = [];
+  const catalogGrants: Array<Record<string, unknown>> = [];
   const innerFetch = globalThis.fetch;
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const url = String(input);
@@ -127,6 +128,17 @@ async function main() {
     if (url.endsWith("/api/connections/mcp") && method === "GET") return jsonRes({
       connections: [returnedMcp], ...(standingProfile ? { standing_read_profile: "emw_catalog_v1" } : {}),
     });
+    if (url.endsWith(`/api/connections/mcp/${sampleMcp.id}/allow-catalog-reads`) && method === "POST") {
+      const request = JSON.parse(String(init?.body));
+      catalogGrants.push(request);
+      if (request.snapshot_revision !== returnedMcp.snapshot_revision)
+        return new Response(JSON.stringify({ error: { code: "stale_revision", message: "Snapshot changed" } }), {
+          status: 409, headers: { "Content-Type": "application/json" },
+        });
+      returnedMcp = { ...returnedMcp, visibility: "personal", standing_read_profile: "emw_catalog_v1",
+        standing_read_access: "allowed" } as typeof sampleMcp;
+      return jsonRes({ connection: returnedMcp });
+    }
     if (url.endsWith(`/api/connections/mcp/${sampleMcp.id}/tools`) && method === "POST") {
       const body = JSON.parse(String(init?.body));
       toolWrites.push(body);
@@ -499,6 +511,23 @@ async function main() {
   await renderEmw("empty");
   await drain();
   assert(messageWrites.length === 0, "empty callback nonce never resumes");
+  win.localStorage.removeItem(emwKey);
+  win.history.replaceState({}, "", "/home");
+  const createsBeforeLegacyGrant = creates.length;
+  returnedMcp = { ...sampleMcp, name: "EMW", endpoint_url: emwEndpoint, oauth_scopes: ["catalog:read"],
+    standing_read_access: "confirm" } as typeof sampleMcp;
+  await renderEmw("legacy-confirm");
+  await settle(() => assert(byText("button", "Allow Atlas catalog reads"), "legacy owner can grant access in chat"));
+  await act(async () => byText("button", "Allow Atlas catalog reads")!.click());
+  await settle(() => assert(text().includes("Connected · Catalog read access") && messageWrites.length === 1, "grant resumes the waiting conversation"));
+  assert(catalogGrants.length === 1 && catalogGrants[0]?.snapshot_revision === sampleMcp.snapshot_revision, "uses guarded existing-connection action");
+  assert(creates.length === createsBeforeLegacyGrant && win.location.pathname === "/home", "keeps the saved login and stays in chat");
+  assert(messageWrites.at(0)?.conversation === "thread-21" && /^mcp-setup-[0-9a-f]{64}$/.test(String(messageWrites.at(0)?.message)), "grant resumes only the original conversation");
+  await renderEmw("legacy-remount");
+  await settle(() => assert(text().includes("Connected · Catalog read access"), "granted access persists after remount"));
+  assert(messageWrites.slice().length === 1 && !byText("button", "Allow Atlas catalog reads"), "grant does not ask or resume again");
+  messageWrites.length = 0;
+  win.localStorage.setItem(emwKey, receipt);
   standingProfile = false;
   win.history.replaceState({}, "", callbackUrl);
   await renderEmw("missing-profile");
