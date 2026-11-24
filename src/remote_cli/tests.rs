@@ -10579,6 +10579,163 @@ fn aos739_agent_enroll_verbs_are_registered_with_their_scopes_and_effects() {
 }
 
 #[test]
+fn aos739_agent_enroll_refusals_and_receipts_are_enforced() {
+    let refusal_cases = [
+        (
+            "agent_enroll_list",
+            403,
+            "approval_scope_required",
+            Map::new(),
+        ),
+        ("agent_enroll_approve", 403, "owner_required", Map::new()),
+        (
+            "agent_enroll_start",
+            403,
+            "approver_login_cannot_enroll",
+            Map::new(),
+        ),
+        (
+            "agent_enroll_approve",
+            403,
+            "self_approval_refused",
+            Map::new(),
+        ),
+        ("agent_enroll_approve", 404, "not_found", Map::new()),
+        (
+            "agent_enroll_start",
+            409,
+            "renewable_login_required",
+            Map::new(),
+        ),
+        ("agent_enroll_approve", 409, "not_pending", Map::new()),
+        ("agent_enroll_approve", 409, "authority_changed", Map::new()),
+        (
+            "agent_enroll_approve",
+            409,
+            "profile_unavailable",
+            Map::new(),
+        ),
+    ];
+    for (verb, status, code, args) in refusal_cases {
+        let (out, _) = run(
+            vec![(
+                status,
+                "",
+                json!({"ok": false, "error": {"code": code, "message": "x"}}),
+            )],
+            verb,
+            args,
+            10,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "rejected", "{verb} {status} {code}: {err}");
+        assert_eq!(err.code(), Some(code), "{verb} {status} {code}: {err}");
+    }
+
+    // Mutating enroll verbs reject missing or mismatched 2xx receipts as OutcomeUnknown.
+    let start_bad = run(
+        vec![(200, "", json!({"ok": true, "data": {"state": "pending"}}))],
+        "agent_enroll_start",
+        Map::new(),
+        10,
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(start_bad.kind(), "unknown", "{start_bad}");
+
+    let start_ok = run(
+        vec![(
+            200,
+            "",
+            json!({
+                "ok": true,
+                "data": {
+                    "state": "pending",
+                    "request_id": "cae_1",
+                    "approval_url": "https://board.example/enroll/cae_1"
+                }
+            }),
+        )],
+        "agent_enroll_start",
+        Map::new(),
+        10,
+    )
+    .0;
+    assert!(start_ok.is_ok(), "{start_ok:?}");
+
+    let mut approve_args = Map::new();
+    approve_args.insert("request_id".into(), json!("cae_1"));
+    approve_args.insert("profile_id".into(), json!("ap_1"));
+    let approve_bad = run(
+        vec![(
+            200,
+            "",
+            json!({
+                "ok": true,
+                "data": { "enrollment": { "id": "cae_other", "profile_id": "ap_1", "state": "active" } }
+            }),
+        )],
+        "agent_enroll_approve",
+        approve_args.clone(),
+        10,
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(approve_bad.kind(), "unknown", "{approve_bad}");
+
+    let approve_ok = run(
+        vec![(
+            200,
+            "",
+            json!({
+                "ok": true,
+                "data": { "enrollment": { "id": "cae_1", "profile_id": "ap_1", "state": "active" } }
+            }),
+        )],
+        "agent_enroll_approve",
+        approve_args,
+        10,
+    )
+    .0;
+    assert!(approve_ok.is_ok(), "{approve_ok:?}");
+
+    let mut revoke_args = Map::new();
+    revoke_args.insert("request_id".into(), json!("cae_1"));
+    let revoke_bad = run(
+        vec![(
+            200,
+            "",
+            json!({
+                "ok": true,
+                "data": { "enrollment": { "id": "cae_1", "state": "active" } }
+            }),
+        )],
+        "agent_enroll_revoke",
+        revoke_args.clone(),
+        10,
+    )
+    .0
+    .unwrap_err();
+    assert_eq!(revoke_bad.kind(), "unknown", "{revoke_bad}");
+
+    let revoke_ok = run(
+        vec![(
+            200,
+            "",
+            json!({
+                "ok": true,
+                "data": { "enrollment": { "id": "cae_1", "state": "revoked" } }
+            }),
+        )],
+        "agent_enroll_revoke",
+        revoke_args,
+        10,
+    )
+    .0;
+    assert!(revoke_ok.is_ok(), "{revoke_ok:?}");
+}
+
+#[test]
 fn cad2747_renewal_preserves_assistant_actor_mode_and_refuses_elevation() {
     let at = now().unwrap();
     let target = RemoteTarget {

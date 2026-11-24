@@ -3062,9 +3062,10 @@ where
         action: AgentAction::Enroll { action },
     } = &command
     {
-        // CAD-2758: list/approve/revoke are a live human owner's decision;
-        // start/status stay allowed for the isolated agent login.
-        super::agent_enroll::refuse_managed_owner_action(action, non_human_actor)?;
+        // CAD-2758: managed daemon panes are refused for all enroll verbs;
+        // owner verbs require human/owner authority; start/status stay allowed
+        // for an unmanaged coding harness on a normal login.
+        super::agent_enroll::refuse_disallowed_caller(action, &target)?;
     }
     if let Commands::WorkspaceSkill { action } = &command {
         // CAD-2396: approve and revoke are an owner's decision, refused for a

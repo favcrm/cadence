@@ -56,27 +56,40 @@ impl EnrollAction {
     }
 }
 
-/// Owner enrollment decisions (`list`, `approve`, `revoke`) require a live
-/// human workspace owner. Because the board cannot observe `CADENCE_ALIAS`,
-/// refuse managed callers here before any request is sent; `start` and `status`
-/// stay allowed so an isolated agent session can enroll itself.
-pub(crate) fn refuse_managed_owner_action(
+/// Refuse hosted CLI enrollment commands for disallowed caller identities before
+/// any request is sent:
+/// - Managed daemon callers (`CADENCE_ALIAS`, `CADENCE_GRANT_TOKEN`, or pinned
+///   `target.identity`) share the host's login and may not run ANY `agent enroll`
+///   subcommand (`start`, `status`, `list`, `approve`, or `revoke`).
+/// - Unmanaged non-human callers: `list`, `approve`, and `revoke` require a
+///   live human owner (`refuse_non_human_actor`); `start` and `status` remain
+///   allowed in an external coding harness unless explicit `--agent` /
+///   `CADENCE_CLI_ACTOR=assistant` / `--as-assistant` was chosen.
+pub(crate) fn refuse_disallowed_caller(
     action: &EnrollAction,
-    pinned_identity: bool,
+    target: &cadence_agent::remote_cli::RemoteTarget,
 ) -> Result<()> {
-    if action.is_owner_action()
-        && (pinned_identity
-            || std::env::var_os("CADENCE_ALIAS").is_some()
-            || std::env::var_os("CADENCE_GRANT_TOKEN").is_some())
+    if target.identity.is_some()
+        || std::env::var_os("CADENCE_ALIAS").is_some()
+        || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
     {
         return Err(Error::invalid(
             "managed_caller_refused",
             format!(
-                "`cadence {}` is refused for a managed agent: listing, approving, or revoking \
-                 CLI enrollments is a live human workspace owner's decision. Nothing was sent.",
+                "`cadence {}` is refused for a managed agent: hosted CLI enrollment acts on a \
+                 standalone CLI login (`cadence login`), not a managed daemon session. Nothing \
+                 was sent.",
                 action.verb()
             ),
         ));
+    }
+    if action.is_owner_action() {
+        return cadence_agent::remote_cli::refuse_non_human_actor(Some(target), action.verb());
+    }
+    if cadence_agent::remote_cli::saved_login_is_assistant_only(target)
+        || cadence_agent::remote_cli::cli_actor_is_explicit_non_human()
+    {
+        return cadence_agent::remote_cli::refuse_non_human_actor(Some(target), action.verb());
     }
     Ok(())
 }
@@ -220,69 +233,135 @@ mod tests {
     }
 
     #[test]
-    fn managed_caller_may_start_and_status_but_cannot_list_approve_or_revoke() {
-        let start = EnrollAction::Start { profile: None };
-        let status = EnrollAction::Status;
-        let list = EnrollAction::List;
-        let approve = EnrollAction::Approve {
-            request: "cae_12345678".into(),
-            profile: "ap_11111111-2222-4333-8444-555555555555".into(),
-            write: false,
+    fn managed_and_explicit_non_human_callers_are_refused_through_remote_run() {
+        let target = || cadence_agent::remote_cli::RemoteTarget {
+            org: "acme".into(),
+            endpoint: "https://127.0.0.1:1".into(),
+            org_id: "ws_synthetic".into(),
+            identity: None,
         };
-        let revoke = EnrollAction::Revoke {
-            request: "cae_12345678".into(),
+        let cmd = |action| Commands::Agent {
+            action: AgentAction::Enroll { action },
+        };
+        let actions = || {
+            vec![
+                EnrollAction::Start { profile: None },
+                EnrollAction::Status,
+                EnrollAction::List,
+                EnrollAction::Approve {
+                    request: "cae_12345678".into(),
+                    profile: "ap_11111111-2222-4333-8444-555555555555".into(),
+                    write: false,
+                },
+                EnrollAction::Revoke {
+                    request: "cae_12345678".into(),
+                },
+            ]
         };
 
-        assert!(refuse_managed_owner_action(&start, true).is_ok());
-        assert!(refuse_managed_owner_action(&status, true).is_ok());
-        assert_eq!(
-            refuse_managed_owner_action(&list, true).unwrap_err().code(),
-            Some("managed_caller_refused")
-        );
-        assert_eq!(
-            refuse_managed_owner_action(&approve, true)
-                .unwrap_err()
-                .code(),
-            Some("managed_caller_refused")
-        );
-        assert_eq!(
-            refuse_managed_owner_action(&revoke, true)
-                .unwrap_err()
-                .code(),
-            Some("managed_caller_refused")
-        );
-
-        let (start_env, status_env, list_env, approve_env, revoke_env) = managed_env(|| {
-            (
-                refuse_managed_owner_action(&start, false),
-                refuse_managed_owner_action(&status, false),
-                refuse_managed_owner_action(&list, false),
-                refuse_managed_owner_action(&approve, false),
-                refuse_managed_owner_action(&revoke, false),
-            )
+        // Managed daemon caller (CADENCE_ALIAS) refuses ALL 5 actions through super::remote::run
+        // before attempting any credential load or HTTP request to 127.0.0.1:1.
+        let managed_results: Vec<_> = managed_env(|| {
+            actions()
+                .into_iter()
+                .map(|a| super::remote::run(target(), cmd(a), 1, None, None))
+                .collect()
         });
-        assert!(start_env.is_ok());
-        assert!(status_env.is_ok());
-        assert_eq!(list_env.unwrap_err().code(), Some("managed_caller_refused"));
-        assert_eq!(
-            approve_env.unwrap_err().code(),
-            Some("managed_caller_refused")
+        for result in managed_results {
+            let err = result.unwrap_err();
+            assert_eq!(err.code(), Some("managed_caller_refused"), "{err}");
+        }
+
+        // Unmanaged external harness default (implicit_harness = true) allows start/status past
+        // the caller guard (failing later at missing login), while refusing list/approve/revoke.
+        let _lock = crate::cli::org::tests::RESOLVE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env_bare = crate::cli::org::tests::EnvGuard::bare();
+        env_bare.write_registry(&crate::cli::org::tests::remote_registry(
+            "acme",
+            crate::cli::org::tests::EP_A,
+            "ws_synthetic",
+            true,
+        ));
+        cadence_agent::remote_cli::bind_cli_actor(Some(cadence_agent::remote_cli::CliActor {
+            mode: cadence_agent::remote_cli::CliActorMode::Assistant,
+            implicit_harness: true,
+        }));
+        let start_res = super::remote::run(
+            target(),
+            cmd(EnrollAction::Start { profile: None }),
+            1,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_ne!(
+            start_res.code(),
+            Some("managed_caller_refused"),
+            "{start_res}"
         );
-        assert_eq!(
-            revoke_env.unwrap_err().code(),
-            Some("managed_caller_refused")
+        assert!(
+            !start_res.to_string().contains("human/owner authority"),
+            "{start_res}"
         );
+        let approve_err = super::remote::run(
+            target(),
+            cmd(EnrollAction::Approve {
+                request: "cae_12345678".into(),
+                profile: "ap_11111111-2222-4333-8444-555555555555".into(),
+                write: false,
+            }),
+            1,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            approve_err.to_string().contains("human/owner authority"),
+            "{approve_err}"
+        );
+
+        // Explicit --agent refuses start/status as well.
+        cadence_agent::remote_cli::bind_cli_actor(Some(cadence_agent::remote_cli::CliActor {
+            mode: cadence_agent::remote_cli::CliActorMode::Agent("ap_x".into()),
+            implicit_harness: false,
+        }));
+        let explicit_start_err = super::remote::run(
+            target(),
+            cmd(EnrollAction::Start { profile: None }),
+            1,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            explicit_start_err
+                .to_string()
+                .contains("human/owner authority"),
+            "{explicit_start_err}"
+        );
+        cadence_agent::remote_cli::unbind_cli_actor();
     }
 
     #[test]
-    fn require_named_org_refuses_omitted_org_flag() {
-        let cmd = Commands::Agent {
-            action: AgentAction::Enroll {
-                action: EnrollAction::Status,
-            },
-        };
-        let err = require_named_org(None, &cmd, "fav-limited").unwrap_err();
-        assert_eq!(err.code(), Some("org_not_named"));
-        assert!(require_named_org(Some("fav-limited"), &cmd, "fav-limited").is_ok());
+    fn omitted_org_is_refused_through_dispatch_and_client_only_routes() {
+        use crate::cli::org::tests::{remote_registry, EnvGuard, EP_A, RESOLVE_ENV};
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        for args in [
+            vec!["cadence", "agent", "enroll", "status"],
+            vec!["cadence", "agent", "enroll", "start"],
+            vec!["cadence", "agent", "enroll", "list"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let err = super::action_dispatch::run_cli(cli).unwrap_err();
+            assert_eq!(err.code(), Some("org_not_named"), "{err}");
+
+            let cli_only = Cli::try_parse_from(&args).unwrap();
+            let err_only = super::client_update::route_client_only(cli_only).unwrap_err();
+            assert_eq!(err_only.code(), Some("org_not_named"), "{err_only}");
+        }
     }
 }
