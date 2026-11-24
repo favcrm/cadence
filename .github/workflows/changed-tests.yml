@@ -36,11 +36,9 @@ concurrency:
 permissions:
   contents: read
 
-# rust-cache and sccache hash these into their keys; they match ci.yml. The
-# gate-test-ld2 key restored below has had no saver since CAD-1970 dropped
-# cache-warm's test leg, so the restore is a no-op kept in step with tests.yml
-# (save-if is false: this job never writes it); the read-only sccache is what
-# warms the build.
+# rust-cache and sccache hash these into their keys; they match ci.yml.
+# CAD-2749 can seed gate-test-ld2 once from trusted main; this job remains
+# restore-only, and still uses read-only sccache.
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
