@@ -742,10 +742,8 @@ fn stale_delivery_apply_sends_exact_fence_once_and_returns_conflict() {
     };
     let err = run_cmd(target_with(&endpoint, None), command).unwrap_err();
     let message = err.to_string();
-    assert!(
-        message.contains("409") && message.contains("revision_conflict"),
-        "{message}"
-    );
+    assert_eq!(err.kind(), "rejected", "{message}");
+    assert!(message.contains("revision_conflict"), "{message}");
     let calls = server.take_calls();
     assert_eq!(
         calls,
