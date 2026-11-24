@@ -41,6 +41,7 @@ const { ShareRequestCard } = require("../src/features/home/ShareRequestCard") as
 const { parseShareRequestEntry } = require("../src/features/home/shareRequest") as typeof import("../src/features/home/shareRequest");
 const { asEntry, threadItems } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
 const { onThreadReload } = require("../src/lib/masterChanged") as typeof import("../src/lib/masterChanged");
+const { WriteGate } = require("../src/features/auth/WriteGate") as typeof import("../src/features/auth/WriteGate");
 
 const entryOf = (raw: Record<string, unknown>, seq = 1) => {
   const e = asEntry({ seq, ...raw });
@@ -91,9 +92,17 @@ const text = (el: Element | null) => el?.textContent?.replace(/\s+/g, " ").trim(
 let reads: unknown[] = [];
 const posts: string[] = [];
 let cancelAnswer: { status: number; body: unknown } = { status: 200, body: { ok: true, id: "sr_0123456789abcdef0123456789abcdef", status: "cancelled" } };
+let confirmAnswer: { status: number; body: unknown } | null = { status: 200, body: { ok: true, outcome: "sent" } };
+let confirmInit: RequestInit | undefined;
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
+  if (url.pathname.startsWith("/api/share-requests/offers/") && init?.method === "POST") {
+    posts.push(url.pathname + url.search);
+    confirmInit = init;
+    if (confirmAnswer === null) throw new Error("connection lost");
+    return json(confirmAnswer.body, confirmAnswer.status);
+  }
   const m = /^\/api\/share-requests\/(sr_[0-9a-f]{32})(?:\/(cancel))?$/.exec(url.pathname);
   if (!m) return json({}, 404);
   if (m[2] === "cancel" && init?.method === "POST") {
@@ -104,11 +113,11 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   return next === undefined ? json({ ok: true, request: fixture("card-pending").payload }) : json({ ok: true, request: next });
 }) as typeof fetch;
 
-async function mount(raw: Record<string, unknown>) {
+async function mount(raw: Record<string, unknown>, writeBlock: string | null = null) {
   const { host, root } = html();
   document.body.append(host);
   await React.act(async () => {
-    root.render(React.createElement(LocaleProvider, null, React.createElement(ShareRequestCard, { entry: entryOf(raw) })));
+    root.render(React.createElement(LocaleProvider, null, React.createElement(WriteGate.Provider, { value: writeBlock }, React.createElement(ShareRequestCard, { entry: entryOf(raw) }))));
   });
   const card = () => host.querySelector('[data-kind="share_request"]') as HTMLElement | null;
   const done = async () => { await React.act(async () => { root.unmount(); }); host.remove(); };
@@ -193,6 +202,72 @@ async function mount(raw: Record<string, unknown>) {
   assert(/Chris declined: Not final until the audit closes/.test(text(v.card())), "with the note");
   assert(reloads >= 1, "and the chat is asked to read again, so a shared file's card follows");
   await v.done();
+  stop();
+}
+
+// ---- confirmation offers preserve the exact report and submit only once ----
+{
+  let reloads = 0;
+  const stop = onThreadReload(() => { reloads++; });
+  const raw = fixture("card-offered");
+  raw.payload.params["custom_filter"] = "<literal & value>";
+  const v = await mount(raw);
+  assert(text(v.card()).includes('custom filter: "<literal & value>"'), "arbitrary filter and literal value shown");
+  assert(text(v.card()).includes("1 Jul – 30 Sep 2026") && text(v.card()).includes("Monthly · Prior year") &&
+    text(v.card()).includes("November planning meeting"), "exact options and reason shown");
+  assert(!posts.some((p) => p.includes("/offers/")), "opening never sends");
+  const confirmationPath = "/api/share-requests/offers/sro_0123456789abcdef0123456789abcdef/confirm?conversation=tc_12345678-1234-4123-8123-123456789abc";
+  confirmAnswer = { status: 200, body: { ok: true, outcome: "sent" } };
+  await React.act(async () => { (v.card()!.querySelector("[data-share-confirm]") as HTMLElement).click(); });
+  await settle(() => assert(text(v.card()).includes("Waiting for an owner"), "accepted request waits for owner"));
+  assert(posts.filter((p) => p === confirmationPath).length === 1, "one confirmation for this conversation");
+  assert(confirmInit?.credentials === "same-origin" && confirmInit?.body === undefined, "authenticated POST without payload");
+  assert(reloads > 0, "confirmation reloads thread");
+  assert((v.card()!.querySelector("[data-share-confirm]") as HTMLButtonElement).disabled, "accepted offer cannot be sent twice");
+  await v.done();
+
+  for (const [answer, expected] of [
+    [{ status: 200, body: { ok: true, outcome: "already_requested" } }, "already pending"],
+    [{ status: 404, body: {} }, "no longer available"],
+    [{ status: 409, body: {} }, "no longer active"],
+    [{ status: 410, body: {} }, "expired"],
+    [{ status: 503, body: { error: { code: "owners_unavailable" } } }, "owners are unavailable"],
+    [{ status: 503, body: { error: { code: "confirmation_unconfirmed" } } }, "result is unknown"],
+    [null, "result is unknown"],
+  ] as const) {
+    confirmAnswer = answer;
+    const w = await mount(fixture("card-offered"));
+    const before: number = posts.length;
+    await React.act(async () => { (w.card()!.querySelector("[data-share-confirm]") as HTMLElement).click(); });
+    await settle(() => assert(text(w.card()).includes(expected), `confirmation result: ${expected}`));
+    assert((w.card()!.querySelector("[data-share-confirm]") as HTMLButtonElement).disabled === (expected !== "result is unknown"),
+      "only an unconfirmed result can be checked with the same offer");
+    assert(posts.length === before + 1, "one POST per confirmation");
+    await w.done();
+  }
+  for (const status of ["expired", "failed", "already_requested"]) {
+    const offer = fixture("card-offered");
+    offer.payload.status = status;
+    const w = await mount(offer);
+    assert((w.card()!.querySelector("[data-share-confirm]") as HTMLButtonElement).disabled, `${status} is not confirmable`);
+    await w.done();
+  }
+  const ambiguous = fixture("card-offered");
+  ambiguous.payload.status = "submitting";
+  const checking = await mount(ambiguous);
+  const checkButton = checking.card()!.querySelector<HTMLButtonElement>("[data-share-confirm]");
+  assert(checkButton && !checkButton.disabled && text(checkButton) === "Check request", "a saved incomplete attempt can be checked");
+  confirmAnswer = { status: 503, body: { error: { code: "owners_unavailable" } } };
+  await React.act(async () => { checkButton.click(); });
+  await settle(() => assert(!checkButton.disabled && text(checkButton) === "Check request", "temporary owner lookup failure keeps the same offer actionable"));
+  confirmAnswer = { status: 200, body: { ok: true, outcome: "sent" } };
+  await React.act(async () => { checkButton.click(); });
+  await settle(() => assert(text(checking.card()).includes("Waiting for an owner"), "checking waits for an owner when the same request was sent"));
+  assert(posts.at(-1) === confirmationPath, "checking uses the original offer");
+  await checking.done();
+  const locked = await mount(fixture("card-offered"), "Sign in to write.");
+  assert(!locked.card()!.querySelector("[data-share-confirm]") && text(locked.card()).includes("Sign in to write."), "write gate prevents confirmation");
+  await locked.done();
   stop();
 }
 console.log("shareRequestCard ok");

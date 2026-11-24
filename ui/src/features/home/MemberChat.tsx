@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { navigate } from "../../lib/useLocation";
@@ -140,15 +140,6 @@ export default function MemberChat({
   useEffect(() => {
     void store.revalidate();
   }, [store]);
-  // AOS-711: a share request card was decided; read the newest page again so the rewritten card and its file show.
-  useEffect(
-    () =>
-      onThreadReload(() => {
-        if (store.get().data) memberWrite(store, (cur) => ({ ...cur!, tailReload: true }));
-        void store.invalidate();
-      }),
-    [store],
-  );
   const [surface, setSurface] = useState<MemberSurface | null>(null);
   const [activityFeed, setActivityFeed] = useState<{ revision: number; turn: MemberLiveTurn | null }>({
     revision: 0,
@@ -173,6 +164,29 @@ export default function MemberChat({
   const liveAfter = useRef<number | null>(null);
 
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
+  // Keep the history position the member had revealed even if the reload
+  // also appends messages that would otherwise push an older card off-screen.
+  const reloadWindow = useRef<{ scope: string; hidden: number } | null>(null);
+  useEffect(
+    () =>
+      onThreadReload(() => {
+        const data = store.get().data;
+        if (data) {
+          if (reloadWindow.current?.scope !== scope)
+            reloadWindow.current = { scope, hidden: Math.max(0, threadItems(data).length - limit) };
+          memberWrite(store, (cur) => ({ ...cur!, tailReload: true }));
+        }
+        void store.invalidate();
+      }),
+    [limit, scope, store],
+  );
+  useLayoutEffect(() => {
+    const window = reloadWindow.current;
+    if (window?.scope !== scope || !thread.data || thread.data.tailReload) return;
+    reloadWindow.current = null;
+    const keep = items.length - window.hidden;
+    setLimit((current) => Math.max(current, keep));
+  }, [items.length, scope, thread.data]);
   // History truth is carried in the member payload (round 3): a
   // `Resource.write` stamps ok/error=null/asOf on every optimistic
   // mutation, so `data !== null`/`status` can never prove a read

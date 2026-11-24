@@ -3,8 +3,8 @@ export {};
  * AOS-711 (CAD-2705): a share request card is rewritten in place when it is
  * decided (and a file card is added after it, which renumbers every later
  * `csrid_`), which the member chat's forward-only poll never reads. `tailReload`
- * makes the next read replace what is held with the newest page: nothing is
- * duplicated by the renumbering, and the forward cursor moves on.
+ * rebuilds the held window, including older pages: the changed card stays
+ * visible, nothing is duplicated by renumbering, and the forward cursor moves on.
  */
 declare function require(name: string): any;
 declare const process: { cwd(): string; exit(code?: number): never };
@@ -21,9 +21,22 @@ const reply = (id: string) => ({ role: "assistant", kind: "message", text: "Chri
 const file = { ...fixture("artifact-card-after-shared"), id: "csrid_3" };
 const asked: Record<string, unknown>[] = [];
 const page = (entries: unknown[], cursor: string, earlier = "csc1_1") => ({ conversation, entries, cursor, before_cursor: earlier, more_before: true, more_after: false });
+let olderHistory = false;
+let confirmed = false;
 globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
   const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
   asked.push(body);
+  if (olderHistory) {
+    const offer = { ...fixture(confirmed ? "card-pending" : "card-offered"), id: "csrid_100" };
+    const answer = body.before === "csc1_101"
+      ? { ...page([offer], "csc1_100", "csc1_100"), more_before: false }
+      : body.before === "csc1_103"
+        ? page([reply("csrid_101"), reply("csrid_102")], "csc1_102", "csc1_101")
+        : confirmed
+          ? page([reply("csrid_103"), reply("csrid_104"), reply("csrid_105")], "csc1_105", "csc1_103")
+          : page([reply("csrid_101"), reply("csrid_102")], "csc1_102", "csc1_101");
+    return new Response(JSON.stringify(answer), { headers: { "Content-Type": "application/json" } });
+  }
   const decided = asked.length > 2;
   const answer = body.tail === true
     ? page(decided ? [before, sharedCard, file, reply("csrid_4")] : [before, pendingCard, reply("csrid_3")], decided ? "csc1_4" : "csc1_3")
@@ -32,7 +45,7 @@ globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
 }) as typeof fetch;
 
 async function main() {
-  const { memberThreadStore, memberWrite } = require("../src/features/home/memberThread") as typeof import("../src/features/home/memberThread");
+  const { applyMemberEarlier, fetchMemberEarlier, memberThreadStore, memberWrite } = require("../src/features/home/memberThread") as typeof import("../src/features/home/memberThread");
   const store = memberThreadStore("scope-tail");
   await store.refresh();
   equal(store.get().data!.entries.map((e) => e.kind), ["message", "share_request", "message"], "the first read is the tail");
@@ -51,6 +64,21 @@ async function main() {
   equal(data.memberPosition, { forward: "csc1_4", before: "csc1_1" }, "the forward cursor moves on");
   await store.refresh();
   equal(asked[3], { after: "csc1_4", limit: 200 }, "and the next read is forward again");
+
+  olderHistory = true;
+  const olderStore = memberThreadStore("scope-older-offer");
+  await olderStore.refresh();
+  const earlier = await fetchMemberEarlier(olderStore.get().data!);
+  memberWrite(olderStore, (current) => applyMemberEarlier(current!, earlier!));
+  equal(olderStore.get().data!.entries[0]!.payload?.status, "offered", "the member has loaded the old offer");
+  confirmed = true;
+  memberWrite(olderStore, (cur) => ({ ...cur!, tailReload: true }));
+  await olderStore.refresh();
+  const refreshed = olderStore.get().data!;
+  equal(refreshed.entries.map((entry) => entry.payload?.status ?? entry.kind),
+    ["pending", "message", "message", "message", "message", "message"],
+    "refresh keeps the older card after a full newer page arrived");
+  equal(refreshed.memberPosition, { forward: "csc1_105", before: "csc1_100" }, "both continuations describe the restored window");
   console.log("memberTailReload ok");
 }
 main().then(() => process.exit(0), (error) => { console.error(error); process.exit(1); });
