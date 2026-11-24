@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from "react";
 import Button from "../../ui/Button";
 import { IconRefresh } from "../../ui/icons";
 import { sessionHeaders } from "../../lib/sessionKey";
@@ -219,6 +227,116 @@ function NativePlatformAccount() {
   );
 }
 
+function BillingModal({
+  title,
+  sizeClass,
+  testId,
+  busy = false,
+  closeLabel,
+  headerControls,
+  onClose,
+  children,
+}: {
+  title: string;
+  sizeClass: "billing-modal-plans" | "billing-modal-extra";
+  testId: string;
+  busy?: boolean;
+  closeLabel: string;
+  headerControls?: ReactNode;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const titleId = useId();
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const active = document.activeElement;
+    openerRef.current = active instanceof HTMLElement ? active : null;
+    dialogRef.current?.focus();
+    return () => {
+      const opener = openerRef.current;
+      if (opener?.isConnected) opener.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (!busy) onClose();
+    };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [busy, onClose]);
+
+  const focusable = (): HTMLElement[] => {
+    const root = dialogRef.current;
+    if (!root) return [];
+    return Array.from(
+      root.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.getAttribute("aria-hidden") !== "true");
+  };
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Tab") return;
+    const items = focusable();
+    if (items.length === 0) {
+      event.preventDefault();
+      dialogRef.current?.focus();
+      return;
+    }
+    const first = items[0]!;
+    const last = items[items.length - 1]!;
+    const active = document.activeElement;
+    if (event.shiftKey) {
+      if (active === first || active === dialogRef.current) {
+        event.preventDefault();
+        last.focus();
+      }
+    } else if (active === last || active === dialogRef.current) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  return (
+    <div className="billing-modal-backdrop" role="presentation" onClick={() => { if (!busy) onClose(); }}>
+      <section
+        ref={dialogRef}
+        tabIndex={-1}
+        className={`card billing-modal-panel ${sizeClass}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        data-testid={testId}
+        onKeyDown={handleKeyDown}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="billing-modal-head">
+          <h2 id={titleId}>{title}</h2>
+          <div className="billing-modal-head-right">
+            {headerControls}
+            <button
+              type="button"
+              className="billing-modal-close"
+              aria-label={closeLabel}
+              disabled={busy}
+              onClick={onClose}
+            >
+              ×
+            </button>
+          </div>
+        </div>
+        <div className="billing-modal-body">{children}</div>
+      </section>
+    </div>
+  );
+}
+
 function HostedBilling({
   onBillingSnapshot,
   onRedirect,
@@ -235,6 +353,7 @@ function HostedBilling({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [checkedAt, setCheckedAt] = useState<Date | null>(null);
   const [interval, setInterval] = useState<"month" | "year">("month");
+  const [activeModal, setActiveModal] = useState<"plans" | "extra" | null>(null);
   const [returnBanner, setReturnBanner] = useState<{ kind: "subscription" | "topup"; status: "success" | "cancel" } | null>(null);
   const [usageTab, setUsageTab] = useState<"daily" | "log" | "events" | null>(null);
   const [selectedDay, setSelectedDay] = useState<string | null>(null);
@@ -373,6 +492,16 @@ function HostedBilling({
     }
   }, [navigateExternal, t]);
 
+  const openModal = useCallback((kind: "plans" | "extra") => {
+    setActionError(null);
+    setActiveModal(kind);
+  }, []);
+
+  const closeModal = useCallback(() => {
+    setActionError(null);
+    setActiveModal(null);
+  }, []);
+
   const account = data?.account ?? null;
   const offer = data?.offer ?? null;
   const workspaceLabel =
@@ -452,16 +581,6 @@ function HostedBilling({
           <Button icon={<IconRefresh />} loading={loading} onClick={() => void refresh()}>
             {t("Refresh")}
           </Button>
-          {data?.canManage && account && subActive && !isIapManaged && (
-            <Button
-              variant="primary"
-              loading={busyAction === "portal"}
-              disabled={busyAction !== null}
-              onClick={() => void runAction("portal", "/api/account/billing/portal", {})}
-            >
-              {t("Manage billing")}
-            </Button>
-          )}
         </div>
       </header>
 
@@ -485,7 +604,7 @@ function HostedBilling({
         </div>
       )}
 
-      {actionError && (
+      {actionError && !activeModal && (
         <div className="account-notice" data-tone="fail" role="alert">
           <strong>{t("Billing action failed")}</strong>
           <p>{actionError}</p>
@@ -546,12 +665,8 @@ function HostedBilling({
                     <strong>{t("Monthly allowance reached — Extra usage active")}</strong>
                     <p>{t("Requests are now drawing automatically from your prepaid extra usage pool.")}</p>
                   </div>
-                  {allPlans.length > 0 && (
-                    <Button
-                      size="sm"
-                      variant="primary"
-                      onClick={() => document.getElementById("billing-plans")?.scrollIntoView({ behavior: "smooth" })}
-                    >
+                  {allPlans.length > 0 && !isIapManaged && (
+                    <Button size="sm" variant="primary" onClick={() => openModal("plans")}>
                       {t("Upgrade plan")}
                     </Button>
                   )}
@@ -565,20 +680,13 @@ function HostedBilling({
                     <p>{t("Capacity is paused until your cycle resets or you upgrade or add an extra usage pack.")}</p>
                   </div>
                   <div className="billing-banner-actions">
-                    {allPlans.length > 0 && (
-                      <Button
-                        size="sm"
-                        onClick={() => document.getElementById("billing-plans")?.scrollIntoView({ behavior: "smooth" })}
-                      >
-                        {t("Upgrade plan")}
+                    {allPlans.length > 0 && !isIapManaged && (
+                      <Button size="sm" onClick={() => openModal("plans")}>
+                        {t("Choose plan")}
                       </Button>
                     )}
                     {account.packs.length > 0 && (
-                      <Button
-                        size="sm"
-                        variant="primary"
-                        onClick={() => document.getElementById("billing-packs")?.scrollIntoView({ behavior: "smooth" })}
-                      >
+                      <Button size="sm" variant="primary" onClick={() => openModal("extra")}>
                         {t("Add extra usage")}
                       </Button>
                     )}
@@ -601,187 +709,234 @@ function HostedBilling({
                 </div>
               )}
 
-              <section className="account-summary" aria-label={t("Account summary")}>
-                <article className="card account-summary-card" data-testid="billing-usage-summary">
-                  {summary.mode === "overflow" && (
-                    <div className="billing-completed-cycle" data-testid="billing-completed-cycle">
-                      <div className="billing-completed-row">
-                        <span>{t("Monthly allowance · 100% used")}</span>
-                        {summary.cycle?.resetsAt && (
-                          <span>
-                            {t("Resets {date}").replace("{date}", new Date(summary.cycle.resetsAt).toLocaleDateString())}
-                          </span>
+              {(() => {
+                const planTitle =
+                  subActive && account.plan
+                    ? account.plan.name
+                    : account.trial?.status === "active"
+                      ? t("Free trial")
+                      : t("No active plan");
+                const planUsedPct = summary.cycle
+                  ? summary.cycle.usedPercent
+                  : summary.mode === "depleted"
+                    ? 100
+                    : 0;
+                const planRemPct = summary.cycle
+                  ? summary.cycle.remainingPercent
+                  : summary.mode === "depleted"
+                    ? 0
+                    : 100;
+                const planFillTone =
+                  summary.mode === "depleted"
+                    ? "fail"
+                    : summary.mode === "overflow"
+                      ? "muted"
+                      : planUsedPct >= 80
+                        ? "warn"
+                        : "ok";
+                const planBadge =
+                  account.plan?.status === "past_due"
+                    ? { label: t("Past due"), tone: "warn" as const }
+                    : summary.mode === "overflow"
+                      ? { label: t("100% used"), tone: undefined }
+                      : summary.mode === "depleted"
+                        ? { label: t("100% used"), tone: "fail" as const }
+                        : account.plan?.status === "active"
+                          ? { label: t("Active"), tone: "ok" as const }
+                          : account.trial?.status === "active"
+                            ? { label: t("Trial active"), tone: "info" as const }
+                            : summary.mode === "refill_only"
+                              ? { label: t("Pay-as-you-go"), tone: undefined }
+                              : { label: t("No active subscription"), tone: undefined };
+
+                return (
+                  <section className="account-summary" aria-label={t("Account summary")}>
+                    <article className="card account-summary-card billing-hero-card" data-testid="billing-usage-summary">
+                      <div className="billing-card-head" data-testid="billing-plan-card">
+                        <div className="billing-hero-title-group">
+                          <div className="billing-head-left">
+                            <h2 className="billing-hero-heading">{planTitle}</h2>
+                            <span className="billing-status-pill" data-tone={planBadge.tone}>
+                              {planBadge.label}
+                            </span>
+                          </div>
+                          <p className="billing-hero-sub">
+                            {summary.mode === "trial"
+                              ? t("Included trial allowance · Upgrade anytime")
+                              : !subActive
+                                ? t("No active monthly subscription")
+                                : t("Included monthly allowance")}
+                          </p>
+                        </div>
+                        {allPlans.length > 0 && (
+                          <Button
+                            id="billing-open-plans"
+                            size="sm"
+                            variant={subActive ? "primary" : "secondary"}
+                            onClick={() => openModal("plans")}
+                          >
+                            {subActive ? t("Upgrade") : t("Choose plan")}
+                          </Button>
                         )}
                       </div>
-                      <div className="billing-completed-track" aria-hidden="true">
-                        <div className="billing-completed-fill" />
-                      </div>
-                    </div>
-                  )}
 
-                  <div className="billing-card-head">
-                    <div className="billing-head-left">
-                      <h2>
-                        {isExtraPrimary
-                          ? t("Extra usage")
-                          : summary.mode === "trial"
-                            ? t("Trial usage")
-                            : summary.mode === "depleted"
-                              ? t("Monthly allowance reached")
-                              : t("Monthly usage")}
-                      </h2>
-                      {isExtraPrimary && (
-                        <span className="billing-status-pill" data-tone="info">{t("Active")}</span>
-                      )}
-                    </div>
-                    {account.packs.length > 0 && (
-                      <Button
-                        size="sm"
-                        onClick={() => document.getElementById("billing-packs")?.scrollIntoView({ behavior: "smooth" })}
-                      >
-                        {t("Add extra usage")}
-                      </Button>
-                    )}
-                  </div>
-
-                  {(() => {
-                    const shownPct = isExtraPrimary
-                      ? summary.extra.poolUsedPercent
-                      : (summary.cycle?.usedPercent ?? 100);
-                    const remPct = isExtraPrimary
-                      ? summary.extra.poolRemainingPercent
-                      : (summary.cycle?.remainingPercent ?? 0);
-                    const barTone =
-                      summary.mode === "depleted"
-                        ? "fail"
-                        : isExtraPrimary
-                          ? "info"
-                          : shownPct >= 80
-                            ? "warn"
-                            : "ok";
-                    return (
-                      <>
+                      <div>
                         <div className="billing-usage-row">
                           <p className="account-balance" data-testid="billing-usage-percent">
-                            {shownPct}%
+                            {planUsedPct}%
                           </p>
-                          <span className="billing-usage-sub">
-                            {isExtraPrimary
-                              ? t("of extra usage pool used")
-                              : summary.mode === "trial"
-                                ? t("of trial allowance used")
-                                : t("of monthly allowance used")}
-                          </span>
-                        </div>
-                        <div className="billing-usage-track" aria-hidden="true">
-                          <div className="billing-usage-fill" data-tone={barTone} style={{ width: `${shownPct}%` }} />
-                        </div>
-                        <div className="billing-usage-meta">
-                          <span>{t("{pct}% remaining").replace("{pct}", String(remPct))}</span>
-                          {isExtraPrimary ? (
-                            <span>{t("Prepaid · Never expires · No surprise overage bills")}</span>
-                          ) : summary.cycle?.resetsAt ? (
-                            <span>
+                          <span className="billing-usage-sub">{t("used")}</span>
+                          {summary.cycle?.resetsAt && (
+                            <span className="billing-usage-right">
                               {summary.mode === "trial"
                                 ? `${t("Trial ends")} ${new Date(summary.cycle.resetsAt).toLocaleDateString()}`
                                 : t("Resets {date}").replace("{date}", new Date(summary.cycle.resetsAt).toLocaleDateString())}
                             </span>
-                          ) : null}
+                          )}
                         </div>
-                      </>
-                    );
-                  })()}
+                        <div className="billing-usage-track" aria-hidden="true">
+                          <div className="billing-usage-fill" data-tone={planFillTone} style={{ width: `${planUsedPct}%` }} />
+                        </div>
+                      </div>
 
-                  {summary.mode === "monthly_standby" && summary.extra.hasReserve && (
-                    <div className="billing-extra-standby" data-testid="billing-extra-standby">
-                      <span className="billing-extra-standby-left">
-                        <span className="billing-swatch" data-kind="included" aria-hidden="true" />
-                        <span>{t("Extra usage")}</span>
-                        <span className="billing-status-pill">{t("Standby")}</span>
-                      </span>
-                      <span>
-                        {t("{pct}% left · Applies automatically at 100%").replace(
-                          "{pct}",
-                          String(summary.extra.poolRemainingPercent),
+                      <div className="billing-usage-meta">
+                        <span>{t("{pct}% remaining").replace("{pct}", String(planRemPct))}</span>
+                        {account.trial?.status === "active" ? (
+                          <span>
+                            {account.trial.tokensUsed.toLocaleString()} / {account.trial.tokenCap.toLocaleString()} {t("tokens")}
+                          </span>
+                        ) : (
+                          <span>{t("Cycle allowance")}</span>
                         )}
-                      </span>
-                    </div>
-                  )}
-                </article>
+                      </div>
 
-                <article className="card account-summary-card" data-testid="billing-plan-card">
-                  <div className="billing-card-head">
-                    <h2>{t("Billing plan")}</h2>
-                    <span
-                      className="billing-status-pill"
-                      data-tone={
-                        summary.mode === "depleted"
-                          ? "fail"
-                          : summary.mode === "overflow"
-                            ? "info"
-                            : subActive
-                              ? "ok"
-                              : account.trial?.status === "active"
-                                ? "info"
-                                : undefined
-                      }
-                    >
-                      {summary.mode === "overflow"
-                        ? t("In overflow")
-                        : account.plan?.status === "active"
-                          ? t("Active")
-                          : account.plan?.status === "past_due"
-                            ? t("Past due")
-                            : account.trial?.status === "active"
-                              ? t("Trial active")
-                              : summary.mode === "refill_only"
-                                ? t("Pay-as-you-go")
-                                : t("No active subscription")}
-                    </span>
-                  </div>
-                  <p className="account-plan">
-                    {subActive && account.plan
-                      ? account.plan.name
-                      : account.trial?.status === "active"
-                        ? t("Free trial")
-                        : t("No active plan")}
-                  </p>
-                  <p className="account-plan-status">
-                    {account.plan?.status === "active"
-                      ? t("Active")
-                      : account.plan?.status === "past_due"
-                        ? t("Past due")
-                        : account.trial?.status === "active"
-                          ? t("Trial active")
-                          : summary.mode === "refill_only"
-                            ? t("Pay-as-you-go (Extra usage)")
-                            : t("No active subscription")}
-                  </p>
-                  {account.trial?.status === "active" && (
-                    <p className="billing-trial-meta">
-                      {t("Trial ends")}{" "}
-                      <time dateTime={account.trial.deadlineAt}>
-                        {new Date(account.trial.deadlineAt).toLocaleDateString()}
-                      </time>
-                      {" · "}
-                      {account.trial.tokensUsed.toLocaleString()} / {account.trial.tokenCap.toLocaleString()} {t("tokens")}
+                      {openCheckoutUrl && (
+                        <div className="billing-card-actions">
+                          <a className="btn btn-primary btn-sm" href={openCheckoutUrl}>
+                            {t("Resume checkout")}
+                          </a>
+                        </div>
+                      )}
+                    </article>
+
+                    <article className="card account-summary-card billing-hero-card" data-testid="billing-extra-card">
+                      <div className="billing-card-head">
+                        <div className="billing-hero-title-group">
+                          <div className="billing-head-left">
+                            <h2 className="billing-hero-heading">{t("Extra usage")}</h2>
+                            {isExtraPrimary ? (
+                              <span className="billing-status-pill" data-tone="info">{t("Active")}</span>
+                            ) : summary.extra.hasReserve ? (
+                              <span className="billing-status-pill" data-tone="ok">{t("Standby")}</span>
+                            ) : null}
+                          </div>
+                          <p className="billing-hero-sub">
+                            {isExtraPrimary
+                              ? t("Active overflow — drawing from prepaid reserve")
+                              : summary.extra.hasReserve
+                                ? t("Applies automatically when monthly hits 100%")
+                                : t("Optional prepaid buffer for overflow at 100%")}
+                          </p>
+                        </div>
+                        {account.packs.length > 0 && (
+                          <Button
+                            id="billing-open-extra"
+                            size="sm"
+                            variant={summary.mode === "depleted" ? "primary" : "secondary"}
+                            onClick={() => openModal("extra")}
+                          >
+                            {t("Add extra usage")}
+                          </Button>
+                        )}
+                      </div>
+
+                      {!summary.extra.hasReserve ? (
+                        <p className="billing-empty-reserve">
+                          {t("No prepaid extra usage added. Add a pack so runs continue automatically if your monthly allowance reaches 100%.")}
+                        </p>
+                      ) : isExtraPrimary ? (
+                        <div>
+                          <div className="billing-usage-row">
+                            <p className="account-balance" data-testid="billing-extra-percent">
+                              {summary.extra.poolUsedPercent}%
+                            </p>
+                            <span className="billing-usage-sub">{t("of reserve used")}</span>
+                            <span className="billing-usage-right">
+                              {t("{pct}% remaining").replace("{pct}", String(summary.extra.poolRemainingPercent))}
+                            </span>
+                          </div>
+                          <div className="billing-usage-track" aria-hidden="true">
+                            <div
+                              className="billing-usage-fill"
+                              data-tone="info"
+                              style={{ width: `${summary.extra.poolUsedPercent}%` }}
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <div data-testid="billing-extra-standby">
+                          <div className="billing-usage-row">
+                            <p className="account-balance" data-testid="billing-extra-percent">
+                              {summary.extra.poolRemainingPercent}%
+                            </p>
+                            <span className="billing-usage-sub">{t("left in reserve")}</span>
+                            <span className="billing-usage-right">
+                              {t("{pct}% used").replace("{pct}", String(summary.extra.poolUsedPercent))}
+                            </span>
+                          </div>
+                          <div className="billing-usage-track" aria-hidden="true">
+                            <div
+                              className="billing-usage-fill"
+                              data-tone="info"
+                              style={{ width: `${summary.extra.poolRemainingPercent}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="billing-usage-meta">
+                        <span>{t("Prepaid · Never expires")}</span>
+                        <span>{t("No surprise overage bills")}</span>
+                      </div>
+                    </article>
+                  </section>
+                );
+              })()}
+
+              {(subActive || isIapManaged) && (
+                <section className="card billing-manage-strip" data-testid="billing-manage-strip">
+                  <div>
+                    <strong className="billing-manage-title">{t("Invoices & payment details")}</strong>
+                    <p className="billing-manage-sub">
+                      {isIapManaged
+                        ? planProvider === "apple"
+                          ? t("Managed via Apple App Store.")
+                          : t("Managed via Google Play.")
+                        : t("Payment methods, tax details, and invoices are managed in Stripe.")}
                     </p>
+                  </div>
+                  {!isIapManaged && (
+                    <Button
+                      size="sm"
+                      loading={busyAction === "portal"}
+                      disabled={busyAction !== null}
+                      onClick={() => void runAction("portal", "/api/account/billing/portal", {})}
+                    >
+                      {t("Open billing portal")}
+                    </Button>
                   )}
-                  {openCheckoutUrl && (
-                    <div className="billing-card-actions">
-                      <a className="btn btn-primary btn-sm" href={openCheckoutUrl}>
-                        {t("Resume checkout")}
-                      </a>
-                    </div>
-                  )}
-                </article>
-              </section>
+                </section>
+              )}
 
-              {allPlans.length > 0 && (
-                <section id="billing-plans" className="billing-section" aria-labelledby="billing-plans-title">
-                  <div className="account-section-heading">
-                    <h2 id="billing-plans-title">{t("Subscription plans")}</h2>
-                    {showIntervalToggle && (
+              {activeModal === "plans" && allPlans.length > 0 && (
+                <BillingModal
+                  title={t("Subscription plans")}
+                  sizeClass="billing-modal-plans"
+                  testId="billing-plans-modal"
+                  busy={busyAction !== null}
+                  closeLabel={t("Close")}
+                  headerControls={
+                    showIntervalToggle ? (
                       <div className="billing-interval-toggle" role="group" aria-label={t("Billing interval")}>
                         <button
                           type="button"
@@ -800,8 +955,28 @@ function HostedBilling({
                           {t("Yearly billing")}
                         </button>
                       </div>
-                    )}
-                  </div>
+                    ) : undefined
+                  }
+                  onClose={closeModal}
+                >
+                  {actionError && (
+                    <div className="account-notice" data-tone="fail" role="alert">
+                      <strong>{t("Billing action failed")}</strong>
+                      <p>{actionError}</p>
+                    </div>
+                  )}
+                  {isIapManaged && (
+                    <div className="account-notice" role="status">
+                      <strong>
+                        {planProvider === "apple" ? t("Managed via App Store") : t("Managed via Google Play")}
+                      </strong>
+                      <p>
+                        {planProvider === "apple"
+                          ? t("This workspace subscription is billed through the Apple App Store. Manage or cancel it in your Apple ID subscriptions.")
+                          : t("This workspace subscription is billed through Google Play. Manage or cancel it in Google Play subscriptions.")}
+                      </p>
+                    </div>
+                  )}
                   <div className="billing-catalog-grid">
                     {visiblePlans.map((plan) => {
                       const currentPlan =
@@ -866,16 +1041,52 @@ function HostedBilling({
                       );
                     })}
                   </div>
-                </section>
+                  {isZh && (
+                    <p className="billing-disclosure">
+                      {t("Billed in USD via Stripe. HKD figures are approximate references only.")}
+                    </p>
+                  )}
+                </BillingModal>
               )}
 
-              {account.packs.length > 0 && (
-                <section id="billing-packs" className="billing-section" aria-labelledby="billing-packs-title">
-                  <div className="account-section-heading">
-                    <h2 id="billing-packs-title">{t("Extra usage packs")}</h2>
-                    <span>{t("Prepaid · Never expires · No surprise overage bills")}</span>
+              {activeModal === "extra" && account.packs.length > 0 && (
+                <BillingModal
+                  title={t("Add extra usage")}
+                  sizeClass="billing-modal-extra"
+                  testId="billing-extra-modal"
+                  busy={busyAction !== null}
+                  closeLabel={t("Close")}
+                  onClose={closeModal}
+                >
+                  {actionError && (
+                    <div className="account-notice" data-tone="fail" role="alert">
+                      <strong>{t("Billing action failed")}</strong>
+                      <p>{actionError}</p>
+                    </div>
+                  )}
+                  <div className="billing-extra-reserve-box">
+                    <div className="billing-extra-reserve-row">
+                      <strong>{t("Current prepaid reserve")}</strong>
+                      <span
+                        className="billing-status-pill"
+                        data-tone={!summary.extra.hasReserve ? undefined : isExtraPrimary ? "info" : "ok"}
+                      >
+                        {!summary.extra.hasReserve
+                          ? t("Not added")
+                          : `${t("{pct}% remaining").replace("{pct}", String(summary.extra.poolRemainingPercent))} · ${isExtraPrimary ? t("Active") : t("Standby")}`}
+                      </span>
+                    </div>
+                    {summary.extra.hasReserve && (
+                      <div className="billing-usage-track" aria-hidden="true">
+                        <div
+                          className="billing-usage-fill"
+                          data-tone="info"
+                          style={{ width: `${summary.extra.poolRemainingPercent}%` }}
+                        />
+                      </div>
+                    )}
                   </div>
-                  <div className="billing-catalog-grid">
+                  <div id="billing-packs" className="billing-catalog-grid">
                     {account.packs.map((pack) => {
                       const usd = formatUsdFromMinor(pack.chargeMinor, numLocale) ?? `${pack.chargeMinor}`;
                       const hkd = isZh ? formatApproxHkdFromMinor(pack.chargeMinor) : null;
@@ -899,6 +1110,7 @@ function HostedBilling({
                           <Button
                             full
                             size="sm"
+                            variant="primary"
                             disabled={!pack.available || busyAction !== null}
                             loading={busyAction === actionKey}
                             onClick={() => void runAction(actionKey, "/api/account/billing/topup", { pack: pack.id })}
@@ -909,13 +1121,16 @@ function HostedBilling({
                       );
                     })}
                   </div>
-                </section>
-              )}
-
-              {isZh && (allPlans.length > 0 || account.packs.length > 0) && (
-                <p className="billing-disclosure">
-                  {t("Billed in USD via Stripe. HKD figures are approximate references only.")}
-                </p>
+                  <ul className="billing-explainer-list">
+                    <li>{t("Monthly or trial allowance is always used first; extra usage activates automatically at 100%.")}</li>
+                    <li>{t("Prepaid · Never expires · No surprise overage bills")}</li>
+                  </ul>
+                  {isZh && (
+                    <p className="billing-disclosure">
+                      {t("Billed in USD via Stripe. HKD figures are approximate references only.")}
+                    </p>
+                  )}
+                </BillingModal>
               )}
 
               {(() => {
