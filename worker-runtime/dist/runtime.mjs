@@ -51670,27 +51670,41 @@ var REFUSED_STATUS = word("401|402|403");
 var TOOL_CALL = /tool.?call/i;
 var TOOL_CALL_OUTPUT_LIMIT = /output.?(?:limit|space|token)/i;
 var TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|supported.?limit/i;
-function failedTurnReason(errorMessage) {
+function modelDiagnosticCode(errorMessage) {
   const raw = errorMessage ?? "";
   if (raw.includes("billing_unavailable"))
     return "billing_unavailable";
   if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
-    return "The selected model cannot read images.";
+    return "image_input_unavailable";
   if (TIMEOUT.test(raw))
-    return "The model request timed out.";
+    return "model_timeout";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
-    return "The model service could not be reached.";
+    return "model_unreachable";
   if (BUSY.test(raw) || BUSY_STATUS.test(raw))
-    return "The model is busy right now.";
+    return "model_busy";
   if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
-    return "The model request was refused.";
+    return "model_refused";
   if (TOOL_CALL.test(raw)) {
     if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
-      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
+      return "tool_output_limit";
     if (TOOL_CALL_TOO_LARGE.test(raw))
-      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
+      return "tool_input_limit";
   }
-  return "The model request failed.";
+  return "model_error";
+}
+var modelFailureText = {
+  billing_unavailable: "billing_unavailable",
+  image_input_unavailable: "The selected model cannot read images.",
+  model_timeout: "The model request timed out.",
+  model_unreachable: "The model service could not be reached.",
+  model_busy: "The model is busy right now.",
+  model_refused: "The model request was refused.",
+  tool_output_limit: "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.",
+  tool_input_limit: "The model wrote a tool call that was too large. Ask for the content in smaller parts.",
+  model_error: "The model request failed."
+};
+function failedTurnReason(errorMessage) {
+  return modelFailureText[modelDiagnosticCode(errorMessage)];
 }
 function terminalError(messages, index) {
   const message = messages[index];
@@ -57309,6 +57323,117 @@ function readSessionTranscript(sql, objectId, sessionId, after, project) {
   }
 }
 
+// src/session-turn-diagnostics.ts
+var PAGE_RECORDS2 = 24;
+var MAX_EVENTS = 100;
+var MAX_MODEL_MESSAGES = 4;
+var IDENTIFIER = /^[A-Za-z0-9_.-]{1,160}$/;
+var MODEL = /^[A-Za-z0-9_-][A-Za-z0-9_./:-]{0,159}$/;
+var SOURCE = `(json_extract(record, '$.kind') IN ('pi.assistant', 'pi.tool-result') OR
+  (json_extract(record, '$.kind') = ? AND json_extract(record, '$.data.transcriptRole') = 'operator'))`;
+function identifier(value) {
+  return typeof value === "string" && IDENTIFIER.test(value) ? value : null;
+}
+function timestamp(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000 ? value : null;
+}
+function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
+  const bounds = readSessionBounds(sql, objectId, sessionId);
+  if (bounds === null)
+    return null;
+  try {
+    if (before !== undefined) {
+      if (!Number.isSafeInteger(before) || before <= bounds.anchor || before > bounds.upper)
+        return null;
+      if (!sql.exec(`SELECT id FROM pi_entries WHERE conversation_id=? AND id=? AND ${SOURCE} LIMIT 1`, ROOT_CONVERSATION_ID, before, BOARD_MESSAGE_KIND).toArray()[0])
+        return null;
+    }
+    const rows = sql.exec(`SELECT id, json_extract(record, '$.kind') AS kind,
+         substr(json_extract(record, '$.data.messageId'), 1, 161) AS messageId,
+         json_extract(record, '$.model[0].timestamp') AS inputAt,
+         (SELECT json_group_array(json(evidence)) FROM (
+           SELECT json_object(
+             'role', json_extract(m.value, '$.role'),
+             'at', json_extract(m.value, '$.timestamp'),
+             'model', substr(json_extract(m.value, '$.model'), 1, 161),
+             'stop', json_extract(m.value, '$.stopReason'),
+             'error', CASE WHEN json_extract(m.value, '$.stopReason')='error'
+               THEN substr(json_extract(m.value, '$.errorMessage'), 1, 4096) END,
+             'toolUseId', substr(json_extract(m.value, '$.toolCallId'), 1, 161),
+             'isError', json_extract(m.value, '$.isError'),
+             'calls', json(CASE WHEN json_extract(m.value, '$.role')='assistant' THEN (
+               SELECT json_group_array(json(call)) FROM (
+                 SELECT json_object(
+                   'name', substr(json_extract(p.value, '$.name'), 1, 161),
+                   'id', substr(json_extract(p.value, '$.id'), 1, 161)
+                 ) AS call FROM json_each(m.value, '$.content') p
+                 WHERE p.type='object' AND json_extract(p.value, '$.type')='toolCall'
+                 ORDER BY p.key LIMIT ?
+               )
+             ) ELSE '[]' END)
+           ) AS evidence FROM json_each(record, '$.model') m
+           WHERE m.type='object' AND json_extract(m.value, '$.role') IN ('assistant', 'toolResult')
+           ORDER BY m.key LIMIT ?
+         )) AS evidence
+       FROM (
+         SELECT id, record FROM pi_entries WHERE conversation_id=? AND id>? AND id<=?
+           AND ${SOURCE} ORDER BY id DESC LIMIT ?
+       ) ORDER BY id DESC`, MAX_EVENTS + 1, MAX_MODEL_MESSAGES + 1, ROOT_CONVERSATION_ID, bounds.anchor, before === undefined ? bounds.upper : before - 1, BOARD_MESSAGE_KIND, PAGE_RECORDS2 + 1).toArray();
+    const groups = [];
+    let eventCount = 0;
+    let oldest = null;
+    for (let i = 0;i < Math.min(rows.length, PAGE_RECORDS2); i++) {
+      const row = rows[i];
+      if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || typeof row.evidence !== "string")
+        return null;
+      const group = [];
+      const messageId = row.kind === BOARD_MESSAGE_KIND ? identifier(row.messageId) : null;
+      if (messageId !== null)
+        group.push({ kind: "input", at: timestamp(row.inputAt), messageId });
+      const evidence = JSON.parse(row.evidence);
+      if (evidence.length > MAX_MODEL_MESSAGES)
+        return null;
+      for (const entry of evidence) {
+        const at = timestamp(entry.at);
+        if (entry.role === "toolResult") {
+          const toolUseId = identifier(entry.toolUseId);
+          if (toolUseId !== null)
+            group.push({ kind: "tool_result", at, toolUseId, outcome: entry.isError === 1 ? "error" : "ok" });
+          continue;
+        }
+        if (entry.calls.length > MAX_EVENTS)
+          return null;
+        for (const call of entry.calls) {
+          const toolName = identifier(call.name);
+          const toolUseId = identifier(call.id);
+          if (toolName !== null && toolUseId !== null)
+            group.push({ kind: "tool_call", at, toolName, toolUseId });
+        }
+        const model = typeof entry.model === "string" && MODEL.test(entry.model) && !entry.model.includes("://") ? entry.model : null;
+        if (entry.stop === "error") {
+          group.push({ kind: "model_error", at, model, code: modelDiagnosticCode(entry.error ?? undefined) });
+        } else if (entry.stop === "stop" || entry.stop === "length") {
+          group.push({ kind: "response_finished", at, model, reason: entry.stop });
+        }
+      }
+      if (eventCount + group.length > MAX_EVENTS) {
+        if (oldest === null)
+          return null;
+        break;
+      }
+      groups.push(group);
+      eventCount += group.length;
+      oldest = row.id;
+    }
+    const events = [];
+    for (let i = groups.length - 1;i >= 0; i--)
+      events.push(...groups[i]);
+    return { events, nextBefore: rows.length > groups.length ? oldest : null };
+  } catch {
+    return null;
+  }
+}
+
 // src/summary-tool-errors.ts
 var TOOL_ERROR_REDACTED = "the call failed; its error text is left out of this summary";
 var TOOL_ERROR_TEXT_OMITTED = "(tool error text omitted)";
@@ -58155,6 +58280,9 @@ data: ${JSON.stringify(entry)}
   }
   sessionTranscript(sessionId, after) {
     return readSessionTranscript(this.ctx.storage.sql, this.ctx.id.toString(), sessionId, after, this.options.projectThread);
+  }
+  sessionTurnDiagnostics(sessionId, before) {
+    return readSessionTurnDiagnostics(this.ctx.storage.sql, this.ctx.id.toString(), sessionId, before);
   }
   async recordCount() {
     return (await this.harness.session().messages()).length;

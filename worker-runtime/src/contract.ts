@@ -446,6 +446,32 @@ export type HostedSessionInspection =
   | { readonly state: "observed"; readonly session: HostedSessionSummary }
   | { readonly state: "unobserved" | "unknown" };
 
+export type HostedModelDiagnosticCode =
+  | "model_error"
+  | "model_timeout"
+  | "model_unreachable"
+  | "model_busy"
+  | "model_refused"
+  | "image_input_unavailable"
+  | "billing_unavailable"
+  | "tool_output_limit"
+  | "tool_input_limit";
+
+/** Committed observations, not inferred turn outcomes. No conversation content. */
+export type HostedTurnDiagnosticEvent = { at: number | null } & (
+  | { kind: "input"; messageId: string }
+  | { kind: "tool_call"; toolName: string; toolUseId: string }
+  | { kind: "tool_result"; toolUseId: string; outcome: "ok" | "error" }
+  | { kind: "model_error"; model: string | null; code: HostedModelDiagnosticCode }
+  | { kind: "response_finished"; model: string | null; reason: "stop" | "length" }
+);
+
+export interface HostedTurnDiagnosticsPage {
+  events: HostedTurnDiagnosticEvent[];
+  /** Exclusive position for the next (older) page of the same runtime generation. */
+  nextBefore: number | null;
+}
+
 /** Shown when a blocking compaction failed and its run ended without an answer. */
 export const COMPACTION_FAILURE_TEXT =
   "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";

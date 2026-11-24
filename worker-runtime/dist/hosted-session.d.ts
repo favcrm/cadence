@@ -66,6 +66,8 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
         }[];
         nextCursor: number | null;
     } | null;
+    /** Read bounded, content-free evidence for one exact, committed generation. */
+    sessionTurnDiagnostics(sessionId: string, before?: number): import("./contract.js").HostedTurnDiagnosticsPage | null;
     /** Stored runtime records, not expanded presentation entries. Read-only. */
     recordCount(): Promise<number>;
     /** Abort this instance; durable state is retained when it is reconstructed. */

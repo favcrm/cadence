@@ -87,6 +87,7 @@ import { PreviewGuard } from "./preview.ts";
 import { rawSessionFrame, sessionEventResponse } from "./session-stream.ts";
 import { readSessionSummary } from "./session-summary.ts";
 import { readSessionTranscript } from "./session-transcript.ts";
+import { readSessionTurnDiagnostics } from "./session-turn-diagnostics.ts";
 import { renderSummarySource } from "./summary-source.ts";
 import type { ToolAuthority } from "./tool-policy.ts";
 import { BOARD_MESSAGE_KIND } from "./contract.ts";
@@ -659,6 +660,16 @@ export class HostedSession<
       sessionId,
       after,
       this.options.projectThread,
+    );
+  }
+
+  /** Read bounded, content-free evidence for one exact, committed generation. */
+  sessionTurnDiagnostics(sessionId: string, before?: number) {
+    return readSessionTurnDiagnostics(
+      this.ctx.storage.sql as unknown as TaskSql,
+      this.ctx.id.toString(),
+      sessionId,
+      before,
     );
   }
 

@@ -516,6 +516,14 @@ and omits inputs without recorded visibility, including older input records
 that predate that marker. Missing proof or an older host/runtime never falls
 back to whole-conversation history.
 
+For support triage, `HostedSession.sessionTurnDiagnostics(sessionId, before?)`
+reads the newest committed observations inside the same proven generation.
+Use `nextBefore` to fetch an older page; each page is chronological. An
+unavailable or unproven generation returns `null`, not an empty result.
+Tool calls and results share their recorded tool-use ID. A model error is a
+recorded attempt, not proof a later retry failed. The read sends no prompts,
+reasoning, tool arguments/results, or provider error text and never starts work.
+
 From `worker-runtime/`, using its pinned Bun version:
 
 ```sh
