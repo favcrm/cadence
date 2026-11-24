@@ -15,13 +15,12 @@
 
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::*;
 use crate::platform::{ImageFailure, ImageReason, ImageSettle};
 use crate::store::app_records::RecordStore;
-use crate::store::app_social_drafts::{ImageJob, ImageSettlement};
-use crate::store::app_tools::AppToolRecord;
+use crate::store::app_social_drafts::{ImageJobAuthority, ImageSettlement};
 
 /// Per-job window before a still-unresolved job settles `uncertain`. An
 /// explicit re-check opens a fresh window; a restart always replays the key
@@ -201,28 +200,24 @@ impl Shared {
             }
         }
         let records = RecordStore::open(&self.state_dir, install)?;
-        let Some(job) = records.app_social_image_job(call_id)? else {
+        let Some(job_authority) = records.app_social_image_job_authority(call_id)? else {
             return Ok(RunEnd::Held);
         };
-        let Some(spec) = job.spec.clone().filter(|_| job.state == "active") else {
+        let job = job_authority.job();
+        let Some(spec) = job.spec.as_ref() else {
             return Ok(RunEnd::Held);
         };
-        let settle = |settlement| records.app_social_image_job_settle(call_id, settlement);
+        let settle =
+            |settlement| records.app_social_image_job_settle_authorized(&job_authority, settlement);
         // A crash between the stored receipt and the settle: retain it in
         // this context before completing the intent, without another provider call.
-        if let Some(receipt) = self.store.app_tool_result_for_request(&job.request_id)? {
+        if let Some(receipt) =
+            records.app_social_image_result_for_job(&self.store, &job_authority)?
+        {
             let id = receipt["id"].as_str().unwrap_or_default();
-            if let Some(created) = receipt["created_at"].as_f64() {
-                #[cfg(feature = "test-seam")]
-                test_probe::before_receipt_attach(&job.request_id, id);
-                records.app_social_tool_receipt_attach(
-                    &job.context_id,
-                    id,
-                    created,
-                    receipt["result"]["kind"].as_str().unwrap_or(""),
-                )?;
-            }
-            settle(ImageSettlement::Succeeded { receipt: id })?;
+            #[cfg(feature = "test-seam")]
+            test_probe::before_receipt_attach(&job.request_id, id);
+            records.app_social_image_complete(&self.store, &job_authority)?;
             self.social_attach_image(&records, &job.context_id, &job.request_id, id);
             return Ok(RunEnd::Settled);
         }
@@ -272,7 +267,7 @@ impl Shared {
             };
             let failure = match outcome {
                 Ok(output) => {
-                    self.image_job_succeed(&records, &job, &spec, &credential, output)?;
+                    self.image_job_succeed(&records, &job_authority, &credential, output)?;
                     return Ok(RunEnd::Settled);
                 }
                 Err(failure) => failure,
@@ -309,11 +304,11 @@ impl Shared {
     fn image_job_succeed(
         &self,
         records: &RecordStore,
-        job: &ImageJob,
-        spec: &Value,
+        authority: &ImageJobAuthority,
         credential: &[u8],
         output: crate::platform::AppCapabilityOutput,
     ) -> Result<()> {
+        let job = authority.job();
         let leaked =
             crate::platform::refuse_leak("app tool result", &output.result.to_string(), credential)
                 .is_err()
@@ -326,47 +321,29 @@ impl Shared {
                     .is_err()
                 });
         if leaked {
-            records.app_social_image_job_settle(
-                &job.call_id,
+            records.app_social_image_job_settle_authorized(
+                authority,
                 ImageSettlement::Uncertain {
                     reason: ImageReason::JobMalformed.code(),
                 },
             )?;
             return Ok(());
         }
-        let text = |key: &str| spec[key].as_str().unwrap_or_default();
-        let receipt = self.store.app_tool_record(AppToolRecord {
-            id: &job.call_id,
-            request: &job.request_id,
-            install: records.install(),
-            alias: text("alias"),
-            slot: text("slot"),
-            binding_digest: text("binding_digest"),
-            input_digest: text("input_digest"),
-            input: &spec["input"],
-            result: &output.result,
-            asset: output
+        let receipt = records.app_social_image_record_result(
+            &self.store,
+            authority,
+            &output.result,
+            output
                 .asset
                 .as_ref()
                 .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
-        })?;
+        )?;
         let id = receipt["id"].as_str().unwrap_or_default();
         // Completed is observable immediately; its receipt must already be
         // retained in this context for the real draft attachment guard.
-        if let Some(created) = receipt["created_at"].as_f64() {
-            #[cfg(feature = "test-seam")]
-            test_probe::before_receipt_attach(&job.request_id, id);
-            records.app_social_tool_receipt_attach(
-                &job.context_id,
-                id,
-                created,
-                receipt["result"]["kind"].as_str().unwrap_or(""),
-            )?;
-        }
-        records.app_social_image_job_settle(
-            &job.call_id,
-            ImageSettlement::Succeeded { receipt: id },
-        )?;
+        #[cfg(feature = "test-seam")]
+        test_probe::before_receipt_attach(&job.request_id, id);
+        records.app_social_image_complete(&self.store, authority)?;
         self.social_attach_image(records, &job.context_id, &job.request_id, id);
         Ok(())
     }
