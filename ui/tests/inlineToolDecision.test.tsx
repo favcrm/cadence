@@ -77,8 +77,10 @@ async function settle(check: () => void) {
 }
 const text = (el: Element | null | undefined) => (el?.textContent ?? "").replace(/[\u2066-\u2069]/g, "").replace(/\s+/g, " ").trim();
 const button = (host: Element, label: string) => Array.from(host.querySelectorAll("button")).find((b) => text(b) === label) as HTMLElement | undefined;
-async function click(el: Element | undefined | null) {
+const sleep = (ms: number) => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); });
+async function click(el: Element | undefined | null, quick = false) {
   assert(el, "click target exists");
+  if (!quick && (text(el) === "Approve" || text(el) === "Always allow")) await sleep(850);
   await React.act(async () => { el.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 } as any)); });
   await flush();
 }
@@ -99,6 +101,8 @@ let { host, root } = await mount(true, "en", "c1");
 await settle(() => assert(button(host, "Approve") && button(host, "Always allow") && button(host, "Reject"), "three buttons"));
 assert(!button(host, "Review"), "no Review button");
 assert(text(host).includes("Run create_invoice on Acme Billing?") && text(host).includes("customer: Marlow Books") && host.querySelector("details"), "title, operation line and collapsed input");
+await click(button(host, "Approve"), true);
+assert(calls.length === 0, "a click before arming does nothing");
 await click(button(host, "Approve"));
 await settle(() => assert(text(host).includes("Approved · create_invoice") && !button(host, "Approve"), "the card shrinks to one line"));
 assert(calls.join("|") === "approve:a1", "approve called once, no tool-mode update");

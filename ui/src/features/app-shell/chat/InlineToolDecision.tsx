@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState, type MouseEvent } from "react";
+import { ARM_MS } from "../../decisions/StagedWriteDetail";
 import { isolate, type StagedWrite } from "../../decisions/stagedWrite";
 import Button from "../../../ui/Button";
 
@@ -43,6 +45,17 @@ export default function InlineToolDecision({
   t: (key: string) => string;
 }) {
   const { write, busy, done, note } = entry;
+  // Same guard as the drawer: a new card ignores Approve and Always allow until armed, and a double-click.
+  const armedAt = useRef(Date.now() + ARM_MS);
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setArmed(true), ARM_MS);
+    return () => clearTimeout(timer);
+  }, []);
+  const guarded = (verb: InlineVerb) => (event: MouseEvent) => {
+    if (event.detail > 1 || Date.now() < armedAt.current) return;
+    onDecide(verb);
+  };
   const { tool, connection } = names(write);
   if (done !== undefined) {
     return (
@@ -70,9 +83,9 @@ export default function InlineToolDecision({
         <pre className="text-label text-ink-300" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{isolate(write.raw)}</pre>
       </details>
       <div className="flex gap-2">
-        <Button size="sm" variant="primary" disabled={busy} onClick={() => onDecide("approve")}>{t("Approve")}</Button>
+        <Button size="sm" variant="primary" disabled={busy || !armed} onClick={guarded("approve")}>{t("Approve")}</Button>
         {canAlwaysAllow && write.kind === "custom_mcp_effect" && (
-          <Button size="sm" variant="secondary" disabled={busy} onClick={() => onDecide("always")}>{t("Always allow")}</Button>
+          <Button size="sm" variant="secondary" disabled={busy || !armed} onClick={guarded("always")}>{t("Always allow")}</Button>
         )}
         <Button size="sm" variant="ghost" disabled={busy} onClick={() => onDecide("reject")}>{t("Reject")}</Button>
       </div>
