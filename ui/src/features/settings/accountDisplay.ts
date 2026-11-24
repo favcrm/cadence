@@ -95,11 +95,52 @@ export interface HostedBillingOffer {
   };
 }
 
+export type HostedBillingUsageMode =
+  | "monthly"
+  | "monthly_standby"
+  | "overflow"
+  | "refill_only"
+  | "trial"
+  | "depleted";
+
+export interface HostedBillingUsageCycle {
+  usedPercent: number;
+  remainingPercent: number;
+  resetsAt: string | null;
+}
+
+export interface HostedBillingUsageExtra {
+  hasReserve: boolean;
+  poolRemainingPercent: number;
+  poolUsedPercent: number;
+  status: "none" | "standby" | "active" | "low" | "depleted";
+}
+
+export interface HostedBillingUsageSummary {
+  mode: HostedBillingUsageMode;
+  cycle: HostedBillingUsageCycle | null;
+  extra: HostedBillingUsageExtra;
+  denominatorBasis: "monthly_plan" | "trial" | "standard_month";
+}
+
+export interface HostedBillingDailyUsage {
+  date: string;
+  runCount: number;
+  totalPercent: number;
+  monthlyPercent: number;
+  extraPercent: number;
+  source: "monthly" | "extra" | "mixed";
+  models: string[];
+}
+
 export interface HostedBillingUsageRow {
   date: string;
   description: string;
   amount: string;
   kind: "credit" | "debit" | "charge" | "grant";
+  model?: string | null;
+  source?: "monthly" | "extra" | null;
+  usagePercent?: number | null;
 }
 
 export interface HostedBillingAccount {
@@ -109,6 +150,7 @@ export interface HostedBillingAccount {
   links: { account: string; topUp?: string };
   packs: HostedBillingPack[];
   trial: HostedBillingTrial | null;
+  usageSummary?: HostedBillingUsageSummary;
 }
 
 export interface HostedBillingSnapshot {
@@ -126,6 +168,7 @@ export interface HostedBillingSnapshot {
   usage: {
     rows: HostedBillingUsageRow[];
     cursor: string | null;
+    dailyUsage?: HostedBillingDailyUsage[];
   };
   manageUrl: string | null;
 }
@@ -290,6 +333,94 @@ function parsePack(value: unknown): HostedBillingPack | null {
   };
 }
 
+function isPctInt(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 100;
+}
+
+function parseUsageSummary(value: unknown): HostedBillingUsageSummary | null {
+  if (!isRecord(value)) return null;
+  const modes = new Set(["monthly", "monthly_standby", "overflow", "refill_only", "trial", "depleted"]);
+  if (typeof value.mode !== "string" || !modes.has(value.mode)) return null;
+  if (
+    value.denominatorBasis !== "monthly_plan" &&
+    value.denominatorBasis !== "trial" &&
+    value.denominatorBasis !== "standard_month"
+  ) {
+    return null;
+  }
+  let cycle: HostedBillingUsageCycle | null = null;
+  if (value.cycle !== null) {
+    if (
+      !isRecord(value.cycle) ||
+      !isPctInt(value.cycle.usedPercent) ||
+      !isPctInt(value.cycle.remainingPercent) ||
+      !isNullableString(value.cycle.resetsAt)
+    ) {
+      return null;
+    }
+    cycle = {
+      usedPercent: value.cycle.usedPercent,
+      remainingPercent: value.cycle.remainingPercent,
+      resetsAt: value.cycle.resetsAt,
+    };
+  }
+  const extraRaw = value.extra;
+  const extraStatuses = new Set(["none", "standby", "active", "low", "depleted"]);
+  if (
+    !isRecord(extraRaw) ||
+    typeof extraRaw.hasReserve !== "boolean" ||
+    !isPctInt(extraRaw.poolRemainingPercent) ||
+    !isPctInt(extraRaw.poolUsedPercent) ||
+    typeof extraRaw.status !== "string" ||
+    !extraStatuses.has(extraRaw.status)
+  ) {
+    return null;
+  }
+  return {
+    mode: value.mode as HostedBillingUsageMode,
+    cycle,
+    extra: {
+      hasReserve: extraRaw.hasReserve,
+      poolRemainingPercent: extraRaw.poolRemainingPercent,
+      poolUsedPercent: extraRaw.poolUsedPercent,
+      status: extraRaw.status as HostedBillingUsageExtra["status"],
+    },
+    denominatorBasis: value.denominatorBasis,
+  };
+}
+
+function parseDailyUsage(value: unknown): HostedBillingDailyUsage[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: HostedBillingDailyUsage[] = [];
+  for (const row of value) {
+    if (
+      !isRecord(row) ||
+      typeof row.date !== "string" ||
+      typeof row.runCount !== "number" ||
+      !Number.isInteger(row.runCount) ||
+      row.runCount < 0 ||
+      typeof row.totalPercent !== "number" ||
+      typeof row.monthlyPercent !== "number" ||
+      typeof row.extraPercent !== "number" ||
+      (row.source !== "monthly" && row.source !== "extra" && row.source !== "mixed") ||
+      !Array.isArray(row.models) ||
+      !row.models.every((m) => typeof m === "string")
+    ) {
+      return null;
+    }
+    out.push({
+      date: row.date,
+      runCount: row.runCount,
+      totalPercent: row.totalPercent,
+      monthlyPercent: row.monthlyPercent,
+      extraPercent: row.extraPercent,
+      source: row.source,
+      models: row.models,
+    });
+  }
+  return out;
+}
+
 function parseHostedAccount(value: unknown): HostedBillingAccount | null {
   if (!isRecord(value) || !isRecord(value.company) || typeof value.company.name !== "string") return null;
   const b = value.balance;
@@ -343,6 +474,12 @@ function parseHostedAccount(value: unknown): HostedBillingAccount | null {
     trial = parseTrial(value.trial);
     if (!trial) return null;
   }
+  let usageSummary: HostedBillingUsageSummary | undefined;
+  if (value.usageSummary !== undefined) {
+    const parsedSummary = parseUsageSummary(value.usageSummary);
+    if (!parsedSummary) return null;
+    usageSummary = parsedSummary;
+  }
   return {
     company: { name: value.company.name },
     balance: {
@@ -360,6 +497,7 @@ function parseHostedAccount(value: unknown): HostedBillingAccount | null {
     },
     packs,
     trial,
+    ...(usageSummary !== undefined ? { usageSummary } : {}),
   };
 }
 
@@ -430,12 +568,38 @@ export function parseHostedBilling(value: unknown): HostedBillingSnapshot | null
     ) {
       return null;
     }
+    let model: string | null | undefined;
+    if (row.model !== undefined) {
+      if (!isNullableString(row.model)) return null;
+      model = row.model;
+    }
+    let source: "monthly" | "extra" | null | undefined;
+    if (row.source !== undefined) {
+      if (row.source !== null && row.source !== "monthly" && row.source !== "extra") return null;
+      source = row.source;
+    }
+    let usagePercent: number | null | undefined;
+    if (row.usagePercent !== undefined) {
+      if (row.usagePercent !== null && (typeof row.usagePercent !== "number" || row.usagePercent < 0)) {
+        return null;
+      }
+      usagePercent = row.usagePercent;
+    }
     rows.push({
       date: row.date,
       description: row.description,
       amount: row.amount,
       kind: row.kind,
+      ...(model !== undefined ? { model } : {}),
+      ...(source !== undefined ? { source } : {}),
+      ...(usagePercent !== undefined ? { usagePercent } : {}),
     });
+  }
+  let dailyUsage: HostedBillingDailyUsage[] | undefined;
+  if (value.usage.dailyUsage !== undefined) {
+    const parsedDaily = parseDailyUsage(value.usage.dailyUsage);
+    if (!parsedDaily) return null;
+    dailyUsage = parsedDaily;
   }
   if (!isNullableString(value.manageUrl)) return null;
   return {
@@ -445,7 +609,11 @@ export function parseHostedBilling(value: unknown): HostedBillingSnapshot | null
     account,
     offer,
     receivable: value.receivable,
-    usage: { rows, cursor: value.usage.cursor },
+    usage: {
+      rows,
+      cursor: value.usage.cursor,
+      ...(dailyUsage !== undefined ? { dailyUsage } : {}),
+    },
     manageUrl: value.manageUrl,
   };
 }
@@ -581,6 +749,194 @@ export function formatApproxHkdFromMinor(chargeMinor: number): string | null {
   if (!Number.isSafeInteger(chargeMinor) || chargeMinor < 0) return null;
   const hkd = (BigInt(chargeMinor) * HKD_PEG_NUM + HKD_PEG_DEN / 2n) / HKD_PEG_DEN;
   return `≈ HK$${hkd.toString()}`;
+}
+
+/** Resolve server-computed usageSummary, with safe fallback for older API responses. */
+export function resolveUsageSummary(
+  account: HostedBillingAccount,
+  offer: HostedBillingOffer | null,
+): HostedBillingUsageSummary {
+  if (account.usageSummary) return account.usageSummary;
+  const subActive = account.plan?.status === "active" || account.plan?.status === "past_due";
+  const trialActive = !subActive && account.trial?.status === "active";
+  const includedMicro = parseScaled6(account.balance.includedAmount) ?? 0n;
+  const refillMicro = parseScaled6(account.balance.refillAmount) ?? 0n;
+  const hasReserve = refillMicro > 0n;
+  const poolRemainingPercent = hasReserve ? 100 : 0;
+  const poolUsedPercent = 0;
+
+  let cycle: HostedBillingUsageCycle | null = null;
+  if (subActive || trialActive) {
+    let usedPct = includedMicro > 0n ? 0 : 100;
+    if (trialActive && account.trial && account.trial.tokenCap > 0) {
+      usedPct = Math.min(100, Math.round((account.trial.tokensUsed * 100) / account.trial.tokenCap));
+    } else if (subActive && includedMicro > 0n && offer) {
+      const plans = offer.plans && offer.plans.length > 0 ? offer.plans : offer.plan ? [offer.plan] : [];
+      const matched = plans.find((p) => p.id === account.plan?.planId) ?? plans[0];
+      const grantMicro = matched ? (parseScaled6(matched.includedCredit) ?? 0n) : 0n;
+      if (grantMicro > 0n) {
+        const rem = Math.min(100, Math.max(0, Number((includedMicro * 100n) / grantMicro)));
+        usedPct = 100 - rem;
+      }
+    }
+    cycle = {
+      usedPercent: usedPct,
+      remainingPercent: 100 - usedPct,
+      resetsAt: trialActive ? (account.trial?.deadlineAt ?? null) : null,
+    };
+  }
+
+  let mode: HostedBillingUsageMode;
+  let extraStatus: HostedBillingUsageExtra["status"];
+  if (subActive) {
+    if (cycle && cycle.usedPercent < 100) {
+      mode = hasReserve ? "monthly_standby" : "monthly";
+      extraStatus = hasReserve ? "standby" : "none";
+    } else if (hasReserve) {
+      mode = "overflow";
+      extraStatus = account.balance.low ? "low" : "active";
+    } else {
+      mode = "depleted";
+      extraStatus = "depleted";
+    }
+  } else if (trialActive) {
+    if (cycle && cycle.usedPercent < 100) {
+      mode = "trial";
+      extraStatus = hasReserve ? "standby" : "none";
+    } else if (hasReserve) {
+      mode = "overflow";
+      extraStatus = account.balance.low ? "low" : "active";
+    } else {
+      mode = "depleted";
+      extraStatus = "depleted";
+    }
+  } else if (hasReserve) {
+    mode = "refill_only";
+    extraStatus = account.balance.low ? "low" : "active";
+  } else {
+    mode = "depleted";
+    extraStatus = "depleted";
+  }
+
+  return {
+    mode,
+    cycle,
+    extra: {
+      hasReserve,
+      poolRemainingPercent,
+      poolUsedPercent,
+      status: extraStatus,
+    },
+    denominatorBasis: subActive ? "monthly_plan" : trialActive ? "trial" : "standard_month",
+  };
+}
+
+function positiveMicroBig(scaled6: string): bigint {
+  return parseScaled6(scaled6) ?? 0n;
+}
+
+function formatRatioMultiplier(ratio: number): string {
+  if (!Number.isFinite(ratio) || ratio <= 0) return "1×";
+  const rounded = Math.round(ratio * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded}×` : `${rounded.toFixed(1)}×`;
+}
+
+/** Express each subscription tier relative to the base monthly plan (`1×`, `3×`, ...). */
+export function planCapacityLabel(plans: readonly HostedBillingOfferPlan[], plan: HostedBillingOfferPlan): string {
+  const monthly = plans
+    .filter((entry) => entry.period === "month")
+    .map((entry) => positiveMicroBig(entry.includedCredit))
+    .filter((v) => v > 0n);
+  const all = plans.map((entry) => positiveMicroBig(entry.includedCredit)).filter((v) => v > 0n);
+  const pool = monthly.length > 0 ? monthly : all;
+  let base = 0n;
+  for (const val of pool) {
+    if (base === 0n || val < base) base = val;
+  }
+  const current = positiveMicroBig(plan.includedCredit);
+  if (base <= 0n || current <= 0n) return "1×";
+  return formatRatioMultiplier(Number(current) / Number(base));
+}
+
+/** Express an extra capacity pack relative to the standard monthly plan (`+50%`, `+2×`, ...). */
+export function packCapacityLabel(
+  packs: readonly HostedBillingPack[],
+  plans: readonly HostedBillingOfferPlan[],
+  pack: HostedBillingPack,
+): string {
+  const monthly = plans
+    .filter((entry) => entry.period === "month")
+    .map((entry) => positiveMicroBig(entry.includedCredit))
+    .filter((v) => v > 0n);
+  const packSizes = packs.map((entry) => positiveMicroBig(entry.credit)).filter((v) => v > 0n);
+  const pool = monthly.length > 0 ? monthly : packSizes;
+  let base = 0n;
+  for (const val of pool) {
+    if (base === 0n || val < base) base = val;
+  }
+  const current = positiveMicroBig(pack.credit);
+  if (base <= 0n || current <= 0n) return "+1×";
+  const ratio = Number(current) / Number(base);
+  if (ratio < 1) return `+${Math.max(1, Math.round(ratio * 100))}%`;
+  return `+${formatRatioMultiplier(ratio)}`;
+}
+
+/** Format a usage percentage share (`<0.1%`, `1.4%`, or `null` when unavailable). */
+export function formatUsagePercent(value: number | null | undefined): string | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  if (value <= 0) return "0.0%";
+  if (value < 0.1) return "<0.1%";
+  return `${value.toFixed(1)}%`;
+}
+
+export interface SidebarBillingStatus {
+  labelKind: "plan" | "trial" | "billing";
+  planName?: string;
+  metricKind: "used" | "extra_left" | "depleted";
+  percent: number;
+  tone: "ok" | "warn" | "info" | "fail";
+}
+
+/** Derive compact percentage/health status for the sidebar footer pill (zero raw credits). */
+export function sidebarBillingStatus(
+  account: HostedBillingAccount,
+  offer: HostedBillingOffer | null,
+): SidebarBillingStatus {
+  const summary = resolveUsageSummary(account, offer);
+  const subActive = account.plan?.status === "active" || account.plan?.status === "past_due";
+  const labelKind: SidebarBillingStatus["labelKind"] = subActive
+    ? "plan"
+    : account.trial?.status === "active"
+      ? "trial"
+      : "billing";
+  const planName = subActive ? account.plan?.name : undefined;
+
+  if (summary.mode === "overflow" || summary.mode === "refill_only") {
+    return {
+      labelKind,
+      ...(planName ? { planName } : {}),
+      metricKind: "extra_left",
+      percent: summary.extra.poolRemainingPercent,
+      tone: summary.extra.status === "low" ? "warn" : "info",
+    };
+  }
+  if (summary.mode === "depleted") {
+    return {
+      labelKind,
+      ...(planName ? { planName } : {}),
+      metricKind: "depleted",
+      percent: 100,
+      tone: "fail",
+    };
+  }
+  const used = summary.cycle?.usedPercent ?? 0;
+  return {
+    labelKind,
+    ...(planName ? { planName } : {}),
+    metricKind: "used",
+    percent: used,
+    tone: used >= 80 ? "warn" : "ok",
+  };
 }
 
 /** Integer-derived percentage split between included/trial credits and non-expiring refills. */
