@@ -2514,6 +2514,7 @@ Object.assign(zhTW, {
   // CAD-2471: an app view in the canvas.
   "App": "應用程式",
   "read-only": "唯讀",
+  "Preview workbook": "預覽試算表",
   "Open in {app}": "在 {app} 開啟",
   "Open in canvas": "在畫布開啟",
   "No access": "沒有存取權限",
