@@ -723,12 +723,14 @@ function HostedBilling({
       && (stored === null || attemptStates.subscription === "closed" || attemptStates.subscription === "confirmed"))
       || (typeof stored === "object" && stored?.attemptId === id);
     if (trackHere && !savedAttempt("subscription", data.workspace.id, id)) {
-      setCloseState("unknown");
+      setConfirmClose(null);
+      setActionError(t("Checkout wasn’t closed. Allow session storage in this browser and try again."));
       return;
     }
     actionGuard.current = true;
     refreshVersion.current++;
     setBusyAction("cancel");
+    setActionError(null);
     lastCloseId.current = id;
     setCloseState("unknown");
     setCheckoutStatus({ attemptId: id, state: "unknown", resumeUrl: null });
@@ -763,7 +765,7 @@ function HostedBilling({
       setConfirmClose(null);
       void refresh();
     }
-  }, [data, sessionScope, dataScope, confirmClose, error, loading, checkingPayment, unsupported, checkout?.state, attemptStates.subscription, savedAttempt, refresh]);
+  }, [data, sessionScope, dataScope, confirmClose, error, loading, checkingPayment, unsupported, checkout?.state, attemptStates.subscription, savedAttempt, refresh, t]);
 
   const openModal = useCallback((kind: "plans" | "extra") => {
     setActionError(null);

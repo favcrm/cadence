@@ -865,6 +865,33 @@ async function run(): Promise<void> {
   await React.act(async () => resumeButton()?.click());
   assert(!resumeButton(), "completed checkout still awaiting payment cannot resume");
   equal(redirects.length, beforeResume, "an earlier checkout URL is not used after session completion");
+
+  const findButton = (label: string) => Array.from(host.querySelectorAll("button"))
+    .find((button) => button.textContent?.trim() === label);
+  const workingStorage = globalThis.sessionStorage;
+  const closes = () => requests.filter((request) => request.path === "/api/account/billing/subscribe/cancel").length;
+  const beforeClose = closes();
+  try {
+    globalThis.sessionStorage = {
+      getItem: workingStorage.getItem.bind(workingStorage),
+      setItem() { throw new DOMException("Storage full", "QuotaExceededError"); },
+    } as unknown as Storage;
+    const openClose = findButton("Close Checkout");
+    assert(openClose && !openClose.disabled, "open subscription offers Close Checkout");
+    await React.act(async () => openClose.click());
+    const confirmClose = findButton("Confirm close Checkout");
+    assert(confirmClose && !confirmClose.disabled, "closing requires explicit confirmation");
+    await React.act(async () => confirmClose.click());
+    assert(host.textContent?.includes("Checkout wasn’t closed."), "explain a close that was not sent");
+    equal(closes(), beforeClose, "storage failure refuses before dispatch");
+  } finally {
+    globalThis.sessionStorage = workingStorage;
+  }
+  nextBillingPayload = syntheticSnapshot;
+  await React.act(async () => findButton("Refresh")?.click());
+  await React.act(async () => (host.querySelector("#billing-open-plans") as HTMLButtonElement).click());
+  assert(!(host.querySelector('[data-plan-id="synth_basic_mo"] button') as HTMLButtonElement).disabled,
+    "a close that was not sent does not create an unresolved payment");
   await unmount();
   host.remove();
   console.log("hostedBilling checks passed");

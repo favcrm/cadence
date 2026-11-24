@@ -4427,6 +4427,7 @@ const CAD2726_ZHTW: Record<string, string> = {
   "Confirming payment": "正在確認付款",
   "Checkout confirmed. Current access is shown below.": "結帳已確認。目前的使用權限如下所示。",
   "Checkout closed.": "結帳已關閉。",
+  "Checkout wasn’t closed. Allow session storage in this browser and try again.": "結帳未關閉。請允許此瀏覽器使用工作階段儲存空間，然後再試一次。",
   "Checkout status is unknown. Refresh before trying another payment.": "結帳狀態未知。請重新整理後再嘗試付款。",
   "Checkout recovery is not available on this board yet.": "此看板暫未支援結帳復原。",
   "The selected checkout option is no longer available. Refresh and choose again.":
