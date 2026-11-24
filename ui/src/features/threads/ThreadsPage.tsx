@@ -66,6 +66,7 @@ import {
   type ThreadsUrlState,
 } from "./threadsView";
 import {
+  ChannelTimelineSkeleton,
   ConversationListSkeleton,
   DetailsPanelSkeleton,
   HumanContextPanel,
@@ -237,8 +238,8 @@ export default function ThreadsPage({
     return set;
   }, [humanRooms.rooms]);
   const humanRoom = humanId ? humanRooms.rooms?.find((r) => r.id === humanId) ?? null : null;
-  const humanContext = humanId && human.me ? (
-    humanRoom && humanState !== null && humanState.id === humanId ? (
+  const humanContext = humanId ? (
+    human.me && humanRoom && humanState !== null && humanState.id === humanId ? (
       <HumanContextPanel
         room={humanRoom}
         me={human.me}
@@ -261,7 +262,7 @@ export default function ThreadsPage({
           navigate(humanHref(id), { replace: true });
         }}
       />
-    ) : humanRooms.error === null ? (
+    ) : human.loading || (human.me !== null && humanRooms.error === null && !humanState?.denied) ? (
       <DetailsPanelSkeleton />
     ) : null
   ) : null;
@@ -619,6 +620,12 @@ export default function ThreadsPage({
                 people={people.people}
                 boardAgents={agentsState.data?.agents ?? null}
               />
+            ) : human.loading ? (
+              <div className="threads-timeline">
+                <div className="threads-messages">
+                  <ChannelTimelineSkeleton />
+                </div>
+              </div>
             ) : (
               <div className="threads-empty">
                 <p>{t("Channels are unavailable for this sign-in.")}</p>

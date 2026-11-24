@@ -242,6 +242,8 @@ async function main(): Promise<void> {
 
   let holdRoomRead = false;
   let releaseRoomRead: (() => void) | null = null;
+  let holdHumanMe = false;
+  let releaseHumanMe: (() => void) | null = null;
 
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const url = new URL(String(input), "http://localhost");
@@ -249,7 +251,14 @@ async function main(): Promise<void> {
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
     calls.push({ method, path: url.pathname, body });
     if (url.pathname === "/api/human-threads/stream") return new Response("", { status: 404 });
-    if (url.pathname === "/api/human-threads/me") return json({ human: { id: "human-me", name: "Mei" } });
+    if (url.pathname === "/api/human-threads/me") {
+      if (holdHumanMe) {
+        await new Promise<void>((r) => {
+          releaseHumanMe = r;
+        });
+      }
+      return json({ human: { id: "human-me", name: "Mei" } });
+    }
     if (url.pathname === "/api/human-threads/rooms") return json({ rooms: [roomSummary] });
     if (url.pathname === "/api/agents") return json({ daemon: "reachable", agents: [], totals: null, by_issue: {} });
     if (url.pathname === "/api/issues") return json({ issues: [] });
@@ -631,8 +640,11 @@ async function main(): Promise<void> {
     "zh-TW Channels and modal close copy translate cleanly",
   );
 
-  // 8. CAD-2765 ThreadsPage on hosted boards (workConversationsEnabled=false) clears loading state without stuck 'Loading conversations…'
+  // 8. CAD-2765 ThreadsPage on hosted boards (workConversationsEnabled=false) clears loading state without stuck 'Loading conversations…',
+  //    and shows timeline + details skeletons on deep link while /me is still resolving (never flashing unavailable prematurely).
   const ThreadsPage = require<{ default: ReactModule.ComponentType<{ operator: boolean; workConversationsEnabled?: boolean; humanThreadsEnabled?: boolean }> }>("../src/features/threads/ThreadsPage").default;
+  holdHumanMe = true;
+  window.history.replaceState(null, "", "/threads?h=room-1");
   await React.act(async () => {
     root.render(
       React.createElement(LocaleProvider, null,
@@ -644,6 +656,15 @@ async function main(): Promise<void> {
       ),
     );
   });
+  await flush();
+  const pendingMainText = host.querySelector(".threads-main")?.textContent ?? "";
+  assert(
+    host.querySelector(".threads-main .threads-skel-timeline") !== null
+      && !pendingMainText.includes("Channels are unavailable for this sign-in."),
+    "Deep-linked channel shows timeline skeleton instead of flashing unavailable while identity is loading",
+  );
+  holdHumanMe = false;
+  (releaseHumanMe as (() => void) | null)?.();
   for (let i = 0; i < 8; i += 1) await flush();
   const sidebarText = host.querySelector(".threads-list")?.textContent ?? "";
   assert(

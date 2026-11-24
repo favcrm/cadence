@@ -249,7 +249,7 @@ export function ConversationListSkeleton() {
   );
 }
 
-function ChannelTimelineSkeleton() {
+export function ChannelTimelineSkeleton() {
   const t = useTranslate();
   return (
     <div className="threads-skel-group threads-skel-timeline" role="status" aria-busy="true">
@@ -634,6 +634,36 @@ export function HumanRoomTimeline({
   };
 
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const pinnedToTailRef = useRef(true);
+  const tailPostRef = useRef<{ room: string; id: string | null; initialized: boolean }>({
+    room: "",
+    id: null,
+    initialized: false,
+  });
+  useEffect(() => {
+    pinnedToTailRef.current = true;
+    tailPostRef.current = { room: id, id: null, initialized: false };
+  }, [id]);
+  useEffect(() => {
+    const root = messagesRef.current;
+    if (!root) return;
+    const onScroll = () => {
+      pinnedToTailRef.current = root.scrollHeight - root.scrollTop - root.clientHeight <= 48;
+    };
+    root.addEventListener("scroll", onScroll, { passive: true });
+    return () => root.removeEventListener("scroll", onScroll);
+  }, []);
+  useEffect(() => {
+    const root = messagesRef.current;
+    if (!root || !currentPage || currentPage.room !== id) return;
+    const lastId = currentPage.posts[currentPage.posts.length - 1]?.id ?? null;
+    const prev = tailPostRef.current;
+    if (prev.initialized && prev.room === id && prev.id === lastId) return;
+    tailPostRef.current = { room: id, id: lastId, initialized: true };
+    if (pinnedToTailRef.current) {
+      root.scrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+    }
+  }, [id, currentPage]);
   useEffect(() => {
     const changed = () => setDocumentVisible(document.visibilityState === "visible");
     document.addEventListener("visibilitychange", changed);
