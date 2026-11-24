@@ -300,13 +300,17 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
 }
 
 // Browser storage only locates the original attempt. It never establishes a grant.
-type SetupAttempt = { id: string; endpoint: string; nonce: string; profile?: "emw_catalog_v1" };
-const EMW_ENDPOINT = "https://emw-mcp.simplebuild.site/";
+type SetupAttempt = { id: string; endpoint: string; nonce: string; profile?: string };
+type StandingOffer = { profile: string; endpoint_url: string; required_scopes: string[]; tool_name: string };
+
+function resumeStandingRead(id: string, tool: string): string {
+  return `Custom MCP connection ${id} is ready. If my request in this chat is waiting for a read, finish only that read using ${tool}. If I only asked to connect, confirm that it is connected without running any tools.`;
+}
 
 function parseSetupAttempt(value: string | null, endpoint: string): SetupAttempt | null {
   try {
     const [id, savedEndpoint = endpoint, nonce = "", profile] = (value ?? "").split("\n");
-    return id ? { id, endpoint: new URL(savedEndpoint).href, nonce, ...(profile === "emw_catalog_v1" ? { profile } : {}) } : null;
+    return id ? { id, endpoint: new URL(savedEndpoint).href, nonce, ...(profile ? { profile } : {}) } : null;
   } catch {
     return null;
   }
@@ -360,7 +364,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   const [error, setError] = useState<string | null>(null);
   const [connection, setConnection] = useState<CustomMcpConnectionSummary | null>(null);
   const [recheck, setRecheck] = useState(0);
-  const [profileAvailable, setProfileAvailable] = useState<boolean | null>(null);
+  const [offer, setOffer] = useState<StandingOffer | null | undefined>(undefined);
   const [existingCatalog, setExistingCatalog] = useState<CustomMcpConnectionSummary | null>(null);
   const [authorizationUrl, setAuthorizationUrl] = useState<string | null>(null);
   const autoResumeAttempt = useRef<string | null>(null);
@@ -371,37 +375,58 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   const attempt = conversation ? readSetupAttempt(key, setup.endpointUrl) : null;
   const connId = attempt?.id;
   const endpoint = attempt?.endpoint ?? setup.endpointUrl;
-  const isEmw = new URL(setup.endpointUrl).href === EMW_ENDPOINT;
-  const presetAttempt = attempt?.profile === "emw_catalog_v1";
+  const presetAttempt = !!attempt?.profile;
   const outcome = connId && callback?.connectionId === connId &&
     url.searchParams.get("mcp_attempt") === (attempt?.nonce || null) ? callback.outcome : null;
-  const requiredScopes = presetAttempt ? "catalog:read" : setup.requiredScopes?.join(" ");
+  const requiredScopes = setup.requiredScopes?.join(" ");
   url.search = withoutConnectParams(url.search);
   url.searchParams.delete("mcp_attempt");
   url.searchParams.set("mcp_setup", String(entry.seq));
   const returnTo = url.href;
 
+  function findOffer(list: { standing_read_offers?: StandingOffer[] }, profile?: string): StandingOffer | undefined {
+    return list.standing_read_offers?.find((item) => {
+      try {
+        return !!item.profile && !!item.tool_name && (!profile || item.profile === profile) &&
+          new URL(item.endpoint_url).href === new URL(setup.endpointUrl).href &&
+          matchesSetupScopes(item.required_scopes, requiredScopes);
+      } catch { return false; }
+    });
+  }
+
+  function eligible(row: CustomMcpConnectionSummary, selected: StandingOffer): boolean {
+    try {
+      return row.connected_by_you === true && new URL(row.endpoint_url).href === new URL(selected.endpoint_url).href &&
+        (row.auth_kind === "oauth" || row.auth_kind === "oauth_static") &&
+        matchesSetupScopes(row.oauth_scopes, selected.required_scopes.join(" ")) &&
+        (row.standing_read_access === "confirm" || row.standing_read_access === "allowed") &&
+        (row.standing_read_access === "confirm" ? !row.standing_read_profile || row.standing_read_profile === selected.profile
+          : row.standing_read_profile === selected.profile);
+    } catch { return false; }
+  }
+
   useEffect(() => {
-    if (!isEmw) return;
+    if (outcome === "connected") return;
     const controller = new AbortController();
     void usingPrivateOperation(undefined, (operation) => api.customMcpList(true, operation), controller.signal)
       .then((list) => {
         if (controller.signal.aborted) return;
-        const offered = list.standing_read_profile === "emw_catalog_v1";
-        setProfileAvailable(offered);
-        const eligible = offered ? list.connections.filter(row => row.connected_by_you &&
-          row.endpoint_url === EMW_ENDPOINT &&
-          (row.standing_read_access !== undefined || row.standing_read_profile === "emw_catalog_v1")) : [];
-        setExistingCatalog(eligible.find(row => row.standing_read_access === "allowed") ?? eligible[0] ?? null);
-      }, () => { if (!controller.signal.aborted) setProfileAvailable(false); });
+        const selected = findOffer(list, attempt?.profile);
+        setOffer(selected ?? null);
+        const rows = selected ? list.connections.filter((row) => eligible(row, selected)) : [];
+        setExistingCatalog(rows.find((row) => row.standing_read_access === "allowed") ?? rows[0] ?? null);
+      }, () => { if (!controller.signal.aborted) setOffer(null); });
     return () => controller.abort();
-  }, [isEmw]);
+  }, [setup.endpointUrl, requiredScopes, attempt?.profile, outcome]);
 
   function verified(row: CustomMcpConnectionSummary | undefined): row is CustomMcpConnectionSummary {
-    return row !== undefined && row.id === connId && row.connected_by_you === true &&
-      row.name === setup.label && new URL(row.endpoint_url).href === endpoint &&
-      (row.auth_kind === "oauth" || row.auth_kind === "oauth_static") &&
-      matchesSetupScopes(row.oauth_scopes, requiredScopes);
+    if (!row) return false;
+    try {
+      return row.id === connId && row.connected_by_you === true &&
+        row.name === setup.label && new URL(row.endpoint_url).href === endpoint &&
+        (row.auth_kind === "oauth" || row.auth_kind === "oauth_static") &&
+        matchesSetupScopes(row.oauth_scopes, requiredScopes);
+    } catch { return false; }
   }
 
   useEffect(() => {
@@ -411,10 +436,12 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     setError(null);
     void usingPrivateOperation(undefined, async (operation) => {
       const list = await api.customMcpList(true, operation);
-      if (presetAttempt && list.standing_read_profile !== "emw_catalog_v1") return undefined;
-      return list.connections.find((row) => verified(row) && (presetAttempt
-        ? endpoint === EMW_ENDPOINT && !!attempt?.nonce && row.standing_read_profile === "emw_catalog_v1"
-        : row.standing_read_profile !== "emw_catalog_v1"));
+      const selected = presetAttempt ? findOffer(list, attempt?.profile) : undefined;
+      setOffer(selected ?? null);
+      if (presetAttempt && (!selected || !attempt?.nonce)) return undefined;
+      return list.connections.find((row) => verified(row) && (selected
+        ? eligible(row, selected) && row.standing_read_profile === selected.profile
+        : !row.standing_read_profile));
     }, controller.signal).then((row) => {
       if (controller.signal.aborted) return;
       if (row) setConnection(row);
@@ -425,7 +452,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     return () => controller.abort();
   }, [connId, endpoint, outcome, requiredScopes, setup.label, resumed, recheck, presetAttempt]);
 
-  function remember(id: string, endpointUrl: string, nonce: string, profile?: "emw_catalog_v1") {
+  function remember(id: string, endpointUrl: string, nonce: string, profile?: string) {
     const value = `${id}\n${new URL(endpointUrl).href}\n${nonce}${profile ? `\n${profile}` : ""}`;
     // A same-origin tab can recover an attempt; restricted browsers still support same-tab return.
     try {
@@ -482,8 +509,16 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   }
 
   function retryOAuth() {
-    if (!connId || !attempt || (presetAttempt && !profileAvailable)) return;
+    if (!connId || !attempt) return;
     void run(async () => {
+      let retryScopes = requiredScopes;
+      if (presetAttempt) {
+        const list = await api.customMcpList();
+        const selected = findOffer(list, attempt.profile);
+        const row = list.connections.find(verified);
+        if (!selected || !row || !eligible(row, selected)) throw new Error("Cadence could not verify this Custom MCP connection.");
+        retryScopes = selected.required_scopes.join(" ");
+      }
       try {
         const nonce = crypto.randomUUID();
         const retryReturnTo = new URL(returnTo);
@@ -494,9 +529,9 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
           setError("Server did not return a valid https:// authorization URL.");
           return;
         }
-        if (requiredScopes !== undefined) {
+        if (retryScopes !== undefined) {
           const actual = new URL(authUrl).searchParams.getAll("scope");
-          if (actual.length !== 1 || !matchesSetupScopes(actual[0].split(" "), requiredScopes)) {
+          if (actual.length !== 1 || !matchesSetupScopes(actual[0].split(" "), retryScopes)) {
             setError("The provider did not request exactly the required OAuth scopes.");
             return;
           }
@@ -516,11 +551,12 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     if (!conversation || !connId || !attempt) return;
     void run(() => usingPrivateOperation(undefined, async (operation) => {
       const list = await api.customMcpList(true, operation);
+      const selected = presetAttempt ? findOffer(list, attempt.profile) : undefined;
       const row = list.connections.find(verified);
       if (row?.status !== "active" || !liveCallback(attempt) ||
-          (presetAttempt ? (endpoint !== EMW_ENDPOINT || !attempt.nonce || list.standing_read_profile !== "emw_catalog_v1" ||
-            row.standing_read_profile !== "emw_catalog_v1" || row.standing_read_access !== "allowed")
-            : row.standing_read_profile === "emw_catalog_v1")) {
+          (presetAttempt ? (!selected || !attempt.nonce || !eligible(row, selected) ||
+            row.standing_read_profile !== selected.profile || row.standing_read_access !== "allowed")
+            : !!row.standing_read_profile)) {
         setConnection(presetAttempt ? null : row ?? null);
         setError("Cadence could not verify this Custom MCP connection.");
         return;
@@ -529,7 +565,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       if (!liveCallback(attempt)) return;
       const sent = await sendToMaster(
         presetAttempt
-          ? `EMW catalog connection ${connId} is ready. If my request in this chat is waiting for an EMW catalog read, finish only that read using catalog.search. If I only asked to connect, confirm that it is connected without running any tools.`
+          ? resumeStandingRead(connId, selected!.tool_name)
           : `Custom MCP connection ${connId} is connected. Continue my original request using only currently permitted tools. If a tool is unavailable, explain what access is needed.`,
         message, undefined, undefined, conversation, operation,
       );
@@ -545,23 +581,24 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   }
 
   useEffect(() => {
-    if (!presetAttempt || !attempt?.nonce || !profileAvailable || !connection ||
+    if (!presetAttempt || !attempt?.nonce || !offer || !connection ||
         connection.status !== "active" || connection.standing_read_access !== "allowed" ||
         resumed || autoResumeAttempt.current === attempt.nonce) return;
     autoResumeAttempt.current = attempt.nonce;
     continueReply();
-  }, [presetAttempt, attempt?.nonce, profileAvailable, connection, resumed]);
+  }, [presetAttempt, attempt?.nonce, offer, connection, resumed]);
 
-  function connectEmw() {
-    if (!conversation || !profileAvailable || !isEmw) return;
+  function connectStandingRead() {
+    if (!conversation || !offer) return;
     void run(async () => {
       const list = await api.customMcpList();
-      if (list.standing_read_profile !== "emw_catalog_v1") {
-        setProfileAvailable(false);
-        throw new Error("Catalog access is no longer available. Please try again.");
+      const selected = findOffer(list, offer.profile);
+      if (!selected || selected.tool_name !== offer.tool_name ||
+          !matchesSetupScopes(selected.required_scopes, offer.required_scopes.join(" "))) {
+        setOffer(null);
+        throw new Error("Read access is no longer available. Please try again.");
       }
-      const alreadyConnected = list.connections.find(row => row.connected_by_you && row.endpoint_url === EMW_ENDPOINT &&
-        (row.standing_read_access !== undefined || row.standing_read_profile === "emw_catalog_v1"));
+      const alreadyConnected = list.connections.find((row) => eligible(row, selected));
       if (alreadyConnected) {
         setExistingCatalog(alreadyConnected);
         return;
@@ -570,19 +607,48 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       const target = new URL(returnTo);
       target.searchParams.set("mcp_attempt", nonce);
       const reply = await api.customMcpCreate({
-        name: setup.label, endpoint_url: EMW_ENDPOINT, auth_kind: "oauth", visibility: "personal",
-        required_scopes: ["catalog:read"], standing_read_profile: "emw_catalog_v1", return_to: target.href,
+        name: setup.label, endpoint_url: selected.endpoint_url, auth_kind: "oauth", visibility: "personal",
+        required_scopes: selected.required_scopes, standing_read_profile: selected.profile, return_to: target.href,
       });
       if (reply.mode !== "oauth_redirect") throw new Error("This server did not start OAuth sign-in.");
       const safeUrl = customMcpAuthorizationUrl(reply);
       const scopes = safeUrl ? new URL(safeUrl).searchParams.getAll("scope") : [];
-      if (!safeUrl || scopes.length !== 1 || !matchesSetupScopes(scopes[0].split(" "), "catalog:read")) {
+      if (!safeUrl || scopes.length !== 1 || !matchesSetupScopes(scopes[0].split(" "), selected.required_scopes.join(" "))) {
         throw new Error("The provider did not request exactly the required OAuth scopes.");
       }
       if (window.location.href !== originalHref) return;
-      remember(reply.connection_id, EMW_ENDPOINT, nonce, "emw_catalog_v1");
+      remember(reply.connection_id, selected.endpoint_url, nonce, selected.profile);
       setAuthorizationUrl(safeUrl);
     });
+  }
+
+  function allowExistingCatalog() {
+    const chosen = existingCatalog;
+    if (!conversation || !offer || chosen?.standing_read_access !== "confirm") return;
+    void run(() => usingPrivateOperation(undefined, async (operation) => {
+      const list = await api.customMcpList(true, operation);
+      const selected = findOffer(list, offer.profile);
+      const row = list.connections.find((item) => item.id === chosen.id);
+      if (!selected || selected.tool_name !== offer.tool_name || !row || !eligible(row, selected) ||
+          row.standing_read_access !== "confirm" || row.snapshot_revision !== chosen.snapshot_revision) {
+        throw new Error("Cadence could not verify this Custom MCP connection.");
+      }
+      const { connection: allowed } = await api.customMcpAllowCatalogReads(row.id, row.snapshot_revision, operation);
+      if (window.location.href !== originalHref) return;
+      if (allowed.id !== row.id || !eligible(allowed, selected) ||
+          allowed.standing_read_profile !== selected.profile || allowed.standing_read_access !== "allowed") {
+        throw new Error("Cadence could not verify this Custom MCP connection.");
+      }
+      setExistingCatalog(allowed);
+      const message = await setupMessageId(conversation, entry.seq, {
+        id: allowed.id, endpoint: new URL(selected.endpoint_url).href, nonce: "standing-consent",
+      });
+      if (window.location.href !== originalHref) return;
+      const sent = await sendToMaster(
+        resumeStandingRead(allowed.id, selected.tool_name), message, undefined, undefined, conversation, operation,
+      );
+      if (!sent.ok) setError(sent.error);
+    }));
   }
 
   function enableRead(pin: CustomMcpToolPin) {
@@ -626,13 +692,13 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   let status: string | null = null;
   let actions;
   if (resumed) {
-    status = resumedPreset ? "Connected · Catalog read access" : null;
+    status = resumedPreset ? "Connected · Read access" : null;
     actions = resumedPreset
       ? <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>
       : <span className="text-micro text-ok font-medium">{t("Reply resumed")}</span>;
   } else if (active && presetAttempt) {
     status = current.standing_read_access === "allowed"
-      ? "Connected · Catalog read access" : "Catalog access is not ready. Check this connection.";
+      ? "Connected · Read access" : "Read access is not ready. Check this connection.";
     actions = current.standing_read_access !== "allowed"
       ? <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>
       : error ? <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Resume")}</button> : null;
@@ -653,22 +719,25 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       <div className="flex flex-wrap gap-2">
         {outcome === "connected" && !current ? (
           <button type="button" className="btn btn-secondary" disabled={!error || busy} onClick={() => setRecheck((value) => value + 1)}>{t("Check connection")}</button>
-        ) : current?.status !== "needs_review" && (!presetAttempt || profileAvailable) ? (
+        ) : current?.status !== "needs_review" && (!presetAttempt || offer) ? (
           <button type="button" className="btn btn-primary" disabled={busy} onClick={retryOAuth}>{t("Retry OAuth sign-in")}</button>
         ) : null}
         {!presetAttempt && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setDrawer("edit")}>{t("Edit endpoint")}</button>}
       </div>
     );
-  } else if (isEmw && profileAvailable === null) {
+  } else if (offer === undefined) {
     status = "Checking connection…";
-  } else if (isEmw && profileAvailable && existingCatalog) {
-    status = existingCatalog.standing_read_access === "allowed" ? "Connected · Catalog read access"
+  } else if (offer && existingCatalog) {
+    const canAllow = existingCatalog.standing_read_access === "confirm";
+    status = existingCatalog.standing_read_access === "allowed" ? "Connected · Read access"
       : existingCatalog.status === "auth_expired" ? "OAuth sign-in expired. Sign in again."
-      : existingCatalog.standing_read_access === "confirm" ? "Use your existing EMW sign-in in Connections."
-      : "Catalog access is not ready. Check this connection.";
-    actions = <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>;
-  } else if (isEmw && profileAvailable) {
-    actions = <button type="button" className="btn btn-primary" disabled={!conversation || busy} onClick={connectEmw}>{t("Connect EMW for catalog reads")}</button>;
+      : canAllow ? "Use your existing sign-in and make this connection personal. Atlas can read until you disconnect."
+      : "Read access is not ready. Check this connection.";
+    actions = canAllow
+      ? <button type="button" className="btn btn-primary" disabled={!conversation || busy} onClick={allowExistingCatalog}>{t("Allow Atlas read access")}</button>
+      : <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>;
+  } else if (offer) {
+    actions = <button type="button" className="btn btn-primary" disabled={!conversation || busy} onClick={connectStandingRead}>{t("Connect {label} for read access").replace("{label}", () => setup.label)}</button>;
   } else {
     actions = (
       <div className="flex flex-wrap gap-2">
@@ -685,7 +754,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
         footer={actions}
       >
         <p className="text-label text-ink-300 break-words">{plainText(entry.text, 500)}</p>
-        {isEmw && profileAvailable && !connId && <p className="text-micro text-ink-300">{t("Allow Atlas to read the EMW catalog in your personal chats until you disconnect. Other agents and workspace members cannot use this access.")}</p>}
+        {offer && !connId && <p className="text-micro text-ink-300">{t("Allow Atlas to read in your personal chats until you disconnect. Other agents and workspace members cannot use this access.")}</p>}
         {status && <p className={`text-micro ${active ? "text-ok" : "text-warn"}`} role="status">{t(status)}</p>}
         {active && !presetAttempt && (
           <details className="text-micro text-ink-300">

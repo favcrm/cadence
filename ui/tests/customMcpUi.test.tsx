@@ -119,14 +119,38 @@ async function main() {
   let rejectNextGuard = false;
   const toolWrites: unknown[] = [];
   let standingProfile = false;
+  let rejectStandingGrant = false;
+  let mismatchStandingGrant = false;
   const creates: Array<Record<string, unknown>> = [];
+  const catalogGrants: Array<Record<string, unknown>> = [];
   const innerFetch = globalThis.fetch;
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? "GET";
     if (url.endsWith("/api/connections/mcp") && method === "GET") return jsonRes({
-      connections: [returnedMcp], ...(standingProfile ? { standing_read_profile: "emw_catalog_v1" } : {}),
+      connections: [returnedMcp], ...(standingProfile ? { standing_read_offers: [{ profile: "inventory_v2", endpoint_url: "https://inventory.example/", required_scopes: ["stock:read"], tool_name: "stock.lookup" }] } : {}),
     });
+    if (url.endsWith(`/api/connections/mcp/${sampleMcp.id}/allow-catalog-reads`) && method === "POST") {
+      const request = JSON.parse(String(init?.body));
+      catalogGrants.push(request);
+      if (rejectStandingGrant) {
+        rejectStandingGrant = false;
+        return new Response(JSON.stringify({ error: { code: "refused", message: "Access refused" } }), {
+          status: 403, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (mismatchStandingGrant) {
+        mismatchStandingGrant = false;
+        return jsonRes({ connection: { ...returnedMcp, standing_read_profile: "inventory_v2", standing_read_access: "allowed", oauth_scopes: ["wrong:scope"] } });
+      }
+      if (request.snapshot_revision !== returnedMcp.snapshot_revision)
+        return new Response(JSON.stringify({ error: { code: "stale_revision", message: "Snapshot changed" } }), {
+          status: 409, headers: { "Content-Type": "application/json" },
+        });
+      returnedMcp = { ...returnedMcp, visibility: "personal", standing_read_profile: "inventory_v2",
+        standing_read_access: "allowed" } as typeof sampleMcp;
+      return jsonRes({ connection: returnedMcp });
+    }
     if (url.endsWith(`/api/connections/mcp/${sampleMcp.id}/tools`) && method === "POST") {
       const body = JSON.parse(String(init?.body));
       toolWrites.push(body);
@@ -149,7 +173,7 @@ async function main() {
     if (url.endsWith("/api/connections/mcp") && method === "POST") {
       creates.push(JSON.parse(String(init?.body)));
       if (standingProfile) return jsonRes({
-        mode: "oauth_redirect", authorization_url: "https://emw-mcp.simplebuild.site/authorize?scope=catalog%3Aread",
+        mode: "oauth_redirect", authorization_url: "https://inventory.example/authorize?scope=stock%3Aread",
         connection_id: sampleMcp.id,
       });
       return jsonRes({
@@ -440,68 +464,94 @@ async function main() {
   assert(document.querySelector<HTMLInputElement>('input[type="url"]')?.readOnly === false, "failed setup can edit its endpoint");
   assert(text().includes("mcp:read"), "edited setup retains the requested OAuth scope");
 
-  const emwEndpoint = "https://emw-mcp.simplebuild.site/";
-  const emwEntry = {
-    ...setupEntry, seq: 21, text: "Find EMW catalog items",
-    payload: { v: 2, toolkit: "custom_mcp", toolkit_label: "EMW", endpoint_url: emwEndpoint, required_scopes: ["catalog:read"] },
+  const inventoryEndpoint = "https://inventory.example/";
+  const inventoryEntry = {
+    ...setupEntry, seq: 21, text: "Find inventory items",
+    payload: { v: 2, toolkit: "custom_mcp", toolkit_label: "Inventory", endpoint_url: inventoryEndpoint, required_scopes: ["stock:read"] },
   } satisfies ThreadEntry;
-  const emwKey = "cadence:mcp-setup:thread-21:21";
-  const renderEmw = async (key: string) => act(async () => root.render(
+  const inventoryKey = "cadence:mcp-setup:thread-21:21";
+  const renderInventory = async (key: string) => act(async () => root.render(
     React.createElement(PageLocale, null, React.createElement(ImageConversation, { value: "thread-21" },
-      React.createElement(ConnectCard, { key, entry: emwEntry }))),
+      React.createElement(ConnectCard, { key, entry: inventoryEntry }))),
   ));
-  win.localStorage.removeItem(emwKey);
+  win.localStorage.removeItem(inventoryKey);
   win.history.replaceState({}, "", "/home");
   standingProfile = false;
-  await renderEmw("older");
-  await settle(() => assert(byText("button", "Connect EMW") && !byText("button", "Connect EMW for catalog reads"), "older server keeps generic setup"));
+  await renderInventory("older");
+  await settle(() => assert(byText("button", "Connect Inventory") && !byText("button", "Connect Inventory for read access"), "older server keeps generic setup"));
   standingProfile = true;
-  await renderEmw("preset");
-  await settle(() => assert(byText("button", "Connect EMW for catalog reads"), "trusted server exposes the catalog consent"));
-  await act(async () => byText("button", "Connect EMW for catalog reads")!.click());
+  await renderInventory("preset");
+  await settle(() => assert(byText("button", "Connect Inventory for read access"), "trusted server exposes read consent"));
+  await act(async () => byText("button", "Connect Inventory for read access")!.click());
   await settle(() => assert(byText("a", "Continue to OAuth sign-in"), "consent starts validated OAuth handoff"));
   const created = creates.at(-1)!;
-  assert(created.standing_read_profile === "emw_catalog_v1" && created.visibility === "personal" &&
-    JSON.stringify(created.required_scopes) === '["catalog:read"]', "preset sends fixed personal catalog scope");
-  const receipt = win.localStorage.getItem(emwKey)!;
+  assert(created.standing_read_profile === "inventory_v2" && created.visibility === "personal" &&
+    JSON.stringify(created.required_scopes) === '["stock:read"]', "preset sends offered personal scope");
+  const receipt = win.localStorage.getItem(inventoryKey)!;
   const nonce = receipt.split("\n")[2];
-  assert(nonce && receipt.endsWith("\nemw_catalog_v1"), "handoff preserves a selected nonce and preset");
-  returnedMcp = { ...sampleMcp, name: "EMW", endpoint_url: emwEndpoint, oauth_scopes: ["catalog:read"],
-    standing_read_profile: "emw_catalog_v1", standing_read_access: "allowed" } as typeof sampleMcp;
+  assert(nonce && receipt.endsWith("\ninventory_v2"), "handoff preserves a selected nonce and preset");
+  returnedMcp = { ...sampleMcp, name: "Inventory", endpoint_url: inventoryEndpoint, oauth_scopes: ["stock:read"],
+    standing_read_profile: "inventory_v2", standing_read_access: "allowed" } as typeof sampleMcp;
   messageWrites.length = 0;
   const callbackUrl = `/home?mcp_setup=21&aos_connect=connected&toolkit=custom_mcp&connection_id=${sampleMcp.id}&mcp_attempt=${nonce}`;
   win.history.replaceState({}, "", callbackUrl);
-  await renderEmw("returned");
-  await settle(() => assert(text().includes("Connected · Catalog read access") && messageWrites.length === 1, "matched approved callback auto resumes"));
+  await renderInventory("returned");
+  await settle(() => assert(text().includes("Connected · Read access") && messageWrites.length === 1, "matched approved callback auto resumes"));
   assert(!byText("button", "Continue in chat") && !byText("button", "Enable read access"), "preset does not expose generic promotion or continuation");
   assert(messageWrites.at(0)?.conversation === "thread-21" && /^mcp-setup-[0-9a-f]{64}$/.test(String(messageWrites.at(0)?.message)), "resume targets the original conversation with deterministic identity");
+  assert(JSON.stringify(messageWrites[0]).includes("stock.lookup"), "resume names only the offered tool");
   assert(toolWrites.slice().length === 2, "preset does not write tool modes");
-  await renderEmw("remounted");
+  await renderInventory("remounted");
   assert(messageWrites.length === 1, "remount does not send again");
-  await settle(() => assert(text().includes("Connected · Catalog read access"), "already allowed connection stays visible after reload"));
-  assert(!byText("button", "Connect EMW for catalog reads"), "already authorized owners do not start OAuth again");
-  win.localStorage.setItem(emwKey, receipt);
+  await settle(() => assert(text().includes("Connected · Read access"), "already allowed connection stays visible after reload"));
+  assert(!byText("button", "Connect Inventory for read access"), "already authorized owners do not start OAuth again");
+  win.localStorage.setItem(inventoryKey, receipt);
   win.history.replaceState({}, "", callbackUrl);
   messageWrites.length = 0;
   messageMode = "uncertain";
-  await renderEmw("uncertain-preset");
+  await renderInventory("uncertain-preset");
   await settle(() => assert(byText("button", "Resume"), "failed automatic send offers recovery"));
   await act(async () => byText("button", "Resume")!.click());
-  await settle(() => assert(text().includes("Connected · Catalog read access") && messageWrites.length === 2, "resume recovers uncertain send"));
+  await settle(() => assert(text().includes("Connected · Read access") && messageWrites.length === 2, "resume recovers uncertain send"));
   assert(JSON.stringify(messageWrites[0]) === JSON.stringify(messageWrites[1]), "recovery reuses the identical message envelope");
   messageWrites.length = 0;
-  win.localStorage.setItem(emwKey, receipt);
+  win.localStorage.setItem(inventoryKey, receipt);
   win.history.replaceState({}, "", callbackUrl.replace(nonce, "wrong"));
-  await renderEmw("forged");
+  await renderInventory("forged");
   await drain();
   assert(messageWrites.length === 0, "wrong callback nonce never resumes");
   win.history.replaceState({}, "", callbackUrl.replace(`&mcp_attempt=${nonce}`, ""));
-  await renderEmw("empty");
+  await renderInventory("empty");
   await drain();
   assert(messageWrites.length === 0, "empty callback nonce never resumes");
+  win.localStorage.removeItem(inventoryKey);
+  win.history.replaceState({}, "", "/home");
+  const createsBeforeLegacyGrant = creates.length;
+  returnedMcp = { ...sampleMcp, name: "Inventory", endpoint_url: inventoryEndpoint, oauth_scopes: ["stock:read"],
+    standing_read_access: "confirm" } as typeof sampleMcp;
+  await renderInventory("legacy-confirm");
+  await settle(() => assert(byText("button", "Allow Atlas read access"), "legacy owner can grant access in chat"));
+  rejectStandingGrant = true;
+  await act(async () => byText("button", "Allow Atlas read access")!.click());
+  await settle(() => assert(document.querySelector('[role="alert"]')?.textContent?.includes("Could not complete the Custom MCP request. Try again."), "refusal is shown"));
+  assert(messageWrites.length === 0, "refusal never resumes");
+  mismatchStandingGrant = true;
+  await act(async () => byText("button", "Allow Atlas read access")!.click());
+  await settle(() => assert(document.querySelector('[role="alert"]')?.textContent?.includes("Could not complete the Custom MCP request. Try again."), "mismatched grant is refused"));
+  assert(messageWrites.length === 0, "mismatched grant never resumes");
+  await act(async () => byText("button", "Allow Atlas read access")!.click());
+  await settle(() => assert(text().includes("Connected · Read access") && messageWrites.length === 1, "grant resumes the waiting conversation"));
+  assert(catalogGrants.length === 3 && catalogGrants.every((grant) => grant.snapshot_revision === sampleMcp.snapshot_revision), "uses guarded existing-connection action");
+  assert(creates.length === createsBeforeLegacyGrant && win.location.pathname === "/home", "keeps the saved login and stays in chat");
+  assert(messageWrites.at(0)?.conversation === "thread-21" && /^mcp-setup-[0-9a-f]{64}$/.test(String(messageWrites.at(0)?.message)), "grant resumes only the original conversation");
+  await renderInventory("legacy-remount");
+  await settle(() => assert(text().includes("Connected · Read access"), "granted access persists after remount"));
+  assert(messageWrites.slice().length === 1 && !byText("button", "Allow Atlas read access"), "grant does not ask or resume again");
+  messageWrites.length = 0;
+  win.localStorage.setItem(inventoryKey, receipt);
   standingProfile = false;
   win.history.replaceState({}, "", callbackUrl);
-  await renderEmw("missing-profile");
+  await renderInventory("missing-profile");
   await settle(() => assert(text().includes("could not verify"), "in-flight preset fails closed on older server"));
   assert(messageWrites.length === 0, "missing trusted wrapper never resumes");
 
