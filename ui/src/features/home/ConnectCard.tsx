@@ -262,7 +262,8 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   const [error, setError] = useState<string | null>(null);
   const [connection, setConnection] = useState<CustomMcpConnectionSummary | null>(null);
   const [recheck, setRecheck] = useState(0);
-  const [profileAvailable, setProfileAvailable] = useState(false);
+  const [profileAvailable, setProfileAvailable] = useState<boolean | null>(null);
+  const [existingCatalog, setExistingCatalog] = useState<CustomMcpConnectionSummary | null>(null);
   const [authorizationUrl, setAuthorizationUrl] = useState<string | null>(null);
   const autoResumeAttempt = useRef<string | null>(null);
   const url = new URL(window.location.href);
@@ -286,8 +287,15 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     if (!isEmw) return;
     const controller = new AbortController();
     void usingPrivateOperation(undefined, (operation) => api.customMcpList(true, operation), controller.signal)
-      .then((list) => { if (!controller.signal.aborted) setProfileAvailable(list.standing_read_profile === "emw_catalog_v1"); },
-        () => { if (!controller.signal.aborted) setProfileAvailable(false); });
+      .then((list) => {
+        if (controller.signal.aborted) return;
+        const offered = list.standing_read_profile === "emw_catalog_v1";
+        setProfileAvailable(offered);
+        const eligible = offered ? list.connections.filter(row => row.connected_by_you &&
+          row.endpoint_url === EMW_ENDPOINT &&
+          (row.standing_read_access !== undefined || row.standing_read_profile === "emw_catalog_v1")) : [];
+        setExistingCatalog(eligible.find(row => row.standing_read_access === "allowed") ?? eligible[0] ?? null);
+      }, () => { if (!controller.signal.aborted) setProfileAvailable(false); });
     return () => controller.abort();
   }, [isEmw]);
 
@@ -307,7 +315,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       const list = await api.customMcpList(true, operation);
       if (presetAttempt && list.standing_read_profile !== "emw_catalog_v1") return undefined;
       return list.connections.find((row) => verified(row) && (presetAttempt
-        ? endpoint === EMW_ENDPOINT && !!attempt?.nonce && row.standing_read_profile === "emw_catalog_v1" && row.standing_read_access === "allowed"
+        ? endpoint === EMW_ENDPOINT && !!attempt?.nonce && row.standing_read_profile === "emw_catalog_v1"
         : row.standing_read_profile !== "emw_catalog_v1"));
     }, controller.signal).then((row) => {
       if (controller.signal.aborted) return;
@@ -440,7 +448,8 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
 
   useEffect(() => {
     if (!presetAttempt || !attempt?.nonce || !profileAvailable || !connection ||
-        connection.status !== "active" || resumed || autoResumeAttempt.current === attempt.nonce) return;
+        connection.status !== "active" || connection.standing_read_access !== "allowed" ||
+        resumed || autoResumeAttempt.current === attempt.nonce) return;
     autoResumeAttempt.current = attempt.nonce;
     continueReply();
   }, [presetAttempt, attempt?.nonce, profileAvailable, connection, resumed]);
@@ -452,6 +461,12 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       if (list.standing_read_profile !== "emw_catalog_v1") {
         setProfileAvailable(false);
         throw new Error("Catalog access is no longer available. Please try again.");
+      }
+      const alreadyConnected = list.connections.find(row => row.connected_by_you && row.endpoint_url === EMW_ENDPOINT &&
+        (row.standing_read_access !== undefined || row.standing_read_profile === "emw_catalog_v1"));
+      if (alreadyConnected) {
+        setExistingCatalog(alreadyConnected);
+        return;
       }
       const nonce = crypto.randomUUID();
       const target = new URL(returnTo);
@@ -509,7 +524,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   const tools = current?.tools ?? [];
   const canRead = tools.some((pin) => pin.mode === "read" && !pin.drifted);
   const readOptions = tools.filter(reviewableRead);
-  const settings = `${routePath({ screen: "settings", section: "connections" })}?mcp_focus=${encodeURIComponent(connId ?? setup.label)}`;
+  const settings = `${routePath({ screen: "settings", section: "connections" })}?mcp_focus=${encodeURIComponent(connId ?? existingCatalog?.id ?? setup.label)}`;
   let status: string | null = null;
   let actions;
   if (resumed) {
@@ -518,8 +533,11 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       ? <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>
       : <span className="text-micro text-ok font-medium">{t("Reply resumed")}</span>;
   } else if (active && presetAttempt) {
-    status = "Connected · Catalog read access";
-    actions = error ? <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Resume")}</button> : null;
+    status = current.standing_read_access === "allowed"
+      ? "Connected · Catalog read access" : "Catalog access is not ready. Check this connection.";
+    actions = current.standing_read_access !== "allowed"
+      ? <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>
+      : error ? <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Resume")}</button> : null;
   } else if (active) {
     status = canRead ? "Connected." : "Connected. No tools can run automatically.";
     actions = <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Continue in chat")}</button>;
@@ -540,10 +558,18 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
         ) : current?.status !== "needs_review" && (!presetAttempt || profileAvailable) ? (
           <button type="button" className="btn btn-primary" disabled={busy} onClick={retryOAuth}>{t("Retry OAuth sign-in")}</button>
         ) : null}
-        <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setDrawer("edit")}>{t("Edit endpoint")}</button>
+        {!presetAttempt && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setDrawer("edit")}>{t("Edit endpoint")}</button>}
       </div>
     );
-  } else if (isEmw && profileAvailable && !connId) {
+  } else if (isEmw && profileAvailable === null) {
+    status = "Checking connection…";
+  } else if (isEmw && profileAvailable && existingCatalog) {
+    status = existingCatalog.standing_read_access === "allowed" ? "Connected · Catalog read access"
+      : existingCatalog.status === "auth_expired" ? "OAuth sign-in expired. Sign in again."
+      : existingCatalog.standing_read_access === "confirm" ? "Use your existing EMW sign-in in Connections."
+      : "Catalog access is not ready. Check this connection.";
+    actions = <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>;
+  } else if (isEmw && profileAvailable) {
     actions = <button type="button" className="btn btn-primary" disabled={!conversation || busy} onClick={connectEmw}>{t("Connect EMW for catalog reads")}</button>;
   } else {
     actions = (

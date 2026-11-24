@@ -613,7 +613,7 @@ export function CustomMcpInspectDrawer({
   };
 
   const submitRevoke = () => {
-    if (!canEdit || !revokeArmed || busyAction) return;
+    if (!canEdit || (!isStandingCatalog && !revokeArmed) || busyAction) return;
     setBusyAction("revoke");
     setFeedback(null);
     void api.customMcpRevoke(connection.id)
@@ -625,6 +625,34 @@ export function CustomMcpInspectDrawer({
   };
 
   const okBanner = feedback?.ok ? <div className="custmcp-ok-banner" role="status">{feedback.text}</div> : null;
+
+  const disconnectControl = canEdit && (
+    <div className="border-t border-ink-700 pt-3 space-y-2">
+      {!revokeOpen ? (
+        <Button size="sm" variant="danger" disabled={busyAction !== null} onClick={() => setRevokeOpen(true)}>{t(isStandingCatalog ? "Disconnect EMW" : "Disconnect server…")}</Button>
+      ) : (
+        <div className="space-y-2">
+          <p className="text-label text-ink-200 break-words">
+            {t(isStandingCatalog ? "Disconnecting stops Atlas from using this catalog connection." : "Disconnecting removes stored credentials and pinned tools for this Custom MCP server immediately.")}
+          </p>
+          {!isStandingCatalog && (
+            <label className="flex items-start gap-2 text-label text-ink-300">
+              <input type="checkbox" checked={revokeArmed} onChange={(e) => setRevokeArmed(e.target.checked)} disabled={busyAction !== null} className="mt-0.5" />
+              <span>{t("I understand disconnecting disables all tools from this server.")}</span>
+            </label>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="danger" loading={busyAction === "revoke"} disabled={(!isStandingCatalog && !revokeArmed) || busyAction !== null} onClick={submitRevoke}>
+              {busyAction === "revoke" ? t("Disconnecting…") : t("Disconnect")}
+            </Button>
+            <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => { setRevokeOpen(false); setRevokeArmed(false); }}>
+              {t("Cancel")}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   const toolsPanel = (
     <div className="space-y-3 min-w-0">
@@ -641,7 +669,7 @@ export function CustomMcpInspectDrawer({
               <Button size="sm" variant="primary" loading={busyAction === "catalog"} disabled={busyAction !== null} onClick={() => void allowCatalogReads()}>{t("Allow Atlas catalog reads")}</Button>
             </>
           )}
-          {canEdit && <Button size="sm" variant="ghost" onClick={() => setTab("auth")}>{t("Disconnect EMW")}</Button>}
+          {disconnectControl}
         </div>
       )}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-ink-700 bg-ink-850 px-3 py-2">
@@ -948,31 +976,7 @@ export function CustomMcpInspectDrawer({
           )}
         </div>
       )}
-      {canEdit && (
-        <div className="border-t border-ink-700 pt-3 space-y-2">
-          {!revokeOpen ? (
-            <Button size="sm" variant="danger" disabled={busyAction !== null} onClick={() => setRevokeOpen(true)}>{t(isStandingCatalog ? "Disconnect EMW" : "Disconnect server…")}</Button>
-          ) : (
-            <div className="space-y-2">
-              <p className="text-label text-ink-200 break-words">
-                {t("Disconnecting removes stored credentials and pinned tools for this Custom MCP server immediately.")}
-              </p>
-              <label className="flex items-start gap-2 text-label text-ink-300">
-                <input type="checkbox" checked={revokeArmed} onChange={(e) => setRevokeArmed(e.target.checked)} disabled={busyAction !== null} className="mt-0.5" />
-                <span>{t("I understand disconnecting disables all tools from this server.")}</span>
-              </label>
-              <div className="flex flex-wrap gap-2">
-                <Button size="sm" variant="danger" loading={busyAction === "revoke"} disabled={!revokeArmed || busyAction !== null} onClick={() => void submitRevoke()}>
-                  {busyAction === "revoke" ? t("Disconnecting…") : t("Disconnect")}
-                </Button>
-                <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => { setRevokeOpen(false); setRevokeArmed(false); }}>
-                  {t("Cancel")}
-                </Button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      {!isStandingCatalog && disconnectControl}
     </div>
   );
 

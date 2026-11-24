@@ -478,6 +478,8 @@ async function main() {
   assert(toolWrites.slice().length === 2, "preset does not write tool modes");
   await renderEmw("remounted");
   assert(messageWrites.length === 1, "remount does not send again");
+  await settle(() => assert(text().includes("Connected · Catalog read access"), "already allowed connection stays visible after reload"));
+  assert(!byText("button", "Connect EMW for catalog reads"), "already authorized owners do not start OAuth again");
   win.localStorage.setItem(emwKey, receipt);
   win.history.replaceState({}, "", callbackUrl);
   messageWrites.length = 0;
