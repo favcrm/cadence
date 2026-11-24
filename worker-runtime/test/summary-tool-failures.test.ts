@@ -63,9 +63,21 @@ it("does not preserve a temporary assistant give-up alongside a blanket user ban
     .toBe("An earlier canvas_open call failed.");
 });
 
+it("does not convert a limit on repeated attempts into a ban on any retry", () => {
+  const restricted = new Map<string, Set<string>>();
+  const repeated = "Do not keep retrying canvas_open.";
+  collectUserToolRestrictions(repeated, restricted);
+  expect(rewriteGiveUps(repeated, failed, restricted)).toBe(repeated);
+  for (const text of ["Never call canvas_open again.", "Avoid calling canvas_open for now."]) {
+    expect(rewriteGiveUps(text, failed, restricted)).toBe("An earlier canvas_open call failed.");
+  }
+});
+
 it.each([
   "If the board is read-only; do not retry canvas_open.",
   "Use the backup; unless the board is writable; do not retry canvas_open.",
+  "As long as the board is read-only; do not retry canvas_open.",
+  "So long as the board is read-only; do not retry canvas_open.",
 ])("does not promote a scoped semicolon consequence into a blanket prohibition: %p", (text) => {
   const restricted = new Map<string, Set<string>>();
   collectUserToolRestrictions(text, restricted);

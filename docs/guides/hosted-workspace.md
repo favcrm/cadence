@@ -239,7 +239,8 @@ Rendered errors can also be redacted on successful results without counting
 them as failures. Standalone assistant give-ups change only after a native
 failure for the same tool.
 A successful retry clears that failure. A temporary give-up cannot relax a
-user's explicit no-repeat rule. Quoted examples and code are not user restrictions
+user's explicit no-repeat rule, and a limit on repeated attempts is not a ban
+on a first retry. Quoted examples and code are not user restrictions
 or assistant claims. A complete reporting sentence may end inside its closing
 quote, but punctuation inside a conditional label does not split that condition.
 Semicolons do not detach the consequence from an explicit condition.

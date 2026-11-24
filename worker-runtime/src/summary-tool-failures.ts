@@ -10,7 +10,7 @@ export const TRANSIENT_FAILURE_NOTE =
 // contain facts or valid restrictions; leave them for the runtime note.
 const TOOL = String.raw`[\x60]?(?<tool>[A-Za-z_][\w.-]*)[\x60]?`;
 const ACTION = "call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|open(?:ing)?|re-?call(?:ing)?";
-const AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not|must not|should not) (?:keep |try to )?(?<action>${ACTION})|avoid)`;
+const AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not|must not|should not) (?:(?<repeat>keep |continue (?:to )?)|try to )?(?<action>${ACTION})|avoid)`;
 const LIMIT = "again|for now|until (?:it )?(?:is fixed|is resolved|works|fixed|resolved)";
 const AVOID_CLAIM = String.raw`${AVOID_ACTION} ${TOOL}(?: (?<condition>${LIMIT}))?`;
 const AVOID = new RegExp(`^${AVOID_CLAIM}$`, "i");
@@ -28,8 +28,8 @@ const BROKEN = new RegExp(
 );
 function restrictionScope(groups: Record<string, string>): string {
   const condition = groups.condition?.toLowerCase().replace(/^until (?:it )?(?:is )?/, "until ");
-  if (condition !== undefined) return condition;
-  return /^(?:retr|re-?call)/i.test(groups.action ?? "") ? "again" : "";
+  const scope = condition ?? (/^(?:retr|re-?call)/i.test(groups.action ?? "") ? "again" : "");
+  return groups.repeat ? `repeated:${scope}` : scope;
 }
 
 export function collectUserToolRestrictions(text: string, restricted: Map<string, Set<string>>): void {

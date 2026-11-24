@@ -57390,7 +57390,7 @@ function errorEchoScrubber(removed) {
 
 // src/summary-prose.ts
 var REPORTING_LEAD_IN = /^\s*(?:(?:the|a|an|this|that|our|its)[ \t]+(?:(?!(?:if|unless|until|when|whenever|while|before|after|only|that|which|who|because|provided|assuming|since|as|whether)\b)[A-Za-z][\w-]*[ \t]+){1,3}|(?:i|we|it|they|you)[ \t]+)(?:say|says|said|return|returns|returned|read|reads|report|reports|reported|write|writes|wrote|show|shows|showed|display|displays|displayed)(?:[ \t]*[,:])?[ \t]*$/i;
-var CONDITIONAL_LEAD_IN = /^\s*(?:(?:[-+*]|\d+[.)])[ \t]+)?(?:if|only if|even if|unless|when|whenever|while|until|before|after|provided|assuming|in case)\b/i;
+var CONDITIONAL_LEAD_IN = /^\s*(?:(?:[-+*]|\d+[.)])[ \t]+)?(?:if|only if|even if|unless|when|whenever|while|until|before|after|provided|assuming|in case|(?:as|so) long as|as soon as|on condition)\b/i;
 function* proseClauses(text, semicolons) {
   let start = 0;
   let quoted = false;
@@ -57608,7 +57608,7 @@ function quoteEnd(text, start, close, escapedOpener) {
 var TRANSIENT_FAILURE_NOTE = "[Runtime note]: Past tool failures are runtime events, not standing facts about the tools. " + "Keep user restrictions and scoped limits; otherwise the next turn should try again normally if needed.";
 var TOOL = String.raw`[\x60]?(?<tool>[A-Za-z_][\w.-]*)[\x60]?`;
 var ACTION = "call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|open(?:ing)?|re-?call(?:ing)?";
-var AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not|must not|should not) (?:keep |try to )?(?<action>${ACTION})|avoid)`;
+var AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|stop|skip|never|don't|do not|not|must not|should not) (?:(?<repeat>keep |continue (?:to )?)|try to )?(?<action>${ACTION})|avoid)`;
 var LIMIT = "again|for now|until (?:it )?(?:is fixed|is resolved|works|fixed|resolved)";
 var AVOID_CLAIM = String.raw`${AVOID_ACTION} ${TOOL}(?: (?<condition>${LIMIT}))?`;
 var AVOID = new RegExp(`^${AVOID_CLAIM}$`, "i");
@@ -57618,9 +57618,8 @@ var OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED].map((mark
 var BROKEN = new RegExp(String.raw`^${TOOL} (?:(?:does not work|doesn't work|won't work|is broken|is not working|isn't working|keeps failing|keeps refusing)(?: (?:${TIME2}|though)| with (?:${OMITTED_ERROR})(?:: (?:${OMITTED_ERROR}))?|, avoid it)?|(?:is unavailable|is not available|isn't available) (?:${TIME2}))$`, "i");
 function restrictionScope(groups) {
   const condition = groups.condition?.toLowerCase().replace(/^until (?:it )?(?:is )?/, "until ");
-  if (condition !== undefined)
-    return condition;
-  return /^(?:retr|re-?call)/i.test(groups.action ?? "") ? "again" : "";
+  const scope = condition ?? (/^(?:retr|re-?call)/i.test(groups.action ?? "") ? "again" : "");
+  return groups.repeat ? `repeated:${scope}` : scope;
 }
 function collectUserToolRestrictions(text, restricted) {
   for (const [start, end] of proseClauses(text, true)) {

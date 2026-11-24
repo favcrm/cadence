@@ -4,7 +4,7 @@
 const REPORTING_LEAD_IN =
   /^\s*(?:(?:the|a|an|this|that|our|its)[ \t]+(?:(?!(?:if|unless|until|when|whenever|while|before|after|only|that|which|who|because|provided|assuming|since|as|whether)\b)[A-Za-z][\w-]*[ \t]+){1,3}|(?:i|we|it|they|you)[ \t]+)(?:say|says|said|return|returns|returned|read|reads|report|reports|reported|write|writes|wrote|show|shows|showed|display|displays|displayed)(?:[ \t]*[,:])?[ \t]*$/i;
 const CONDITIONAL_LEAD_IN =
-  /^\s*(?:(?:[-+*]|\d+[.)])[ \t]+)?(?:if|only if|even if|unless|when|whenever|while|until|before|after|provided|assuming|in case)\b/i;
+  /^\s*(?:(?:[-+*]|\d+[.)])[ \t]+)?(?:if|only if|even if|unless|when|whenever|while|until|before|after|provided|assuming|in case|(?:as|so) long as|as soon as|on condition)\b/i;
 
 export function* proseClauses(text: string, semicolons: boolean): Generator<readonly [start: number, end: number]> {
   let start = 0;
