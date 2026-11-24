@@ -109,7 +109,7 @@ import Composer, { type ComposerAction } from "./Composer";
 import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
-import AssistantOperations, { matchesPrepareReceipt, type PrepareCapability } from "./AssistantOperations";
+import AssistantOperations, { matchesPrepareReceipt, notifyAssistantOperationWrite, type PrepareCapability } from "./AssistantOperations";
 import ConversationDecisions from "./ConversationDecisions";
 import { conversationDecisions, type DecisionsStore } from "../../decisions/useDecisions";
 import { StagedSourceContext } from "../../../ui/StagedChip";
@@ -729,10 +729,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const onSnapshot = useCallback(() => setStreamRevision((revision) => revision + 1), []);
   const operationScope = `${installId}\u0000${mode.contextId}`;
   const [operationState, setOperationState] = useState<{ scope: string; revision: number | null; pending: boolean } | null>(null);
-  const operationScopeRef = useRef(operationScope);
-  operationScopeRef.current = operationScope;
   const [prepareState, setPrepareState] = useState<{ scope: string; revision: number | null; capability: PrepareCapability | null } | null>(null);
-  const [operationWrite, setOperationWrite] = useState(0);
   const onPrepareState = useCallback((capability: PrepareCapability | null, revision: number | null) => {
     setPrepareState({ scope: operationScope, revision, capability });
   }, [operationScope]);
@@ -1674,7 +1671,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       }
       const response = await api.assistantPrepare(installId, { context_id: mode.contextId, action_id: "media.refine.prepare", request_id: requestId, input });
       if (!matchesPrepareReceipt(response?.operation, installId, mode.contextId, input)) throw new Error("Invalid prepare receipt");
-      if (operationScopeRef.current === operationScope) setOperationWrite((revision) => revision + 1);
+      notifyAssistantOperationWrite(installId, mode.contextId);
       if (current()) setComposerNotice(null);
     } catch (error) {
       if (current()) setComposerNotice("The edit could not be prepared. Retry the same instructions or change them and try again.");
@@ -2268,7 +2265,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       </ViewScopeContext.Provider>
       </AttachmentNamesContext.Provider>
       </StagedSourceContext.Provider>
-      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} appLabel={mode.appLabel ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} onPrepareChange={onPrepareState} writeRevision={operationWrite} />
+      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} appLabel={mode.appLabel ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} onPrepareChange={onPrepareState} />
       {decisionsOn && convId !== null && decisionStore !== null && (
         <ConversationDecisions key={`${installId}\u0000${convId}`} canAlwaysAllow={viewer.operator === true && !viewer.readOnly} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}

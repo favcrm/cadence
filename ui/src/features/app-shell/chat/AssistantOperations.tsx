@@ -178,6 +178,7 @@ function parseRecordPreview(value: unknown): RecordPreview | null {
 }
 const MEDIA_PREVIEW_KEYS = ["asset_id", "revision", "sha256", "title", "artifact_ref", "instructions", "workflow", "slot", "model", "quote", "estimate_micros", "currency", "allow_once"] as const;
 const MEDIA_QUOTE_KEYS = ["schema", "currency", "unit_price_micros", "units", "total_price_micros", "price_revision"] as const;
+const MEDIA_INSTRUCTION_LIMIT = 2000;
 function closedKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const seen = Object.keys(value);
   return seen.length === keys.length && keys.every((key) => seen.includes(key));
@@ -198,7 +199,7 @@ function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
   const sha = text(preview.sha256, 71);
   const title = text(preview.title, 200);
   const artifact = text(preview.artifact_ref, 256);
-  const instructions = text(preview.instructions, 2000);
+  const instructions = text(preview.instructions, MEDIA_INSTRUCTION_LIMIT);
   const slot = text(preview.slot, 64);
   const model = text(preview.model, 80);
   const revision = preview.revision;
@@ -259,7 +260,7 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
 }
 function parseOperation(value: unknown): Operation | null {
   const v = record(value);
-  if (!v || !text(v.id, 128) || !text(v.action_id, 64) || !statuses.has(String(v.status)) ||
+  if (!v || !text(v.id, 128) || !text(v.action_id, 64) || typeof v.status !== "string" || !statuses.has(v.status) ||
       !Number.isSafeInteger(v.revision) || !text(v.summary, 500) || !Array.isArray(v.resource_refs)) return null;
   const refs = v.resource_refs.map(parseRef);
   if (refs.some((ref) => ref === null)) return null;
@@ -279,12 +280,13 @@ function parseOperation(value: unknown): Operation | null {
 }
 export function matchesPrepareReceipt(value: unknown, installId: string, contextId: string, input: { asset_id: string; revision: number; sha256: string; instructions: string }): boolean {
   const operation = parseOperation(value);
-  if (!operation || operation.action_id !== "media.refine.prepare") return false;
+  if (!operation || operation.action_id !== "media.refine.prepare" || operation.revision < 1) return false;
   if (operation.status !== "pending_permission") return true;
   const request = operation.permission_request;
   const preview = request?.mediaPreview;
-  return request?.scope.install_id === installId && request.scope.context_id === contextId &&
-    request.scope.action_id === "media.refine.prepare" && preview !== null && preview !== undefined &&
+  return request !== null && !request.allow_always && request.scope.install_id === installId &&
+    request.scope.context_id === contextId && request.scope.action_id === "media.refine.prepare" &&
+    request.scope.resource_id === input.asset_id && preview !== null && preview !== undefined &&
     preview.asset_id === input.asset_id && preview.revision === input.revision &&
     preview.sha256 === input.sha256 && preview.instructions === input.instructions;
 }
@@ -515,7 +517,14 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange, onPrepareChange, writeRevision }: {
+// A confirmed write can outlive its originating pane. Notify just the active
+// readers of that installation/context, including readers that remounted.
+const operationWriteListeners = new Set<(installId: string, contextId: string) => void>();
+export function notifyAssistantOperationWrite(installId: string, contextId: string): void {
+  for (const listener of operationWriteListeners) listener(installId, contextId);
+}
+
+export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange, onPrepareChange }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
@@ -528,7 +537,6 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   connectionRevision: number;
   onPendingChange: (pending: boolean, reconciledRevision: number | null) => void;
   onPrepareChange: (capability: PrepareCapability | null, reconciledRevision: number | null) => void;
-  writeRevision: number;
 }) {
   const t = useTranslate();
   const scopeKey = JSON.stringify([installId, contextId]);
@@ -588,12 +596,14 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
         const operationResponse = operations.value;
         const permissionResponse = permissions.value;
         const prepare = record(actionResponse.prepare);
+        const maxBytes = prepare?.max_instruction_bytes;
         const mediaTypes = prepare?.source_media_types;
-        const capability: PrepareCapability | null = prepare && Object.keys(prepare).length === 3 &&
-          prepare.action_id === "media.refine.prepare" && prepare.max_instruction_bytes === 2000 &&
-          Array.isArray(mediaTypes) && mediaTypes.length === 2 &&
-          mediaTypes.includes("image/png") && mediaTypes.includes("image/jpeg")
-          ? { maxBytes: 2000, sourceMediaTypes: mediaTypes as string[] } : null;
+        const capability: PrepareCapability | null =
+          prepare?.action_id === "media.refine.prepare" &&
+          typeof maxBytes === "number" && Number.isSafeInteger(maxBytes) && maxBytes > 0 &&
+          Array.isArray(mediaTypes) && mediaTypes.length > 0 &&
+          mediaTypes.every((value) => typeof value === "string" && /^image\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(value))
+            ? { maxBytes: Math.min(maxBytes, MEDIA_INSTRUCTION_LIMIT), sourceMediaTypes: mediaTypes } : null;
         if (!Array.isArray(actionResponse.actions) || !Array.isArray(operationResponse.operations) || !Array.isArray(permissionResponse.permissions)) {
           throw new Error("The assistant service returned an invalid response.");
         }
@@ -653,6 +663,9 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     const resumeRead = () => {
       if (alive && !document.hidden) void written();
     };
+    const onOperationWrite = (writtenInstall: string, writtenContext: string) => {
+      if (writtenInstall === installId && writtenContext === contextId) void written();
+    };
 
     const handle: Poller = { alive: () => alive, written, refresh: poll };
     // No context yet: nothing to ask for (an empty context ID is a 400).
@@ -660,9 +673,11 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     poller.current = handle;
     document.addEventListener("visibilitychange", resumeRead);
     const unsubscribeMaster = subscribeMasterChanged(resumeRead);
+    operationWriteListeners.add(onOperationWrite);
     return () => {
       alive = false;
       document.removeEventListener("visibilitychange", resumeRead);
+      operationWriteListeners.delete(onOperationWrite);
       unsubscribeMaster();
       if (poller.current === handle) poller.current = null;
     };
@@ -672,9 +687,6 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     // Keep the scope's handle alive so in-flight decisions still settle.
     void poller.current?.written();
   }, [scopeKey, connectionRevision]);
-  useEffect(() => {
-    if (writeRevision > 0) void poller.current?.written();
-  }, [writeRevision]);
 
   const runWrite = async (busyId: string, write: () => Promise<unknown>, failure: string) => {
     const handle = poller.current;
