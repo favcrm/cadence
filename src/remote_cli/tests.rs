@@ -10538,3 +10538,42 @@ fn cad2415_stale_delete_revision_is_a_conflict_answer() {
     assert_eq!(body["error"]["code"], "revision_conflict");
     assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
 }
+
+#[test]
+fn aos739_agent_enroll_verbs_are_registered_with_their_scopes_and_effects() {
+    use super::{cli_requested_scopes, lost_mutation_note, mutating_cli_verb, REMOTE_VERBS};
+
+    for verb in [
+        "agent_enroll_start",
+        "agent_enroll_status",
+        "agent_enroll_list",
+        "agent_enroll_approve",
+        "agent_enroll_revoke",
+    ] {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb}");
+    }
+    assert_eq!(cli_requested_scopes("agent_enroll_start"), &["cli.read"]);
+    assert_eq!(cli_requested_scopes("agent_enroll_status"), &["cli.read"]);
+    assert_eq!(
+        cli_requested_scopes("agent_enroll_list"),
+        &["cli.read", "audit.approve"]
+    );
+    assert_eq!(
+        cli_requested_scopes("agent_enroll_approve"),
+        &["cli.write", "audit.approve"]
+    );
+    assert_eq!(
+        cli_requested_scopes("agent_enroll_revoke"),
+        &["cli.write", "audit.approve"]
+    );
+
+    assert!(!mutating_cli_verb("agent_enroll_status"));
+    assert!(!mutating_cli_verb("agent_enroll_list"));
+    assert!(mutating_cli_verb("agent_enroll_start"));
+    assert!(mutating_cli_verb("agent_enroll_approve"));
+    assert!(mutating_cli_verb("agent_enroll_revoke"));
+
+    assert!(lost_mutation_note("agent_enroll_start").contains("agent enroll status"));
+    assert!(lost_mutation_note("agent_enroll_approve").contains("agent enroll list"));
+    assert!(lost_mutation_note("agent_enroll_revoke").contains("agent enroll list"));
+}

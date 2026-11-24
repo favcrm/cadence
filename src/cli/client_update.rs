@@ -255,6 +255,7 @@ pub(crate) fn route_client_only(cli: Cli) -> Result<i32> {
             // CAD-2101: the same refusal as the full install; a saved default
             // is not naming the org for a profile command.
             super::agent_profile::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
+            super::agent_enroll::require_named_org(cli.org.as_deref(), &cli.command, &target.org)?;
             remote::run(
                 target,
                 cli.command,

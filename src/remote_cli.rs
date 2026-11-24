@@ -273,6 +273,14 @@ pub const REMOTE_VERBS: &[&str] = &[
     "document_create",
     "document_show",
     "document_export",
+    // CAD-2758 / AOS-739: enroll a hosted CLI login (`hosted_cli_sessions`)
+    // as an existing agent profile. Answered by the platform (control/tenant),
+    // never forwarded to a runtime.
+    "agent_enroll_start",
+    "agent_enroll_status",
+    "agent_enroll_list",
+    "agent_enroll_approve",
+    "agent_enroll_revoke",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -310,7 +318,11 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "template_list"
         | "template_show"
         | "template_blob_read"
-        | "document_show" => &["cli.read"],
+        | "document_show"
+        | "agent_enroll_start"
+        | "agent_enroll_status" => &["cli.read"],
+        "agent_enroll_list" => &["cli.read", "audit.approve"],
+        "agent_enroll_approve" | "agent_enroll_revoke" => &["cli.write", "audit.approve"],
         // CAD-2286: the tenant admits `document_submit` with cli.write alone.
         "document_submit" | "template_create" | "template_revise" | "template_sample"
         | "template_intake" | "template_approve" | "document_create" | "document_export" => {
@@ -448,6 +460,9 @@ const RECONCILE_TEMPLATE_APPROVE: &str = "the template approval may or may not h
 const RECONCILE_TEMPLATE_PREVIEW: &str = "the template preview/intake request did not return a usable answer — nothing was approved or issued";
 const RECONCILE_DOCUMENT_CREATE: &str = "the document draft may or may not have been created — check `artifact find` (if --save-artifact was set) before repeating it";
 const RECONCILE_DOCUMENT_EXPORT: &str = "the document export may or may not have been recorded — read `document show` for the same id before repeating it";
+const RECONCILE_AGENT_ENROLL_START: &str = "the enrollment request may or may not have been created — run `cadence agent enroll status` before repeating it";
+const RECONCILE_AGENT_ENROLL_APPROVE: &str = "the enrollment approval may or may not have been recorded — run `cadence agent enroll list` before repeating it";
+const RECONCILE_AGENT_ENROLL_REVOKE: &str = "the enrollment revocation may or may not have been recorded — run `cadence agent enroll list` before repeating it";
 const RECONCILE_UNKNOWN: &str =
     "the action may or may not have been applied — read the same resource before repeating it";
 
@@ -509,7 +524,12 @@ fn cli_effect(verb: &str) -> Effect {
         | "template_list"
         | "template_show"
         | "template_blob_read"
-        | "document_show" => Effect::Read,
+        | "document_show"
+        | "agent_enroll_status"
+        | "agent_enroll_list" => Effect::Read,
+        "agent_enroll_start" => mutation(RECONCILE_AGENT_ENROLL_START),
+        "agent_enroll_approve" => mutation(RECONCILE_AGENT_ENROLL_APPROVE),
+        "agent_enroll_revoke" => mutation(RECONCILE_AGENT_ENROLL_REVOKE),
         "template_create" | "template_revise" => mutation(RECONCILE_TEMPLATE_WRITE),
         "template_approve" => mutation(RECONCILE_TEMPLATE_APPROVE),
         "template_sample" | "template_intake" => mutation(RECONCILE_TEMPLATE_PREVIEW),
@@ -5502,6 +5522,14 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "not_found",
             "this workspace's wiki has no readable page at that path for this login; nothing \
              was read",
+        )),
+        (
+            "agent_enroll_list" | "agent_enroll_approve" | "agent_enroll_revoke",
+            Some("approval_scope_required"),
+        ) => Some((
+            "approval_scope_required",
+            "this login does not carry `audit.approve`; run `cadence login --audit-approve` once \
+             and retry. Nothing was changed",
         )),
         _ => None,
     };
