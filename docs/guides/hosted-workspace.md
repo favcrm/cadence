@@ -1252,9 +1252,9 @@ cadence --org acme issue project delivery storefront --preview \
   --repo acme/storefront --delivery-file ./delivery.yaml
 ```
 
-The preview returns the current revision, exact proposal and `preview_digest`
-without writing. Workspace MCP can request the same preview through
-`cadence_cli` with verb `delivery_policy` and arguments
+On a compatible hosted board, preview returns the current revision, exact
+proposal and `preview_digest` without writing. Workspace MCP can request the
+same preview through `cadence_cli` with verb `delivery_policy` and arguments
 `{project, proposal: {repos, delivery}}`. MCP cannot apply it.
 
 After checking the proposal, the owner applies it from the CLI with the same
@@ -1268,9 +1268,11 @@ cadence --org acme issue project delivery storefront \
   --expect-rev "$revision" --preview-digest "$digest"
 ```
 
-If the stored revision or proposed inputs changed, preview again. Do not remove
-the fences to get an older board to accept the write. Applying settings does
-not approve a PR, dispatch a reviewer, or enqueue a merge.
+If the stored revision or proposed inputs changed, preview again. A policy
+that names a reviewer `profile` requires both fences and a board that supports
+profile-backed policy; older boards cannot apply it. The unfenced legacy
+command remains available for policies without profile nominations. Applying
+settings does not approve a PR, dispatch a reviewer, or enqueue a merge.
 
 ### Attesting who produced a PR head
 
@@ -1285,10 +1287,11 @@ cadence --org acme audit producer --project storefront --issue STORE-1 \
   --source "Owner verified the producer from the implementation assignment"
 ```
 
-Omit the producer flags and `--source` to read the exact receipt. Workspace
-MCP may use `cadence_cli` with verb `review_producer` and the same tuple to
-read it; MCP may not attest it. A changed head needs a new receipt. If an
-attestation response is lost, read the receipt before repeating the command.
+Omit the producer flags and `--source` to read the exact receipt. On a hosted
+board that supports producer attestation, Workspace MCP may use `cadence_cli`
+with verb `review_producer` and the same tuple to read it; MCP may not attest
+it. A changed head needs a new receipt. If an attestation response is lost,
+read the receipt before repeating the command.
 
 ### Workspace skills from the CLI (CAD-2396)
 

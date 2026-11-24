@@ -33,6 +33,13 @@ pub const OVERSIZED_FILES: u64 = 40;
 
 pub const FOCI: &[&str] = &["general", "standards", "spec-security", "browser-qa"];
 
+/// The profile identifier accepted by delivery policy and producer evidence.
+pub fn valid_workspace_profile_id(profile: &str) -> bool {
+    profile.strip_prefix("ap_").is_some_and(|id| {
+        (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
 /// A project's delivery policy — `PROJECT.md` `delivery:` or the
 /// defaults. [`parse`] builds it through the strict raw types and
 /// [`DeliveryPolicy::validate`]; `serde` round-trips the validated
@@ -475,11 +482,7 @@ impl DeliveryPolicy {
                 ..
             } = review
             {
-                let valid = profile.strip_prefix("ap_").is_some_and(|id| {
-                    (8..=64).contains(&id.len())
-                        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                });
-                if !valid {
+                if !valid_workspace_profile_id(profile) {
                     return Err(err(format!(
                         "reviews.{name:?}.profile: expected a workspace profile ID"
                     )));

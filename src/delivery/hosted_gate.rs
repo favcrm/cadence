@@ -456,7 +456,7 @@ pub fn set_delivery(
     delivery: Option<&str>,
     fence: Option<(u64, &str)>,
 ) -> Result<Value> {
-    let repos = checked_delivery_inputs(repos, delivery)?;
+    let repos = checked_delivery_inputs(repos, delivery, fence.is_some())?;
     let mut call_args = args(&[("project", json!(project)), ("repos", json!(repos))]);
     if let Some(section) = delivery {
         call_args.insert("delivery".into(), json!(section));
@@ -508,7 +508,7 @@ pub fn preview_delivery(
     repos: &[String],
     delivery: Option<&str>,
 ) -> Result<Value> {
-    let repos = checked_delivery_inputs(repos, delivery)?;
+    let repos = checked_delivery_inputs(repos, delivery, true)?;
     let repos: Vec<_> = repos.iter().map(|repo| repo.to_ascii_lowercase()).collect();
     let mut proposal = json!({"repos": repos});
     if let Some(section) = delivery {
@@ -546,11 +546,29 @@ fn preview_delivery_answer(
     Ok(body)
 }
 
-fn checked_delivery_inputs(repos: &[String], delivery: Option<&str>) -> Result<Vec<String>> {
+fn checked_delivery_inputs(
+    repos: &[String],
+    delivery: Option<&str>,
+    allow_profile: bool,
+) -> Result<Vec<String>> {
     let repos = set_delivery_repos(repos)?;
     if let Some(section) = delivery {
-        if delivery_policy::parse(&delivery_policy::section_front(section))?.is_none() {
-            return Err(refuse("the delivery file holds no delivery section"));
+        let policy = delivery_policy::parse(&delivery_policy::section_front(section))?
+            .ok_or_else(|| refuse("the delivery file holds no delivery section"))?;
+        if !allow_profile
+            && policy.reviews.values().any(|review| {
+                matches!(
+                    review,
+                    delivery_policy::Review::Agent {
+                        profile: Some(_),
+                        ..
+                    }
+                )
+            })
+        {
+            return Err(refuse(
+                "profile-backed delivery policy requires --expect-rev and --preview-digest from --preview",
+            ));
         }
     }
     Ok(repos)
@@ -761,16 +779,7 @@ pub fn review_producer(
                 "--source must give the owner's producer evidence (1–200 UTF-8 bytes)",
             ));
         }
-        if human_only != profiles.is_empty()
-            || profiles.len() > 16
-            || profiles.windows(2).any(|pair| pair[0] == pair[1])
-            || profiles.iter().any(|profile| {
-                !profile.strip_prefix("ap_").is_some_and(|id| {
-                    (8..=64).contains(&id.len())
-                        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                })
-            })
-        {
+        if !valid_producer_profiles(kind, profiles.iter().map(|id| Some(id.as_str()))) {
             return Err(refuse(
                 "attest with --source and either --human-only or distinct --producer-profile ids",
             ));
@@ -804,9 +813,42 @@ pub fn review_producer(
     }
 }
 
+fn valid_producer_profiles<'a>(
+    kind: &str,
+    profiles: impl ExactSizeIterator<Item = Option<&'a str>>,
+) -> bool {
+    const MAX_PRODUCERS: usize = 16;
+    match kind {
+        "human-only" => return profiles.len() == 0,
+        "profile-assisted" if (1..=MAX_PRODUCERS).contains(&profiles.len()) => {}
+        _ => return false,
+    }
+    let mut seen = [""; MAX_PRODUCERS];
+    for (index, profile) in profiles.enumerate() {
+        let Some(id) = profile.filter(|id| delivery_policy::valid_workspace_profile_id(id)) else {
+            return false;
+        };
+        if seen[..index].contains(&id) {
+            return false;
+        }
+        seen[index] = id;
+    }
+    true
+}
+
 fn review_producer_answer(body: &Value, binding: &GateBinding, verb: &str) -> Result<()> {
+    let producer = &body["producer"];
     let tuple = match body["state"].as_str() {
-        Some("recorded") if body["producer"]["profile_ids"].is_array() => &body["producer"],
+        Some("recorded")
+            if producer["kind"]
+                .as_str()
+                .zip(producer["profile_ids"].as_array())
+                .is_some_and(|(kind, ids)| {
+                    valid_producer_profiles(kind, ids.iter().map(Value::as_str))
+                }) =>
+        {
+            producer
+        }
         Some("not_recorded") if verb == "review_producer" => body,
         _ => {
             return Err(refuse(format!(
@@ -2555,6 +2597,28 @@ mod tests {
         absent["state"] = json!("not_recorded");
         assert!(review_producer_answer(&absent, &binding, "review_producer").is_ok());
         assert!(review_producer_answer(&absent, &binding, "review_producer_attest").is_err());
+        reply["producer"]["head"] = json!(HEAD);
+        for (kind, profiles) in [
+            (json!(null), json!([])),
+            (json!("unrecognized"), json!([])),
+            (json!("human-only"), json!(["ap_standards-123"])),
+            (json!("profile-assisted"), json!([])),
+            (json!("profile-assisted"), json!([7])),
+            (json!("profile-assisted"), json!(["ap_short"])),
+            (
+                json!("profile-assisted"),
+                json!(["ap_standards-123", "ap_standards-123"]),
+            ),
+        ] {
+            reply["producer"]["kind"] = kind;
+            reply["producer"]["profile_ids"] = profiles;
+            assert!(
+                review_producer_answer(&reply, &binding, "review_producer").is_err(),
+                "{reply}"
+            );
+        }
+        reply["producer"]["profile_ids"] = json!(["ap_standards-123", "ap_spec-12345"]);
+        assert!(review_producer_answer(&reply, &binding, "review_producer").is_ok());
     }
 
     #[test]
