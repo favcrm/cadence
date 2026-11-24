@@ -379,16 +379,24 @@ async function run(): Promise<void> {
     "no raw credit counts rendered",
   );
   assert(host.textContent?.includes("Free trial"), "active trial badge visible");
-  assert(host.textContent?.includes("1× monthly usage capacity"), "relative plan capacity multiplier displayed");
-  assert(host.textContent?.includes("$17"), "monthly USD price shown by default");
-  assert(!host.textContent?.includes("$163"), "yearly price hidden until toggled");
+  assert(Boolean(host.querySelector('[data-testid="billing-extra-card"]')), "extra usage hero card rendered");
+  assert(!host.querySelector("[data-plan-id]") && !host.querySelector("#billing-packs"), "plans and extra packs stay tucked in modals on initial load");
 
-  const yearlyBtn = Array.from(host.querySelectorAll("button")).find(
+  const openPlansBtn = host.querySelector("#billing-open-plans") as HTMLButtonElement;
+  assert(openPlansBtn, "Choose plan / Upgrade button present");
+  await React.act(async () => openPlansBtn.click());
+  const plansModal = host.querySelector('[data-testid="billing-plans-modal"]');
+  assert(Boolean(plansModal), "plans modal opens on click");
+  assert(plansModal?.textContent?.includes("1× monthly usage capacity"), "relative plan capacity multiplier displayed");
+  assert(plansModal?.textContent?.includes("$17"), "monthly USD price shown by default");
+  assert(!plansModal?.textContent?.includes("$163"), "yearly price hidden until toggled");
+
+  const yearlyBtn = Array.from(plansModal?.querySelectorAll("button") ?? []).find(
     (b) => b.textContent === "Yearly billing",
   ) as HTMLButtonElement;
   assert(yearlyBtn, "yearly toggle button present");
   await React.act(async () => yearlyBtn.click());
-  assert(host.textContent?.includes("$163"), "yearly USD price shown after toggle");
+  assert(host.querySelector('[data-testid="billing-plans-modal"]')?.textContent?.includes("$163"), "yearly USD price shown after toggle");
 
   const choosePlanBtn = host.querySelector('[data-plan-id="synth_basic_yr"] button') as HTMLButtonElement;
   await React.act(async () => choosePlanBtn.click());
@@ -400,17 +408,29 @@ async function run(): Promise<void> {
   equal(subReq.body, JSON.stringify({ planId: "synth_basic_yr" }), "subscribe sends selected planId");
   equal(firstRedirect, "https://checkout.stripe.com/c/pay/cs_synth_1", "redirects to Stripe Checkout");
 
-  // Unsafe redirect URL is refused
+  await React.act(async () => {
+    win.document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  });
+  assert(!host.querySelector('[data-testid="billing-plans-modal"]'), "plans modal closes on Escape");
+
+  // Unsafe redirect URL is refused inside Extra usage modal
+  const openExtraBtn = host.querySelector("#billing-open-extra") as HTMLButtonElement;
+  assert(openExtraBtn, "Add extra usage button present");
+  await React.act(async () => openExtraBtn.click());
+  assert(Boolean(host.querySelector('[data-testid="billing-extra-modal"] #billing-packs')), "extra usage modal opens with refill packs");
   nextPostPayload = { url: "https://evil.example.test/steal" };
   const buyPackBtn = host.querySelector('[data-pack-id="pack_alpha"] button') as HTMLButtonElement;
   await React.act(async () => buyPackBtn.click());
   await waitForDom(
     React.act,
     host,
-    () => Boolean(host.textContent?.includes("redirect link was invalid")),
+    () => Boolean(host.querySelector('[data-testid="billing-extra-modal"]')?.textContent?.includes("redirect link was invalid")),
     "unsafe redirect inline error",
   );
   equal(redirects.length, 1, "unsafe topup URL does not redirect");
+  const closeExtraBtn = host.querySelector('[data-testid="billing-extra-modal"] button[aria-label="Close"]') as HTMLButtonElement;
+  await React.act(async () => closeExtraBtn.click());
+  assert(!host.querySelector('[data-testid="billing-extra-modal"]'), "extra modal closes on Close button");
   await unmount();
 
   // 2. zh-TW locale shows approx HKD references + formal USD Stripe settlement disclosure
@@ -431,23 +451,33 @@ async function run(): Promise<void> {
     waitForDom(
       React.act,
       host,
-      () => Boolean(host.textContent?.includes("訂閱方案")),
-      "zh-TW billing heading and plans",
+      () => Boolean(host.querySelector("#billing-open-plans")),
+      "zh-TW billing heading and overview",
     ),
   );
   assert(host.textContent?.includes("帳單與方案"), "zh-TW billing heading rendered");
-  assert(host.textContent?.includes("訂閱方案"), "zh-TW Subscription plans label rendered without Plans collision");
+  assert(host.textContent?.includes("升級方案"), "zh-TW Upgrade CTA rendered");
+  assert(host.textContent?.includes("加購額外用量"), "zh-TW Add extra usage CTA rendered");
+  assert(host.textContent?.includes("發票與付款方式"), "zh-TW Invoices & payment details rendered");
+  assert(!host.textContent?.includes("計畫") && !host.textContent?.includes("按月"), "zh-TW avoids collided native task strings");
+
+  await React.act(async () => (host.querySelector("#billing-open-plans") as HTMLButtonElement).click());
+  const zhPlansModal = host.querySelector('[data-testid="billing-plans-modal"]');
+  assert(zhPlansModal?.textContent?.includes("訂閱方案"), "zh-TW Subscription plans label rendered without Plans collision");
   assert(
-    host.textContent?.includes("月繳") && host.textContent?.includes("年繳"),
+    zhPlansModal?.textContent?.includes("月繳") && zhPlansModal?.textContent?.includes("年繳"),
     "zh-TW Monthly/Yearly billing labels rendered without collision",
   );
-  assert(!host.textContent?.includes("計畫") && !host.textContent?.includes("按月"), "zh-TW avoids collided native task strings");
-  assert(host.textContent?.includes("≈ HK$"), "zh-TW secondary HKD reference shown");
-  assert(host.textContent?.includes("以美元 (USD) 經 Stripe 結算，港幣金額僅供參考。"), "zh-TW disclosure shown");
+  assert(zhPlansModal?.textContent?.includes("≈ HK$"), "zh-TW secondary HKD reference shown");
+  assert(zhPlansModal?.textContent?.includes("以美元 (USD) 經 Stripe 結算，港幣金額僅供參考。"), "zh-TW disclosure shown");
+  await React.act(async () => {
+    win.document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  });
+
   const portalBtn = Array.from(host.querySelectorAll("button")).find(
     (b) => b.textContent === "管理帳單",
   ) as HTMLButtonElement;
-  assert(portalBtn, "active Stripe subscription shows Manage billing button");
+  assert(portalBtn, "active Stripe subscription shows Open billing portal button");
   nextPostPayload = { url: "https://billing.stripe.com/p/session/bps_synth_1" };
   await React.act(async () => portalBtn.click());
   const secondRedirect = await redirectSignal.wait(React.act, "portal redirect");
@@ -504,16 +534,21 @@ async function run(): Promise<void> {
     waitForDom(
       React.act,
       host,
-      () => Boolean(host.querySelector('[data-testid="billing-iap-notice"]')),
-      "IAP notice",
+      () => Boolean(host.querySelector('[data-testid="billing-manage-strip"]')),
+      "IAP notice strip",
     ),
   );
   assert(
-    host.querySelector('[data-testid="billing-iap-notice"]')?.textContent?.includes("App Store"),
-    "IAP store notice shown",
+    host.querySelector('[data-testid="billing-manage-strip"]')?.textContent?.includes("App Store"),
+    "IAP store notice shown on billing manage strip",
   );
-  const manageBtns = Array.from(host.querySelectorAll("button")).filter((b) => b.textContent === "Manage billing");
+  const manageBtns = Array.from(host.querySelectorAll("button")).filter((b) => b.textContent === "Open billing portal");
   equal(manageBtns.length, 0, "IAP subscription hides Stripe portal button");
+  await React.act(async () => (host.querySelector("#billing-open-plans") as HTMLButtonElement).click());
+  assert(
+    host.querySelector('[data-testid="billing-plans-modal"]')?.textContent?.includes("App Store"),
+    "IAP store notice shown in plans modal",
+  );
   await unmount();
 
   // 6. Standby extra usage, 14-day chart filter, 3 tabs & pagination
@@ -581,12 +616,13 @@ async function run(): Promise<void> {
     "active monthly plan shows 38% used",
   );
   assert(
-    host.querySelector('[data-testid="billing-extra-standby"]')?.textContent?.includes("Standby"),
-    "standby extra strip shown when monthly < 100%",
+    host.querySelector('[data-testid="billing-extra-card"]')?.textContent?.includes("Standby"),
+    "standby badge shown in extra card when monthly < 100%",
   );
   assert(
-    host.querySelector('[data-testid="billing-extra-standby"]')?.textContent?.includes("100% left"),
-    "standby strip shows 100% left in pool",
+    host.querySelector('[data-testid="billing-extra-standby"]')?.textContent?.includes("100%") &&
+      host.querySelector('[data-testid="billing-extra-standby"]')?.textContent?.includes("left in reserve"),
+    "standby extra card shows 100% left in reserve",
   );
   assert(Boolean(host.querySelector('[data-testid="billing-usage-chart"]')), "14-day chart rendered");
   assert(
@@ -654,13 +690,20 @@ async function run(): Promise<void> {
       "overflow billing summary",
     ),
   );
-  assert(Boolean(host.querySelector('[data-testid="billing-completed-cycle"]')), "completed monthly strip visible in overflow");
   equal(
     host.querySelector('[data-testid="billing-usage-percent"]')?.textContent?.trim(),
-    "21%",
-    "overflow promotes extra pool used %",
+    "100%",
+    "overflow keeps monthly plan at 100% used",
   );
-  assert(host.textContent?.includes("79% remaining"), "overflow shows 79% extra remaining");
+  equal(
+    host.querySelector('[data-testid="billing-extra-percent"]')?.textContent?.trim(),
+    "21%",
+    "overflow displays active extra reserve used %",
+  );
+  assert(
+    host.querySelector('[data-testid="billing-extra-card"]')?.textContent?.includes("79% remaining"),
+    "overflow shows 79% extra remaining",
+  );
   await unmount();
 
   nextBillingPayload = {
