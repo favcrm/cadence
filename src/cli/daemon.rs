@@ -115,7 +115,7 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
                     _ => {}
                 }
             }
-            cadence_agent::daemon::serve(&state_dir)?;
+            cadence_daemon::serve(&state_dir)?;
             Ok(0)
         }
         DaemonAction::Start {
@@ -926,10 +926,9 @@ pub(crate) fn recovery_record_verdict(
                 .to_string(),
         );
     };
-    let Some(current) =
-        std::fs::read_to_string(state_dir.join(cadence_agent::daemon::INSTANCE_FILE))
-            .ok()
-            .map(|s| s.trim().to_string())
+    let Some(current) = std::fs::read_to_string(state_dir.join(cadence_daemon::INSTANCE_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
     else {
         return Some(
             "the new daemon left no readable instance file — the predecessor's \
@@ -937,10 +936,9 @@ pub(crate) fn recovery_record_verdict(
                 .to_string(),
         );
     };
-    let Some(record) =
-        std::fs::read_to_string(state_dir.join(cadence_agent::daemon::LAST_RECOVERY_FILE))
-            .ok()
-            .and_then(|raw| serde_json::from_str::<RecoveryRecordView>(&raw).ok())
+    let Some(record) = std::fs::read_to_string(state_dir.join(cadence_daemon::LAST_RECOVERY_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<RecoveryRecordView>(&raw).ok())
     else {
         return Some(
             "the new daemon left no readable recovery record (missing or malformed) — \

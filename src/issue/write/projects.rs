@@ -72,7 +72,7 @@ pub fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
     }
 }
 
-pub(crate) fn load_front(dir: &Path) -> Result<(Front, String)> {
+pub fn load_front(dir: &Path) -> Result<(Front, String)> {
     let text = std::fs::read_to_string(dir.join("issue.md"))?;
     parse::parse_issue(&text)
 }
@@ -121,6 +121,12 @@ pub(crate) fn split_tags(value: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[doc(hidden)]
+pub fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
+    atomic_write(&dir.join("issue.md"), &parse::render(front, body)?)
+}
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
     atomic_write(&dir.join("issue.md"), &parse::render(front, body)?)
 }

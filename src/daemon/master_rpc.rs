@@ -26,11 +26,11 @@ use super::{
     optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
 };
 
+use super::caller_rule::AgentCaller;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report};
 use crate::master::{self, ALIAS};
-use crate::peer::AgentCaller;
 use crate::store;
 // Readers and protected writers share the file/digest/params publication boundary.
 pub(super) static MASTER_IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1733,8 +1733,9 @@ impl Shared {
         let _lock = pm.lock()?;
         let rule = crate::master_perm::revoke_rule(&pm.dir, ALIAS, id)?;
         let path = crate::master_perm::rules_file(&pm.dir, ALIAS)?;
-        crate::issue::write::commit(
+        crate::issue::write::commit_scoped(
             &pm,
+            &_lock,
             std::slice::from_ref(&path),
             "agents/master: revoke a permission rule",
             &[],
@@ -1771,8 +1772,9 @@ impl Shared {
         let mut rules = crate::master_perm::read_rules(&pm.dir, ALIAS)?;
         rules.push(rule);
         let path = crate::master_perm::write_rules(&pm.dir, ALIAS, &rules)?;
-        if let Err(e) = crate::issue::write::commit(
+        if let Err(e) = crate::issue::write::commit_scoped(
             pm,
+            &_lock,
             std::slice::from_ref(&path),
             "agents/master: update permissions.yaml",
             &[],

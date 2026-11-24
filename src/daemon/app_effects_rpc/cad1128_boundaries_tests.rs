@@ -70,6 +70,7 @@
 
 // PRIVATE execution-capable SMTP fixture (distinct from the merged,
 // stage-only `platform::smtp::test_artifact_adapter` helper).
+#[path = "cad1128_boundaries_tests/cad1128_exec_smtp_fixture.rs"]
 mod cad1128_exec_smtp_fixture;
 
 use crate::daemon::cad1128_canary_fx as fx;
@@ -162,7 +163,10 @@ fn social_install_bundle(rig: &Rig) -> (String, String) {
     let out = op(
         rig,
         "app_workspace_install",
-        json!({"source": format!("{}/tests/fixtures/apps/social-content", env!("CARGO_MANIFEST_DIR"))}),
+        json!({"source": format!(
+            "{}/tests/fixtures/apps/social-content",
+            crate::contract_fixture::workspace_root().display()
+        )}),
     );
     op(
         rig,
@@ -377,7 +381,7 @@ fn seeded_encrypted_publication_run(
     .map(|(key, value)| (key.to_string(), value.to_string()))
     .collect();
     let workflow_text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        crate::contract_fixture::workspace_root()
             .join("tests/fixtures/apps/social-content/workflows/facebook.md"),
     )
     .expect("facebook workflow fixture readable");
@@ -454,7 +458,7 @@ fn seed_encrypted_binding(
         .expect("fixture publication mapping");
     let declaration = {
         let manifest_text = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            crate::contract_fixture::workspace_root()
                 .join("tests/fixtures/apps/social-content/app.md"),
         )
         .expect("social app manifest readable");

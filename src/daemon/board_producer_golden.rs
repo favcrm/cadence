@@ -7,10 +7,9 @@
 use super::*;
 use crate::store::NewAgent;
 use crate::test_seam::{scoped, Asserted};
-use std::path::PathBuf;
 
 fn golden(name: &str, actual: &Value) {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = crate::contract_fixture::workspace_root()
         .join("src/ui/board_api_golden")
         .join(name);
     let text = serde_json::to_string_pretty(actual).unwrap() + "\n";
@@ -50,7 +49,20 @@ fn fixture() -> (tempfile::TempDir, Arc<Shared>) {
             model_policy: None,
         })
         .unwrap();
-    crate::test_seam::seed_pi_fixture_policy(&shared.store, "fixture/model").unwrap();
+    let mut settings = shared.store.settings().unwrap();
+    settings.doc.pi = Some(
+        serde_json::from_value(serde_json::json!({
+            "models": {
+                "allow": ["fixture/model"],
+                "default": {"master": "fixture/model"}
+            }
+        }))
+        .unwrap(),
+    );
+    shared
+        .store
+        .save_settings(settings.revision, settings.doc, "test-seam-fixture")
+        .unwrap();
     (dir, shared)
 }
 

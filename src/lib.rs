@@ -54,10 +54,13 @@ pub mod web_push;
 // platform double, not a live adapter. Hidden from the public API docs.
 #[doc(hidden)]
 pub mod contract_fixture;
+#[path = "daemon/shared.rs"]
 pub mod daemon;
 pub mod delegation;
 pub mod delivery;
 // CAD-777: board sign-in through the AgenticOS device grant.
+#[cfg(test)]
+mod board_schema_test;
 pub mod device_login;
 pub mod devin_catalog;
 pub mod doctor;
@@ -71,14 +74,15 @@ pub mod home;
 pub mod ident;
 pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) mod installer_bundle;
+#[doc(hidden)]
+pub mod installer_bundle;
 pub mod issue;
 #[doc(hidden)]
 pub mod issuer_transport;
 pub mod lease;
 pub mod local_assignment;
-pub(crate) mod managed_section;
+#[doc(hidden)]
+pub mod managed_section;
 pub mod master;
 pub mod master_perm;
 pub mod mcp;
@@ -86,6 +90,7 @@ pub mod mcp_agent;
 pub mod memory;
 pub mod model_defaults;
 pub mod needs_dismiss;
+#[path = "operator_auth_shared.rs"]
 pub mod operator_auth;
 pub mod output;
 pub mod overview;
@@ -126,7 +131,11 @@ pub mod tailnet_proof;
 pub(crate) mod test_ports;
 pub mod test_queue;
 pub mod test_seam;
-pub(crate) mod thread_budget;
+#[cfg(feature = "test-seam")]
+#[doc(hidden)]
+pub fn send_row_gate_take(gate: &test_seam::SendRowGate) {
+    gate.take();
+}
 pub mod thread_search;
 pub mod ui;
 pub mod update;
@@ -144,10 +153,11 @@ extern crate self as cadence_agent;
 #[cfg(any(test, feature = "test-seam"))]
 #[doc(hidden)]
 pub mod test_web_issuer_tls;
-#[cfg(test)]
-mod web_cli_test_harness;
 
 pub use error::{Error, Result};
+
+/// Shipped native host version, shared by workspace runtime crates.
+pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Fixed no-argument non-setuid carrier entry, never a configurable exec API.
 pub fn installer_carrier_entry() -> Result<()> {

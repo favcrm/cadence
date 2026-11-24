@@ -23,7 +23,7 @@ use crate::store::Store;
 /// Runtime admission uses the same descriptor-confined installation lookup.
 /// The callback runs under PM -> SQLite lock ordering, never the reverse.
 #[track_caller]
-pub(crate) fn with_runtime_snapshot<T>(
+pub fn with_runtime_snapshot<T>(
     pm: &Pm,
     id: &str,
     callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
@@ -39,7 +39,7 @@ pub(crate) fn with_runtime_snapshot<T>(
 /// Both reads run the same checks as `with_runtime_snapshot`; the second
 /// read never re-enters `read_catalog`, so an odd legacy generation cannot
 /// refuse it while the caller already holds the lock.
-pub(crate) fn with_runtime_snapshot_pair<T>(
+pub fn with_runtime_snapshot_pair<T>(
     pm: &Pm,
     caller: &str,
     producer: &str,
@@ -123,7 +123,7 @@ pub(crate) mod read_seam {
 /// optimistic retry, but takes no PM lock. A callback that creates or
 /// changes state must use `with_runtime_snapshot`, which the PM lock orders
 /// against install, upgrade, remove and revoke.
-pub(crate) fn with_runtime_read<T>(
+pub fn with_runtime_read<T>(
     pm: &Pm,
     id: &str,
     callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
@@ -160,7 +160,7 @@ pub(crate) fn with_runtime_read<T>(
 /// bytes may supply the old app contract. Active runs always use the current
 /// runtime snapshot above.
 #[track_caller]
-pub(crate) fn with_completed_bundle_snapshot<T>(
+pub fn with_completed_bundle_snapshot<T>(
     pm: &Pm,
     id: &str,
     digest: &str,
@@ -242,7 +242,7 @@ pub(super) fn builtin_bundle(
 /// distributions, so this always resolves to the retired refusal before
 /// any lock or write — the guard never runs on a source that cannot
 /// install.
-pub(crate) fn install_builtin_guarded(
+pub fn install_builtin_guarded(
     pm: &Pm,
     catalog_id: &str,
     expected_digest: &str,
@@ -266,7 +266,7 @@ pub(crate) fn install_builtin_guarded(
 /// re-resolves `HEAD` to a commit and re-fetches; `Source::Builtin`
 /// answers "current" until a later built-in catalog version ships.
 /// A `Source::Path` is a local checkout — no upstream to check.
-pub(crate) fn update_check(pm: &Pm, install_id: &str) -> Result<Value> {
+pub fn update_check(pm: &Pm, install_id: &str) -> Result<Value> {
     let id = InstallationId::parse(install_id)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
@@ -345,7 +345,7 @@ pub(crate) fn update_check(pm: &Pm, install_id: &str) -> Result<Value> {
 /// `personal_data` flag and the data it keeps. Per-kind counts live
 /// in the store's own tables; the daemon's RPC reads those directly.
 /// Writes nothing; the operator confirms before `remove` commits.
-pub(crate) fn remove_preview(pm: &Pm, install_id: &str) -> Result<Value> {
+pub fn remove_preview(pm: &Pm, install_id: &str) -> Result<Value> {
     let id = InstallationId::parse(install_id)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
@@ -385,7 +385,7 @@ pub(crate) fn remove_preview(pm: &Pm, install_id: &str) -> Result<Value> {
 
 /// [`remove`] with a guard re-run under the PM lock before the first write
 /// (CAD-1374). A replay returns before the guard: it changes nothing.
-pub(crate) fn remove_guarded(
+pub fn remove_guarded(
     pm: &Pm,
     store: &Store,
     install_id: &str,
@@ -451,11 +451,7 @@ pub(crate) fn remove_guarded(
 
 /// [`restore`] with a guard re-run under the PM lock before the first write
 /// (CAD-1374). An already-live install returns before the guard: no effect.
-pub(crate) fn restore_guarded(
-    pm: &Pm,
-    install_id: &str,
-    guard: &dyn Fn() -> Result<()>,
-) -> Result<Value> {
+pub fn restore_guarded(pm: &Pm, install_id: &str, guard: &dyn Fn() -> Result<()>) -> Result<Value> {
     let id = InstallationId::parse(install_id)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;

@@ -1050,7 +1050,7 @@ impl Shared {
         };
         let issue_id = &snapshot.issue;
         let app_paths =
-            crate::issue::app_guard::apps_in_paths(gated.front.paths.iter().map(String::as_str));
+            crate::issue::app_guard::apps_in_paths(gated.front().paths.iter().map(String::as_str));
         let mut authors: Vec<&str> = vec![plan.worker.alias.as_str(), plan.job.pm_alias.as_str()];
         authors.extend(caller.filter(|c| !c.is_empty()));
         let guard = crate::issue::app_guard::Ctx {
@@ -1121,7 +1121,7 @@ impl Shared {
         // unprovable checkout refuses instead of becoming an empty app
         // set.
         let remotes =
-            crate::issue::app_guard::checkout_remotes(&gated.project, &root).map_err(|e| {
+            crate::issue::app_guard::checkout_remotes(gated.project(), &root).map_err(|e| {
                 Error::rejected(format!(
                     "task dispatch refused: job '{}' / task '{}' — {}",
                     plan.job.id, plan.task.id, e

@@ -189,7 +189,7 @@ impl Shared {
     /// `agent_send` without a connection to attribute (unit tests):
     /// a threaded agent records the message as unattributed, and a
     /// steering send is the operator's.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seam"))]
     pub(super) fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
         self.send_with(params, &|_| Ok(store::Sender::Unattributed), &|_| {
             Ok(AgentCaller::Operator)
@@ -571,7 +571,7 @@ impl Shared {
                 .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
             let caller = steer_caller(verb)?;
             let pm = self.effective_pm(target)?;
-            crate::peer::may_mutate_agent(
+            super::caller_rule::may_mutate_agent(
                 &caller,
                 &alias,
                 pm.as_deref(),
@@ -1326,7 +1326,7 @@ impl Shared {
         let panes = crate::peer::AgentPids::classify(self.store.pty_pane_pids()?);
         let peer = PeerTies::probe(peer_pid);
         if let Some(target) = panes.get(alias) {
-            if peer.tied_to(alias, target.pid) {
+            if peer.tied_to(alias, target.pid()) {
                 return Err(Error::rejected(format!(
                     "a pane cannot {verb} its own pane — the caller is tied \
                      to the target's pane process",
@@ -1335,11 +1335,11 @@ impl Shared {
         }
         if let Some(row) = panes
             .unproven()
-            .find(|row| row.alias != alias && peer.tied_to(&row.alias, row.pid))
+            .find(|row| row.alias() != alias && peer.tied_to(row.alias(), row.pid()))
         {
             return Err(Error::rejected(format!(
                 "cannot derive the caller for `{verb}`: {}",
-                crate::peer::unproven_row(&row.alias, row.pid)
+                crate::peer::unproven_row(row.alias(), row.pid())
             )));
         }
         let live = panes.live();
@@ -1354,7 +1354,7 @@ impl Shared {
         // EINVAL, so liveness is a `metadata` existence check.
         let target_alive = panes
             .get(alias)
-            .is_some_and(|row| std::fs::metadata(format!("/proc/{}", row.pid)).is_ok());
+            .is_some_and(|row| std::fs::metadata(format!("/proc/{}", row.pid())).is_ok());
         unmatched_caller(peer.walked(), target_alive, peer.on_tty(), verb)
     }
 
@@ -1407,7 +1407,7 @@ impl Shared {
     /// at paste.
     ///
     /// Caller rule (CAD-149): only the operator or the target's own PM
-    /// ([`crate::peer::may_mutate_agent`], `Controlled`) — a pane must
+    /// ([`super::caller_rule::may_mutate_agent`], `Controlled`) — a pane must
     /// never submit its own input, and a peer never another's.
     ///
     /// Every precondition holds at action time or nothing is sent:
@@ -2244,7 +2244,7 @@ impl Shared {
     /// `turn/interrupt`, a pty's interrupt keys), never a kill.
     ///
     /// Caller rule: the operator, or the agent's own dispatcher — its PM,
-    /// via the one agent-mutation policy ([`crate::peer::may_mutate_agent`],
+    /// via the one agent-mutation policy ([`super::caller_rule::may_mutate_agent`],
     /// `Controlled`), or the master for a turn it dispatched
     /// (`master_dispatched`) — an agent interrupts neither a peer nor
     /// itself.

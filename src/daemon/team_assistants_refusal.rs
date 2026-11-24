@@ -97,9 +97,13 @@ fn write_private(path: &Path, bytes: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+#[path = "team_assistants_refusal/cad2215_delivery_provenance_acceptance.rs"]
 mod cad2215_delivery_provenance_acceptance;
+#[path = "team_assistants_refusal/cad2215_member_scope_acceptance.rs"]
 mod cad2215_member_scope_acceptance;
+#[path = "team_assistants_refusal/cad2215_private_completion_acceptance.rs"]
 mod cad2215_private_completion_acceptance;
+#[path = "team_assistants_refusal/cad2215_private_delivery_native_acceptance.rs"]
 mod cad2215_private_delivery_native_acceptance;
 
 pub use super::AssistantFlagOn;
@@ -7068,7 +7072,7 @@ mod master_home_acceptance {
     fn master_home_report_is_metadata_only_and_master_cannot_verdict() {
         let _flag = AssistantFlagOn::arm();
         let fx = Fx::new();
-        let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi-gateway.py");
+        let fake = crate::contract_fixture::workspace_root().join("tests/fixtures/pi-gateway.py");
         let token = format!("hcs_{}", "e".repeat(43));
         let sub = "sub-home";
         // Fixture platform member authority: the live membership and recorded

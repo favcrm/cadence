@@ -65,7 +65,7 @@ pub(crate) fn source_digest(identity: &AccountImageIdentity) -> String {
     )
 }
 
-pub(crate) fn validate_quote_source(
+pub fn validate_quote_source(
     identity: &AccountImageIdentity,
     revision: &str,
 ) -> std::result::Result<(), String> {
@@ -81,9 +81,7 @@ pub(crate) fn validate_quote_source(
     Ok(())
 }
 
-pub(crate) fn current_identity(
-    config: &Value,
-) -> std::result::Result<AccountImageIdentity, String> {
+pub fn current_identity(config: &Value) -> std::result::Result<AccountImageIdentity, String> {
     let account = config["account"]
         .as_str()
         .ok_or("account image source is absent")?;
@@ -104,7 +102,7 @@ pub(crate) fn current_identity(
 }
 
 /// Called after unlocked quote I/O and reacquiring native receipt guards.
-pub(crate) fn recheck_quote(config: &Value, quote: &AppCapabilityQuote) -> Result<()> {
+pub fn recheck_quote(config: &Value, quote: &AppCapabilityQuote) -> Result<()> {
     if config["provider"] == PLATFORM {
         let identity = current_identity(config).map_err(Error::rejected)?;
         validate_quote_source(&identity, &quote.price_revision).map_err(Error::rejected)?;
@@ -164,16 +162,16 @@ impl AccountMediaAdapter {
     }
 }
 
-pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+pub fn attach(opts: &mut impl super::PlatformRegistry) -> Result<()> {
     let adapter = AccountMediaAdapter::new()?;
-    if let Some(existing) = opts.platforms.get(PLATFORM) {
+    if let Some(existing) = opts.platforms_mut().get(PLATFORM) {
         if existing.connection_registration() != adapter.connection_registration() {
             return Err(Error::rejected(
                 "account image transport conflicts with registered provider",
             ));
         }
     } else {
-        opts.platforms
+        opts.platforms_mut()
             .insert(PLATFORM.into(), std::sync::Arc::new(adapter));
     }
     Ok(())

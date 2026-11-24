@@ -26,20 +26,24 @@ mod early_kickoff;
 mod job_spec;
 mod kickoff;
 
+#[doc(hidden)]
+pub use self::context::JobContext;
 use self::context::{
     content_digest, lessons, redacted_fact, Lessons, LESSON_KIND, LESSON_OMITTED_ID, LESSON_PATH,
 };
-pub(crate) use self::context::{context_guard, ContextTarget, JobContext, PreparedContext};
+pub use self::context::{context_guard, ContextTarget, PreparedContext};
 use self::early_kickoff::{
     early_kickoff, message_refs, message_row, row_mode, same_path, spec_locator, DispatchMode,
     EarlyDispatch, EarlyKickoff,
 };
-pub(crate) use self::job_spec::{
-    canonical_issue_spec_digest, capture_intake_cloud_spec, intake_spec_matches, intake_spec_pin,
-    job_context,
+#[doc(hidden)]
+pub use self::job_spec::{
+    canonical_issue_spec_digest, capture_intake_cloud_spec, dispatch_lane, intake_spec_matches,
+    intake_spec_pin, job_context,
 };
 pub use self::kickoff::parse_acceptance_listing;
-pub(crate) use self::kickoff::{
+#[doc(hidden)]
+pub use self::kickoff::{
     acceptance_listing, inline_listing, intake_acceptance, outstanding_items,
     with_independent_acceptance,
 };
@@ -229,7 +233,8 @@ impl ContextFacts {
 /// The lane's creation base, never the current branch tip. A lifecycle
 /// record is authoritative when present; legacy lanes need a surviving
 /// branch-creation reflog entry.
-pub(crate) fn original_lane_base(
+#[doc(hidden)]
+pub fn original_lane_base(
     root: &Path,
     lane: &Path,
     branch: &str,
@@ -254,7 +259,8 @@ pub(crate) fn original_lane_base(
 }
 
 /// Attach the complete approved acceptance section to an intake request.
-pub(crate) fn intake_request(request: &str, source: &str) -> Result<String> {
+#[doc(hidden)]
+pub fn intake_request(request: &str, source: &str) -> Result<String> {
     let (_, body) = parse::split_front(source)?;
     let scope = parse::acceptance_scope(body)
         .ok_or_else(|| Error::internal("approved intake has no acceptance scope"))?;
@@ -263,6 +269,12 @@ pub(crate) fn intake_request(request: &str, source: &str) -> Result<String> {
     ))
 }
 
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[doc(hidden)]
+pub fn intake_scope_marker(revision: &str, digest: &str) -> String {
+    format!(" [Cadence intake scope: revision={revision} digest={digest}]")
+}
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn intake_scope_marker(revision: &str, digest: &str) -> String {
     format!(" [Cadence intake scope: revision={revision} digest={digest}]")
 }
@@ -274,13 +286,15 @@ fn intake_legacy_acceptance(source: &str) -> Result<String> {
     intake_acceptance(scope)
 }
 
-pub(crate) fn intake_legacy_suffix(source: &str, revision: &str, digest: &str) -> Result<String> {
+#[doc(hidden)]
+pub fn intake_legacy_suffix(source: &str, revision: &str, digest: &str) -> Result<String> {
     let mut acceptance = intake_legacy_acceptance(source)?;
     acceptance.push_str(&intake_scope_marker(revision, digest));
     Ok(acceptance)
 }
 
-pub(crate) fn body_has_intake_scope(text: &str, suffix: &str) -> bool {
+#[doc(hidden)]
+pub fn body_has_intake_scope(text: &str, suffix: &str) -> bool {
     text.rsplit_once(suffix).is_some_and(|(_, tail)| {
         tail.is_empty()
             || tail
@@ -338,15 +352,40 @@ struct Preflight {
 /// Authority, claim and target checks stay with the caller — this only
 /// removes the duplicated load/acceptance/plan sequence.
 #[derive(Clone)]
-pub(crate) struct GatedIssue {
+pub struct GatedIssue {
+    #[doc(hidden)]
     pub project: crate::issue::project::Project,
+    #[doc(hidden)]
     pub dir: PathBuf,
+    #[doc(hidden)]
     pub front: Front,
+    #[doc(hidden)]
     pub items: Vec<AcceptanceItem>,
     /// Exact source from which `front` and `items` were parsed.
+    #[doc(hidden)]
     pub source: String,
     /// Complete canonical prose from that same parse, without criteria copies.
-    pub request: String,
+    pub(crate) request: String,
+}
+
+impl GatedIssue {
+    pub fn project(&self) -> &crate::issue::project::Project {
+        &self.project
+    }
+
+    pub fn front(&self) -> &Front {
+        &self.front
+    }
+
+    #[doc(hidden)]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    #[doc(hidden)]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
 }
 
 /// One issue read: the project and folder that hold it, its frontmatter, its
@@ -431,7 +470,7 @@ impl IssueSnapshot {
 /// legacy kickoff instead of gaining a new refusal merely because context
 /// capture was attempted. A held issue that cannot be read, and a tracker
 /// that cannot be listed, still fail closed.
-pub(crate) fn capture_issue(pm: &Pm, id: &str) -> Result<Option<GatedIssue>> {
+pub fn capture_issue(pm: &Pm, id: &str) -> Result<Option<GatedIssue>> {
     let Some(snapshot) = IssueSnapshot::read(pm, id)? else {
         return Ok(None);
     };
@@ -442,7 +481,7 @@ pub(crate) fn capture_issue(pm: &Pm, id: &str) -> Result<Option<GatedIssue>> {
 /// read it, apply the plan gate and require acceptance when the caller does.
 /// Authority, claim and target checks stay with the caller — this only
 /// removes the duplicated load/acceptance/plan sequence.
-pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
+pub fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
     let Some(snapshot) = IssueSnapshot::read(pm, id)? else {
         return Err(Error::rejected(format!(
             "Unknown issue '{id}' — `cadence issue ls` lists what exists"
@@ -456,7 +495,7 @@ pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<
 /// and a confined pi worker is not on a Devin model. Split out so a
 /// caller that runs `issue start` itself (the board kickoff) can refuse
 /// before the first mutation.
-pub(crate) struct SeatCheck {
+pub struct SeatCheck {
     pub show: Value,
     pub agent: Value,
     pub cwd_override: Option<String>,
@@ -464,7 +503,7 @@ pub(crate) struct SeatCheck {
     pub endpoint_kind: String,
 }
 
-pub(crate) fn check_seat(
+pub fn check_seat(
     project: &crate::issue::project::Project,
     alias: &str,
     force: bool,

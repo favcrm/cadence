@@ -628,6 +628,7 @@ impl RuntimeOwnerService {
         let launch_request: serde_json::Value = serde_json::from_str(&launch_request_json)
             .map_err(|_| Error::internal("launch request is not valid JSON"))?;
         Ok(PreparedRuntime {
+            listener_enrollment: std::sync::Mutex::new(None),
             runtime_id: allocation.runtime_id.clone(),
             operation_id: allocation.operation_id.clone(),
             generation: allocation.generation,

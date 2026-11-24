@@ -9,7 +9,7 @@
 use crate::error::{Error, Result};
 
 /// Parse one strict JSON document.
-pub(crate) fn parse(bytes: &[u8]) -> Result<serde_json::Value> {
+pub fn parse(bytes: &[u8]) -> Result<serde_json::Value> {
     if bytes.is_empty() {
         return Err(Error::rejected("empty JSON document"));
     }
@@ -20,7 +20,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<serde_json::Value> {
 }
 
 /// A JSON object with exactly `names` — deny unknown, duplicate and missing.
-pub(crate) fn object<'a>(
+pub fn object<'a>(
     v: &'a serde_json::Value,
     names: &[&str],
 ) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
@@ -39,7 +39,7 @@ pub(crate) fn object<'a>(
 }
 
 /// A JSON object with the required `names` and at most the `optional` ones.
-pub(crate) fn object_with<'a>(
+pub fn object_with<'a>(
     v: &'a serde_json::Value,
     required: &[&str],
     optional: &[&str],
@@ -57,23 +57,20 @@ pub(crate) fn object_with<'a>(
     Ok(m)
 }
 
-pub(crate) fn string<'a>(
-    m: &'a serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<&'a str> {
+pub fn string<'a>(m: &'a serde_json::Map<String, serde_json::Value>, key: &str) -> Result<&'a str> {
     m.get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| Error::rejected(format!("'{key}' is missing or not a string")))
 }
 
-pub(crate) fn boolean(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<bool> {
+pub fn boolean(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<bool> {
     m.get(key)
         .and_then(|v| v.as_bool())
         .ok_or_else(|| Error::rejected(format!("'{key}' is missing or not a boolean")))
 }
 
 /// A JS-safe non-negative integer (`<= 2^53 - 1`); floats/strings refuse.
-pub(crate) fn safe_u64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<u64> {
+pub fn safe_u64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<u64> {
     match m.get(key).and_then(|v| v.as_u64()) {
         Some(n) if n <= super::MAX_SAFE_INT => Ok(n),
         _ => Err(Error::rejected(format!(
@@ -83,10 +80,7 @@ pub(crate) fn safe_u64(m: &serde_json::Map<String, serde_json::Value>, key: &str
 }
 
 /// A positive JS-safe integer (revisions/generations).
-pub(crate) fn positive_u64(
-    m: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<u64> {
+pub fn positive_u64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<u64> {
     let n = safe_u64(m, key)?;
     if n == 0 {
         return Err(Error::rejected(format!("'{key}' must be positive")));
@@ -94,7 +88,7 @@ pub(crate) fn positive_u64(
     Ok(n)
 }
 
-pub(crate) fn array<'a>(
+pub fn array<'a>(
     m: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
 ) -> Result<&'a Vec<serde_json::Value>> {
@@ -104,7 +98,7 @@ pub(crate) fn array<'a>(
 }
 
 /// Validate a `sha256:` + 64 lowercase hex digest.
-pub(crate) fn digest(s: &str) -> Result<()> {
+pub fn digest(s: &str) -> Result<()> {
     let hex = s
         .strip_prefix("sha256:")
         .ok_or_else(|| Error::rejected("digest must be sha256:<64 lowercase hex>"))?;
@@ -114,7 +108,7 @@ pub(crate) fn digest(s: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn is_lower_hex(s: &str, len: usize) -> bool {
+pub fn is_lower_hex(s: &str, len: usize) -> bool {
     s.len() == len
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

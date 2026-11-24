@@ -64,7 +64,8 @@ pub fn operator_price_refusal(message: &str) -> Option<&str> {
     (code.is_empty() || code.strip_prefix(": ").is_some_and(refusal_code)).then_some(message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
+#[path = "app_capabilities_rpc/tests.rs"]
 mod tests;
 
 /// A run-bound capability failure as a daemon error: an explicit refusal
@@ -197,7 +198,7 @@ impl Shared {
         crate::platform::account_media::recheck_quote(&proof.config, quote)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seam"))]
     pub(super) fn app_capability_quote(
         &self,
         proof: &BindingProof,
@@ -413,7 +414,7 @@ impl Shared {
             workspace::with_runtime_snapshot_pair(
                 &pm,
                 install,
-                &original.install_id,
+                original.install_id(),
                 |(bundle, files), producer| admit(bundle, files, Some(producer)),
             )?
         } else {
@@ -507,7 +508,7 @@ impl Shared {
                 workspace::with_runtime_snapshot_pair(
                     &pm,
                     install,
-                    &original.install_id,
+                    original.install_id(),
                     |(bundle, files), producer| record(bundle, files, Some(producer)),
                 )
             } else {
@@ -1183,4 +1184,5 @@ impl Shared {
 }
 
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "app_capabilities_rpc/early_app_quote_tests.rs"]
 mod early_app_quote_tests;

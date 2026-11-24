@@ -66,7 +66,7 @@ use crate::error::Error;
 /// `/proc` read failed mid-walk: an incomplete chain proves neither
 /// membership nor its absence, so callers must treat it as
 /// unverifiable rather than outside.
-pub(crate) struct PeerTies {
+pub struct PeerTies {
     pid: u32,
     chain: Option<Vec<u32>>,
     env_alias: Option<String>,
@@ -74,7 +74,7 @@ pub(crate) struct PeerTies {
 
 impl PeerTies {
     /// Read the peer's ancestry and `CADENCE_ALIAS` now.
-    pub(crate) fn probe(pid: u32) -> Self {
+    pub fn probe(pid: u32) -> Self {
         Self {
             pid,
             chain: caller_chain(pid),
@@ -83,7 +83,7 @@ impl PeerTies {
     }
 
     /// Whether the whole `/proc` ancestry could be walked.
-    pub(crate) fn walked(&self) -> bool {
+    pub fn walked(&self) -> bool {
         self.chain.is_some()
     }
 
@@ -105,7 +105,7 @@ impl PeerTies {
     /// The widest tie — a process signal OR the pane's `CADENCE_ALIAS`
     /// in the peer's env. For narrowing authority only (a pane may not
     /// answer its own menu): a forged alias can only refuse its forger.
-    pub(crate) fn tied_to(&self, alias: &str, pane_pid: u32) -> bool {
+    pub fn tied_to(&self, alias: &str, pane_pid: u32) -> bool {
         self.process_tied(pane_pid) || self.env_alias.as_deref() == Some(alias)
     }
 
@@ -115,7 +115,7 @@ impl PeerTies {
     /// tie never attributes by itself; when a process signal
     /// corroborates it, the process signal already decides. The pty
     /// signal is choosable too (see the module doc's residual).
-    pub(crate) fn attributed_agents<'a>(
+    pub fn attributed_agents<'a>(
         &self,
         panes: impl IntoIterator<Item = (&'a str, u32)>,
     ) -> Vec<String> {
@@ -130,10 +130,7 @@ impl PeerTies {
     /// Every registered pane (`(alias, pane_pid)`) the peer is tied to,
     /// sorted by alias and deduplicated — deterministic, never map
     /// order.
-    pub(crate) fn agents<'a>(
-        &self,
-        panes: impl IntoIterator<Item = (&'a str, u32)>,
-    ) -> Vec<String> {
+    pub fn agents<'a>(&self, panes: impl IntoIterator<Item = (&'a str, u32)>) -> Vec<String> {
         let tied: BTreeSet<&str> = panes
             .into_iter()
             .filter(|(alias, pane_pid)| self.tied_to(alias, *pane_pid))
@@ -146,7 +143,7 @@ impl PeerTies {
     /// pane membership check failed, so any pts fd is foreign by
     /// definition — positive evidence of an interactive terminal. A
     /// detached caller (`setsid … </dev/null >&2`) holds none.
-    pub(crate) fn on_tty(&self) -> bool {
+    pub fn on_tty(&self) -> bool {
         (0..=2).any(|fd| {
             std::fs::read_link(format!("/proc/{}/fd/{fd}", self.pid))
                 .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
@@ -191,7 +188,7 @@ fn holds_pane_tty(peer_pid: u32, pane_pid: u32) -> bool {
 /// alive, `unknown` once it is gone. A clean walk with no match is
 /// `operator` only with positive terminal evidence (`foreign_tty`); a
 /// detached caller is `unknown`, never `operator`.
-pub(crate) fn unmatched_caller(
+pub fn unmatched_caller(
     walked: bool,
     target_alive: bool,
     foreign_tty: bool,
@@ -346,6 +343,17 @@ pub fn operator_proof(
 /// Set in the environment of a coding agent's process and its shells.
 /// `spawn_daemon_run` and the board's start remove them: a long-running
 /// service started from an agent's shell is not that agent.
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[doc(hidden)]
+pub const AGENT_RUNTIME_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "PI_CODING_AGENT",
+    "PI_SESSION_ID",
+];
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) const AGENT_RUNTIME_MARKERS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
@@ -372,7 +380,7 @@ fn agent_runtime_marker(environ: &[u8]) -> Option<&'static str> {
 /// environment and leaves the marked ancestry (`setsid -f env -i`), or starts
 /// through `systemd-run`, cron or `ssh localhost`, still passes. An unreadable
 /// hop is skipped, as in [`operator_proof`].
-pub(crate) fn refuse_agent_runtime(peer_pid: u32, state_dir: &Path) -> Result<(), String> {
+pub fn refuse_agent_runtime(peer_pid: u32, state_dir: &Path) -> Result<(), String> {
     if !production_store(state_dir) {
         return Ok(());
     }
@@ -401,104 +409,8 @@ fn production_store(state_dir: &Path) -> bool {
         .map_or(true, |default| resolved(&default) == resolved(state_dir))
 }
 
-/// Who is asking to change or delete an agent row — derived from the
-/// connection, never from a request field (CAD-149, CAD-304 S3). The
-/// daemon builds it from the peer's `/proc` ancestry (the nearest
-/// registered pane or enrolled managed endpoint IS that agent) and,
-/// deriving none, from [`operator_proof`]; anything else is refused
-/// before a caller exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AgentCaller {
-    /// Positive operator proof.
-    Operator,
-    /// A registered agent, by alias.
-    Agent(String),
-}
-
-impl AgentCaller {
-    /// `(by, by_kind)` for audit events.
-    pub(crate) fn audit(&self) -> (&str, &'static str) {
-        match self {
-            AgentCaller::Operator => ("operator", "operator"),
-            AgentCaller::Agent(alias) => (alias, "agent"),
-        }
-    }
-}
-
-/// What a mutation of an agent can do — the key class of the policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentMutation {
-    /// Only self-service params (model, effort — see
-    /// `registry::ParamClass::SelfService`).
-    SelfService,
-    /// Anything else: trust-bearing or posture params, and removal
-    /// (which deletes the agent's history).
-    Controlled,
-    /// Steering the agent's queue (CAD-158): an `urgent` send, or one
-    /// that supersedes its queued messages. Never self-service — and a
-    /// worker is never its PM's PM, so worker output cannot jump its
-    /// PM's queue.
-    Steer,
-}
-
-/// The one rule for "may `caller` mutate agent `target`" (CAD-149,
-/// shared with `agent remove`/`agent gc`, CAD-304 S3). `target_pm` is
-/// the target's own PM — its `params.upstream`.
-///
-/// - the operator may do anything;
-/// - the target's own PM may do anything to it (a PM is never its own
-///   PM, even if an upstream names itself);
-/// - the agent itself may make a self-service change only (it may not
-///   steer its own queue);
-/// - everyone else — a peer worker, the PM of another group, a worker
-///   writing to its own PM — is refused.
-///
-/// `Err` is the refusal text, naming the rule.
-pub(crate) fn may_mutate_agent(
-    caller: &AgentCaller,
-    target: &str,
-    target_pm: Option<&str>,
-    mutation: AgentMutation,
-    verb: &str,
-) -> Result<(), String> {
-    let alias = match caller {
-        AgentCaller::Operator => return Ok(()),
-        AgentCaller::Agent(alias) => alias.as_str(),
-    };
-    if alias != target && target_pm == Some(alias) {
-        return Ok(());
-    }
-    let owner = match target_pm.filter(|pm| *pm != target) {
-        Some(pm) => format!("the operator or its PM '{pm}'"),
-        None => "the operator (it has no PM)".to_string(),
-    };
-    if mutation == AgentMutation::Steer {
-        return Err(format!(
-            "{verb} refused: agent '{alias}' may not send urgent or superseding \
-             messages to '{target}' — only {owner} may steer '{target}''s queue \
-             (steering rule: operator or the recipient's PM, CAD-158)"
-        ));
-    }
-    if alias == target {
-        return match mutation {
-            AgentMutation::SelfService => Ok(()),
-            AgentMutation::Controlled | AgentMutation::Steer => Err(format!(
-                "{verb} refused: agent '{alias}' cannot make this change to itself — \
-                 an agent may set only its own model/effort; trust-bearing and \
-                 posture params and removal of '{target}' belong to {owner} \
-                 (caller rule, CAD-149)"
-            )),
-        };
-    }
-    Err(format!(
-        "{verb} refused: agent '{alias}' cannot change another agent — only \
-         '{target}' itself (model/effort) and {owner} may change '{target}' \
-         (caller rule, CAD-149)"
-    ))
-}
-
 /// Real and effective uid from `/proc/<pid>/status`.
-pub(crate) fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
+pub fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
     status
@@ -511,7 +423,7 @@ pub(crate) fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
 }
 
 /// The session id (`/proc/<pid>/stat` field 6).
-pub(crate) fn proc_session(pid: u32) -> Result<u32, String> {
+pub fn proc_session(pid: u32) -> Result<u32, String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|e| format!("/proc/{pid}/stat: {e}"))?;
     // comm (field 2) may hold spaces and parens — split after the last
@@ -527,7 +439,7 @@ pub(crate) fn proc_session(pid: u32) -> Result<u32, String> {
 /// `comm` (field 2) may hold spaces and parens, so fields are counted
 /// after the LAST `)`: state (field 3) is index 0, field 22 index 19.
 /// `None` when the process is gone or its `stat` is unreadable.
-pub(crate) fn proc_starttime(pid: u32) -> Option<u64> {
+pub fn proc_starttime(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_proc_starttime(&stat)
 }
@@ -547,7 +459,7 @@ pub(crate) fn parse_proc_starttime(stat: &str) -> Option<u64> {
 /// process holding that pid NOW (CAD-385). The pid alone never names an
 /// agent: pids are reused, and a row outlives its process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PidProof {
+pub enum PidProof {
     /// The pid still names the recorded process — same start time.
     Same,
     /// The pid names another process, or none: the row is stale and
@@ -562,7 +474,7 @@ pub(crate) enum PidProof {
 }
 
 /// Classify one recorded pid against `/proc` now ([`PidProof`]).
-pub(crate) fn pid_proof(pid: u32, recorded_start: Option<u64>) -> PidProof {
+pub fn pid_proof(pid: u32, recorded_start: Option<u64>) -> PidProof {
     let Some(recorded) = recorded_start else {
         return PidProof::Unproven;
     };
@@ -585,10 +497,20 @@ pub(crate) const PID_START_REMEDY: &str = "restart the daemon on this build \
 
 /// One agent's recorded process, classified.
 #[derive(Debug, Clone)]
-pub(crate) struct AgentPid {
+pub struct AgentPid {
     pub(crate) alias: String,
     pub(crate) pid: u32,
     pub(crate) proof: PidProof,
+}
+
+impl AgentPid {
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
 }
 
 /// The agent rows' recorded processes — pane pids or managed provider
@@ -647,28 +569,28 @@ impl AgentPids {
     }
 
     /// pid → alias for rows whose recorded process is proven live.
-    pub(crate) fn live(&self) -> HashMap<u32, String> {
+    pub fn live(&self) -> HashMap<u32, String> {
         self.map(|r| r.proof == PidProof::Same)
     }
 
     /// pid → alias for every row that may still be its process.
-    pub(crate) fn fenced(&self) -> HashMap<u32, String> {
+    pub fn fenced(&self) -> HashMap<u32, String> {
         self.map(|_| true)
     }
 
     /// The row recorded for `alias`, when it is not stale.
-    pub(crate) fn get(&self, alias: &str) -> Option<&AgentPid> {
+    pub fn get(&self, alias: &str) -> Option<&AgentPid> {
         self.rows.iter().find(|r| r.alias == alias)
     }
 
     /// The unproven rows.
-    pub(crate) fn unproven(&self) -> impl Iterator<Item = &AgentPid> {
+    pub fn unproven(&self) -> impl Iterator<Item = &AgentPid> {
         self.rows.iter().filter(|r| r.proof == PidProof::Unproven)
     }
 
     /// `Err` naming the nearest unproven row on `chain` (a caller's
     /// `/proc` ancestry, nearest first) and the remedy.
-    pub(crate) fn refuse_unproven_on(&self, chain: &[u32]) -> Result<(), String> {
+    pub fn refuse_unproven_on(&self, chain: &[u32]) -> Result<(), String> {
         let unproven = self.map(|r| r.proof == PidProof::Unproven);
         match chain
             .iter()
@@ -681,7 +603,7 @@ impl AgentPids {
 }
 
 /// The refusal for a caller tied to an [`PidProof::Unproven`] row.
-pub(crate) fn unproven_row(alias: &str, pid: u32) -> String {
+pub fn unproven_row(alias: &str, pid: u32) -> String {
     format!(
         "pid {pid} is agent '{alias}''s recorded process, but the row has no \
          process start time that proves it still is (recorded before CAD-385, \
@@ -1478,81 +1400,6 @@ mod tests {
                 .unwrap()
                 .expect("live client socket must match exact board endpoint");
             assert_eq!(exact.1, own_uid, "{bind}");
-        }
-    }
-
-    /// CAD-149: the policy per caller kind and mutation class.
-    #[test]
-    fn may_mutate_agent_per_caller_kind() {
-        use AgentMutation::{Controlled, SelfService};
-        let op = AgentCaller::Operator;
-        let pm = AgentCaller::Agent("pm".into());
-        let pm2 = AgentCaller::Agent("pm2".into());
-        let w1 = AgentCaller::Agent("w1".into());
-        let w2 = AgentCaller::Agent("w2".into());
-        let may = |c: &AgentCaller, target: &str, target_pm: Option<&str>, m| {
-            may_mutate_agent(c, target, target_pm, m, "agent set")
-        };
-        for m in [SelfService, Controlled] {
-            // Operator: everything, PM or not.
-            assert!(may(&op, "w2", Some("pm"), m).is_ok());
-            assert!(may(&op, "root", None, m).is_ok());
-            // The target's own PM: everything.
-            assert!(may(&pm, "w2", Some("pm"), m).is_ok());
-            // A peer worker and another group's PM: nothing.
-            let e = may(&w1, "w2", Some("pm"), m).unwrap_err();
-            assert!(e.contains("cannot change another agent"), "{e}");
-            assert!(e.contains("its PM 'pm'"), "{e}");
-            assert!(may(&pm2, "w2", Some("pm"), m).is_err());
-            // A worker that happens to be named as nothing: refused.
-            assert!(may(&w2, "w1", None, m).is_err());
-        }
-        // Self: self-service only — trust/posture/removal refused, and
-        // the refusal names the rule.
-        assert!(may(&w1, "w1", Some("pm"), SelfService).is_ok());
-        let e = may(&w1, "w1", Some("pm"), Controlled).unwrap_err();
-        assert!(e.contains("cannot make this change to itself"), "{e}");
-        assert!(e.contains("caller rule"), "{e}");
-        // A PM on itself is not its own PM.
-        assert!(may(&pm, "pm", None, Controlled).is_err());
-        assert!(may(&pm, "pm", None, SelfService).is_ok());
-        // An upstream naming the target itself grants it nothing.
-        assert!(may(&w1, "w1", Some("w1"), Controlled).is_err());
-    }
-
-    /// CAD-158: urgent/supersede sends — the operator or the recipient's
-    /// own PM only; the refusal names the steering rule on every route.
-    #[test]
-    fn steer_is_operator_or_recipients_pm_only() {
-        let steer = |c: &AgentCaller, target: &str, target_pm: Option<&str>| {
-            may_mutate_agent(
-                c,
-                target,
-                target_pm,
-                AgentMutation::Steer,
-                "send --priority",
-            )
-        };
-        let agent = |a: &str| AgentCaller::Agent(a.into());
-        assert!(steer(&AgentCaller::Operator, "w1", Some("pm")).is_ok());
-        assert!(steer(&AgentCaller::Operator, "pm", None).is_ok());
-        assert!(steer(&agent("pm"), "w1", Some("pm")).is_ok());
-        for (caller, target, target_pm) in [
-            // A worker to its own PM: never urgent.
-            ("w1", "pm", None),
-            // A worker on itself.
-            ("w1", "w1", Some("pm")),
-            // A peer worker in the same group.
-            ("w2", "w1", Some("pm")),
-            // Another group's PM.
-            ("pm2", "w1", Some("pm")),
-            // A PM on itself, and an upstream naming the target itself.
-            ("pm", "pm", None),
-            ("w1", "w1", Some("w1")),
-        ] {
-            let e = steer(&agent(caller), target, target_pm).unwrap_err();
-            assert!(e.contains("steering rule"), "{caller}->{target}: {e}");
-            assert!(e.contains(&format!("agent '{caller}'")), "{e}");
         }
     }
 }

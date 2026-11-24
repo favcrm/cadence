@@ -278,7 +278,8 @@ fn names_ident(text: &str, sym: &str) -> bool {
 /// any note on this head whose Risk is not `auto` or `delegated`. With a
 /// scope pre-approval the chosen notes must name its id. Answers
 /// `(path, reviewer)` pairs.
-pub(crate) fn pick_verdicts(
+#[doc(hidden)]
+pub fn pick_verdicts(
     rows: &Value,
     excluded: &BTreeSet<String>,
     scope_id: Option<&str>,

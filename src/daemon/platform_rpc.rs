@@ -441,7 +441,7 @@ impl Shared {
                 Some(record) => Some(self.platform_custody.load(&record.custody, &key)?),
                 None => None,
             };
-            self.platform_custody.put_legacy(&key, &enrollment.bytes)?;
+            self.platform_custody.put(&key, &enrollment.bytes)?;
             if let Err(err) = self.store.platform_enroll(&record, rotate, risk) {
                 // The record refused — custody must hold exactly what the
                 // record (still) describes: the old bytes for a rotate,
@@ -452,7 +452,7 @@ impl Shared {
                 };
                 match &prior {
                     Some(old) => {
-                        let _ = self.platform_custody.put_legacy(&key, old);
+                        let _ = self.platform_custody.put(&key, old);
                     }
                     None => {
                         let _ = self.platform_custody.remove(&record.custody, &key);
@@ -661,7 +661,7 @@ impl Shared {
                 // put the bytes back (best effort; the record fails
                 // closed at load if the restore cannot land either).
                 if let Some(bytes) = bytes {
-                    let _ = self.platform_custody.put_legacy(&key, &bytes);
+                    let _ = self.platform_custody.put(&key, &bytes);
                 }
                 return Err(err);
             }

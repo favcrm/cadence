@@ -15,7 +15,7 @@ use crate::store;
 /// The runtime facts that pick a task's context role and delivery
 /// envelope. They come from the actual assigned worker row, never from a
 /// request field, a project default or a guessed model.
-pub(crate) struct ContextTarget<'a> {
+pub struct ContextTarget<'a> {
     pub team_role: Option<&'a str>,
     pub provider: &'a str,
     pub endpoint_kind: &'a str,
@@ -23,7 +23,7 @@ pub(crate) struct ContextTarget<'a> {
 
 /// A validated opted-in task context: the manifest the admission
 /// transaction must pin, and the exact body that turn delivers.
-pub(crate) struct PreparedContext<'a> {
+pub struct PreparedContext<'a> {
     pub manifest: crate::context_pack::Manifest,
     pub body: std::borrow::Cow<'a, str>,
 }
@@ -32,7 +32,8 @@ pub(crate) struct PreparedContext<'a> {
 /// proposed dispatch revision and message id, the actual assignee's
 /// runtime facts and — for a native admission — the caller's proof of the
 /// issue lane the job actually holds.
-pub(crate) struct JobContext<'a> {
+#[doc(hidden)]
+pub struct JobContext<'a> {
     pub job: &'a store::Job,
     pub task: &'a store::Task,
     pub revision: i64,
@@ -48,7 +49,8 @@ pub(crate) struct JobContext<'a> {
 
 /// The native caller's issue-lane proof, run once inside the guard's lazy
 /// factory — after opt-in and endpoint confirmation, before any spec read.
-pub(crate) type AdmissionScope<'a> =
+#[doc(hidden)]
+pub type AdmissionScope<'a> =
     &'a dyn Fn(&crate::issue::project::Project, &Front) -> crate::error::Result<()>;
 
 /// Synthetic identity of the optional lesson source and its aggregate gap
@@ -300,7 +302,7 @@ fn admit_context<'a>(
 /// combined mandatory payload over the local cap and a non-managed
 /// endpoint that cannot receive required prompt context all refuse with
 /// [`crate::context_pack::Refusal`] before anything is created.
-pub(crate) fn context_guard<'a>(
+pub fn context_guard<'a>(
     pm: &Pm,
     project: &crate::issue::project::Project,
     front: &Front,

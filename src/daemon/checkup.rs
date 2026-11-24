@@ -686,7 +686,7 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 mod tests {
     use super::*;
     use crate::adapter::Probe;

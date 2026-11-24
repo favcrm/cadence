@@ -103,7 +103,8 @@ pub struct Task {
 /// One durable dispatch/report event for a task. `None` means the field
 /// was missing or the payload was unreadable — never a value to guess at.
 #[derive(Clone, Debug)]
-pub(crate) struct TaskHistoryEvent {
+#[doc(hidden)]
+pub struct TaskHistoryEvent {
     pub kind: String,
     pub alias: String,
     pub task: Option<String>,
@@ -299,10 +300,11 @@ impl DispatchPlan {
     }
 }
 
-pub(crate) struct PreparedJobKickoff {
-    pub(crate) body: String,
-    pub(crate) selection: super::messages::IssueSelection,
-    pub(crate) intake_acceptance: Option<String>,
+#[doc(hidden)]
+pub struct PreparedJobKickoff {
+    pub body: String,
+    pub selection: super::messages::IssueSelection,
+    pub intake_acceptance: Option<String>,
 }
 
 pub(super) struct DispatchPreparation<'a> {
@@ -378,7 +380,8 @@ impl Store {
     /// Optional job read: `Ok(None)` only when no row exists. Any other
     /// store failure propagates, so a caller can never mistake a failed
     /// read for an absent job.
-    pub(crate) fn job_opt(&self, id: &str) -> Result<Option<Job>> {
+    #[doc(hidden)]
+    pub fn job_opt(&self, id: &str) -> Result<Option<Job>> {
         let conn = self.conn();
         match conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job) {
             Ok(job) => Ok(Some(job)),
@@ -521,7 +524,8 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub(crate) fn has_open_job_for_issue(&self, issue: &str) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn has_open_job_for_issue(&self, issue: &str) -> Result<bool> {
         Ok(self
             .conn()
             .query_opt(OPEN_JOB_FOR_ISSUE, [issue], |_| Ok(()))?
@@ -539,7 +543,8 @@ impl Store {
     }
 
     /// Resolve task ids to their jobs' issue bindings in bounded batches.
-    pub(crate) fn task_issue_bindings<S: AsRef<str>>(
+    #[doc(hidden)]
+    pub fn task_issue_bindings<S: AsRef<str>>(
         &self,
         ids: &[S],
     ) -> Result<std::collections::HashMap<String, Option<String>>> {
@@ -617,11 +622,8 @@ impl Store {
     /// `task_dispatched` and `task_reported` rows, oldest first. Scoped by
     /// the stored job/task columns. A payload field that is missing or
     /// unreadable stays `None` so the caller refuses rather than guesses.
-    pub(crate) fn task_history_events(
-        &self,
-        job: &str,
-        task: &str,
-    ) -> Result<Vec<TaskHistoryEvent>> {
+    #[doc(hidden)]
+    pub fn task_history_events(&self, job: &str, task: &str) -> Result<Vec<TaskHistoryEvent>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
                 "SELECT kind,alias,payload FROM events
@@ -672,7 +674,8 @@ impl Store {
 
     /// Every durable dispatch message the store wrote for this task,
     /// oldest first. Native rows only; nothing is parsed from prose.
-    pub(crate) fn task_dispatch_messages(&self, task: &str) -> Result<Vec<Message>> {
+    #[doc(hidden)]
+    pub fn task_dispatch_messages(&self, task: &str) -> Result<Vec<Message>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
                 "SELECT * FROM messages
@@ -722,7 +725,8 @@ impl Store {
     }
 
     /// The issue binding of each assigned, non-terminal task in the fleet.
-    pub(crate) fn open_task_issue_bindings(
+    #[doc(hidden)]
+    pub fn open_task_issue_bindings(
         &self,
     ) -> Result<std::collections::HashMap<String, Option<String>>> {
         self.read_tx(|conn| {
@@ -1161,7 +1165,8 @@ impl Store {
     /// Admit a daemon-prepared delivery with the existing native job guards.
     /// The optional delivery is consumed only for a genuinely new kickoff;
     /// an accepted duplicate retains its original message and selection.
-    pub(crate) fn dispatch_task_planned(
+    #[doc(hidden)]
+    pub fn dispatch_task_planned(
         &self,
         plan: &DispatchPlan,
         delivery: Option<PreparedJobKickoff>,

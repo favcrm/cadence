@@ -60,8 +60,8 @@ use super::Shared;
 use crate::error::{Error, Result};
 use crate::protected_runtime::ops::{OpsMethod, RuntimeCaller};
 use crate::store::connection_dispatch::{
-    effect_operation_binding, AdmissionFactsV1, CommitOutcome, IssuedSnapshotV1, LoadedSnapshot,
-    ProfileSnapshotIssueFactsV1, SnapshotIssueFactsV1,
+    AdmissionFactsV1, CommitOutcome, IssuedSnapshotV1, LoadedSnapshot, ProfileSnapshotIssueFactsV1,
+    SnapshotIssueFactsV1,
 };
 
 /// How long one provider call may take once the permit exists.
@@ -105,17 +105,19 @@ impl OwnerEligibility {
     ) -> Result<Self> {
         let unreadable = || Error::invalid("runtime_unqualified", "owner evidence is unusable");
         Ok(Self {
-            workspace_id: evidence.workspace_id.clone(),
+            workspace_id: evidence.workspace_id().to_owned(),
             custody_domain: "local".to_string(),
-            custody_epoch: Revision::new(evidence.custody_epoch).map_err(|_| unreadable())?,
-            owner_epoch: Revision::new(evidence.owner_epoch).map_err(|_| unreadable())?,
-            runtime_generation: Revision::new(evidence.runtime_generation)
+            custody_epoch: Revision::new(evidence.custody_epoch()).map_err(|_| unreadable())?,
+            owner_epoch: Revision::new(evidence.owner_epoch()).map_err(|_| unreadable())?,
+            runtime_generation: Revision::new(evidence.runtime_generation())
                 .map_err(|_| unreadable())?,
-            enrollment_id: UuidV1::try_from(evidence.enrollment_id.clone())
+            enrollment_id: UuidV1::try_from(evidence.enrollment_id().to_owned())
                 .map_err(|_| unreadable())?,
-            observed_registry_digest: Digest::try_from(evidence.observed_registry_digest.clone())
-                .map_err(|_| unreadable())?,
-            fence: if evidence.fenced {
+            observed_registry_digest: Digest::try_from(
+                evidence.observed_registry_digest().to_owned(),
+            )
+            .map_err(|_| unreadable())?,
+            fence: if evidence.fenced() {
                 FenceStateV1::Revoking
             } else {
                 FenceStateV1::Clear
@@ -1023,7 +1025,7 @@ impl ProtectedConnections {
         };
         let principal_key = caller.session_binding().to_string();
         let source_id = args.source_id.clone();
-        let staged = shared.store.protected_management_commit(
+        let staged = shared.store.protected_stage_send_approval(
             &authority.workspace_id,
             eligibility.owner_epoch,
             digest(
@@ -1035,35 +1037,14 @@ impl ProtectedConnections {
                     "runtime_generation": eligibility.runtime_generation.get(),
                 }),
             )?,
-            |tx| {
-                crate::store::connection_dispatch::put_approval_in(
-                    tx,
-                    &approval,
-                    &principal_key,
-                    &message.to,
-                    body.as_bytes(),
-                )?;
-                let stored = crate::store::connection_dispatch::approval_material_in(
-                    tx,
-                    approval.approval_id.as_str(),
-                )?
-                .ok_or_else(|| {
-                    Error::invalid("approval_required", "a current human approval is required")
-                })?;
-                let operation_binding = effect_operation_binding(
-                    &authority.workspace_id,
-                    &approval.principal_digest,
-                    args.connection_id.as_str(),
-                    binding.credential_revision,
-                    binding.authorization_revision,
-                    approval.policy_revision,
-                    source_id.as_str(),
-                    &stored.0.source_digest,
-                    &stored.0.body_digest,
-                );
-                crate::store::effect_bind_in(tx, source_id.as_str(), operation_binding.as_str())?;
-                Ok(stored.0)
-            },
+            approval,
+            principal_key,
+            message.to,
+            body.into_bytes(),
+            source_id.as_str().to_string(),
+            args.connection_id.as_str().to_string(),
+            binding.credential_revision,
+            binding.authorization_revision,
         )?;
         Ok(json!({"approval": staged}))
     }
@@ -2331,7 +2312,7 @@ impl ProtectedConnections {
             fingerprint: crate::secret::fingerprint(&screen),
             custody: reference,
             exchange,
-            enrolled_at: crate::store::now(),
+            enrolled_at: crate::store::now_public(),
             by: if rotated {
                 "human:rotate".to_string()
             } else {
@@ -2353,7 +2334,7 @@ impl ProtectedConnections {
                 "the protected workspace changed",
             ));
         }
-        shared.store.protected_management_commit(
+        shared.store.protected_commit_checkpoint(
             &workspace_id,
             profile_evidence.owner_epoch,
             digest(
@@ -2365,7 +2346,6 @@ impl ProtectedConnections {
                     "verb": if rotated { "rotate" } else { "enroll" },
                 }),
             )?,
-            |_tx| Ok(()),
         )?;
         Ok(json!({
             "connection_id": record.connection_id,
@@ -2482,7 +2462,7 @@ fn synthetic_record(attempt: &VerifiedHumanAttemptV1) -> crate::store::Credentia
         fingerprint: String::new(),
         custody: String::new(),
         exchange: String::new(),
-        enrolled_at: crate::store::now(),
+        enrolled_at: crate::store::now_public(),
         by: String::new(),
     }
 }
@@ -3024,10 +3004,10 @@ fn done_verified() -> ValidatedOutcomeV1 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 #[path = "protected_connections_epoch_acceptance_20261027.rs"]
 mod protected_connections_epoch_acceptance_20261027;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 #[path = "protected_connections_agenticos_read_acceptance.rs"]
 mod protected_connections_agenticos_read_acceptance;

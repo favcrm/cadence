@@ -9,10 +9,12 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::protected_runtime::console::OwnerConsole;
 use crate::protected_runtime::qualified::CurrentReader;
 use crate::protected_runtime::RuntimeCaller;
 use crate::store::Store;
+pub(crate) use cadence_agent::daemon::console_port::{
+    AttachedConsole, ConsoleSubject, NativeTaskGuard, ProtectedConsoleProvider,
+};
 
 use super::Shared;
 
@@ -106,41 +108,6 @@ impl Shared {
         }
         Ok(json!({"entry": {"configured": false, "protected": false}}))
     }
-}
-
-pub(crate) struct AttachedConsole {
-    pub(crate) console: OwnerConsole,
-    pub(crate) generation_tag: String,
-    pub(crate) runtime_id: String,
-    pub(crate) caller: RuntimeCaller,
-}
-
-pub(crate) struct ConsoleSubject<'a> {
-    pub(crate) alias: &'a str,
-    pub(crate) agent_uid: &'a str,
-    pub(crate) created: f64,
-}
-
-pub(crate) trait NativeTaskGuard: Send {
-    fn fence(&self, reason: &str);
-}
-
-pub(crate) trait ProtectedConsoleProvider: Send + Sync {
-    fn open_console(
-        &self,
-        subject: ConsoleSubject<'_>,
-        stderr_log: &Path,
-    ) -> Result<AttachedConsole>;
-
-    fn bind_native_task(
-        &self,
-        caller: &RuntimeCaller,
-        client_message_id: &str,
-        claim: &crate::store::NativeTurnClaim,
-        turn_token: &str,
-    ) -> Result<Box<dyn NativeTaskGuard>>;
-
-    fn stop_agent(&self, agent_uid: &str, reason: &str);
 }
 
 fn refused() -> Error {

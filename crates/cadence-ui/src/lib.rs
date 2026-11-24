@@ -17,12 +17,17 @@ mod console_macros;
 pub mod ui;
 pub use ui::*;
 
+#[cfg(all(test, feature = "test-seam", debug_assertions))]
+#[path = "../../../src/ui/hosted_source_board_fixture.rs"]
+mod hosted_source_board_fixture;
+
 #[cfg(feature = "test-seam")]
 pub use cadence_agent::test_web_issuer_tls;
 pub use cadence_agent::{
     adapter, agent_roles, agent_uid, assistant_actor, board_identity, briefing, cli_actor, client,
-    daemon, delivery, device_login, doctor, error, filter, gh_guard, ident, issue,
-    issuer_transport, lease, master, memory, model_defaults, needs_dismiss, operator_auth,
-    overview, peer, platform, project_policy, proto, reaper, rollout, secret, setup, skill, store,
-    tailnet_proof, test_seam, update, upgrade, wiki, worktree, Error, Result,
+    delivery, device_login, doctor, error, filter, gh_guard, ident, issue, issuer_transport, lease,
+    master, memory, model_defaults, needs_dismiss, operator_auth, overview, peer, platform,
+    project_policy, proto, reaper, rollout, secret, setup, skill, store, tailnet_proof, test_seam,
+    update, upgrade, wiki, worktree, Error, Result,
 };
+pub use cadence_daemon::daemon;

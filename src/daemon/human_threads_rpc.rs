@@ -141,15 +141,15 @@ impl HumanRoomCursors {
         room: &str,
         scope: &HumanRoomCursorScope,
     ) -> Result<Self> {
-        let created = format!("{:016x}", scope.created);
-        let cutoff = scope.cutoff.to_string();
+        let created = format!("{:016x}", scope.created());
+        let cutoff = scope.cutoff().to_string();
         Ok(Self {
             codec: shared.scoped_cursor_codec()?,
             principal: job_events_opaque::framed(&[&actor.org, &actor.id]),
             resource: job_events_opaque::framed(&[
                 "human-room",
                 room,
-                &scope.topic,
+                scope.topic(),
                 &created,
                 &cutoff,
             ]),
@@ -396,7 +396,7 @@ impl Shared {
         let (post, _fresh) =
             self.store
                 .human_room_ask_post(&current.actor, room, agent_uid, key, body)?;
-        let post_receipt = cursors.post(&post, scope.cutoff, None)?;
+        let post_receipt = cursors.post(&post, scope.cutoff(), None)?;
         // The queue names the selected member's uid; the enqueue transaction
         // refuses if the alias now belongs to another uid (no reassignment race).
         let send =
@@ -519,7 +519,7 @@ impl Shared {
         let meta_map = self.store.human_room_post_meta_for(&post_ids)?;
         let rows = posts
             .iter()
-            .map(|post| cursors.post(post, scope.cutoff, meta_map.get(&post.id)))
+            .map(|post| cursors.post(post, scope.cutoff(), meta_map.get(&post.id)))
             .collect::<Result<Vec<_>>>()?;
         let can_ask = self.ask_authority(token, peer_pid, &current);
         let can_manage = room_kind != crate::store::human_threads::KIND_DM
@@ -606,7 +606,7 @@ impl Shared {
                     org: &current.actor.org,
                     room,
                     room_kind: &room_kind,
-                    topic: &scope.topic,
+                    topic: scope.topic(),
                     post_id: &post.id,
                     client_id,
                     body,
@@ -632,7 +632,7 @@ impl Shared {
             stored
         };
 
-        let post = cursors.post(&post, scope.cutoff, Some(&meta))?;
+        let post = cursors.post(&post, scope.cutoff(), Some(&meta))?;
         self.reprove_human_room(token, params, peer_pid, room, &current.actor, &scope)?;
         let mut result = json!({
             "post": post,

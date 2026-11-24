@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS app_tool_claims(
 pub const RESULT_BYTES: usize = 256 * 1024;
 pub const ASSET_BYTES: usize = 2 * 1024 * 1024;
 
-pub(crate) struct AppToolUpload<'a> {
+#[doc(hidden)]
+pub struct AppToolUpload<'a> {
     pub id: &'a str,
     pub request: &'a str,
     pub install: &'a str,
@@ -50,7 +51,8 @@ pub(crate) struct AppToolUpload<'a> {
     pub bytes: &'a [u8],
 }
 
-pub(crate) struct AppToolRecord<'a> {
+#[cfg_attr(all(debug_assertions, feature = "test-seam"), doc(hidden))]
+pub struct AppToolRecord<'a> {
     pub id: &'a str,
     pub request: &'a str,
     pub install: &'a str,
@@ -64,7 +66,8 @@ pub(crate) struct AppToolRecord<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct AppToolClaim<'a> {
+#[doc(hidden)]
+pub struct AppToolClaim<'a> {
     pub request: &'a str,
     pub install: &'a str,
     pub alias: &'a str,
@@ -75,7 +78,8 @@ pub(crate) struct AppToolClaim<'a> {
 }
 
 /// A claim returned only after its durable pre-call reservation.
-pub(crate) struct AppToolClaimReceipt<'a> {
+#[doc(hidden)]
+pub struct AppToolClaimReceipt<'a> {
     request: &'a str,
     install: &'a str,
     alias: &'a str,
@@ -103,7 +107,8 @@ impl AppToolClaimReceipt<'_> {
             && app_runs::material_digest(&spec["input"]) == self.input_digest
     }
 
-    pub(crate) fn record(
+    #[doc(hidden)]
+    pub fn record(
         &self,
         store: &Store,
         input: &Value,
@@ -151,72 +156,65 @@ fn receipt_digest(f: &ReceiptFields<'_>) -> String {
 }
 
 impl Store {
+    fn insert_and_verify_claim(tx: &impl StoreConn, claim: AppToolClaim<'_>) -> Result<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO app_tool_claims VALUES(?,?,?,?,?,?,?,?)",
+            params![
+                claim.request,
+                claim.install,
+                claim.alias,
+                claim.slot,
+                claim.binding_digest,
+                claim.input_digest,
+                claim.call_id,
+                now()
+            ],
+        )?;
+        let existing: Option<(String, String, String, String, String, String)> = tx.query_opt(
+            "SELECT install_id,alias,slot,binding_digest,input_digest,call_id
+                     FROM app_tool_claims WHERE request_id=?",
+            [claim.request],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )?;
+        if let Some(existing) = existing {
+            if existing
+                != (
+                    claim.install.into(),
+                    claim.alias.into(),
+                    claim.slot.into(),
+                    claim.binding_digest.into(),
+                    claim.input_digest.into(),
+                    claim.call_id.into(),
+                )
+            {
+                return Err(Error::rejected(
+                    "tool request id already claimed a different operation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Reserve the one paid operation for this request id BEFORE provider
     /// I/O. A repeat of the same request id is admitted only when it is
     /// byte-for-byte the same intent (same install, alias, slot, binding,
     /// input and call id) — an uncertain transport retry. Any difference
     /// refuses so a recycled id can never run a second/changed operation.
-    pub(crate) fn app_tool_claim(&self, claim: AppToolClaim<'_>) -> Result<()> {
-        let AppToolClaim {
-            request,
-            install,
-            alias,
-            slot,
-            binding_digest,
-            input_digest,
-            call_id,
-        } = claim;
-        self.write_tx(|conn| {
-            let tx = &mut *conn;
-            tx.execute(
-                "INSERT OR IGNORE INTO app_tool_claims VALUES(?,?,?,?,?,?,?,?)",
-                params![
-                    request,
-                    install,
-                    alias,
-                    slot,
-                    binding_digest,
-                    input_digest,
-                    call_id,
-                    now()
-                ],
-            )?;
-            let existing: Option<(String, String, String, String, String, String)> = tx.query_opt(
-                "SELECT install_id,alias,slot,binding_digest,input_digest,call_id
-                     FROM app_tool_claims WHERE request_id=?",
-                [request],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
-            )?;
-            if let Some(existing) = existing {
-                if existing
-                    != (
-                        install.into(),
-                        alias.into(),
-                        slot.into(),
-                        binding_digest.into(),
-                        input_digest.into(),
-                        call_id.into(),
-                    )
-                {
-                    return Err(Error::rejected(
-                        "tool request id already claimed a different operation",
-                    ));
-                }
-            }
-            Ok(())
-        })
+    pub fn app_tool_claim(&self, claim: AppToolClaim<'_>) -> Result<()> {
+        self.write_tx(|conn| Self::insert_and_verify_claim(&*conn, claim))
     }
 
-    pub(crate) fn app_tool_claim_receipt<'a>(
+    #[doc(hidden)]
+    pub fn app_tool_claim_receipt<'a>(
         &self,
         claim: AppToolClaim<'a>,
     ) -> Result<AppToolClaimReceipt<'a>> {
@@ -258,7 +256,8 @@ impl Store {
 
     /// Installs that ever reserved a paid call: a restart looks for unfinished
     /// image jobs only in their record files.
-    pub(crate) fn app_tool_claim_installs(&self) -> Result<Vec<String>> {
+    #[doc(hidden)]
+    pub fn app_tool_claim_installs(&self) -> Result<Vec<String>> {
         let conn = self.conn();
         let installs = conn
             .prepare("SELECT DISTINCT install_id FROM app_tool_claims")?
@@ -268,7 +267,8 @@ impl Store {
     }
 
     /// The retained receipt for one request id, or `None`.
-    pub(crate) fn app_tool_result_for_request(&self, request: &str) -> Result<Option<Value>> {
+    #[doc(hidden)]
+    pub fn app_tool_result_for_request(&self, request: &str) -> Result<Option<Value>> {
         let id = self
             .conn()
             .query_row(
@@ -358,18 +358,21 @@ impl Store {
         let input_text = serde_json::to_string(input)?;
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            if !Self::app_tool_claimed(
-                &tx,
-                &AppToolClaim {
+            let claimed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_tool_claims WHERE request_id=? AND call_id=?
+                 AND install_id=? AND alias=? AND slot=? AND binding_digest=? AND input_digest=?)",
+                params![
                     request,
+                    id,
                     install,
                     alias,
                     slot,
                     binding_digest,
-                    input_digest,
-                    call_id: id,
-                },
-            )? {
+                    input_digest
+                ],
+                |r| r.get(0),
+            )?;
+            if !claimed {
                 return Err(Error::rejected(
                     "app tool result has no matching pre-call claim",
                 ));
@@ -426,8 +429,9 @@ impl Store {
     }
 
     // Existing custody fixtures exercise the low-level checked store path.
-    #[cfg(test)]
-    pub(crate) fn app_tool_record(&self, record: AppToolRecord<'_>) -> Result<Value> {
+    #[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
+    #[cfg_attr(not(test), doc(hidden))]
+    pub fn app_tool_record(&self, record: AppToolRecord<'_>) -> Result<Value> {
         self.app_tool_record_in(record)
     }
 
@@ -437,7 +441,8 @@ impl Store {
     /// sniffed/decoded/normalised them, and the receipt is always attached
     /// to one app context by the daemon. The id/request are daemon-minted;
     /// the receipt is content-addressed and bounded exactly like a tool asset.
-    pub(crate) fn app_tool_upload_record(&self, upload: AppToolUpload<'_>) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_tool_upload_record(&self, upload: AppToolUpload<'_>) -> Result<Value> {
         let AppToolUpload {
             id,
             request,
@@ -516,13 +521,15 @@ impl Store {
         })
     }
 
-    pub(crate) fn app_tool_result(&self, id: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_tool_result(&self, id: &str) -> Result<Value> {
         Self::app_tool_result_in(&self.conn(), id)
     }
 
     /// Read retained bytes only for an install-owned receipt. The caller
     /// rechecks draft attachment/context and image integrity before serving.
-    pub(crate) fn app_tool_asset_bytes(
+    #[doc(hidden)]
+    pub fn app_tool_asset_bytes(
         &self,
         install: &str,
         id: &str,
@@ -613,7 +620,8 @@ impl Store {
     /// The receipts for one installation (operator read), newest last.
     /// Verify a selected post against a retained read receipt owned by this install.
     /// The receipt remains install-scoped; this does not assert it was private to a context.
-    pub(crate) fn app_tool_source_post_exists(
+    #[doc(hidden)]
+    pub fn app_tool_source_post_exists(
         &self,
         install: &str,
         receipt_id: &str,
@@ -642,7 +650,8 @@ impl Store {
     /// would cost history. Probing the primary key per candidate and checking
     /// the installation here keeps the query at 500 point lookups — asserted by
     /// the plan test, at production cardinality.
-    pub(crate) fn app_tool_source_results_for(
+    #[doc(hidden)]
+    pub fn app_tool_source_results_for(
         &self,
         install: &str,
         ids: &[String],
@@ -680,7 +689,8 @@ impl Store {
         Ok(out)
     }
 
-    pub(crate) fn app_tool_results(&self, install: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_tool_results(&self, install: &str) -> Result<Value> {
         let conn = self.conn();
         let ids = conn
             .prepare(

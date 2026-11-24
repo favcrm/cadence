@@ -163,8 +163,9 @@ fn reserved_ticket(
 /// The supplied issue is this reservation's selected ticket, already
 /// committed and clean against HEAD. The caller holds the tracker lock.
 /// This reads only: it does not commit, allocate, or clear a crash marker.
-pub(crate) fn confirm_committed_selected_issue(
+pub fn confirm_committed_selected_issue(
     pm: &Pm,
+    lock: Option<&PmLock>,
     issue_id: &str,
     reserved: &Value,
 ) -> Result<()> {
@@ -178,6 +179,8 @@ pub(crate) fn confirm_committed_selected_issue(
             return Err(error);
         }
     };
+    let lock = lock.ok_or_else(|| Error::rejected("ticket bind requires the tracker lock"))?;
+    pm.check_lock_paths(lock, &[dir.join("issue.md")])?;
     let path = dir.join("issue.md");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| Error::rejected(format!("cannot read {}: {e}", path.display())))?;

@@ -9,7 +9,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
-pub(crate) const RECORD: &str = "custody-encrypted.json";
+pub const RECORD: &str = "custody-encrypted.json";
 const LIMIT: u64 = 4096;
 fn refused() -> Error {
     Error::invalid(
@@ -23,6 +23,14 @@ struct Record {
     key_file: PathBuf,
     #[serde(default)]
     vault_dir: Option<PathBuf>,
+}
+
+/// Read only the checked path selection; this grants no vault access.
+pub fn load_paths(
+    state_dir: &Path,
+    tracker: Option<&Path>,
+) -> Result<Option<EncryptedCustodyConfig>> {
+    Ok(load(state_dir, tracker)?.map(|record| record.paths))
 }
 
 /// Keep the admitted namespace descriptors and record fd for the caller's

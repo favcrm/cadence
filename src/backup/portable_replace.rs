@@ -72,7 +72,8 @@ impl NativeOperatorProof {
     /// Mint a proof for `req`. Crate-internal: the daemon handler calls this
     /// only after `operator_connection` has passed and `req` has been built
     /// from the controller's own canonical state dir.
-    pub(crate) fn mint(req: &ReplaceRequest) -> Self {
+    #[doc(hidden)]
+    pub fn mint(req: &ReplaceRequest) -> Self {
         Self {
             bound: Bound {
                 action: ACTION,

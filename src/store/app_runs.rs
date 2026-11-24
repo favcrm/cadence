@@ -753,7 +753,8 @@ impl Store {
     /// There is no creator setter: the only way a creator lands is a
     /// verified argument at creation.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn app_run_create_attributed(
+    #[doc(hidden)]
+    pub fn app_run_create_attributed(
         &self,
         request: LocalRunRequest<'_>,
         context: Option<&super::app_contexts::ContextProof>,
@@ -2328,7 +2329,8 @@ pub(super) fn app_reason_class(detail: &str) -> &'static str {
 /// terminal allowlist by `finish_in`/`reconcile`, so interpolating it
 /// is safe; `detail` names only whether the provider reported error
 /// prose at all, never the prose itself.
-pub(crate) fn app_worker_turn_reason(status: &str, detail: bool) -> String {
+#[doc(hidden)]
+pub fn app_worker_turn_reason(status: &str, detail: bool) -> String {
     match (status, detail) {
         ("failed", true) => "worker turn failed: provider error".to_string(),
         ("interrupted", _) => "worker turn was interrupted".to_string(),
@@ -2346,7 +2348,8 @@ pub(crate) fn app_worker_turn_reason(status: &str, detail: bool) -> String {
 /// provider account stays on the operator-private message row (app
 /// mail inspection already requires operator proof); this class is
 /// the only text Unproven and Agent readers ever see.
-pub(crate) fn app_uncertain_turn_reason() -> String {
+#[doc(hidden)]
+pub fn app_uncertain_turn_reason() -> String {
     app_worker_turn_reason("unknown", true)
 }
 
@@ -2789,7 +2792,8 @@ pub struct LocalRunRequest<'a> {
 impl Store {
     /// The socket caller and live turn select the run; a request cannot name
     /// another run, installation, context, account, or provider.
-    pub(crate) fn app_capability_turn(
+    #[doc(hidden)]
+    pub fn app_capability_turn(
         &self,
         alias: &str,
         message: &str,
@@ -3063,10 +3067,12 @@ impl Store {
 impl Store {
     /// Transcripts can retain app material after a turn ends. Never infer
     /// public readability merely from an idle endpoint.
-    pub(crate) fn app_material_endpoint(&self, alias: &str) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn app_material_endpoint(&self, alias: &str) -> Result<bool> {
         Ok(self.conn().query_row("SELECT 1 FROM app_run_steps s JOIN tasks t ON t.id=s.task_id WHERE t.assignee=? LIMIT 1", [alias], |_| Ok(())).optional()?.is_some())
     }
-    pub(crate) fn app_effect_guard(&self, alias: &str, task: Option<&str>) -> Result<()> {
+    #[doc(hidden)]
+    pub fn app_effect_guard(&self, alias: &str, task: Option<&str>) -> Result<()> {
         if self
             .running_messages(alias)?
             .iter()

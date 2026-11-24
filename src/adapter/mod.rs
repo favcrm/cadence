@@ -280,6 +280,19 @@ impl ProviderEnv {
         Ok(())
     }
 
+    /// Resolve and validate an instance's upload workspace before binding
+    /// it to provider policy. No caller-selected workspace is accepted.
+    #[doc(hidden)]
+    pub fn bind_operational_workspace(
+        &self,
+        tracker: &std::path::Path,
+        state_dir: &std::path::Path,
+    ) -> Result<(Self, std::path::PathBuf)> {
+        let workspace = crate::home::workspace_for_provider_env(tracker, self)?;
+        crate::home::validate_workspace_isolated(&workspace, state_dir, self)?;
+        Ok((self.with_workspace(workspace.clone()), workspace))
+    }
+
     /// Bind this environment to the daemon's immutable, checked workspace.
     /// The authority is outside the mutable environment map and is inherited
     /// by clones without being exposed through `set`, `remove` or `vars`.
@@ -297,7 +310,7 @@ impl ProviderEnv {
     }
 
     /// Immutable image-owned authority; mutable environment values cannot grant it.
-    pub(crate) fn with_company_master(
+    pub fn with_company_master(
         mut self,
         admission: Option<crate::platform::deployments::HostedCompanyMaster>,
     ) -> Self {
@@ -510,10 +523,8 @@ impl<'a> TurnMessage<'a> {
         self.id
     }
 
-    pub(crate) fn from_actor(
-        id: &'a str,
-        claim: Option<&'a crate::store::NativeTurnClaim>,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn from_actor(id: &'a str, claim: Option<&'a crate::store::NativeTurnClaim>) -> Self {
         Self { id, claim }
     }
 }

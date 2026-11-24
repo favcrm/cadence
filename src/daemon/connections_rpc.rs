@@ -106,11 +106,7 @@ impl Shared {
             let projection = (|| -> Result<Value> {
                 let permit =
                     operation.witness(super::custody_rpc::CustodyUse::Connections, record)?;
-                let bytes = platform::load_credential_witnessed(
-                    &self.store,
-                    &self.platform_custody,
-                    &permit,
-                )?;
+                let bytes = self.load_credential_witnessed(&permit)?;
                 let (envelope, projection) = platform::smtp::custody_decode(&bytes)?;
                 let mut projected = row.clone();
                 projected["smtp"] = projection.to_json();
@@ -220,9 +216,9 @@ impl Shared {
         let permit = operation
             .witness(super::custody_rpc::CustodyUse::Connections, record)
             .map_err(|_| ProjectionFault::Unavailable)?;
-        let bytes =
-            platform::load_credential_witnessed(&self.store, &self.platform_custody, &permit)
-                .map_err(|_| ProjectionFault::Unavailable)?;
+        let bytes = self
+            .load_credential_witnessed(&permit)
+            .map_err(|_| ProjectionFault::Unavailable)?;
         platform::smtp::project_custody(&bytes)
     }
     fn connection_metadata_projection(&self, record: &CredentialRecord) -> Result<Value> {

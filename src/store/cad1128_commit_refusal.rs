@@ -2,7 +2,11 @@
 //! Test-only observation/veto on the actual Store connection. The sealed
 //! authorizer, guarded writer and production error mapping remain unchanged.
 
-#[cfg(not(all(test, target_os = "linux", feature = "test-seam")))]
+#[cfg(not(all(
+    target_os = "linux",
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "test-seam"))
+)))]
 compile_error!("CAD-1128 commit probe requires Linux unit tests with test-seam");
 
 use super::Store;
@@ -20,11 +24,13 @@ struct ProbeState {
     rollbacks: AtomicUsize,
 }
 
-pub(crate) struct SmtpCommitProbe {
+#[doc(hidden)]
+pub struct SmtpCommitProbe {
     state: Arc<ProbeState>,
 }
 
-pub(crate) struct SmtpCommitCounts {
+#[doc(hidden)]
+pub struct SmtpCommitCounts {
     pub target_updates: usize,
     pub refused_commits: usize,
     pub rollbacks: usize,
@@ -32,7 +38,7 @@ pub(crate) struct SmtpCommitCounts {
 }
 
 impl SmtpCommitProbe {
-    pub(crate) fn counts(&self) -> SmtpCommitCounts {
+    pub fn counts(&self) -> SmtpCommitCounts {
         SmtpCommitCounts {
             target_updates: self.state.target_updates.load(Ordering::SeqCst),
             refused_commits: self.state.refused_commits.load(Ordering::SeqCst),
@@ -46,7 +52,7 @@ impl Store {
     /// Refuse only the next real COMMIT containing an update to this exact
     /// existing SMTP link row. Other writes/read transactions do not consume
     /// the one-shot fault. Hooks never execute SQL or replace the authorizer.
-    pub(crate) fn cad1128_refuse_next_smtp_link_commit(
+    pub fn cad1128_refuse_next_smtp_link_commit(
         &self,
         install: &str,
         context: &str,
@@ -100,7 +106,7 @@ impl Store {
 
     /// Remove only the probe hooks; the sealed authorizer is untouched.
     /// No pre-existing core commit/update/rollback hook exists in this source.
-    pub(crate) fn cad1128_clear_smtp_commit_probe(&self) -> Result<()> {
+    pub fn cad1128_clear_smtp_commit_probe(&self) -> Result<()> {
         let conn = self.conn();
         conn.commit_hook(None::<fn() -> bool>);
         conn.update_hook(None::<fn(Action, &str, &str, i64)>);

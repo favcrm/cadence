@@ -957,7 +957,7 @@ impl Shared {
         records.app_social_tool_receipt_attach(
             context,
             &id,
-            crate::store::now(),
+            crate::store::now_public(),
             result["kind"].as_str().unwrap_or(""),
         )?;
         Ok(json!({

@@ -25,7 +25,10 @@ fn fixture() -> (
     let mut shared = Shared::new(dir.path(), &opts).unwrap();
     // Synthetic file custody only; never consult an installed host keychain.
     Arc::get_mut(&mut shared).unwrap().platform_custody =
-        Custody::file(dir.path().join("fixture-custody"));
+        crate::daemon::custody_rpc::DaemonCustody::new(
+            Custody::file(dir.path().join("fixture-custody")),
+            None,
+        );
     let connections = shared.connection_list_locked().unwrap();
     let connection = connections
         .iter()

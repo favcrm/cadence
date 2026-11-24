@@ -15,7 +15,7 @@ use super::StoreConn;
 use super::{now, Store};
 
 /// What every agent-gc timer output says, verbatim.
-pub(crate) const AGENT_GC_RECORDS_ONLY: &str = "records only: frees no memory and no disk; \
+pub const AGENT_GC_RECORDS_ONLY: &str = "records only: frees no memory and no disk; \
      a removed agent can no longer be resumed";
 
 /// The agent-state vocabulary — the `agents.state` column values —

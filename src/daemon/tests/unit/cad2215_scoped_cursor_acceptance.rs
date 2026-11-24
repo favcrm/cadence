@@ -13,8 +13,7 @@
 
 use super::*;
 use crate::daemon::scoped_cursor::{
-    CursorBinding, CursorDirection, CursorError, CursorKeyId, CursorKeyring, ScopedCursorCodec,
-    KEY_BYTES,
+    CursorBinding, CursorDirection, CursorError, ScopedCursorCodec, KEY_BYTES,
 };
 use crate::test_seam::Asserted;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
@@ -39,24 +38,16 @@ fn id_hex(byte: u8) -> String {
     format!("{byte:02x}").repeat(16)
 }
 
-fn key_id(byte: u8) -> CursorKeyId {
-    CursorKeyId::from_bytes(&[byte; 16]).unwrap()
-}
-
-/// Build the same already-admitted ring the record names, for a test that
-/// needs to prove which sealing key a token used.
-fn ring_with(ids: &[u8]) -> CursorKeyring {
-    let mut ring = CursorKeyring::new();
-    for &id in ids {
+fn key_entries(ids: &[u8]) -> impl Iterator<Item = ([u8; 16], [u8; KEY_BYTES])> + '_ {
+    ids.iter().map(|&id| {
         let key_byte = match id {
             KEY_ID_A => KEY_A_BYTE,
             KEY_ID_B => KEY_B_BYTE,
             KEY_ID_C => KEY_C_BYTE,
             _ => unreachable!("fixture key id"),
         };
-        ring.insert_key(key_id(id), &key_bytes(key_byte)).unwrap();
-    }
-    ring
+        ([id; 16], key_bytes(key_byte))
+    })
 }
 
 fn binding() -> CursorBinding<'static> {
@@ -606,24 +597,24 @@ fn active_key_switches_among_the_retained_set_and_opens_old_cursors() {
     // full retained ring opens both.
     let (workspace, _) = switched.store.cursor_keyring_metadata().unwrap();
     let identity = key_bytes(IDENTITY_BYTE);
-    let a_only = ScopedCursorCodec::new(
+    let a_only = ScopedCursorCodec::fixture_with_keys(
         &workspace,
-        ring_with(&[KEY_ID_A]),
-        key_id(KEY_ID_A),
+        key_entries(&[KEY_ID_A]),
+        [KEY_ID_A; 16],
         &identity,
     )
     .unwrap();
-    let b_only = ScopedCursorCodec::new(
+    let b_only = ScopedCursorCodec::fixture_with_keys(
         &workspace,
-        ring_with(&[KEY_ID_B]),
-        key_id(KEY_ID_B),
+        key_entries(&[KEY_ID_B]),
+        [KEY_ID_B; 16],
         &identity,
     )
     .unwrap();
-    let full = ScopedCursorCodec::new(
+    let full = ScopedCursorCodec::fixture_with_keys(
         &workspace,
-        ring_with(&[KEY_ID_A, KEY_ID_B]),
-        key_id(KEY_ID_A),
+        key_entries(&[KEY_ID_A, KEY_ID_B]),
+        [KEY_ID_A; 16],
         &identity,
     )
     .unwrap();

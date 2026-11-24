@@ -27,11 +27,17 @@ use done::check_done_evidence;
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use done::Staged;
 pub(crate) use done::{
-    apply_pairs, commit_staged, commit_staged_scoped, mark_done_on_merge_locked,
-    mark_done_on_merge_waiting_with, stage, RealWait, WaitClock,
+    apply_pairs, commit_staged, commit_staged_scoped, mark_done_on_merge_waiting_with, stage,
+    RealWait, WaitClock,
 };
-pub use done::{mark_done_on_merge, mark_done_on_merge_waiting, DoneWriteFailure};
-#[cfg(all(test, feature = "test-seam"))]
+pub use done::{
+    mark_done_on_merge, mark_done_on_merge_locked, mark_done_on_merge_waiting, DoneWriteFailure,
+};
+#[cfg(all(
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "test-seam"))
+))]
+#[cfg_attr(not(test), doc(hidden))]
 pub use edit::keyed_commit_seam::{arm_keyed_commit_after_success, KeyedCommitSeam};
 pub use edit::{
     add_comment, add_comment_keyed, add_ref, add_report, attach, attach_bytes, close_ref, link,
@@ -42,10 +48,19 @@ pub(crate) use edit::{
 };
 pub(crate) use new::next_id;
 pub use new::{master_issue_new_limits, new_issue};
-pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, GrantedPreview};
+pub(crate) use plan::check_structure;
+pub use plan::granted_semantics;
+#[doc(hidden)]
+pub use plan::{create_granted_plan, GrantedPreview};
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
-pub(crate) use projects::{check_tags, load_front, save_front, split_tags};
+pub use projects::load_front;
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[doc(hidden)]
+pub use projects::save_front;
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
+pub(crate) use projects::save_front;
+pub(crate) use projects::{check_tags, split_tags};
 #[doc(hidden)]
 pub use projects::{checked_project_dirs, issue_dir};
 pub use projects::{
@@ -55,13 +70,14 @@ pub use projects::{
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use rev::blocked_warnings;
 use rev::check_rev;
+pub use rev::commit_scoped;
 pub use rev::issue_rev;
 pub(crate) use rev::{
     actor_who, atomic_write, attach_foreign, attach_post_warnings, blocked_warnings_best_effort,
-    commit, commit_scoped, commit_who, commit_who_scoped, create_exclusive, file_preimage,
-    post_commit_warning, restore_preimage, write_new,
+    commit, commit_who, commit_who_scoped, create_exclusive, file_preimage, post_commit_warning,
+    restore_preimage, write_new,
 };
-pub(crate) use ticket::confirm_committed_selected_issue;
+pub use ticket::confirm_committed_selected_issue;
 pub use ticket::materialize_app_run_ticket;
 // The bind acceptance test is the only caller, and it compiles only with
 // the test seam. A plain library build must not carry the re-export.

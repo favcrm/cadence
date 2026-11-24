@@ -108,7 +108,7 @@ fn seal_topic_cursor(
 impl Shared {
     /// The caller as the topic rule sees it: the operator, or an agent
     /// alias the daemon derived. An unproven, underivable caller is refused.
-    fn topic_caller(&self, verb: &str, peer_pid: u32) -> Result<crate::peer::AgentCaller> {
+    fn topic_caller(&self, verb: &str, peer_pid: u32) -> Result<super::caller_rule::AgentCaller> {
         self.agent_caller(peer_pid, verb)
     }
 
@@ -129,11 +129,11 @@ impl Shared {
     /// CAD-810: may `caller` create `kind:source`?
     fn may_create_topic(
         &self,
-        caller: &crate::peer::AgentCaller,
+        caller: &super::caller_rule::AgentCaller,
         kind: &str,
         source: &str,
     ) -> Result<()> {
-        use crate::peer::AgentCaller::{Agent, Operator};
+        use super::caller_rule::AgentCaller::{Agent, Operator};
         match (caller, kind) {
             (Operator, "fleet" | "project") => Ok(()),
             (Agent(alias), "peer") => {
@@ -170,10 +170,14 @@ impl Shared {
 
     /// CAD-1412: the durable uid of an agent caller of a human room. The
     /// operator's generic topic verbs never reach a human room's transcript.
-    fn human_room_agent(&self, caller: &crate::peer::AgentCaller, verb: &str) -> Result<String> {
+    fn human_room_agent(
+        &self,
+        caller: &super::caller_rule::AgentCaller,
+        verb: &str,
+    ) -> Result<String> {
         match caller {
-            crate::peer::AgentCaller::Agent(alias) => Ok(self.store.agent(alias)?.uid),
-            crate::peer::AgentCaller::Operator => Err(Error::rejected(format!(
+            super::caller_rule::AgentCaller::Agent(alias) => Ok(self.store.agent(alias)?.uid),
+            super::caller_rule::AgentCaller::Operator => Err(Error::rejected(format!(
                 "{verb} refused: this topic is a private human room — use the human-threads API"
             ))),
         }
@@ -181,11 +185,11 @@ impl Shared {
 
     fn may_manage_members(
         &self,
-        caller: &crate::peer::AgentCaller,
+        caller: &super::caller_rule::AgentCaller,
         topic: &Topic,
         member: &str,
     ) -> Result<()> {
-        use crate::peer::AgentCaller::{Agent, Operator};
+        use super::caller_rule::AgentCaller::{Agent, Operator};
         match caller {
             Operator => Ok(()),
             Agent(alias) if matches!(topic.kind.as_str(), "job" | "peer") => {
@@ -211,11 +215,11 @@ impl Shared {
     /// the allowlist).
     fn may_use_topic(
         &self,
-        caller: &crate::peer::AgentCaller,
+        caller: &super::caller_rule::AgentCaller,
         topic: &Topic,
         verb: &str,
     ) -> Result<()> {
-        use crate::peer::AgentCaller::{Agent, Operator};
+        use super::caller_rule::AgentCaller::{Agent, Operator};
         match caller {
             Operator => Ok(()),
             Agent(alias) => {
@@ -233,8 +237,12 @@ impl Shared {
 
     /// A subscription is not a project grant. Job-scoped topics also inherit
     /// the member-private job boundary; unknown bindings refuse as unknown.
-    fn may_read_topic_scope(&self, caller: &crate::peer::AgentCaller, topic: &Topic) -> Result<()> {
-        let crate::peer::AgentCaller::Agent(alias) = caller else {
+    fn may_read_topic_scope(
+        &self,
+        caller: &super::caller_rule::AgentCaller,
+        topic: &Topic,
+    ) -> Result<()> {
+        let super::caller_rule::AgentCaller::Agent(alias) = caller else {
             return Ok(());
         };
         let unknown = || Error::rejected("Unknown topic");
@@ -407,8 +415,8 @@ impl Shared {
         }
         self.may_use_topic(&caller, &topic, "topic_publish")?;
         let (sender_uid, sender_label) = match &caller {
-            crate::peer::AgentCaller::Operator => (None, "operator".to_string()),
-            crate::peer::AgentCaller::Agent(alias) => {
+            super::caller_rule::AgentCaller::Operator => (None, "operator".to_string()),
+            super::caller_rule::AgentCaller::Agent(alias) => {
                 (Some(self.store.agent(alias)?.uid), alias.clone())
             }
         };
@@ -584,11 +592,11 @@ impl Shared {
 
     fn enforce_member_turn_topic_scope(
         &self,
-        caller: &crate::peer::AgentCaller,
+        caller: &super::caller_rule::AgentCaller,
         topic: &crate::store::Topic,
         verb: &str,
     ) -> Result<()> {
-        let crate::peer::AgentCaller::Agent(alias) = caller else {
+        let super::caller_rule::AgentCaller::Agent(alias) = caller else {
             return Ok(());
         };
         let Some(turn) = self.store.running_channel_authority(alias)? else {
@@ -646,10 +654,10 @@ impl Shared {
             )));
         }
         let identity = match &caller {
-            crate::peer::AgentCaller::Agent(alias) => {
+            super::caller_rule::AgentCaller::Agent(alias) => {
                 Some((alias.clone(), self.store.agent(alias)?.uid))
             }
-            crate::peer::AgentCaller::Operator => None,
+            super::caller_rule::AgentCaller::Operator => None,
         };
         let human_scope = if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
             let uid = self.human_room_agent(&caller, "topic_read")?;

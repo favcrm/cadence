@@ -107,7 +107,7 @@ pub fn read_asset_material(path: &std::path::Path, id: &str) -> Result<(Value, V
     asset_material_in(&open_read_only(path)?, id)
 }
 
-pub(crate) struct AppCapabilityRecord<'a> {
+pub struct AppCapabilityRecord<'a> {
     pub id: &'a str,
     pub run: &'a str,
     pub step: &'a str,
@@ -121,7 +121,7 @@ pub(crate) struct AppCapabilityRecord<'a> {
     pub asset: Option<(&'a str, &'a [u8])>,
 }
 
-pub(crate) struct AppCapabilityClaim<'a> {
+pub struct AppCapabilityClaim<'a> {
     pub run: &'a str,
     pub step: &'a str,
     pub message: &'a str,
@@ -164,7 +164,7 @@ const SOURCE_PAGE_FENCE_SLACK: usize = 1024;
 impl Store {
     /// Reserve the one paid operation for this run slot before provider I/O.
     /// A failed/uncertain result can only retry the same operation and key.
-    pub(crate) fn app_capability_claim(&self, claim: AppCapabilityClaim<'_>) -> Result<bool> {
+    pub fn app_capability_claim(&self, claim: AppCapabilityClaim<'_>) -> Result<bool> {
         let AppCapabilityClaim {
             run,
             step,
@@ -240,7 +240,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn app_selected_source_input(
+    #[doc(hidden)]
+    pub fn app_selected_source_input(
         &self,
         install: &str,
         context: Option<&str>,
@@ -279,7 +280,8 @@ impl Store {
         crate::issue::workflow::source_input_line(caption)
     }
 
-    pub(crate) fn app_capability_receipt_for_turn(
+    #[doc(hidden)]
+    pub fn app_capability_receipt_for_turn(
         &self,
         id: &str,
         alias: &str,
@@ -317,11 +319,8 @@ impl Store {
         Ok(receipt)
     }
 
-    pub(crate) fn app_capability_result_for_slot(
-        &self,
-        run: &str,
-        slot: &str,
-    ) -> Result<Option<Value>> {
+    #[doc(hidden)]
+    pub fn app_capability_result_for_slot(&self, run: &str, slot: &str) -> Result<Option<Value>> {
         let id = self
             .conn()
             .query_row(
@@ -333,7 +332,7 @@ impl Store {
         id.map(|id| self.app_capability_result(&id)).transpose()
     }
 
-    pub(crate) fn app_capability_record(&self, record: AppCapabilityRecord<'_>) -> Result<Value> {
+    pub fn app_capability_record(&self, record: AppCapabilityRecord<'_>) -> Result<Value> {
         let AppCapabilityRecord {
             id,
             run,
@@ -490,7 +489,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn app_capability_result(&self, id: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_capability_result(&self, id: &str) -> Result<Value> {
         Self::app_capability_result_in(&self.conn(), id)
     }
 
@@ -535,7 +535,8 @@ impl Store {
         Ok(receipt)
     }
 
-    pub(crate) fn app_capability_results(&self, run: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_capability_results(&self, run: &str) -> Result<Value> {
         let conn = self.conn();
         let ids = conn.prepare("SELECT id FROM app_capability_results WHERE run_id=? ORDER BY created,id LIMIT 100")?
             .query_map([run], |r| r.get::<_,String>(0))?
@@ -552,7 +553,8 @@ impl Store {
     /// an equal or backdated `created` and any id is excluded from a scan that
     /// began earlier. Receipts are immutable and never deleted, so the bound
     /// is a stable snapshot of the run-bound rows.
-    pub(crate) fn app_source_run_watermark(&self) -> Result<i64> {
+    #[doc(hidden)]
+    pub fn app_source_run_watermark(&self) -> Result<i64> {
         Ok(self.conn().query_row(
             "SELECT COALESCE(MAX(rowid),0) FROM app_capability_results",
             [],
@@ -569,7 +571,8 @@ impl Store {
     /// authenticated, so the skip budget is `SOURCE_PAGE_FENCE_SLACK`; past
     /// it the scan is refused as `stale_cursor` rather than walking the
     /// scoped history. This bounds this function only.
-    pub(crate) fn app_source_run_candidates(
+    #[doc(hidden)]
+    pub fn app_source_run_candidates(
         &self,
         install: &str,
         context: &str,
@@ -615,7 +618,8 @@ impl Store {
     /// use the existing draft proof; native host executions use their approved
     /// step and exact claim. This read does not widen draft authorization.
     /// `None` means the receipt is not provable; nothing is guessed.
-    pub(crate) fn app_source_run_receipt(
+    #[doc(hidden)]
+    pub fn app_source_run_receipt(
         &self,
         install: &str,
         context: &str,
@@ -645,7 +649,8 @@ impl Store {
         Some((receipt, run_id))
     }
 
-    pub(crate) fn app_capability_asset(&self, id: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_capability_asset(&self, id: &str) -> Result<Value> {
         let (receipt, bytes) = asset_material_in(&self.conn(), id)?;
         use base64::Engine;
         Ok(

@@ -31,12 +31,13 @@ const RECORD_KIND: &str = "knowledge-correction";
 const RECORD_SCHEMA: u64 = 1;
 const RECORD_CLAIMS: &str = "reported-untrusted";
 
-pub(crate) struct Human {
+#[doc(hidden)]
+pub struct Human {
     pub sub: String,
     pub display: String,
 }
 
-pub(crate) fn list(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
+pub fn list(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     super::admitted_for_export(pm, caller, path)?;
     let loaded = collection::root_and_project(pm, caller, path)?;
     let requests = match &loaded.review_project {
@@ -50,13 +51,8 @@ pub(crate) fn list(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     }))
 }
 
-pub(crate) fn submit(
-    pm: &Pm,
-    caller: &Caller,
-    path: &str,
-    body: &Value,
-    human: &Human,
-) -> Result<Value> {
+#[doc(hidden)]
+pub fn submit(pm: &Pm, caller: &Caller, path: &str, body: &Value, human: &Human) -> Result<Value> {
     require_subject(&human.sub)?;
     if !matches!(caller, Caller::User(_) | Caller::Operator) {
         return Err(Error::rejected(
@@ -84,13 +80,8 @@ pub(crate) fn submit(
     correction_value(pm, caller, &loaded, &id)
 }
 
-pub(crate) fn review(
-    pm: &Pm,
-    caller: &Caller,
-    path: &str,
-    body: &Value,
-    human: &Human,
-) -> Result<Value> {
+#[doc(hidden)]
+pub fn review(pm: &Pm, caller: &Caller, path: &str, body: &Value, human: &Human) -> Result<Value> {
     require_subject(&human.sub)?;
     if !matches!(caller, Caller::Operator) {
         return Err(Error::rejected(

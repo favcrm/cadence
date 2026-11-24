@@ -11,8 +11,8 @@ use crate::error::{Error, Result};
 
 use super::strict;
 
-#[derive(Clone, Debug)]
-pub(crate) struct PreparedRuntime {
+#[derive(Debug)]
+pub struct PreparedRuntime {
     pub(crate) runtime_id: String,
     /// The immutable owner-generated operation id — the canonical challenge id
     /// the installer correlates on.
@@ -45,10 +45,57 @@ pub(crate) struct PreparedRuntime {
     pub(crate) agent_uid: String,
     pub(crate) session_binding: String,
     pub(crate) server_generation: u64,
+    pub(super) listener_enrollment: std::sync::Mutex<Option<super::ops::AgentEnrollment>>,
     pub(crate) profile_digest: String,
 }
 
 impl PreparedRuntime {
+    /// Bind once, using only the immutable enrollment captured from an
+    /// authenticated owner reply. Parsed wire data alone cannot bind a caller.
+    pub fn bind_operations(&self) -> Result<super::ops::RuntimeOpsListener> {
+        let enrollment = self
+            .listener_enrollment
+            .lock()
+            .map_err(|_| Error::internal("operations enrollment lock poisoned"))?
+            .take()
+            .ok_or_else(|| Error::rejected("operations enrollment is unavailable"))?;
+        super::ops::RuntimeOpsListener::bind(&self.ops_socket, enrollment)
+    }
+
+    pub fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn os_uid(&self) -> u32 {
+        self.os_uid
+    }
+    pub fn ops_socket(&self) -> &std::path::Path {
+        &self.ops_socket
+    }
+    pub fn launch_request(&self) -> &serde_json::Value {
+        &self.launch_request
+    }
+    pub fn recipient_pid(&self) -> u32 {
+        self.recipient_pid
+    }
+    pub fn recipient_starttime(&self) -> u64 {
+        self.recipient_starttime
+    }
+    pub fn recipient_generation(&self) -> &str {
+        &self.recipient_generation
+    }
+    pub fn recipient_nonce(&self) -> &str {
+        &self.recipient_nonce
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "runtime_id": self.runtime_id,
@@ -143,6 +190,7 @@ impl PreparedRuntime {
             ));
         }
         Ok(Self {
+            listener_enrollment: std::sync::Mutex::new(None),
             runtime_id: bounded(strict::string(m, "runtime_id")?, 200, "runtime_id")?,
             operation_id: operation_id.to_string(),
             generation: strict::positive_u64(m, "generation")?,
@@ -190,14 +238,14 @@ impl PreparedRuntime {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct StartOutcome {
-    pub(crate) runtime_id: String,
-    pub(crate) generation: u64,
-    pub(crate) owner_epoch: u64,
-    pub(crate) phase: String,
-    pub(crate) node_pid: u32,
-    pub(crate) node_starttime: u64,
-    pub(crate) container_id: String,
+pub struct StartOutcome {
+    pub runtime_id: String,
+    pub generation: u64,
+    pub owner_epoch: u64,
+    pub phase: String,
+    pub node_pid: u32,
+    pub node_starttime: u64,
+    pub container_id: String,
 }
 
 impl StartOutcome {

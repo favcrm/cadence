@@ -26,8 +26,13 @@
 //! acceptance/refusal only — never delivery, never reads. There is
 //! no bulk path in this ticket.
 
-#[cfg(all(test, unix, feature = "test-seam"))]
-pub(crate) mod test_artifact_adapter;
+#[cfg(all(
+    unix,
+    feature = "test-seam",
+    any(test, all(debug_assertions, feature = "test-seam"))
+))]
+#[cfg_attr(not(test), doc(hidden))]
+pub mod test_artifact_adapter;
 
 use super::connections::{CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor};
 use crate::contract_fixture::ToolTable;
@@ -652,8 +657,8 @@ impl Default for SmtpAdapter {
 /// `local`: the adapter holds no credential and opens no socket —
 /// enrollment is the operator's explicit act, and a daemon without
 /// one fails every SMTP send closed.
-pub fn attach(opts: &mut crate::daemon::ServeOptions) {
-    opts.platforms
+pub fn attach(opts: &mut impl super::PlatformRegistry) {
+    opts.platforms_mut()
         .insert(PLATFORM.to_string(), Arc::new(SmtpAdapter::default()));
 }
 
@@ -2409,7 +2414,7 @@ mod direct_call_tests {
     /// executes them, so they must not be advertised as directly callable.
     #[test]
     fn smtp_has_no_direct_platform_call() {
-        let mut opts = crate::daemon::ServeOptions::default();
+        let mut opts = crate::platform::TestComposition::default();
         crate::platform::smtp::attach(&mut opts);
         let adapter = opts
             .platforms

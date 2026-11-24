@@ -108,13 +108,20 @@ fn reviewed_media_pin(pin: &str) -> Option<&'static str> {
 /// Only validated image metadata can produce this construction proof. It
 /// authorizes one fixed internal media door, not arbitrary HTTP or a lease.
 #[derive(Clone, Debug)]
-pub(crate) struct HostedMediaAdmission {
+#[cfg_attr(all(debug_assertions, feature = "test-seam"), doc(hidden))]
+pub struct HostedMediaAdmission {
     /// The reviewed manifest pin the image metadata asserted — only
     /// `MANIFEST_PIN` (@3) or `TEXT_MANIFEST_PIN` (@4), never a free string.
     pin: &'static str,
 }
 
 impl HostedMediaAdmission {
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub fn pin(&self) -> &'static str {
+        self.pin
+    }
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn pin(&self) -> &'static str {
         self.pin
     }
@@ -124,7 +131,7 @@ impl HostedMediaAdmission {
 /// documents tuple can produce this proof. It selects the hosted document
 /// door and grants no lifecycle lease, media or SMTP authority.
 #[derive(Clone, Debug)]
-pub(crate) struct HostedBusinessDocumentsAdmission {
+pub struct HostedBusinessDocumentsAdmission {
     _private: (),
 }
 
@@ -149,7 +156,7 @@ pub(crate) struct HostedWhatsappAdmission {
 /// The hosted Master may read company files, including operational originals.
 /// Only validated deployment metadata can construct this authority.
 #[derive(Clone, Debug)]
-pub(crate) struct HostedCompanyMaster {
+pub struct HostedCompanyMaster {
     _private: (),
 }
 
@@ -272,6 +279,16 @@ impl DeploymentMetadata {
     /// The MEDIA assertion grants media only. CAD-1158: an explicit
     /// transport match, so an SMTP-only assertion never yields a media
     /// admission (the find-first-transport pitfall).
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub fn hosted_media(&self) -> Option<HostedMediaAdmission> {
+        self.providers
+            .iter()
+            .find(|entry| matches!(entry.transport, Some(DeploymentTransport::HostedMediaLease)))
+            .and_then(|entry| reviewed_media_pin(&entry.manifest_pin))
+            .map(|pin| HostedMediaAdmission { pin })
+    }
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn hosted_media(&self) -> Option<HostedMediaAdmission> {
         self.providers
             .iter()
@@ -299,7 +316,7 @@ impl DeploymentMetadata {
 
     /// CAD-1416: `Some` only for the exact business-documents tuple (all
     /// four fields). An SMTP or media assertion never yields it.
-    pub(crate) fn hosted_business_documents(&self) -> Option<HostedBusinessDocumentsAdmission> {
+    pub fn hosted_business_documents(&self) -> Option<HostedBusinessDocumentsAdmission> {
         self.providers
             .iter()
             .find(|entry| {
@@ -331,7 +348,7 @@ impl DeploymentMetadata {
             .map(|_| HostedWhatsappAdmission { _private: () })
     }
 
-    pub(crate) fn hosted_company_master(&self) -> Option<HostedCompanyMaster> {
+    pub fn hosted_company_master(&self) -> Option<HostedCompanyMaster> {
         self.company_master.clone()
     }
 

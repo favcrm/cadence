@@ -108,21 +108,24 @@ pub struct ImageJob {
 
 /// An active image job re-proved from this installation's record file.
 /// Its fields are private so a caller-built `ImageJob` is never authority.
-pub(crate) struct ImageJobAuthority {
+#[doc(hidden)]
+pub struct ImageJobAuthority {
     install: String,
     job: ImageJob,
     epoch: i64,
 }
 
 impl ImageJobAuthority {
-    pub(crate) fn job(&self) -> &ImageJob {
+    #[doc(hidden)]
+    pub fn job(&self) -> &ImageJob {
         &self.job
     }
 }
 
 /// How a worker ends an active image job.
 #[derive(Clone, Copy)]
-pub(crate) enum ImageSettlement<'a> {
+#[doc(hidden)]
+pub enum ImageSettlement<'a> {
     Succeeded { receipt: &'a str },
     Failed { reason: &'a str },
     Uncertain { reason: &'a str },
@@ -887,7 +890,8 @@ impl RecordStore {
     /// exactly once per key. The intent leaves `uncertain` for `pending` in
     /// the same transaction, and only for the request that owns it.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn app_social_image_job_start(
+    #[doc(hidden)]
+    pub fn app_social_image_job_start(
         &self,
         context: &str,
         intent: &str,
@@ -1046,7 +1050,8 @@ impl RecordStore {
         }))
     }
 
-    pub(crate) fn app_social_image_job_authority(
+    #[doc(hidden)]
+    pub fn app_social_image_job_authority(
         &self,
         call_id: &str,
     ) -> Result<Option<ImageJobAuthority>> {
@@ -1086,7 +1091,8 @@ impl RecordStore {
         }
     }
 
-    pub(crate) fn app_social_image_result_for_job(
+    #[doc(hidden)]
+    pub fn app_social_image_result_for_job(
         &self,
         store: &Store,
         authority: &ImageJobAuthority,
@@ -1097,7 +1103,8 @@ impl RecordStore {
         })
     }
 
-    pub(crate) fn app_social_image_record_result(
+    #[doc(hidden)]
+    pub fn app_social_image_record_result(
         &self,
         store: &Store,
         authority: &ImageJobAuthority,
@@ -1129,7 +1136,8 @@ impl RecordStore {
 
     /// Attach only the receipt proved by the active job and its claim, then
     /// complete the job and intent in the same record-file transaction.
-    pub(crate) fn app_social_image_complete(
+    #[doc(hidden)]
+    pub fn app_social_image_complete(
         &self,
         store: &Store,
         authority: &ImageJobAuthority,
@@ -1155,7 +1163,8 @@ impl RecordStore {
         })
     }
 
-    pub(crate) fn app_social_image_job_settle_authorized(
+    #[doc(hidden)]
+    pub fn app_social_image_job_settle_authorized(
         &self,
         authority: &ImageJobAuthority,
         settlement: ImageSettlement<'_>,

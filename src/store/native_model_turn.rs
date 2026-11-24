@@ -157,21 +157,33 @@ CREATE INDEX IF NOT EXISTS native_model_request_unresolved
 
 /// The request lifecycle. `prepared` is reserve-free (a selector only);
 /// only `committed` consumes rate/concurrency.
-pub(crate) const STATE_PREPARED: &str = "prepared";
-pub(crate) const STATE_COMMITTED: &str = "committed";
-pub(crate) const STATE_DONE: &str = "done";
-pub(crate) const STATE_REFUSED: &str = "refused";
-pub(crate) const STATE_RESULT_REFUSED: &str = "result_refused";
-pub(crate) const STATE_UNKNOWN: &str = "unknown";
+#[doc(hidden)]
+pub const STATE_PREPARED: &str = "prepared";
+#[doc(hidden)]
+pub const STATE_COMMITTED: &str = "committed";
+#[doc(hidden)]
+pub const STATE_DONE: &str = "done";
+#[doc(hidden)]
+pub const STATE_REFUSED: &str = "refused";
+#[doc(hidden)]
+pub const STATE_RESULT_REFUSED: &str = "result_refused";
+#[doc(hidden)]
+pub const STATE_UNKNOWN: &str = "unknown";
 
-pub(crate) const TASK_ACTIVE: &str = "active";
+#[doc(hidden)]
+pub const TASK_ACTIVE: &str = "active";
 
-pub(crate) const SOURCE_ACTIVE: &str = "active";
-pub(crate) const SOURCE_LOCKED: &str = "locked";
-pub(crate) const SOURCE_REVOKED: &str = "revoked";
+#[doc(hidden)]
+pub const SOURCE_ACTIVE: &str = "active";
+#[doc(hidden)]
+pub const SOURCE_LOCKED: &str = "locked";
+#[doc(hidden)]
+pub const SOURCE_REVOKED: &str = "revoked";
 
-pub(crate) const ORIGIN_CREDENTIALS: &str = "devin_credentials";
-pub(crate) const ORIGIN_PINNED: &str = "operator_pinned";
+#[doc(hidden)]
+pub const ORIGIN_CREDENTIALS: &str = "devin_credentials";
+#[doc(hidden)]
+pub const ORIGIN_PINNED: &str = "operator_pinned";
 
 fn storage(message: &str) -> Error {
     Error::invalid("storage_unavailable", message)
@@ -186,7 +198,8 @@ fn refused(message: &str) -> Error {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub(crate) struct SourceRow {
+#[doc(hidden)]
+pub struct SourceRow {
     pub source_id: String,
     pub workspace_id: String,
     pub provider: String,
@@ -432,7 +445,8 @@ pub(crate) fn source_history_in(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub(crate) struct TaskRow {
+#[doc(hidden)]
+pub struct TaskRow {
     pub durable_task_id: String,
     pub workspace_id: String,
     pub agent_uid: String,
@@ -491,13 +505,15 @@ pub(crate) fn task_by_id_in(
 }
 
 /// Only a committed binding can produce this Store-local fence target.
-pub(crate) struct NativeTaskLease {
+#[doc(hidden)]
+pub struct NativeTaskLease {
     store: Arc<GuardState>,
     task_id: String,
 }
 
 impl NativeTaskLease {
-    pub(crate) fn id(&self) -> &str {
+    #[doc(hidden)]
+    pub fn id(&self) -> &str {
         &self.task_id
     }
 }
@@ -552,7 +568,8 @@ fn fence_task_in(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ConfigurationRow {
+#[doc(hidden)]
+pub struct ConfigurationRow {
     pub configuration_id: String,
     pub revision: i64,
     pub workspace_id: String,
@@ -734,7 +751,8 @@ max_output_tokens) DO NOTHING"
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub(crate) struct RequestRow {
+#[doc(hidden)]
+pub struct RequestRow {
     pub request_id: String,
     pub workspace_id: String,
     pub agent_uid: String,
@@ -946,7 +964,8 @@ pub(crate) fn note_unknown_in(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct WindowUsage {
+#[doc(hidden)]
+pub struct WindowUsage {
     pub agent_requests: i64,
     pub agent_unresolved: i64,
     pub account_requests: i64,
@@ -1011,7 +1030,8 @@ pub(crate) fn window_usage_in(
 /// Agent role and configured model/effort, re-derived by stable UID on every
 /// prepare and final admission. Nothing here is caller input.
 #[derive(Clone, Debug)]
-pub(crate) struct AgentFacts {
+#[doc(hidden)]
+pub struct AgentFacts {
     pub role: String,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -1045,10 +1065,23 @@ pub(crate) fn agent_facts_by_uid_in(
 // Read wrappers on the store
 // ---------------------------------------------------------------------------
 
-/// Durable read helpers for the daemon-side broker. Every one is a plain read
-/// inside the store's read transaction; none writes or caches authority.
+/// Metadata-only selector pair produced by [`crate::store::Store::prepare_native_model_request`].
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct PreparedNativeModelRequest {
+    pub request_id: String,
+    pub request_index: i64,
+    pub configuration_id: String,
+    pub configuration_revision: i64,
+    pub snapshot_id: String,
+    pub loaded_receipt_id: String,
+}
+
+/// Durable read and sealed transaction helpers for the daemon-side broker.
+/// None exposes raw SQLite handles or caches authority across turns.
 impl crate::store::Store {
-    pub(crate) fn native_model_source(
+    #[doc(hidden)]
+    pub fn native_model_source(
         &self,
         workspace_id: &str,
         source_id: &str,
@@ -1056,7 +1089,8 @@ impl crate::store::Store {
         self.read_tx(|conn| source_in(&*conn, workspace_id, source_id))
     }
 
-    pub(crate) fn native_model_rotation_source(
+    #[doc(hidden)]
+    pub fn native_model_rotation_source(
         &self,
         source_id: &str,
         provider: &str,
@@ -1065,28 +1099,33 @@ impl crate::store::Store {
         self.read_tx(|conn| rotation_source_in(&*conn, source_id, provider, expected_revision))
     }
 
-    pub(crate) fn native_model_task_by_id(&self, durable_task_id: &str) -> Result<Option<TaskRow>> {
+    #[doc(hidden)]
+    pub fn native_model_task_by_id(&self, durable_task_id: &str) -> Result<Option<TaskRow>> {
         self.read_tx(|conn| task_by_id_in(&*conn, durable_task_id))
     }
 
-    pub(crate) fn native_model_configuration(
+    #[doc(hidden)]
+    pub fn native_model_configuration(
         &self,
         configuration_id: &str,
     ) -> Result<Option<ConfigurationRow>> {
         self.read_tx(|conn| configuration_in(&*conn, configuration_id))
     }
 
-    pub(crate) fn native_model_request(&self, request_id: &str) -> Result<Option<RequestRow>> {
+    #[doc(hidden)]
+    pub fn native_model_request(&self, request_id: &str) -> Result<Option<RequestRow>> {
         self.read_tx(|conn| request_in(&*conn, request_id))
     }
 
-    pub(crate) fn native_model_agent(&self, uid: &str) -> Result<Option<AgentFacts>> {
+    #[doc(hidden)]
+    pub fn native_model_agent(&self, uid: &str) -> Result<Option<AgentFacts>> {
         self.read_tx(|conn| agent_facts_by_uid_in(&*conn, uid))
     }
 
     /// Re-prove the actor's exact take and bind the task in one writer
     /// critical section, before the protected adapter can send its prompt.
-    pub(crate) fn bind_claimed_native_task(
+    #[doc(hidden)]
+    pub fn bind_claimed_native_task(
         &self,
         claim: &super::NativeTurnClaim,
         candidate: &TaskRow,
@@ -1175,7 +1214,8 @@ impl crate::store::Store {
         Ok((task, lease))
     }
 
-    pub(crate) fn fence_claimed_native_task(
+    #[doc(hidden)]
+    pub fn fence_claimed_native_task(
         &self,
         lease: &NativeTaskLease,
         reason: &str,
@@ -1188,6 +1228,413 @@ impl crate::store::Store {
             ));
         }
         self.write_tx(|tx| fence_task_in(tx, lease.id(), reason, now_ms))
+    }
+
+    /// Prepare (or return existing idempotent) native model turn request and
+    /// frozen configuration in a single writer critical section.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_native_model_request(
+        &self,
+        workspace: &str,
+        agent_uid: &str,
+        task_id: &str,
+        index: i64,
+        provider: &str,
+        now_ms: impl Fn() -> i64 + 'static,
+        check_policy: impl FnOnce(
+            &AgentFacts,
+            Option<&cadence_core::connection_dispatch::RoleModelPolicyV1>,
+        ) -> Result<(String, String)>,
+        build_configuration: impl FnOnce(
+            &AgentFacts,
+            &SourceRow,
+            i64,
+        ) -> Result<(ConfigurationRow, String)>,
+    ) -> Result<PreparedNativeModelRequest> {
+        let workspace = workspace.to_string();
+        let agent_uid = agent_uid.to_string();
+        let task_id = task_id.to_string();
+        let provider = provider.to_string();
+        self.write_tx(move |tx| {
+            let authority = crate::store::connection_dispatch::authority_in(tx)?;
+            if !authority.enabled || !authority.ever_enabled || authority.fenced {
+                return Err(Error::invalid(
+                    "runtime_unqualified",
+                    "protected custody is not enabled on this store",
+                ));
+            }
+            if authority.workspace_id != workspace {
+                return Err(Error::invalid(
+                    "loaded_state_mismatch",
+                    "the protected workspace changed",
+                ));
+            }
+            let live = task_by_id_in(tx, &task_id)?
+                .ok_or_else(|| Error::invalid("runtime_revoked", "the model task is unknown"))?;
+            if live.state != TASK_ACTIVE {
+                return Err(Error::invalid(
+                    "runtime_revoked",
+                    "the model task is fenced",
+                ));
+            }
+            if let Some(existing) =
+                request_by_index_in(tx, &workspace, &agent_uid, &task_id, index)?
+            {
+                return Ok(PreparedNativeModelRequest {
+                    request_id: existing.request_id,
+                    request_index: existing.request_index,
+                    configuration_id: existing.configuration_id,
+                    configuration_revision: existing.configuration_revision,
+                    snapshot_id: existing.snapshot_id,
+                    loaded_receipt_id: existing.loaded_receipt_id,
+                });
+            }
+            let max = max_request_index_in(tx, &task_id)?;
+            let next = max.map(|value| value + 1).unwrap_or(0);
+            if index != next {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "the request index is not the contiguous next index",
+                ));
+            }
+            let agent = agent_facts_by_uid_in(tx, &agent_uid)?
+                .ok_or_else(|| Error::invalid("principal_required", "the agent is unknown"))?;
+            let role_policy = crate::store::connection_dispatch::role_model_policy_in(tx)?;
+            let (model_id, bare_model_id) = check_policy(&agent, role_policy.as_ref())?;
+            crate::store::connection_dispatch::require_native_model_provider_in(
+                tx,
+                &model_id,
+                &bare_model_id,
+                &provider,
+            )?;
+            let source = active_source_in(tx, &workspace, &provider)?.ok_or_else(|| {
+                Error::invalid(
+                    "auth_unavailable",
+                    "no positive-human native model source is linked",
+                )
+            })?;
+            let revision = next_configuration_revision_in(tx, &agent_uid)?;
+            let (configuration, billing_json) = build_configuration(&agent, &source, revision)?;
+            let stored = put_configuration_in(tx, &configuration)?;
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let row = RequestRow {
+                request_id: request_id.clone(),
+                workspace_id: workspace.clone(),
+                agent_uid: agent_uid.clone(),
+                durable_task_id: task_id.clone(),
+                request_index: index,
+                configuration_id: stored.configuration_id.clone(),
+                configuration_revision: stored.revision,
+                snapshot_id: stored.snapshot_id.clone(),
+                loaded_receipt_id: stored.loaded_receipt_id.clone(),
+                source_id: stored.source_id.clone(),
+                account: stored.account.clone(),
+                state: STATE_PREPARED.to_string(),
+                input_digest: None,
+                assistant_json: None,
+                usage_json: None,
+                error_json: None,
+                billing_json,
+                created_ms: now_ms(),
+            };
+            insert_prepared_in(tx, &row)?;
+            Ok(PreparedNativeModelRequest {
+                request_id,
+                request_index: index,
+                configuration_id: stored.configuration_id,
+                configuration_revision: stored.revision,
+                snapshot_id: stored.snapshot_id,
+                loaded_receipt_id: stored.loaded_receipt_id,
+            })
+        })
+    }
+
+    /// Revalidate witness/authority/task/configuration/snapshot/source/limits
+    /// and atomically freeze input + commit a prepared native model request.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_native_model_request<R: 'static>(
+        &self,
+        workspace: &str,
+        agent_uid: &str,
+        runtime_generation: u64,
+        task_id: &str,
+        configuration_id: &str,
+        configuration_revision: i64,
+        source_id: &str,
+        source_revision: i64,
+        request_id: &str,
+        digest: &str,
+        provider: &str,
+        now_ms: i64,
+        require_witness: impl FnOnce() -> Result<()>,
+        verify_policy: impl FnOnce(
+            &AgentFacts,
+            Option<&cadence_core::connection_dispatch::RoleModelPolicyV1>,
+            &ConfigurationRow,
+        ) -> Result<(String, String)>,
+        resolve_and_verify: impl FnOnce(&AgentFacts, &ConfigurationRow) -> Result<R>,
+        check_limits: impl FnOnce(&WindowUsage) -> Result<()>,
+    ) -> Result<Option<R>> {
+        let workspace = workspace.to_string();
+        let agent_uid = agent_uid.to_string();
+        let task_id = task_id.to_string();
+        let configuration_id = configuration_id.to_string();
+        let source_id = source_id.to_string();
+        let request_id = request_id.to_string();
+        let digest = digest.to_string();
+        let provider = provider.to_string();
+        self.write_tx(move |tx| {
+            require_witness()?;
+            let authority = crate::store::connection_dispatch::authority_in(tx)?;
+            if !authority.enabled || authority.fenced {
+                return Err(Error::invalid(
+                    "runtime_unqualified",
+                    "protected custody is not enabled on this store",
+                ));
+            }
+            if authority.workspace_id != workspace {
+                return Err(Error::invalid(
+                    "loaded_state_mismatch",
+                    "the protected workspace changed",
+                ));
+            }
+            let live = task_by_id_in(tx, &task_id)?
+                .ok_or_else(|| Error::invalid("runtime_revoked", "the model task is unknown"))?;
+            if live.state != TASK_ACTIVE {
+                return Err(Error::invalid(
+                    "runtime_revoked",
+                    "the model task is fenced",
+                ));
+            }
+            let current = configuration_in(tx, &configuration_id)?.ok_or_else(|| {
+                Error::invalid("stale_configuration", "the configuration is unknown")
+            })?;
+            if current.revision != configuration_revision || current.snapshot_expires_ms <= now_ms {
+                return Err(Error::invalid(
+                    "stale_configuration",
+                    "the model configuration changed",
+                ));
+            }
+            let loaded = crate::store::connection_dispatch::current_snapshot_in(
+                tx,
+                &agent_uid,
+                runtime_generation,
+                now_ms as u64,
+            )?
+            .ok_or_else(|| {
+                Error::invalid(
+                    "loaded_state_mismatch",
+                    "the loaded protected state is no longer current",
+                )
+            })?;
+            if loaded.snapshot.snapshot_id.as_str() != current.snapshot_id
+                || loaded.receipt.loaded_receipt_id.as_str() != current.loaded_receipt_id
+                || loaded.authorization_revision != authority.authorization_revision
+            {
+                return Err(Error::invalid(
+                    "loaded_state_mismatch",
+                    "the issued authority changed before commitment",
+                ));
+            }
+            let agent = agent_facts_by_uid_in(tx, &agent_uid)?
+                .ok_or_else(|| Error::invalid("principal_required", "the agent is unknown"))?;
+            if agent.role != current.role || agent.model.as_deref() != Some(current.model.as_str())
+            {
+                return Err(Error::invalid(
+                    "stale_configuration",
+                    "the agent role or model changed before commitment",
+                ));
+            }
+            let role_policy = crate::store::connection_dispatch::role_model_policy_in(tx)?;
+            let (model_id, bare_model_id) = verify_policy(&agent, role_policy.as_ref(), &current)?;
+            crate::store::connection_dispatch::require_native_model_provider_in(
+                tx,
+                &model_id,
+                &bare_model_id,
+                &provider,
+            )?;
+            let resolved = resolve_and_verify(&agent, &current)?;
+            let source_row = source_in(tx, &workspace, &source_id)?
+                .ok_or_else(|| Error::invalid("auth_unavailable", "the model source is unknown"))?;
+            if source_row.state != SOURCE_ACTIVE
+                || source_row.revision != source_revision
+                || source_row.account != current.account
+                || source_row.origin != current.origin
+                || source_row.provider != current.provider
+            {
+                return Err(Error::invalid(
+                    "auth_unavailable",
+                    "the model source changed or is not active",
+                ));
+            }
+            let usage = window_usage_in(tx, &workspace, &agent_uid, &source_id, now_ms)?;
+            check_limits(&usage)?;
+            let row = request_in(tx, &request_id)?
+                .ok_or_else(|| Error::invalid("invalid_request", "the request is unknown"))?;
+            if row.state != STATE_PREPARED {
+                return Ok(None);
+            }
+            if let Some(existing) = &row.input_digest {
+                if existing != &digest {
+                    return Err(Error::invalid(
+                        "idempotency_conflict",
+                        "the model request was already bound to different input",
+                    ));
+                }
+                return Ok(None);
+            }
+            freeze_input_in(tx, &request_id, &digest)?;
+            commit_request_in(tx, &request_id, now_ms)?;
+            Ok(Some(resolved))
+        })
+    }
+
+    /// Settle one prepared/committed/unknown native model request in one write tx.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle_native_model_request(
+        &self,
+        request_id: &str,
+        state: &str,
+        assistant_json: Option<&str>,
+        usage_json: Option<&str>,
+        error_json: Option<&str>,
+        billing_json: &str,
+        auth_requests: i64,
+        inference_requests: i64,
+        now_ms: i64,
+    ) -> Result<RequestRow> {
+        let request_id = request_id.to_string();
+        let state = state.to_string();
+        let assistant_json = assistant_json.map(str::to_string);
+        let usage_json = usage_json.map(str::to_string);
+        let error_json = error_json.map(str::to_string);
+        let billing_json = billing_json.to_string();
+        self.write_tx(move |tx| {
+            let row = request_in(tx, &request_id)?
+                .ok_or_else(|| Error::invalid("invalid_request", "the request is unknown"))?;
+            settle_request_in(
+                tx,
+                &row,
+                &state,
+                assistant_json.as_deref(),
+                usage_json.as_deref(),
+                error_json.as_deref(),
+                &billing_json,
+                auth_requests,
+                inference_requests,
+                now_ms,
+            )?;
+            request_in(tx, &request_id)?.ok_or_else(|| Error::internal("the request vanished"))
+        })
+    }
+
+    /// Record ambiguous execution counts while retaining `unknown` state.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_native_model_request_unknown(
+        &self,
+        request_id: &str,
+        auth_requests: i64,
+        inference_requests: i64,
+        error_json: &str,
+        billing_json: &str,
+        now_ms: i64,
+    ) -> Result<RequestRow> {
+        let request_id = request_id.to_string();
+        let error_json = error_json.to_string();
+        let billing_json = billing_json.to_string();
+        self.write_tx(move |tx| {
+            note_unknown_in(
+                tx,
+                &request_id,
+                auth_requests,
+                inference_requests,
+                &error_json,
+                &billing_json,
+                now_ms,
+            )?;
+            request_in(tx, &request_id)?.ok_or_else(|| Error::internal("the request vanished"))
+        })
+    }
+
+    /// Persist or rotate a native model source and verify its committed binding
+    /// before returning to the external restore checkpoint.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn protected_save_native_model_source(
+        &self,
+        workspace_id: &str,
+        owner_epoch: cadence_core::connection_dispatch::primitives::Revision,
+        digest: cadence_core::connection_dispatch::primitives::Digest,
+        existing_revision: Option<i64>,
+        next: SourceRow,
+        action: &str,
+        actor: &str,
+        now_ms: i64,
+        verify_binding: impl FnOnce(&SourceRow) -> Result<()>,
+    ) -> Result<SourceRow> {
+        let workspace = workspace_id.to_string();
+        let action = action.to_string();
+        let actor = actor.to_string();
+        self.protected_management_commit(workspace_id, owner_epoch, digest, move |tx| {
+            if let Some(expected) = existing_revision {
+                rotate_source_in(
+                    tx,
+                    &workspace,
+                    &next.source_id,
+                    expected,
+                    &next.account,
+                    &next.origin,
+                    &next.origin_kind,
+                    next.catalog_revision,
+                    &next.model_uid_map,
+                    &next.vault_reference,
+                    &next.key_id,
+                    now_ms,
+                )?;
+            } else {
+                insert_source_in(tx, &next)?;
+            }
+            source_history_in(tx, &next.source_id, next.revision, &action, &actor, now_ms)?;
+            let stored = source_in(tx, &workspace, &next.source_id)?
+                .ok_or_else(|| Error::internal("the native model source vanished"))?;
+            verify_binding(&stored)?;
+            Ok(stored)
+        })
+    }
+
+    /// Lock or revoke a native model source under external management checkpoint,
+    /// rolling back if the committed row no longer matches the expected binding.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn protected_fence_native_model_source(
+        &self,
+        workspace_id: &str,
+        source_id: &str,
+        owner_epoch: cadence_core::connection_dispatch::primitives::Revision,
+        digest: cadence_core::connection_dispatch::primitives::Digest,
+        state: &str,
+        action: &str,
+        now_ms: i64,
+        verify_binding: impl FnOnce(&SourceRow) -> Result<()>,
+    ) -> Result<()> {
+        let workspace = workspace_id.to_string();
+        let id = source_id.to_string();
+        let state = state.to_string();
+        let action = action.to_string();
+        self.protected_management_commit(workspace_id, owner_epoch, digest, move |tx| {
+            let current = source_in(tx, &workspace, &id)?
+                .ok_or_else(|| Error::invalid("auth_unavailable", "the model source is unknown"))?;
+            set_source_state_in(tx, &workspace, &id, &state, now_ms)?;
+            source_history_in(tx, &id, current.revision, &action, "owner", now_ms)?;
+            let fenced = source_in(tx, &workspace, &id)?
+                .ok_or_else(|| Error::internal("the native model source vanished"))?;
+            verify_binding(&fenced)?;
+            Ok(())
+        })
     }
 }
 

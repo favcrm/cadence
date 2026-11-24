@@ -587,7 +587,7 @@ impl Shared {
     /// a project's content. A connection that proves nothing never reaches a
     /// spelling: [`agent_caller`] refuses it first.
     pub(super) fn policy_actor(&self, peer_pid: u32, verb: &str) -> Result<String> {
-        use crate::peer::AgentCaller;
+        use super::caller_rule::AgentCaller;
         match self.agent_caller(peer_pid, verb)? {
             AgentCaller::Operator => Ok("operator".to_string()),
             AgentCaller::Agent(alias) => Ok(format!("agents/{alias}")),
@@ -1128,7 +1128,7 @@ impl Shared {
     /// Authorize one agent-mutating request against `target` (CAD-149,
     /// CAD-304 S3): identity-shaped request fields are refused, the
     /// caller is derived ([`Self::agent_caller`]) and the one policy
-    /// ([`crate::peer::may_mutate_agent`]) decides with the target's own
+    /// ([`caller_rule::may_mutate_agent`]) decides with the target's own
     /// PM (`params.upstream`). Returns the caller for the audit stamp.
     pub(super) fn authorize_agent_mutation(
         &self,
@@ -1141,7 +1141,7 @@ impl Shared {
         reject_identity_fields(params, verb)?;
         let caller = self.agent_caller(peer_pid, verb)?;
         let pm = self.effective_pm(target)?;
-        crate::peer::may_mutate_agent(&caller, &target.alias, pm.as_deref(), mutation, verb)
+        caller_rule::may_mutate_agent(&caller, &target.alias, pm.as_deref(), mutation, verb)
             .map_err(Error::rejected)?;
         Ok(caller)
     }
@@ -1259,7 +1259,7 @@ impl Shared {
         let mut not_permitted = Vec::new();
         for agent in self.store.gc_candidates(older_than)? {
             let pm = self.effective_pm(&agent)?;
-            let allowed = crate::peer::may_mutate_agent(
+            let allowed = caller_rule::may_mutate_agent(
                 caller,
                 &agent.alias,
                 pm.as_deref(),
@@ -1300,7 +1300,7 @@ impl Shared {
             });
             if row.eligible() {
                 let pm = self.effective_pm(&row.agent)?;
-                let allowed = crate::peer::may_mutate_agent(
+                let allowed = caller_rule::may_mutate_agent(
                     caller,
                     &row.agent.alias,
                     pm.as_deref(),

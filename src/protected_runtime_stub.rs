@@ -11,7 +11,7 @@ pub(crate) const MAX_SAFE_INT: u64 = 9_007_199_254_740_991;
 /// A verified operations caller. Private fields; on this host the listener
 /// that alone produces one never binds, so no caller can be admitted.
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeCaller {
+pub struct RuntimeCaller {
     runtime_id: String,
     agent_uid: String,
     session_binding: String,
@@ -22,8 +22,51 @@ pub(crate) struct RuntimeCaller {
 }
 
 impl RuntimeCaller {
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn registered(
+        runtime_id: String,
+        agent_uid: String,
+        session_binding: String,
+        runtime_generation: u64,
+        os_uid: u32,
+        peer_pid: u32,
+        peer_starttime: u64,
+    ) -> Self {
+        Self::registered_impl(
+            runtime_id,
+            agent_uid,
+            session_binding,
+            runtime_generation,
+            os_uid,
+            peer_pid,
+            peer_starttime,
+        )
+    }
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     #[allow(dead_code)]
     pub(crate) fn registered(
+        runtime_id: String,
+        agent_uid: String,
+        session_binding: String,
+        runtime_generation: u64,
+        os_uid: u32,
+        peer_pid: u32,
+        peer_starttime: u64,
+    ) -> Self {
+        Self::registered_impl(
+            runtime_id,
+            agent_uid,
+            session_binding,
+            runtime_generation,
+            os_uid,
+            peer_pid,
+            peer_starttime,
+        )
+    }
+    #[allow(dead_code)]
+    fn registered_impl(
         runtime_id: String,
         agent_uid: String,
         session_binding: String,
@@ -43,25 +86,25 @@ impl RuntimeCaller {
         }
     }
 
-    pub(crate) fn runtime_id(&self) -> &str {
+    pub fn runtime_id(&self) -> &str {
         &self.runtime_id
     }
-    pub(crate) fn agent_uid(&self) -> &str {
+    pub fn agent_uid(&self) -> &str {
         &self.agent_uid
     }
-    pub(crate) fn session_binding(&self) -> &str {
+    pub fn session_binding(&self) -> &str {
         &self.session_binding
     }
-    pub(crate) fn runtime_generation(&self) -> u64 {
+    pub fn runtime_generation(&self) -> u64 {
         self.runtime_generation
     }
-    pub(crate) fn os_uid(&self) -> u32 {
+    pub fn os_uid(&self) -> u32 {
         self.os_uid
     }
-    pub(crate) fn peer_pid(&self) -> u32 {
+    pub fn peer_pid(&self) -> u32 {
         self.peer_pid
     }
-    pub(crate) fn peer_starttime(&self) -> u64 {
+    pub fn peer_starttime(&self) -> u64 {
         self.peer_starttime
     }
 }
@@ -90,27 +133,27 @@ pub mod console {
 pub mod qualified {
     /// The live qualified reader. On this host no reader can be issued, so
     /// every lookup refuses.
-    pub(crate) struct CurrentReader<'a>(std::marker::PhantomData<&'a ()>);
+    pub struct CurrentReader<'a>(std::marker::PhantomData<&'a ()>);
 
     impl CurrentReader<'_> {
-        pub(crate) fn qualified(&self) -> Option<&QualifiedRuntime> {
+        pub fn qualified(&self) -> Option<&QualifiedRuntime> {
             None
         }
 
-        pub(crate) fn require(&self) -> crate::error::Result<&QualifiedRuntime> {
+        pub fn require(&self) -> crate::error::Result<&QualifiedRuntime> {
             Err(crate::error::Error::rejected(
                 "no current qualified runtime — admission refused",
             ))
         }
 
-        pub(crate) fn runtime_id(&self) -> Option<&str> {
+        pub fn runtime_id(&self) -> Option<&str> {
             None
         }
     }
 
     /// A runtime the qualification registry would publish; on this host the
     /// registry never holds one.
-    pub(crate) struct QualifiedRuntime;
+    pub struct QualifiedRuntime;
 }
 
 /// The strict JSON parser is platform-neutral and shared verbatim with the
@@ -119,12 +162,12 @@ pub mod qualified {
 pub mod strict;
 
 pub mod ops {
-    pub(crate) use super::RuntimeCaller;
+    pub use super::RuntimeCaller;
 
     /// The fixed operations method set. On this host the router never
     /// dispatches them; the type exists so shared code compiles.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum OpsMethod {
+    pub enum OpsMethod {
         ConnectionSnapshotV1,
         ConnectionModelQuoteV1,
         ConnectionStageSendV1,
@@ -137,7 +180,7 @@ pub mod ops {
     }
 
     impl OpsMethod {
-        pub(crate) fn as_str(self) -> &'static str {
+        pub fn as_str(self) -> &'static str {
             match self {
                 Self::ConnectionSnapshotV1 => "connection_snapshot_v1",
                 Self::ConnectionModelQuoteV1 => "connection_model_quote_v1",

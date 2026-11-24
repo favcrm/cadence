@@ -335,10 +335,23 @@ fn readable_room(conn: &impl StoreConn, actor: &VerifiedHuman, room: &str) -> Re
 /// The room incarnation and the member's current join boundary. Both are
 /// checked in the same transaction as a scoped history read or marker write.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HumanRoomCursorScope {
+#[doc(hidden)]
+pub struct HumanRoomCursorScope {
     pub(crate) topic: String,
     pub(crate) created: u64,
     pub(crate) cutoff: i64,
+}
+
+impl HumanRoomCursorScope {
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+    pub fn created(&self) -> u64 {
+        self.created
+    }
+    pub fn cutoff(&self) -> i64 {
+        self.cutoff
+    }
 }
 
 fn human_room_cursor_scope_in(
@@ -1096,7 +1109,8 @@ impl Store {
 
     /// Resolve the current room incarnation and join boundary for cursor
     /// binding. This is an authorization check, not a caller-provided scope.
-    pub(crate) fn human_room_cursor_scope(
+    #[doc(hidden)]
+    pub fn human_room_cursor_scope(
         &self,
         actor: &VerifiedHuman,
         room: &str,
@@ -1105,7 +1119,8 @@ impl Store {
     }
 
     /// Read under the same membership and cutoff used to open the cursor.
-    pub(crate) fn human_room_history_scoped(
+    #[doc(hidden)]
+    pub fn human_room_history_scoped(
         &self,
         actor: &VerifiedHuman,
         room: &str,
@@ -1326,12 +1341,8 @@ impl Store {
 
     /// Current membership cutoff for a native agent's private room. A
     /// changed cutoff invalidates cursors from the earlier visible history.
-    pub(crate) fn human_agent_cutoff(
-        &self,
-        org: &str,
-        agent_uid: &str,
-        topic: &str,
-    ) -> Result<i64> {
+    #[doc(hidden)]
+    pub fn human_agent_cutoff(&self, org: &str, agent_uid: &str, topic: &str) -> Result<i64> {
         self.read_tx(|conn| agent_cutoff_in(conn, org, agent_uid, topic))
     }
 
@@ -2358,7 +2369,8 @@ impl Store {
     /// Mark the room read up to `seq`. Monotonic: a lower seq never moves the
     /// marker back. Returns the unread count after the update, counting posts
     /// from others that the actor may see.
-    pub(crate) fn human_room_mark_read(
+    #[doc(hidden)]
+    pub fn human_room_mark_read(
         &self,
         actor: &VerifiedHuman,
         room: &str,

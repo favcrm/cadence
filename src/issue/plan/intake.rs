@@ -268,7 +268,8 @@ impl GoalIntake {
     }
 }
 
-pub(crate) fn scope_digest(front: &Front, body: &str) -> Result<String> {
+#[doc(hidden)]
+pub fn scope_digest(front: &Front, body: &str) -> Result<String> {
     // A claim, assignee or status change is operational, not new work.
     for path in &front.paths {
         areas::check_path(path)?;

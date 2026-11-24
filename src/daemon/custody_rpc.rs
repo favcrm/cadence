@@ -4,6 +4,42 @@ use crate::platform::encrypted_sqlite::{EncryptedVault, ExpectedIdentity, TAG_PR
 use crate::store::{CredentialRecord, Store};
 use std::sync::MutexGuard;
 
+/// The legacy credential for this exact enrollment. This never decrypts a
+/// vault row; encrypted consumers need the separate scoped witness below.
+pub(crate) fn load_credential(
+    store: &Store,
+    custody: &crate::platform::Custody,
+    platform: &str,
+    account: &str,
+) -> Result<Vec<u8>> {
+    if crate::platform::is_builtin(platform, account) {
+        return Ok(Vec::new());
+    }
+    let record = store
+        .platform_credential(platform, account)?
+        .ok_or_else(|| {
+            Error::rejected(format!(
+                "no credential is enrolled for {platform}/{account}"
+            ))
+        })?;
+    let bytes = custody.load(&record.custody, &crate::platform::Key { platform, account })?;
+    if crate::secret::fingerprint(&bytes) != record.fingerprint {
+        return Err(Error::internal(format!(
+            "custody bytes for {platform}/{account} no longer match the recorded \
+             fingerprint — re-enroll or rotate"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// A lane credential may replace only missing enrollment, not a torn write.
+pub(crate) fn credential_enrollment_missing(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Rejected(message) if message.contains("no credential is enrolled")
+    )
+}
+
 // Only these statically audited daemon use sites may request a decrypt.
 #[derive(Clone, Copy)]
 pub(super) enum CustodyUse {
@@ -74,7 +110,62 @@ impl CustodyOperation<'_> {
     }
 }
 
+pub(super) struct DaemonCustody {
+    inner: crate::platform::Custody,
+    vault: Option<std::sync::Arc<EncryptedVault>>,
+}
+
+impl DaemonCustody {
+    pub(super) fn new(
+        inner: crate::platform::Custody,
+        vault: Option<std::sync::Arc<EncryptedVault>>,
+    ) -> Self {
+        Self { inner, vault }
+    }
+
+    pub(super) fn encrypted(&self) -> Option<&std::sync::Arc<EncryptedVault>> {
+        self.vault.as_ref()
+    }
+
+    pub(super) fn load_encrypted(
+        &self,
+        witness: &CustodyWitness<'_>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        self.vault
+            .as_ref()
+            .ok_or_else(|| {
+                Error::invalid(
+                    "unsupported_custody_use",
+                    "this daemon is not configured for encrypted custody",
+                )
+            })?
+            .read_exact(&witness.record().custody, witness.expected())
+    }
+}
+
+impl std::ops::Deref for DaemonCustody {
+    type Target = crate::platform::Custody;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl Shared {
+    pub(super) fn load_credential_witnessed(
+        &self,
+        witness: &CustodyWitness<'_>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        witness.validate(&self.store)?;
+        let bytes = self.platform_custody.load_encrypted(witness)?;
+        if crate::secret::fingerprint(&bytes) != witness.record().fingerprint {
+            return Err(Error::invalid(
+                "integrity_failure",
+                "custody fingerprint mismatch",
+            ));
+        }
+        Ok(bytes)
+    }
     pub(super) fn custody_operation(&self) -> Result<CustodyOperation<'_>> {
         let guard = if self.platform_custody.encrypted().is_some() {
             match self.platform_custody_lock.try_lock() {
@@ -183,11 +274,7 @@ impl Shared {
                     let inspected = (|| -> Result<()> {
                         for record in references {
                             let witness = _operation.witness(CustodyUse::Connections, &record)?;
-                            let _bytes = crate::platform::load_credential_witnessed(
-                                &self.store,
-                                &self.platform_custody,
-                                &witness,
-                            )?;
+                            let _bytes = self.load_credential_witnessed(&witness)?;
                         }
                         Ok(())
                     })();

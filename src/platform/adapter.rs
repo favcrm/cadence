@@ -16,7 +16,7 @@
 //! the same file's executable copy.
 //!
 //! Adapters register per platform name in
-//! [`crate::daemon::ServeOptions::platforms`]; CAD-367 lands
+//! daemon platform registry; CAD-367 lands
 //! Cloudflare's, and CAD-501 registers AgenticOS when the daemon is
 //! hosted. A platform with no registered adapter refuses every call —
 //! the gate fails closed.

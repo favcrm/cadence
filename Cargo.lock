@@ -216,7 +216,6 @@ dependencies = [
  "ammonia",
  "base64",
  "cadence-core",
- "cadence-ui",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
@@ -259,6 +258,7 @@ dependencies = [
  "base64",
  "cadence-agent",
  "cadence-core",
+ "cadence-daemon",
  "cadence-ui",
  "clap",
  "getrandom 0.3.4",
@@ -298,12 +298,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "cadence-daemon"
+version = "0.2.5"
+dependencies = [
+ "base64",
+ "cadence-agent",
+ "cadence-core",
+ "cadence-ui",
+ "chacha20poly1305",
+ "chrono",
+ "chrono-tz",
+ "getrandom 0.3.4",
+ "image",
+ "jsonschema",
+ "libc",
+ "regex",
+ "ring",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "signal-hook",
+ "tempfile",
+ "tiny_http",
+ "tracing",
+ "ureq",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "cadence-ui"
 version = "0.2.5"
 dependencies = [
  "base64",
  "cadence-agent",
  "cadence-core",
+ "cadence-daemon",
  "clap",
  "getrandom 0.3.4",
  "image",

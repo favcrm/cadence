@@ -75,7 +75,8 @@ impl MemberGrant {
         self.state == "active"
     }
 
-    pub(crate) fn has_valid_authorization_epoch(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_valid_authorization_epoch(&self) -> bool {
         self.authorization_epoch.len() == 32
             && self
                 .authorization_epoch

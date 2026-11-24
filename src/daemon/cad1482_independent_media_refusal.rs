@@ -110,7 +110,7 @@ fn square_png() -> Vec<u8> {
 }
 
 fn media_screen(app_dir: &std::path::Path) {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = crate::contract_fixture::workspace_root();
     let src = manifest_dir.join("tests/fixtures/apps/ig-tools-fixture/screens/feed");
     let dst = app_dir.join("screens/media");
     std::fs::create_dir_all(&dst).unwrap();
@@ -298,7 +298,10 @@ impl Fx {
         );
         let mut shared = Shared::new(&state, &opts).unwrap();
         Arc::get_mut(&mut shared).unwrap().platform_custody =
-            Custody::file(dir.path().join("fixture-custody"));
+            crate::daemon::custody_rpc::DaemonCustody::new(
+                Custody::file(dir.path().join("fixture-custody")),
+                None,
+            );
         let token = b"synthetic-cad1482-inspect-token";
         let key = Key {
             platform: agenticos_external::PLATFORM,

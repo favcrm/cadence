@@ -15,7 +15,7 @@ use crate::worktree;
 
 /// The project's declared repo roots, canonicalized and de-duplicated:
 /// two rows naming one checkout are one repo (CAD-2001).
-pub(crate) fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
+pub fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     for path in project.repos.iter().filter_map(|r| r.path.as_deref()) {
         let expanded = project::expand_home(path);
@@ -48,7 +48,8 @@ fn repo_list(project: &project::Project, candidates: &[PathBuf]) -> String {
 /// discovery), then the cwd's repo when it is one of the project's,
 /// then the project's only repo, else refuse naming the candidates.
 /// Returns the main checkout root (linked worktrees resolve to it).
-pub(crate) fn resolve_repo(
+#[doc(hidden)]
+pub fn resolve_repo(
     project: &project::Project,
     flag: Option<&Path>,
     cwd: &Path,
@@ -91,7 +92,8 @@ pub(crate) fn resolve_repo(
 
 /// The ref and commit a new lane is cut from.
 #[derive(Debug)]
-pub(crate) struct ResolvedBase {
+#[doc(hidden)]
+pub struct ResolvedBase {
     pub name: String,
     pub sha: String,
     /// Set when the main checkout's tip is not contained in `sha`.
@@ -103,7 +105,8 @@ pub(crate) struct ResolvedBase {
 /// is `root`. `None` when no row for that checkout configures one. Two
 /// rows for the same checkout that name different bases are refused: the
 /// lane base must never depend on which row is read first (CAD-2001).
-pub(crate) fn configured_integration<'a>(
+#[doc(hidden)]
+pub fn configured_integration<'a>(
     project: &'a project::Project,
     root: &Path,
 ) -> Result<Option<&'a str>> {
@@ -156,7 +159,8 @@ pub(crate) fn configured_integration<'a>(
 /// When the checkout's tip is not contained in the integration commit,
 /// the lane is still cut from that commit and [`ResolvedBase::warning`]
 /// names the mismatch.
-pub(crate) fn resolve_base(
+#[doc(hidden)]
+pub fn resolve_base(
     root: &Path,
     flag: Option<&str>,
     configured: Option<&str>,
@@ -416,7 +420,8 @@ pub(super) fn branch_base(root: &Path, branch: &str, fallback: &str) -> String {
 
 /// Prove the original branch base from a surviving creation reflog entry.
 /// Never substitute the branch tip when creation history is unavailable.
-pub(crate) fn intake_branch_creation_base(root: &Path, branch: &str) -> Result<String> {
+#[doc(hidden)]
+pub fn intake_branch_creation_base(root: &Path, branch: &str) -> Result<String> {
     let unavailable = || {
         Error::invalid(
             "plan_evidence_stale",

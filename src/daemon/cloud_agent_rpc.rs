@@ -20,6 +20,13 @@ use crate::cloud_agent::{
 use crate::remote_cli::RemoteTarget;
 use crate::store::cloud_agent::{CloudSource, SOURCE_PEER, SOURCE_USER};
 
+fn sender_from_caller(caller: &AgentCaller) -> Sender {
+    match caller {
+        AgentCaller::Operator => Sender::Operator,
+        AgentCaller::Agent(alias) => Sender::Agent(alias.clone()),
+    }
+}
+
 fn allow(params: &Value, keys: &[&str], verb: &str) -> Result<()> {
     let object = params
         .as_object()
@@ -724,10 +731,10 @@ impl Shared {
         verb: &str,
     ) -> Result<(Sender, Source)> {
         let caller = self.agent_caller(peer_pid, verb)?;
-        if matches!(&caller, crate::peer::AgentCaller::Agent(_)) {
+        if matches!(&caller, AgentCaller::Agent(_)) {
             self.cloud_peer_isolation(peer_pid)?;
         }
-        let sender = Sender::from_caller(&caller);
+        let sender = sender_from_caller(&caller);
         let target = Self::cloud_agent_target(agent);
         let source = sender.source_for(&self.store, &target)?;
         Ok((sender, source))
@@ -834,10 +841,7 @@ impl Shared {
                 || (registered.is_none() && self.store.alias_has_cloud_content(alias)?)
             {
                 // Missing cloud authority never supplies caller authority.
-                if matches!(
-                    self.agent_caller(peer_pid, verb)?,
-                    crate::peer::AgentCaller::Agent(_)
-                ) {
+                if matches!(self.agent_caller(peer_pid, verb)?, AgentCaller::Agent(_)) {
                     self.cloud_peer_isolation(peer_pid)?;
                 }
                 let (derived, ordinary) = self.store.cloud_projection_rows(alias, message_id)?;
@@ -998,10 +1002,8 @@ impl Shared {
             return Ok(CloudProjection::derived_rows(rows, ordinary, None, false));
         }
         let (viewer, operator) = match self.agent_caller(peer_pid, "cloud read")? {
-            crate::peer::AgentCaller::Operator => (None, true),
-            crate::peer::AgentCaller::Agent(caller) => {
-                (Some(self.store.agent(&caller)?.uid), false)
-            }
+            AgentCaller::Operator => (None, true),
+            AgentCaller::Agent(caller) => (Some(self.store.agent(&caller)?.uid), false),
         };
         // Delivery eligibility comes first: unrelated readers keep ordinary
         // mail without attempting cloud access. Each eligible origin below
@@ -1355,7 +1357,7 @@ impl Shared {
             "cloud_agent_list" => {
                 allow(params, &[], method)?;
                 let caller = self.agent_caller(peer_pid, "cloud agent list")?;
-                let sender = Sender::from_caller(&caller);
+                let sender = sender_from_caller(&caller);
                 let mut views = Vec::new();
                 for agent in self.store.cloud_agents()? {
                     let target = Self::cloud_agent_target(&agent);

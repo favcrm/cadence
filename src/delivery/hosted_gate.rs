@@ -2,7 +2,7 @@
 //! hosted org, with no local daemon.
 //!
 //! `cadence delivery requirements` runs the daemon's own classifier
-//! ([`crate::daemon::classify_from`]) in this process. Only its inputs
+//! ([`crate::daemon::delivery_classifier::classify_from`]) in this process. Only its inputs
 //! move: the ticket's project comes from the hosted `issue_show`, the
 //! PROJECT.md text, recorded delivery approval and declared remotes from
 //! the hosted `delivery_policy`, and the PR from the caller's `gh` exactly
@@ -35,7 +35,7 @@
 use serde_json::{json, Map, Value};
 use std::time::{Duration, Instant};
 
-use crate::daemon::{classify_from, GhRead, RequirementInputs};
+use crate::daemon::delivery_classifier::{classify_from, GhRead, RequirementInputs};
 use crate::error::{Error, Result};
 use crate::issue::delivery_policy;
 use crate::remote_cli::{RemoteAnswer, RemoteTarget};

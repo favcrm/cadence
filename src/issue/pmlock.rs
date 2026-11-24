@@ -494,6 +494,21 @@ pub(super) fn has_pathspec_magic(s: &str) -> bool {
 }
 
 impl PmLock {
+    /// Refuse a guard acquired for a different tracker before touching files.
+    pub(super) fn check_tracker(&self, pm: &Pm) -> Result<()> {
+        let held = self
+            .legacy
+            .parent()
+            .and_then(|path| path.canonicalize().ok());
+        let requested = pm.dir.canonicalize().ok();
+        if held.is_none() || held != requested {
+            return Err(Error::rejected(
+                "tracker lock belongs to a different tracker",
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse a commit that leaves this lock's scope: outside the
     /// declared paths, or overlapping the crashed writer's leftovers.
     /// `Full` locks admit everything (the unscoped behavior). Called

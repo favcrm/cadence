@@ -609,7 +609,7 @@ fn rpc_deadline_frame_on(
 /// `Ok(false)` is the spent deadline — the caller reports it; a real
 /// readiness (data, hangup, error) is `Ok(true)` and the next syscall
 /// surfaces which. EINTR recomputes the remaining time and waits on.
-pub(crate) fn poll_deadline(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<bool> {
+pub fn poll_deadline(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<bool> {
     loop {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
             return Ok(false);
@@ -890,7 +890,7 @@ fn connect_on(fd: RawFd, socket: &Path, deadline: Instant) -> Result<()> {
 /// matching what std's UnixStream does on every unix target that has
 /// the flag; the BSD targets without it get SO_NOSIGPIPE at socket
 /// setup instead ([`no_sigpipe`]).
-pub(crate) fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+pub fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> Result<()> {
     // MSG_NOSIGNAL where send(2) supports it (every unix target here
     // except Apple); 0 on Apple where SO_NOSIGPIPE on the socket
     // already did the work.

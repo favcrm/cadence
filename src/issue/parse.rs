@@ -283,7 +283,8 @@ fn checklist_rows(
 }
 
 /// The full approved checklist section, including Markdown qualifiers.
-pub(crate) fn acceptance_scope(body: &str) -> Option<&str> {
+#[doc(hidden)]
+pub fn acceptance_scope(body: &str) -> Option<&str> {
     match acceptance_sections(body).as_slice() {
         [section] => Some(&body[section.heading_end..section.end]),
         _ => None,
@@ -348,7 +349,7 @@ fn update_checkmarks(
 /// Split a canonical task body into its prose and complete criteria without
 /// duplicating the criteria in the provider payload. Keep every other line,
 /// including Acceptance preambles, continuations and fenced examples.
-pub(crate) fn task_request(mut body: String) -> (String, Vec<AcceptanceItem>) {
+pub fn task_request(mut body: String) -> (String, Vec<AcceptanceItem>) {
     let mut removed = Vec::new();
     let mut items = Vec::new();
     for (line, text, checked) in acceptance_lines(&body) {

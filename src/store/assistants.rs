@@ -110,14 +110,16 @@ pub struct AssistRequest {
     pub created: f64,
 }
 
-pub(crate) enum PrivateJobReader<'a> {
+#[doc(hidden)]
+pub enum PrivateJobReader<'a> {
     User { org: &'a str, sub: &'a str },
     Agent(&'a str),
     Unproven,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct PrivateJobDenials {
+#[doc(hidden)]
+pub struct PrivateJobDenials {
     pub jobs: std::collections::BTreeSet<String>,
     pub tasks: std::collections::BTreeSet<String>,
     /// Issue-only messages cannot prove they are unrelated to these jobs.
@@ -127,7 +129,8 @@ pub(crate) struct PrivateJobDenials {
 }
 
 impl PrivateJobDenials {
-    pub(crate) fn hides_message(&self, message: &super::Message) -> bool {
+    #[doc(hidden)]
+    pub fn hides_message(&self, message: &super::Message) -> bool {
         match message.task_id.as_deref() {
             Some(task) => self.tasks.contains(task),
             None => message
@@ -1114,7 +1117,8 @@ impl Store {
     /// listed: a request that crashed before its ledger bind or before
     /// `completed=1` never appears in the owner's job list while it is
     /// still pending, so this projection agrees with the read denials.
-    pub(crate) fn assist_member_jobs_scoped(
+    #[doc(hidden)]
+    pub fn assist_member_jobs_scoped(
         &self,
         org: &str,
         sub: &str,
@@ -1149,7 +1153,8 @@ impl Store {
     /// job. A pre-queue legacy job without any queue row keeps its unique
     /// ledger owner. `assist_request_owns` stays raw provenance for the
     /// promotion/recovery path.
-    pub(crate) fn assist_job_owner(&self, job: &str) -> Result<Option<(String, String)>> {
+    #[doc(hidden)]
+    pub fn assist_job_owner(&self, job: &str) -> Result<Option<(String, String)>> {
         let conn = self.conn();
         let provenance = Self::PRIVATE_PROVENANCE_CTE;
         let mut stmt = conn.prepare(&format!(
@@ -1185,10 +1190,8 @@ impl Store {
     /// revokes the task-assignee exception too: a half-promoted job must not
     /// reveal its tasks. The operator never reaches this query, so it stays
     /// recoverable.
-    pub(crate) fn private_job_denials(
-        &self,
-        reader: PrivateJobReader<'_>,
-    ) -> Result<PrivateJobDenials> {
+    #[doc(hidden)]
+    pub fn private_job_denials(&self, reader: PrivateJobReader<'_>) -> Result<PrivateJobDenials> {
         let conn = self.conn();
         self.private_job_denials_in(&conn, reader)
     }
@@ -1300,7 +1303,8 @@ impl Store {
     /// before the ledger bind is still provably member-owned. A delivery
     /// reader must treat `true` as member-private and fail closed; this API
     /// never infers provenance from an id prefix. DB errors propagate.
-    pub(crate) fn assist_job_has_request(&self, job: &str) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn assist_job_has_request(&self, job: &str) -> Result<bool> {
         let conn = self.conn();
         conn.query_row(
             "SELECT EXISTS(
@@ -1453,10 +1457,8 @@ impl Store {
     /// committed against a different request. `completed=1` is not
     /// required for admission; only the effects of a still-unfinished
     /// request may proceed.
-    pub(crate) fn assist_queue_promotion_unambiguous(
-        &self,
-        record: &AssistRequestQueued,
-    ) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn assist_queue_promotion_unambiguous(&self, record: &AssistRequestQueued) -> Result<bool> {
         if record.planned_job_id.is_empty() {
             return Ok(false);
         }

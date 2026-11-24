@@ -63,15 +63,17 @@ impl Custody {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn file(dir: PathBuf) -> Self {
+    #[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
+    #[cfg_attr(not(test), doc(hidden))]
+    pub fn file(dir: PathBuf) -> Self {
         Self {
             legacy: LegacyBackend::File(dir),
             vault: None,
         }
     }
 
-    pub(crate) fn with_encrypted(mut self, vault: Arc<EncryptedVault>) -> Self {
+    #[doc(hidden)]
+    pub fn with_encrypted(mut self, vault: Arc<EncryptedVault>) -> Self {
         self.vault = Some(vault);
         self
     }
@@ -85,9 +87,6 @@ impl Custody {
         }
     }
 
-    pub(crate) fn encrypted(&self) -> Option<&Arc<EncryptedVault>> {
-        self.vault.as_ref()
-    }
     /// Store legacy bytes atomically. Configured encrypted custody admits
     /// new writes only through its private enrollment path.
     pub fn put(&self, key: &Key, bytes: &[u8]) -> Result<&'static str> {
@@ -97,11 +96,6 @@ impl Custody {
                 "encrypted custody records are written by the enrollment path only",
             ));
         }
-        self.put_legacy(key, bytes)
-    }
-
-    /// Existing-legacy mutation only; new configured enrollments never call this.
-    pub(crate) fn put_legacy(&self, key: &Key, bytes: &[u8]) -> Result<&'static str> {
         match &self.legacy {
             LegacyBackend::File(dir) => {
                 file_put(dir, key, bytes)?;
@@ -172,27 +166,6 @@ impl Custody {
             ))),
             (other, _) => Err(Error::internal(format!("unknown custody tag '{other}'"))),
         }
-    }
-
-    /// The one authorized encrypted read: the caller presents the
-    /// scoped [`Witness`](crate::platform::CustodyWitness) minted by
-    /// the management/SMTP admission path, plus the expected core
-    /// identity bound into AAD. Both stored and expected identity must
-    /// match — a substituted locator never yields another record's
-    /// bytes.
-    pub(crate) fn load_encrypted(
-        &self,
-        witness: &crate::platform::CustodyWitness<'_>,
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
-        self.vault
-            .as_ref()
-            .ok_or_else(|| {
-                Error::invalid(
-                    "unsupported_custody_use",
-                    "this daemon is not configured for encrypted custody",
-                )
-            })?
-            .read_exact(&witness.record().custody, witness.expected())
     }
 
     /// Drop `key`'s bytes from the `tag` backend. Idempotent — a

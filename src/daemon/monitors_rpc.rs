@@ -41,13 +41,9 @@ use serde_json::{json, Value};
 
 use super::identity::{scope_allows_issue, ProjectScope, PublicReadPrincipal};
 use super::job_events_opaque;
+pub(crate) use super::monitor_scope::MONITOR_READER_SCOPE_ACK;
 use super::scoped_cursor::{CursorBinding, CursorDirection, ScopedCursorCodec};
 use super::*;
-
-/// The exact value of [`READER_SCOPE_FIELD`] on a scoped monitor reply: the
-/// daemon understood the relayed reader proof and applied the reader boundary
-/// to this answer. Bump the suffix when this changes.
-pub(crate) const MONITOR_READER_SCOPE_ACK: &str = "cad2215.monitor-read.opaque.v1";
 
 const ALERTS_DOMAIN: &str = "monitor-alerts";
 const ACK_DOMAIN: &str = "monitor-alert-ack";
@@ -150,12 +146,126 @@ impl ScopedMonitorAck<'_> {
         if let Some(hook) = &shared.monitor_ack_writer_hook {
             hook();
         }
-        let out = shared
-            .store
-            .ack_scoped_monitor_alert(&mut slots, &scope, &self)?;
+        let out = self.ack_scoped(&shared.store, &mut slots, &scope)?;
         drop(slots);
         drop(tracker);
         Ok(out)
+    }
+
+    /// Check native authority and mutate the exact alert in one fenced write.
+    /// The caller holds the tracker and slots guards, in that order. Rendering
+    /// stays inside the transaction so a cursor error rolls the mutation back.
+    fn ack_scoped(
+        &self,
+        store: &store::Store,
+        slots: &mut crate::slots::Slots,
+        scope: &Option<ProjectScope>,
+    ) -> Result<Value> {
+        let changed =
+            || Error::rejected("monitor alert acknowledgement refused: reader access changed");
+        let evidence = &self.identity;
+        if evidence.alias != self.by {
+            return Err(changed());
+        }
+        let asserted = crate::test_seam::asserted();
+        let fetch_panes = asserted.is_none();
+        if let Some(asserted) = asserted {
+            match asserted {
+                crate::test_seam::Asserted::Agent(alias) if alias == evidence.alias => {}
+                _ => return Err(changed()),
+            }
+        }
+        store.ack_scoped_monitor_alert(
+            &evidence.alias,
+            self.monitor_id,
+            self.seq,
+            self.by,
+            fetch_panes,
+            |pane_rows| {
+                let Some(pane_rows) = pane_rows else {
+                    return Ok(None);
+                };
+                if let Some((pid, start)) = evidence.pane {
+                    let current = pane_rows
+                        .iter()
+                        .find(|row| row.0 == evidence.alias)
+                        .map(|row| (row.1, row.2));
+                    if current != Some((pid, start)) {
+                        return Err(changed());
+                    }
+                }
+                let recorded = crate::peer::AgentPids::classify(pane_rows);
+                recorded
+                    .refuse_unproven_on(&evidence.chain)
+                    .map_err(|why| {
+                        Error::rejected(format!("monitor alert acknowledgement refused: {why}"))
+                    })?;
+                let panes = recorded.live();
+                let current =
+                    Shared::slot_identity_from(evidence.peer_pid, &evidence.chain, &panes, slots)
+                        .map_err(|_| changed())?
+                        .ok_or_else(changed)?;
+                if current.lane() != evidence.alias {
+                    return Err(changed());
+                }
+                match (&evidence.slot, &current) {
+                    (
+                        super::identity::SlotWho::Pane { .. },
+                        super::identity::SlotWho::Pane { .. },
+                    ) => Ok(None),
+                    (
+                        super::identity::SlotWho::Strict(before),
+                        super::identity::SlotWho::Strict(now),
+                    ) => {
+                        if before.enrollment_id != now.enrollment_id {
+                            return Err(changed());
+                        }
+                        let enrollment = slots
+                            .endpoint_enrollment(&now.enrollment_id)
+                            .cloned()
+                            .ok_or_else(changed)?;
+                        Ok(Some(enrollment))
+                    }
+                    _ => Err(changed()),
+                }
+            },
+            |agent, strict_enrollment| {
+                if let Some(enrollment) = strict_enrollment {
+                    if enrollment.owner_actor != evidence.alias
+                        || super::identity::owner_generation(agent).as_deref()
+                            != Some(enrollment.owner_generation.as_str())
+                        || agent.pid != Some(i64::from(enrollment.root.pid))
+                        || agent.pid_start.and_then(|start| u64::try_from(start).ok())
+                            != Some(enrollment.root.starttime)
+                    {
+                        return Err(changed());
+                    }
+                }
+                if agent.uid != evidence.uid {
+                    return Err(changed());
+                }
+                Ok(())
+            },
+            |current, denied| {
+                if monitor_resource(&current.monitor) != self.resource {
+                    return Err(Error::rejected(
+                        "monitor alert acknowledgement refused: monitor identity changed",
+                    ));
+                }
+                if !monitor_visible(scope, denied, &current.coverage) {
+                    return Err(Error::rejected(
+                        "monitor alert acknowledgement refused: reader access changed",
+                    ));
+                }
+                Ok(())
+            },
+            |alert| {
+                let row = scoped_alert_json(&self.codec, &self.principal, &self.resource, alert)?;
+                let mut out = json!({"alert": row});
+                out[READER_SCOPE_FIELD] = json!(MONITOR_READER_SCOPE_ACK);
+                Ok(out)
+            },
+        )
     }
 }
 
@@ -360,132 +470,6 @@ fn scoped_alert_page(
     });
     page[READER_SCOPE_FIELD] = json!(MONITOR_READER_SCOPE_ACK);
     Ok(page)
-}
-
-impl store::Store {
-    /// Re-run the native identity decision inside the acknowledgement write
-    /// transaction. `slots` is held by the caller; this helper must not call
-    /// `agent_caller`, `slot_identity`, `revalidate_enrollments` or any store
-    /// accessor that reacquires the store/slots mutex.
-    fn revalidate_monitor_ack_in(
-        &self,
-        tx: &impl crate::store::StoreConn,
-        slots: &mut crate::slots::Slots,
-        evidence: &MonitorAckIdentity,
-        by: &str,
-    ) -> Result<()> {
-        let changed =
-            || Error::rejected("monitor alert acknowledgement refused: reader access changed");
-        if evidence.alias != by {
-            return Err(changed());
-        }
-        if let Some(asserted) = crate::test_seam::asserted() {
-            match asserted {
-                crate::test_seam::Asserted::Agent(alias) if alias == evidence.alias => {}
-                _ => return Err(changed()),
-            }
-        } else {
-            let pane_rows = self.pty_pane_pids_in(tx)?;
-            if let Some((pid, start)) = evidence.pane {
-                let current = pane_rows
-                    .iter()
-                    .find(|row| row.0 == evidence.alias)
-                    .map(|row| (row.1, row.2));
-                if current != Some((pid, start)) {
-                    return Err(changed());
-                }
-            }
-            let recorded = crate::peer::AgentPids::classify(pane_rows);
-            recorded
-                .refuse_unproven_on(&evidence.chain)
-                .map_err(|why| {
-                    Error::rejected(format!("monitor alert acknowledgement refused: {why}"))
-                })?;
-            let panes = recorded.live();
-            let current =
-                Shared::slot_identity_from(evidence.peer_pid, &evidence.chain, &panes, slots)
-                    .map_err(|_| changed())?
-                    .ok_or_else(changed)?;
-            if current.lane() != evidence.alias {
-                return Err(changed());
-            }
-            match (&evidence.slot, &current) {
-                (super::identity::SlotWho::Pane { .. }, super::identity::SlotWho::Pane { .. }) => {}
-                (
-                    super::identity::SlotWho::Strict(before),
-                    super::identity::SlotWho::Strict(now),
-                ) => {
-                    if before.enrollment_id != now.enrollment_id {
-                        return Err(changed());
-                    }
-                    let enrollment = slots
-                        .endpoint_enrollment(&now.enrollment_id)
-                        .cloned()
-                        .ok_or_else(changed)?;
-                    let agent = self.agent_in(tx, &evidence.alias)?;
-                    if enrollment.owner_actor != evidence.alias
-                        || super::identity::owner_generation(&agent).as_deref()
-                            != Some(enrollment.owner_generation.as_str())
-                        || agent.pid != Some(i64::from(enrollment.root.pid))
-                        || agent.pid_start.and_then(|start| u64::try_from(start).ok())
-                            != Some(enrollment.root.starttime)
-                    {
-                        return Err(changed());
-                    }
-                }
-                _ => return Err(changed()),
-            }
-        }
-        let agent = self.agent_in(tx, &evidence.alias)?;
-        if agent.uid != evidence.uid {
-            return Err(changed());
-        }
-        Ok(())
-    }
-
-    /// Check native authority and mutate the exact alert in one fenced write.
-    /// The caller holds the tracker and slots guards, in that order. Rendering
-    /// stays inside the transaction so a cursor error rolls the mutation back.
-    fn ack_scoped_monitor_alert(
-        &self,
-        slots: &mut crate::slots::Slots,
-        scope: &Option<ProjectScope>,
-        ack: &ScopedMonitorAck<'_>,
-    ) -> Result<Value> {
-        self.write_tx(|tx| {
-            self.revalidate_monitor_ack_in(&*tx, slots, &ack.identity, ack.by)?;
-            let current = self.project_monitor_view_in(&*tx, ack.monitor_id)?;
-            if monitor_resource(&current.monitor) != ack.resource {
-                return Err(Error::rejected(
-                    "monitor alert acknowledgement refused: monitor identity changed",
-                ));
-            }
-            let denied = self.private_job_denials_in(
-                &*tx,
-                store::PrivateJobReader::Agent(&ack.identity.alias),
-            )?;
-            if !monitor_visible(scope, &denied, &current.coverage) {
-                return Err(Error::rejected(
-                    "monitor alert acknowledgement refused: reader access changed",
-                ));
-            }
-            let alert = self.monitor_alert_in(&*tx, ack.seq)?;
-            if !current
-                .coverage
-                .iter()
-                .any(|(task, _)| task == &alert.task_id)
-            {
-                return Err(Error::rejected(
-                    "monitor alert acknowledgement refused: alert is outside current coverage",
-                ));
-            }
-            let alert = self.ack_monitor_alert_in(&*tx, ack.monitor_id, ack.seq, ack.by)?;
-            let row = scoped_alert_json(&ack.codec, &ack.principal, &ack.resource, &alert)?;
-            let mut out = json!({"alert": row});
-            out[READER_SCOPE_FIELD] = json!(MONITOR_READER_SCOPE_ACK);
-            Ok(out)
-        })
-    }
 }
 
 impl Shared {

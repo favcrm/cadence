@@ -206,7 +206,7 @@ pub(super) fn title_kind_and_result(title: &str, issue: &str) -> (&'static str, 
 /// AOS-473: the document says `origin:"local"`. The merge gate counts a
 /// hosted document by attested principal and an unmarked one as local, so
 /// the marker is what keeps these notes under today's rule.
-pub(crate) fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
+pub fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
     let read = std::fs::read_dir(dir).map_err(|e| {
         Error::rejected(format!("cannot read the notes dir {}: {e}", dir.display()))
     })?;

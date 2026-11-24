@@ -472,7 +472,8 @@ impl Store {
     /// CAD-1123 HP4: the intent a host-minted request id already froze in
     /// this install, if any — so a retried or double-tapped publish start
     /// resumes the same intent instead of minting a second one.
-    pub(crate) fn social_publish_find_request(
+    #[doc(hidden)]
+    pub fn social_publish_find_request(
         &self,
         install_id: &str,
         request_id: &str,
@@ -499,7 +500,8 @@ impl Store {
     /// CAD-1123 HP4: the artifact a run's independent reviewer approved —
     /// the one the publish material re-proves. Ordered like the material's
     /// own review lookup, so both name the same artifact.
-    pub(crate) fn app_run_approved_artifact(&self, run_id: &str) -> Result<String> {
+    #[doc(hidden)]
+    pub fn app_run_approved_artifact(&self, run_id: &str) -> Result<String> {
         self.conn()
             .query_row(
                 "SELECT artifact_id FROM app_run_reviews WHERE run_id=? AND decision='approve' ORDER BY step_id LIMIT 1",
@@ -596,7 +598,8 @@ impl Store {
     /// Peek the oldest due queued intent without claiming. The dispatch
     /// RPC uses it to compare operator-supplied current authority against
     /// frozen before claiming; the claim itself re-verifies in-transaction.
-    pub(crate) fn social_publish_peek_due(&self, now_epoch: i64) -> Result<Option<Value>> {
+    #[doc(hidden)]
+    pub fn social_publish_peek_due(&self, now_epoch: i64) -> Result<Option<Value>> {
         self.read_tx(|conn| {
 
                     let next: Option<String> = conn
@@ -612,7 +615,8 @@ impl Store {
     /// CAD-1020: one page of the driver's due rows — up to `limit` due
     /// queued intents, oldest first, after the `(due_epoch, intent_id)`
     /// keyset `after`. A read only; each row is still claimed by identity.
-    pub(crate) fn social_publish_due_batch(
+    #[doc(hidden)]
+    pub fn social_publish_due_batch(
         &self,
         now_epoch: i64,
         limit: usize,
@@ -634,7 +638,8 @@ impl Store {
     /// CAD-1020: `processing` rows for the driver's status reconcile, as
     /// `(intent_id, request, updated)`. `after` is a rotating cursor, so a
     /// bounded sweep reaches every row over successive ticks.
-    pub(crate) fn social_publish_processing(
+    #[doc(hidden)]
+    pub fn social_publish_processing(
         &self,
         limit: usize,
         after: Option<&str>,
@@ -656,7 +661,8 @@ impl Store {
     /// review itself) and requires artifact/asset digests to equal frozen.
     /// Any failure returns false: hold for a new human decision.
     /// Explicit-mode intents return true; operator recheck owns them.
-    pub(crate) fn social_publish_material_current(&self, intent_id: &str) -> Result<bool> {
+    #[doc(hidden)]
+    pub fn social_publish_material_current(&self, intent_id: &str) -> Result<bool> {
         let shown = read_row(&self.conn(), intent_id)?;
         let frozen = &shown["intent"]["frozen"];
         let artifact = frozen["artifact_id"].as_str();
@@ -691,11 +697,8 @@ impl Store {
     /// caller proves current authority through `eligible` (grant, binding,
     /// app/context eligibility and unchanged digests at dispatch): a false
     /// verdict leaves the row queued. Exactly one claimant wins.
-    pub(crate) fn social_publish_claim_due<F>(
-        &self,
-        now_epoch: i64,
-        eligible: F,
-    ) -> Result<Option<Value>>
+    #[doc(hidden)]
+    pub fn social_publish_claim_due<F>(&self, now_epoch: i64, eligible: F) -> Result<Option<Value>>
     where
         F: FnOnce(&super::WriteTxn<'_>, &str, &Value) -> Result<bool>,
     {
@@ -743,7 +746,8 @@ impl Store {
     /// the row only when it belongs to exactly this install and context
     /// (null-preserving, the CAD-1027 cancel predicate). Send-now reads
     /// through it so an out-of-scope request refuses before staging.
-    pub(crate) fn social_publish_show_scoped(
+    #[doc(hidden)]
+    pub fn social_publish_show_scoped(
         &self,
         intent_id: &str,
         install_id: &str,
@@ -774,7 +778,8 @@ impl Store {
     /// claimant wins and a wrong scope never claims; a second click, a
     /// racing `claim_due` or a cancel reads a non-queued row and yields
     /// `None`.
-    pub(crate) fn social_publish_claim_id(
+    #[doc(hidden)]
+    pub fn social_publish_claim_id(
         &self,
         intent_id: &str,
         install_id: &str,

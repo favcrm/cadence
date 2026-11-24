@@ -4,8 +4,10 @@ use super::*;
 use crate::memory::{self, policy, IdentityProof, NativeIdentity};
 
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "memory_rpc/cad2662_refusal_acceptance.rs"]
 mod cad2662_refusal_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "memory_rpc/cad2662_tests.rs"]
 mod cad2662_tests;
 
 impl Shared {

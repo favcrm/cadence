@@ -39,10 +39,10 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use super::caller_rule::AgentCaller;
 use super::{required_str, Shared, DAEMON_ALIAS};
 use crate::error::{Error, Result};
 use crate::issue::{task_report, write};
-use crate::peer::AgentCaller;
 use crate::proto;
 
 /// Answer bytes a message carries to a pty pane (one pasted line under

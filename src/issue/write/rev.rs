@@ -66,7 +66,7 @@ pub(super) fn commit_message(
 /// stay inside the lock's admitted paths (see
 /// [`Pm::commit_scoped`]). Callers that took
 /// [`Pm::lock_for_paths`](Pm::lock_for_paths) commit through here.
-pub(crate) fn commit_scoped(
+pub fn commit_scoped(
     pm: &Pm,
     lock: &PmLock,
     paths: &[PathBuf],

@@ -896,5 +896,6 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
+#[path = "slots_rpc/unregistered_tests.rs"]
 mod unregistered_tests;

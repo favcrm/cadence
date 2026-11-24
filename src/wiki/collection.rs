@@ -43,7 +43,7 @@ pub(super) struct Meta {
     pub(super) documents: Vec<Doc>,
 }
 
-pub(crate) fn get(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str) -> Result<Value> {
+pub fn get(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str) -> Result<Value> {
     // A collection's metadata names its documents; the store's project gate
     // decides before that metadata is assembled, not after.
     super::admitted_for_export(pm, caller, path)?;
@@ -53,7 +53,8 @@ pub(crate) fn get(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str) -> Res
     state_value(pm, state_dir, caller, &root, &meta, rev)
 }
 
-pub(crate) fn put(
+#[doc(hidden)]
+pub fn put(
     pm: &Pm,
     state_dir: &Path,
     caller: &Caller,

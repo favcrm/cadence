@@ -16,12 +16,20 @@ pub mod agenticos_web;
 pub mod connections;
 pub mod custody;
 pub mod deployments;
-pub(crate) mod encrypted_config;
+#[doc(hidden)]
+pub mod encrypted_config;
 mod encrypted_fs;
 /// CAD-2215: the fixed owner-selected path-only scoped-cursor keyring
 /// record. `pub(crate)` — no platform/custody surface re-exports it.
 pub(crate) mod scoped_cursor_config;
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[doc(hidden)]
+pub use encrypted_fs::Directories as ControlledDirectories;
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) use encrypted_fs::Directories as ControlledDirectories;
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[doc(hidden)]
+pub use scoped_cursor_config::fixture_codec as fixture_scoped_cursor_codec;
 /// CAD-1128: the encrypted-SQLite custody vault. `pub(crate)` — the
 /// manager and its key material are daemon-internal; no public
 /// platform/custody re-export exposes them.
@@ -37,6 +45,96 @@ pub use adapter::{
     AppArtifactError, AppCapabilityError, ConnectedRead, ImageFailure, ImageReason, ImageSettle,
     PlatformAdapter,
 };
+
+/// Adapter registry used by both the daemon and in-process composition.
+pub type PlatformMap = std::collections::HashMap<String, std::sync::Arc<dyn PlatformAdapter>>;
+
+pub trait PlatformRegistry {
+    fn platforms_mut(&mut self) -> &mut PlatformMap;
+}
+
+impl PlatformRegistry for PlatformMap {
+    fn platforms_mut(&mut self) -> &mut PlatformMap {
+        self
+    }
+}
+
+/// Local registration also pins the directory served by the daemon.
+pub trait LocalRegistry: PlatformRegistry {
+    fn outbox_dir_mut(&mut self) -> &mut Option<std::path::PathBuf>;
+}
+
+/// Borrowed startup composition; none of these fields are copied.
+pub struct AttachView<'a> {
+    pub platforms: &'a mut PlatformMap,
+    pub provider_deployments: &'a mut Option<deployments::DeploymentMetadata>,
+    pub hosted_email: &'a mut Option<hosted_email::HostedEmail>,
+    pub hosted_whatsapp: &'a mut Option<hosted_whatsapp::HostedWhatsapp>,
+    pub smtp_internal: &'a mut Option<smtp_internal::SmtpInternal>,
+    pub social_publish_sender:
+        &'a mut Option<std::sync::Arc<dyn agenticos_external::publish::PublishSender>>,
+    pub social_media_importer:
+        &'a mut Option<std::sync::Arc<agenticos_external::media_import::MediaImporter>>,
+    pub social_media_resolver:
+        &'a mut Option<std::sync::Arc<agenticos_external::media_import::MediaResolver>>,
+}
+
+impl PlatformRegistry for AttachView<'_> {
+    fn platforms_mut(&mut self) -> &mut PlatformMap {
+        self.platforms
+    }
+}
+
+pub trait PlatformComposition: PlatformRegistry {
+    fn attach_view(&mut self) -> AttachView<'_>;
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestComposition {
+    pub platforms: PlatformMap,
+    pub outbox_dir: Option<std::path::PathBuf>,
+    pub provider_deployments: Option<deployments::DeploymentMetadata>,
+    pub hosted_email: Option<hosted_email::HostedEmail>,
+    pub hosted_whatsapp: Option<hosted_whatsapp::HostedWhatsapp>,
+    pub smtp_internal: Option<smtp_internal::SmtpInternal>,
+    pub social_publish_sender:
+        Option<std::sync::Arc<dyn agenticos_external::publish::PublishSender>>,
+    pub social_media_importer:
+        Option<std::sync::Arc<agenticos_external::media_import::MediaImporter>>,
+    pub social_media_resolver:
+        Option<std::sync::Arc<agenticos_external::media_import::MediaResolver>>,
+}
+
+#[cfg(test)]
+impl PlatformRegistry for TestComposition {
+    fn platforms_mut(&mut self) -> &mut PlatformMap {
+        &mut self.platforms
+    }
+}
+
+#[cfg(test)]
+impl LocalRegistry for TestComposition {
+    fn outbox_dir_mut(&mut self) -> &mut Option<std::path::PathBuf> {
+        &mut self.outbox_dir
+    }
+}
+
+#[cfg(test)]
+impl PlatformComposition for TestComposition {
+    fn attach_view(&mut self) -> AttachView<'_> {
+        AttachView {
+            platforms: &mut self.platforms,
+            provider_deployments: &mut self.provider_deployments,
+            hosted_email: &mut self.hosted_email,
+            hosted_whatsapp: &mut self.hosted_whatsapp,
+            smtp_internal: &mut self.smtp_internal,
+            social_publish_sender: &mut self.social_publish_sender,
+            social_media_importer: &mut self.social_media_importer,
+            social_media_resolver: &mut self.social_media_resolver,
+        }
+    }
+}
 
 /// One reviewed adapter tool, as registered at daemon startup.
 #[derive(Clone, Debug)]
@@ -161,8 +259,6 @@ use crate::store::{Grant, Store};
 
 #[doc(hidden)]
 pub use custody::{Custody, Key};
-
-pub(crate) use crate::daemon::custody_rpc::CustodyWitness;
 
 pub struct OpDeadline {
     end: std::time::Instant,
@@ -677,75 +773,6 @@ pub fn require_grant(
     }
 }
 
-/// The credential bytes for `(platform, account)` — the only path
-/// that ever reads custody. The effect gate calls it inside a grant
-/// check (never from an RPC handler), and it verifies the bytes still
-/// match the recorded fingerprint so a custody/record tear (a crash
-/// between the custody write and the record write at rotate) refuses
-/// instead of proxying stale bytes.
-/// Missing enrollment is the only custody result a lane credential may
-/// replace. Fingerprint and custody tears stay their own errors.
-pub(crate) fn credential_enrollment_missing(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::Rejected(message) if message.contains("no credential is enrolled")
-    )
-}
-
-/// Refuses encrypted custody records. Supported consumers require a fresh
-/// `CustodyWitness` and `load_credential_witnessed`.
-pub(crate) fn load_credential(
-    store: &Store,
-    custody: &Custody,
-    platform: &str,
-    account: &str,
-) -> Result<Vec<u8>> {
-    // The built-in account holds no bytes — there is nothing to load
-    // and nothing to leak (CAD-577). The gate still runs its grant
-    // check before this is ever reached.
-    if is_builtin(platform, account) {
-        return Ok(Vec::new());
-    }
-    let record = store
-        .platform_credential(platform, account)?
-        .ok_or_else(|| {
-            Error::rejected(format!(
-                "no credential is enrolled for {platform}/{account}"
-            ))
-        })?;
-    let bytes = custody.load(&record.custody, &Key { platform, account })?;
-    if crate::secret::fingerprint(&bytes) != record.fingerprint {
-        return Err(Error::internal(format!(
-            "custody bytes for {platform}/{account} no longer match the recorded \
-             fingerprint — re-enroll or rotate"
-        )));
-    }
-    Ok(bytes)
-}
-
-/// The witnessed encrypted read — the ONLY way an encrypted record's
-/// bytes leave custody. `expected` carries the live core identity the
-/// caller resolved (connection_id/provider/account/revision/exchange
-/// plus the workspace and the configured key id); `read_exact`
-/// authenticates the stored row against exactly that before any
-/// plaintext returns. The core fingerprint is still checked after
-/// decrypt, so a torn vault/core pair refuses.
-pub(crate) fn load_credential_witnessed(
-    store: &Store,
-    custody: &Custody,
-    witness: &CustodyWitness<'_>,
-) -> Result<zeroize::Zeroizing<Vec<u8>>> {
-    witness.validate(store)?;
-    let bytes = custody.load_encrypted(witness)?;
-    if crate::secret::fingerprint(&bytes) != witness.record().fingerprint {
-        return Err(Error::invalid(
-            "integrity_failure",
-            "custody fingerprint mismatch",
-        ));
-    }
-    Ok(bytes)
-}
-
 /// Belt-and-braces: a serialized result, event payload or error text
 /// must never contain `secret` or a fragment of eight or more characters.
 /// Callers check before the value leaves
@@ -782,7 +809,7 @@ fn carries_credential(secret: &str, text: &str) -> bool {
 /// first would escape the punctuation a raw credential can contain, so
 /// this walks object keys, string values and scalar text directly with
 /// the same whole-secret + eight-character semantics and no exemptions.
-pub(crate) fn refuse_json_leak(what: &str, value: &Value, secret: &[u8]) -> Result<()> {
+pub fn refuse_json_leak(what: &str, value: &Value, secret: &[u8]) -> Result<()> {
     let secret = String::from_utf8_lossy(secret);
     if secret.is_empty() {
         return Ok(());

@@ -448,7 +448,7 @@ pub(crate) fn mark_done_on_merge_waiting_with(
 /// The lock must be scoped to this issue's `issue.md` (see
 /// [`mark_done_on_merge_waiting_with`]); an unscoped `Full` guard commits as
 /// before, but its acquisition is refused beside any interrupted leftovers.
-pub(crate) fn mark_done_on_merge_locked(
+pub fn mark_done_on_merge_locked(
     pm: &Pm,
     lock: &PmLock,
     id: &str,
@@ -456,9 +456,12 @@ pub(crate) fn mark_done_on_merge_locked(
     actor: &str,
     expect: Option<&str>,
 ) -> std::result::Result<Option<String>, DoneWriteFailure> {
+    lock.check_tracker(pm)
+        .map_err(|error| DoneWriteFailure { error, from: None })?;
     let mut from = None;
     let result = (|| -> Result<Option<String>> {
         let (_project, dir) = issue_dir(pm, id)?;
+        pm.check_lock_paths(lock, &[dir.join("issue.md")])?;
         let (mut front, body) = load_front(&dir)?;
         from = Some(front.status.clone());
         if matches!(front.status.as_str(), "done" | "dropped")

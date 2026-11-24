@@ -429,7 +429,7 @@ impl Shared {
             super::job_events_opaque::read_as_principal(&self.store, actor, verb)?
         } else {
             match self.agent_caller(peer_pid, verb)? {
-                crate::peer::AgentCaller::Agent(alias) => {
+                super::caller_rule::AgentCaller::Agent(alias) => {
                     let agent = self.store.agent(&alias).map_err(|_| {
                         Error::rejected(format!(
                             "{verb} refused: the caller's registration is unavailable"
@@ -437,7 +437,7 @@ impl Shared {
                     })?;
                     super::job_events_opaque::agent_principal(&agent.uid)
                 }
-                crate::peer::AgentCaller::Operator => {
+                super::caller_rule::AgentCaller::Operator => {
                     return Ok(VerifiedAgentEventReader {
                         scope: None,
                         relayed,

@@ -646,4 +646,5 @@ pub(crate) fn from_host_stdin() -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "installer_client/tests.rs"]
 mod tests;

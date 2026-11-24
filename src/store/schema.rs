@@ -203,7 +203,8 @@ impl Store {
     /// schema guards as `open_adopting`; only the recovery sweep is
     /// skipped, so pending runner, CRM, image and nudge rows stay inert.
     /// The outcome is the default: nothing was fenced, adopted or claimed.
-    pub(crate) fn open_unrecovered(path: &Path) -> Result<(Self, RecoveryOutcome)> {
+    #[doc(hidden)]
+    pub fn open_unrecovered(path: &Path) -> Result<(Self, RecoveryOutcome)> {
         let (store, _) = Self::open_inner(path, None, true, false, super::seal::OpenMode::Legacy)?;
         Ok((store, RecoveryOutcome::default()))
     }
@@ -212,7 +213,8 @@ impl Store {
     /// guards as `open_adopting`, but NO recovery sweep. The daemon installs
     /// the external checkpoint transport and validates the external floor
     /// before it runs [`Self::run_guarded_recover`] explicitly.
-    pub(crate) fn open_unrecovered_mode(
+    #[doc(hidden)]
+    pub fn open_unrecovered_mode(
         path: &Path,
         mode: super::seal::OpenMode,
     ) -> Result<(Self, RecoveryOutcome)> {
@@ -225,7 +227,8 @@ impl Store {
     /// head BEFORE reporting success. A missing/lost acknowledgement fences
     /// further protected admission and answers `outcome_unknown`; the sweep is
     /// never rerun.
-    pub(crate) fn run_guarded_recover(
+    #[doc(hidden)]
+    pub fn run_guarded_recover(
         &self,
         marker: Option<&ConsumedMarker>,
         owner_epoch: cadence_core::connection_dispatch::primitives::Revision,

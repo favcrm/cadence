@@ -1474,11 +1474,11 @@ fn require_same_aliases<T>(aliases: &[String], pairs: &[(String, T)]) -> Result<
 /// a mistyped `--older-than 1h` is otherwise unrecoverable.
 fn require_gc_floor(secs: Option<f64>, force: bool) -> Result<()> {
     if let Some(secs) = secs {
-        if secs < cadence_agent::daemon::AGENT_GC_FLOOR_SECS as f64 && !force {
+        if secs < cadence_daemon::AGENT_GC_FLOOR_SECS as f64 && !force {
             return Err(Error::rejected(format!(
                 "agent gc --older-than {secs}s is below the 7-day floor ({}s) — \
                  pass --force to sweep younger rows",
-                cadence_agent::daemon::AGENT_GC_FLOOR_SECS
+                cadence_daemon::AGENT_GC_FLOOR_SECS
             )));
         }
     }

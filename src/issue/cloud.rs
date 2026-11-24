@@ -50,7 +50,8 @@ const MAX_POLLS: u32 = 720;
 
 /// One logical cloud branch. Older starts could record the same ref twice;
 /// different branches or a host branch do not establish a sandbox lane.
-pub(crate) fn open_lane_branch(front: &model::Front) -> Result<Option<&str>> {
+#[doc(hidden)]
+pub fn open_lane_branch(front: &model::Front) -> Result<Option<&str>> {
     let mut branches = front
         .refs
         .iter()
@@ -446,7 +447,8 @@ pub fn run_dispatch(
     Ok(())
 }
 
-pub(crate) fn fail_message(store: &Store, message: &Message, error: &Error) {
+#[doc(hidden)]
+pub fn fail_message(store: &Store, message: &Message, error: &Error) {
     let error_text = error.to_string();
     let result = json!({
         "status": "failed",

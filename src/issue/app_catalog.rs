@@ -610,7 +610,7 @@ pub(crate) const PENDING_INSTALL: &str = "app_install_pending";
 pub(crate) const PENDING_PUBLICATION: &str = "app_catalog_publication_pending";
 pub(crate) const CATALOG_NOT_CURRENT: &str = "app_catalog_not_current";
 pub(crate) const RECORD_CHANGED: &str = "app_record_changed_during_inspection";
-pub(crate) const ADMISSION_CHANGED: &str = "app_changed_during_runtime_admission";
+pub const ADMISSION_CHANGED: &str = "app_changed_during_runtime_admission";
 pub(crate) const LEGACY_CHANGED: &str = "app_legacy_files_changed_during_read";
 
 fn no_pending(root: &Root) -> Result<()> {

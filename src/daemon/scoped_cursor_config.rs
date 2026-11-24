@@ -2,8 +2,7 @@
 //! scoped-cursor codec.
 //!
 //! The keyring record is fixed at `<state-dir>/scoped-cursors.json` and is
-//! read and proven for every handler access through
-//! [`super::Shared::scoped_cursor_codec`], so a changed record, workspace or
+//! read and proven for every daemon handler access, so a changed record, workspace or
 //! keyring is never silently accepted. Nothing here generates keys, repairs
 //! a ring or falls back to an empty codec: a missing record,
 //! `connection_metadata.cursor_keyring_fingerprint = NULL`, unreadable
@@ -23,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::platform::scoped_cursor_config as record;
 use crate::store::{CursorKeyringInit, Store};
 
-pub(super) fn unavailable() -> Error {
+pub fn unavailable() -> Error {
     Error::invalid(
         "scoped_cursor_unavailable",
         "scoped cursor keyring unavailable",
@@ -32,7 +31,7 @@ pub(super) fn unavailable() -> Error {
 
 /// Load the fixed record, bind it to `workspace`, and prove the persisted
 /// fingerprint. This never initializes: an unbound store refuses.
-pub(crate) fn load_codec(
+pub fn load_codec(
     state_dir: &Path,
     tracker_root: &Path,
     store: &Store,
@@ -57,7 +56,7 @@ pub(crate) fn load_codec(
 
 /// The explicit `scoped_cursor_initialize` body: the operator answer names
 /// whether the NULL fingerprint was bound or an identical value confirmed.
-pub(crate) fn initialize(state_dir: &Path, tracker_root: &Path, store: &Store) -> Result<Value> {
+pub fn initialize(state_dir: &Path, tracker_root: &Path, store: &Store) -> Result<Value> {
     let (workspace, _) = store.cursor_keyring_metadata().map_err(|_| unavailable())?;
     let material = record::load(state_dir, Some(tracker_root))
         .map_err(|_| unavailable())?

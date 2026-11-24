@@ -81,7 +81,10 @@ impl Fx {
                 })
                 .unwrap();
         }
-        let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+        let source = format!(
+            "{}/tests/fixtures/apps/crm",
+            crate::contract_fixture::workspace_root().display()
+        );
         let mut fx = Self {
             _dir: dir,
             shared,

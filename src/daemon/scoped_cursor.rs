@@ -37,7 +37,7 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 /// AEAD key length in bytes.
-pub(crate) const KEY_BYTES: usize = 32;
+pub const KEY_BYTES: usize = 32;
 /// Key id length in bytes. Ids are public selectors, not secrets.
 pub(crate) const KEY_ID_BYTES: usize = 16;
 /// Canonical unpadded base64 length of a full 32-byte MAC.
@@ -99,7 +99,7 @@ const AAD_BYTES: usize = ENVELOPE_AAD_DOMAIN.len() + 1 + KEY_ID_BYTES + NONCE_BY
 /// One generic rejection for invalid material and every authentication or
 /// bounds failure. It deliberately carries no token, key, field or position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CursorError;
+pub struct CursorError;
 
 impl fmt::Display for CursorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -183,7 +183,7 @@ impl fmt::Debug for CursorKeyring {
 /// Page direction bound into the cursor. Forward and backward cursors are
 /// never interchangeable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CursorDirection {
+pub enum CursorDirection {
     Forward,
     Backward,
 }
@@ -201,7 +201,7 @@ impl CursorDirection {
 /// workspace namespace is injected from the codec, never from this struct,
 /// so a token cannot be replayed across workspaces.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct CursorBinding<'a> {
+pub struct CursorBinding<'a> {
     /// Domain/purpose, e.g. `thread`, `message-list`, `jobs`. Never a
     /// human label; it is an exact contract term.
     pub domain: &'a str,
@@ -216,7 +216,7 @@ pub(crate) struct CursorBinding<'a> {
 }
 
 /// A fixed-length, defensively copied cursor codec.
-pub(crate) struct ScopedCursorCodec {
+pub struct ScopedCursorCodec {
     workspace: String,
     keys: Vec<CursorKey>,
     active_key_id: CursorKeyId,
@@ -275,20 +275,36 @@ impl ScopedCursorCodec {
         })
     }
 
+    /// Build an isolated test codec without loading any configured key material.
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub fn fixture_with_keys(
+        workspace: &str,
+        entries: impl IntoIterator<Item = ([u8; KEY_ID_BYTES], [u8; KEY_BYTES])>,
+        active: [u8; KEY_ID_BYTES],
+        identity: &[u8; KEY_BYTES],
+    ) -> Result<Self, CursorError> {
+        let mut ring = CursorKeyring::new();
+        for (id, key) in entries {
+            ring.insert_key(CursorKeyId(id), &key)?;
+        }
+        Self::new(workspace, ring, CursorKeyId(active), identity)
+    }
+
     /// A keyed, domain-separated fingerprint of the workspace namespace, the
     /// identity key and every retained key id plus key bytes. It deliberately
     /// excludes the active key id, so switching the active key among the same
     /// retained set keeps the persisted check and old cursors valid. Adding,
     /// removing or substituting key material changes it and must fail closed
     /// until an explicitly approved transition. It reveals no key material.
-    pub(crate) fn keyring_fingerprint(&self) -> &str {
+    pub fn keyring_fingerprint(&self) -> &str {
         &self.keyring_fingerprint
     }
 
     /// Constant-time comparison against persisted metadata. A mismatch is
     /// the same generic refusal; the codec does not initialize or repair a
     /// ring.
-    pub(crate) fn verify_keyring_fingerprint(&self, expected: &str) -> Result<(), CursorError> {
+    pub fn verify_keyring_fingerprint(&self, expected: &str) -> Result<(), CursorError> {
         if constant_time_slices_equal(expected.as_bytes(), self.keyring_fingerprint.as_bytes()) {
             Ok(())
         } else {
@@ -298,11 +314,7 @@ impl ScopedCursorCodec {
 
     /// Seal one nonnegative position under exactly this binding using the
     /// active key and a fresh OS-CSPRNG nonce.
-    pub(crate) fn seal(
-        &self,
-        position: i64,
-        binding: &CursorBinding<'_>,
-    ) -> Result<String, CursorError> {
+    pub fn seal(&self, position: i64, binding: &CursorBinding<'_>) -> Result<String, CursorError> {
         if position < 0 {
             return Err(CursorError);
         }
@@ -334,11 +346,7 @@ impl ScopedCursorCodec {
     /// Open a cursor under exactly one binding. Any tamper, another key,
     /// domain, direction, filter, resource, principal or workspace, or a
     /// negative/out-of-range position is the same generic refusal.
-    pub(crate) fn open(
-        &self,
-        token: &str,
-        binding: &CursorBinding<'_>,
-    ) -> Result<i64, CursorError> {
+    pub fn open(&self, token: &str, binding: &CursorBinding<'_>) -> Result<i64, CursorError> {
         let binding_digest = self.binding_digest(binding)?;
         let mut envelope = [0u8; ENVELOPE_BYTES];
         decode_envelope(token, &mut envelope)?;
@@ -377,7 +385,7 @@ impl ScopedCursorCodec {
     /// creates a new namespace and therefore new identifiers even when the
     /// identity key is reused. The result is `csrid_` plus canonical
     /// URL_SAFE_NO_PAD base64 of the full 32-byte HMAC.
-    pub(crate) fn stable_row_id(
+    pub fn stable_row_id(
         &self,
         domain: &str,
         resource: &str,
@@ -412,7 +420,7 @@ impl ScopedCursorCodec {
     ///
     /// [`seal`]: Self::seal
     /// [`open`]: Self::open
-    pub(crate) fn validate_binding(&self, binding: &CursorBinding<'_>) -> Result<(), CursorError> {
+    pub fn validate_binding(&self, binding: &CursorBinding<'_>) -> Result<(), CursorError> {
         self.binding_digest(binding).map(|_| ())
     }
 

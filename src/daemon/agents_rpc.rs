@@ -1396,11 +1396,11 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
         verb: &str,
-    ) -> Result<(String, crate::peer::AgentCaller)> {
+    ) -> Result<(String, super::caller_rule::AgentCaller)> {
         reject_identity_fields(params, verb)?;
         let caller = self.agent_caller(peer_pid, verb)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        if let crate::peer::AgentCaller::Agent(agent) = &caller {
+        if let super::caller_rule::AgentCaller::Agent(agent) = &caller {
             if agent != &alias {
                 return Err(Error::rejected(format!(
                     "{verb} refused: an agent may access only its own inbox"
@@ -1425,8 +1425,8 @@ impl Shared {
     pub(super) fn rpc_inbox(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let (alias, caller) = self.inbox_caller(params, peer_pid, "agent_inbox")?;
         let agent_uid = match &caller {
-            crate::peer::AgentCaller::Agent(_) => Some(self.store.agent(&alias)?.uid),
-            crate::peer::AgentCaller::Operator => None,
+            super::caller_rule::AgentCaller::Agent(_) => Some(self.store.agent(&alias)?.uid),
+            super::caller_rule::AgentCaller::Operator => None,
         };
         let reprove = || -> Result<()> {
             let changed = || Error::rejected("agent_inbox refused: caller identity changed");
@@ -1507,13 +1507,13 @@ impl Shared {
     pub(super) fn rpc_inbox_ack(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let (alias, who) = self.inbox_caller(params, peer_pid, "agent_inbox_ack")?;
         let by = match &who {
-            crate::peer::AgentCaller::Agent(caller) => caller.clone(),
-            crate::peer::AgentCaller::Operator => "operator".to_string(),
+            super::caller_rule::AgentCaller::Agent(caller) => caller.clone(),
+            super::caller_rule::AgentCaller::Operator => "operator".to_string(),
         };
         let reader = inbox_reader(params)?;
         // Reset redelivers queued messages, so it requires the operator.
         if params.get("reset").and_then(Value::as_bool) == Some(true) {
-            if !matches!(who, crate::peer::AgentCaller::Operator) {
+            if !matches!(who, super::caller_rule::AgentCaller::Operator) {
                 return Err(Error::rejected(
                     "agent_inbox_ack --reset refused: resetting a reader cursor is \
                      an operator action — run it from an operator shell outside \
@@ -1981,7 +1981,7 @@ impl Shared {
         // `agent stop` is the explicit kill. For a live agent the
         // actor's own close() already ran, so this is a no-op for it.
         if agent.endpoint_kind == "pty" {
-            adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env, self.agent_uid);
+            pty_kill::kill_pane(&self.state_dir, &alias, &self.provider_env, self.agent_uid);
         }
         match pane_tree {
             Some(Ok(Some(root))) => {

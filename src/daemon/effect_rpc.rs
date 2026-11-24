@@ -1368,10 +1368,13 @@ mod platform_call_floor_tests;
 mod claims_revoke;
 
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "effect_rpc/boundary_floor_tests.rs"]
 mod boundary_floor_tests;
 
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "effect_rpc/cad1128_execute_claim_tests.rs"]
 mod cad1128_execute_claim_tests;
 
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "effect_rpc/cad1128_reason_claim_tests.rs"]
 mod cad1128_reason_claim_tests;

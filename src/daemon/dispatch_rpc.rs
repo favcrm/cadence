@@ -30,10 +30,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::caller_rule::{may_mutate_agent, AgentCaller, AgentMutation};
 use super::{optional_str, reject_identity_fields, required_str, Shared};
 use crate::error::{Error, Result};
 use crate::issue::{self, claim};
-use crate::peer::{may_mutate_agent, AgentCaller, AgentMutation};
 use crate::store;
 
 impl Shared {
@@ -458,40 +458,7 @@ impl Shared {
         project: &issue::project::Project,
         front: &issue::model::Front,
     ) -> Result<PathBuf> {
-        let repos = issue::start::declared_repos(project);
-        let mut lanes: Vec<PathBuf> = Vec::new();
-        for cand in issue::start::open_worktrees(front) {
-            let dir = cand.canonicalize().unwrap_or(cand.clone());
-            let Ok(root) = crate::worktree::main_root(&dir) else {
-                continue;
-            };
-            if !repos.contains(&root) {
-                continue;
-            }
-            let wt_root = crate::worktree::layout::worktrees_dir(&root)
-                .canonicalize()
-                .unwrap_or_else(|_| crate::worktree::layout::worktrees_dir(&root));
-            if dir.starts_with(&wt_root) {
-                lanes.push(dir);
-            }
-        }
-        lanes.sort();
-        lanes.dedup();
-        match lanes.len() {
-            1 => Ok(lanes.remove(0)),
-            0 => Err(Error::rejected(format!(
-                "{verb}: {} has no open lane the daemon can verify — a dispatch \
-                 kickoff binds the worktree `issue start` recorded; none of its \
-                 open worktree refs is a live worktree of the project's repos",
-                front.id
-            ))),
-            n => Err(Error::rejected(format!(
-                "{verb}: {} has {n} open lane refs the daemon can verify — \
-                 which one a kickoff binds is ambiguous; close the stale \
-                 lanes first",
-                front.id
-            ))),
-        }
+        issue::dispatch::dispatch_lane(verb, project, front)
     }
 }
 

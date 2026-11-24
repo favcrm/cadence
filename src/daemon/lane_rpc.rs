@@ -17,10 +17,10 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
+use super::caller_rule::AgentCaller;
 use super::{reject_identity_fields, required_str, Shared};
 use crate::error::{Error, Result};
 use crate::issue::{self, claim};
-use crate::peer::AgentCaller;
 
 const VERB: &str = "lane";
 

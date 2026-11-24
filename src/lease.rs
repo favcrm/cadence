@@ -114,6 +114,17 @@ pub fn acquire(state_dir: &Path, hosted: &Hosted) -> Result<Option<Arc<LeaseCtl>
     acquire_with_endpoint(state_dir, hosted, None)
 }
 
+/// Test seam for a loopback renewal endpoint; production acquisition uses the
+/// configured, validated host endpoint through [`acquire`].
+#[cfg(all(feature = "test-seam", debug_assertions))]
+pub fn acquire_with_test_endpoint(
+    state_dir: &Path,
+    hosted: &Hosted,
+    endpoint_override: Option<&str>,
+) -> Result<Option<Arc<LeaseCtl>>> {
+    acquire_with_endpoint(state_dir, hosted, endpoint_override)
+}
+
 /// [`acquire`] with a test-only HTTP endpoint override (CAD-702): when
 /// the configured spec is HTTP and `endpoint_override` is `Some`, the
 /// renewal transport dials it instead of `lease.internal` — a loopback
@@ -520,7 +531,7 @@ fn transient_lease_error(message: impl Into<String>) -> Error {
 
 /// Whether a renewal failure is a retryable blip inside the local
 /// deadline rather than lease loss.
-pub(crate) fn is_transient_lease_error(error: &Error) -> bool {
+pub fn is_transient_lease_error(error: &Error) -> bool {
     matches!(error, Error::Rejected(message) if message.starts_with(TRANSIENT_PREFIX))
 }
 

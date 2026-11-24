@@ -40,7 +40,11 @@ const PDF_MIME: &str = "application/pdf";
 const JSON_MIME: &str = "application/json";
 
 /// Hosted structured extraction of one reference file.
-pub fn intake(file_name: &str, bytes: &[u8]) -> Result<Intake> {
+pub fn intake(
+    _admission: &crate::platform::deployments::HostedBusinessDocumentsAdmission,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<Intake> {
     // Refuse an unsafe name before any upload, exactly as native intake does.
     check_reference_name(file_name)?;
     if bytes.len() > BYTES_CAP {
@@ -71,12 +75,20 @@ pub fn intake(file_name: &str, bytes: &[u8]) -> Result<Intake> {
 }
 
 /// Hosted render of a retained draft template with its draft context.
-pub fn export(template_docx: &[u8], context: &Value) -> Result<Exported> {
+pub fn export(
+    _admission: &crate::platform::deployments::HostedBusinessDocumentsAdmission,
+    template_docx: &[u8],
+    context: &Value,
+) -> Result<Exported> {
     render(template_docx, context, false)
 }
 
 /// Hosted labelled sample render of an approved version.
-pub fn export_sample(template_docx: &[u8], context: &Value) -> Result<Exported> {
+pub fn export_sample(
+    _admission: &crate::platform::deployments::HostedBusinessDocumentsAdmission,
+    template_docx: &[u8],
+    context: &Value,
+) -> Result<Exported> {
     render(template_docx, context, true)
 }
 

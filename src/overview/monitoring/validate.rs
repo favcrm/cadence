@@ -7,7 +7,7 @@
 use cadence_core::board_api::{MONITOR_CURSOR_FORMAT, READER_SCOPE_FIELD};
 use serde_json::Value;
 
-use crate::daemon::monitors_rpc::MONITOR_READER_SCOPE_ACK;
+use crate::daemon::monitor_scope::MONITOR_READER_SCOPE_ACK;
 
 /// Validate the stable fields emitted by `monitor_list` before projecting any
 /// rows. A partially readable response is not a valid empty registration:

@@ -79,19 +79,21 @@ pub(super) fn kickoff_body(
 /// [`parse_acceptance_listing`] reads it back exactly. Quoting escapes
 /// every control character and U+2028/U+2029, so the result can ride a
 /// single-line pty kickoff without losing them.
-pub(crate) fn acceptance_listing(items: &[AcceptanceItem]) -> Option<String> {
+pub fn acceptance_listing(items: &[AcceptanceItem]) -> Option<String> {
     (!items.is_empty()).then(|| inline_listing(items))
 }
 
 /// Render the approved Markdown as one anchored, unambiguous scope.
-pub(crate) fn intake_acceptance(scope: &str) -> Result<String> {
+#[doc(hidden)]
+pub fn intake_acceptance(scope: &str) -> Result<String> {
     let scope = serde_json::to_string(scope).map_err(|e| Error::internal(e.to_string()))?;
     Ok(format!(
         "Approved issue acceptance Markdown (including qualifiers): {scope}"
     ))
 }
 
-pub(crate) fn with_independent_acceptance(
+#[doc(hidden)]
+pub fn with_independent_acceptance(
     mut rendered: String,
     independent: Option<&str>,
 ) -> Result<String> {
@@ -106,7 +108,8 @@ pub(crate) fn with_independent_acceptance(
 
 /// The CAD-300 listing of `items` at any length —
 /// `1) [ ] "a"; 2) [x] "b"`, numbered from 1.
-pub(crate) fn inline_listing(items: &[AcceptanceItem]) -> String {
+#[doc(hidden)]
+pub fn inline_listing(items: &[AcceptanceItem]) -> String {
     items
         .iter()
         .enumerate()
@@ -121,7 +124,8 @@ pub(crate) fn inline_listing(items: &[AcceptanceItem]) -> String {
 /// CAD-160: the still-unchecked criteria in a task's stored
 /// acceptance. A whole CAD-300 listing yields its `[ ]` items; any
 /// other non-blank text (a free-form `--accept`) is one unchecked item.
-pub(crate) fn outstanding_items(acceptance: Option<&str>) -> Vec<AcceptanceItem> {
+#[doc(hidden)]
+pub fn outstanding_items(acceptance: Option<&str>) -> Vec<AcceptanceItem> {
     let Some(text) = acceptance.map(str::trim).filter(|t| !t.is_empty()) else {
         return vec![];
     };

@@ -16,47 +16,88 @@
 // wakeups, constants, RPC dispatch and test suites stay here; actor
 // execution lives in src/daemon/actor.rs.
 
+use cadence_agent::daemon::{
+    app_team_state, delivery_classifier, monitor_scope, screen_frame, social_effect_id,
+};
+
+#[path = "daemon/activity_rpc.rs"]
 mod activity_rpc;
+#[path = "daemon/actor.rs"]
 mod actor;
+#[path = "daemon/agent_wait.rs"]
 mod agent_wait;
+#[path = "daemon/agents_rpc.rs"]
 mod agents_rpc;
+#[path = "daemon/answer_rpc.rs"]
 mod answer_rpc;
+#[path = "daemon/app_assistant_rpc.rs"]
 mod app_assistant_rpc;
+#[path = "daemon/app_assistant_social.rs"]
 mod app_assistant_social;
+#[path = "daemon/app_audiences_rpc.rs"]
 mod app_audiences_rpc;
+#[path = "daemon/app_bindings_rpc.rs"]
 mod app_bindings_rpc;
+#[path = "daemon/app_capabilities_rpc.rs"]
 mod app_capabilities_rpc;
+#[path = "daemon/app_chat_rpc.rs"]
 mod app_chat_rpc;
+#[path = "daemon/app_content_rpc.rs"]
 mod app_content_rpc;
+#[path = "daemon/app_contexts_rpc.rs"]
 mod app_contexts_rpc;
+#[path = "daemon/app_effects_rpc.rs"]
 pub(crate) mod app_effects_rpc;
+#[path = "daemon/app_explorer_rpc.rs"]
 mod app_explorer_rpc;
+#[path = "daemon/app_image_jobs.rs"]
 mod app_image_jobs;
+#[path = "daemon/app_media_rpc.rs"]
 mod app_media_rpc;
+#[path = "daemon/app_record_actions_rpc.rs"]
 mod app_record_actions_rpc;
+#[path = "daemon/app_works_rpc.rs"]
 mod app_works_rpc;
+#[path = "daemon/hosted_assignments.rs"]
 mod hosted_assignments;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
+#[path = "daemon/app_calendar_query.rs"]
 mod app_calendar_query;
+#[path = "daemon/app_records_rpc.rs"]
 mod app_records_rpc;
+#[path = "daemon/app_routines_list.rs"]
 mod app_routines_list;
+#[path = "daemon/app_runs_rpc.rs"]
 mod app_runs_rpc;
+#[path = "daemon/app_screen_services_rpc.rs"]
 mod app_screen_services_rpc;
 #[cfg(feature = "test-seam")]
+#[path = "daemon/test_events.rs"]
 pub mod test_events;
 
+#[path = "daemon/app_screens_rpc.rs"]
 mod app_screens_rpc;
+#[path = "daemon/app_social_drafts_rpc.rs"]
 mod app_social_drafts_rpc;
+#[path = "daemon/app_teams_rpc.rs"]
 pub(crate) mod app_teams_rpc;
+#[path = "daemon/app_tools_rpc.rs"]
 mod app_tools_rpc;
+#[path = "daemon/approvals_rpc.rs"]
 mod approvals_rpc;
+#[path = "daemon/area_rpc.rs"]
 mod area_rpc;
+#[path = "daemon/business_templates_rpc.rs"]
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "daemon/cad811_installed_crm_qa_fixture.rs"]
 mod cad811_installed_crm_qa_fixture;
+#[path = "daemon/company_zone_rpc.rs"]
 mod company_zone_rpc;
+#[path = "daemon/delivery_envelope.rs"]
 mod delivery_envelope;
+#[path = "daemon/routines_rpc.rs"]
 mod routines_rpc;
 
 use delivery_envelope::{
@@ -144,108 +185,161 @@ fn archive_expected_revs(params: &Value) -> Result<Vec<(String, i64)>> {
     Ok(out)
 }
 
+#[path = "daemon/artifacts_rpc.rs"]
 mod artifacts_rpc;
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "daemon/cad1482_independent_media_refusal.rs"]
 mod cad1482_independent_media_refusal;
+#[path = "daemon/caller_rule.rs"]
 mod caller_rule;
+#[path = "daemon/chat_files_rpc.rs"]
 mod chat_files_rpc;
+#[path = "daemon/checkup.rs"]
 mod checkup;
+#[path = "daemon/cli_rpc.rs"]
 mod cli_rpc;
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "daemon/wiki_trash_guard_acceptance.rs"]
 mod wiki_trash_guard_acceptance;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "daemon/board_producer_golden.rs"]
 mod board_producer_golden;
 /// CAD-1913: independent adversarial acceptance for planned-path lesson
 /// selection, project isolation and secret non-disclosure at the issue/job
 /// delivery seam. Test-only registration; production carries neither.
 /// CAD-1932: reviewer-owned refusal acceptance for the non-records drawer
 /// parent proof. Test-only registration.
+#[path = "daemon/cloud_agent_rpc.rs"]
 mod cloud_agent_rpc;
+#[path = "daemon/connection_test.rs"]
 mod connection_test;
+#[path = "daemon/connections_rpc.rs"]
 mod connections_rpc;
 #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
+#[path = "daemon/credential_entry_fixture.rs"]
 mod credential_entry_fixture;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "daemon/credential_entry_rpc.rs"]
 mod credential_entry_rpc;
 /// CAD-1128: the `connection_custody_*` operator verbs.
+#[path = "daemon/custody_rpc.rs"]
 pub(crate) mod custody_rpc;
+#[path = "daemon/native_model_turn/mod.rs"]
 pub(crate) mod native_model_turn;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "daemon/protected_connections.rs"]
 pub(crate) mod protected_connections;
 #[cfg(all(feature = "test-seam", target_os = "linux", target_arch = "x86_64"))]
 #[doc(hidden)]
 pub use credential_entry_fixture::configure_credential_entry_fixture;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "daemon/protected_management_rpc.rs"]
 mod protected_management_rpc;
 // the frozen acceptance check and its genuine fixture.
 // Both compile only under `test-seam`; production carries neither.
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "daemon/automatic_upgrade_consent.rs"]
 mod automatic_upgrade_consent;
+#[path = "daemon/bootstrap_files.rs"]
+mod bootstrap_files;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "daemon/cached_return_tests.rs"]
 mod cached_return_tests;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "daemon/cad1128_canary_fx.rs"]
 mod cad1128_canary_fx;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "daemon/campaign_canary_tests.rs"]
 mod campaign_canary_tests;
+#[path = "daemon/conversations_rpc.rs"]
 mod conversations_rpc;
+#[path = "daemon/crm_send_rpc.rs"]
 mod crm_send_rpc;
+#[path = "daemon/crm_smtp_rpc.rs"]
 mod crm_smtp_rpc;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "daemon/custody_acceptance_fixture.rs"]
 pub(crate) mod custody_acceptance_fixture;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "daemon/custody_security_r2.rs"]
 mod custody_security_r2;
+#[path = "daemon/delivery_requirements_rpc.rs"]
 mod delivery_requirements_rpc;
-#[cfg(all(debug_assertions, feature = "test-seam"))]
-pub use delivery_requirements_rpc::queue_authority_acceptance;
-pub(crate) use delivery_requirements_rpc::{classify_from, GhRead, RequirementInputs};
+#[path = "daemon/delivery_rpc.rs"]
 mod delivery_rpc;
+#[path = "daemon/dispatch_rpc.rs"]
 mod dispatch_rpc;
+#[path = "daemon/effect_rpc.rs"]
 mod effect_rpc;
-mod form_rpc;
-mod hire_rpc;
-mod idea_rpc;
-mod identity;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod installer_client;
-pub(crate) mod installer_enrollment_wire;
-mod lane_relaunch;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
-mod bootstrap_files;
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "daemon/endpoints_gate_test.rs"]
 mod endpoints_gate_test;
+#[path = "daemon/endpoints_rpc.rs"]
 mod endpoints_rpc;
+#[path = "daemon/form_rpc.rs"]
+mod form_rpc;
+#[path = "daemon/hire_rpc.rs"]
+mod hire_rpc;
+#[path = "daemon/human_current.rs"]
 mod human_current;
+#[path = "daemon/human_threads_rpc.rs"]
 mod human_threads_rpc;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) mod installer_enrolled;
+#[path = "daemon/idea_rpc.rs"]
+mod idea_rpc;
+#[path = "daemon/identity.rs"]
+mod identity;
 #[doc(hidden)]
+#[path = "daemon/jobs_rpc.rs"]
 pub mod jobs_rpc;
+#[path = "daemon/lane_relaunch.rs"]
+mod lane_relaunch;
+#[path = "daemon/lane_rpc.rs"]
 mod lane_rpc;
+#[path = "daemon/master_rpc.rs"]
 mod master_rpc;
+#[path = "daemon/master_session_rpc.rs"]
 mod master_session_rpc;
+#[path = "daemon/master_status_rpc.rs"]
 mod master_status_rpc;
+#[path = "daemon/master_wake.rs"]
 mod master_wake;
+#[path = "daemon/members_rpc.rs"]
 mod members_rpc;
+#[path = "daemon/memory_rpc.rs"]
 mod memory_rpc;
+#[path = "daemon/messages_rpc.rs"]
 mod messages_rpc;
+#[path = "daemon/models_rpc.rs"]
 mod models_rpc;
+#[path = "daemon/monitors_rpc.rs"]
 pub(crate) mod monitors_rpc;
+#[path = "daemon/needs_rpc.rs"]
 mod needs_rpc;
+#[path = "daemon/next_action.rs"]
 mod next_action;
+#[path = "daemon/notify_driver.rs"]
 mod notify_driver;
+#[path = "daemon/operator_rpc.rs"]
 mod operator_rpc;
+#[path = "daemon/plans_rpc.rs"]
 mod plans_rpc;
+#[path = "daemon/platform_rpc.rs"]
 mod platform_rpc;
+#[path = "daemon/pm_activity_rpc.rs"]
 mod pm_activity_rpc;
+#[path = "daemon/portable_replace_rpc.rs"]
 mod portable_replace_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "daemon/protected_runtime.rs"]
 pub(crate) mod protected_runtime;
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 #[path = "daemon/protected_runtime_stub.rs"]
 pub(crate) mod protected_runtime;
+#[path = "daemon/pty_kill.rs"]
+mod pty_kill;
+#[path = "daemon/public_membership.rs"]
 mod public_membership;
 #[cfg(any(test, feature = "test-seam"))]
 #[doc(hidden)]
@@ -256,26 +350,35 @@ pub use public_membership::MembershipMode as TestMembershipMode;
 #[doc(hidden)]
 pub use public_membership::NativeContext as TestNativeMembershipContext;
 /// CAD-2215: opaque agent-event positions for every non-operator reader.
+#[path = "daemon/agent_events_opaque.rs"]
 mod agent_events_opaque;
 /// CAD-2215: opaque job-event positions for every non-operator reader.
+#[path = "daemon/job_events_opaque.rs"]
 mod job_events_opaque;
+#[path = "daemon/recovery_rpc.rs"]
 mod recovery_rpc;
+#[path = "daemon/requests_rpc.rs"]
 mod requests_rpc;
+#[path = "daemon/review_evidence_rpc.rs"]
 mod review_evidence_rpc;
-/// CAD-2215: the opaque bound-cursor codec (no provisioning here).
-pub(crate) mod scoped_cursor;
-/// CAD-2215: the fixed keyring record and explicit operator initialization.
-mod scoped_cursor_config;
+use cadence_agent::daemon::scoped_cursor;
+use cadence_agent::daemon::scoped_cursor_config;
+#[path = "daemon/serve.rs"]
 mod serve;
+#[path = "daemon/settings_rpc.rs"]
 mod settings_rpc;
+#[path = "daemon/slots_rpc.rs"]
 mod slots_rpc;
+#[path = "daemon/social_connect_rpc.rs"]
 mod social_connect_rpc;
+#[path = "daemon/social_publish_driver.rs"]
 mod social_publish_driver;
+#[path = "daemon/social_publish_rpc.rs"]
 mod social_publish_rpc;
+#[path = "daemon/social_publish_start.rs"]
 mod social_publish_start;
-#[cfg(target_os = "linux")]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) mod supervisor_grant;
+use cadence_agent::daemon::supervisor_grant;
 #[cfg(any(test, feature = "test-seam"))]
 static ASSISTANT_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -324,20 +427,34 @@ pub mod team_assistants_refusal {
 }
 
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "daemon/team_assistants_refusal.rs"]
 pub(crate) mod team_assistants_refusal;
+#[path = "daemon/test_queue_rpc.rs"]
 mod test_queue_rpc;
+#[path = "daemon/thread_search_rpc.rs"]
 mod thread_search_rpc;
+#[path = "daemon/threads_rpc.rs"]
 mod threads_rpc;
+#[path = "daemon/timers.rs"]
 mod timers;
+#[path = "daemon/topics_rpc.rs"]
 mod topics_rpc;
+#[path = "daemon/turn_project.rs"]
 mod turn_project;
+#[path = "daemon/unattended.rs"]
 mod unattended;
+#[path = "daemon/unattended_landing.rs"]
 mod unattended_landing;
+#[path = "daemon/watch.rs"]
 mod watch;
+#[path = "daemon/whatsapp_copilot.rs"]
 mod whatsapp_copilot;
+#[path = "daemon/whatsapp_rpc.rs"]
 mod whatsapp_rpc;
+#[path = "daemon/wiki_rpc.rs"]
 mod wiki_rpc;
 
+use self::caller_rule::{AgentCaller, AgentMutation};
 use crate::adapter;
 use crate::adapter::registry;
 use crate::adapter::ProviderAdapter;
@@ -348,8 +465,6 @@ use crate::client;
 use crate::error::Error;
 use crate::error::Result;
 use crate::peer::unmatched_caller;
-use crate::peer::AgentCaller;
-use crate::peer::AgentMutation;
 use crate::proto;
 use crate::slots::SlotConfig;
 use crate::slots::Slots;
@@ -382,17 +497,13 @@ use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;
 
-/// CAD-339: the daemon methods a master connection may call.
-pub use master_rpc::MASTER_ALLOWED;
-// CAD-1006: the frame-document renderer the board's consume route uses.
-// `pub(crate)` — the UI frame route calls it; unit tests live in the
-// module, not as a public API.
+/// The operator-price refusal predicate shared with the board HTTP server.
 #[doc(hidden)]
 pub use app_capabilities_rpc::operator_price_refusal;
-#[cfg(test)]
-pub(crate) use app_screens_rpc::render_package_frame_html;
+/// CAD-339: the daemon methods a master connection may call.
+pub use master_rpc::MASTER_ALLOWED;
 #[doc(hidden)]
-pub use app_screens_rpc::{
+pub use screen_frame::{
     render_checked_package_frame_html, render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION,
 };
 
@@ -887,7 +998,7 @@ pub struct Shared {
     /// CAD-366: where enrolled platform credential bytes live — the
     /// host's keychain when usable, else the daemon-owned `0600`
     /// store under the state dir (ADR 0006 §5.3).
-    platform_custody: crate::platform::Custody,
+    platform_custody: custody_rpc::DaemonCustody,
     /// CAD-366: serializes a custody write against the record write it
     /// pairs with — concurrent enrolls of one account, or a revoke
     /// racing a put, must never leave a record's fingerprint and the
@@ -1317,13 +1428,9 @@ impl Shared {
         let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
         // A sandbox daemon is its own home; a stale sandbox profile is
         // refused here rather than binding the host's workspace.
-        let upload_workspace_dir =
-            crate::home::workspace_for_provider_env(&wiki_pm_dir, &opts.provider_env)?;
-        crate::home::validate_workspace_isolated(
-            &upload_workspace_dir,
-            state_dir,
-            &opts.provider_env,
-        )?;
+        let (provider_env, upload_workspace_dir) = opts
+            .provider_env
+            .bind_operational_workspace(&wiki_pm_dir, state_dir)?;
         if let Some(config) = &opts.encrypted_custody {
             if config.key_file.starts_with(state_dir)
                 || config.key_file.starts_with(&wiki_pm_dir)
@@ -1359,9 +1466,7 @@ impl Shared {
             store.import_legacy_settings(&wiki_pm_dir)?;
         }
         let store = Arc::new(store);
-        let provider_env = opts
-            .provider_env
-            .with_workspace(upload_workspace_dir.clone())
+        let provider_env = provider_env
             .with_company_master(
                 opts.provider_deployments
                     .as_ref()
@@ -1506,14 +1611,16 @@ impl Shared {
                     },
                 ) as MembershipLookupForTest
             }),
-            platform_custody: match &opts.encrypted_custody {
-                Some(config) => {
-                    crate::platform::Custody::open(state_dir)?.with_encrypted(std::sync::Arc::new(
-                        crate::platform::encrypted_sqlite::EncryptedVault::new(config.clone())?,
-                    ))
-                }
-                None => crate::platform::Custody::open(state_dir)?,
-            },
+            platform_custody: custody_rpc::DaemonCustody::new(
+                crate::platform::Custody::open(state_dir)?,
+                opts.encrypted_custody
+                    .as_ref()
+                    .map(|config| {
+                        crate::platform::encrypted_sqlite::EncryptedVault::new(config.clone())
+                            .map(Arc::new)
+                    })
+                    .transpose()?,
+            ),
             platform_custody_lock: Box::leak(Box::new(Mutex::new(()))),
             crm_send_workers: Mutex::new(std::collections::HashSet::new()),
             image_job_workers: Mutex::new(std::collections::HashSet::new()),
@@ -2240,7 +2347,7 @@ impl Shared {
     /// CAD-565: for a pty endpoint the "body" the prompt carries is the
     /// one-line delivery notice (see [`Self::delivery_body`]); the full
     /// text is pulled, not pasted.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seam"))]
     fn continuity_prompt(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
         self.continuity_prompt_slotted(alias, endpoint_kind, message, None)
     }
@@ -2341,7 +2448,7 @@ impl Shared {
     /// any) wrapped ahead of the delivery body. The actor calls
     /// [`Self::continuity_parts`] directly so mandatory task context is
     /// planned before optional history.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seam"))]
     fn continuity_prompt_slotted(
         &self,
         alias: &str,
@@ -4034,9 +4141,8 @@ impl Shared {
                             .iter()
                             .filter_map(|message| message.task_id.as_deref())
                             .collect::<Vec<_>>();
-                        let scope = self.project_scope_for_caller(
-                            &crate::peer::AgentCaller::Agent(alias.clone()),
-                        );
+                        let scope =
+                            self.project_scope_for_caller(&AgentCaller::Agent(alias.clone()));
                         let task_issues = self.store.task_issue_bindings(&task_ids);
                         let private_denials =
                             self.private_job_denials_for_read(params, None, None, peer_pid);
@@ -4178,7 +4284,7 @@ impl Shared {
                         peer_pid,
                         "profile launch instructions",
                         &agent,
-                        crate::peer::AgentMutation::SelfService,
+                        AgentMutation::SelfService,
                     )?;
                 }
                 // CAD-2323: the launch/join poll (`briefing::launch_poll_read`)
@@ -4974,7 +5080,7 @@ impl Shared {
                     // the explicit kill; never leave an orphan session
                     // on the private socket behind a dropped row.
                     if agent.endpoint_kind == "pty" {
-                        adapter::pty::kill_pane(
+                        pty_kill::kill_pane(
                             &self.state_dir,
                             &alias,
                             &self.provider_env,
@@ -5025,7 +5131,7 @@ impl Shared {
                             // the explicit kill; no orphan sessions behind
                             // dropped rows.
                             if agent.endpoint_kind == "pty" {
-                                adapter::pty::kill_pane(
+                                pty_kill::kill_pane(
                                     &self.state_dir,
                                     &agent.alias,
                                     &self.provider_env,
@@ -6047,7 +6153,12 @@ fn pm_dir_of_with(
     }
 }
 
-#[cfg(test)]
+// Daemon unit tests rely on cadence-agent's debug-only `test-seam` hooks
+// so `--profile ci` and `--release` workspace builds never enable them by
+// default. All CI suites (`tests.yml`, `changed-tests.yml`, `clippy --features test-seam`)
+// pass `--features test-seam`.
+#[cfg(all(test, feature = "test-seam"))]
+#[path = "daemon/tests/mod.rs"]
 mod tests;
 
 /// Content hash for spec-drift detection — the same value the CLI
@@ -6700,6 +6811,7 @@ pub struct ServeOptions {
     /// spec is still parsed, so endpoint restrictions hold; only
     /// in-process fixtures set this, never pm.yaml, RPC, or env.
     /// Production leaves it unset.
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     pub lease_http_endpoint_override: Option<String>,
     /// CAD-702: test-only extra dwell inside the shutdown flush, so a
     /// test can prove renewal spans a slow flush. In-process fixtures
@@ -6789,6 +6901,33 @@ pub struct ServeOptions {
     pub crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
 }
 
+impl crate::platform::PlatformRegistry for ServeOptions {
+    fn platforms_mut(&mut self) -> &mut crate::platform::PlatformMap {
+        &mut self.platforms
+    }
+}
+
+impl crate::platform::LocalRegistry for ServeOptions {
+    fn outbox_dir_mut(&mut self) -> &mut Option<PathBuf> {
+        &mut self.outbox_dir
+    }
+}
+
+impl crate::platform::PlatformComposition for ServeOptions {
+    fn attach_view(&mut self) -> crate::platform::AttachView<'_> {
+        crate::platform::AttachView {
+            platforms: &mut self.platforms,
+            provider_deployments: &mut self.provider_deployments,
+            hosted_email: &mut self.hosted_email,
+            hosted_whatsapp: &mut self.hosted_whatsapp,
+            smtp_internal: &mut self.smtp_internal,
+            social_publish_sender: &mut self.social_publish_sender,
+            social_media_importer: &mut self.social_media_importer,
+            social_media_resolver: &mut self.social_media_resolver,
+        }
+    }
+}
+
 /// Cap on the serve loop's transient-accept backoff — per listener
 /// pass, doubling from 5ms on each consecutive failure. With the
 /// shared socket a pass can sleep twice plus the accept poll, so the
@@ -6862,19 +7001,20 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     // One fixed path-only record also governs standalone artifact exclusion.
     // An in-process option cannot silently disagree with that admitted record.
-    let configured =
-        crate::platform::encrypted_config::load(state_dir, Some(&pm_dir_of(&opts.provider_env)?))?;
+    let configured = crate::platform::encrypted_config::load_paths(
+        state_dir,
+        Some(&pm_dir_of(&opts.provider_env)?),
+    )?;
     match (&opts.encrypted_custody, configured.as_ref()) {
         (Some(selected), Some(record))
-            if selected.key_file == record.paths.key_file
-                && selected.vault_dir == record.paths.vault_dir => {}
+            if selected.key_file == record.key_file && selected.vault_dir == record.vault_dir => {}
         (Some(_), _) => {
             return Err(Error::invalid(
                 "storage_unavailable",
                 "custody path configuration mismatch",
             ))
         }
-        (None, Some(record)) => opts.encrypted_custody = Some(record.paths.clone()),
+        (None, Some(record)) => opts.encrypted_custody = Some(record.clone()),
         (None, None) => {}
     }
     let euid = unsafe { libc::geteuid() };
@@ -6950,11 +7090,14 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     crate::platform::agenticos_external::publish_sender::attach_publish_sender(
         state_dir, &mut opts,
     )?;
-    let lease = crate::lease::acquire_with_endpoint(
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
+    let lease = crate::lease::acquire_with_test_endpoint(
         state_dir,
         &hosted,
         opts.lease_http_endpoint_override.as_deref(),
     )?;
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
+    let lease = crate::lease::acquire(state_dir, &hosted)?;
     // CAD-947: renewal starts the moment the lease is held, before the
     // store opens or recovery runs — startup of any length rides a
     // renewed lease. The guard stops and joins it if startup fails; the
@@ -7193,7 +7336,18 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // mutation kicks one coalesced rebuild; the query-time tree check
     // stays the correctness fallback. Joined at shutdown so a rebuild
     // never outlives the daemon.
-    let wiki_index_worker = shared.wiki_index.spawn();
+    let wiki_index_worker = {
+        let index = Arc::clone(&shared.wiki_index);
+        match crate::thread_budget::spawn_named("wiki-index-refresh".to_string(), move || {
+            index.run()
+        }) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("cadence: wiki index refresh not started: {e}");
+                None
+            }
+        }
+    };
     // CAD-538 heartbeat under CAD-702 shutdown order: the single renewal
     // poster (started right after acquire, CAD-947) runs until after the
     // shutdown flush — stopped and joined only once the flush has

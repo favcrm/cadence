@@ -32,11 +32,11 @@ use super::{CheckpointAck, CheckpointV1, MAX_FRAME_BYTES, REQUEST_BUDGET, RESPON
 /// The facts the supervisor sends for one allocation. Agent identity, session
 /// binding and the expected owner epoch are server-derived by the caller.
 #[derive(Clone, Debug)]
-pub(crate) struct PrepareRequest {
-    pub(crate) stable_agent_uid: String,
-    pub(crate) session_binding: String,
-    pub(crate) server_generation: u64,
-    pub(crate) expected_owner_epoch: u64,
+pub struct PrepareRequest {
+    pub stable_agent_uid: String,
+    pub session_binding: String,
+    pub server_generation: u64,
+    pub expected_owner_epoch: u64,
 }
 
 /// The measured owner identity a successful `hello_v1` establishes. Private
@@ -53,7 +53,7 @@ struct AuthenticatedOwnerPeer {
 /// mint one — the dispatch layer must use the real loaded-receipt contract for
 /// those, never an invented timestamp.
 #[derive(Clone, Debug)]
-pub(crate) struct OwnerEvidence {
+pub struct OwnerEvidence {
     pub(crate) workspace_id: String,
     /// The enrolled stable participant identity this runtime was allocated
     /// for. Live owner row data, never a caller field.
@@ -78,16 +78,97 @@ pub(crate) struct OwnerEvidence {
     pub(crate) profile_digest: String,
 }
 
+impl OwnerEvidence {
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn agent_uid(&self) -> &str {
+        &self.agent_uid
+    }
+    pub fn session_binding(&self) -> &str {
+        &self.session_binding
+    }
+    pub fn custody_domain(&self) -> &'static str {
+        self.custody_domain
+    }
+    pub fn custody_epoch(&self) -> u64 {
+        self.custody_epoch
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn runtime_generation(&self) -> u64 {
+        self.runtime_generation
+    }
+    pub fn enrollment_id(&self) -> &str {
+        &self.enrollment_id
+    }
+    pub fn phase(&self) -> &str {
+        &self.phase
+    }
+    pub fn fenced(&self) -> bool {
+        self.fenced
+    }
+    pub fn fenced_reason(&self) -> Option<&str> {
+        self.fenced_reason.as_deref()
+    }
+    pub fn loaded_receipt_id(&self) -> &str {
+        &self.loaded_receipt_id
+    }
+    pub fn observed_registry_digest(&self) -> &str {
+        &self.observed_registry_digest
+    }
+    pub fn node_pid(&self) -> u32 {
+        self.node_pid
+    }
+    pub fn node_starttime(&self) -> u64 {
+        self.node_starttime
+    }
+    pub fn os_uid(&self) -> u32 {
+        self.os_uid
+    }
+    pub fn container_id(&self) -> &str {
+        &self.container_id
+    }
+    pub fn image_digest(&self) -> &str {
+        &self.image_digest
+    }
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
+}
+
 /// The root owner's authenticated prestart witness / ledger floor. Secret
 /// free; produced only from `prestart_eligibility_v1`.
 #[derive(Clone, Debug)]
-pub(crate) struct PrestartEligibility {
+pub struct PrestartEligibility {
     pub(crate) workspace_id: String,
     pub(crate) owner_epoch: u64,
     pub(crate) database_epoch: u64,
     pub(crate) restore_state: String,
     pub(crate) min_sequence: u64,
     pub(crate) min_digest: String,
+}
+
+impl PrestartEligibility {
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn database_epoch(&self) -> u64 {
+        self.database_epoch
+    }
+    pub fn restore_state(&self) -> &str {
+        &self.restore_state
+    }
+    pub fn min_sequence(&self) -> u64 {
+        self.min_sequence
+    }
+    pub fn min_digest(&self) -> &str {
+        &self.min_digest
+    }
 }
 
 /// The authenticated selector for one owned-console attachment. Private
@@ -103,7 +184,7 @@ pub(crate) struct ConsoleOpen {
 
 /// One connection-scoped owner client. The socket path comes from the
 /// root-owned profile; nothing here is caller-configurable.
-pub(crate) struct RootOwnerClient {
+pub struct RootOwnerClient {
     profile: LocalProfile,
     supervisor_generation: String,
     socket: PathBuf,
@@ -113,7 +194,7 @@ pub(crate) struct RootOwnerClient {
 impl RootOwnerClient {
     /// Authenticate with the root owner (`hello_v1` + kernel peer + pinned key)
     /// before any authority call is possible.
-    pub(crate) fn connect(profile: &LocalProfile, supervisor_generation: String) -> Result<Self> {
+    pub fn connect(profile: &LocalProfile, supervisor_generation: String) -> Result<Self> {
         if !strict::is_lower_hex(&supervisor_generation, 32) {
             return Err(Error::rejected(
                 "supervisor generation must be 32 lowercase hex",
@@ -135,14 +216,14 @@ impl RootOwnerClient {
     }
 
     /// The authenticated owner epoch every exchange is bound to.
-    pub(crate) fn owner_epoch(&self) -> u64 {
+    pub fn owner_epoch(&self) -> u64 {
         self.peer.as_ref().map(|p| p.owner_epoch).unwrap_or(0)
     }
 
     /// Bind a signed fence callback to this channel's authenticated live owner.
     /// Root's executable was measured by the signed hello; the supervisor must
     /// not attempt an unprivileged `/proc/<root>/exe` open on the callback.
-    pub(crate) fn verify_owner_callback(
+    pub fn verify_owner_callback(
         &self,
         stream: &std::os::unix::net::UnixStream,
         owner_epoch: u64,
@@ -309,7 +390,7 @@ impl RootOwnerClient {
     /// Prepare one allocating intent. The reply carries the canonical
     /// LaunchRequest/digest, the measured recipient and the owner-launched
     /// installer; `challenge` is null until `enroll_pending` binds it.
-    pub(crate) fn prepare_runtime(&self, request: &PrepareRequest) -> Result<PreparedRuntime> {
+    pub fn prepare_runtime(&self, request: &PrepareRequest) -> Result<PreparedRuntime> {
         let data = self.call(
             "prepare_runtime",
             serde_json::json!({
@@ -321,13 +402,34 @@ impl RootOwnerClient {
                 "supervisor_generation": self.supervisor_generation,
             }),
         )?;
-        PreparedRuntime::from_json(&data)
+        let prepared = PreparedRuntime::from_json(&data)?;
+        if prepared.agent_uid != request.stable_agent_uid
+            || prepared.session_binding != request.session_binding
+            || prepared.server_generation != request.server_generation
+            || prepared.owner_epoch != request.expected_owner_epoch
+        {
+            return Err(Error::rejected(
+                "owner allocation does not match the requested subject",
+            ));
+        }
+        *prepared
+            .listener_enrollment
+            .lock()
+            .map_err(|_| Error::internal("operations enrollment lock poisoned"))? =
+            Some(super::ops::AgentEnrollment {
+                runtime_id: prepared.runtime_id.clone(),
+                agent_uid: prepared.agent_uid.clone(),
+                session_binding: prepared.session_binding.clone(),
+                runtime_generation: prepared.generation,
+                os_uid: prepared.os_uid,
+            });
+        Ok(prepared)
     }
 
     /// Release the staged capsule to the owner-launched installer for this
     /// exact committed allocation. The reply is delivery evidence only; it is
     /// not launch, consume or readiness authority.
-    pub(crate) fn release_installer(
+    pub fn release_installer(
         &self,
         runtime_id: &str,
         operation_id: &str,
@@ -455,7 +557,7 @@ impl RootOwnerClient {
         })
     }
 
-    pub(crate) fn start_runtime(&self, runtime_id: &str, generation: u64) -> Result<StartOutcome> {
+    pub fn start_runtime(&self, runtime_id: &str, generation: u64) -> Result<StartOutcome> {
         let data = self.call(
             "start_runtime",
             serde_json::json!({
@@ -468,7 +570,7 @@ impl RootOwnerClient {
     }
 
     /// Fresh recheck → the only place a `QualifiedRuntime` is minted.
-    pub(crate) fn recheck(&self, runtime_id: &str, generation: u64) -> Result<QualifiedRuntime> {
+    pub fn recheck(&self, runtime_id: &str, generation: u64) -> Result<QualifiedRuntime> {
         let data = self.call(
             "recheck",
             serde_json::json!({
@@ -485,11 +587,7 @@ impl RootOwnerClient {
     /// fresh `recheck` that must agree. This is the typed surface the protected
     /// dispatch eligibility adapter consumes; it never certifies readiness by
     /// itself and never synthesizes a timestamp or epoch on failure.
-    pub(crate) fn owner_evidence(
-        &self,
-        runtime_id: &str,
-        generation: u64,
-    ) -> Result<OwnerEvidence> {
+    pub fn owner_evidence(&self, runtime_id: &str, generation: u64) -> Result<OwnerEvidence> {
         let status = self.observe(runtime_id)?;
         let qualified = self.recheck(runtime_id, generation)?;
         let identity = qualified.identity();
@@ -528,7 +626,7 @@ impl RootOwnerClient {
     /// The authenticated external prestart witness. This is the root physical
     /// issuer's provenance document; it is not a grant, a receipt or an epoch
     /// that a local database can assert by itself.
-    pub(crate) fn prestart_eligibility(&self) -> Result<PrestartEligibility> {
+    pub fn prestart_eligibility(&self) -> Result<PrestartEligibility> {
         let data = self.call(
             "prestart_eligibility_v1",
             serde_json::json!({"supervisor_generation": self.supervisor_generation}),
@@ -615,12 +713,7 @@ impl RootOwnerClient {
         })
     }
 
-    pub(crate) fn fence(
-        &self,
-        runtime_id: &str,
-        generation: u64,
-        reason: &str,
-    ) -> Result<FenceAck> {
+    pub fn fence(&self, runtime_id: &str, generation: u64, reason: &str) -> Result<FenceAck> {
         let data = self.call(
             "fence",
             serde_json::json!({
@@ -651,7 +744,7 @@ impl RootOwnerClient {
         })
     }
 
-    pub(crate) fn observe(&self, runtime_id: &str) -> Result<RuntimeStatus> {
+    pub fn observe(&self, runtime_id: &str) -> Result<RuntimeStatus> {
         let data = self.call(
             "observe",
             serde_json::json!({

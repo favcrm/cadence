@@ -162,7 +162,8 @@ fn spec_candidate(
 
 /// Resolve a relative job locator to the same canonical file used by the
 /// scoped kickoff reader. Absolute legacy locators remain untouched.
-pub(crate) fn intake_spec_pin(
+#[doc(hidden)]
+pub fn intake_spec_pin(
     project: &crate::issue::project::Project,
     task: &store::Task,
     job: &store::Job,
@@ -177,7 +178,8 @@ pub(crate) fn intake_spec_pin(
 
 /// Re-read a canonical relative-job pin without following replaced symlinks
 /// or reading more than the context reader's bound.
-pub(crate) fn intake_spec_matches(path: &Path, expected: &str) -> bool {
+#[doc(hidden)]
+pub fn intake_spec_matches(path: &Path, expected: &str) -> bool {
     let Ok(relative) = path.strip_prefix("/") else {
         return false;
     };
@@ -281,7 +283,8 @@ fn read_job_spec(
 /// without granting the locator authority to read outside the approved scope.
 /// Canonical issue specs use the approved issue snapshot, not their old raw
 /// digest; independent specs must still match the job's immutable byte pin.
-pub(crate) fn capture_intake_cloud_spec(
+#[doc(hidden)]
+pub fn capture_intake_cloud_spec(
     gated: &GatedIssue,
     task: &store::Task,
     job: &store::Job,
@@ -320,7 +323,7 @@ pub(crate) fn capture_intake_cloud_spec(
 /// Canonical issue specs contain mutable tracker metadata that is not part
 /// of their effective spec. Pin every body byte, including all criteria;
 /// retain the separate raw source digest in the delivery manifest.
-pub(crate) fn canonical_issue_spec_digest(
+pub fn canonical_issue_spec_digest(
     pm: &Pm,
     issue: &str,
     spec: &Path,
@@ -350,12 +353,55 @@ pub(crate) fn canonical_issue_spec_digest(
     )))
 }
 
+/// Resolve the issue's one live worktree in a declared project repository.
+pub fn dispatch_lane(
+    verb: &str,
+    project: &crate::issue::project::Project,
+    front: &crate::issue::model::Front,
+) -> Result<PathBuf> {
+    let repos = start::declared_repos(project);
+    let mut lanes: Vec<PathBuf> = Vec::new();
+    for cand in start::open_worktrees(front) {
+        let dir = cand.canonicalize().unwrap_or(cand.clone());
+        let Ok(root) = crate::worktree::main_root(&dir) else {
+            continue;
+        };
+        if !repos.contains(&root) {
+            continue;
+        }
+        let wt_root = crate::worktree::layout::worktrees_dir(&root)
+            .canonicalize()
+            .unwrap_or_else(|_| crate::worktree::layout::worktrees_dir(&root));
+        if dir.starts_with(&wt_root) {
+            lanes.push(dir);
+        }
+    }
+    lanes.sort();
+    lanes.dedup();
+    match lanes.len() {
+        1 => Ok(lanes.remove(0)),
+        0 => Err(Error::rejected(format!(
+            "{verb}: {} has no open lane the daemon can verify — a dispatch \
+             kickoff binds the worktree `issue start` recorded; none of its \
+             open worktree refs is a live worktree of the project's repos",
+            front.id
+        ))),
+        n => Err(Error::rejected(format!(
+            "{verb}: {} has {n} open lane refs the daemon can verify — \
+             which one a kickoff binds is ambiguous; close the stale \
+             lanes first",
+            front.id
+        ))),
+    }
+}
+
 /// CAD-1846: the mandatory pipeline for an issue-linked job task. The caller
 /// proves its captured issue binding and lane. Intake admissions supply the
 /// approved issue checklist; other tasks keep their recorded acceptance.
 /// `None` means the project has not opted in and the caller renders the
 /// legacy kickoff instead.
-pub(crate) fn job_context(
+#[doc(hidden)]
+pub fn job_context(
     pm: &Pm,
     gated: &GatedIssue,
     job: JobContext<'_>,

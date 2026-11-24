@@ -142,19 +142,19 @@ impl AgenticosAdapter {
 }
 
 /// Register the adapter on a daemon that already decided the base URL.
-pub fn register(opts: &mut crate::daemon::ServeOptions, base: &str) -> Result<()> {
+pub fn register(opts: &mut impl super::PlatformRegistry, base: &str) -> Result<()> {
     register_with_deployment_pin(opts, base, None)
 }
 
 /// Explicit trusted provider composition metadata; never an app/worker input.
 /// Default registration and hosted attach supply no assertion and stay gated.
 pub fn register_with_deployment_pin(
-    opts: &mut crate::daemon::ServeOptions,
+    opts: &mut impl super::PlatformRegistry,
     base: &str,
     deployment_pin: Option<&str>,
 ) -> Result<()> {
     let adapter = AgenticosAdapter::with_deployment_pin(base, deployment_pin)?;
-    opts.platforms
+    opts.platforms_mut()
         .insert(PLATFORM.to_string(), std::sync::Arc::new(adapter));
     Ok(())
 }
@@ -165,7 +165,11 @@ pub fn register_with_deployment_pin(
 /// URL wins over the hosted default. This does not read
 /// `AGENTICOS_BOARD_COMPANY`: that variable is set on shared dev hosts
 /// that are not the hosted container.
-pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hosted) -> Result<()> {
+pub fn attach(
+    opts: &mut impl super::PlatformComposition,
+    hosted: &crate::lease::Hosted,
+) -> Result<()> {
+    let opts = &mut opts.attach_view();
     // CAD-1158: compose the trusted bridge-owned `smtp.internal` relay
     // independently of platform registration and the Cadence lifecycle
     // lease — before the early platform-registered return and before lease
@@ -188,19 +192,19 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hos
     // CAD-1063: only a real hosted lease replaces SMTP egress with the
     // platform email door; an explicit URL alone never does.
     if lease_is_on(hosted) && opts.hosted_email.is_none() {
-        opts.hosted_email = super::hosted_email::HostedEmail::from_env(&base)?;
+        *opts.hosted_email = super::hosted_email::HostedEmail::from_env(&base)?;
     }
     // CAD-1562: the same real lease opens the WhatsApp door; an explicit
     // URL alone never does.
     if lease_is_on(hosted) && opts.hosted_whatsapp.is_none() {
-        opts.hosted_whatsapp = Some(super::hosted_whatsapp::HostedWhatsapp::new(&base)?);
+        *opts.hosted_whatsapp = Some(super::hosted_whatsapp::HostedWhatsapp::new(&base)?);
     }
     // CAD-1126: the same real lease routes enrolled SMTP senders
     // through the `smtp.internal` pass-through (no direct socket).
     if lease_is_on(hosted) && opts.smtp_internal.is_none() {
-        opts.smtp_internal = Some(super::smtp_internal::SmtpInternal::from_env()?);
+        *opts.smtp_internal = Some(super::smtp_internal::SmtpInternal::from_env()?);
     }
-    register_from_composition(opts, &base, lease_is_on(hosted))
+    register_from_view(opts, &base, lease_is_on(hosted), super::deployments::load)
 }
 
 /// CAD-1158: independent trusted SMTP composition. Installs the fixed
@@ -211,11 +215,11 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hos
 /// relay — and the absence of that proof never installs one. The relay
 /// base is fixed by the proof; caller-controlled env URLs cannot redirect
 /// the transport that will carry the custodied credential.
-fn compose_hosted_smtp(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+fn compose_hosted_smtp(opts: &mut super::AttachView<'_>) -> Result<()> {
     if opts.smtp_internal.is_some() {
         return Ok(());
     }
-    let admission = match &opts.provider_deployments {
+    let admission = match opts.provider_deployments.as_ref() {
         Some(metadata) => metadata.hosted_smtp(),
         // No in-memory composition: consult the fixed root-owned image
         // file, the same source `register_with_loader` trusts for the
@@ -223,7 +227,7 @@ fn compose_hosted_smtp(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
         None => super::deployments::load()?.and_then(|metadata| metadata.hosted_smtp()),
     };
     if let Some(admission) = admission {
-        opts.smtp_internal = Some(super::smtp_internal::SmtpInternal::from_admission(
+        *opts.smtp_internal = Some(super::smtp_internal::SmtpInternal::from_admission(
             &admission,
         )?);
     }
@@ -234,16 +238,16 @@ fn compose_hosted_smtp(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
 /// fixed `api.internal` door only when the image-owned metadata carries the
 /// dedicated `hosted-whatsapp-door@1` admission; the lease path in `attach`
 /// is unchanged and an env URL never admits.
-fn compose_hosted_whatsapp(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+fn compose_hosted_whatsapp(opts: &mut super::AttachView<'_>) -> Result<()> {
     if opts.hosted_whatsapp.is_some() {
         return Ok(());
     }
-    let admission = match &opts.provider_deployments {
+    let admission = match opts.provider_deployments.as_ref() {
         Some(metadata) => metadata.hosted_whatsapp(),
         None => super::deployments::load()?.and_then(|metadata| metadata.hosted_whatsapp()),
     };
     if let Some(admission) = admission {
-        opts.hosted_whatsapp = Some(super::hosted_whatsapp::HostedWhatsapp::from_admission(
+        *opts.hosted_whatsapp = Some(super::hosted_whatsapp::HostedWhatsapp::from_admission(
             &admission,
         )?);
     }
@@ -256,7 +260,7 @@ fn compose_hosted_whatsapp(opts: &mut crate::daemon::ServeOptions) -> Result<()>
 /// platform-registered early return), so this route only covers the
 /// `agenticos` platform pin itself — never SMTP authority.
 pub fn register_from_composition(
-    opts: &mut crate::daemon::ServeOptions,
+    opts: &mut impl super::PlatformComposition,
     base: &str,
     hosted: bool,
 ) -> Result<()> {
@@ -264,7 +268,16 @@ pub fn register_from_composition(
 }
 
 pub(super) fn register_with_loader(
-    opts: &mut crate::daemon::ServeOptions,
+    opts: &mut impl super::PlatformComposition,
+    base: &str,
+    hosted: bool,
+    load: impl FnOnce() -> Result<Option<super::deployments::DeploymentMetadata>>,
+) -> Result<()> {
+    register_from_view(&mut opts.attach_view(), base, hosted, load)
+}
+
+fn register_from_view(
+    opts: &mut super::AttachView<'_>,
     base: &str,
     hosted: bool,
     load: impl FnOnce() -> Result<Option<super::deployments::DeploymentMetadata>>,
@@ -272,14 +285,17 @@ pub(super) fn register_with_loader(
     if !hosted {
         return register(opts, base);
     }
-    let metadata = match &opts.provider_deployments {
-        Some(metadata) => Some(metadata.clone()),
-        None => load()?,
+    let loaded = if opts.provider_deployments.is_none() {
+        load()?
+    } else {
+        None
     };
-    let pin = metadata
+    let pin = opts
+        .provider_deployments
         .as_ref()
+        .or(loaded.as_ref())
         .and_then(|metadata| metadata.pin(PLATFORM, base));
-    register_with_deployment_pin(opts, base, pin)
+    register_with_deployment_pin(opts.platforms, base, pin)
 }
 
 /// `Some` is the origin to register. An explicit URL wins, including

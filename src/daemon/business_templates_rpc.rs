@@ -74,8 +74,8 @@ impl Shared {
                 self.business_template_caller("template intake", params, peer_pid)?;
                 let file = required_str(params, "file")?;
                 let source = source_param(params)?;
-                let out = if self.hosted_business_documents.is_some() {
-                    crate::business_export::hosted::intake(file, &source)?
+                let out = if let Some(admission) = &self.hosted_business_documents {
+                    crate::business_export::hosted::intake(admission, file, &source)?
                 } else {
                     crate::business_export::intake(file, &source)?
                 };
@@ -124,8 +124,12 @@ impl Shared {
                 if format == Some("html") {
                     return Err(Error::rejected(format!("template '{name}' v{version} is a legacy DOCX template and cannot sample as HTML")));
                 }
-                let out = if self.hosted_business_documents.is_some() {
-                    crate::business_export::hosted::export_sample(&source, &draft.context())?
+                let out = if let Some(admission) = &self.hosted_business_documents {
+                    crate::business_export::hosted::export_sample(
+                        admission,
+                        &source,
+                        &draft.context(),
+                    )?
                 } else {
                     crate::business_export::export_sample(&source, &draft.context())?
                 };
@@ -242,8 +246,8 @@ impl Shared {
                         "document '{id}' uses a legacy DOCX template and cannot export as HTML"
                     )));
                 }
-                let out = if self.hosted_business_documents.is_some() {
-                    crate::business_export::hosted::export(&source, &doc.context)?
+                let out = if let Some(admission) = &self.hosted_business_documents {
+                    crate::business_export::hosted::export(admission, &source, &doc.context)?
                 } else {
                     crate::business_export::export(&source, &doc.context)?
                 };

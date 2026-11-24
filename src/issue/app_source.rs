@@ -364,7 +364,7 @@ pub fn resolve(source: &SelectedGitSource) -> Result<ResolvedGitBundle> {
 /// step (CAD-1129). One bounded, scrubbed `git` call; its stdout's
 /// `sha\tref` line yields the pinned commit. Every refusal is a plain
 /// `Err`.
-pub(crate) fn ls_remote(tmp: &Path, url: &str, git_ref: &str) -> Result<String> {
+pub fn ls_remote(tmp: &Path, url: &str, git_ref: &str) -> Result<String> {
     let out = git_step(tmp, "ls-remote", |cmd| {
         cmd.arg("ls-remote").arg("--").arg(url).arg(git_ref);
     })?;

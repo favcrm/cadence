@@ -1383,7 +1383,7 @@ impl Shared {
                         "revision": revision,
                         "sha256": sha256,
                         "title": title,
-                        "artifact_ref": original.reference,
+                        "artifact_ref": original.reference(),
                         "instructions": instructions,
                         "workflow": "refine-image",
                         "slot": slot,
@@ -1437,9 +1437,9 @@ impl Shared {
             .reference
             .split_once('.')
             .is_some_and(|(job, digest)| {
-                digest == hex && job.starts_with("med_") && !original.reference.contains("://")
+                digest == hex && job.starts_with("med_") && !original.reference().contains("://")
             });
-        if image.asset.revision != revision || original.sha256 != sha256 || !reference_ok {
+        if image.asset.revision != revision || original.sha256() != sha256 || !reference_ok {
             return Err(Error::rejected(
                 "producer reference is not the retained original artifact",
             ));
@@ -1576,7 +1576,7 @@ impl Shared {
             ));
         }
         let (original, title) = self.refine_source_current(asset_id, revision, sha256)?;
-        if preview["title"] != title || preview["artifact_ref"] != original.reference {
+        if preview["title"] != title || preview["artifact_ref"] != original.reference() {
             return Err(Error::rejected(
                 "producer reference changed since the price was shown",
             ));

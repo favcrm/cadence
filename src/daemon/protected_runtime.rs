@@ -35,26 +35,21 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::protected_runtime::console::{self, OwnerConsole};
-use crate::protected_runtime::ops::{
-    AgentEnrollment, OpsFamily, OpsMethod, RuntimeCaller, RuntimeOpsHandler, RuntimeOpsListener,
+use crate::protected_runtime::ops::{OpsFamily, OpsMethod, RuntimeCaller, RuntimeOpsHandler};
+use crate::protected_runtime::owner_link::{OwnerBootAuthority as BootAuthority, OwnerLink};
+use crate::protected_runtime::{CurrentEligibility, LocalProfile, RuntimeStatus};
+use crate::store::Store;
+use cadence_agent::daemon::console_port::{
+    self, AttachedConsole, ConsoleSubject, NativeTaskGuard, ProtectedConsoleProvider,
+    VerifiedConsoleSubject,
 };
-use crate::protected_runtime::{
-    attestation, CurrentEligibility, LocalProfile, RootOwnerClient, RuntimeStatus,
-};
-use cadence_core::connection_dispatch::ledger::{CheckpointAckV1, CheckpointV1, LedgerRecordV1};
-use cadence_core::connection_dispatch::primitives::{Counter, Digest, Ident, Revision};
-
-use crate::store::{
-    connection_dispatch::{BootAuthority, ExternalFloorV1},
-    Store,
-};
+use cadence_core::connection_dispatch::primitives::{Digest, Ident, Revision};
 
 use super::protected_connections::{
     OwnerEligibility, ProfileRegistryManifest, ProtectedOwnerClient,
@@ -71,136 +66,6 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// Upper bound on the selector registry file.
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
-
-// ---------------------------------------------------------------------------
-// Live owner channel
-// ---------------------------------------------------------------------------
-
-/// The authenticated owner channel plus the process-local supervisor
-/// generation. A lost/ambiguous exchange drops the client so the *next* call
-/// performs a fresh `hello_v1`; mutations are never retried here.
-struct OwnerLink {
-    profile: LocalProfile,
-    generation: String,
-    client: RwLock<Option<Arc<RootOwnerClient>>>,
-}
-
-impl OwnerLink {
-    fn new(profile: LocalProfile, generation: String) -> Arc<Self> {
-        Arc::new(Self {
-            profile,
-            generation,
-            client: RwLock::new(None),
-        })
-    }
-
-    /// The live authenticated owner client, connecting on first use. The owner
-    /// being down is an error — never a synthesized epoch or readiness.
-    fn client(&self) -> Result<Arc<RootOwnerClient>> {
-        if let Some(client) = self
-            .client
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned())
-        {
-            return Ok(client);
-        }
-        let client = Arc::new(RootOwnerClient::connect(
-            &self.profile,
-            self.generation.clone(),
-        )?);
-        if let Ok(mut guard) = self.client.write() {
-            *guard = Some(Arc::clone(&client));
-        }
-        Ok(client)
-    }
-
-    fn invalidate(&self) {
-        if let Ok(mut guard) = self.client.write() {
-            *guard = None;
-        }
-    }
-
-    /// A read-only exchange, retried ONCE after a transport/epoch failure.
-    /// Reads are idempotent; mutations use [`Self::client`] directly and are
-    /// never replayed.
-    fn read<T>(&self, f: impl Fn(&RootOwnerClient) -> Result<T>) -> Result<T> {
-        let client = self.client()?;
-        match f(&client) {
-            Ok(value) => Ok(value),
-            Err(first) => {
-                self.invalidate();
-                let fresh = self.client()?;
-                f(&fresh).map_err(|second| {
-                    if matches!(second.kind(), "unknown") {
-                        Error::unknown(format!(
-                            "owner recheck failed after reconnect: {} / {}",
-                            first.kind(),
-                            second.kind()
-                        ))
-                    } else {
-                        second
-                    }
-                })
-            }
-        }
-    }
-}
-
-struct OwnerCheckpoint {
-    link: Arc<OwnerLink>,
-}
-
-impl crate::store::connection_dispatch::ProtectedCheckpointWriter for OwnerCheckpoint {
-    fn context(
-        &self,
-        workspace_id: &str,
-        database_epoch: Revision,
-    ) -> Result<crate::store::connection_dispatch::ProtectedCheckpointContext> {
-        let witness = self.link.read(|client| client.prestart_eligibility())?;
-        if witness.workspace_id != workspace_id
-            || witness.database_epoch != database_epoch.get()
-            || witness.restore_state != "stable"
-        {
-            return Err(Error::invalid(
-                "runtime_unqualified",
-                "the live owner does not authorize this core history",
-            ));
-        }
-        Ok(
-            crate::store::connection_dispatch::ProtectedCheckpointContext {
-                owner_epoch: Revision::new(witness.owner_epoch).map_err(|_| {
-                    Error::invalid("runtime_unqualified", "the owner epoch is malformed")
-                })?,
-                minimum_sequence: Counter::new(witness.min_sequence).map_err(|_| {
-                    Error::invalid("runtime_unqualified", "the owner minimum is malformed")
-                })?,
-                minimum_digest: Digest::try_from(witness.min_digest).map_err(|_| {
-                    Error::invalid("runtime_unqualified", "the owner minimum is malformed")
-                })?,
-            },
-        )
-    }
-
-    /// Called AFTER the writer transaction commits and the DB lock is released.
-    /// A lost acknowledgement is `outcome_unknown`; there is no replay and no
-    /// callback retry. The transport `runtime_generation` field is not
-    /// authority (the owner validates the canonical checkpoint, which binds the
-    /// exact runtime generation through `runtime_binding_digest`), so the fixed
-    /// positive carrier value is sent and nothing more is claimed.
-    fn checkpoint(
-        &self,
-        checkpoint: &CheckpointV1,
-        prefix: &[LedgerRecordV1],
-    ) -> Result<CheckpointAckV1> {
-        let client = self.link.client()?;
-        client.checkpoint(checkpoint, prefix, 1)
-    }
-
-    fn acknowledged_head(&self, checkpoint: &CheckpointV1) -> Result<CheckpointAckV1> {
-        self.link.client()?.checkpoint_receipt(checkpoint)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Prepared protection (before boot-time authorizing writes)
@@ -231,41 +96,6 @@ pub(crate) enum PreparedBoot {
     MetadataOnly { code: &'static str },
 }
 
-/// Read the authenticated external floor before taking the store's read lock.
-/// Management may establish enablement; execution must already have it.
-fn current_owner_authority(
-    store: &Store,
-    profile: &LocalProfile,
-    owner: &OwnerLink,
-    require_enabled: bool,
-) -> Result<(
-    crate::protected_runtime::client::PrestartEligibility,
-    BootAuthority,
-)> {
-    let witness = owner.client()?.prestart_eligibility()?;
-    if witness.workspace_id != profile.workspace_id()
-        || witness.database_epoch != profile.database_epoch()
-        || witness.restore_state != "stable"
-    {
-        return Err(Error::invalid(
-            "runtime_unqualified",
-            "the live owner does not authorize this database lineage",
-        ));
-    }
-    let floor = ExternalFloorV1 {
-        workspace_id: witness.workspace_id.clone(),
-        min_sequence: witness.min_sequence,
-        min_digest: Digest::try_from(witness.min_digest.clone())
-            .map_err(|_| Error::invalid("runtime_unqualified", "the owner floor is malformed"))?,
-    };
-    let authority = if require_enabled {
-        store.protected_boot_preflight(&floor)?
-    } else {
-        store.protected_history_preflight(&floor)?
-    };
-    Ok((witness, authority))
-}
-
 impl PreparedProtection {
     /// Decide the boot authority from the authenticated owner witness and the
     /// actual local ledger. A floor of 0 (fresh deployment) is `Ready` for an
@@ -273,11 +103,11 @@ impl PreparedProtection {
     /// without a chicken/egg owner-less state. It never treats a mismatch or a
     /// missing owner as `Ready`.
     pub(crate) fn boot_authority(&self, store: &Store) -> PreparedBoot {
-        match current_owner_authority(store, &self.profile, &self.owner, false) {
+        match self.owner.current_authority(store, false) {
             Ok((witness, BootAuthority::Ready)) => PreparedBoot::Ready {
-                owner_epoch: witness.owner_epoch,
-                floor_sequence: witness.min_sequence,
-                floor_digest: witness.min_digest,
+                owner_epoch: witness.owner_epoch(),
+                floor_sequence: witness.min_sequence(),
+                floor_digest: witness.min_digest().to_string(),
             },
             Ok((_, BootAuthority::MetadataOnly(code))) => PreparedBoot::MetadataOnly { code },
             Err(_) => PreparedBoot::MetadataOnly {
@@ -293,9 +123,9 @@ impl PreparedProtection {
         &self,
     ) -> Result<crate::protected_runtime::client::PrestartEligibility> {
         let witness = self.owner.client()?.prestart_eligibility()?;
-        if witness.workspace_id != self.profile.workspace_id()
-            || witness.database_epoch != self.profile.database_epoch()
-            || witness.restore_state != "stable"
+        if witness.workspace_id() != self.profile.workspace_id()
+            || witness.database_epoch() != self.profile.database_epoch()
+            || witness.restore_state() != "stable"
         {
             return Err(Error::rejected(
                 "owner prestart witness does not match this protected profile/lineage",
@@ -328,16 +158,15 @@ pub(crate) fn prepare_profile(profile_path: Option<&Path>) -> Result<Option<Prep
     };
     let profile = LocalProfile::load_from(path)?;
     // This process must be the pinned supervisor.
-    let facts = crate::protected_runtime::local_supervisor_facts(&profile)?;
+    let owner = OwnerLink::new(profile.clone())?;
     validate_private_layout(&profile)?;
-    let owner = OwnerLink::new(profile.clone(), facts.generation.clone());
     // Eager connect is best effort: the checkpoint writer (not startup) stays
     // fail-closed until the owner is live, so encrypted metadata remains
     // readable in the meantime.
     let _ = owner.client();
     Ok(Some(PreparedProtection {
         profile,
-        supervisor_generation: facts.generation,
+        supervisor_generation: owner.generation().to_owned(),
         owner,
     }))
 }
@@ -354,9 +183,7 @@ pub(crate) fn install_store_gate(
     prepared: &PreparedProtection,
 ) -> Result<PreparedBoot> {
     validate_core_identity(store, &prepared.profile)?;
-    store.install_protected_checkpoint(Arc::new(OwnerCheckpoint {
-        link: Arc::clone(&prepared.owner),
-    }))?;
+    prepared.owner.install_checkpoint(store)?;
     // The composite gate: the permitted latchless Legacy store stays
     // `protected=false`; real protected admission requires this live owner
     // witness + the ledger floor, decided before any guarded recovery.
@@ -583,9 +410,9 @@ impl Drop for RuntimeLaunchGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             let _ = self.coordinator.fence_id(
-                &self.prepared.runtime_id,
-                &self.prepared.operation_id,
-                self.prepared.generation,
+                self.prepared.runtime_id(),
+                self.prepared.operation_id(),
+                self.prepared.generation(),
                 "runtime bootstrap did not complete",
             );
         }
@@ -654,79 +481,6 @@ pub(crate) struct ProtectedRuntimeCoordinator {
     router: Arc<RuntimeOpsRouter>,
     eligibility: CurrentEligibility,
     closing: AtomicBool,
-}
-
-/// The attachment returned for one agent: the private console plus the stable
-/// generation tag the adapter stamps on its events, and the closed caller
-/// identity the adapter binds a durable model task to.
-pub(crate) struct AttachedConsole {
-    pub(crate) console: OwnerConsole,
-    pub(crate) generation_tag: String,
-    pub(crate) runtime_id: String,
-    pub(crate) caller: RuntimeCaller,
-}
-
-/// The process-global console provider. The protected coordinator is a
-/// process-global authority (one daemon per process); the adapter reaches it
-/// without threading a new field through every adapter constructor.
-static CONSOLE_PROVIDER: OnceLock<Weak<dyn ProtectedConsoleProvider>> = OnceLock::new();
-
-/// One agent's closed console subject. Values come from the durable agent row
-/// the daemon already holds; nothing here is a request field.
-pub(crate) struct ConsoleSubject<'a> {
-    pub(crate) alias: &'a str,
-    pub(crate) agent_uid: &'a str,
-    pub(crate) created: f64,
-}
-
-/// A held native-model task binding. Dropping it ends the binding; `fence`
-/// stops new preparation for the turn when it settles or is interrupted.
-pub(crate) trait NativeTaskGuard: Send {
-    fn fence(&self, reason: &str);
-}
-
-/// The adapter-facing contract implemented by the coordinator.
-pub(crate) trait ProtectedConsoleProvider: Send + Sync {
-    fn open_console(
-        &self,
-        subject: ConsoleSubject<'_>,
-        stderr_log: &Path,
-    ) -> Result<AttachedConsole>;
-
-    fn bind_native_task(
-        &self,
-        caller: &RuntimeCaller,
-        client_message_id: &str,
-        claim: &crate::store::NativeTurnClaim,
-        turn_token: &str,
-    ) -> Result<Box<dyn NativeTaskGuard>>;
-
-    /// Stop exactly this agent's owned runtime. Best effort from a close path;
-    /// the owner fences first and only retires its own labelled container.
-    fn stop_agent(&self, agent_uid: &str, reason: &str);
-}
-
-/// Install the process-global provider (called once from [`initialize`]).
-fn install_console_provider(coordinator: &Arc<ProtectedRuntimeCoordinator>) -> Result<()> {
-    let provider: Arc<dyn ProtectedConsoleProvider> = coordinator.clone();
-    let weak: Weak<dyn ProtectedConsoleProvider> = Arc::downgrade(&provider);
-    CONSOLE_PROVIDER
-        .set(weak)
-        .map_err(|_| Error::internal("the protected console provider is already installed"))
-}
-
-/// The live provider, or a refusal. An active protected profile without a
-/// provider refuses — it never falls back to a host process.
-pub(crate) fn console_provider() -> Result<Arc<dyn ProtectedConsoleProvider>> {
-    CONSOLE_PROVIDER
-        .get()
-        .and_then(|weak| weak.upgrade())
-        .ok_or_else(|| {
-            Error::invalid(
-                "runtime_unqualified",
-                "no protected runtime coordinator is installed",
-            )
-        })
 }
 
 impl ProtectedRuntimeCoordinator {
@@ -967,8 +721,7 @@ impl ProtectedRuntimeCoordinator {
             .shared
             .upgrade()
             .ok_or_else(|| Error::invalid("runtime_unqualified", "the daemon is shutting down"))?;
-        let (_, authority) =
-            current_owner_authority(&shared.store, &self.profile, &self.owner, true)?;
+        let (_, authority) = self.owner.current_authority(&shared.store, true)?;
         if let BootAuthority::MetadataOnly(code) = authority {
             return Err(Error::invalid(code, "protected execution is unavailable"));
         }
@@ -989,9 +742,7 @@ impl ProtectedRuntimeCoordinator {
         handle: &RuntimeHandle,
         stderr_log: &Path,
     ) -> Result<AttachedConsole> {
-        let status = self
-            .owner
-            .read(|client| client.observe(&handle.runtime_id))?;
+        let status = self.owner.observe(&handle.runtime_id)?;
         if status.phase != "ready" || !status.qualified || status.fenced_reason.is_some() {
             return Err(Error::rejected("registered runtime is not live"));
         }
@@ -1004,47 +755,33 @@ impl ProtectedRuntimeCoordinator {
                 "registered runtime no longer names this exact subject",
             ));
         }
-        let qualified = self
-            .owner
-            .read(|client| client.recheck(&handle.runtime_id, handle.generation))?;
-        self.eligibility.refresh(qualified)?;
-        self.attach_console(handle, stderr_log)
-    }
-
-    fn attach_console(&self, handle: &RuntimeHandle, stderr_log: &Path) -> Result<AttachedConsole> {
-        let client = self.owner.client()?;
-        let open = client.open_console(
-            &handle.runtime_id,
-            handle.generation,
-            &handle.recipient_nonce,
-        )?;
-        if open.node_pid != handle.node_pid || open.node_starttime != handle.node_starttime {
+        let qualified = self.owner.recheck(&handle.runtime_id, handle.generation)?;
+        let identity = qualified.identity();
+        if identity.runtime_id != handle.runtime_id
+            || identity.agent_uid != handle.agent_uid
+            || identity.session_binding != handle.session_binding
+            || identity.runtime_generation != handle.generation
+            || identity.os_uid != handle.os_uid
+            || identity.node_pid != handle.node_pid
+            || identity.node_starttime != handle.node_starttime
+        {
             return Err(Error::rejected(
-                "owner console names a different measured guest",
+                "registered runtime no longer names this exact subject",
             ));
         }
-        let console = console::connect(
-            &open.path,
-            &open.token,
-            &handle.runtime_id,
-            handle.generation,
-            open.node_pid,
-            Some(stderr_log.to_path_buf()),
-        )?;
-        Ok(AttachedConsole {
-            console,
-            generation_tag: format!("{}-{}", handle.runtime_id, handle.generation),
-            runtime_id: handle.runtime_id.clone(),
-            caller: RuntimeCaller::registered(
-                handle.runtime_id.clone(),
-                handle.agent_uid.clone(),
-                handle.session_binding.clone(),
-                handle.generation,
-                handle.os_uid,
-                handle.node_pid,
-                handle.node_starttime,
-            ),
-        })
+        let subject = VerifiedConsoleSubject::from_qualified(&qualified);
+        self.eligibility.refresh(qualified)?;
+        self.attach_console(handle, subject, stderr_log)
+    }
+
+    fn attach_console(
+        &self,
+        handle: &RuntimeHandle,
+        subject: VerifiedConsoleSubject,
+        stderr_log: &Path,
+    ) -> Result<AttachedConsole> {
+        let client = self.owner.client()?;
+        console_port::attach_console(&client, subject, &handle.recipient_nonce, stderr_log)
     }
 
     /// The complete r5 cold bootstrap for one agent. Any stage that does not
@@ -1085,20 +822,11 @@ impl ProtectedRuntimeCoordinator {
         };
         // Bind the one per-runtime operations socket BEFORE start: the owner
         // seals this exact listening socket at start_runtime.
-        let listener = RuntimeOpsListener::bind(
-            &prepared.ops_socket,
-            AgentEnrollment {
-                runtime_id: prepared.runtime_id.clone(),
-                agent_uid: agent_uid.to_string(),
-                session_binding: session_binding.clone(),
-                runtime_generation: prepared.generation,
-                os_uid: prepared.os_uid,
-            },
-        )?;
+        let listener = prepared.bind_operations()?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut ops_guard = OpsListenerGuard {
             stop: Arc::clone(&stop),
-            path: prepared.ops_socket.clone(),
+            path: prepared.ops_socket().to_path_buf(),
             armed: true,
         };
         {
@@ -1125,32 +853,33 @@ impl ProtectedRuntimeCoordinator {
             grant.register_prepared(&prepared)?;
         }
         client.release_installer(
-            &prepared.runtime_id,
-            &prepared.operation_id,
-            prepared.generation,
+            prepared.runtime_id(),
+            prepared.operation_id(),
+            prepared.generation(),
         )?;
         self.wait_for_install(&prepared)?;
         let started = client
-            .start_runtime(&prepared.runtime_id, prepared.generation)
+            .start_runtime(prepared.runtime_id(), prepared.generation())
             .inspect_err(|_| {
                 self.owner.invalidate();
             })?;
-        if started.generation != prepared.generation || started.node_pid == 0 {
+        if started.generation != prepared.generation() || started.node_pid == 0 {
             return Err(Error::unknown(
                 "owner start reply does not bind this runtime",
             ));
         }
-        self.wait_for_phase(&prepared.runtime_id, "ready", READY_BUDGET)?;
+        self.wait_for_phase(prepared.runtime_id(), "ready", READY_BUDGET)?;
         let qualified = client
-            .recheck(&prepared.runtime_id, prepared.generation)
+            .recheck(prepared.runtime_id(), prepared.generation())
             .inspect_err(|_| {
                 self.owner.invalidate();
             })?;
         let identity = qualified.identity();
-        if identity.agent_uid != agent_uid
+        if identity.runtime_id != prepared.runtime_id()
+            || identity.agent_uid != agent_uid
             || identity.session_binding != session_binding
-            || identity.runtime_generation != prepared.generation
-            || identity.os_uid != prepared.os_uid
+            || identity.runtime_generation != prepared.generation()
+            || identity.os_uid != prepared.os_uid()
             || identity.node_pid != started.node_pid
             || identity.node_starttime != started.node_starttime
         {
@@ -1167,23 +896,24 @@ impl ProtectedRuntimeCoordinator {
             },
             agent_uid: agent_uid.to_string(),
             session_binding,
-            runtime_id: prepared.runtime_id.clone(),
-            operation_id: prepared.operation_id.clone(),
-            generation: prepared.generation,
+            runtime_id: prepared.runtime_id().to_string(),
+            operation_id: prepared.operation_id().to_string(),
+            generation: prepared.generation(),
             server_generation,
-            owner_epoch: prepared.owner_epoch,
-            os_uid: prepared.os_uid,
+            owner_epoch: prepared.owner_epoch(),
+            os_uid: prepared.os_uid(),
             node_pid: identity.node_pid,
             node_starttime: identity.node_starttime,
-            recipient_nonce: prepared.recipient_nonce.clone(),
+            recipient_nonce: prepared.recipient_nonce().to_string(),
             container_id: identity.container_id.clone(),
             loaded_receipt_id: identity.loaded_receipt_id.clone(),
             observed_registry_digest: identity.loaded_registry_digest.clone(),
             stop: Arc::clone(&stop),
-            ops_path: prepared.ops_socket.clone(),
+            ops_path: prepared.ops_socket().to_path_buf(),
         };
+        let subject = VerifiedConsoleSubject::from_qualified(&qualified);
         self.eligibility.refresh(qualified)?;
-        let attached = self.attach_console(&handle, stderr_log)?;
+        let attached = self.attach_console(&handle, subject, stderr_log)?;
         self.insert_handle(handle);
         ops_guard.armed = false;
         launch_guard.armed = false;
@@ -1200,14 +930,14 @@ impl ProtectedRuntimeCoordinator {
         let image = self.profile.image();
         let expected = SupervisorChallenge {
             launch: LaunchBinding {
-                epoch: prepared.owner_epoch,
-                request: parse_request(&prepared.launch_request)?,
+                epoch: prepared.owner_epoch(),
+                request: parse_request(prepared.launch_request())?,
             },
             recipient: Recipient {
-                pid: prepared.recipient_pid,
-                starttime: prepared.recipient_starttime.to_string(),
-                generation: prepared.recipient_generation.clone(),
-                nonce: prepared.recipient_nonce.clone(),
+                pid: prepared.recipient_pid(),
+                starttime: prepared.recipient_starttime().to_string(),
+                generation: prepared.recipient_generation().to_string(),
+                nonce: prepared.recipient_nonce().to_string(),
             },
             pins: Pins {
                 source: image.source.clone(),
@@ -1233,7 +963,7 @@ impl ProtectedRuntimeCoordinator {
                 .map_err(|_| Error::internal("grant core lock poisoned"))?
                 .as_mut()
                 .ok_or_else(|| Error::rejected("the grant core is unavailable"))?
-                .take_installed(&prepared.operation_id);
+                .take_installed(prepared.operation_id());
             if let Some(grant) = installed {
                 if grant.challenge() != &expected {
                     return Err(Error::rejected(
@@ -1252,7 +982,7 @@ impl ProtectedRuntimeCoordinator {
     fn wait_for_phase(&self, runtime_id: &str, phase: &str, budget: Duration) -> Result<()> {
         let deadline = Instant::now() + budget;
         loop {
-            match self.owner.read(|client| client.observe(runtime_id)) {
+            match self.owner.observe(runtime_id) {
                 Ok(status) => {
                     if status.phase == phase && status.fenced_reason.is_none() {
                         return Ok(());
@@ -1353,15 +1083,15 @@ impl ProtectedRuntimeCoordinator {
         handle: &RuntimeHandle,
     ) -> Result<crate::protected_runtime::OwnerEvidence> {
         self.owner
-            .read(|client| client.owner_evidence(&handle.runtime_id, handle.generation))
+            .owner_evidence(&handle.runtime_id, handle.generation)
     }
 
     fn owner_eligibility(&self, handle: &RuntimeHandle) -> Result<OwnerEligibility> {
         let evidence = self.live_evidence(handle)?;
-        if evidence.agent_uid != handle.agent_uid
-            || evidence.session_binding != handle.session_binding
-            || evidence.runtime_generation != handle.generation
-            || evidence.os_uid != handle.os_uid
+        if evidence.agent_uid() != handle.agent_uid
+            || evidence.session_binding() != handle.session_binding
+            || evidence.runtime_generation() != handle.generation
+            || evidence.os_uid() != handle.os_uid
         {
             return Err(Error::rejected(
                 "owner evidence does not name the registered subject",
@@ -1385,7 +1115,7 @@ impl ProtectedRuntimeCoordinator {
             ));
         }
         let utility = self.live_evidence(&handle)?;
-        if utility.phase != "ready" || utility.fenced {
+        if utility.phase() != "ready" || utility.fenced() {
             return Err(Error::invalid(
                 "runtime_unqualified",
                 "the registered runtime is not currently ready",
@@ -1415,7 +1145,7 @@ impl ProtectedRuntimeCoordinator {
             session_binding: handle.session_binding.clone(),
             runtime_id: handle.runtime_id.clone(),
             runtime_generation: handle.generation,
-            owner_epoch: utility.owner_epoch,
+            owner_epoch: utility.owner_epoch(),
             os_uid: handle.os_uid,
             node_pid: handle.node_pid,
             node_starttime: handle.node_starttime,
@@ -1458,7 +1188,7 @@ impl ProtectedRuntimeCoordinator {
         }
         let qualified = self
             .owner
-            .read(|client| client.recheck(&caller_handle.runtime_id, caller_handle.generation))?;
+            .recheck(&caller_handle.runtime_id, caller_handle.generation)?;
         let live = qualified.identity();
         if live.owner_epoch != evidence.owner_epoch
             || live.runtime_generation != evidence.runtime_generation
@@ -1524,14 +1254,7 @@ impl BrokerFenceTarget for ProtectedRuntimeCoordinator {
         stream: &std::os::unix::net::UnixStream,
         owner_epoch: u64,
     ) -> Result<()> {
-        let client = self
-            .owner
-            .client
-            .read()
-            .map_err(|_| Error::rejected("owner channel state is unavailable"))?
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| Error::rejected("owner channel is not authenticated"))?;
+        let client = self.owner.connected_client()?;
         client.verify_owner_callback(stream, owner_epoch)
     }
 
@@ -1582,8 +1305,7 @@ impl ProtectedRuntimeCoordinator {
             .shared
             .upgrade()
             .ok_or_else(|| Error::invalid("runtime_unqualified", "the daemon is shutting down"))?;
-        let (witness, current) =
-            current_owner_authority(&shared.store, &self.profile, &self.owner, false)?;
+        let (witness, current) = self.owner.current_authority(&shared.store, false)?;
         if let BootAuthority::MetadataOnly(code) = current {
             return Err(Error::invalid(
                 code,
@@ -1598,7 +1320,7 @@ impl ProtectedRuntimeCoordinator {
                 "durable core identity does not match the protected profile",
             ));
         }
-        let owner_epoch = witness.owner_epoch;
+        let owner_epoch = witness.owner_epoch();
         Ok(ManagementProfileEvidence {
             workspace_id: self.profile.workspace_id().to_string(),
             custody_domain: "local",
@@ -1807,7 +1529,8 @@ pub(crate) fn initialize(shared: &Arc<Shared>, prepared: Option<PreparedProtecti
         return shared.install_protected(None);
     };
     let coordinator = ProtectedRuntimeCoordinator::start(shared, prepared)?;
-    install_console_provider(&coordinator)?;
+    let provider: Arc<dyn ProtectedConsoleProvider> = coordinator.clone();
+    console_port::install_console_provider(&coordinator.owner, &provider)?;
     shared.install_protected(Some(
         Arc::clone(&coordinator) as Arc<dyn ProtectedOwnerClient>
     ))?;
@@ -1846,8 +1569,8 @@ fn is_stable_agent_uid(value: &str) -> bool {
 }
 
 fn random_hex32() -> Result<String> {
-    let raw = attestation::random32()?;
-    Ok(attestation::hex32(&raw))
+    let raw = crate::protected_runtime::random32()?;
+    Ok(crate::protected_runtime::hex32(&raw))
 }
 
 /// The durable server generation for one agent registration. The registration
@@ -1868,7 +1591,7 @@ pub(crate) fn runtime_status(
     coordinator: &ProtectedRuntimeCoordinator,
     runtime_id: &str,
 ) -> Result<RuntimeStatus> {
-    coordinator.owner.read(|client| client.observe(runtime_id))
+    coordinator.owner.observe(runtime_id)
 }
 
 #[cfg(test)]
