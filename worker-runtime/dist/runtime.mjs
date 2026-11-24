@@ -51839,19 +51839,13 @@ var REFUSED = /refused|forbidden|unauthori[sz]ed|denied/i;
 var REFUSED_STATUS = word("401|402|403");
 var TOOL_CALL = /tool.?call/i;
 var TOOL_CALL_OUTPUT_LIMIT = /output.?(?:limit|space|token)/i;
-var TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|exceed/i;
+var TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|supported.?limit/i;
 function failedTurnReason(errorMessage) {
   const raw = errorMessage ?? "";
   if (raw.includes("billing_unavailable"))
     return "billing_unavailable";
   if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
     return "The selected model cannot read images.";
-  if (TOOL_CALL.test(raw)) {
-    if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
-      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
-    if (TOOL_CALL_TOO_LARGE.test(raw))
-      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
-  }
   if (TIMEOUT.test(raw))
     return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
@@ -51860,6 +51854,12 @@ function failedTurnReason(errorMessage) {
     return "The model is busy right now.";
   if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
     return "The model request was refused.";
+  if (TOOL_CALL.test(raw)) {
+    if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
+      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
+    if (TOOL_CALL_TOO_LARGE.test(raw))
+      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
+  }
   return "The model request failed.";
 }
 function terminalError(messages, index) {
@@ -52028,8 +52028,11 @@ function partialText(message) {
 `).trim();
   return text.length <= PARTIAL_TEXT_CAP ? text : `${text.slice(0, PARTIAL_TEXT_CAP)}...`;
 }
+function readable(reason) {
+  return reason === "billing_unavailable" ? "Billing is unavailable for this workspace." : reason;
+}
 function failureNote(message, ran) {
-  const reason = message.stopReason === "aborted" ? "The turn was stopped." : failedTurnReason(message.errorMessage);
+  const reason = message.stopReason === "aborted" ? "The turn was stopped." : readable(failedTurnReason(message.errorMessage));
   const partial = partialText(message);
   const names = [...new Set(ran.map((result) => result.toolName))];
   return [

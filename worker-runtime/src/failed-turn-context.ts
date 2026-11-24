@@ -36,11 +36,18 @@ function partialText(message: Assistant): string {
     : `${text.slice(0, PARTIAL_TEXT_CAP)}...`;
 }
 
+/** The board's sentinel token is not a sentence a model can use. */
+function readable(reason: string): string {
+  return reason === "billing_unavailable"
+    ? "Billing is unavailable for this workspace."
+    : reason;
+}
+
 function failureNote(message: Assistant, ran: readonly ToolResult[]): string {
   const reason =
     message.stopReason === "aborted"
       ? "The turn was stopped."
-      : failedTurnReason(message.errorMessage);
+      : readable(failedTurnReason(message.errorMessage));
   const partial = partialText(message);
   const names = [...new Set(ran.map((result) => result.toolName))];
   return [

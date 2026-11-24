@@ -27,7 +27,7 @@ const REFUSED_STATUS = word("401|402|403");
 // distinguishing words and let the sentence around them change.
 const TOOL_CALL = /tool.?call/i;
 const TOOL_CALL_OUTPUT_LIMIT = /output.?(?:limit|space|token)/i;
-const TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|exceed/i;
+const TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|supported.?limit/i;
 
 /** Classify private provider text; never expose its URLs, keys or diagnostics. */
 export function failedTurnReason(errorMessage: string | undefined): string {
@@ -35,12 +35,6 @@ export function failedTurnReason(errorMessage: string | undefined): string {
   if (raw.includes("billing_unavailable")) return "billing_unavailable";
   if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
     return "The selected model cannot read images.";
-  if (TOOL_CALL.test(raw)) {
-    if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
-      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
-    if (TOOL_CALL_TOO_LARGE.test(raw))
-      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
-  }
   if (TIMEOUT.test(raw)) return "The model request timed out.";
   if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
     return "The model service could not be reached.";
@@ -48,6 +42,12 @@ export function failedTurnReason(errorMessage: string | undefined): string {
     return "The model is busy right now.";
   if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
     return "The model request was refused.";
+  if (TOOL_CALL.test(raw)) {
+    if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
+      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
+    if (TOOL_CALL_TOO_LARGE.test(raw))
+      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
+  }
   return "The model request failed.";
 }
 

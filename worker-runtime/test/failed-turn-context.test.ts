@@ -1,6 +1,7 @@
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "bun:test";
+import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { withFailedTurnNotes } from "../src/failed-turn-context.ts";
 import { threadEntries } from "../src/transcript.ts";
 
@@ -118,5 +119,30 @@ describe("failed turn reasons", () => {
       "The model request timed out.",
     );
     expect(reasonOf("something unrelated broke")).toBe("The model request failed.");
+  });
+
+  it("keeps every existing class for text that also mentions a tool call", () => {
+    expect(reasonOf("tool call timed out: deadline exceeded")).toBe("The model request timed out.");
+    expect(reasonOf("Rate limit exceeded (429) while streaming tool call")).toBe("The model is busy right now.");
+    expect(reasonOf("503 service unavailable: tool call quota exceeded")).toBe("The model service could not be reached.");
+    expect(reasonOf("401 unauthorized: tool_call limit exceeded")).toBe("The model request was refused.");
+    expect(reasonOf("overloaded: tool calls exceeded concurrency")).toBe("The model is busy right now.");
+  });
+});
+
+describe("failed turn note on replay", () => {
+  it("survives pi-ai transformMessages, and the billing token reads as a sentence", () => {
+    const messages: Message[] = [
+      user("hi"),
+      assistant([], "error", "billing_unavailable"),
+      user("what went wrong?"),
+    ];
+    const model = { api: "openai-completions", provider: "openai", id: "synthetic", input: ["text"] } as never;
+    const replayed = transformMessages(withFailedTurnNotes(messages) as Message[], model);
+    expect(replayed).toHaveLength(3);
+    expect(text(replayed[1])).toBe(
+      "[Your previous turn did not finish: Billing is unavailable for this workspace. No tool call from that turn completed.]",
+    );
+    expect(replayed.length - transformMessages(messages, model).length).toBe(1);
   });
 });
