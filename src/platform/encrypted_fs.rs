@@ -86,8 +86,7 @@ impl Directories {
     }
     /// Artifact directories allocate every missing component exclusively;
     /// existing components receive the same owner-controlled admission.
-    #[doc(hidden)]
-    pub fn artifact(path: &Path, fresh: bool) -> Result<(Self, bool)> {
+    pub(crate) fn artifact(path: &Path, fresh: bool) -> Result<(Self, bool)> {
         Self::open_mode(path, true, true, fresh, true)
     }
     /// Legacy metadata/artifact compatibility under owner-controlled paths,
@@ -192,8 +191,7 @@ impl Directories {
     }
     /// Remove only this still-pinned final directory and only if empty.
     /// Caller must prove it exclusively created that component.
-    #[doc(hidden)]
-    pub fn remove_empty_last(&self) -> Result<()> {
+    pub(crate) fn remove_empty_last(&self) -> Result<()> {
         self.check()?;
         let parent = &self.handles[self.handles.len() - 2];
         let leaf = self.names.last().ok_or_else(store_refused)?;
@@ -202,13 +200,17 @@ impl Directories {
         }
         parent.sync_all().map_err(|_| store_refused())
     }
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn last(&self) -> &File {
         self.handles.last().expect("root descriptor always present")
     }
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
+    pub(crate) fn last(&self) -> &File {
+        self.handles.last().expect("root descriptor always present")
+    }
     /// Metadata-only inspection; never opens the configured key/vault leaf.
-    #[doc(hidden)]
-    pub fn stat(&self, leaf: &std::ffi::OsStr) -> Result<Option<libc::stat>> {
+    pub(crate) fn stat(&self, leaf: &std::ffi::OsStr) -> Result<Option<libc::stat>> {
         statat(self.last(), &name(leaf.as_bytes())?)
     }
     /// Only the fixed path-only record is opened here, never a key file.
@@ -226,8 +228,7 @@ impl Directories {
         Ok(Some(file))
     }
     #[allow(clippy::unnecessary_cast)] // stat field widths differ across Unix hosts
-    #[doc(hidden)]
-    pub fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let mut private_ancestor = false;
         for (i, part) in self.names.iter().enumerate() {
             let current = statat(&self.handles[i], part)?.ok_or_else(store_refused)?;
@@ -393,5 +394,77 @@ impl VaultFiles {
             .sync_all()
             .and_then(|_| self.dirs.last().sync_all())
             .map_err(|_| Error::invalid("outcome_unknown", "custody filesystem durability unknown"))
+    }
+}
+
+/// Artifact-only capability wrapper around [`Directories`] for `cadence-ops`
+/// (`backup::namespace`), keeping `Directories::last()` and raw custody
+/// directory handles internal to `cadence-agent`.
+#[doc(hidden)]
+pub struct ArtifactPin(Directories);
+
+impl ArtifactPin {
+    pub fn open(path: &Path, fresh: bool) -> Result<(Self, bool)> {
+        Directories::artifact(path, fresh).map(|(dirs, created)| (Self(dirs), created))
+    }
+
+    pub fn check(&self) -> Result<()> {
+        self.0.check()
+    }
+
+    pub fn stat(&self, leaf: &std::ffi::OsStr) -> Result<Option<libc::stat>> {
+        self.0.stat(leaf)
+    }
+
+    pub fn dir_metadata(&self) -> std::io::Result<Metadata> {
+        self.0.last().metadata()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn linux_proc_fd_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", self.0.last().as_raw_fd()))
+    }
+
+    pub fn open_exclusive_file(&self, encoded: &std::ffi::CStr) -> std::io::Result<File> {
+        let raw = unsafe {
+            libc::openat(
+                self.0.last().as_raw_fd(),
+                encoded.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+                0o600,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(raw) })
+    }
+
+    pub fn unlink_leaf(&self, encoded: &std::ffi::CStr) -> std::io::Result<()> {
+        if unsafe { libc::unlinkat(self.0.last().as_raw_fd(), encoded.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn link_leaf(&self, from: &std::ffi::CStr, to: &std::ffi::CStr) -> std::io::Result<()> {
+        let fd = self.0.last().as_raw_fd();
+        if unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn sync_all(&self) -> std::io::Result<()> {
+        self.0.last().sync_all()
+    }
+
+    pub fn remove_empty_last(&self) -> Result<()> {
+        self.0.remove_empty_last()
     }
 }

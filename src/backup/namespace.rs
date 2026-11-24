@@ -4,11 +4,10 @@
 //! supported Unix re-proves the admitted canonical path on every use.
 //! Publication is exclusive linkat, cleanup is inode/owner checked unlinkat.
 use crate::error::{Error, Result};
-use crate::platform::ControlledDirectories;
+use crate::platform::ArtifactPin;
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -37,7 +36,7 @@ struct Identity {
 }
 
 pub(super) struct ArtifactDir {
-    pin: ControlledDirectories,
+    pin: ArtifactPin,
     path: PathBuf,
     // Identity of the admitted directory. Linux uses it for the one-time
     // /proc admission proof; the other supported Unix re-proves the pathname
@@ -57,9 +56,8 @@ impl ArtifactDir {
             return Err(refused());
         }
         let path = crate::platform::encrypted_config::resolve_output(path)?;
-        let (pin, created) =
-            ControlledDirectories::artifact(&path, fresh).map_err(|_| refused())?;
-        let meta = pin.last().metadata()?;
+        let (pin, created) = ArtifactPin::open(&path, fresh).map_err(|_| refused())?;
+        let meta = pin.dir_metadata()?;
         if meta.uid() != unsafe { libc::geteuid() } {
             return Err(refused());
         }
@@ -116,7 +114,7 @@ impl ArtifactDir {
     }
     #[cfg(target_os = "linux")]
     fn view_path(&self) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.pin.last().as_raw_fd()))
+        self.pin.linux_proc_fd_path()
     }
     #[cfg(not(target_os = "linux"))]
     fn view_path(&self) -> PathBuf {
@@ -133,23 +131,10 @@ impl ArtifactDir {
     pub(super) fn create(&mut self, name: &OsStr) -> Result<File> {
         self.check()?;
         let encoded = leaf(name)?;
-        let raw = unsafe {
-            libc::openat(
-                self.pin.last().as_raw_fd(),
-                encoded.as_ptr(),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC
-                    | libc::O_NONBLOCK,
-                0o600,
-            )
-        };
-        if raw < 0 {
-            return Err(refused());
-        }
-        let file = unsafe { File::from_raw_fd(raw) };
+        let file = self
+            .pin
+            .open_exclusive_file(&encoded)
+            .map_err(|_| refused())?;
         let meta = file.metadata()?;
         if !meta.is_file()
             || meta.uid() != unsafe { libc::geteuid() }
@@ -212,9 +197,7 @@ impl ArtifactDir {
             return Err(refused());
         }
         let encoded = leaf(name)?;
-        if unsafe { libc::unlinkat(self.pin.last().as_raw_fd(), encoded.as_ptr(), 0) } != 0 {
-            return Err(refused());
-        }
+        self.pin.unlink_leaf(&encoded).map_err(|_| refused())?;
         self.owned.remove(name);
         Ok(())
     }
@@ -226,21 +209,10 @@ impl ArtifactDir {
         }
         let from = leaf(temp)?;
         let to = leaf(final_name)?;
-        if unsafe {
-            libc::linkat(
-                self.pin.last().as_raw_fd(),
-                from.as_ptr(),
-                self.pin.last().as_raw_fd(),
-                to.as_ptr(),
-                0,
-            )
-        } != 0
-        {
-            return Err(refused());
-        }
+        self.pin.link_leaf(&from, &to).map_err(|_| refused())?;
         self.owned.insert(final_name.to_os_string(), identity);
         self.remove_owned(temp)?;
-        self.pin.last().sync_all()?;
+        self.pin.sync_all()?;
         Ok(())
     }
     pub(super) fn clean_sidecars(&mut self, db: &OsStr) -> Result<()> {
@@ -253,7 +225,7 @@ impl ArtifactDir {
     }
     pub(super) fn commit(&mut self) -> Result<()> {
         self.check()?;
-        self.pin.last().sync_all()?;
+        self.pin.sync_all()?;
         self.committed = true;
         Ok(())
     }

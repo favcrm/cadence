@@ -23,6 +23,9 @@ mod encrypted_fs;
 /// record. `pub(crate)` — no platform/custody surface re-exports it.
 pub(crate) mod scoped_cursor_config;
 #[doc(hidden)]
+pub use encrypted_fs::ArtifactPin;
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[doc(hidden)]
 pub use encrypted_fs::Directories as ControlledDirectories;
 #[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
