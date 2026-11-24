@@ -167,27 +167,12 @@ source review. Record "fresh-session review," not "independent parties."
 For hosted Standards and Spec/security, only eligible owner-attested verdicts
 or trusted workflow results count. A fresh OMP review is evidence, not a
 hosted verdict. See [Review evidence](docs/guides/delivery.md#review-evidence).
-If two source reviews are required, use a separate fresh session for each
-axis. Record the resolved model in each exact-head report. Fresh, read-only
-OMP reviewers may replace Opus for these CI-only changes:
-
-- Changes to how an existing required check runs that preserve its scope,
-  coverage and refusal behavior.
-- Adding or changing a manually dispatched GitHub Actions Rust dependency
-  cache job that builds and saves only on protected `refs/heads/main`. The
-  job checks the explicitly requested SHA against the event SHA before
-  checkout or cache access and builds that commit. It uses the existing pinned
-  cache action, saves only after a successful build, and excludes workspace
-  and test artifacts. PR and merge-queue consumers stay restore-only. The
-  change adds no credential access, token permissions, or R2/shared sccache writes.
-
-Neither exception covers changes to review or delivery rules, production
-security, schemas or release behavior. Use the policy already on `main` to
-review a policy change; a PR cannot apply its proposed exception to itself.
-
-Other gate, security, schema and release PRs still require fresh-session Opus
-source reviews. The hosted workflow reviews below do not replace these source
-reviews. This does not change hosted verdict eligibility or operator approval.
+If two source reviews are required, use separate fresh, read-only sessions for
+Standards and Spec/security. Use the repository's approved reviewer routing.
+Fresh, read-only OMP subagents qualify, including for gate, security, schema
+and release PRs. Record the full PR head and actual resolved model in each
+source report. Hosted workflow verdicts do not replace required source reviews.
+Review changes to this policy under the rules already on protected `main`.
 
 **The hosted route** is this repository's supported delivery route.
 
