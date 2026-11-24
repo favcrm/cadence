@@ -962,7 +962,9 @@ fn cli_session_post_with(
 ) -> Result<IssuerAnswer> {
     if !matches!(
         path,
-        "/v1/hosted-cadence/cli-session/renew" | "/v1/hosted-cadence/cli-session/revoke"
+        "/v1/hosted-cadence/cli-session/renew"
+            | "/v1/hosted-cadence/cli-session/revoke"
+            | "/v1/hosted-cadence/cli-session/actor-credential"
     ) {
         return Err(reject("Hosted CLI session path refused"));
     }
@@ -1253,7 +1255,9 @@ pub fn web_issuer_request(
     let auth = format!("Bearer {bearer}");
     let failed_response = |message: &str| {
         if matches!(method, "POST" | "PUT") {
-            Error::unknown("the hosted web mutation may have committed; reconcile its saved intent before retrying")
+            Error::unknown(
+                "the hosted web mutation may have committed; reconcile its saved intent before retrying",
+            )
         } else {
             reject(message)
         }
@@ -2019,9 +2023,15 @@ impl ContinuityRefusal {
             Self::FreshConsent => {
                 "Hosted continuity requires fresh consent in a new private enrollment directory"
             }
-            Self::Parked => "Hosted continuity is parked while original session status is uncertain",
-            Self::Authorization => "Hosted continuity authorization or issuer configuration refused",
-            Self::Uncertain => "Hosted continuity request uncertain; retry the same pending key with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`",
+            Self::Parked => {
+                "Hosted continuity is parked while original session status is uncertain"
+            }
+            Self::Authorization => {
+                "Hosted continuity authorization or issuer configuration refused"
+            }
+            Self::Uncertain => {
+                "Hosted continuity request uncertain; retry the same pending key with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`"
+            }
             Self::Invalid => "Invalid hosted continuity issuer response",
         })
     }
@@ -2441,7 +2451,7 @@ fn enroll_browser_with(
             (400, Some("access_denied")) => return Err(reject("Hosted browser consent denied")),
             (400, Some("expired_token")) => return Err(reject("Hosted device code expired")),
             (400, Some("invalid_grant" | "invalid_request")) => {
-                return Err(reject("Hosted browser grant refused"))
+                return Err(reject("Hosted browser grant refused"));
             }
             (
                 403,
@@ -2494,11 +2504,20 @@ pub struct CliSession {
     pub device_label: String,
     pub idle_expires_at: u64,
     pub absolute_expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_mode: Option<String>,
 }
 
 impl CliSession {
     fn from_value(value: &Value, at: u64) -> Result<Self> {
         let session = &value["cli_session"];
+        let actor_mode = match session.get("actor_mode") {
+            None => None,
+            Some(Value::String(mode)) if matches!(mode.as_str(), "human" | "assistant") => {
+                Some(mode.clone())
+            }
+            Some(_) => return Err(reject("Invalid CLI session metadata")),
+        };
         let result = Self {
             session_id: field(session, "session_id")?.to_owned(),
             refresh_token: field(session, "refresh_token")?.to_owned(),
@@ -2506,11 +2525,13 @@ impl CliSession {
             device_label: field(session, "device_label")?.to_owned(),
             idle_expires_at: timestamp(session, "idle_expires_at")?,
             absolute_expires_at: timestamp(session, "absolute_expires_at")?,
+            actor_mode,
         };
         let fields = session
             .as_object()
             .ok_or_else(|| reject("Invalid CLI session metadata"))?;
-        if fields.len() != 6
+        let expected_len = if result.actor_mode.is_some() { 7 } else { 6 };
+        if fields.len() != expected_len
             || !result.session_id.strip_prefix("hcs_").is_some_and(|s| {
                 s.len() == 36 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
             })
@@ -2705,6 +2726,13 @@ impl LoginGrant {
         &self.capabilities
     }
 
+    /// Optional session actor mode (`"human"` or `"assistant"`, CAD-2747).
+    pub fn actor_mode(&self) -> Option<&str> {
+        self.cli_session
+            .as_ref()
+            .and_then(|session| session.actor_mode.as_deref())
+    }
+
     /// Write the `hct_` to `cli-<slug>.json` at 0600 (temp file, then
     /// rename), separate from `orgs.json`. Never printed.
     pub fn save_credential(&self, dir: &Path) -> Result<()> {
@@ -2721,7 +2749,7 @@ impl LoginGrant {
             _ => {
                 return Err(reject(
                     "CLI credential destination must be a private owned regular file",
-                ))
+                ));
             }
         }
         let mut random = [0u8; 16];
@@ -2956,6 +2984,31 @@ pub fn login_portal_scoped(
         },
         cloud_agent,
         audit_approve,
+        false,
+    )
+}
+
+/// CAD-2747: request an assistant-scoped renewable CLI session
+/// (`actor_mode: "assistant"`), which grants board/wiki capabilities without
+/// elevating to human/owner authority.
+pub fn login_portal_assistant(
+    issuer: &str,
+    hint: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<LoginGrant> {
+    let issuer = origin(issuer, cfg!(test))?;
+    login_device_flow_with(
+        &issuer,
+        None,
+        hint,
+        dir,
+        show_code,
+        &mut RealLoginRuntime,
+        LoginScope::Wiki,
+        false,
+        false,
+        true,
     )
 }
 
@@ -3156,6 +3209,7 @@ fn login_device_flow(
         scope,
         cloud_agent,
         false,
+        false,
     )
 }
 
@@ -3170,6 +3224,7 @@ fn login_device_flow_with(
     scope: LoginScope,
     cloud_agent: bool,
     audit_approve: bool,
+    as_assistant: bool,
 ) -> Result<LoginGrant> {
     if org.is_some_and(|value| !id(value)) || hint.is_some_and(|value| !slug(value)) {
         return Err(reject("Invalid hosted login request"));
@@ -3197,6 +3252,9 @@ fn login_device_flow_with(
     let mut request = json!({"version":DEVICE_VERSION,
         "client_label":"cadence-cli","requested_capabilities":requested,
         "code_challenge":challenge,"cli_session":"renewable"});
+    if as_assistant {
+        request["actor_mode"] = json!("assistant");
+    }
     if let (Some(org), Some(hint)) = (org, hint) {
         request["organization_id"] = json!(org);
         request["audience"] = json!(format!("https://{hint}{CLOUD_SUFFIX}"));
@@ -3257,7 +3315,7 @@ fn login_device_flow_with(
             (400, Some("access_denied")) => return Err(reject("Hosted browser consent denied")),
             (400, Some("expired_token")) => return Err(reject("Hosted device code expired")),
             (400, Some("invalid_grant" | "invalid_request")) => {
-                return Err(reject("Hosted browser grant refused"))
+                return Err(reject("Hosted browser grant refused"));
             }
             (
                 403,
@@ -3272,6 +3330,11 @@ fn login_device_flow_with(
     };
     let grant = login_grant(&grant, org, hint, &issuer, &requested)
         .map_err(|_| device_token_unknown(dir, org.or(hint)))?;
+    if as_assistant && grant.actor_mode() != Some("assistant") {
+        return Err(reject(
+            "Hosted issuer did not confirm an assistant CLI session for --as-assistant",
+        ));
+    }
     confirm_login_access_ingress(dir, &issuer, &access)
         .map_err(|_| device_token_unknown(dir, org.or(hint)))?;
     Ok(grant)

@@ -633,7 +633,10 @@ fn browser_continuity_bind_proves_key_and_retains_exact_private_lineage() {
         let signature = request["signature"].as_str().unwrap();
         let proof = format!(
             "{{\"version\":\"hosted-cadence-continuity.v1\",\"action\":\"bind_key\",\"challengeId\":\"ch_{}\",\"nonce\":\"{}\",\"registryEpoch\":\"{}\",\"publicKey\":\"{}\"}}",
-            "A".repeat(43), "C".repeat(43), "D".repeat(43), public
+            "A".repeat(43),
+            "C".repeat(43),
+            "D".repeat(43),
+            public
         );
         ring::signature::UnparsedPublicKey::new(
             &ring::signature::ED25519,
@@ -1381,7 +1384,10 @@ fn browser_continuity_bind_metadata_recovers_only_the_same_pending_key() {
         assert_ne!(second_body["signature"], first_body["signature"]);
         let proof = format!(
             "{{\"version\":\"hosted-cadence-continuity.v1\",\"action\":\"bind_key\",\"challengeId\":\"ch_{}\",\"nonce\":\"{}\",\"registryEpoch\":\"{}\",\"publicKey\":\"{}\"}}",
-            "F".repeat(43), "H".repeat(43), "I".repeat(43), first_public
+            "F".repeat(43),
+            "H".repeat(43),
+            "I".repeat(43),
+            first_public
         );
         ring::signature::UnparsedPublicKey::new(
             &ring::signature::ED25519,
@@ -3859,7 +3865,11 @@ mod cad2009_enrollment_uncertainty_acceptance {
             Fault::Bare503 => ("503 Service Unavailable", b"{}".to_vec()),
         };
         // A client that reaches its response cap may close before this write.
-        let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+        let _ = write!(
+            socket,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
         let _ = socket.write_all(&bytes);
         let _ = socket.flush();
     }
@@ -4036,8 +4046,11 @@ mod cad2009_enrollment_uncertainty_acceptance {
                             SERVICE,
                             &dir,
                         );
-                        assert_eq!(fs::read(dir.join(RECORD)).unwrap(), before,
-                        "{fault:?}: an unproved enrollment must not replace or delete existing custody");
+                        assert_eq!(
+                            fs::read(dir.join(RECORD)).unwrap(),
+                            before,
+                            "{fault:?}: an unproved enrollment must not replace or delete existing custody"
+                        );
                         result
                     },
                     |index, request, socket| {
@@ -4432,7 +4445,11 @@ mod cad2009_device_token_uncertainty_acceptance {
             ),
         };
         // Early client closure after its response cap is expected.
-        let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+        let _ = write!(
+            socket,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
         let _ = socket.write_all(&bytes);
         let _ = socket.flush();
     }
@@ -4692,5 +4709,118 @@ mod cad2009_device_token_uncertainty_acceptance {
                 assert!(!dir.join(CONTINUITY_RECORD).exists());
             }
         }
+    }
+
+    #[test]
+    fn cad2747_assistant_device_flow_requests_and_persists_actor_mode() {
+        struct AssistantRuntime {
+            baseline: Instant,
+            elapsed: u64,
+            saw_actor_mode: bool,
+            grant: Value,
+        }
+        impl LoginRuntime for AssistantRuntime {
+            fn now(&mut self) -> Instant {
+                self.baseline + Duration::from_secs(self.elapsed)
+            }
+            fn wait(&mut self, interval: Duration) {
+                self.elapsed += interval.as_secs();
+            }
+            fn post_public(
+                &mut self,
+                _issuer: &str,
+                path: &str,
+                body: Value,
+                _access: Option<&AccessIngress>,
+            ) -> Result<(u16, Value)> {
+                match path {
+                    "/v1/hosted-cadence/device/code" => {
+                        assert_eq!(body["actor_mode"], "assistant");
+                        self.saw_actor_mode = true;
+                        Ok((200, browser_code(60)))
+                    }
+                    "/v1/hosted-cadence/device/token" => Ok((200, self.grant.clone())),
+                    other => panic!("unexpected path {other}"),
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("assistant");
+        let issuer = "https://issuer.example.test";
+        trust(&dir, issuer);
+        let mut assistant_grant = login_grant_body();
+        assistant_grant["organization_slug"] = json!("acme");
+        assistant_grant["audience"] = json!(format!("https://acme{CLOUD_SUFFIX}"));
+        assistant_grant["capabilities"] =
+            json!(["cli.read", "cli.write", "wiki.read", "wiki.write"]);
+        assistant_grant["cli_session"]["actor_mode"] = json!("assistant");
+
+        let mut runtime = AssistantRuntime {
+            baseline: Instant::now(),
+            elapsed: 0,
+            saw_actor_mode: false,
+            grant: assistant_grant,
+        };
+        let grant = login_device_flow_with(
+            issuer,
+            None,
+            Some("acme"),
+            &dir,
+            |_, _| Ok(()),
+            &mut runtime,
+            LoginScope::Wiki,
+            false,
+            false,
+            true,
+        )
+        .expect("assistant device login must succeed");
+        assert!(runtime.saw_actor_mode);
+        assert_eq!(grant.actor_mode(), Some("assistant"));
+        grant.save_credential(&dir).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&fs::read(dir.join("cli-acme.json")).unwrap()).unwrap();
+        assert_eq!(saved["cli_session"]["actor_mode"], "assistant");
+
+        // An omitted or downgraded actor_mode on `--as-assistant` must refuse.
+        let mut omitted_grant = login_grant_body();
+        omitted_grant["organization_slug"] = json!("acme");
+        omitted_grant["audience"] = json!(format!("https://acme{CLOUD_SUFFIX}"));
+        omitted_grant["capabilities"] = json!(["cli.read", "cli.write", "wiki.read", "wiki.write"]);
+        let mut bad_runtime = AssistantRuntime {
+            baseline: Instant::now(),
+            elapsed: 0,
+            saw_actor_mode: false,
+            grant: omitted_grant,
+        };
+        assert!(login_device_flow_with(
+            issuer,
+            None,
+            Some("acme"),
+            &dir,
+            |_, _| Ok(()),
+            &mut bad_runtime,
+            LoginScope::Wiki,
+            false,
+            false,
+            true,
+        )
+        .is_err());
+
+        // Production CLI session POST wrapper must admit `/actor-credential`.
+        let answer = cli_session_post_with(
+            &dir,
+            issuer,
+            "/v1/hosted-cadence/cli-session/actor-credential",
+            BRIDGE,
+            json!({"version": "hosted-cadence-cli-session.v1", "organization_id": "ws_real", "audience": "https://acme.cadencecloud.app", "mode": "assistant"}),
+            Instant::now() + Duration::from_secs(5),
+            |_url, _bearer, _access, body, _timeout| {
+                assert_eq!(body["mode"], "assistant");
+                Ok((200, br#"{"ok":true}"#.to_vec(), None))
+            },
+        )
+        .expect("actor-credential path must be allowed on trusted issuer");
+        assert_eq!(answer.status, 200);
     }
 }

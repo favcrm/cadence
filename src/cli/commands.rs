@@ -113,6 +113,22 @@ pub(crate) enum Commands {
         /// approving or changing settings.
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         full_access: bool,
+        /// CAD-2747: request an assistant-scoped renewable session
+        /// (`actor_mode: "assistant"`), intended for unmanaged harness
+        /// terminals instead of human/owner login authority.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "token_stdin",
+                "org",
+                "web",
+                "settings",
+                "cloud_agent",
+                "audit_approve",
+                "full_access"
+            ]
+        )]
+        as_assistant: bool,
     },
     /// Create a hosted workspace in the browser and approve this CLI. Opens
     /// the AgenticOS registration page, waits for email OTP, workspace

@@ -258,7 +258,7 @@ fn auth_status_body(
                             return Err(Error::rejected(format!(
                                 "several hosted workspaces are registered ({}); name one with `cadence auth status --org <name>`",
                                 remotes.join(", ")
-                            )))
+                            )));
                         }
                     }
                 }
@@ -298,7 +298,7 @@ fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
     {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Registry::default(), None))
+            return Ok((Registry::default(), None));
         }
         // `O_NOFOLLOW` refuses any symlink, dangling or not. Name that
         // plainly: a link is a registry this process will not read, never
@@ -306,7 +306,7 @@ fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
             return Err(Error::rejected(
                 "org registry must not be a symbolic link; refusing destination selection",
-            ))
+            ));
         }
         Err(e) => return Err(e.into()),
     };
@@ -520,6 +520,9 @@ pub(super) fn run(action: OrgAction) -> Result<i32> {
             registry.selected = Some(c.selection.clone());
             file.write(&registry)?;
             view(&c, true)
+        }
+        OrgAction::Login { .. } => {
+            unreachable!("org login dispatches before org::run");
         }
     };
     print_json(&out);
@@ -1380,6 +1383,30 @@ pub(crate) enum OrgAction {
     Inspect {
         /// Org name; default is the saved/`CADENCE_ORG` selection.
         name: Option<String>,
+    },
+    /// Sign in to a hosted org (`cadence org login [--as-assistant]`).
+    Login {
+        /// Workspace slug hint.
+        #[arg(value_name = "SLUG", conflicts_with = "slug")]
+        hint: Option<String>,
+        /// Override hosted issuer URL.
+        #[arg(long)]
+        issuer: Option<String>,
+        /// Workspace slug hint (`--slug <org>`).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Switch default org to this workspace after login.
+        #[arg(long = "use")]
+        use_: bool,
+        /// Do not print browser launch links automatically.
+        #[arg(long)]
+        no_open: bool,
+        /// Override credential directory.
+        #[arg(long)]
+        auth_dir: Option<PathBuf>,
+        /// CAD-2747: request an assistant-scoped session (`actor_mode: "assistant"`).
+        #[arg(long)]
+        as_assistant: bool,
     },
 }
 

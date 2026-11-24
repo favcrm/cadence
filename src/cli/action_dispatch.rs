@@ -109,6 +109,113 @@ pub(super) fn login_granted_line(capabilities: &[String]) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_hosted_login(
+    hint: Option<&str>,
+    issuer: Option<&str>,
+    org: Option<&str>,
+    slug: Option<&str>,
+    use_: bool,
+    token_stdin: bool,
+    no_open: bool,
+    auth_dir: Option<&std::path::Path>,
+    web: bool,
+    settings: bool,
+    cloud_agent: bool,
+    audit_approve: bool,
+    full_access: bool,
+    as_assistant: bool,
+) -> Result<i32> {
+    if use_ && !token_stdin {
+        org::refuse_managed_default_change()?;
+    }
+    // `--token-stdin` is the legacy AgenticOS token path, not org login.
+    let dir = cadence_agent::remote_auth::auth_dir(auth_dir)?;
+    if token_stdin {
+        let issuer = issuer.expect("clap requires --issuer with --token-stdin");
+        let org = org.expect("clap requires --org with --token-stdin");
+        return cadence_agent::remote_auth::login(issuer, org, &dir, true, no_open);
+    }
+    let issuer = issuer.unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
+    let (web, settings, cloud_agent, audit_approve) = if as_assistant {
+        (false, false, false, false)
+    } else {
+        login_scopes(web, settings, cloud_agent, audit_approve, full_access)
+    };
+    let mut grant = if as_assistant {
+        cadence_agent::remote_enrollment::login_portal_assistant(
+            issuer,
+            hint.or(slug),
+            &dir,
+            |url, code| show_login_code(url, code, no_open),
+        )?
+    } else if web || settings || cloud_agent || audit_approve {
+        cadence_agent::remote_enrollment::login_portal_scoped(
+            issuer,
+            hint.or(slug),
+            &dir,
+            |url, code| show_login_code(url, code, no_open),
+            web,
+            settings,
+            cloud_agent,
+            audit_approve,
+        )?
+    } else if let Some(org) = org {
+        let slug =
+            slug.ok_or_else(|| Error::rejected("legacy login with --org needs --slug <org-slug>"))?;
+        cadence_agent::remote_enrollment::login_browser(issuer, org, slug, &dir, |url, code| {
+            show_login_code(url, code, no_open)
+        })?
+    } else {
+        cadence_agent::remote_enrollment::login_portal(issuer, hint.or(slug), &dir, |url, code| {
+            show_login_code(url, code, no_open)
+        })?
+    };
+    grant.requested = requested_scopes(web, settings, cloud_agent, audit_approve);
+    let stored = org::record_remote(
+        &grant.slug,
+        &grant.endpoint,
+        &grant.organization_id,
+        use_,
+        || grant.save_credential(&dir),
+    )
+    .map_err(|error| issued_session_persistence_error(&grant.organization_id, &dir, error))?;
+    let actor_note = grant
+        .actor_mode()
+        .map(|mode| format!("; actor_mode={mode}"))
+        .unwrap_or_default();
+    cadence_agent::output::print_format_line(format_args!(
+        "Signed in to {} ({}); granted: {}{actor_note}",
+        grant.slug,
+        grant.endpoint,
+        login_granted_line(grant.capabilities()),
+    ));
+    if as_assistant {
+        eprintln!(
+            "note: signed in with an assistant-scoped session (`actor_mode=assistant`); \
+             owner/human actions remain refused on this login"
+        );
+    } else if full_access {
+        let missing = missing_full_access(grant.capabilities());
+        if !missing.is_empty() {
+            eprintln!(
+                "warning: requested {} and the issuer withheld {} — re-run \
+                 `cadence login --full-access` after the workspace grants them",
+                FULL_ACCESS_SCOPES.join(", "),
+                missing.join(", ")
+            );
+        }
+    } else if !web && !settings && !cloud_agent && !audit_approve && org.is_none() {
+        eprintln!(
+            "note: this login requested board access only; --full-access also requests \
+             {} (required before approve, settings, web and cloud-agent verbs)",
+            FULL_ACCESS_SCOPES.join(", ")
+        );
+    }
+    show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
+    Ok(0)
+}
+
 fn show_workspace_handover(slug: &str, stored: &Value, explicit_auth_dir: bool) {
     let selected = stored.get("selected").and_then(Value::as_bool);
     match selected {
@@ -357,6 +464,26 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     ) {
         return discovery::run(&cli.command);
     }
+    // CAD-2747: resolve unmanaged harness/actor override cleanly. Managed
+    // daemon callers (`CADENCE_ALIAS` / `CADENCE_GRANT_TOKEN`) remain pinned to
+    // their assignment session and cannot pass `--agent` or `--as-human`.
+    let managed_caller = std::env::var_os("CADENCE_ALIAS").is_some()
+        || std::env::var_os("CADENCE_GRANT_TOKEN").is_some();
+    if managed_caller && (cli.agent.is_some() || cli.as_human) {
+        return Err(Error::rejected(
+            "managed callers cannot pass --agent or --as-human",
+        ));
+    }
+    if cli.agent.is_some() && cli.as_human {
+        return Err(Error::usage("--agent cannot be combined with --as-human"));
+    }
+    if managed_caller {
+        cadence_agent::remote_cli::bind_cli_actor(None);
+    } else {
+        let actor =
+            cadence_agent::remote_cli::detect_unmanaged_actor(cli.agent.as_deref(), cli.as_human)?;
+        cadence_agent::remote_cli::bind_cli_actor(actor);
+    }
     let client_only = client_update::client_only_mode()?;
     // CAD-2111: plain doctor on a hosted org checks that connection from this
     // machine, on any installation, before any local state exists. `route`
@@ -521,101 +648,53 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             cloud_agent,
             audit_approve,
             full_access,
+            as_assistant,
         } => {
-            if *use_ && !*token_stdin {
-                org::refuse_managed_default_change()?;
-            }
-            // `--token-stdin` is the legacy AgenticOS token path, not org login.
-            let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-            if *token_stdin {
-                let issuer = issuer
-                    .as_deref()
-                    .expect("clap requires --issuer with --token-stdin");
-                let org = org
-                    .as_deref()
-                    .expect("clap requires --org with --token-stdin");
-                return cadence_agent::remote_auth::login(issuer, org, &dir, true, *no_open);
-            }
-            let issuer = issuer
-                .as_deref()
-                .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            // CAD-2213: `--full-access` is the union of the opt-in scopes, so
-            // one consent can approve, change settings and spend a cloud
-            // agent instead of four logins discovered one failure at a time.
-            let (web, settings, cloud_agent, audit_approve) =
-                login_scopes(*web, *settings, *cloud_agent, *audit_approve, *full_access);
-            let mut grant = if web || settings || cloud_agent || audit_approve {
-                cadence_agent::remote_enrollment::login_portal_scoped(
-                    issuer,
-                    hint.as_deref().or(slug.as_deref()),
-                    &dir,
-                    |url, code| show_login_code(url, code, *no_open),
-                    web,
-                    settings,
-                    cloud_agent,
-                    audit_approve,
-                )?
-            } else if let Some(org) = org.as_deref() {
-                let slug = slug.as_deref().ok_or_else(|| {
-                    Error::rejected("legacy login with --org needs --slug <org-slug>")
-                })?;
-                cadence_agent::remote_enrollment::login_browser(
-                    issuer,
-                    org,
-                    slug,
-                    &dir,
-                    |url, code| show_login_code(url, code, *no_open),
-                )?
-            } else {
-                cadence_agent::remote_enrollment::login_portal(
-                    issuer,
-                    hint.as_deref().or(slug.as_deref()),
-                    &dir,
-                    |url, code| show_login_code(url, code, *no_open),
-                )?
-            };
-            grant.requested = requested_scopes(web, settings, cloud_agent, audit_approve);
-            // Registry replacement and credential save are one recovery
-            // unit: a failed credential write restores the old binding, so a
-            // replay never leaves a new binding pointing at an old token.
-            let stored = org::record_remote(
-                &grant.slug,
-                &grant.endpoint,
-                &grant.organization_id,
+            return run_hosted_login(
+                hint.as_deref(),
+                issuer.as_deref(),
+                org.as_deref(),
+                slug.as_deref(),
                 *use_,
-                || grant.save_credential(&dir),
-            )
-            .map_err(|error| {
-                issued_session_persistence_error(&grant.organization_id, &dir, error)
-            })?;
-            cadence_agent::output::print_format_line(format_args!(
-                "Signed in to {} ({}); granted: {}",
-                grant.slug,
-                grant.endpoint,
-                login_granted_line(grant.capabilities())
-            ));
-            if *full_access {
-                let missing = missing_full_access(grant.capabilities());
-                if !missing.is_empty() {
-                    eprintln!(
-                        "warning: requested {} and the issuer withheld {} — re-run \
-                         `cadence login --full-access` after the workspace grants them",
-                        FULL_ACCESS_SCOPES.join(", "),
-                        missing.join(", ")
-                    );
-                }
-            } else if !web && !settings && !cloud_agent && !audit_approve && org.is_none() {
-                // Only a plain portal login: a scoped or legacy login already
-                // asked for something specific, and `--full-access` conflicts
-                // with the legacy `--org` form.
-                eprintln!(
-                    "note: this login requested board access only; --full-access also requests \
-                     {} (required before approve, settings, web and cloud-agent verbs)",
-                    FULL_ACCESS_SCOPES.join(", ")
-                );
-            }
-            show_workspace_handover(&grant.slug, &stored, auth_dir.is_some());
-            return Ok(0);
+                *token_stdin,
+                *no_open,
+                auth_dir.as_deref(),
+                *web,
+                *settings,
+                *cloud_agent,
+                *audit_approve,
+                *full_access,
+                *as_assistant,
+            );
+        }
+        Commands::Org {
+            action:
+                org::OrgAction::Login {
+                    hint,
+                    issuer,
+                    slug,
+                    use_,
+                    no_open,
+                    auth_dir,
+                    as_assistant,
+                },
+        } => {
+            return run_hosted_login(
+                hint.as_deref(),
+                issuer.as_deref(),
+                None,
+                slug.as_deref(),
+                *use_,
+                false,
+                *no_open,
+                auth_dir.as_deref(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                *as_assistant,
+            );
         }
         Commands::Auth { action } => {
             return match action {
@@ -640,7 +719,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                         cadence_agent::remote_auth::logout(&dir)
                     }
                 }
-            }
+            };
         }
         _ => {}
     }
@@ -769,9 +848,11 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     ) {
         let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), None)? {
             org::Resolved::Remote(target) => target,
-            org::Resolved::Local(_) => return Err(Error::usage(
-                "published app lifecycle requires --org <logged-in-workspace>; no local daemon or hosted request was started",
-            )),
+            org::Resolved::Local(_) => {
+                return Err(Error::usage(
+                    "published app lifecycle requires --org <logged-in-workspace>; no local daemon or hosted request was started",
+                ));
+            }
         };
         return remote::run(
             target,
@@ -789,6 +870,12 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         if std::env::var_os("CADENCE_ALIAS").is_some() {
             return Err(Error::rejected(
                 "a managed agent cannot administer the human team. A saved login is not team authority. Nothing was sent",
+            ));
+        }
+        if cadence_agent::remote_cli::cli_actor_is_non_human() {
+            return Err(Error::rejected(
+                "assistant/agent CLI mode cannot administer the human team — re-run explicitly \
+                 with `--as-human` from an authorized human shell. Nothing was sent",
             ));
         }
         let tracker = tracker_pin()?;
@@ -819,7 +906,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             org::Resolved::Local(_) => {
                 return Err(Error::rejected(
                     "cadence web needs a remote workspace: pass --org <org> for a logged-in workspace; nothing was sent",
-                ))
+                ));
             }
         };
         let local_state = match cli.state_dir.clone() {

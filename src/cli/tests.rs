@@ -2568,3 +2568,70 @@ fn thread_search_parses_a_query_or_a_hit_and_names_no_agent() {
         assert!(parse(args).is_err(), "{args:?} must not parse");
     }
 }
+
+/// CAD-2747: top-level `--agent`, global `--as-human`, `login --as-assistant`,
+/// and `org login --as-assistant` must parse without colliding with subcommand
+/// `--agent` flags (for example `doctor --agent`), and conflicting flags must
+/// be refused cleanly.
+#[test]
+fn cad2747_cli_actor_and_assistant_login_flags_parse_without_collision() {
+    <Cli as clap::CommandFactory>::command().debug_assert();
+
+    let agent_cli = Cli::try_parse_from([
+        "cadence",
+        "--agent",
+        "ap_reviewer",
+        "--org",
+        "acme",
+        "issue",
+        "ls",
+    ])
+    .expect("top-level --agent must parse");
+    assert_eq!(agent_cli.agent.as_deref(), Some("ap_reviewer"));
+    assert!(!agent_cli.as_human);
+
+    let as_human_cli =
+        Cli::try_parse_from(["cadence", "--org", "acme", "issue", "ls", "--as-human"])
+            .expect("global --as-human must parse");
+    assert!(as_human_cli.as_human);
+    assert_eq!(as_human_cli.agent, None);
+
+    // Subcommand `--agent` must keep working without colliding with root `--agent`.
+    Cli::try_parse_from(["cadence", "doctor", "--agent", "worker"])
+        .expect("subcommand --agent on doctor must keep working");
+
+    let login_assistant =
+        Cli::try_parse_from(["cadence", "login", "--as-assistant"]).expect("login --as-assistant");
+    assert!(matches!(
+        login_assistant.command,
+        Commands::Login {
+            as_assistant: true,
+            ..
+        }
+    ));
+
+    let org_login_assistant = Cli::try_parse_from(["cadence", "org", "login", "--as-assistant"])
+        .expect("org login --as-assistant");
+    assert!(matches!(
+        org_login_assistant.command,
+        Commands::Org {
+            action: super::org::OrgAction::Login {
+                as_assistant: true,
+                ..
+            }
+        }
+    ));
+
+    let conflict = Cli::try_parse_from([
+        "cadence",
+        "--agent",
+        "ap_reviewer",
+        "--as-human",
+        "issue",
+        "ls",
+    ])
+    .expect("CLI parser defers conflict to action_dispatch");
+    let err = action_dispatch::run_cli(conflict)
+        .expect_err("--agent + --as-human must refuse before transport");
+    assert!(err.to_string().contains("--as-human"), "{err}");
+}

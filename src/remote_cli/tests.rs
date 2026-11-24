@@ -5187,7 +5187,10 @@ fn upload_total_deadline_covers_response_body() {
         if path == "/__platform/wiki/authorize" {
             upload_authorize_answer(socket);
         } else {
-            let _ = write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{{");
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{{"
+            );
             let _ = socket.flush();
             thread::sleep(Duration::from_secs(3));
             let _ = socket.write_all(b"\"ok\":true}");
@@ -9294,9 +9297,21 @@ mod agent_credential_acceptance {
         }
 
         for (mode, exp, nlen) in [
-            (UploadMode::AgentOk, "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent", 0),
-            (UploadMode::StaleCached401Once, "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent agent-credential:login authorize:agent upload:agent", 0),
-            (UploadMode::HumanSessionRequired, "agent-credential:login authorize:agent upload:agent authorize:login upload:login", 1),
+            (
+                UploadMode::AgentOk,
+                "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent",
+                0,
+            ),
+            (
+                UploadMode::StaleCached401Once,
+                "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent agent-credential:login authorize:agent upload:agent",
+                0,
+            ),
+            (
+                UploadMode::HumanSessionRequired,
+                "agent-credential:login authorize:agent upload:agent authorize:login upload:login",
+                1,
+            ),
         ] {
             let (trail, notes, res) = run_case(mode);
             let got: Vec<String> = trail.into_iter().map(|(r, w)| format!("{r}:{w}")).collect();
@@ -10537,4 +10552,91 @@ fn cad2415_stale_delete_revision_is_a_conflict_answer() {
     let body = out.expect("a conflict is an answer, not an error");
     assert_eq!(body["error"]["code"], "revision_conflict");
     assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+}
+
+#[test]
+fn cad2747_renewal_preserves_assistant_actor_mode_and_refuses_elevation() {
+    let at = now().unwrap();
+    let target = RemoteTarget {
+        identity: None,
+        org: ORG.into(),
+        org_id: ORG_ID.into(),
+        endpoint: "https://acme.cadencecloud.app".into(),
+    };
+    let old_session = CliSession {
+        session_id: "hcs_12345678-1234-4234-8234-123456789abc".into(),
+        refresh_token: format!("hcr_{}", "A".repeat(43)),
+        generation: 1,
+        device_label: "cadence CLI".into(),
+        idle_expires_at: at + 1000,
+        absolute_expires_at: at + 10_000,
+        actor_mode: Some("assistant".into()),
+    };
+    let prior = Credential {
+        organization_id: ORG_ID.into(),
+        organization_slug: Some(ORG.into()),
+        audience: "https://acme.cadencecloud.app".into(),
+        issuer: Some("https://api-v2.agenticos.hk".into()),
+        subject_id: Some("user_owner".into()),
+        capabilities: vec![
+            "cli.read".into(),
+            "cli.write".into(),
+            "wiki.read".into(),
+            "wiki.write".into(),
+        ],
+        access_token: BRIDGE.into(),
+        expires_at: at - 1,
+        cli_session: Some(old_session),
+        pending: None,
+    };
+    let pending = PendingRenewal {
+        operation_id: "op_123".into(),
+        expected_generation: 1,
+    };
+    let base_body = || {
+        json!({
+            "version": "hosted-cadence-auth.v1",
+            "organization_id": ORG_ID,
+            "organization_slug": ORG,
+            "audience": "https://acme.cadencecloud.app",
+            "principal": { "kind": "user", "current_role": "owner", "subject_id": "user_owner" },
+            "capabilities": ["cli.read", "cli.write", "wiki.read", "wiki.write"],
+            "credential": {
+                "credential_id": "cred_2",
+                "access_token": format!("hct_{}", "B".repeat(43)),
+                "token_type": "Bearer",
+                "issued_at": at,
+                "expires_at": at + 300,
+                "renewal": "reexchange",
+            },
+            "cli_session": {
+                "session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+                "refresh_token": format!("hcr_{}", "B".repeat(43)),
+                "generation": 2,
+                "device_label": "cadence CLI",
+                "idle_expires_at": at + 2000,
+                "absolute_expires_at": at + 10_000,
+                "actor_mode": "assistant",
+            },
+        })
+    };
+    validate_renewal_response(&base_body(), &prior, &target, &pending)
+        .expect("assistant actor_mode must renew cleanly");
+
+    let mut promoted = base_body();
+    promoted["cli_session"]["actor_mode"] = json!("human");
+    assert!(
+        validate_renewal_response(&promoted, &prior, &target, &pending).is_err(),
+        "renewal must refuse elevating assistant actor_mode to human"
+    );
+
+    let mut dropped = base_body();
+    dropped["cli_session"]
+        .as_object_mut()
+        .unwrap()
+        .remove("actor_mode");
+    assert!(
+        validate_renewal_response(&dropped, &prior, &target, &pending).is_err(),
+        "renewal must refuse dropping assistant actor_mode"
+    );
 }
