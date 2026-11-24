@@ -371,6 +371,8 @@ fn cloud_prewrite_fails_and_preserves_a_hosted_failure_report() {
             subject_id: Some("user_member"),
             issuer: Some("https://hosted-completion-regression.invalid"),
             profile_id: None,
+            action: "dispatch",
+            note: None,
         },
         "Synthetic terminal failure",
     )

@@ -84,6 +84,10 @@ pub struct Kickoff<'a> {
     pub issuer: Option<&'a str>,
     /// Optional profile recorded for this claim (`ap_...`).
     pub profile_id: Option<&'a str>,
+    /// Assignment action (`dispatch`, `start`, `resume`).
+    pub action: &'a str,
+    /// Optional owner/dispatch note or follow-up guidance for this turn.
+    pub note: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,13 +100,35 @@ pub struct SpawnSpec {
     pub profile_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeSpec {
+    pub runner_id: String,
+    pub prior_assignment_id: Option<String>,
+    pub lane_alias: Option<String>,
+    pub target_agent_id: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 pub(super) enum PickupTarget {
-    Seat { alias: String, repo_root: PathBuf },
-    Spawn { spec: SpawnSpec, repo_root: PathBuf },
+    Seat {
+        alias: String,
+        repo_root: PathBuf,
+    },
+    Spawn {
+        spec: SpawnSpec,
+        repo_root: PathBuf,
+    },
+    Resume {
+        spec: ResumeSpec,
+        seat_aliases: std::collections::BTreeMap<String, String>,
+    },
 }
 
 pub(super) type SpawnActorMut<'a> =
     &'a mut dyn FnMut(&SpawnSpec, &Path, &str) -> Result<(String, String)>;
+pub(super) type ResumeActorMut<'a> =
+    &'a mut dyn FnMut(&ResumeSpec, &str, &Path, &str, bool) -> Result<String>;
 
 #[derive(Clone)]
 pub(super) struct Assignment {
@@ -121,6 +147,7 @@ pub(super) struct Assignment {
     profile_id: Option<String>,
     target_agent_id: Option<String>,
     spawn: Option<SpawnSpec>,
+    resume: Option<ResumeSpec>,
     guidance: Option<Value>,
     reported_head_sha: Option<String>,
     text: Option<String>,
@@ -189,6 +216,20 @@ struct Attempt {
     /// reservation without it cannot be located safely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lane_repo: Option<String>,
+    /// Local actor alias bound when this assignment activated (`omp-...` or seat alias).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_alias: Option<String>,
+    /// Connected runner identity bound when this assignment activated (`lri_...`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_runner_id: Option<String>,
+    /// Lane/worktree/repo carried across a non-cancelled bumped-generation retry
+    /// from `blocked` so retries reuse the existing checkout without duplicating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_lane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_repo: Option<String>,
 }
 
 /// Binding as it was when a fresh cancellation reserved its safety marker.
@@ -585,6 +626,25 @@ impl Ledger {
     }
 }
 
+/// Preserve an existing non-cancelled checkout across a generation bump when
+/// retrying a blocked or mid-activation assignment into `queued`/`waiting`/`running`.
+fn preserve_retry_lane_if_eligible(attempt: &mut Attempt, next_state: &str) {
+    if attempt.retired_lane_guard
+        || attempt.reassign_fingerprint.as_deref() == Some("cancel")
+        || attempt_ended(&attempt.state)
+        || !matches!(next_state, "queued" | "waiting" | "running")
+    {
+        return;
+    }
+    if let (Some(lane), Some(wt)) = (attempt.lane.as_ref(), attempt.worktree.as_ref()) {
+        if recorded_lane_present(wt) {
+            attempt.retry_lane = Some(lane.clone());
+            attempt.retry_worktree = Some(wt.clone());
+            attempt.retry_repo = attempt.lane_repo.clone();
+        }
+    }
+}
+
 /// Drop mutable custody and delivery for a retired claim. A guarded lane
 /// remains only as recovery evidence; origins and pending operations stay.
 fn retire_current_claim(attempt: &mut Attempt) {
@@ -657,6 +717,7 @@ fn stamp(attempt: &mut Attempt, assignment: &Assignment) {
             return;
         }
         if assignment.generation > generation {
+            preserve_retry_lane_if_eligible(attempt, &assignment.state);
             retire_current_claim(attempt);
         }
     }
@@ -964,6 +1025,11 @@ impl<H: CoordHttp> Coordinator<H> {
                         session_profile: None,
                         handoff: None,
                         lane_repo: None,
+                        lane_alias: None,
+                        lane_runner_id: None,
+                        retry_lane: None,
+                        retry_worktree: None,
+                        retry_repo: None,
                     })
                     .operation_id
                     .clone()
@@ -1296,6 +1362,11 @@ impl<H: CoordHttp> Coordinator<H> {
                     session_profile: None,
                     handoff: None,
                     lane_repo: None,
+                    lane_alias: None,
+                    lane_runner_id: None,
+                    retry_lane: None,
+                    retry_worktree: None,
+                    retry_repo: None,
                 };
                 stamp(&mut attempt, &claimed);
                 ledger
@@ -1373,6 +1444,11 @@ impl<H: CoordHttp> Coordinator<H> {
                 session_profile: None,
                 handoff: None,
                 lane_repo: None,
+                lane_alias: None,
+                lane_runner_id: None,
+                retry_lane: None,
+                retry_worktree: None,
+                retry_repo: None,
             };
             stamp(&mut attempt, assignment);
             ledger
@@ -1720,6 +1796,56 @@ impl<H: CoordHttp> Coordinator<H> {
             }) {
                 return Ok(lane);
             }
+            let root_str = root.to_string_lossy().into_owned();
+            if let Some((retry_lane, retry_wt)) = ledger.attempts.values().find_map(|attempt| {
+                (claim_still_active(attempt, claimed) && !attempt.retired_lane_guard)
+                    .then(|| {
+                        let lane = attempt.retry_lane.clone()?;
+                        let wt = attempt.retry_worktree.clone()?;
+                        let repo_ok = attempt
+                            .retry_repo
+                            .as_deref()
+                            .is_some_and(|repo| repo == root_str)
+                            || worktree::main_root(Path::new(&wt)).ok().as_deref() == Some(root);
+                        let dir_ok = fs::symlink_metadata(&wt)
+                            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
+                        (repo_ok && dir_ok).then_some((lane, wt))
+                    })
+                    .flatten()
+            }) {
+                for origin in ledger.origins.values_mut() {
+                    if origin.assignment_id == claimed.assignment_id
+                        && origin.generation < claimed.generation
+                        && origin.lane.as_deref() == Some(retry_lane.as_str())
+                    {
+                        origin.settled = true;
+                    }
+                }
+                let occupied = ledger.origins.values().any(|origin| {
+                    origin.assignment_id == claimed.assignment_id
+                        && !origin.settled
+                        && (origin.claim_id != claim_id || origin.generation != claimed.generation)
+                        && origin.lane.as_deref() == Some(retry_lane.as_str())
+                });
+                if occupied {
+                    return Err(Error::rejected(
+                        "that worktree still belongs to an unsettled actor; a new generation was not checked out there",
+                    ));
+                }
+                for attempt in ledger.attempts.values_mut() {
+                    if claim_still_active(attempt, claimed) {
+                        attempt.lane = Some(retry_lane.clone());
+                        attempt.worktree = Some(retry_wt.clone());
+                        attempt.lane_claim = Some(claim_id.clone());
+                        attempt.lane_generation = Some(claimed.generation);
+                        attempt.lane_repo = Some(root_str.clone());
+                        attempt.retry_lane = None;
+                        attempt.retry_worktree = None;
+                        attempt.retry_repo = None;
+                    }
+                }
+                return Ok(retry_lane);
+            }
             let lane = bounded_lane(
                 &claimed.issue_id,
                 name,
@@ -1773,6 +1899,232 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
+    fn resolve_resume_lane(
+        &self,
+        claimed: &Assignment,
+        spec: &ResumeSpec,
+        seat_aliases: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(String, String, String, bool)> {
+        let claim_id = claimed
+            .claim_id
+            .clone()
+            .ok_or_else(|| Error::rejected("the local claim has no id; resume refused"))?;
+        let seat_alias_from_id = spec
+            .target_agent_id
+            .as_deref()
+            .and_then(|id| seat_aliases.get(id).map(String::as_str));
+        if spec.target_agent_id.is_some() && seat_alias_from_id.is_none() {
+            return Err(Error::invalid(
+                "resume_agent_not_found",
+                "the targeted local seat agent is not connected on this runner",
+            ));
+        }
+        let (lane, wt_str, lane_repo, target_alias, is_seat) = self.with_ledger(|ledger| {
+            if !ledger
+                .attempts
+                .values()
+                .any(|attempt| claim_still_active(attempt, claimed))
+            {
+                return Err(Error::invalid(
+                    "fenced",
+                    "the claim is no longer active; resume refused",
+                ));
+            }
+            if let Some((lane, wt, repo, alias)) = ledger.attempts.values().find_map(|attempt| {
+                (claim_still_active(attempt, claimed)
+                    && attempt.lane_claim.as_deref() == Some(claim_id.as_str())
+                    && attempt.lane_generation == Some(claimed.generation)
+                    && !attempt.retired_lane_guard)
+                    .then(|| {
+                        Some((
+                            attempt.lane.clone()?,
+                            attempt.worktree.clone()?,
+                            attempt.lane_repo.clone(),
+                            attempt.lane_alias.clone()?,
+                        ))
+                    })
+                    .flatten()
+            }) {
+                let is_seat = spec.target_agent_id.is_some()
+                    || seat_aliases.values().any(|candidate| candidate == &alias);
+                return Ok((lane, wt, repo, alias, is_seat));
+            }
+
+            let prior = if let Some(prior_id) = spec.prior_assignment_id.as_deref() {
+                ledger
+                    .attempts
+                    .values()
+                    .find(|attempt| attempt.assignment_id.as_deref() == Some(prior_id))
+                    .ok_or_else(|| {
+                        Error::invalid(
+                            "resume_lane_not_found",
+                            format!("no local lane is recorded for assignment {prior_id}"),
+                        )
+                    })?
+                    .clone()
+            } else {
+                let expected_alias = spec.lane_alias.as_deref().or(seat_alias_from_id);
+                let mut same_issue: Vec<&Attempt> = ledger
+                    .attempts
+                    .values()
+                    .filter(|attempt| {
+                        attempt.assignment_id.as_deref() != Some(claimed.assignment_id.as_str())
+                            && attempt.issue_id == claimed.issue_id
+                            && attempt.worktree.is_some()
+                            && expected_alias
+                                .is_none_or(|alias| attempt.lane_alias.as_deref() == Some(alias))
+                    })
+                    .collect();
+                same_issue.sort_by_key(|attempt| attempt.generation.unwrap_or(0));
+                if let Some(found) = same_issue.pop() {
+                    found.clone()
+                } else if let Some(alias) = expected_alias {
+                    let on_other_issue = ledger.attempts.values().any(|attempt| {
+                        attempt.issue_id != claimed.issue_id
+                            && attempt.lane_alias.as_deref() == Some(alias)
+                    });
+                    if on_other_issue {
+                        return Err(Error::invalid(
+                            "resume_issue_mismatch",
+                            format!(
+                                "local lane '{alias}' belongs to another issue, not {}",
+                                claimed.issue_id
+                            ),
+                        ));
+                    }
+                    return Err(Error::invalid(
+                        "resume_lane_not_found",
+                        format!("no resumable local lane was found for {}", claimed.issue_id),
+                    ));
+                } else {
+                    return Err(Error::invalid(
+                        "resume_lane_not_found",
+                        format!("no resumable local lane was found for {}", claimed.issue_id),
+                    ));
+                }
+            };
+
+            if prior.issue_id != claimed.issue_id {
+                return Err(Error::invalid(
+                    "resume_issue_mismatch",
+                    format!(
+                        "recorded lane belongs to {} rather than {}",
+                        prior.issue_id, claimed.issue_id
+                    ),
+                ));
+            }
+            if prior.retired_lane_guard || prior.reassign_fingerprint.as_deref() == Some("cancel") {
+                return Err(Error::invalid(
+                    "resume_lane_retired",
+                    "that local lane was cancelled or retired and cannot be resumed",
+                ));
+            }
+            if let Some(recorded_runner) = prior.lane_runner_id.as_deref() {
+                if recorded_runner != spec.runner_id {
+                    return Err(Error::invalid(
+                        "resume_runner_mismatch",
+                        format!(
+                            "recorded lane belongs to runner {recorded_runner}, not {}",
+                            spec.runner_id
+                        ),
+                    ));
+                }
+            }
+            if let (Some(recorded_alias), Some(req_alias)) =
+                (prior.lane_alias.as_deref(), spec.lane_alias.as_deref())
+            {
+                if recorded_alias != req_alias {
+                    return Err(Error::invalid(
+                        "resume_alias_mismatch",
+                        format!("recorded lane alias '{recorded_alias}' does not match '{req_alias}'"),
+                    ));
+                }
+            }
+            if let (Some(recorded_alias), Some(seat_alias)) =
+                (prior.lane_alias.as_deref(), seat_alias_from_id)
+            {
+                if recorded_alias != seat_alias {
+                    return Err(Error::invalid(
+                        "resume_alias_mismatch",
+                        format!(
+                            "recorded lane alias '{recorded_alias}' does not match seat '{seat_alias}'"
+                        ),
+                    ));
+                }
+            }
+            if let (Some(req_alias), Some(seat_alias)) =
+                (spec.lane_alias.as_deref(), seat_alias_from_id)
+            {
+                if req_alias != seat_alias {
+                    return Err(Error::invalid(
+                        "resume_alias_mismatch",
+                        format!("lane_alias '{req_alias}' does not match seat '{seat_alias}'"),
+                    ));
+                }
+            }
+            let target_alias = prior
+                .lane_alias
+                .clone()
+                .or_else(|| spec.lane_alias.clone())
+                .or_else(|| seat_alias_from_id.map(str::to_string))
+                .ok_or_else(|| {
+                    Error::invalid(
+                        "resume_lane_not_found",
+                        "recorded assignment has no local agent alias to resume",
+                    )
+                })?;
+            let (Some(lane), Some(wt_str)) = (prior.lane.clone(), prior.worktree.clone()) else {
+                return Err(Error::invalid(
+                    "resume_worktree_missing",
+                    "recorded assignment has no worktree directory on disk",
+                ));
+            };
+            let is_seat = spec.target_agent_id.is_some()
+                || seat_aliases.values().any(|candidate| candidate == &target_alias);
+            Ok((lane, wt_str, prior.lane_repo.clone(), target_alias, is_seat))
+        })?;
+
+        let wt_path = Path::new(&wt_str);
+        let wt_meta = fs::symlink_metadata(wt_path).map_err(|_| {
+            Error::invalid(
+                "resume_worktree_missing",
+                format!("recorded worktree {wt_str} no longer exists on disk"),
+            )
+        })?;
+        if wt_meta.file_type().is_symlink() || !wt_meta.is_dir() {
+            return Err(Error::invalid(
+                "resume_worktree_missing",
+                "recorded worktree path is not a regular directory",
+            ));
+        }
+        if git_line(wt_path, &["rev-parse", "--is-inside-work-tree"]) != "true" {
+            return Err(Error::invalid(
+                "resume_worktree_missing",
+                format!("recorded worktree {wt_str} is not an active git checkout"),
+            ));
+        }
+        let repo_root = lane_repo.or_else(|| {
+            worktree::main_root(wt_path)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+        self.with_ledger(|ledger| {
+            for attempt in ledger.attempts.values_mut() {
+                if claim_still_active(attempt, claimed) {
+                    attempt.lane = Some(lane.clone());
+                    attempt.worktree = Some(wt_str.clone());
+                    attempt.lane_claim = Some(claim_id.clone());
+                    attempt.lane_generation = Some(claimed.generation);
+                    attempt.lane_repo = repo_root.clone();
+                    attempt.lane_alias = Some(target_alias.clone());
+                    attempt.lane_runner_id = Some(spec.runner_id.clone());
+                }
+            }
+            Ok(())
+        })?;
+        Ok((lane, wt_str, target_alias, is_seat))
+    }
+
     fn activate<F>(
         &mut self,
         assignment: &Assignment,
@@ -1787,13 +2139,19 @@ impl<H: CoordHttp> Coordinator<H> {
         let mut no_spawn = |_: &SpawnSpec, _: &Path, _: &str| -> Result<(String, String)> {
             Err(Error::rejected("spawn target is not enabled in this mode"))
         };
+        let mut no_resume = |_: &ResumeSpec, _: &str, _: &Path, _: &str, _: bool| -> Result<String> {
+            Err(Error::rejected("resume target is not enabled in this mode"))
+        };
         self.activate_target(
             assignment,
-            root,
             name,
-            Some(alias),
+            PickupTarget::Seat {
+                alias: alias.to_string(),
+                repo_root: root.to_path_buf(),
+            },
             None,
             &mut no_spawn,
+            &mut no_resume,
             deliver,
         )
     }
@@ -1802,11 +2160,11 @@ impl<H: CoordHttp> Coordinator<H> {
     fn activate_target<F>(
         &mut self,
         assignment: &Assignment,
-        root: &Path,
         name: Option<&str>,
-        seat_alias: Option<&str>,
-        spawn_spec: Option<&SpawnSpec>,
+        target: PickupTarget,
+        runner_id: Option<&str>,
         spawn_actor: SpawnActorMut<'_>,
+        resume_actor: ResumeActorMut<'_>,
         deliver: &mut F,
     ) -> Result<Value>
     where
@@ -1861,48 +2219,63 @@ impl<H: CoordHttp> Coordinator<H> {
         // A cancellation must not retire this claim between lane reservation
         // and the checkout/actor handoff being recorded.
         let _assignment_lock = self.assignment_lock(&current.assignment_id)?;
-        let lane = match self.lane_for(&current, name, root) {
-            Ok(lane) => lane,
-            Err(error) => {
-                return Err(self.activation_failure(&current, error));
-            }
-        };
-        #[cfg(test)]
-        if let Some(wait) = self.before_lane_open.clone() {
-            wait();
-        }
-        let pinned = self.with_ledger(|ledger| {
-            Ok(ledger.attempts.values().find_map(|attempt| {
-                (attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
-                    && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
-                    && attempt.lane_generation == Some(current.generation))
-                .then(|| attempt.worktree.clone())
-                .flatten()
-            }))
-        })?;
-        let opened = match pinned {
-            Some(path) => worktree::main_root(Path::new(&path))
-                .and_then(|original_root| ensure_lane(&original_root, &lane, None)),
-            None => ensure_lane(root, &lane, None),
-        };
-        let dir = match opened {
-            Ok(dir) => dir,
-            Err(error) => {
-                return Err(self.activation_failure(&current, error));
-            }
-        };
-        let path = dir.display().to_string();
-        self.with_ledger(|ledger| {
-            for attempt in ledger.attempts.values_mut() {
-                if attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
-                    && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
-                    && attempt.lane_generation == Some(current.generation)
-                {
-                    attempt.worktree = Some(path.clone());
+        let (lane, path, resume_resolved) = match &target {
+            PickupTarget::Resume { spec, seat_aliases } => {
+                match self.resolve_resume_lane(&current, spec, seat_aliases) {
+                    Ok((lane, wt, target_alias, is_seat)) => {
+                        (lane, wt, Some((spec, target_alias, is_seat)))
+                    }
+                    Err(error) => return Err(self.activation_failure(&current, error)),
                 }
             }
-            Ok(())
-        })?;
+            PickupTarget::Seat { repo_root, .. } | PickupTarget::Spawn { repo_root, .. } => {
+                let root = repo_root.as_path();
+                let lane = match self.lane_for(&current, name, root) {
+                    Ok(lane) => lane,
+                    Err(error) => {
+                        return Err(self.activation_failure(&current, error));
+                    }
+                };
+                #[cfg(test)]
+                if let Some(wait) = self.before_lane_open.clone() {
+                    wait();
+                }
+                let pinned = self.with_ledger(|ledger| {
+                    Ok(ledger.attempts.values().find_map(|attempt| {
+                        (attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
+                            && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
+                            && attempt.lane_generation == Some(current.generation))
+                        .then(|| attempt.worktree.clone())
+                        .flatten()
+                    }))
+                })?;
+                let opened = match pinned {
+                    Some(path) => worktree::main_root(Path::new(&path))
+                        .and_then(|original_root| ensure_lane(&original_root, &lane, None)),
+                    None => ensure_lane(root, &lane, None),
+                };
+                let dir = match opened {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        return Err(self.activation_failure(&current, error));
+                    }
+                };
+                let path = dir.display().to_string();
+                self.with_ledger(|ledger| {
+                    for attempt in ledger.attempts.values_mut() {
+                        if attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
+                            && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
+                            && attempt.lane_generation == Some(current.generation)
+                        {
+                            attempt.worktree = Some(path.clone());
+                        }
+                    }
+                    Ok(())
+                })?;
+                (lane, path, None)
+            }
+        };
+        let dir = PathBuf::from(&path);
         let actor = if let Some(message) = self.delivered_kickoff(&current)? {
             json!({"message": message, "state": "already_delivered"})
         } else {
@@ -1913,19 +2286,49 @@ impl<H: CoordHttp> Coordinator<H> {
             let message_id = self.reserve_kickoff(&current)?;
             let (_origin_assignment, origin_claim, origin_generation) =
                 self.origin_for_message(&message_id)?;
-            let (target_alias, spawned_adapter) = if let Some(spec) = spawn_spec {
-                match spawn_actor(spec, &dir, &current.assignment_id) {
-                    Ok((alias, adapter)) => (alias, Some(adapter)),
-                    Err(error) => return Err(self.activation_failure(&current, error)),
+            let (target_alias, spawned_adapter, resumed_adapter, eff_runner_id) =
+                if let Some((spec, alias, is_seat)) = resume_resolved {
+                    match resume_actor(
+                        spec,
+                        &alias,
+                        &dir,
+                        &current.assignment_id,
+                        is_seat,
+                    ) {
+                        Ok(adapter) => {
+                            (alias, None, Some(adapter), Some(spec.runner_id.clone()))
+                        }
+                        Err(error) => return Err(self.activation_failure(&current, error)),
+                    }
+                } else if let PickupTarget::Spawn { spec, .. } = &target {
+                    match spawn_actor(spec, &dir, &current.assignment_id) {
+                        Ok((alias, adapter)) => {
+                            (alias, Some(adapter), None, Some(spec.runner_id.clone()))
+                        }
+                        Err(error) => return Err(self.activation_failure(&current, error)),
+                    }
+                } else if let PickupTarget::Seat { alias, .. } = &target {
+                    (alias.clone(), None, None, runner_id.map(str::to_string))
+                } else {
+                    return Err(self.activation_failure(
+                        &current,
+                        Error::rejected("local target alias is missing"),
+                    ));
+                };
+            self.with_ledger(|ledger| {
+                for attempt in ledger.attempts.values_mut() {
+                    if attempt.assignment_id.as_deref() == Some(current.assignment_id.as_str())
+                        && attempt.lane_claim.as_deref() == current.claim_id.as_deref()
+                        && attempt.lane_generation == Some(current.generation)
+                    {
+                        attempt.lane_alias = Some(target_alias.clone());
+                        if let Some(ref rid) = eff_runner_id {
+                            attempt.lane_runner_id = Some(rid.clone());
+                        }
+                    }
                 }
-            } else {
-                (
-                    seat_alias
-                        .ok_or_else(|| Error::rejected("local target alias is missing"))?
-                        .to_string(),
-                    None,
-                )
-            };
+                Ok(())
+            })?;
             let kickoff = Kickoff {
                 alias: &target_alias,
                 issue_id: &current.issue_id,
@@ -1939,6 +2342,8 @@ impl<H: CoordHttp> Coordinator<H> {
                 subject_id: self.subject_id.as_deref(),
                 issuer: self.issuer.as_deref(),
                 profile_id: current.profile_id.as_deref(),
+                action: &current.action,
+                note: current.text.as_deref(),
             };
             match deliver(&kickoff) {
                 Ok(value) => {
@@ -1967,6 +2372,9 @@ impl<H: CoordHttp> Coordinator<H> {
                     receipt["message"] = json!(message);
                     if let Some(adapter) = spawned_adapter {
                         receipt["spawned_adapter"] = json!(adapter);
+                    }
+                    if let Some(adapter) = resumed_adapter {
+                        receipt["resumed_adapter"] = json!(adapter);
                     }
                     receipt
                 }
@@ -2442,6 +2850,9 @@ impl<H: CoordHttp> Coordinator<H> {
         let mut no_spawn = |_: &SpawnSpec, _: &Path, _: &str| -> Result<(String, String)> {
             Err(Error::rejected("spawn target is not enabled in this mode"))
         };
+        let mut no_resume = |_: &ResumeSpec, _: &str, _: &Path, _: &str, _: bool| -> Result<String> {
+            Err(Error::rejected("resume target is not enabled in this mode"))
+        };
         let mut resolve = |_row: &Assignment| -> Result<Option<PickupTarget>> {
             Ok(Some(PickupTarget::Seat {
                 alias: alias.clone(),
@@ -2453,8 +2864,10 @@ impl<H: CoordHttp> Coordinator<H> {
             name,
             resume_blocked,
             Some(&alias),
+            None,
             &mut resolve,
             &mut no_spawn,
+            &mut no_resume,
             deliver,
         )
     }
@@ -2466,8 +2879,10 @@ impl<H: CoordHttp> Coordinator<H> {
         name: Option<&str>,
         resume_blocked: bool,
         summary_alias: Option<&str>,
+        runner_id: Option<&str>,
         resolve: &mut dyn FnMut(&Assignment) -> Result<Option<PickupTarget>>,
         spawn_actor: SpawnActorMut<'_>,
+        resume_actor: ResumeActorMut<'_>,
         deliver: &mut F,
     ) -> Result<Value>
     where
@@ -2549,26 +2964,15 @@ impl<H: CoordHttp> Coordinator<H> {
                     continue;
                 }
             };
-            let result = match target {
-                PickupTarget::Seat { alias, repo_root } => self.activate_target(
-                    &row,
-                    &repo_root,
-                    name,
-                    Some(&alias),
-                    None,
-                    spawn_actor,
-                    deliver,
-                ),
-                PickupTarget::Spawn { spec, repo_root } => self.activate_target(
-                    &row,
-                    &repo_root,
-                    name,
-                    None,
-                    Some(&spec),
-                    spawn_actor,
-                    deliver,
-                ),
-            };
+            let result = self.activate_target(
+                &row,
+                name,
+                target,
+                runner_id,
+                spawn_actor,
+                resume_actor,
+                deliver,
+            );
             match result {
                 Ok(value) => claimed.push(value),
                 Err(error) => refused.push(json!({
@@ -3435,6 +3839,393 @@ mod assignment_contract_tests {
             .is_err());
         assert!(coord.reserve_kickoff(&original).is_err());
         assert_eq!(calls.get(), 1, "custody observation must not send HTTP");
+    }
+
+    #[test]
+    fn cad2777_retry_reuses_worktree_and_resume_routes_existing_lane() {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct RecordedDeliver {
+            alias: String,
+            worktree: String,
+            action: String,
+            note: Option<String>,
+        }
+
+        struct ScriptedHttp {
+            claim_counter: usize,
+            board: Rc<RefCell<BTreeMap<String, Value>>>,
+            reports: Rc<RefCell<Vec<(String, String, u64)>>>,
+        }
+
+        impl CoordHttp for ScriptedHttp {
+            fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
+                if method == "POST" && path.ends_with("/claim") {
+                    self.claim_counter += 1;
+                    let id = path.rsplit('/').nth(1).unwrap().to_string();
+                    let mut board = self.board.borrow_mut();
+                    let row = board.get_mut(&id).unwrap();
+                    let body = body.unwrap();
+                    if row["state"] == "queued" {
+                        row["state"] = json!("running");
+                        row["claim_id"] = json!(format!(
+                            "hlc_00000000-0000-4000-8000-{:012}",
+                            self.claim_counter
+                        ));
+                        row["client_agent_id"] = body["client_agent_id"].clone();
+                    }
+                    return Ok(Reply {
+                        status: 200,
+                        body: row.clone(),
+                    });
+                }
+                if method == "POST" && path.ends_with("/report") {
+                    let id = path.rsplit('/').nth(1).unwrap().to_string();
+                    let body = body.unwrap();
+                    let state = body["state"].as_str().unwrap().to_string();
+                    let generation = body["expected_generation"].as_u64().unwrap();
+                    self.reports
+                        .borrow_mut()
+                        .push((id.clone(), state.clone(), generation));
+                    let mut board = self.board.borrow_mut();
+                    let row = board.get_mut(&id).unwrap();
+                    row["state"] = json!(state);
+                    row["text"] = body.get("text").cloned().unwrap_or(Value::Null);
+                    row["reported_head_sha"] =
+                        body.get("reported_head_sha").cloned().unwrap_or(Value::Null);
+                    return Ok(Reply {
+                        status: 200,
+                        body: row.clone(),
+                    });
+                }
+                panic!("unexpected HTTP {method} {path}");
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let authority = root.path().join("authority");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&authority).unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(crate::reaper::status(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&repo)
+        )
+        .unwrap()
+        .success());
+        assert!(crate::reaper::status(
+            Command::new("git")
+                .args(["-C"])
+                .arg(&repo)
+                .args(["config", "user.email", "test@example.com"])
+        )
+        .unwrap()
+        .success());
+        assert!(crate::reaper::status(
+            Command::new("git")
+                .args(["-C"])
+                .arg(&repo)
+                .args(["config", "user.name", "Test User"])
+        )
+        .unwrap()
+        .success());
+        assert!(crate::reaper::status(
+            Command::new("git")
+                .args(["-C"])
+                .arg(&repo)
+                .args(["commit", "--allow-empty", "-m", "init", "--quiet"])
+        )
+        .unwrap()
+        .success());
+
+        let hla_1 = "hla_00000000-0000-4000-8000-000000000101";
+        let hla_2 = "hla_00000000-0000-4000-8000-000000000102";
+        let hla_3 = "hla_00000000-0000-4000-8000-000000000103";
+        let hla_4 = "hla_00000000-0000-4000-8000-000000000104";
+        let hla_other = "hla_00000000-0000-4000-8000-000000000999";
+        let runner_1 = "lri_00000000-0000-4000-8000-000000000001";
+        let runner_other = "lri_00000000-0000-4000-8000-000000000002";
+
+        let spawn_row = json!({
+            "version": VERSION,
+            "assignment_id": hla_1,
+            "organization_id": "ws_1",
+            "issue_id": "CAD-2777",
+            "action": "dispatch",
+            "execution": "local",
+            "state": "queued",
+            "generation": 1,
+            "claim_id": null,
+            "target": "usr_1",
+            "created_by_subject_id": "usr_1",
+            "client_agent_id": null,
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": "initial dispatch",
+            "spawn": {
+                "runner_id": runner_1,
+                "provider": "omp",
+                "repo": "fav-limited/cadence",
+            }
+        });
+        let board = Rc::new(RefCell::new(BTreeMap::from([(
+            hla_1.to_string(),
+            spawn_row.clone(),
+        )])));
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let mut coord = Coordinator::open(
+            ScriptedHttp {
+                claim_counter: 0,
+                board: Rc::clone(&board),
+                reports: Rc::clone(&reports),
+            },
+            "ws_1".into(),
+            authority.clone(),
+            Some("usr_1".into()),
+            Some("https://issuer.example".into()),
+            "https://board.example".into(),
+        )
+        .unwrap();
+
+        let deliveries = Rc::new(RefCell::new(Vec::<RecordedDeliver>::new()));
+        let resumed_calls = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+        let mut spawn_fn = |spec: &SpawnSpec, _wt: &Path, _id: &str| -> Result<(String, String)> {
+            Ok(("omp-lane1".to_string(), format!("{}/rpc", spec.provider)))
+        };
+        let resumed_ref = Rc::clone(&resumed_calls);
+        let mut resume_fn =
+            |spec: &ResumeSpec, alias: &str, wt: &Path, _id: &str, is_seat: bool| -> Result<String> {
+                assert!(!is_seat);
+                assert_eq!(spec.runner_id, runner_1);
+                resumed_ref
+                    .borrow_mut()
+                    .push((alias.to_string(), wt.display().to_string()));
+                Ok("omp/rpc".to_string())
+            };
+        let deliver_flag = Rc::new(RefCell::new(true));
+        let deliveries_ref = Rc::clone(&deliveries);
+        let flag_ref = Rc::clone(&deliver_flag);
+        let mut deliver_fn = |k: &Kickoff| -> Result<Value> {
+            if *flag_ref.borrow() {
+                return Err(Error::invalid("default_agent_unavailable", "agent fenced"));
+            }
+            deliveries_ref.borrow_mut().push(RecordedDeliver {
+                alias: k.alias.to_string(),
+                worktree: k.worktree.to_string(),
+                action: k.action.to_string(),
+                note: k.note.map(str::to_string),
+            });
+            Ok(json!({"message": k.message_id}))
+        };
+        let repo_clone = repo.clone();
+        let mut resolve_fn = |row: &Assignment| -> Result<Option<PickupTarget>> {
+            if let Some(spec) = &row.spawn {
+                return Ok(Some(PickupTarget::Spawn {
+                    spec: spec.clone(),
+                    repo_root: repo_clone.clone(),
+                }));
+            }
+            if let Some(spec) = &row.resume {
+                return Ok(Some(PickupTarget::Resume {
+                    spec: spec.clone(),
+                    seat_aliases: BTreeMap::new(),
+                }));
+            }
+            Ok(None)
+        };
+
+        // 1. Gen-1 fails delivery -> blocked, leaving one worktree on disk.
+        let r1 = coord
+            .pickup_rows_routed(
+                vec![parse_assignment(&spawn_row).unwrap()],
+                None,
+                false,
+                None,
+                Some(runner_1),
+                &mut resolve_fn,
+                &mut spawn_fn,
+                &mut resume_fn,
+                &mut deliver_fn,
+            )
+            .unwrap();
+        assert_eq!(r1["refused"].as_array().unwrap().len(), 1);
+        let wt_parent = layout::worktree_dir(&repo, "x").parent().unwrap().to_path_buf();
+        let entries_after_gen1: Vec<String> = fs::read_dir(&wt_parent)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|f| f.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(entries_after_gen1.len(), 1, "gen 1 created one worktree");
+
+        // 2. Owner retries -> board bumps generation=2, state=queued, text="retry guidance".
+        *deliver_flag.borrow_mut() = false;
+        let mut retry_row = spawn_row.clone();
+        retry_row["generation"] = json!(2);
+        retry_row["state"] = json!("queued");
+        retry_row["claim_id"] = Value::Null;
+        retry_row["client_agent_id"] = Value::Null;
+        retry_row["text"] = json!("retry guidance");
+        board.borrow_mut().insert(hla_1.to_string(), retry_row.clone());
+
+        let r2 = coord
+            .pickup_rows_routed(
+                vec![parse_assignment(&retry_row).unwrap()],
+                None,
+                false,
+                None,
+                Some(runner_1),
+                &mut resolve_fn,
+                &mut spawn_fn,
+                &mut resume_fn,
+                &mut deliver_fn,
+            )
+            .unwrap();
+        assert_eq!(r2["claimed"].as_array().unwrap().len(), 1);
+        let entries_after_retry: Vec<String> = fs::read_dir(&wt_parent)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|f| f.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            entries_after_retry, entries_after_gen1,
+            "bumped-generation retry must reuse existing worktree without duplicates"
+        );
+        let first_wt = deliveries.borrow()[0].worktree.clone();
+        assert_eq!(deliveries.borrow()[0].alias, "omp-lane1");
+        assert_eq!(deliveries.borrow()[0].note.as_deref(), Some("retry guidance"));
+
+        // 3. hla_1 finishes (`result`); owner dispatches hla_2 (`action: resume`).
+        let (claim_id, gen) = coord.origin_for_assignment(hla_1).unwrap();
+        coord
+            .report_claimed(
+                hla_1,
+                &claim_id,
+                gen,
+                "result",
+                Some("Done first pass"),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .unwrap();
+
+        let resume_row = json!({
+            "version": VERSION,
+            "assignment_id": hla_2,
+            "organization_id": "ws_1",
+            "issue_id": "CAD-2777",
+            "action": "resume",
+            "execution": "local",
+            "state": "queued",
+            "generation": 1,
+            "claim_id": null,
+            "target": "usr_1",
+            "created_by_subject_id": "usr_1",
+            "client_agent_id": null,
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": "address PR comment",
+            "resume": {
+                "runner_id": runner_1,
+                "prior_assignment_id": hla_1,
+                "lane_alias": "omp-lane1",
+                "model": "sonnet-4",
+            }
+        });
+        board.borrow_mut().insert(hla_2.to_string(), resume_row.clone());
+        let r3 = coord
+            .pickup_rows_routed(
+                vec![parse_assignment(&resume_row).unwrap()],
+                None,
+                false,
+                None,
+                Some(runner_1),
+                &mut resolve_fn,
+                &mut spawn_fn,
+                &mut resume_fn,
+                &mut deliver_fn,
+            )
+            .unwrap();
+        assert_eq!(r3["claimed"].as_array().unwrap().len(), 1);
+        assert_eq!(resumed_calls.borrow().len(), 1);
+        assert_eq!(resumed_calls.borrow()[0].0, "omp-lane1");
+        assert_eq!(resumed_calls.borrow()[0].1, first_wt);
+        assert_eq!(deliveries.borrow()[1].alias, "omp-lane1");
+        assert_eq!(deliveries.borrow()[1].worktree, first_wt);
+        assert_eq!(deliveries.borrow()[1].action, "resume");
+        assert_eq!(
+            deliveries.borrow()[1].note.as_deref(),
+            Some("address PR comment")
+        );
+        let entries_after_resume: Vec<String> = fs::read_dir(&wt_parent)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|f| f.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(entries_after_resume, entries_after_gen1);
+
+        // 4. Fail-closed checks: cross-issue mismatch & missing lane refuse and mark blocked.
+        let mut wrong_issue = resume_row.clone();
+        wrong_issue["assignment_id"] = json!(hla_3);
+        wrong_issue["issue_id"] = json!("CAD-9999");
+        board.borrow_mut().insert(hla_3.to_string(), wrong_issue.clone());
+        let r4 = coord
+            .pickup_rows_routed(
+                vec![parse_assignment(&wrong_issue).unwrap()],
+                None,
+                false,
+                None,
+                Some(runner_1),
+                &mut resolve_fn,
+                &mut spawn_fn,
+                &mut resume_fn,
+                &mut deliver_fn,
+            )
+            .unwrap();
+        assert_eq!(r4["refused"][0]["code"], "assignment_blocked");
+        assert!(r4["refused"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("CAD-2777"));
+
+        let mut wrong_runner = resume_row.clone();
+        wrong_runner["assignment_id"] = json!(hla_4);
+        wrong_runner["resume"]["runner_id"] = json!(runner_other);
+        board.borrow_mut().insert(hla_4.to_string(), wrong_runner.clone());
+        let r5 = coord
+            .pickup_rows_routed(
+                vec![parse_assignment(&wrong_runner).unwrap()],
+                None,
+                false,
+                None,
+                Some(runner_other),
+                &mut resolve_fn,
+                &mut spawn_fn,
+                &mut resume_fn,
+                &mut deliver_fn,
+            )
+            .unwrap();
+        assert_eq!(r5["refused"][0]["code"], "assignment_blocked");
+
+        let mut missing_prior = resume_row;
+        missing_prior["assignment_id"] = json!(hla_other);
+        missing_prior["resume"]["prior_assignment_id"] =
+            json!("hla_00000000-0000-4000-8000-000000000777");
+        board.borrow_mut().insert(hla_other.to_string(), missing_prior.clone());
+        let r6 = coord
+            .pickup_rows_routed(
+                vec![parse_assignment(&missing_prior).unwrap()],
+                None,
+                false,
+                None,
+                Some(runner_1),
+                &mut resolve_fn,
+                &mut spawn_fn,
+                &mut resume_fn,
+                &mut deliver_fn,
+            )
+            .unwrap();
+        assert_eq!(r6["refused"][0]["code"], "assignment_blocked");
     }
 }
 

@@ -187,6 +187,7 @@ function PageBody({
   blocked,
   onWrite,
   onError,
+  onToast,
   onOpen,
   setKickoff,
   hosted,
@@ -387,10 +388,14 @@ function PageBody({
               checklistVisible={!editingDescription}
               blocked={blocked}
               hosted={hosted === true}
+              canLocalDispatch={canLocalDispatch === true}
+              readOnly={readOnly}
               codeDelivery={codeDelivery}
               stagedActions={stagedActions}
               tabHref={tabHref}
               onCompose={composeWith}
+              onAssignmentMutated={() => void resources.issue(id).invalidate()}
+              onToast={onToast}
               onOpen={onOpen}
             >
               {editingDescription ? (

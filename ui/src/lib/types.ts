@@ -117,12 +117,18 @@ export interface IssueApprovals {
 export interface IssueAssignmentRow {
   assignment_id?: string;
   issue_id?: string;
+  action?: "dispatch" | "start" | "resume";
+  generation?: number;
   target?: string | null;
   state: string;
   text?: string | null;
   text_truncated?: boolean;
   deliverable?: { type: "artifact" | "link"; ref: string; title?: string | null } | null;
   deliverable_check?: { found: boolean | null; reason: string | null };
+  target_agent_id?: string;
+  spawn?: HostedLocalDispatchSpawnSpec;
+  resume?: HostedLocalDispatchResumeSpec;
+  created_at?: string | null;
   updated_at?: string | null;
 }
 
@@ -2410,17 +2416,45 @@ export interface HostedLocalDispatchSpawnSpec {
   profile_id?: string;
 }
 
+export interface HostedLocalDispatchResumeSpec {
+  runner_id: string;
+  prior_assignment_id?: string;
+  lane_alias?: string;
+  target_agent_id?: string;
+  model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+}
+
 export type HostedLocalDispatchRequest =
   | { idempotency_key: string; mode: "seat"; target_agent_id: string; note?: string }
-  | { idempotency_key: string; mode: "spawn"; spawn: HostedLocalDispatchSpawnSpec; note?: string };
+  | { idempotency_key: string; mode: "spawn"; spawn: HostedLocalDispatchSpawnSpec; note?: string }
+  | { idempotency_key: string; mode: "resume"; resume: HostedLocalDispatchResumeSpec; note?: string };
+
+export interface HostedLocalCancelRequest {
+  assignment_id: string;
+  expected_generation: number;
+  operation_id: string;
+}
+
+export interface HostedLocalRetryRequest {
+  assignment_id: string;
+  expected_generation: number;
+  operation_id: string;
+  note?: string;
+  model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+}
 
 export interface HostedLocalDispatchResponse {
   assignment: {
     assignment_id: string;
     issue_id: string;
+    action?: "dispatch" | "start" | "resume";
     state: string;
+    generation?: number;
     target_agent_id?: string;
     spawn?: HostedLocalDispatchSpawnSpec;
+    resume?: HostedLocalDispatchResumeSpec;
   };
   replayed: boolean;
 }

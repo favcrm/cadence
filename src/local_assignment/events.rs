@@ -45,12 +45,15 @@ pub struct RunnerRuntimeSnapshot {
 
 pub type SpawnWorkerFn =
     Arc<dyn Fn(&SpawnSpec, &Path, &str) -> Result<(String, String)> + Send + Sync>;
+pub type ResumeWorkerFn =
+    Arc<dyn Fn(&ResumeSpec, &str, &Path, &str, bool) -> Result<String> + Send + Sync>;
 pub type KickoffFn = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 pub struct EventRuntime {
     pub send: Arc<dyn Fn(Value) -> Result<Value> + Send + Sync>,
     pub snapshot: Arc<dyn Fn(&WorkspaceBinding) -> RunnerRuntimeSnapshot + Send + Sync>,
     pub spawn_worker: SpawnWorkerFn,
+    pub resume_worker: ResumeWorkerFn,
     pub on_kickoff: KickoffFn,
     pub on_terminal: Arc<dyn Fn(&str) + Send + Sync>,
     pub notify: Arc<dyn Fn() + Send + Sync>,
@@ -1058,7 +1061,7 @@ fn deliver_assignments<F: FnMut(&Kickoff) -> Result<Value>>(
     }
     let needs_default = rows
         .iter()
-        .any(|row| row.target_agent_id.is_none() && row.spawn.is_none());
+        .any(|row| row.target_agent_id.is_none() && row.spawn.is_none() && row.resume.is_none());
     let allow_default = if needs_default {
         is_assignment_default(http, binding)?
     } else {
@@ -1069,7 +1072,27 @@ fn deliver_assignments<F: FnMut(&Kickoff) -> Result<Value>>(
         .as_deref()
         .map(|raw| worktree::main_root(Path::new(raw)))
         .transpose()?;
+    let seat_aliases: BTreeMap<String, String> = binding
+        .agents
+        .iter()
+        .map(|agent| (agent.agent_id.clone(), agent.alias.clone()))
+        .collect();
     let mut resolve = |row: &Assignment| -> Result<Option<PickupTarget>> {
+        if row.action == "resume" || row.resume.is_some() {
+            let Some(spec) = row.resume.as_ref() else {
+                return Err(Error::invalid(
+                    "resume_spec_missing",
+                    "resume assignment is missing its resume target",
+                ));
+            };
+            if spec.runner_id != binding.runner_id {
+                return Ok(None);
+            }
+            return Ok(Some(PickupTarget::Resume {
+                spec: spec.clone(),
+                seat_aliases: seat_aliases.clone(),
+            }));
+        }
         if let Some(spec) = row.spawn.as_ref() {
             if spec.runner_id != binding.runner_id {
                 return Ok(None);
@@ -1117,15 +1140,30 @@ fn deliver_assignments<F: FnMut(&Kickoff) -> Result<Value>>(
     let mut spawn_actor = |spec: &SpawnSpec, worktree: &Path, assignment_id: &str| {
         (runtime.spawn_worker)(spec, worktree, assignment_id)
     };
+    let mut resume_actor =
+        |spec: &ResumeSpec, alias: &str, worktree: &Path, assignment_id: &str, is_seat: bool| {
+            (runtime.resume_worker)(spec, alias, worktree, assignment_id, is_seat)
+        };
     let picked = coord.pickup_rows_routed(
         rows,
         binding.lane_name.as_deref(),
         resume_blocked,
         binding.default_alias.as_deref(),
+        Some(&binding.runner_id),
         &mut resolve,
         &mut spawn_actor,
+        &mut resume_actor,
         deliver,
     )?;
+    if let Some(refused) = picked["refused"].as_array() {
+        for item in refused {
+            if item["code"] != "fenced" {
+                if let Some(id) = item["assignment_id"].as_str() {
+                    (runtime.on_terminal)(id);
+                }
+            }
+        }
+    }
     pickup_reconciled(coord, &picked)
 }
 
@@ -1407,7 +1445,7 @@ fn process<F: FnMut(&Kickoff) -> Result<Value>>(
             let generation = event["generation"].as_u64().unwrap_or(0);
             if matches!(
                 event["state"].as_str(),
-                Some("result" | "failed" | "cancelled")
+                Some("result" | "failed" | "cancelled" | "blocked" | "queued" | "waiting")
             ) {
                 (runtime.on_terminal)(id);
             }
@@ -1418,6 +1456,10 @@ fn process<F: FnMut(&Kickoff) -> Result<Value>>(
                     .filter(|attempt| attempt.assignment_id.as_deref() == Some(id))
                 {
                     if attempt.generation.is_none_or(|prior| generation > prior) {
+                        preserve_retry_lane_if_eligible(
+                            attempt,
+                            event["state"].as_str().unwrap_or(""),
+                        );
                         retire_current_claim(attempt);
                         attempt.generation = Some(generation);
                         attempt.fenced = true;

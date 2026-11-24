@@ -544,6 +544,8 @@ pub(crate) mod test_helpers {
             subject_id: Some("sub_12345"),
             issuer: Some("https://auth.example"),
             profile_id,
+            action: "dispatch",
+            note: None,
         }
     }
 }
