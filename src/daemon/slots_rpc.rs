@@ -896,5 +896,5 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 mod unregistered_tests;

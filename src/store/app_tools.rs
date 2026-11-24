@@ -51,7 +51,7 @@ pub struct AppToolUpload<'a> {
     pub bytes: &'a [u8],
 }
 
-#[cfg_attr(all(debug_assertions, feature = "store-test-support"), doc(hidden))]
+#[cfg_attr(all(debug_assertions, feature = "test-seam"), doc(hidden))]
 pub struct AppToolRecord<'a> {
     pub id: &'a str,
     pub request: &'a str,
@@ -219,69 +219,6 @@ impl Store {
         claim: AppToolClaim<'a>,
     ) -> Result<AppToolClaimReceipt<'a>> {
         self.app_tool_claim(claim)?;
-        if !Self::app_tool_claimed(&*self.conn(), &claim)? {
-            return Err(Error::rejected(
-                "tool call id already belongs to another claim",
-            ));
-        }
-        Ok(AppToolClaimReceipt {
-            request: claim.request,
-            install: claim.install,
-            alias: claim.alias,
-            slot: claim.slot,
-            binding_digest: claim.binding_digest,
-            input_digest: claim.input_digest,
-            call_id: claim.call_id,
-        })
-    }
-
-    /// Reserve a paid operation inside a checked runtime snapshot and return
-    /// its durable receipt in one transaction.
-    #[doc(hidden)]
-    pub fn app_tool_claim_in_workspace<'a>(
-        &self,
-        workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot<'_>,
-        context: Option<&str>,
-        claim: AppToolClaim<'a>,
-    ) -> Result<AppToolClaimReceipt<'a>> {
-        self.write_tx(|conn| {
-            let tx = &*conn;
-            #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
-            let fixture = workspace.is_store_fixture();
-            #[cfg(not(any(test, all(debug_assertions, feature = "store-test-support"))))]
-            let fixture = false;
-            if !fixture {
-                let scope =
-                    context.map_or_else(|| "installation".to_owned(), |id| format!("context:{id}"));
-                let config: Option<String> = tx.query_opt(
-                    "SELECT config FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=?
-                     AND digest=? AND state='configured' AND json_extract(config,'$.bundle_digest')=?",
-                    params![
-                        claim.install,
-                        scope,
-                        claim.slot,
-                        claim.binding_digest,
-                        workspace.digest()
-                    ],
-                    |r| r.get(0),
-                )?;
-                let current = config
-                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                    .is_some_and(|config| {
-                        app_runs::material_digest(&json!({
-                            "kind":"app-binding-v1", "install_id":claim.install,
-                            "context_id":context, "slot":claim.slot, "config":config
-                        })) == claim.binding_digest
-                    });
-                if workspace.install() != claim.install
-                    || !workspace.declares_read_or_draft(claim.slot)
-                    || !current
-                {
-                    return Err(Error::rejected("tool workspace binding is no longer current"));
-                }
-            }
-            Self::insert_and_verify_claim(tx, claim)
-        })?;
         if !Self::app_tool_claimed(&*self.conn(), &claim)? {
             return Err(Error::rejected(
                 "tool call id already belongs to another claim",
@@ -492,7 +429,7 @@ impl Store {
     }
 
     // Existing custody fixtures exercise the low-level checked store path.
-    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
     #[cfg_attr(not(test), doc(hidden))]
     pub fn app_tool_record(&self, record: AppToolRecord<'_>) -> Result<Value> {
         self.app_tool_record_in(record)

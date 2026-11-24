@@ -54,7 +54,7 @@ impl RuntimeCaller {
     /// Never used for request admission: the listener is the only producer of
     /// a caller for an operations connection, and this exists so the adapter
     /// can bind the durable model task to the same exact subject.
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn registered(
         runtime_id: String,
@@ -75,7 +75,7 @@ impl RuntimeCaller {
             peer_starttime,
         )
     }
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn registered(
         runtime_id: String,
         agent_uid: String,

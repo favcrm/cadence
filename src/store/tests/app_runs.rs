@@ -253,7 +253,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
     let input_digest = crate::store::app_runs::material_digest(&json!({"handle":"client_a"}));
     let result = json!({"posts":[{"id":"p1","caption":"First\npost"}]});
     s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
-        workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
         run: id,
         step: "s1",
         message: &writer.id,
@@ -267,7 +266,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
     .unwrap();
     assert!(
         s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             run: id,
             step: "s1",
             message: &writer.id,
@@ -283,7 +281,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
     );
     assert!(
         s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             run: id,
             step: "s1",
             message: &writer.id,
@@ -298,7 +295,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
         "an interrupted call cannot change its payload"
     );
     s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
-        workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
         run: id,
         step: "s1",
         message: &writer.id,
@@ -312,7 +308,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
     .unwrap();
     let first = s
         .app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             id: "call-1",
             run: id,
             step: "s1",
@@ -337,7 +332,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
     );
     assert_eq!(
         s.app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             id: "call-1",
             run: id,
             step: "s1",
@@ -355,7 +349,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
     );
     assert!(s
         .app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             id: "call-2",
             run: id,
             step: "s1",
@@ -371,7 +364,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
         .is_err());
     assert!(
         s.app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             id: "call-3",
             run: id,
             step: "s1",
@@ -403,7 +395,6 @@ fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
     );
     assert!(s
         .app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             id: "call-3",
             run: id,
             step: "s1",
@@ -1876,7 +1867,6 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
     let turn = writer.turn_id.as_deref().unwrap();
     let input_digest = crate::store::app_runs::material_digest(&json!({"handle":"client_a"}));
     s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
-        workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
         run: &run_id,
         step: "s1",
         message: &writer.id,
@@ -1895,7 +1885,6 @@ fn cad2042_source_page_reads_an_ordered_scoped_index_range() {
         "posts": [{"id": "p1", "permalink": "https://www.instagram.com/p/AbC/", "published_at_unix": 1}],
     });
     s.app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
-        workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
         id: "cad2042-receipt",
         run: &run_id,
         step: "s1",

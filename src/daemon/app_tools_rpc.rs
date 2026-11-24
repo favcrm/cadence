@@ -746,7 +746,7 @@ impl Shared {
                 "tool native actor changed during price discovery",
             ));
         }
-        workspace::with_runtime_snapshot_proof(&pm, &ctx.install_id, |bundle, files, workspace| {
+        workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
             let _custody = self
                 .platform_custody_lock
                 .lock()
@@ -1179,19 +1179,17 @@ impl Shared {
             );
             // Reserve the one paid op BEFORE provider I/O; a repeat of the
             // same id admits only the byte-identical intent.
-            let claim_receipt = self.store.app_tool_claim_in_workspace(
-                workspace,
-                ctx.context_id.as_deref(),
-                crate::store::app_tools::AppToolClaim {
-                    request: request_id,
-                    install: &ctx.install_id,
-                    alias,
-                    slot,
-                    binding_digest: &proof.digest,
-                    input_digest: &input_digest,
-                    call_id: &call_id,
-                },
-            )?;
+            let claim_receipt =
+                self.store
+                    .app_tool_claim_receipt(crate::store::app_tools::AppToolClaim {
+                        request: request_id,
+                        install: &ctx.install_id,
+                        alias,
+                        slot,
+                        binding_digest: &proof.digest,
+                        input_digest: &input_digest,
+                        call_id: &call_id,
+                    })?;
             // Standalone invocation authority is distinct from workflow-run
             // authority; never manufacture run-shaped identifiers here.
             let mut authority = json!({

@@ -63,7 +63,7 @@ impl Custody {
         })
     }
 
-    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
     #[cfg_attr(not(test), doc(hidden))]
     pub fn file(dir: PathBuf) -> Self {
         Self {

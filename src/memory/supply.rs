@@ -202,7 +202,7 @@ pub(super) fn supply_view(
 /// Signed lessons on disk for CAD-2662 tests: an accepted record with two
 /// distinct worker reviews and a PM finalization over its own digest, so
 /// retrieval qualifies it exactly as it would a reviewed lesson.
-#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
 #[cfg_attr(not(test), doc(hidden))]
 #[cfg_attr(not(test), allow(clippy::unwrap_used))]
 pub mod fixture {

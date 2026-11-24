@@ -5,7 +5,7 @@
 #[cfg(not(all(
     target_os = "linux",
     feature = "test-seam",
-    any(test, all(debug_assertions, feature = "store-test-support"))
+    any(test, all(debug_assertions, feature = "test-seam"))
 )))]
 compile_error!("CAD-1128 commit probe requires Linux unit tests with test-seam");
 

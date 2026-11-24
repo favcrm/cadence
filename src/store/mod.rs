@@ -104,7 +104,7 @@ pub mod routines;
 pub mod workspace_settings;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
 mod messages;
-#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
 #[cfg_attr(not(test), doc(hidden))]
 pub use messages::take_decoded_messages;
 pub use messages::{
@@ -172,10 +172,10 @@ mod schema;
 /// CAD-2215: the nullable `connection_metadata.cursor_keyring_fingerprint`
 /// bind for the explicit operator initialization.
 pub(crate) mod scoped_cursor_keys;
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub mod seal;
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) mod seal;
 pub(crate) use scoped_cursor_keys::CursorKeyringInit;
 pub(crate) mod wiki_transfers;
@@ -188,17 +188,17 @@ pub use seal::OpenMode;
 // callers: every method is `pub(crate)` except the read/DML verbs
 // `execute`/`execute_batch`/`query_row`/`query_map` a hook legitimately
 // needs, and there is no `commit`/`rollback`/`Connection` escape.
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub use seal::StoreConn;
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) use seal::StoreConn;
 pub use seal::WriteTxn;
 pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx};
 #[cfg(all(
     target_os = "linux",
     feature = "test-seam",
-    any(test, all(debug_assertions, feature = "store-test-support"))
+    any(test, all(debug_assertions, feature = "test-seam"))
 ))]
 #[cfg_attr(not(test), doc(hidden))]
 pub mod cad1128_commit_refusal;
@@ -210,7 +210,7 @@ mod tests;
 /// reader (`audit`, `issue retro`, `doctor host`) share one WAL store.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn now() -> f64 {
     SystemTime::now()
@@ -219,7 +219,7 @@ pub fn now() -> f64 {
         .as_secs_f64()
 }
 
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -342,7 +342,7 @@ impl Store {
     /// reads it before and after a call and asserts it did not move, to
     /// prove a callback switched to the lock-free
     /// `workspace::with_runtime_read` writes nothing. Compiled out of release.
-    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
     #[cfg_attr(not(test), doc(hidden))]
     pub fn total_changes_for_test(&self) -> u64 {
         self.conn().total_changes()
@@ -454,7 +454,7 @@ impl Store {
         &self.db_identity
     }
 
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn write_tx<R>(&self, f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>) -> Result<R>
     where
@@ -463,7 +463,7 @@ impl Store {
         self.write_tx_checkpointed(true, f)
     }
 
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn write_tx<R>(
         &self,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,

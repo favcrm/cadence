@@ -108,7 +108,6 @@ pub fn read_asset_material(path: &std::path::Path, id: &str) -> Result<(Value, V
 }
 
 pub struct AppCapabilityRecord<'a> {
-    pub workspace: &'a crate::issue::app_catalog::workspace::RuntimeSnapshot<'a>,
     pub id: &'a str,
     pub run: &'a str,
     pub step: &'a str,
@@ -123,7 +122,6 @@ pub struct AppCapabilityRecord<'a> {
 }
 
 pub struct AppCapabilityClaim<'a> {
-    pub workspace: &'a crate::issue::app_catalog::workspace::RuntimeSnapshot<'a>,
     pub run: &'a str,
     pub step: &'a str,
     pub message: &'a str,
@@ -133,37 +131,6 @@ pub struct AppCapabilityClaim<'a> {
     pub binding_digest: &'a str,
     pub input_digest: &'a str,
     pub call_id: &'a str,
-}
-
-fn check_run_binding(
-    conn: &impl StoreConn,
-    workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot<'_>,
-    run: &str,
-    slot: &str,
-    binding_digest: &str,
-) -> Result<()> {
-    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
-    if workspace.is_store_fixture() {
-        return Ok(());
-    }
-    let (install, bundle, snapshot, digest, approved): (String, String, String, String, Option<String>) =
-        conn.query_row(
-            "SELECT install_id,bundle_digest,snapshot,snapshot_digest,approved_digest FROM app_runs WHERE id=?",
-            [run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        ).optional()?.ok_or_else(|| Error::rejected("app capability run is unavailable"))?;
-    let snapshot: Value = serde_json::from_str(&snapshot)?;
-    if install != workspace.install()
-        || bundle != workspace.digest()
-        || approved.as_deref() != Some(digest.as_str())
-        || app_runs::material_digest(&snapshot) != digest
-        || snapshot["capabilities"][slot]["digest"].as_str() != Some(binding_digest)
-        || !snapshot["workflow"]["capability_slots"]
-            .as_array()
-            .is_some_and(|slots| slots.iter().any(|item| item.as_str() == Some(slot)))
-    {
-        return Err(Error::rejected("app capability snapshot binding changed"));
-    }
-    Ok(())
 }
 
 /// CAD-2042: the first page of run-bound source reads. The order matches the
@@ -199,7 +166,6 @@ impl Store {
     /// A failed/uncertain result can only retry the same operation and key.
     pub fn app_capability_claim(&self, claim: AppCapabilityClaim<'_>) -> Result<bool> {
         let AppCapabilityClaim {
-            workspace,
             run,
             step,
             message,
@@ -213,7 +179,6 @@ impl Store {
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
-                    check_run_binding(tx, workspace, run, slot, binding_digest)?;
                     // CAD-1171: a host-execution run has no message or
                     // turn; its dispatched step is the proof.
                     let active: bool = if message.is_empty() && turn.is_empty() {
@@ -369,7 +334,6 @@ impl Store {
 
     pub fn app_capability_record(&self, record: AppCapabilityRecord<'_>) -> Result<Value> {
         let AppCapabilityRecord {
-            workspace,
             id,
             run,
             step,
@@ -383,7 +347,6 @@ impl Store {
             asset,
         } = record;
         let record = AppCapabilityRecord {
-            workspace,
             id,
             run,
             step,
@@ -414,7 +377,6 @@ impl Store {
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
-                    check_run_binding(tx, workspace, run, slot, binding_digest)?;
                     // CAD-1171: a host-execution run records its receipt
                     // with no message or turn; the dispatched step is the
                     // proof, exactly as in the claim.

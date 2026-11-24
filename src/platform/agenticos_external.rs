@@ -133,7 +133,7 @@ impl AgenticosExternalAdapter {
         Self::new(valid_base(base)?, deployment_pin, Transport::ExternalBearer)
     }
 
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn hosted_media(admission: super::deployments::HostedMediaAdmission) -> Result<Self> {
         Self::new(
@@ -143,7 +143,7 @@ impl AgenticosExternalAdapter {
         )
     }
 
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn hosted_media(
         admission: super::deployments::HostedMediaAdmission,
     ) -> Result<Self> {
@@ -1686,7 +1686,6 @@ pub fn attach(opts: &mut impl super::PlatformComposition) -> Result<()> {
     if let Some(admission) = opts
         .provider_deployments
         .as_ref()
-        .and_then(|value| value.verified())
         .and_then(|value| value.hosted_media())
     {
         if std::env::var_os("CADENCE_AGENTICOS_EXTERNAL_URL").is_some() {

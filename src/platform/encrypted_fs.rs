@@ -68,19 +68,19 @@ fn stat_file_valid(stat: &libc::stat) -> bool {
 // fstatat rather than opening/closing another DB fd: POSIX closes would release
 // SQLite's process-scoped locks. The initial DB probe stays open until AFTER
 // the SQLite connection closes.
-#[cfg_attr(all(debug_assertions, feature = "store-test-support"), doc(hidden))]
+#[cfg_attr(all(debug_assertions, feature = "test-seam"), doc(hidden))]
 pub struct Directories {
     handles: Vec<File>,
     names: Vec<CString>,
     private_descendants: bool,
 }
 impl Directories {
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn open(path: &Path, create_last: bool) -> Result<(Self, bool)> {
         Self::open_mode(path, create_last, false, false, false)
     }
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn open(path: &Path, create_last: bool) -> Result<(Self, bool)> {
         Self::open_mode(path, create_last, false, false, false)
     }
@@ -200,12 +200,12 @@ impl Directories {
         }
         parent.sync_all().map_err(|_| store_refused())
     }
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn last(&self) -> &File {
         self.handles.last().expect("root descriptor always present")
     }
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn last(&self) -> &File {
         self.handles.last().expect("root descriptor always present")
     }

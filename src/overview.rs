@@ -818,7 +818,7 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
 
 /// The overview with the gh block served from the cache only — a dry
 /// run must write nothing, cache included, so it never fetches.
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn overview_cached(state_dir: &Path, pm_dir: &Path) -> Value {
     let opts = Options {
@@ -827,7 +827,7 @@ pub fn overview_cached(state_dir: &Path, pm_dir: &Path) -> Value {
     };
     unscoped(overview_with(state_dir, pm_dir, &opts))
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn overview_cached(state_dir: &Path, pm_dir: &Path) -> Value {
     let opts = Options {
         cache_only: true,

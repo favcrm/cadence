@@ -543,7 +543,7 @@ impl Slots {
     }
 
     /// Inject a resource probe (tests); `None` restores the live probe.
-    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
     #[cfg_attr(not(test), doc(hidden))]
     pub fn use_resources(&mut self, probe: Option<ResourceProbe>) {
         self.resources = probe;

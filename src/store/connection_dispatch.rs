@@ -950,13 +950,13 @@ pub(super) fn protection_required_in(conn: &impl StoreConn) -> Result<bool> {
     }
 }
 
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn authority_in(conn: &impl StoreConn) -> Result<Authority> {
     authority_in_impl(conn)
 }
 
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn authority_in(conn: &impl StoreConn) -> Result<Authority> {
     authority_in_impl(conn)
 }
@@ -2890,12 +2890,12 @@ fn boot_preflight_in(
 // Management writers (the daemon proves operator/human authority first)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn set_config_in(tx: &WriteTxn<'_>, enabled: bool, limits: &OwnerLimitsV1) -> Result<()> {
     set_config_in_impl(tx, enabled, limits)
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn set_config_in(
     tx: &WriteTxn<'_>,
     enabled: bool,
@@ -2914,12 +2914,12 @@ fn set_config_in_impl(tx: &WriteTxn<'_>, enabled: bool, limits: &OwnerLimitsV1) 
     Ok(())
 }
 
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn set_manifest_in(tx: &WriteTxn<'_>, manifest: &ManifestV1) -> Result<()> {
     set_manifest_in_impl(tx, manifest)
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn set_manifest_in(tx: &WriteTxn<'_>, manifest: &ManifestV1) -> Result<()> {
     set_manifest_in_impl(tx, manifest)
 }
@@ -2958,7 +2958,7 @@ fn set_manifest_in_impl(tx: &WriteTxn<'_>, manifest: &ManifestV1) -> Result<()> 
     Ok(())
 }
 
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn set_policy_in(
     tx: &WriteTxn<'_>,
@@ -2975,7 +2975,7 @@ pub fn set_policy_in(
         policy_digest,
     )
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn set_policy_in(
     tx: &WriteTxn<'_>,
     connection_id: &str,
@@ -3498,7 +3498,7 @@ impl Store {
     /// immutable head before acknowledging success. A missing/lost
     /// acknowledgement fences further protected admission and answers
     /// `outcome_unknown`; the callback is never re-run.
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn protected_management_commit<F, R: 'static>(
         &self,
@@ -3518,7 +3518,7 @@ impl Store {
         )
     }
 
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn protected_management_commit<F, R: 'static>(
         &self,
         workspace_id: &str,

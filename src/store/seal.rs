@@ -29,11 +29,6 @@ use std::sync::Arc;
 
 use super::Store;
 
-#[cfg(all(not(debug_assertions), feature = "store-test-support"))]
-compile_error!(
-    "feature `store-test-support` exposes raw Store test transactions and must never be compiled into a release build"
-);
-
 #[path = "owner.rs"]
 pub(crate) mod owner;
 
@@ -975,7 +970,7 @@ impl Store {
     /// closure. The authorizer stays Disarmed, so even facade DML verbs
     /// refuse; only the guard opens/finishes the deferred read transaction.
     /// Owned results cannot carry a prepared statement outside the snapshot.
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn read_tx<R>(&self, f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>) -> Result<R>
     where
@@ -988,7 +983,7 @@ impl Store {
     /// closure. The authorizer stays Disarmed, so even facade DML verbs
     /// refuse; only the guard opens/finishes the deferred read transaction.
     /// Owned results cannot carry a prepared statement outside the snapshot.
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn read_tx<R>(
         &self,
         f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
@@ -1426,7 +1421,7 @@ impl Store {
     #[cfg(any(
         test,
         feature = "test-seam",
-        all(debug_assertions, feature = "store-test-support")
+        all(debug_assertions, feature = "test-seam")
     ))]
     #[allow(dead_code)]
     #[doc(hidden)]

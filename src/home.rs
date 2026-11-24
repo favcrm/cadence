@@ -686,7 +686,7 @@ fn test_guard(dir: PathBuf, rel: &str, leaf: &str) -> Result<PathBuf> {
 #[cfg(any(
     test,
     feature = "test-seam",
-    all(debug_assertions, feature = "store-test-support")
+    all(debug_assertions, feature = "test-seam")
 ))]
 fn test_guard_in(dir: PathBuf, real: Option<&Path>, rel: &str, leaf: &str) -> Result<PathBuf> {
     match real {
@@ -731,7 +731,7 @@ pub fn guard_tracker(dir: PathBuf) -> Result<PathBuf> {
 }
 
 /// [`guard_tracker`] with the real home passed in (pure; for tests).
-#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
 #[cfg_attr(not(test), doc(hidden))]
 pub fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
     test_guard_in(dir, real, ".", "pm")
@@ -745,7 +745,7 @@ pub fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
 #[cfg(any(
     test,
     feature = "test-seam",
-    all(debug_assertions, feature = "store-test-support")
+    all(debug_assertions, feature = "test-seam")
 ))]
 fn resolve_for_compare(p: &Path) -> PathBuf {
     use std::path::Component;
@@ -779,7 +779,7 @@ fn resolve_for_compare(p: &Path) -> PathBuf {
 #[cfg(any(
     test,
     feature = "test-seam",
-    all(debug_assertions, feature = "store-test-support")
+    all(debug_assertions, feature = "test-seam")
 ))]
 fn refuse_under(dir: PathBuf, root: &Path) -> Result<PathBuf> {
     let root = resolve_for_compare(root);
@@ -807,7 +807,7 @@ fn real_home() -> Option<PathBuf> {
 
 /// One lock for every CAD-1922 test that rewrites process environment, in
 /// this module and in `sandbox`: they share `HOME` and `CADENCE_*`.
-#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
 #[cfg_attr(not(test), doc(hidden))]
 pub static CAD1922_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

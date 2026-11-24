@@ -22,7 +22,7 @@ pub struct RuntimeCaller {
 }
 
 impl RuntimeCaller {
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn registered(
@@ -44,7 +44,7 @@ impl RuntimeCaller {
             peer_starttime,
         )
     }
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     #[allow(dead_code)]
     pub(crate) fn registered(
         runtime_id: String,
@@ -133,27 +133,27 @@ pub mod console {
 pub mod qualified {
     /// The live qualified reader. On this host no reader can be issued, so
     /// every lookup refuses.
-    pub(crate) struct CurrentReader<'a>(std::marker::PhantomData<&'a ()>);
+    pub struct CurrentReader<'a>(std::marker::PhantomData<&'a ()>);
 
     impl CurrentReader<'_> {
-        pub(crate) fn qualified(&self) -> Option<&QualifiedRuntime> {
+        pub fn qualified(&self) -> Option<&QualifiedRuntime> {
             None
         }
 
-        pub(crate) fn require(&self) -> crate::error::Result<&QualifiedRuntime> {
+        pub fn require(&self) -> crate::error::Result<&QualifiedRuntime> {
             Err(crate::error::Error::rejected(
                 "no current qualified runtime — admission refused",
             ))
         }
 
-        pub(crate) fn runtime_id(&self) -> Option<&str> {
+        pub fn runtime_id(&self) -> Option<&str> {
             None
         }
     }
 
     /// A runtime the qualification registry would publish; on this host the
     /// registry never holds one.
-    pub(crate) struct QualifiedRuntime;
+    pub struct QualifiedRuntime;
 }
 
 /// The strict JSON parser is platform-neutral and shared verbatim with the

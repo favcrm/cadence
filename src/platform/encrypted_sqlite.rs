@@ -35,7 +35,7 @@ use crate::error::{Error, Result};
 #[cfg(all(
     target_os = "linux",
     feature = "test-seam",
-    any(test, all(debug_assertions, feature = "store-test-support"))
+    any(test, all(debug_assertions, feature = "test-seam"))
 ))]
 #[cfg_attr(not(test), doc(hidden))]
 pub mod custody6_hooks;
@@ -123,7 +123,7 @@ pub struct ExpectedIdentity {
 #[cfg(all(
     unix,
     feature = "test-seam",
-    any(test, all(debug_assertions, feature = "store-test-support"))
+    any(test, all(debug_assertions, feature = "test-seam"))
 ))]
 #[cfg_attr(not(test), doc(hidden))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1109,7 +1109,7 @@ impl EncryptedVault {
     #[cfg(all(
         unix,
         feature = "test-seam",
-        any(test, all(debug_assertions, feature = "store-test-support"))
+        any(test, all(debug_assertions, feature = "test-seam"))
     ))]
     #[cfg_attr(not(test), doc(hidden))]
     pub fn rows_for(&self, connection_id: &str) -> Result<Vec<RowMetadata>> {

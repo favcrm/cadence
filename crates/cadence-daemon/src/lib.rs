@@ -30,7 +30,7 @@ use cadence_agent::{
     review, rollout, runner, sandbox, secret, skill, slots, store, test_queue, test_seam,
     thread_search, update, web_push, wiki, worktree, Error, Result,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 use cadence_agent::{web_publish, web_sites};
 
 #[path = "../../../src/operator_auth.rs"]
@@ -55,7 +55,7 @@ pub use daemon::*;
 #[path = "../../../src/thread_budget.rs"]
 mod thread_budget;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 #[path = "../../../src/web_cli_test_harness.rs"]
 mod web_cli_test_harness;
 

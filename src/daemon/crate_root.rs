@@ -1333,7 +1333,6 @@ impl Shared {
         let hosted_business_documents = opts
             .provider_deployments
             .as_ref()
-            .and_then(|metadata| metadata.verified())
             .and_then(|metadata| metadata.hosted_business_documents());
         // Import before serving or actor recovery in a normal workspace.
         // Portable execution-disabled stores deliberately omit authority;
@@ -1347,7 +1346,6 @@ impl Shared {
             .with_company_master(
                 opts.provider_deployments
                     .as_ref()
-                    .and_then(|metadata| metadata.verified())
                     .and_then(|metadata| metadata.hosted_company_master()),
             )
             .with_settings_store(Arc::clone(&store));
@@ -2225,7 +2223,7 @@ impl Shared {
     /// CAD-565: for a pty endpoint the "body" the prompt carries is the
     /// one-line delivery notice (see [`Self::delivery_body`]); the full
     /// text is pulled, not pasted.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seam"))]
     fn continuity_prompt(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
         self.continuity_prompt_slotted(alias, endpoint_kind, message, None)
     }
@@ -2326,7 +2324,7 @@ impl Shared {
     /// any) wrapped ahead of the delivery body. The actor calls
     /// [`Self::continuity_parts`] directly so mandatory task context is
     /// planned before optional history.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seam"))]
     fn continuity_prompt_slotted(
         &self,
         alias: &str,
@@ -6031,7 +6029,11 @@ fn pm_dir_of_with(
     }
 }
 
-#[cfg(test)]
+// Daemon unit tests rely on cadence-agent's debug-only `test-seam` hooks
+// so `--profile ci` and `--release` workspace builds never enable them by
+// default. All CI suites (`tests.yml`, `changed-tests.yml`, `clippy --features test-seam`)
+// pass `--features test-seam`.
+#[cfg(all(test, feature = "test-seam"))]
 mod tests;
 
 /// Content hash for spec-drift detection — the same value the CLI

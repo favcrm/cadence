@@ -13,12 +13,7 @@ const CAP: u64 = 16 * 1024;
 pub struct DeploymentMetadata {
     providers: Vec<ProviderDeployment>,
     company_master: Option<HostedCompanyMaster>,
-    disk_validated: bool,
 }
-
-/// Metadata loaded from an authenticated deployment file, not parsed input.
-/// Only the filesystem loaders can establish this provenance.
-pub struct VerifiedDeploymentMetadata<'a>(&'a DeploymentMetadata);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,7 +108,7 @@ fn reviewed_media_pin(pin: &str) -> Option<&'static str> {
 /// Only validated image metadata can produce this construction proof. It
 /// authorizes one fixed internal media door, not arbitrary HTTP or a lease.
 #[derive(Clone, Debug)]
-#[cfg_attr(all(debug_assertions, feature = "store-test-support"), doc(hidden))]
+#[cfg_attr(all(debug_assertions, feature = "test-seam"), doc(hidden))]
 pub struct HostedMediaAdmission {
     /// The reviewed manifest pin the image metadata asserted — only
     /// `MANIFEST_PIN` (@3) or `TEXT_MANIFEST_PIN` (@4), never a free string.
@@ -121,12 +116,12 @@ pub struct HostedMediaAdmission {
 }
 
 impl HostedMediaAdmission {
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn pin(&self) -> &'static str {
         self.pin
     }
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn pin(&self) -> &'static str {
         self.pin
     }
@@ -278,21 +273,13 @@ impl DeploymentMetadata {
         Ok(Self {
             providers: metadata.providers,
             company_master: metadata.master_trust_boundary,
-            disk_validated: false,
         })
-    }
-
-    /// Obtain the image or sandbox provenance established by a disk loader.
-    /// Parsing metadata alone never creates this capability.
-    pub fn verified(&self) -> Option<VerifiedDeploymentMetadata<'_>> {
-        self.disk_validated
-            .then_some(VerifiedDeploymentMetadata(self))
     }
 
     /// The MEDIA assertion grants media only. CAD-1158: an explicit
     /// transport match, so an SMTP-only assertion never yields a media
     /// admission (the find-first-transport pitfall).
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn hosted_media(&self) -> Option<HostedMediaAdmission> {
         self.providers
@@ -301,7 +288,7 @@ impl DeploymentMetadata {
             .and_then(|entry| reviewed_media_pin(&entry.manifest_pin))
             .map(|pin| HostedMediaAdmission { pin })
     }
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn hosted_media(&self) -> Option<HostedMediaAdmission> {
         self.providers
             .iter()
@@ -329,7 +316,7 @@ impl DeploymentMetadata {
 
     /// CAD-1416: `Some` only for the exact business-documents tuple (all
     /// four fields). An SMTP or media assertion never yields it.
-    pub(crate) fn hosted_business_documents(&self) -> Option<HostedBusinessDocumentsAdmission> {
+    pub fn hosted_business_documents(&self) -> Option<HostedBusinessDocumentsAdmission> {
         self.providers
             .iter()
             .find(|entry| {
@@ -361,7 +348,7 @@ impl DeploymentMetadata {
             .map(|_| HostedWhatsappAdmission { _private: () })
     }
 
-    pub(crate) fn hosted_company_master(&self) -> Option<HostedCompanyMaster> {
+    pub fn hosted_company_master(&self) -> Option<HostedCompanyMaster> {
         self.company_master.clone()
     }
 
@@ -370,34 +357,6 @@ impl DeploymentMetadata {
             .iter()
             .find(|entry| entry.provider == provider && entry.origin == origin)
             .map(|entry| entry.manifest_pin.as_str())
-    }
-}
-
-impl VerifiedDeploymentMetadata<'_> {
-    pub fn hosted_business_documents(&self) -> Option<HostedBusinessDocumentsAdmission> {
-        self.0.hosted_business_documents()
-    }
-
-    pub fn hosted_company_master(&self) -> Option<HostedCompanyMaster> {
-        self.0.hosted_company_master()
-    }
-
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
-    #[doc(hidden)]
-    pub fn hosted_media(&self) -> Option<HostedMediaAdmission> {
-        self.0.hosted_media()
-    }
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
-    pub(crate) fn hosted_media(&self) -> Option<HostedMediaAdmission> {
-        self.0.hosted_media()
-    }
-
-    pub(crate) fn hosted_smtp(&self) -> Option<HostedSmtpAdmission> {
-        self.0.hosted_smtp()
-    }
-
-    pub(crate) fn hosted_whatsapp(&self) -> Option<HostedWhatsappAdmission> {
-        self.0.hosted_whatsapp()
     }
 }
 
@@ -453,9 +412,7 @@ fn read_components(
         .take(CAP + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| refused())?;
-    let mut metadata = DeploymentMetadata::parse(&bytes)?;
-    metadata.disk_validated = true;
-    Ok(Some(metadata))
+    DeploymentMetadata::parse(&bytes).map(Some)
 }
 
 /// Fixed production source: no path, UID or pin environment override.
@@ -522,9 +479,7 @@ fn load_dev_at(state_dir: &Path, path: &Path, dev: bool) -> Result<Option<Deploy
     file.take(CAP + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| refused())?;
-    let mut metadata = DeploymentMetadata::parse(&bytes)?;
-    metadata.disk_validated = true;
-    Ok(Some(metadata))
+    DeploymentMetadata::parse(&bytes).map(Some)
 }
 
 #[cfg(test)]
@@ -539,13 +494,3 @@ fn read_fixture(root: &Path, name: &str, owner: u32) -> Result<Option<Deployment
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[test]
-fn parsed_metadata_does_not_prove_disk_provenance() {
-    let metadata = DeploymentMetadata::parse(
-        br#"{"schema":1,"providers":[{"provider":"business_documents","origin":"http://api.internal","manifest_pin":"business-documents@1","transport":"hosted-business-documents@1"}]}"#,
-    )
-    .unwrap();
-    assert!(metadata.verified().is_none());
-}

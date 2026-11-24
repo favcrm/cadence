@@ -845,7 +845,6 @@ pub fn attach_publish_sender(
         .provider_deployments
         .as_ref()
         .or(loaded.as_ref())
-        .and_then(|metadata| metadata.verified())
         .and_then(|metadata| metadata.hosted_media());
     attach_publish_sender_with(
         state_dir,

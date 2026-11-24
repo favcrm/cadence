@@ -1119,7 +1119,7 @@ impl RecordStore {
         })
     }
 
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
         match self.conn.lock() {
@@ -1136,7 +1136,7 @@ impl RecordStore {
         }
     }
 
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         match self.conn.lock() {
             Ok(guard) => guard,

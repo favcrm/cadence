@@ -269,12 +269,12 @@ pub fn intake_request(request: &str, source: &str) -> Result<String> {
     ))
 }
 
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn intake_scope_marker(revision: &str, digest: &str) -> String {
     format!(" [Cadence intake scope: revision={revision} digest={digest}]")
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn intake_scope_marker(revision: &str, digest: &str) -> String {
     format!(" [Cadence intake scope: revision={revision} digest={digest}]")
 }

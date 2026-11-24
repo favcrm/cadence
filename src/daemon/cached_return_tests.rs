@@ -190,7 +190,6 @@ fn seed_result(
     shared
         .store
         .app_capability_claim(crate::store::app_capabilities::AppCapabilityClaim {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             run: run_id,
             step,
             message,
@@ -205,7 +204,6 @@ fn seed_result(
     let rec = shared
         .store
         .app_capability_record(AppCapabilityRecord {
-            workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot::store_fixture(),
             id: &id,
             run: run_id,
             step,

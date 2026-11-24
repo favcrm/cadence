@@ -1538,28 +1538,18 @@ impl Shared {
         let execute_legacy = |legacy_slots: &[String], finish: bool| -> Result<()> {
             type Files = std::collections::BTreeMap<String, String>;
             type Held<'a> = Option<(&'a Value, &'a Files)>;
-            let snap = |f: &mut dyn FnMut(
-                &Value,
-                &Files,
-                &workspace::RuntimeSnapshot<'_>,
-                Held<'_>,
-            ) -> Result<()>|
-             -> Result<()> {
+            let snap = |f: &mut dyn FnMut(&Value, &Files, Held<'_>) -> Result<()>| -> Result<()> {
                 if let Some(original) = &reference_original {
-                    workspace::with_runtime_snapshot_pair_proof(
+                    workspace::with_runtime_snapshot_pair(
                         &pm,
                         install,
                         original.install_id(),
-                        |(bundle, files, snapshot), producer| {
-                            f(bundle, files, snapshot, Some(producer))
-                        },
+                        |(bundle, files), producer| f(bundle, files, Some(producer)),
                     )
                 } else {
-                    workspace::with_runtime_snapshot_proof(
-                        &pm,
-                        install,
-                        |bundle, files, snapshot| f(bundle, files, snapshot, None),
-                    )
+                    workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                        f(bundle, files, None)
+                    })
                 }
             };
             // Called with the custody and release guards held.
@@ -1603,7 +1593,7 @@ impl Shared {
                     .simple()
                 );
                 let mut prepared = None;
-                snap(&mut |bundle, files, snapshot, producer| {
+                snap(&mut |bundle, files, producer| {
                     let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
@@ -1697,7 +1687,6 @@ impl Shared {
                     let credential = self.app_capability_credential(config)?;
                     let newly_claimed = self.store.app_capability_claim(
                         crate::store::app_capabilities::AppCapabilityClaim {
-                            workspace: snapshot,
                             run: run_id,
                             step: &step_id,
                             message: "",
@@ -1794,7 +1783,7 @@ impl Shared {
                         )),
                     }
                 };
-                let recorded = snap(&mut |bundle, files, snapshot, producer| {
+                let recorded = snap(&mut |bundle, files, producer| {
                     let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
@@ -1847,7 +1836,6 @@ impl Shared {
                     }
                     if let Err(error) = self.store.app_capability_record(
                         crate::store::app_capabilities::AppCapabilityRecord {
-                            workspace: snapshot,
                             id: &call_id,
                             run: run_id,
                             step: &step_id,
@@ -1886,7 +1874,7 @@ impl Shared {
                 }
             }
             if finish {
-                snap(&mut |bundle, files, _, producer| {
+                snap(&mut |bundle, files, producer| {
                     let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock

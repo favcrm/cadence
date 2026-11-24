@@ -582,6 +582,9 @@
 
     /// CAD-1809: the schema-only `AgentQuota` type must match its
     /// live `canonical_quota` producer exactly.
+    /// (The companion `SessionInfo` schema-contract assertions moved verbatim
+    /// to `src/daemon/board_session_schema.rs` in `cadence-daemon` when
+    /// `operator_auth` moved into that crate.)
     #[test]
     fn schema_only_board_types_match_their_producers() {
         use crate::board_schema_test::assert_matches;

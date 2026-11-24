@@ -15,8 +15,7 @@ use runtime_guard::read_seam;
 pub use runtime_guard::{
     install_builtin_guarded, remove_guarded, remove_preview, restore_guarded, update_check,
     with_completed_bundle_snapshot, with_runtime_read, with_runtime_snapshot,
-    with_runtime_snapshot_pair, with_runtime_snapshot_pair_proof, with_runtime_snapshot_proof,
-    RuntimeSnapshot,
+    with_runtime_snapshot_pair,
 };
 
 /// Only this source-owned marker proves a request failed before its first

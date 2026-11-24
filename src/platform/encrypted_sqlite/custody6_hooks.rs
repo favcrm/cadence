@@ -3,7 +3,7 @@
 #[cfg(not(all(
     target_os = "linux",
     feature = "test-seam",
-    any(test, all(debug_assertions, feature = "store-test-support"))
+    any(test, all(debug_assertions, feature = "test-seam"))
 )))]
 compile_error!("custody6 hooks must never enter ordinary/release artifacts");
 

@@ -189,7 +189,7 @@ impl Shared {
     /// `agent_send` without a connection to attribute (unit tests):
     /// a threaded agent records the message as unattributed, and a
     /// steering send is the operator's.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seam"))]
     pub(super) fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
         self.send_with(params, &|_| Ok(store::Sender::Unattributed), &|_| {
             Ok(AgentCaller::Operator)

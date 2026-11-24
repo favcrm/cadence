@@ -3,25 +3,13 @@
 //! the call to nothing; a test installs a callback that asserts the PM
 //! write lock is free at that point.
 
-#[cfg(any(
-    test,
-    feature = "test-seam",
-    all(debug_assertions, feature = "store-test-support")
-))]
+#[cfg(any(test, feature = "test-seam"))]
 use std::cell::RefCell;
 
-#[cfg(any(
-    test,
-    feature = "test-seam",
-    all(debug_assertions, feature = "store-test-support")
-))]
+#[cfg(any(test, feature = "test-seam"))]
 type Hook = Box<dyn Fn(&str)>;
 
-#[cfg(any(
-    test,
-    feature = "test-seam",
-    all(debug_assertions, feature = "store-test-support")
-))]
+#[cfg(any(test, feature = "test-seam"))]
 thread_local! {
     static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
 }
@@ -29,11 +17,7 @@ thread_local! {
 /// Called immediately before slow work that must run without the PM lock.
 #[inline]
 pub fn outside_lock(_point: &str) {
-    #[cfg(any(
-        test,
-        feature = "test-seam",
-        all(debug_assertions, feature = "store-test-support")
-    ))]
+    #[cfg(any(test, feature = "test-seam"))]
     HOOK.with(|h| {
         if let Some(f) = h.borrow().as_ref() {
             f(_point);
@@ -42,11 +26,7 @@ pub fn outside_lock(_point: &str) {
 }
 
 /// Install (or clear) the callback for this thread.
-#[cfg(any(
-    test,
-    feature = "test-seam",
-    all(debug_assertions, feature = "store-test-support")
-))]
+#[cfg(any(test, feature = "test-seam"))]
 pub fn set_hook(hook: Option<Hook>) {
     HOOK.with(|h| *h.borrow_mut() = hook);
 }

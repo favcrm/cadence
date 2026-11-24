@@ -29,7 +29,7 @@
 #[cfg(all(
     unix,
     feature = "test-seam",
-    any(test, all(debug_assertions, feature = "store-test-support"))
+    any(test, all(debug_assertions, feature = "test-seam"))
 ))]
 #[cfg_attr(not(test), doc(hidden))]
 pub mod test_artifact_adapter;

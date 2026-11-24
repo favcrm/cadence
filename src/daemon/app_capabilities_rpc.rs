@@ -64,7 +64,7 @@ pub fn operator_price_refusal(message: &str) -> Option<&str> {
     (code.is_empty() || code.strip_prefix(": ").is_some_and(refusal_code)).then_some(message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 mod tests;
 
 /// A run-bound capability failure as a daemon error: an explicit refusal
@@ -197,7 +197,7 @@ impl Shared {
         crate::platform::account_media::recheck_quote(&proof.config, quote)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seam"))]
     pub(super) fn app_capability_quote(
         &self,
         proof: &BindingProof,
@@ -320,51 +320,46 @@ impl Shared {
             self.recheck_app_capability_quote(&proof, quote)?;
             Ok((step, proof))
         };
-        let prepared = workspace::with_runtime_snapshot_proof(
-            &pm,
-            install,
-            |bundle, files, workspace| {
-                let _custody = self
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let _release = self
-                    .app_release_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let (step, proof) = current(bundle, files)?;
-                if let Some(existing) = self.store.app_capability_result_for_slot(run_id, slot)? {
-                    if existing["step_id"] != step
-                        || existing["request_id"] != request
-                        || existing["input_digest"] != input_digest
-                        || existing["binding_digest"] != proof.digest
-                    {
-                        return Err(Error::rejected(
-                            "approved run capability slot already has its one result",
-                        ));
-                    }
-                    return Ok(std::ops::ControlFlow::Break(existing));
+        let prepared = workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (step, proof) = current(bundle, files)?;
+            if let Some(existing) = self.store.app_capability_result_for_slot(run_id, slot)? {
+                if existing["step_id"] != step
+                    || existing["request_id"] != request
+                    || existing["input_digest"] != input_digest
+                    || existing["binding_digest"] != proof.digest
+                {
+                    return Err(Error::rejected(
+                        "approved run capability slot already has its one result",
+                    ));
                 }
-                let prepared = self.prepare_app_capability_quote(&proof)?;
-                if !self.store.app_capability_claim(
-                    crate::store::app_capabilities::AppCapabilityClaim {
-                        workspace,
-                        run: run_id,
-                        step: &step,
-                        message,
-                        turn,
-                        slot,
-                        request,
-                        binding_digest: &proof.digest,
-                        input_digest: &input_digest,
-                        call_id: &call_id,
-                    },
-                )? {
-                    return Err(Error::unknown("A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made."));
-                }
-                Ok(std::ops::ControlFlow::Continue((step, proof, prepared)))
-            },
-        )?;
+                return Ok(std::ops::ControlFlow::Break(existing));
+            }
+            let prepared = self.prepare_app_capability_quote(&proof)?;
+            if !self.store.app_capability_claim(
+                crate::store::app_capabilities::AppCapabilityClaim {
+                    run: run_id,
+                    step: &step,
+                    message,
+                    turn,
+                    slot,
+                    request,
+                    binding_digest: &proof.digest,
+                    input_digest: &input_digest,
+                    call_id: &call_id,
+                },
+            )? {
+                return Err(Error::unknown("A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made."));
+            }
+            Ok(std::ops::ControlFlow::Continue((step, proof, prepared)))
+        })?;
         let (step, proof, prepared) = match prepared {
             std::ops::ControlFlow::Continue(prepared) => prepared,
             std::ops::ControlFlow::Break(existing) => return Ok(existing),
@@ -450,8 +445,7 @@ impl Shared {
             }
             let record = |bundle: &Value,
                           files: &BTreeMap<String, String>,
-                          producer: Option<(&Value, &BTreeMap<String, String>)>,
-                          workspace: &workspace::RuntimeSnapshot<'_>|
+                          producer: Option<(&Value, &BTreeMap<String, String>)>|
              -> Result<Value> {
                 let _custody = self
                     .platform_custody_lock
@@ -492,7 +486,6 @@ impl Shared {
                 }
                 self.store.app_capability_record(
                     crate::store::app_capabilities::AppCapabilityRecord {
-                        workspace,
                         id: &call_id,
                         run: run_id,
                         step: &step,
@@ -511,17 +504,15 @@ impl Shared {
                 )
             };
             if let Some(original) = &reference {
-                workspace::with_runtime_snapshot_pair_proof(
+                workspace::with_runtime_snapshot_pair(
                     &pm,
                     install,
                     original.install_id(),
-                    |(bundle, files, workspace), producer| {
-                        record(bundle, files, Some(producer), workspace)
-                    },
+                    |(bundle, files), producer| record(bundle, files, Some(producer)),
                 )
             } else {
-                workspace::with_runtime_snapshot_proof(&pm, install, |bundle, files, workspace| {
-                    record(bundle, files, None, workspace)
+                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                    record(bundle, files, None)
                 })
             }
         };
@@ -831,147 +822,142 @@ impl Shared {
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 // Claim under the runtime/custody/release guards; provider I/O
                 // remains outside them, followed by a fresh result check.
-                let prepared = workspace::with_runtime_snapshot_proof(
-                    &pm,
-                    &install,
-                    |bundle, files, workspace| {
-                        let _custody = self.custody_operation()?;
-                        let _release = self
-                            .app_release_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let run = self.store.app_run_show(&run_id)?;
-                        self.app_run_binding_current(&run, bundle, files)?;
-                        let (run, step, proof) = self.store.app_capability_turn(
-                            &alias,
+                let prepared = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
+                    let _custody = self.custody_operation()?;
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let run = self.store.app_run_show(&run_id)?;
+                    self.app_run_binding_current(&run, bundle, files)?;
+                    let (run, step, proof) = self.store.app_capability_turn(
+                        &alias,
+                        message,
+                        turn,
+                        &slot,
+                        required_str(bundle, "digest")?,
+                    )?;
+                    // CAD-1374: the sealed approving human bound at approval
+                    // time. Null for a legacy approval (no human recorded).
+                    let sealed_human = run["approval"]["human"].clone();
+                    // CAD-1141: price drift is accepted. The fresh quote is
+                    // the call's `max_charge_minor` ceiling (authority below);
+                    // the frozen snapshot itself must still be unchanged.
+                    if run["snapshot_digest"] != checked_run["snapshot_digest"] {
+                        return Err(Error::rejected(
+                            "run snapshot digest changed since run approval",
+                        ));
+                    }
+                    self.recheck_app_capability_quote(&proof, &quote)?;
+                    let config = &proof.config;
+                    let provider = required_str(config, "provider")?;
+                    let tool = required_str(&config["mapping"], "tool")?;
+                    let effect = required_str(&config["mapping"], "effect")?;
+                    let adapter = self
+                        .platforms
+                        .get(provider)
+                        .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
+                    if !matches!(effect, "read" | "draft")
+                        || classify_call(
+                            adapter.table(),
+                            adapter.reported_manifest_version().as_deref(),
+                            tool,
+                        ) != if effect == "read" {
+                            Effect::Read
+                        } else {
+                            Effect::Draft
+                        }
+                    {
+                        return Err(Error::rejected(
+                            "bound app capability is not a current read/draft action",
+                        ));
+                    }
+                    let input_digest = app_runs::material_digest(input);
+                    if let Some(existing) =
+                        self.store.app_capability_result_for_slot(&run_id, &slot)?
+                    {
+                        if existing["step_id"] != step
+                            || existing["request_id"] != request
+                            || existing["input_digest"] != input_digest
+                            || existing["binding_digest"] != proof.digest
+                        {
+                            return Err(Error::rejected(
+                                "approved run capability slot already has its one result",
+                            ));
+                        }
+                        return Ok(std::ops::ControlFlow::Break(existing));
+                    }
+                    let call_id = format!(
+                        "app-call-{}",
+                        uuid::Uuid::new_v5(
+                            &uuid::Uuid::NAMESPACE_OID,
+                            format!("{run_id}:{slot}").as_bytes(),
+                        )
+                        .simple()
+                    );
+                    // The claim is the exactly-once gate: a second identical
+                    // request makes no provider call and must not fail the run
+                    // (the first call may still be in flight).
+                    if !self.store.app_capability_claim(
+                        crate::store::app_capabilities::AppCapabilityClaim {
+                            run: &run_id,
+                            step: &step,
                             message,
                             turn,
-                            &slot,
-                            required_str(bundle, "digest")?,
-                        )?;
-                        // CAD-1374: the sealed approving human bound at approval
-                        // time. Null for a legacy approval (no human recorded).
-                        let sealed_human = run["approval"]["human"].clone();
-                        // CAD-1141: price drift is accepted. The fresh quote is
-                        // the call's `max_charge_minor` ceiling (authority below);
-                        // the frozen snapshot itself must still be unchanged.
-                        if run["snapshot_digest"] != checked_run["snapshot_digest"] {
-                            return Err(Error::rejected(
-                                "run snapshot digest changed since run approval",
-                            ));
-                        }
-                        self.recheck_app_capability_quote(&proof, &quote)?;
-                        let config = &proof.config;
-                        let provider = required_str(config, "provider")?;
-                        let tool = required_str(&config["mapping"], "tool")?;
-                        let effect = required_str(&config["mapping"], "effect")?;
-                        let adapter = self.platforms.get(provider).ok_or_else(|| {
-                            Error::rejected("bound capability adapter unavailable")
-                        })?;
-                        if !matches!(effect, "read" | "draft")
-                            || classify_call(
-                                adapter.table(),
-                                adapter.reported_manifest_version().as_deref(),
-                                tool,
-                            ) != if effect == "read" {
-                                Effect::Read
-                            } else {
-                                Effect::Draft
-                            }
-                        {
-                            return Err(Error::rejected(
-                                "bound app capability is not a current read/draft action",
-                            ));
-                        }
-                        let input_digest = app_runs::material_digest(input);
-                        if let Some(existing) =
-                            self.store.app_capability_result_for_slot(&run_id, &slot)?
-                        {
-                            if existing["step_id"] != step
-                                || existing["request_id"] != request
-                                || existing["input_digest"] != input_digest
-                                || existing["binding_digest"] != proof.digest
-                            {
-                                return Err(Error::rejected(
-                                    "approved run capability slot already has its one result",
-                                ));
-                            }
-                            return Ok(std::ops::ControlFlow::Break(existing));
-                        }
-                        let call_id = format!(
-                            "app-call-{}",
-                            uuid::Uuid::new_v5(
-                                &uuid::Uuid::NAMESPACE_OID,
-                                format!("{run_id}:{slot}").as_bytes(),
-                            )
-                            .simple()
-                        );
-                        // The claim is the exactly-once gate: a second identical
-                        // request makes no provider call and must not fail the run
-                        // (the first call may still be in flight).
-                        if !self.store.app_capability_claim(
-                            crate::store::app_capabilities::AppCapabilityClaim {
-                                workspace,
-                                run: &run_id,
-                                step: &step,
-                                message,
-                                turn,
-                                slot: &slot,
-                                request: &request,
-                                binding_digest: &proof.digest,
-                                input_digest: &input_digest,
-                                call_id: &call_id,
-                            },
-                        )? {
-                            return Err(Error::unknown("A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made."));
-                        }
-                        let authority = json!({
-                            "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
-                            "install_id":install,"context_id":run["context_id"],
-                            "step_id":step,"slot":slot,"binding":proof,
-                            "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
-                            "quote":quote,
-                            "call_id":call_id,
-                        });
-                        let credential = self.app_capability_credential(config)?;
-                        // CAD-1374: a NEW external call re-proves the approving
-                        // human after the durable claim and before any provider
-                        // bytes leave. A revoked/demoted human refuses here; the
-                        // claim stays as an honest prepared intent, never resent.
-                        if sealed_human.is_object() {
-                            self.fresh_run_human(&sealed_human)?;
-                        }
-                        // Re-read the live run and active assigned turn after the
-                        // fresh I/O. The approval human binding and the turn must
-                        // still be the ones proven above.
-                        let (current, current_step, current_proof) =
-                            self.store.app_capability_turn(
-                                &alias,
-                                message,
-                                turn,
-                                &slot,
-                                required_str(bundle, "digest")?,
-                            )?;
-                        if current["approval"]["human"] != sealed_human
-                            || current_step != step
-                            || current_proof.digest != proof.digest
-                        {
-                            return Err(Error::rejected(
-                                "capability approval or turn changed before the external call",
-                            ));
-                        }
-                        Ok(std::ops::ControlFlow::Continue((
-                            std::sync::Arc::clone(adapter),
-                            credential,
-                            authority,
-                            call_id,
-                            input_digest,
-                            step,
-                            proof,
-                            sealed_human,
-                        )))
-                    },
-                )?;
+                            slot: &slot,
+                            request: &request,
+                            binding_digest: &proof.digest,
+                            input_digest: &input_digest,
+                            call_id: &call_id,
+                        },
+                    )? {
+                        return Err(Error::unknown("A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made."));
+                    }
+                    let authority = json!({
+                        "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
+                        "install_id":install,"context_id":run["context_id"],
+                        "step_id":step,"slot":slot,"binding":proof,
+                        "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
+                        "quote":quote,
+                        "call_id":call_id,
+                    });
+                    let credential = self.app_capability_credential(config)?;
+                    // CAD-1374: a NEW external call re-proves the approving
+                    // human after the durable claim and before any provider
+                    // bytes leave. A revoked/demoted human refuses here; the
+                    // claim stays as an honest prepared intent, never resent.
+                    if sealed_human.is_object() {
+                        self.fresh_run_human(&sealed_human)?;
+                    }
+                    // Re-read the live run and active assigned turn after the
+                    // fresh I/O. The approval human binding and the turn must
+                    // still be the ones proven above.
+                    let (current, current_step, current_proof) = self.store.app_capability_turn(
+                        &alias,
+                        message,
+                        turn,
+                        &slot,
+                        required_str(bundle, "digest")?,
+                    )?;
+                    if current["approval"]["human"] != sealed_human
+                        || current_step != step
+                        || current_proof.digest != proof.digest
+                    {
+                        return Err(Error::rejected(
+                            "capability approval or turn changed before the external call",
+                        ));
+                    }
+                    Ok(std::ops::ControlFlow::Continue((
+                        std::sync::Arc::clone(adapter),
+                        credential,
+                        authority,
+                        call_id,
+                        input_digest,
+                        step,
+                        proof,
+                        sealed_human,
+                    )))
+                })?;
                 let (
                     adapter,
                     credential,
@@ -1007,76 +993,67 @@ impl Shared {
                     })?;
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.
                 crate::issue::lockseam::outside_lock("app-capability-before-record");
-                let recorded = workspace::with_runtime_snapshot_proof(
-                    &pm,
-                    &install,
-                    |bundle, files, workspace| {
-                        let _custody = self
-                            .platform_custody_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let _release = self
-                            .app_release_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        self.app_run_binding_current(
-                            &self.store.app_run_show(&run_id)?,
-                            bundle,
-                            files,
+                let recorded = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.app_run_binding_current(&self.store.app_run_show(&run_id)?, bundle, files)
+                        .map_err(super::app_effects_rpc::lock2_authority)?;
+                    let (current, current_step, current_proof) = self
+                        .store
+                        .app_capability_turn(
+                            &alias,
+                            message,
+                            turn,
+                            &slot,
+                            required_str(bundle, "digest")?,
                         )
                         .map_err(super::app_effects_rpc::lock2_authority)?;
-                        let (current, current_step, current_proof) = self
-                            .store
-                            .app_capability_turn(
-                                &alias,
-                                message,
-                                turn,
-                                &slot,
-                                required_str(bundle, "digest")?,
-                            )
-                            .map_err(super::app_effects_rpc::lock2_authority)?;
-                        if current["approval"]["human"] != sealed_human
-                            || current_step != step
-                            || current_proof.digest != proof.digest
-                        {
-                            return Err(super::app_effects_rpc::lock2_authority(Error::rejected(
-                                "capability approval or turn changed during the external call",
-                            )));
-                        }
+                    if current["approval"]["human"] != sealed_human
+                        || current_step != step
+                        || current_proof.digest != proof.digest
+                    {
+                        return Err(super::app_effects_rpc::lock2_authority(Error::rejected(
+                            "capability approval or turn changed during the external call",
+                        )));
+                    }
+                    crate::platform::refuse_leak(
+                        "app capability result",
+                        &output.result.to_string(),
+                        &credential,
+                    )?;
+                    if let Some(asset) = &output.asset {
                         crate::platform::refuse_leak(
-                            "app capability result",
-                            &output.result.to_string(),
+                            "app capability asset",
+                            &String::from_utf8_lossy(&asset.bytes),
                             &credential,
                         )?;
-                        if let Some(asset) = &output.asset {
-                            crate::platform::refuse_leak(
-                                "app capability asset",
-                                &String::from_utf8_lossy(&asset.bytes),
-                                &credential,
-                            )?;
-                        }
-                        self.store
-                            .app_capability_record(
-                                crate::store::app_capabilities::AppCapabilityRecord {
-                                    workspace,
-                                    id: &call_id,
-                                    run: &run_id,
-                                    step: &step,
-                                    message,
-                                    turn,
-                                    slot: &slot,
-                                    request: &request,
-                                    binding_digest: &proof.digest,
-                                    input_digest: &input_digest,
-                                    result: &output.result,
-                                    asset: output.asset.as_ref().map(|asset| {
-                                        (asset.media_type.as_str(), asset.bytes.as_slice())
-                                    }),
-                                },
-                            )
-                            .map_err(|error| Error::internal(error.to_string()))
-                    },
-                );
+                    }
+                    self.store
+                        .app_capability_record(
+                            crate::store::app_capabilities::AppCapabilityRecord {
+                                id: &call_id,
+                                run: &run_id,
+                                step: &step,
+                                message,
+                                turn,
+                                slot: &slot,
+                                request: &request,
+                                binding_digest: &proof.digest,
+                                input_digest: &input_digest,
+                                result: &output.result,
+                                asset: output.asset.as_ref().map(|asset| {
+                                    (asset.media_type.as_str(), asset.bytes.as_slice())
+                                }),
+                            },
+                        )
+                        .map_err(|error| Error::internal(error.to_string()))
+                });
                 if let Err(error) = &recorded {
                     // The provider answered but lock 2 refused or could not
                     // retain it: leave a durable uncertain failure naming

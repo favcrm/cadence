@@ -35,7 +35,7 @@ pub use done::{
 };
 #[cfg(all(
     feature = "test-seam",
-    any(test, all(debug_assertions, feature = "store-test-support"))
+    any(test, all(debug_assertions, feature = "test-seam"))
 ))]
 #[cfg_attr(not(test), doc(hidden))]
 pub use edit::keyed_commit_seam::{arm_keyed_commit_after_success, KeyedCommitSeam};
@@ -55,10 +55,10 @@ pub use plan::{create_granted_plan, GrantedPreview};
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
 pub use projects::load_front;
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub use projects::save_front;
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) use projects::save_front;
 pub(crate) use projects::{check_tags, split_tags};
 #[doc(hidden)]

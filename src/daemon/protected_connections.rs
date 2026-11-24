@@ -3004,10 +3004,10 @@ fn done_verified() -> ValidatedOutcomeV1 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 #[path = "protected_connections_epoch_acceptance_20261027.rs"]
 mod protected_connections_epoch_acceptance_20261027;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 #[path = "protected_connections_agenticos_read_acceptance.rs"]
 mod protected_connections_agenticos_read_acceptance;

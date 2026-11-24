@@ -40,12 +40,12 @@ pub type ActorTake = (Take, Option<NativeTurnClaim>);
 
 // Deterministic cost evidence for recurring read paths. Thread-local so
 // unrelated parallel tests cannot add to a caller's measurement.
-#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
 thread_local! {
     static DECODED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
 #[cfg_attr(not(test), doc(hidden))]
 pub fn take_decoded_messages() -> usize {
     DECODED_MESSAGES.with(|n| n.replace(0))
@@ -115,7 +115,7 @@ pub struct Message {
 }
 
 pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
-    #[cfg(any(test, all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
     DECODED_MESSAGES.with(|n| n.set(n.get() + 1));
     let result: Option<String> = row.get("result")?;
     Ok(Message {
@@ -2307,14 +2307,14 @@ impl Store {
     pub fn take_queued(&self, alias: &str) -> Result<Take> {
         self.take_queued_app_proven(alias, None)
     }
-    #[cfg(all(debug_assertions, feature = "store-test-support"))]
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn take_queued_app_proven(&self, alias: &str, proof: Option<(&str, &str)>) -> Result<Take> {
         self.take_queued_inner(alias, proof, false)
             .map(|(take, _)| take)
     }
 
-    #[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     pub(crate) fn take_queued_app_proven(
         &self,
         alias: &str,

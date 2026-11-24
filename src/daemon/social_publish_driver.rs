@@ -682,5 +682,5 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seam"))]
 mod tests;

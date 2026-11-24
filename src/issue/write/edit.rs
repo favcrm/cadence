@@ -14,7 +14,7 @@ pub(crate) use links::{apply_link, new_ref};
 /// compiled without this module.
 #[cfg(all(
     feature = "test-seam",
-    any(test, all(debug_assertions, feature = "store-test-support"))
+    any(test, all(debug_assertions, feature = "test-seam"))
 ))]
 pub mod keyed_commit_seam {
     use std::collections::BTreeMap;
@@ -625,7 +625,7 @@ pub fn add_comment_keyed(
             // through the same cleanup/unknown handler below.
             #[cfg(all(
                 feature = "test-seam",
-                any(test, all(debug_assertions, feature = "store-test-support"))
+                any(test, all(debug_assertions, feature = "test-seam"))
             ))]
             let result = match result {
                 Ok(foreign) => keyed_commit_seam::fire(&pm.dir).map(|()| foreign),

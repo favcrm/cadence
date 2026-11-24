@@ -343,7 +343,7 @@ pub fn operator_proof(
 /// Set in the environment of a coding agent's process and its shells.
 /// `spawn_daemon_run` and the board's start remove them: a long-running
 /// service started from an agent's shell is not that agent.
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub const AGENT_RUNTIME_MARKERS: &[&str] = &[
     "CLAUDECODE",
@@ -353,7 +353,7 @@ pub const AGENT_RUNTIME_MARKERS: &[&str] = &[
     "PI_CODING_AGENT",
     "PI_SESSION_ID",
 ];
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) const AGENT_RUNTIME_MARKERS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",

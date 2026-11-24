@@ -263,12 +263,12 @@ pub(crate) fn validate_artifact_path(decoded: &str) -> Result<()> {
 /// produces (only unreserved characters and `/` are written literally; `/` as
 /// `%2F`), so a double-encoded or malformed-escape segment is refused rather
 /// than decoded leniently. The result is validated with `validate_artifact_path`.
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn decode_artifact_segment(encoded: &str) -> Result<String> {
     decode_artifact_segment_impl(encoded)
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn decode_artifact_segment(encoded: &str) -> Result<String> {
     decode_artifact_segment_impl(encoded)
 }

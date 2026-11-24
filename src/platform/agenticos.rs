@@ -220,17 +220,11 @@ fn compose_hosted_smtp(opts: &mut super::AttachView<'_>) -> Result<()> {
         return Ok(());
     }
     let admission = match opts.provider_deployments.as_ref() {
-        Some(metadata) => metadata
-            .verified()
-            .and_then(|metadata| metadata.hosted_smtp()),
+        Some(metadata) => metadata.hosted_smtp(),
         // No in-memory composition: consult the fixed root-owned image
         // file, the same source `register_with_loader` trusts for the
         // platform pin. Absent file or no SMTP entry admits nothing.
-        None => super::deployments::load()?.and_then(|metadata| {
-            metadata
-                .verified()
-                .and_then(|metadata| metadata.hosted_smtp())
-        }),
+        None => super::deployments::load()?.and_then(|metadata| metadata.hosted_smtp()),
     };
     if let Some(admission) = admission {
         *opts.smtp_internal = Some(super::smtp_internal::SmtpInternal::from_admission(
@@ -249,14 +243,8 @@ fn compose_hosted_whatsapp(opts: &mut super::AttachView<'_>) -> Result<()> {
         return Ok(());
     }
     let admission = match opts.provider_deployments.as_ref() {
-        Some(metadata) => metadata
-            .verified()
-            .and_then(|metadata| metadata.hosted_whatsapp()),
-        None => super::deployments::load()?.and_then(|metadata| {
-            metadata
-                .verified()
-                .and_then(|metadata| metadata.hosted_whatsapp())
-        }),
+        Some(metadata) => metadata.hosted_whatsapp(),
+        None => super::deployments::load()?.and_then(|metadata| metadata.hosted_whatsapp()),
     };
     if let Some(admission) = admission {
         *opts.hosted_whatsapp = Some(super::hosted_whatsapp::HostedWhatsapp::from_admission(

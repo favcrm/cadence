@@ -84,7 +84,7 @@ pub fn role_instructions(briefing: &str) -> Option<&str> {
 /// The `agent_show` request [`brief_agent`] reads the agent with: its stored
 /// job, and (for the agent itself or its group root) the `params` and `cwd`
 /// the briefing is built from (CAD-2310).
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn briefing_read(alias: &str) -> Value {
     json!({
@@ -92,7 +92,7 @@ pub fn briefing_read(alias: &str) -> Value {
         "include_catalogue_instructions": true,
     })
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn briefing_read(alias: &str) -> Value {
     json!({
         "alias": alias, "limit": 0, "include_profile_instructions": true,
@@ -120,24 +120,24 @@ pub fn endpoint_opened(agent: &Value, attachable: bool) -> bool {
 
 /// The `agent_list` request the briefing's group roster is read with
 /// (CAD-2323).
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn roster_read() -> Value {
     json!({"include_group": true})
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn roster_read() -> Value {
     json!({"include_group": true})
 }
 
 /// The briefing's "Group at write time" lines: the root and every agent
 /// whose upstream is the root, from an `agent_list` answer.
-#[cfg(all(debug_assertions, feature = "store-test-support"))]
+#[cfg(all(debug_assertions, feature = "test-seam"))]
 #[doc(hidden)]
 pub fn group_roster(list: &Value, root: &str) -> String {
     group_roster_impl(list, root)
 }
-#[cfg(not(all(debug_assertions, feature = "store-test-support")))]
+#[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) fn group_roster(list: &Value, root: &str) -> String {
     group_roster_impl(list, root)
 }
