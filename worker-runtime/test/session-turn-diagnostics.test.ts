@@ -124,3 +124,14 @@ it("pages through compaction heads without mistaking them for a reset boundary",
     .toEqual(["operation-1"]);
   expect(JSON.stringify(events)).not.toMatch(/private-/);
 });
+
+it("keeps chat and its transcript readable when the optional diagnostics index is unavailable", async () => {
+  const run = await session(() => answer("answer without diagnostics"), { refuseDiagnosticsIndex: true });
+  const settled = await (await run.submit("message without diagnostics")).wait(BACKGROUND_CONTEXT);
+  expect(settled.status).toBe("done");
+  const summary = run.hosted.sessionSummary();
+  if (summary.state !== "observed") throw new Error("expected the retained chat generation");
+  const transcript = run.hosted.sessionTranscript(summary.session.sessionId, 0);
+  expect(JSON.stringify(transcript)).toContain("answer without diagnostics");
+  expect(run.hosted.sessionTurnDiagnostics(summary.session.sessionId)).toBeNull();
+});

@@ -93,6 +93,7 @@ export type SessionOptions = {
   put?: boolean;
   backgroundTokens?: number;
   projectThread?: (entries: readonly ThreadEntry[]) => readonly ThreadEntry[];
+  refuseDiagnosticsIndex?: boolean;
   tools?: readonly unknown[];
 };
 
@@ -106,6 +107,8 @@ export async function session(
   const database = new Database(":memory:");
   const sql = {
     exec(query: string, ...bindings: (string | number | null)[]) {
+      if (options.refuseDiagnosticsIndex && query.startsWith("CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads"))
+        throw new Error("SQLITE_FULL");
       if (/^\s*(SELECT|PRAGMA|WITH)/i.test(query)) {
         const rows = database.prepare(query).all(...bindings);
         return { toArray: () => rows };

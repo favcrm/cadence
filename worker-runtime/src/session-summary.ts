@@ -136,10 +136,16 @@ export function readSessionBounds(
  * Pi's ordinary head index also contains compaction anchors, which are not resets.
  */
 export function ensureDiagnosticResetIndex(sql: TaskSql): void {
-  if (!sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_entries'").toArray()[0])
-    return;
-  sql.exec(`CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads
-    ON pi_entries (conversation_id, id) WHERE head=id`);
+  try {
+    if (!sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_entries'").toArray()[0])
+      return;
+    sql.exec(`CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads
+      ON pi_entries (conversation_id, id) WHERE head=id`);
+  } catch {
+    // The indexed diagnostics read will refuse. An unavailable support index
+    // must not take down ordinary chat or transcript reads.
+    console.warn("Hosted conversation diagnostics index unavailable.");
+  }
 }
 
 /** Diagnostics needs only a proven reset window, not the summary's activity or run scans. */

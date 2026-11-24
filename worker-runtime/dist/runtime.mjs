@@ -57248,10 +57248,14 @@ function readSessionBounds(sql, objectId, sessionId) {
   }
 }
 function ensureDiagnosticResetIndex(sql) {
-  if (!sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_entries'").toArray()[0])
-    return;
-  sql.exec(`CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads
-    ON pi_entries (conversation_id, id) WHERE head=id`);
+  try {
+    if (!sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='pi_entries'").toArray()[0])
+      return;
+    sql.exec(`CREATE INDEX IF NOT EXISTS cadence_diagnostic_reset_heads
+      ON pi_entries (conversation_id, id) WHERE head=id`);
+  } catch {
+    console.warn("Hosted conversation diagnostics index unavailable.");
+  }
 }
 function readBoundedDiagnosticWindow(sql, objectId, sessionId) {
   const prefix = `${objectId}:`;
