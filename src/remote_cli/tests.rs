@@ -10552,8 +10552,14 @@ fn aos739_agent_enroll_verbs_are_registered_with_their_scopes_and_effects() {
     ] {
         assert!(REMOTE_VERBS.contains(&verb), "{verb}");
     }
-    assert_eq!(cli_requested_scopes("agent_enroll_start"), &["cli.read"]);
-    assert_eq!(cli_requested_scopes("agent_enroll_status"), &["cli.read"]);
+    assert_eq!(
+        cli_requested_scopes("agent_enroll_start"),
+        &["cli.read", "cli.write"]
+    );
+    assert_eq!(
+        cli_requested_scopes("agent_enroll_status"),
+        &["cli.read", "cli.write"]
+    );
     assert_eq!(
         cli_requested_scopes("agent_enroll_list"),
         &["cli.read", "audit.approve"]

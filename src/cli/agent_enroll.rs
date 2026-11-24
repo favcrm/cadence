@@ -56,6 +56,35 @@ impl EnrollAction {
     }
 }
 
+fn managed_caller_error(action: &EnrollAction) -> Error {
+    Error::invalid(
+        "managed_caller_refused",
+        format!(
+            "`cadence {}` is refused for a managed agent: hosted CLI enrollment acts on a \
+             standalone CLI login (`cadence login`), not a managed daemon session. Nothing \
+             was sent.",
+            action.verb()
+        ),
+    )
+}
+
+/// Refuse `cadence agent enroll *` when running inside a managed daemon session
+/// (`CADENCE_ALIAS` / `CADENCE_GRANT_TOKEN`), BEFORE `org::resolve` or client-only
+/// routing can send daemon RPCs or renew the host's saved login.
+pub(crate) fn refuse_managed_env_caller(command: &Commands) -> Result<()> {
+    if let Commands::Agent {
+        action: AgentAction::Enroll { action },
+    } = command
+    {
+        if std::env::var_os("CADENCE_ALIAS").is_some()
+            || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
+        {
+            return Err(managed_caller_error(action));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse hosted CLI enrollment commands for disallowed caller identities before
 /// any request is sent:
 /// - Managed daemon callers (`CADENCE_ALIAS`, `CADENCE_GRANT_TOKEN`, or pinned
@@ -73,15 +102,7 @@ pub(crate) fn refuse_disallowed_caller(
         || std::env::var_os("CADENCE_ALIAS").is_some()
         || std::env::var_os("CADENCE_GRANT_TOKEN").is_some()
     {
-        return Err(Error::invalid(
-            "managed_caller_refused",
-            format!(
-                "`cadence {}` is refused for a managed agent: hosted CLI enrollment acts on a \
-                 standalone CLI login (`cadence login`), not a managed daemon session. Nothing \
-                 was sent.",
-                action.verb()
-            ),
-        ));
+        return Err(managed_caller_error(action));
     }
     if action.is_owner_action() {
         return cadence_agent::remote_cli::refuse_non_human_actor(Some(target), action.verb());
@@ -277,6 +298,13 @@ mod tests {
         let _lock = crate::cli::org::tests::RESOLVE_ENV
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        struct UnbindActor;
+        impl Drop for UnbindActor {
+            fn drop(&mut self) {
+                cadence_agent::remote_cli::unbind_cli_actor();
+            }
+        }
+        let _unbind = UnbindActor;
         let env_bare = crate::cli::org::tests::EnvGuard::bare();
         env_bare.write_registry(&crate::cli::org::tests::remote_registry(
             "acme",
@@ -341,7 +369,38 @@ mod tests {
                 .contains("human/owner authority"),
             "{explicit_start_err}"
         );
-        cadence_agent::remote_cli::unbind_cli_actor();
+    }
+
+    #[test]
+    fn managed_env_caller_is_refused_before_org_resolve() {
+        use crate::cli::org::tests::{remote_registry, EnvGuard, EP_A, RESOLVE_ENV};
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", true));
+        std::env::set_var("CADENCE_ALIAS", "synthetic-worker");
+        for args in [
+            vec!["cadence", "agent", "enroll", "status", "--org", "acme"],
+            vec!["cadence", "agent", "enroll", "status"],
+            vec!["cadence", "agent", "enroll", "start", "--org", "acme"],
+            vec!["cadence", "agent", "enroll", "list", "--org", "acme"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let err = super::action_dispatch::run_cli(cli).unwrap_err();
+            assert_eq!(
+                err.code(),
+                Some("managed_caller_refused"),
+                "{args:?}: {err}"
+            );
+
+            let cli_only = Cli::try_parse_from(&args).unwrap();
+            let err_only = super::client_update::route_client_only(cli_only).unwrap_err();
+            assert_eq!(
+                err_only.code(),
+                Some("managed_caller_refused"),
+                "{args:?}: {err_only}"
+            );
+        }
+        std::env::remove_var("CADENCE_ALIAS");
     }
 
     #[test]

@@ -318,9 +318,8 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "template_list"
         | "template_show"
         | "template_blob_read"
-        | "document_show"
-        | "agent_enroll_start"
-        | "agent_enroll_status" => &["cli.read"],
+        | "document_show" => &["cli.read"],
+        "agent_enroll_start" | "agent_enroll_status" => &["cli.read", "cli.write"],
         "agent_enroll_list" => &["cli.read", "audit.approve"],
         "agent_enroll_approve" | "agent_enroll_revoke" => &["cli.write", "audit.approve"],
         // CAD-2286: the tenant admits `document_submit` with cli.write alone.
@@ -5656,11 +5655,7 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
              CLI enrollment commands. Nothing was changed",
         )),
         (
-            "agent_enroll_start"
-            | "agent_enroll_status"
-            | "agent_enroll_list"
-            | "agent_enroll_approve"
-            | "agent_enroll_revoke",
+            "agent_enroll_status" | "agent_enroll_list",
             Some("capability_unavailable"),
         ) => Some((
             "capability_unavailable",

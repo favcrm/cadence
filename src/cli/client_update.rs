@@ -247,6 +247,7 @@ pub(crate) fn route_client_only(cli: Cli) -> Result<i32> {
             return skill::show(name, file.as_deref());
         }
     }
+    super::agent_enroll::refuse_managed_env_caller(&cli.command)?;
     let tracker = std::env::var_os("CADENCE_PM_DIR")
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
