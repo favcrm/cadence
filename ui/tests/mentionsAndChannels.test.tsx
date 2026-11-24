@@ -182,7 +182,7 @@ async function main(): Promise<void> {
     { kind: "human", id: "human-carol", label: "Carol" },
     { kind: "human", id: "human-dan", label: "Dan" },
     { kind: "human", id: "human-erin", label: "Erin" },
-    { kind: "agent", id: "ag-dev", label: "dev" },
+    { kind: "agent", id: "ag-dev", label: "dev", look: "builder" },
   ];
   const people: ClientModule.HumanPerson[] = [
     { id: "human-me", subject: "sub-me", name: "Mei" },
@@ -190,8 +190,8 @@ async function main(): Promise<void> {
     { id: "human-eva", subject: "sub-eva", name: "Eva" },
   ];
   const agents: ClientModule.HumanAgent[] = [
-    { uid: "ag-dev", alias: "dev" },
-    { uid: "ag-qa", alias: "qa" },
+    { uid: "ag-dev", alias: "dev", look: "builder" },
+    { uid: "ag-qa", alias: "qa", look: "tester" },
   ];
   const roomPage: ClientModule.HumanRoomPage = {
     room: "room-1",
@@ -219,6 +219,15 @@ async function main(): Promise<void> {
           { kind: "blocked_dm", handle: "@maya", label: "maya" },
         ],
       },
+      {
+        id: "post-agent",
+        read_cursor: "csc1_post_agent",
+        sender: { id: "ag-dev", label: "dev", kind: "agent" },
+        body: "Working on it now.",
+        created: 1700000250,
+        silent: false,
+        outcomes: [],
+      },
     ],
     events: [
       { id: "ev-1", text: "Mei added @dev", created: 1700000150 },
@@ -231,11 +240,19 @@ async function main(): Promise<void> {
     agent_chain_limit: 2,
   };
 
+  let holdRoomRead = false;
+  let releaseRoomRead: (() => void) | null = null;
+
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const url = new URL(String(input), "http://localhost");
     const method = (init?.method ?? "GET").toUpperCase();
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
     calls.push({ method, path: url.pathname, body });
+    if (url.pathname === "/api/human-threads/stream") return new Response("", { status: 404 });
+    if (url.pathname === "/api/human-threads/me") return json({ human: { id: "human-me", name: "Mei" } });
+    if (url.pathname === "/api/human-threads/rooms") return json({ rooms: [roomSummary] });
+    if (url.pathname === "/api/agents") return json({ daemon: "reachable", agents: [], totals: null, by_issue: {} });
+    if (url.pathname === "/api/issues") return json({ issues: [] });
     if (url.pathname === "/api/human-threads/agents") return json({ agents });
     if (url.pathname === "/api/human-threads/people") {
       const q = (url.searchParams.get("query") ?? "").trim().toLowerCase();
@@ -243,7 +260,14 @@ async function main(): Promise<void> {
       return json({ actor: "human-me", people: filteredPeople, has_more: false });
     }
     if (url.pathname === "/api/human-threads/groups" && method === "POST") return json({ room: "room-new" });
-    if (url.pathname === "/api/human-threads/rooms/room-1" && method === "GET") return json(roomPage);
+    if (url.pathname === "/api/human-threads/rooms/room-1" && method === "GET") {
+      if (holdRoomRead) {
+        await new Promise<void>((resolve) => {
+          releaseRoomRead = resolve;
+        });
+      }
+      return json(roomPage);
+    }
     if (url.pathname === "/api/human-threads/rooms/room-1/posts" && method === "POST") {
       return json({
         post: {
@@ -288,6 +312,7 @@ async function main(): Promise<void> {
     "isShareableAgent excludes personal_assistant, assist-*, master, reviewer, and inbox agents",
   );
 
+  holdRoomRead = true;
   await React.act(async () => {
     root.render(
       React.createElement(LocaleProvider, null,
@@ -330,7 +355,17 @@ async function main(): Promise<void> {
       ),
     );
   });
+  await flush();
+  assert(host.querySelector('.threads-skel-timeline[role="status"][aria-busy="true"]') !== null, "HumanRoomTimeline shows skeleton while room fetch is pending");
+  holdRoomRead = false;
+  (releaseRoomRead as (() => void) | null)?.();
   for (let i = 0; i < 6; i += 1) await flush();
+
+  assert(host.querySelector('.threads-skel-timeline') === null, "HumanRoomTimeline clears skeleton once room loads");
+  assert(host.querySelector('[data-post-id="post-agent"] .agent-avatar[data-slug="builder"]') !== null, "Agent message displays pinned AgentAvatar in chat conversation");
+  assert(host.querySelector('.threads-roster [data-kind="agent"] .agent-avatar[data-slug="builder"]') !== null, "Details roster displays AgentAvatar for shared agents");
+  assert(host.querySelector('.threads-context-room')?.textContent?.includes("Release Sync"), "Details panel displays compact room summary header");
+  assert(host.querySelector('details.threads-guardrails-card')?.hasAttribute("open"), "Active Guardrails disclosure defaults open when paused");
 
   assert(host.querySelectorAll("select").length === 0, "Channels and ThreadComposerFrame render zero native <select> elements");
   assert(
@@ -584,15 +619,36 @@ async function main(): Promise<void> {
     assert(toastStack !== null && toastStack.style.display === "", "NotificationToastStack delegates display to CSS without inline display override");
   }
 
-  // 7. CAD-2736 Channels zh-TW locale entries
+  // 7. CAD-2736 & CAD-2765 Channels zh-TW locale entries
   equal(
     [
       translateUiText("Close new conversation", "zh-TW"),
       translateUiText("Channels", "zh-TW"),
       translateUiText("Channels are unavailable for this sign-in.", "zh-TW"),
+      translateUiText("No channels yet.", "zh-TW"),
     ],
-    ["關閉新對話", "頻道", "此登入帳號無法使用頻道。"],
+    ["關閉新對話", "頻道", "此登入帳號無法使用頻道。", "尚無頻道。"],
     "zh-TW Channels and modal close copy translate cleanly",
+  );
+
+  // 8. CAD-2765 ThreadsPage on hosted boards (workConversationsEnabled=false) clears loading state without stuck 'Loading conversations…'
+  const ThreadsPage = require<{ default: ReactModule.ComponentType<{ operator: boolean; workConversationsEnabled?: boolean; humanThreadsEnabled?: boolean }> }>("../src/features/threads/ThreadsPage").default;
+  await React.act(async () => {
+    root.render(
+      React.createElement(LocaleProvider, null,
+        React.createElement(ThreadsPage, {
+          operator: true,
+          workConversationsEnabled: false,
+          humanThreadsEnabled: true,
+        }),
+      ),
+    );
+  });
+  for (let i = 0; i < 8; i += 1) await flush();
+  const sidebarText = host.querySelector(".threads-list")?.textContent ?? "";
+  assert(
+    sidebarText.includes("Release Sync") && !sidebarText.includes("Loading conversations…"),
+    "Hosted Channels sidebar does not get stuck displaying 'Loading conversations…' above channels",
   );
 
   await React.act(async () => root.unmount());

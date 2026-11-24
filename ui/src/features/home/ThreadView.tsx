@@ -192,6 +192,7 @@ export function Bubble({
   live,
   showName,
   atAlways,
+  avatar,
 }: {
   who: string;
   at?: string;
@@ -203,6 +204,7 @@ export function Bubble({
   live?: ReactNode;
   showName?: boolean;
   atAlways?: boolean;
+  avatar?: ReactNode;
 }) {
   if (me && !showName) {
     return (
@@ -217,14 +219,27 @@ export function Bubble({
       </div>
     );
   }
-  return (
-    <div className={`min-w-0 ${me ? "ml-6 text-right" : ""}`} data-chat-message={me ? "user" : "assistant"}>
+  const inner = (
+    <>
       <div className={`flex items-baseline gap-2 text-micro text-ink-500 mb-1.5 ${me ? "justify-end" : ""}`}>
         <span className="text-label font-medium text-ink-200">{who}</span>
         {at ? <span className="num">{at}</span> : null}
         {live ? <span className="chat-live num">{live}</span> : null}
       </div>
       <div className="min-w-0">{children}</div>
+    </>
+  );
+  if (avatar && !me) {
+    return (
+      <div className="min-w-0 flex items-start gap-2.5" data-chat-message="assistant">
+        <div className="shrink-0 mt-0.5" aria-hidden="true">{avatar}</div>
+        <div className="min-w-0 flex-1">{inner}</div>
+      </div>
+    );
+  }
+  return (
+    <div className={`min-w-0 ${me ? "ml-6 text-right" : ""}`} data-chat-message={me ? "user" : "assistant"}>
+      {inner}
     </div>
   );
 }

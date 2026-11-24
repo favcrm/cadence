@@ -9,6 +9,7 @@ import Composer from "../app-shell/chat/Composer";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import { newMessageId } from "../home/thread";
 import CredentialRequestList from "../connections/CredentialRequestCard";
+import AgentAvatar, { lookFor } from "../agents/AgentAvatar";
 import {
   slugifyHandle,
   startsWithNote,
@@ -16,6 +17,12 @@ import {
   type MentionOutcome,
 } from "../mentions/mentions";
 import { Turn } from "./ThreadChatParts";
+import {
+  HUMAN_LIVE_POLL_MS,
+  HUMAN_POLL_MS,
+  isHumanThreadsStreamLive,
+  subscribeHumanThreadsStream,
+} from "./humanThreadsStream";
 import {
   addHumanMember,
   createHumanGroup,
@@ -37,13 +44,14 @@ import {
 } from "./humanThreadsClient";
 
 /**
- * CAD-1412 / CAD-2711: Channels (1:1 DMs and shared teammate+agent channels).
- * Authorized polling keeps private transcripts out of the shared SSE stream.
+ * CAD-1412 / CAD-2711 / CAD-2765: Channels (1:1 DMs and shared teammate+agent channels).
+ * Member-scoped `/api/human-threads/stream` invalidation delivers real-time updates
+ * without placing transcripts on the wire, falling back to authorized polling on 404.
  * All routing and membership authority lives in the daemon; UI renders server
- * outcomes, `@mention` hints, Human-Turn Brake banners, and audited confirmations.
+ * outcomes, `@mention` hints, Human-Turn Brake banners, agent avatars, and audited confirmations.
  */
 
-export const HUMAN_POLL_MS = 20_000;
+export { HUMAN_POLL_MS };
 const PAGE = 50;
 
 const KIND_LABEL: Record<HumanRoomSummary["kind"], string> = {
@@ -147,10 +155,160 @@ export function useHumanRooms(enabled: boolean) {
   useEffect(() => {
     if (!enabled) return;
     void load();
-    const timer = window.setInterval(() => void load(), HUMAN_POLL_MS);
-    return () => window.clearInterval(timer);
+    let pollMs = isHumanThreadsStreamLive() ? HUMAN_LIVE_POLL_MS : HUMAN_POLL_MS;
+    let timer = window.setInterval(() => void load(), pollMs);
+    const restart = (nextMs: number) => {
+      if (nextMs === pollMs) return;
+      window.clearInterval(timer);
+      pollMs = nextMs;
+      timer = window.setInterval(() => void load(), pollMs);
+    };
+    const unsubscribe = subscribeHumanThreadsStream((msg) => {
+      if (msg.kind === "open") {
+        restart(HUMAN_LIVE_POLL_MS);
+        if (msg.reconnected) void load();
+        return;
+      }
+      if (msg.kind === "degraded") {
+        restart(HUMAN_POLL_MS);
+        return;
+      }
+      if (msg.scopes.includes("rooms")) void load();
+    });
+    return () => {
+      window.clearInterval(timer);
+      unsubscribe();
+    };
   }, [enabled, load]);
   return { rooms, error, reload: load };
+}
+
+export interface BoardAgentHint {
+  alias: string;
+  look?: string | null;
+  params?: Record<string, unknown> | null;
+}
+
+function cleanAgentAlias(label: string): string {
+  const trimmed = label.trim();
+  return trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
+}
+
+function resolveBoardAgentLook(agent: BoardAgentHint): string | undefined {
+  if (typeof agent.look === "string" && agent.look) return agent.look;
+  const paramLook = agent.params?.look;
+  return typeof paramLook === "string" && paramLook ? paramLook : undefined;
+}
+
+function MemberAvatar({
+  kind,
+  label,
+  look,
+  size = 26,
+}: {
+  kind: "human" | "agent";
+  label: string;
+  look?: string | null;
+  size?: number;
+}) {
+  if (kind === "agent") {
+    const alias = cleanAgentAlias(label) || "agent";
+    return <AgentAvatar slug={lookFor(alias)} look={look ?? undefined} still size={size} />;
+  }
+  const initial = label.trim().charAt(0).toUpperCase() || "?";
+  return (
+    <span
+      aria-hidden
+      className="threads-avatar"
+      data-kind="human"
+      style={{ width: size, height: size }}
+    >
+      {initial}
+    </span>
+  );
+}
+
+export function ConversationListSkeleton() {
+  const t = useTranslate();
+  return (
+    <div className="threads-skel-group threads-skel-list" role="status" aria-busy="true">
+      <span className="sr-only">{t("Loading conversations…")}</span>
+      {[
+        { title: "64%", pill: "2.2rem" },
+        { title: "52%", pill: "1.4rem" },
+        { title: "72%", pill: "2.2rem" },
+        { title: "46%", pill: "1.4rem" },
+      ].map((item, idx) => (
+        <div key={idx} className="threads-skel-row" aria-hidden="true">
+          <span className="threads-skel threads-skel-sigil" />
+          <span className="threads-skel threads-skel-pulse" style={{ width: item.title, height: "0.78rem" }} />
+          <span className="threads-skel threads-skel-pulse" style={{ width: item.pill, height: "0.7rem", marginLeft: "auto" }} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChannelTimelineSkeleton() {
+  const t = useTranslate();
+  return (
+    <div className="threads-skel-group threads-skel-timeline" role="status" aria-busy="true">
+      <span className="sr-only">{t("Loading…")}</span>
+      <div className="threads-skel-msg" aria-hidden="true">
+        <span className="threads-skel threads-skel-circle threads-skel-pulse" />
+        <div className="threads-skel-lines">
+          <span className="threads-skel threads-skel-pulse" style={{ width: "6.5rem", height: "0.68rem" }} />
+          <span className="threads-skel threads-skel-bubble threads-skel-pulse" style={{ width: "74%", height: "2.4rem" }} />
+        </div>
+      </div>
+      <div className="threads-skel-msg is-me" aria-hidden="true">
+        <span className="threads-skel threads-skel-bubble threads-skel-pulse" style={{ width: "56%", height: "2.25rem" }} />
+      </div>
+      <div className="threads-skel-msg" aria-hidden="true">
+        <span className="threads-skel threads-skel-circle threads-skel-pulse" />
+        <div className="threads-skel-lines">
+          <span className="threads-skel threads-skel-pulse" style={{ width: "7.5rem", height: "0.68rem" }} />
+          <span className="threads-skel threads-skel-bubble threads-skel-pulse" style={{ width: "84%", height: "3.25rem" }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function DetailsPanelSkeleton() {
+  const t = useTranslate();
+  return (
+    <div className="threads-context-body threads-skel-group" role="status" aria-busy="true">
+      <span className="sr-only">{t("Loading participants…")}</span>
+      <div className="threads-context-room" aria-hidden="true">
+        <span className="threads-skel threads-skel-pulse" style={{ width: "2rem", height: "2rem", borderRadius: "0.45rem" }} />
+        <div className="threads-skel-lines" style={{ flex: 1 }}>
+          <span className="threads-skel threads-skel-pulse" style={{ width: "62%", height: "0.85rem" }} />
+          <span className="threads-skel threads-skel-pulse" style={{ width: "42%", height: "0.68rem" }} />
+        </div>
+      </div>
+      <div className="threads-context-section" aria-hidden="true">
+        <span className="threads-skel threads-skel-pulse" style={{ width: "4.8rem", height: "0.68rem", marginBottom: "0.55rem" }} />
+        <div className="threads-skel-roster">
+          {[0, 1].map((idx) => (
+            <div key={idx} className="threads-skel-member">
+              <span className="threads-skel threads-skel-circle threads-skel-pulse" />
+              <span className="threads-skel threads-skel-pulse" style={{ width: idx === 0 ? "58%" : "44%", height: "0.78rem" }} />
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="threads-context-section" aria-hidden="true">
+        <span className="threads-skel threads-skel-pulse" style={{ width: "5.5rem", height: "0.68rem", marginBottom: "0.55rem" }} />
+        <div className="threads-skel-roster">
+          <div className="threads-skel-member">
+            <span className="threads-skel threads-skel-circle threads-skel-pulse" />
+            <span className="threads-skel threads-skel-pulse" style={{ width: "50%", height: "0.78rem" }} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /** Client-routed channel & DM rows in the left sidebar. */
@@ -275,6 +433,7 @@ export function HumanRoomTimeline({
   isDm,
   roomTitle,
   people,
+  boardAgents,
 }: {
   id: string;
   me: HumanMe;
@@ -287,6 +446,7 @@ export function HumanRoomTimeline({
   isDm: boolean;
   roomTitle?: string;
   people?: HumanPerson[] | null;
+  boardAgents?: readonly BoardAgentHint[] | null;
 }) {
   const t = useTranslate();
   const [page, setPage] = useState<HumanRoomPage | null>(null);
@@ -412,11 +572,33 @@ export function HumanRoomTimeline({
     setDenied(false);
     setOlderBusy(false);
     void load();
-    const timer = window.setInterval(() => void load(), HUMAN_POLL_MS);
+    let pollMs = isHumanThreadsStreamLive() ? HUMAN_LIVE_POLL_MS : HUMAN_POLL_MS;
+    let timer = window.setInterval(() => void load(), pollMs);
+    const restart = (nextMs: number) => {
+      if (nextMs === pollMs) return;
+      window.clearInterval(timer);
+      pollMs = nextMs;
+      timer = window.setInterval(() => void load(), pollMs);
+    };
+    const unsubscribe = subscribeHumanThreadsStream((msg) => {
+      if (msg.kind === "open") {
+        restart(HUMAN_LIVE_POLL_MS);
+        if (msg.reconnected) void load();
+        return;
+      }
+      if (msg.kind === "degraded") {
+        restart(HUMAN_POLL_MS);
+        return;
+      }
+      if (msg.scopes.includes("room") && (!msg.room || msg.room === id)) {
+        void load();
+      }
+    });
     return () => {
       visit.current++;
       latest.current++;
       window.clearInterval(timer);
+      unsubscribe();
     };
   }, [id, load]);
 
@@ -594,10 +776,34 @@ export function HumanRoomTimeline({
   const memberCount = currentPage?.members.length ?? 0;
   const hasAgents = currentPage?.members.some((m) => m.kind === "agent") ?? false;
   const headerSub = !currentPage
-    ? t("Loading…")
+    ? null
     : isDm
       ? t("Direct message")
       : `${memberCount} ${t(memberCount === 1 ? "member" : "members")}${hasAgents ? ` · ${t("Channel")}` : ""}`;
+
+  const agentIdentity = useMemo(() => {
+    const byId = new Map<string, { alias: string; look?: string | null }>();
+    const byAlias = new Map<string, { id?: string; look?: string | null }>();
+    for (const a of boardAgents ?? []) {
+      const look = resolveBoardAgentLook(a);
+      byAlias.set(a.alias.toLowerCase(), { look });
+    }
+    for (const a of catalog) {
+      const prev = byAlias.get(a.alias.toLowerCase());
+      const look = a.look ?? prev?.look ?? null;
+      byId.set(a.uid, { alias: a.alias, look });
+      byAlias.set(a.alias.toLowerCase(), { id: a.uid, look });
+    }
+    for (const m of currentPage?.members ?? []) {
+      if (m.kind !== "agent") continue;
+      const alias = cleanAgentAlias(m.label);
+      const prev = byAlias.get(alias.toLowerCase()) ?? byId.get(m.id);
+      const look = m.look ?? prev?.look ?? null;
+      byId.set(m.id, { alias, look });
+      byAlias.set(alias.toLowerCase(), { id: m.id, look });
+    }
+    return { byId, byAlias };
+  }, [boardAgents, catalog, currentPage?.members]);
 
   const previewMembers = currentPage?.members.slice(0, 4) ?? [];
   const overflowMembers = Math.max(0, memberCount - previewMembers.length);
@@ -607,7 +813,11 @@ export function HumanRoomTimeline({
       <header className="threads-head">
         <div className="threads-head-title">
           <h2>{headerTitle}</h2>
-          <div className="threads-kicker">{headerSub}</div>
+          {headerSub !== null ? (
+            <div className="threads-kicker">{headerSub}</div>
+          ) : !denied && error === null ? (
+            <span className="threads-skel threads-skel-kicker threads-skel-pulse" aria-hidden="true" />
+          ) : null}
         </div>
         <div className="threads-head-actions">
           {previewMembers.length > 0 && (
@@ -616,11 +826,20 @@ export function HumanRoomTimeline({
               title={currentPage?.members.map((m) => m.label).join(", ")}
               aria-label={`${memberCount} ${t(memberCount === 1 ? "member" : "members")}`}
             >
-              {previewMembers.map((m) => (
-                <span key={`${m.kind}:${m.id}`} className="threads-avatar" data-kind={m.kind}>
-                  {m.label.trim().charAt(0).toUpperCase() || "?"}
-                </span>
-              ))}
+              {previewMembers.map((m) => {
+                const look = m.kind === "agent"
+                  ? (m.look ?? agentIdentity.byId.get(m.id)?.look ?? agentIdentity.byAlias.get(cleanAgentAlias(m.label).toLowerCase())?.look)
+                  : undefined;
+                return (
+                  <MemberAvatar
+                    key={`${m.kind}:${m.id}`}
+                    kind={m.kind}
+                    label={m.label}
+                    look={look}
+                    size={24}
+                  />
+                );
+              })}
               {overflowMembers > 0 && <span className="threads-avatar-more">+{overflowMembers}</span>}
             </div>
           )}
@@ -644,8 +863,6 @@ export function HumanRoomTimeline({
         <p className="threads-note px-6 py-3" role="status">{t("You are not a member of this channel.")}</p>
       ) : error !== null ? (
         <p className="threads-note px-6 py-3" role="status">{t("This channel could not load: {error}").replace("{error}", error)}</p>
-      ) : currentPage === null ? (
-        <p className="threads-note px-6 py-3">{t("Loading…")}</p>
       ) : null}
       {readError !== null && (
         <p className="threads-note px-6 py-2" role="status">
@@ -666,6 +883,7 @@ export function HumanRoomTimeline({
       )}
       <div className="threads-messages" aria-live="polite" ref={messagesRef}>
         <CredentialRequestList conversationId={id} />
+        {currentPage === null && !denied && error === null && <ChannelTimelineSkeleton />}
         {currentPage?.more_before && currentPage.posts.length > 0 && (
           <div className="flex justify-center py-2">
             <Button variant="ghost" size="sm" disabled={olderBusy} onClick={loadEarlier}>
@@ -684,6 +902,18 @@ export function HumanRoomTimeline({
           }
           const p = item.post;
           const mine = p.sender.id === me.id;
+          const senderClean = cleanAgentAlias(p.sender.label);
+          const agentById = p.sender.id ? agentIdentity.byId.get(p.sender.id) : undefined;
+          const agentByAlias = agentIdentity.byAlias.get(senderClean.toLowerCase());
+          const isAgent =
+            p.sender.kind === "agent" ||
+            (p.sender.kind !== "human" && (agentById !== undefined || agentByAlias !== undefined));
+          const senderLook = isAgent ? (agentById?.look ?? agentByAlias?.look) : undefined;
+          const who = mine
+            ? t("You")
+            : isAgent
+              ? `@${senderClean || p.sender.label}`
+              : p.sender.label;
           return (
             <article key={item.key} className="threads-msg" data-post-id={p.id} data-role={mine ? "operator" : "member"}>
               {p.silent && (
@@ -691,7 +921,23 @@ export function HumanRoomTimeline({
                   <span className="threads-silent-badge">{t("Silent note")}</span>
                 </div>
               )}
-              <Turn who={mine ? t("You") : p.sender.label} at={fmtTime(p.created)} me={mine} showName={!mine}>
+              <Turn
+                who={who}
+                at={fmtTime(p.created)}
+                me={mine}
+                showName={!mine}
+                markdown={isAgent && !mine}
+                avatar={
+                  !mine ? (
+                    <MemberAvatar
+                      kind={isAgent ? "agent" : "human"}
+                      label={senderClean || p.sender.label}
+                      look={senderLook}
+                      size={28}
+                    />
+                  ) : undefined
+                }
+              >
                 {p.body}
               </Turn>
               <MentionOutcomes outcomes={p.outcomes} />
@@ -759,12 +1005,12 @@ export function HumanRoomTimeline({
   );
 }
 
-function PersonNote({ people, error }: { people: HumanPerson[] | null; error: string | null }) {
+function PersonNote({ error }: { error: string | null }) {
   const t = useTranslate();
-  if (people !== null) return null;
+  if (!error) return null;
   return (
     <p className="threads-note" role="status">
-      {error ? t("People unavailable: {error}").replace("{error}", error) : t("Loading people…")}
+      {t("People unavailable: {error}").replace("{error}", error)}
     </p>
   );
 }
@@ -781,6 +1027,7 @@ export function HumanContextPanel({
   people,
   peopleError,
   agents,
+  boardAgents,
   onChanged,
   onOpened,
 }: {
@@ -794,6 +1041,7 @@ export function HumanContextPanel({
   people: HumanPerson[] | null;
   peopleError: string | null;
   agents: HumanAgent[] | null;
+  boardAgents?: readonly BoardAgentHint[] | null;
   onChanged: () => void;
   onOpened: (id: string) => void;
 }) {
@@ -807,16 +1055,37 @@ export function HumanContextPanel({
   const [removeError, setRemoveError] = useState<string | null>(null);
   const envelope = useRef<{ key: string; id: string } | null>(null);
 
+  const agentLookLookup = useMemo(() => {
+    const byUid = new Map<string, string>();
+    const byAlias = new Map<string, string>();
+    for (const a of boardAgents ?? []) {
+      const look = resolveBoardAgentLook(a);
+      if (look) byAlias.set(a.alias.toLowerCase(), look);
+    }
+    for (const a of agents ?? []) {
+      const look = a.look ?? byAlias.get(a.alias.toLowerCase());
+      if (look) {
+        byUid.set(a.uid, look);
+        byAlias.set(a.alias.toLowerCase(), look);
+      }
+    }
+    return { byUid, byAlias };
+  }, [agents, boardAgents]);
+
   if (members === null) {
-    return (
-      <div className="threads-context-body">
-        <p className="threads-note">{t(denied ? "No access to this channel." : "Loading participants…")}</p>
-      </div>
-    );
+    if (denied) {
+      return (
+        <div className="threads-context-body">
+          <p className="threads-note">{t("No access to this channel.")}</p>
+        </div>
+      );
+    }
+    return <DetailsPanelSkeleton />;
   }
 
   const isGroup = room.kind === "human_group" || room.kind === "mixed_group";
   const mayManage = canManage ?? room.creator === me.id;
+  const roomTitle = room.title.trim() || (room.kind === "dm" ? t("Direct message") : t("Channel"));
 
   const act = async (fn: () => Promise<unknown>) => {
     setError(null);
@@ -851,6 +1120,7 @@ export function HumanContextPanel({
   const shownHumans = query === ""
     ? humanMembers
     : humanMembers.filter((m) => m.label.toLowerCase().includes(query));
+  const brakePaused = agentChainLimit > 0 && agentChainCount >= agentChainLimit;
 
   const startSharedChannelFromDm = () => {
     const humans = members
@@ -872,26 +1142,33 @@ export function HumanContextPanel({
       .catch((e: unknown) => setError(messageOf(e)));
   };
 
+  const lookForMember = (m: HumanMember): string | undefined =>
+    m.kind === "agent"
+      ? (m.look ?? agentLookLookup.byUid.get(m.id) ?? agentLookLookup.byAlias.get(cleanAgentAlias(m.label).toLowerCase()))
+      : undefined;
+
   const renderMemberRow = (m: HumanMember) => {
     const canRemove =
       isGroup &&
       mayManage &&
       ((m.kind === "human" && m.id !== room.creator && m.id !== me.id) || m.kind === "agent");
+    const displayLabel = m.kind === "agent" ? `@${cleanAgentAlias(m.label)}` : m.label;
     return (
       <li key={`${m.kind}:${m.id}`} data-kind={m.kind}>
         <span className="threads-person">
-          <span aria-hidden className="threads-avatar" data-kind={m.kind}>
-            {m.label.trim().charAt(0).toUpperCase() || "?"}
-          </span>
-          <span>
-            {m.kind === "agent" ? `@${m.label}` : m.label}
-            {m.kind === "agent" && <small className="threads-member-tag"> · {t("Shared agent")}</small>}
-          </span>
+          <MemberAvatar
+            kind={m.kind}
+            label={m.label}
+            look={lookForMember(m)}
+            size={26}
+          />
+          <span className="threads-person-name">{displayLabel}</span>
         </span>
         {canRemove && (
           <Button
             variant="ghost"
             size="sm"
+            className="threads-remove-btn"
             onClick={() => {
               setRemoveError(null);
               setPendingRemove(m);
@@ -906,6 +1183,20 @@ export function HumanContextPanel({
 
   return (
     <div className="threads-context-body">
+      <div className="threads-context-room">
+        <span className="threads-context-room-badge" aria-hidden="true">
+          {room.kind === "dm" ? "@" : "#"}
+        </span>
+        <div className="threads-context-room-meta">
+          <strong className="threads-context-room-title">{roomTitle}</strong>
+          <span className="threads-context-room-sub">
+            {room.kind === "dm"
+              ? t("Direct message")
+              : `${members.length} ${t(members.length === 1 ? "member" : "members")}`}
+          </span>
+        </div>
+      </div>
+
       <section className="threads-context-section" aria-label={t("Teammates")}>
         <div className="threads-context-heading">
           <h3 className="threads-context-title">{t("Teammates")}</h3>
@@ -940,7 +1231,7 @@ export function HumanContextPanel({
 
         {isGroup && mayManage && (
           <form
-            className="threads-add"
+            className="threads-add threads-add-inline"
             aria-label={t("Invite teammate to channel")}
             data-invite-select=""
             onSubmit={(e) => {
@@ -954,7 +1245,6 @@ export function HumanContextPanel({
             }}
           >
             <div className="threads-form-field">
-              <span className="threads-field-label">{t("Add a person")}</span>
               <Select
                 full
                 searchable
@@ -962,7 +1252,13 @@ export function HumanContextPanel({
                 value={picked}
                 onChange={setPicked}
                 disabled={addable.length === 0}
-                placeholder={addable.length === 0 ? t("No people to add") : t("+ Invite teammate…")}
+                placeholder={
+                  people === null && !peopleError
+                    ? t("Loading teammates…")
+                    : addable.length === 0
+                      ? t("No people to add")
+                      : t("+ Invite teammate…")
+                }
                 aria-label={t("Add a person")}
                 options={addable.map((p) => ({ value: p.id, label: p.name }))}
               />
@@ -987,7 +1283,7 @@ export function HumanContextPanel({
           )}
           {mayManage && (
             <form
-              className="threads-add"
+              className="threads-add threads-add-inline"
               aria-label={t("Add agent to channel")}
               onSubmit={(e) => {
                 e.preventDefault();
@@ -999,7 +1295,6 @@ export function HumanContextPanel({
               }}
             >
               <div className="threads-form-field">
-                <span className="threads-field-label">{t("Add an agent")}</span>
                 <Select
                   full
                   searchable
@@ -1019,41 +1314,50 @@ export function HumanContextPanel({
       )}
 
       <section className="threads-context-section" aria-label={t("Active Guardrails")}>
-        <div className="threads-context-heading">
-          <h3 className="threads-context-title">{t("Active Guardrails")}</h3>
-        </div>
-        <ul className="threads-guardrails" data-active-guardrails="">
-          <li>
-            <strong>{t("Membership ACL")}</strong>
-            <span>{t("Only admitted members receive notifications or @mentions.")}</span>
-          </li>
-          <li>
-            <strong>{t("Personal assistants")}</strong>
-            <span>{t("Human @mentions notify bell inbox only; private assistants stay isolated.")}</span>
-          </li>
-          {room.kind === "dm" ? (
+        <details className="threads-guardrails-card" open={brakePaused || undefined}>
+          <summary className="threads-guardrails-summary">
+            <span className="threads-context-title">{t("Active Guardrails")}</span>
+            <span className="threads-guardrails-pill" data-paused={brakePaused ? "true" : undefined}>
+              {brakePaused
+                ? t("Paused")
+                : agentChainLimit > 0
+                  ? `${agentChainCount}/${agentChainLimit}`
+                  : t("Active")}
+            </span>
+          </summary>
+          <ul className="threads-guardrails" data-active-guardrails="">
             <li>
-              <strong>{t("1:1 DM isolation")}</strong>
-              <span>{t("Shared agents cannot join direct messages.")}</span>
+              <strong>{t("Membership ACL")}</strong>
+              <span>{t("Only admitted members receive notifications or @mentions.")}</span>
             </li>
-          ) : (
             <li>
-              <strong>{t("Human-Turn Brake")}</strong>
-              <span>
-                {agentChainLimit <= 0
-                  ? t("Inactive until a shared agent joins this channel.")
-                  : agentChainCount >= agentChainLimit
-                    ? t("Paused after consecutive agent turns until a human posts.")
-                    : t("Agent hops: {count}/{limit} before human turn required.")
-                        .replace("{count}", String(agentChainCount))
-                        .replace("{limit}", String(agentChainLimit))}
-              </span>
+              <strong>{t("Personal assistants")}</strong>
+              <span>{t("Human @mentions notify bell inbox only; private assistants stay isolated.")}</span>
             </li>
-          )}
-        </ul>
+            {room.kind === "dm" ? (
+              <li>
+                <strong>{t("1:1 DM isolation")}</strong>
+                <span>{t("Shared agents cannot join direct messages.")}</span>
+              </li>
+            ) : (
+              <li>
+                <strong>{t("Human-Turn Brake")}</strong>
+                <span>
+                  {agentChainLimit <= 0
+                    ? t("Inactive until a shared agent joins this channel.")
+                    : agentChainCount >= agentChainLimit
+                      ? t("Paused after consecutive agent turns until a human posts.")
+                      : t("Agent hops: {count}/{limit} before human turn required.")
+                          .replace("{count}", String(agentChainCount))
+                          .replace("{limit}", String(agentChainLimit))}
+                </span>
+              </li>
+            )}
+          </ul>
+        </details>
       </section>
 
-      <PersonNote people={people} error={peopleError} />
+      <PersonNote error={peopleError} />
       {error && <p className="threads-note" role="status">{error}</p>}
 
       {pendingRemove && (
@@ -1064,11 +1368,14 @@ export function HumanContextPanel({
           body={
             <div className="threads-remove-card">
               <div className="threads-remove-target">
-                <span aria-hidden className="threads-avatar" data-kind={pendingRemove.kind}>
-                  {pendingRemove.label.trim().charAt(0).toUpperCase() || "?"}
-                </span>
+                <MemberAvatar
+                  kind={pendingRemove.kind}
+                  label={pendingRemove.label}
+                  look={lookForMember(pendingRemove)}
+                  size={28}
+                />
                 <span className="threads-remove-target-copy">
-                  <strong>{pendingRemove.kind === "agent" ? `@${pendingRemove.label}` : pendingRemove.label}</strong>
+                  <strong>{pendingRemove.kind === "agent" ? `@${cleanAgentAlias(pendingRemove.label)}` : pendingRemove.label}</strong>
                   <span className="threads-remove-role">
                     {t(pendingRemove.kind === "agent" ? "Shared agent" : "Teammate")}
                   </span>

@@ -31,6 +31,7 @@ export function Turn({
   onOpenIssue,
   knownIssue,
   state,
+  avatar,
   children,
 }: {
   who: string;
@@ -42,10 +43,11 @@ export function Turn({
   onOpenIssue?: (id: string) => void;
   knownIssue?: (id: string) => boolean;
   state?: DeliveryState | string | null;
+  avatar?: ReactNode;
   children: ReactNode;
 }) {
   return (
-    <Bubble who={who} at={at} me={me} showName={showName}>
+    <Bubble who={who} at={at} me={me} showName={showName} avatar={avatar}>
       <div
         className={`text-left text-secondary text-ink-100 [overflow-wrap:anywhere] ${
           me
