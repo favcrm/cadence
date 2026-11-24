@@ -19,6 +19,11 @@
  *   identifier-like code, is replaced;
  * - other user text is never changed: an error the user reports is a fact
  *   about their business.
+ *
+ * The engine's format is plain text, so a message that itself contains
+ * "\n\n[User]: " or a harness block can shift a segment boundary; the rules
+ * above then apply to what the text looks like. Scans stay linear in the
+ * text: a summary is shaped on every compaction attempt.
  */
 
 export const TOOL_ERROR_REDACTED = "the call failed; its error text is left out of this summary";
@@ -39,8 +44,12 @@ const CONVERSATION_END = "\n</conversation>";
 
 /** A closed diagnostics block as the engine renders it in a tool result. */
 const HARNESS_BLOCK = /<harness>\n([\s\S]*?)\n<\/harness>/g;
-/** A quoted block inside a summary: often on one line, sometimes in backticks. */
-const QUOTED_HARNESS_ERROR = /<harness>\s*\[error\]\s*([\s\S]*?)\s*<\/harness>/g;
+const HARNESS_OPEN = "<harness>";
+const HARNESS_CLOSE = "</harness>";
+/** A quoted block longer than a tool result can be is not one: never let it swallow later text. */
+const MAX_QUOTED_BLOCK = 2_000;
+/** The engine's diagnostic severities (pi-durable `Diagnostic`). */
+const DIAGNOSTIC = /^\[(info|warn|error)\] ?(.*)$/;
 
 type Segment = { role: string; start: number; end: number };
 
@@ -72,7 +81,7 @@ function redactHarness(body: string, removed: Set<string>): string {
       message = [];
     };
     for (const line of lines) {
-      const diagnostic = /^\[([a-z]+)\] ?(.*)$/.exec(line);
+      const diagnostic = DIAGNOSTIC.exec(line);
       if (diagnostic) {
         flush();
         inError = diagnostic[1] === "error";
@@ -90,12 +99,48 @@ function redactHarness(body: string, removed: Set<string>): string {
   });
 }
 
-/** An earlier summary's quoted `<harness>[error] …</harness>`, in any layout. */
+/**
+ * An earlier summary's quoted harness block, in any layout (often one line,
+ * sometimes in backticks): each `[error]` diagnostic in it becomes the fixed
+ * line. Scanned with indexOf, not a regex, so a long or unclosed quote costs
+ * linear time; a block without its closing tag within MAX_QUOTED_BLOCK is
+ * left as it is.
+ */
 function redactQuotedHarness(body: string, removed: Set<string>): string {
-  return body.replace(QUOTED_HARNESS_ERROR, (_quote, message: string) => {
-    removed.add(message.trim());
-    return `<harness>[error] ${TOOL_ERROR_REDACTED}</harness>`;
-  });
+  let out = "";
+  let from = 0;
+  for (;;) {
+    const open = body.indexOf(HARNESS_OPEN, from);
+    if (open < 0) break;
+    const inner = open + HARNESS_OPEN.length;
+    const close = body.indexOf(HARNESS_CLOSE, inner);
+    const nested = body.indexOf(HARNESS_OPEN, inner);
+    if (close < 0 || close - inner > MAX_QUOTED_BLOCK || (nested >= 0 && nested < close)) {
+      out += body.slice(from, inner);
+      from = inner;
+      continue;
+    }
+    out += body.slice(from, open) + quotedBlock(body.slice(inner, close), removed);
+    from = close + HARNESS_CLOSE.length;
+  }
+  return out + body.slice(from);
+}
+
+function quotedBlock(inner: string, removed: Set<string>): string {
+  // ["before", "[warn]", " w ", "[error]", " msg ", …]: split on the tags is linear.
+  const parts = inner.split(/(\[(?:info|warn|error)\])/);
+  let changed = false;
+  for (let index = 1; index < parts.length; index += 2) {
+    if (parts[index] !== "[error]") continue;
+    const text = parts[index + 1] ?? "";
+    const message = text.trim();
+    if (message === "" || message === TOOL_ERROR_REDACTED) continue;
+    removed.add(message);
+    const trailing = text.slice(text.trimEnd().length);
+    parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
+    changed = true;
+  }
+  return `${HARNESS_OPEN}${changed ? parts.join("") : inner}${HARNESS_CLOSE}`;
 }
 
 function escape(text: string): string {
@@ -104,7 +149,7 @@ function escape(text: string): string {
 
 /** Replace echoes of removed messages, longest first, then of their codes. */
 function scrubEchoes(body: string, removed: ReadonlySet<string>): string {
-  const messages = [...removed].filter((message) => message.length >= MIN_ECHO_CHARS)
+  const messages = [...removed].filter((message) => message.length >= MIN_ECHO_CHARS && message !== TOOL_ERROR_REDACTED)
     .sort((a, b) => b.length - a.length);
   let out = body;
   for (const message of messages) out = out.split(message).join(TOOL_ERROR_TEXT_OMITTED);

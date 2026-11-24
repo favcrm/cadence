@@ -89,6 +89,44 @@ describe("CAD-2744: tool error text leaves the summary source", () => {
     expect(out).toContain(`[Tool result]: ${harness(`[error] ${TOOL_ERROR_REDACTED}`)}`);
   });
 
+  it("shapes a long unclosed quote in an earlier summary in linear time", () => {
+    const summary = `[User]: ${EARLIER}<harness>[error]${" ".repeat(64_000)}\n</summary>`;
+    const text = source(summary, "[User]: Go.");
+    const started = performance.now();
+    expect(redactToolErrors(text)).toBe(text);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it("cleans a multi-diagnostic quote in an earlier summary, keeping its warning", () => {
+    const summary = `[User]: ${EARLIER}- Result: <harness>\n[warn] output shortened\n[error] ${MESSAGE}\n</harness>\n</summary>`;
+    const out = redactToolErrors(source(summary));
+    expect(out).toContain(`<harness>\n[warn] output shortened\n[error] ${TOOL_ERROR_REDACTED}\n</harness>`);
+    expect(out).not.toContain("no such wiki page");
+  });
+
+  it("never lets an unclosed quote in an earlier summary swallow later facts", () => {
+    const summary = `[User]: ${EARLIER}- Tried <harness>[error] cut off\n- Budget HK$18,450.\n- Quote: \`<harness>[error] ${MESSAGE}</harness>\`\n</summary>`;
+    const out = redactToolErrors(source(summary));
+    expect(out).toContain("- Budget HK$18,450.");
+    expect(out).toContain(`\`<harness>[error] ${TOOL_ERROR_REDACTED}</harness>\``);
+  });
+
+  it("treats only the engine's severities as diagnostics, so a continuation line goes with its message", () => {
+    const out = redactToolErrors(source(`[Tool result]: ${harness("[error] build failed", "[stderr] token=abc123 rejected")}`));
+    expect(out).toContain(harness(`[error] ${TOOL_ERROR_REDACTED}`));
+    expect(out).not.toContain("token=abc123");
+  });
+
+  it("leaves its own placeholder alone on the next compaction", () => {
+    const once = redactToolErrors(source(
+      `[Tool result]: ${harness(`[error] ${MESSAGE}`)}`,
+      `[Assistant]: Saw ${MESSAGE}.`,
+    ));
+    const summary = `[User]: ${EARLIER}- \`<harness>[error] ${TOOL_ERROR_REDACTED}</harness>\`\n- ${TOOL_ERROR_REDACTED}\n</summary>`;
+    expect(redactToolErrors(source(summary))).toBe(source(summary));
+    expect(once).toContain(TOOL_ERROR_TEXT_OMITTED);
+  });
+
   it("returns a source with no tool error unchanged", () => {
     const text = source("[User]: Hi.", "[Assistant]: Hello.", `[Tool result]: ${harness("[warn] note")}`);
     expect(redactToolErrors(text)).toBe(text);

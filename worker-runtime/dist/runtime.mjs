@@ -55247,7 +55247,10 @@ var SEGMENT_START = new RegExp(String.raw`(?:^|\n\n|<conversation>\n)(?=${ROLE})
 var CONVERSATION_END = `
 </conversation>`;
 var HARNESS_BLOCK = /<harness>\n([\s\S]*?)\n<\/harness>/g;
-var QUOTED_HARNESS_ERROR = /<harness>\s*\[error\]\s*([\s\S]*?)\s*<\/harness>/g;
+var HARNESS_OPEN = "<harness>";
+var HARNESS_CLOSE = "</harness>";
+var MAX_QUOTED_BLOCK = 2000;
+var DIAGNOSTIC = /^\[(info|warn|error)\] ?(.*)$/;
 function segments(text) {
   const end = text.lastIndexOf(CONVERSATION_END);
   const limit = end < 0 ? text.length : end;
@@ -55278,7 +55281,7 @@ function redactHarness(body, removed) {
       message = [];
     };
     for (const line of lines) {
-      const diagnostic = /^\[([a-z]+)\] ?(.*)$/.exec(line);
+      const diagnostic = DIAGNOSTIC.exec(line);
       if (diagnostic) {
         flush();
         inError = diagnostic[1] === "error";
@@ -55301,16 +55304,47 @@ ${out.join(`
   });
 }
 function redactQuotedHarness(body, removed) {
-  return body.replace(QUOTED_HARNESS_ERROR, (_quote, message) => {
-    removed.add(message.trim());
-    return `<harness>[error] ${TOOL_ERROR_REDACTED}</harness>`;
-  });
+  let out = "";
+  let from = 0;
+  for (;; ) {
+    const open = body.indexOf(HARNESS_OPEN, from);
+    if (open < 0)
+      break;
+    const inner = open + HARNESS_OPEN.length;
+    const close = body.indexOf(HARNESS_CLOSE, inner);
+    const nested = body.indexOf(HARNESS_OPEN, inner);
+    if (close < 0 || close - inner > MAX_QUOTED_BLOCK || nested >= 0 && nested < close) {
+      out += body.slice(from, inner);
+      from = inner;
+      continue;
+    }
+    out += body.slice(from, open) + quotedBlock(body.slice(inner, close), removed);
+    from = close + HARNESS_CLOSE.length;
+  }
+  return out + body.slice(from);
+}
+function quotedBlock(inner, removed) {
+  const parts = inner.split(/(\[(?:info|warn|error)\])/);
+  let changed = false;
+  for (let index = 1;index < parts.length; index += 2) {
+    if (parts[index] !== "[error]")
+      continue;
+    const text = parts[index + 1] ?? "";
+    const message = text.trim();
+    if (message === "" || message === TOOL_ERROR_REDACTED)
+      continue;
+    removed.add(message);
+    const trailing = text.slice(text.trimEnd().length);
+    parts[index + 1] = ` ${TOOL_ERROR_REDACTED}${trailing}`;
+    changed = true;
+  }
+  return `${HARNESS_OPEN}${changed ? parts.join("") : inner}${HARNESS_CLOSE}`;
 }
 function escape2(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 function scrubEchoes(body, removed) {
-  const messages = [...removed].filter((message) => message.length >= MIN_ECHO_CHARS).sort((a, b) => b.length - a.length);
+  const messages = [...removed].filter((message) => message.length >= MIN_ECHO_CHARS && message !== TOOL_ERROR_REDACTED).sort((a, b) => b.length - a.length);
   let out = body;
   for (const message of messages)
     out = out.split(message).join(TOOL_ERROR_TEXT_OMITTED);
