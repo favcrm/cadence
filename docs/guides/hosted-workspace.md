@@ -1242,6 +1242,36 @@ What the client does when the credential is not available:
 | the agent's own refusals: `403 forbidden` and the rest | final, never retried on the login |
 | a `401` to a **cached** agent credential | drop the cache and re-mint once; a `401` to one just minted is final |
 
+### Previewing hosted delivery settings
+
+Read the stored policy before preparing a replacement:
+
+```sh
+cadence --org acme issue project delivery storefront --show
+cadence --org acme issue project delivery storefront --preview \
+  --repo acme/storefront --delivery-file ./delivery.yaml
+```
+
+The preview returns the current revision, exact proposal and `preview_digest`
+without writing. Workspace MCP can request the same preview through
+`cadence_cli` with verb `delivery_policy` and arguments
+`{project, proposal: {repos, delivery}}`. MCP cannot apply it.
+
+After checking the proposal, the owner applies it from the CLI with the same
+repositories and unchanged file. Use `0` for a preview whose
+`expected_revision` is `null`. Set `revision` and `digest` to the preview's
+`expected_revision` and `preview_digest`:
+
+```sh
+cadence --org acme issue project delivery storefront \
+  --repo acme/storefront --delivery-file ./delivery.yaml \
+  --expect-rev "$revision" --preview-digest "$digest"
+```
+
+If the stored revision or proposed inputs changed, preview again. Do not remove
+the fences to get an older board to accept the write. Applying settings does
+not approve a PR, dispatch a reviewer, or enqueue a merge.
+
 ### Workspace skills from the CLI (CAD-2396)
 
 A hosted workspace can keep its own skills: a `SKILL.md` package with optional

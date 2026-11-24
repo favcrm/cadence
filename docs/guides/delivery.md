@@ -190,6 +190,13 @@ What each required review asks of the hosted gate:
 | `check`, `mode: required` | The latest run of each check that App posted on the exact head concluded `success`. The hosted gate matches the App by its slug, so name it by slug, not by id. |
 | `check`, `mode: advisory` | Nothing; it never blocks. |
 
+An `agent` slot may nominate a workspace profile with `profile: ap_…`.
+Use a distinct profile for each named slot; `check` and `operator` slots
+do not accept a profile. The profile is part of the policy approval digest
+and is returned only for matching slots in `required_reviews`. This field
+does not change review counts, enroll a harness, grant verdict authority, or
+enable hosted claim on its own.
+
 A `revise` on an axis the policy does not require does not block. A change no
 rule asks a review of needs no code review, only its checks and evidence. A
 verdict that states a Risk other than `auto` still adds the owner's approval,
