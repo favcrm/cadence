@@ -12,6 +12,13 @@ import {
 } from "./hostedDom.fixture";
 
 declare function require<T>(name: string): T;
+const recovery = require<{
+  subscription: {
+    ready: { kind: "subscription"; state: "ready"; attemptId: string; url: string };
+    pending: { kind: "subscription"; state: "pending"; attemptId: string };
+  };
+  topup: { blocked: { kind: "topup"; state: "blocked"; attemptId: string } };
+}>(`${process.cwd()}/tests/fixtures/board-account-recovery.v1.json`);
 
 const win = installHostedDom("https://acme.cadencecloud.app/settings/account");
 
@@ -186,7 +193,8 @@ async function run(): Promise<void> {
   const requests: Array<{ path: string; headers: Headers; body: string }> = [];
   let nextBillingStatus = 200;
   let nextBillingPayload: unknown = syntheticSnapshot;
-  let nextPostPayload: unknown = { url: "https://checkout.stripe.com/c/pay/cs_synth_1" };
+  let nextPostPayload: unknown = recovery.subscription.ready;
+  let attemptState = "pending";
 
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
@@ -226,6 +234,13 @@ async function run(): Promise<void> {
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
+    }
+    if (path.startsWith("/api/account/billing/attempt?")) {
+      const query = new URL(path, "https://acme.cadencecloud.app").searchParams;
+      if (query.get("kind") !== "subscription" || query.get("attemptId") !== recovery.subscription.ready.attemptId) {
+        return new Response(null, { status: 404 });
+      }
+      return Response.json({ ...recovery.subscription.pending, state: attemptState });
     }
     return new Response(JSON.stringify(nextPostPayload), {
       status: 200,
@@ -334,11 +349,13 @@ async function run(): Promise<void> {
           children: React.createElement(
             PlatformAccount as React.ComponentType<{
               hosted?: boolean;
+              sessionScope?: string | null;
               onBillingSnapshot?: (snapshot: unknown) => void;
               onRedirect?: (url: string) => void;
             }>,
             {
               hosted: true,
+              sessionScope: "usr_contract_owner",
               onBillingSnapshot: (snap: unknown) => {
                 reportedSnapshot = snap;
               },
@@ -401,37 +418,64 @@ async function run(): Promise<void> {
   const choosePlanBtn = host.querySelector('[data-plan-id="synth_basic_yr"] button') as HTMLButtonElement;
   await React.act(async () => choosePlanBtn.click());
   const firstRedirect = await redirectSignal.wait(React.act, "subscribe redirect");
-  const subReq = requests.find((r) => r.path === "/api/account/billing/subscribe");
+  const subReq = requests.find((r) => r.path === "/api/account/billing/checkout");
   assert(subReq, "subscribe endpoint called");
   equal(subReq.headers.get("x-cadence-board"), "1", "subscribe sends X-Cadence-Board");
   equal(subReq.headers.get("content-type"), "application/json", "subscribe sends application/json");
-  equal(subReq.body, JSON.stringify({ planId: "synth_basic_yr" }), "subscribe sends selected planId");
-  equal(firstRedirect, "https://checkout.stripe.com/c/pay/cs_synth_1", "redirects to Stripe Checkout");
+  const selected = JSON.parse(subReq.body) as { kind: string; planId: string };
+  equal(selected.kind, "subscription", "checkout sends subscription kind");
+  equal(selected.planId, "synth_basic_yr", "checkout sends selected planId");
+  equal(firstRedirect, recovery.subscription.ready.url, "redirects to exact fixture Stripe Checkout");
 
   await React.act(async () => {
     win.document.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   });
   assert(!host.querySelector('[data-testid="billing-plans-modal"]'), "plans modal closes on Escape");
+  await unmount();
+
+  win.history.replaceState({}, "", "/settings/account?subscription=success");
+  unmount = await mountView(() => waitForDom(
+    React.act,
+    host,
+    () => Boolean(host.textContent?.includes("Confirming payment")),
+    "pending Stripe return",
+  ));
+  assert(!host.textContent?.includes("Checkout confirmed."), "a return flag alone is not payment proof");
+  assert(requests.some((r) => r.path.includes(`attemptId=${recovery.subscription.ready.attemptId}`)), "only the stored attempt is checked");
+  attemptState = "confirmed";
+  const refresh = Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Refresh");
+  assert(refresh, "pending return has a refresh");
+  await React.act(async () => refresh.click());
+  await waitForDom(React.act, host, () => Boolean(host.textContent?.includes("Checkout confirmed.")), "exact attempt confirmation");
+  equal(requests.filter((r) => r.path === "/api/account/billing/checkout").length, 1, "refresh does not retry a purchase");
+  await unmount();
+  win.history.replaceState({}, "", "/settings/account");
+
+  win.sessionStorage.clear();
+  unmount = await mountView(() => waitForDom(
+    React.act, host, () => Boolean(host.querySelector("#billing-open-extra")), "fresh owner extra usage",
+  ));
 
   // Unsafe redirect URL is refused inside Extra usage modal
   const openExtraBtn = host.querySelector("#billing-open-extra") as HTMLButtonElement;
   assert(openExtraBtn, "Add extra usage button present");
   await React.act(async () => openExtraBtn.click());
   assert(Boolean(host.querySelector('[data-testid="billing-extra-modal"] #billing-packs')), "extra usage modal opens with refill packs");
-  nextPostPayload = { url: "https://evil.example.test/steal" };
+  nextPostPayload = { ...recovery.topup.blocked, state: "ready", url: "https://evil.example.test/steal" };
   const buyPackBtn = host.querySelector('[data-pack-id="pack_alpha"] button') as HTMLButtonElement;
   await React.act(async () => buyPackBtn.click());
   await waitForDom(
     React.act,
     host,
-    () => Boolean(host.querySelector('[data-testid="billing-extra-modal"]')?.textContent?.includes("redirect link was invalid")),
-    "unsafe redirect inline error",
+    () => Boolean(host.textContent?.includes("Checkout status is unknown") || host.textContent?.includes("redirect link was invalid")),
+    "unsafe checkout URL preserves uncertainty instead of navigating",
   );
   equal(redirects.length, 1, "unsafe topup URL does not redirect");
   const closeExtraBtn = host.querySelector('[data-testid="billing-extra-modal"] button[aria-label="Close"]') as HTMLButtonElement;
   await React.act(async () => closeExtraBtn.click());
   assert(!host.querySelector('[data-testid="billing-extra-modal"]'), "extra modal closes on Close button");
   await unmount();
+  win.sessionStorage.clear();
 
   // 2. zh-TW locale shows approx HKD references + formal USD Stripe settlement disclosure
   win.localStorage.setItem("cadence-locale", "zh-TW");
@@ -485,19 +529,22 @@ async function run(): Promise<void> {
   await unmount();
   win.localStorage.removeItem("cadence-locale");
 
-  // 3. Return banner + URL scrub
-  win.history.replaceState({}, "", "https://acme.cadencecloud.app/settings/account?subscription=success");
+  // 3. An uncorrelated old cancellation is honest and cannot start a second payment.
+  win.sessionStorage.clear();
+  win.history.replaceState({}, "", "https://acme.cadencecloud.app/settings/account?subscription=cancel");
   nextBillingPayload = syntheticSnapshot;
   unmount = await mountView(() =>
     waitForDom(
       React.act,
       host,
-      () => Boolean(host.textContent?.includes("Subscription updated")),
-      "subscription return banner",
+      () => Boolean(host.textContent?.includes("You left Checkout")),
+      "uncorrelated Checkout return banner",
     ),
   );
-  equal(win.location.search, "", "subscription return query param scrubbed from URL");
+  assert(!host.textContent?.includes("No charge was made."), "cancel return does not imply payment status");
+  win.sessionStorage.clear();
   await unmount();
+  win.history.replaceState({}, "", "/settings/account");
 
   // 4. Member read-only view hides balances, plans & packs
   nextBillingPayload = {
@@ -756,7 +803,7 @@ async function run(): Promise<void> {
   console.log("hostedBilling checks passed");
 }
 
-declare const process: { exit: (code?: number) => void };
+declare const process: { cwd(): string; exit: (code?: number) => void };
 run().then(
   () => process.exit(0),
   (err) => {

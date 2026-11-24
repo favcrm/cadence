@@ -6,6 +6,8 @@ import { sessionHeaders } from "../../lib/sessionKey";
 import Button from "../../ui/Button";
 import Switch from "../../ui/Switch";
 import Toast, { type ToastMsg } from "../../ui/Toast";
+import type { Viewer } from "../projects/work";
+import WorkspaceSecurityPolicy from "./WorkspaceSecurityPolicy";
 import { encodeQrMatrix, qrSvgPath } from "./qrCode";
 import "./security.css";
 
@@ -177,8 +179,14 @@ async function postSecurity(path: string, body: object): Promise<unknown> {
 
 export default function Security({
   onSessionInvalidated,
+  viewer,
+  hosted,
+  policyScope,
 }: {
   onSessionInvalidated?: () => void;
+  viewer?: Viewer;
+  hosted?: boolean;
+  policyScope?: string;
 }) {
   const id = useId();
   const t = useTranslate();
@@ -1061,6 +1069,10 @@ export default function Security({
             )}
           </section>
         </div>
+      )}
+
+      {hosted && policyScope && viewer?.operator === true && !viewer.readOnly && (
+        <WorkspaceSecurityPolicy key={policyScope} />
       )}
 
       <Toast msg={toast} />

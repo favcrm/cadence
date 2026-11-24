@@ -10,7 +10,7 @@ import {
 import Button from "../../ui/Button";
 import { IconRefresh } from "../../ui/icons";
 import { sessionHeaders } from "../../lib/sessionKey";
-import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
+import { onPrivateSessionReset, privateFetch, withPrivateOperation } from "../../lib/privateSession";
 import {
   displayAmount,
   formatApproxHkdFromMinor,
@@ -19,14 +19,20 @@ import {
   formatUsdFromMinor,
   formatUsdFromScaled,
   isPlatformAccount,
+  isBillingAttempt,
   packCapacityLabel,
+  parseBillingAttempt,
   parseCheckoutUrlResponse,
   parseHostedBilling,
+  parseTrackedCheckout,
   planCapacityLabel,
   readBillingReturnParams,
   resolveUsageSummary,
   safeManageUrl,
   safeStripeCheckoutUrl,
+  type BillingAttempt,
+  type BillingAttemptKind,
+  type BillingAttemptState,
   type HostedBillingOfferPlan,
   type HostedBillingSnapshot,
   type HostedBillingUsageRow,
@@ -38,14 +44,16 @@ import { useLocale, useTranslate } from "../../lib/locale";
 export default function PlatformAccount({
   hosted = false,
   onBillingSnapshot,
+  sessionScope,
   onRedirect,
 }: {
   hosted?: boolean;
+  sessionScope?: string | null;
   onBillingSnapshot?: (snapshot: HostedBillingSnapshot | null) => void;
   onRedirect?: (url: string) => void;
 } = {}) {
   return hosted ? (
-    <HostedBilling onBillingSnapshot={onBillingSnapshot} onRedirect={onRedirect} />
+    <HostedBilling onBillingSnapshot={onBillingSnapshot} onRedirect={onRedirect} sessionScope={sessionScope} />
   ) : (
     <NativePlatformAccount />
   );
@@ -337,14 +345,44 @@ function BillingModal({
   );
 }
 
+type SavedBillingAttempt = { workspace: string; principal: string; kind: BillingAttemptKind; attemptId: string | null };
+const attemptKey = (kind: BillingAttemptKind) => `cadence.billing.attempt.${kind}`;
+
+function saveBillingAttempt(saved: SavedBillingAttempt): boolean {
+  try {
+    sessionStorage.setItem(attemptKey(saved.kind), JSON.stringify(saved));
+    return true;
+  } catch { return false; }
+}
+
+function readBillingAttempt(kind: BillingAttemptKind, workspace: string, principal: string): BillingAttempt | "unknown" | null {
+  try {
+    const raw = sessionStorage.getItem(attemptKey(kind));
+    if (raw === null) return null;
+    const saved: unknown = JSON.parse(raw);
+    if (!saved || typeof saved !== "object" || !("workspace" in saved) || !("principal" in saved)
+      || !("kind" in saved) || !("attemptId" in saved)
+      || saved.workspace !== workspace || saved.principal !== principal || saved.kind !== kind
+      || !isBillingAttempt(kind, saved.attemptId)) return "unknown";
+    return { kind, attemptId: saved.attemptId };
+  } catch { return "unknown"; }
+}
+
 function HostedBilling({
   onBillingSnapshot,
   onRedirect,
+  sessionScope,
 }: {
   onBillingSnapshot?: (snapshot: HostedBillingSnapshot | null) => void;
   onRedirect?: (url: string) => void;
+  sessionScope?: string | null;
 }) {
   const { locale, t } = useLocale();
+  const [dataScope, setDataScope] = useState<string | null>(null);
+  const [handoffPlan, setHandoffPlan] = useState<string | null>(null);
+  const handoffHandled = useRef(false);
+  const scopeRef = useRef(sessionScope);
+  scopeRef.current = sessionScope;
   const [data, setData] = useState<HostedBillingSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [unsupported, setUnsupported] = useState(false);
@@ -363,11 +401,30 @@ function HostedBilling({
   const [extraUsageRows, setExtraUsageRows] = useState<HostedBillingUsageRow[]>([]);
   const [extraUsageCursor, setExtraUsageCursor] = useState<string | null | undefined>(undefined);
   const [loadingMoreUsage, setLoadingMoreUsage] = useState(false);
+  const [attemptStates, setAttemptStates] = useState<Record<BillingAttemptKind, BillingAttemptState | null>>({ subscription: null, topup: null });
+  const [confirmClose, setConfirmClose] = useState<string | null>(null);
+  const actionGuard = useRef(false);
+  const returnHint = useRef(readBillingReturnParams(window.location.search));
+  const invalidReturn = useRef(!returnHint.current && (() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.has("subscription") || params.has("topup");
+  })());
 
   const navigateExternal = useCallback((url: string) => {
     if (onRedirect) onRedirect(url);
     else window.location.assign(url);
   }, [onRedirect]);
+
+  useEffect(() => onPrivateSessionReset(() => {
+    setData(null);
+    setAttemptStates({ subscription: "unknown", topup: "unknown" });
+    onBillingSnapshot?.(null);
+  }), [onBillingSnapshot]);
+
+  const savedAttempt = useCallback((kind: BillingAttemptKind, workspace: string, attemptId: string | null) => {
+    if (!sessionScope) return false;
+    return saveBillingAttempt({ workspace, principal: sessionScope, kind, attemptId });
+  }, [sessionScope]);
 
   const refresh = useCallback(async (opts: { background?: boolean; signal?: AbortSignal } = {}) => {
     if (!opts.background) setLoading(true);
@@ -388,8 +445,45 @@ function HostedBilling({
         op.assertCurrent();
         const parsed = parseHostedBilling(next);
         if (!parsed) throw new Error("Billing response malformed");
+        if (scopeRef.current !== sessionScope) return;
+        if (parsed.role === "owner" && !sessionScope) {
+          setData(null);
+          onBillingSnapshot?.(null);
+          return;
+        }
+        const states: Record<BillingAttemptKind, BillingAttemptState | null> = { subscription: null, topup: null };
+        if (parsed.role === "owner" && parsed.canManage) {
+          for (const kind of ["subscription", "topup"] as const) {
+            let attempt = sessionScope ? readBillingAttempt(kind, parsed.workspace.id, sessionScope) : "unknown";
+            if (kind === "subscription" && parsed.offer
+              && ["open", "pending", "completed", "unknown"].includes(parsed.offer.checkout.state)) {
+              const id = parsed.offer.checkout.id;
+              if (attempt && attempt !== "unknown" && attempt.attemptId !== id) attempt = "unknown";
+              else if (!attempt && returnHint.current?.kind !== kind)
+                attempt = isBillingAttempt(kind, id) ? { kind, attemptId: id } : "unknown";
+            }
+            if (invalidReturn.current || attempt === "unknown" || (!attempt && returnHint.current?.kind === kind)) {
+              states[kind] = "unknown";
+            } else if (attempt) {
+              try {
+                const query = new URLSearchParams({ kind, attemptId: attempt.attemptId });
+                const result = await privateFetch(`/api/account/billing/attempt?${query}`, { headers: sessionHeaders() }, op);
+                const payload: unknown = result.ok ? await result.json() : null;
+                op.assertCurrent();
+                states[kind] = parseBillingAttempt(payload, attempt);
+              } catch {
+                op.assertCurrent();
+                states[kind] = "unknown";
+              }
+            }
+          }
+        }
+        if (scopeRef.current !== sessionScope) return;
+        op.assertCurrent();
+        if (!actionGuard.current) setAttemptStates(states);
         setUnsupported(false);
         setData(parsed);
+        setDataScope(sessionScope ?? null);
         setExtraUsageRows([]);
         setExtraUsageCursor(undefined);
         setLogPage(1);
@@ -402,18 +496,13 @@ function HostedBilling({
     } finally {
       if (!opts.background) setLoading(false);
     }
-  }, [onBillingSnapshot]);
+  }, [onBillingSnapshot, sessionScope]);
 
   useEffect(() => {
     const abort = new AbortController();
     const returned = readBillingReturnParams(window.location.search);
     if (returned) {
       setReturnBanner(returned);
-      const url = new URL(window.location.href);
-      url.searchParams.delete("subscription");
-      url.searchParams.delete("topup");
-      const cleaned = `${url.pathname}${url.search}${url.hash}`;
-      window.history.replaceState(null, "", cleaned);
     }
     void refresh({ signal: abort.signal });
 
@@ -438,19 +527,39 @@ function HostedBilling({
   }, [refresh]);
 
   useEffect(() => {
-    const period = data?.offer?.subscription.period;
-    if (period === "month" || period === "year") {
-      setInterval(period);
+    if (handoffHandled.current || dataScope !== (sessionScope ?? null)) return;
+    const params = new URLSearchParams(window.location.search);
+    const planId = params.getAll("plan");
+    const period = params.getAll("period");
+    const plans = data?.offer?.plans ?? (data?.offer?.plan ? [data.offer.plan] : []);
+    const match = planId.length === 1 && period.length === 1
+      ? plans.find((p) => p.id === planId[0] && p.period === period[0]) : undefined;
+    if (match && data?.canManage) {
+      handoffHandled.current = true;
+      setHandoffPlan(match.id);
+      setInterval(match.period);
+      setActiveModal("plans");
     }
-  }, [data?.offer?.subscription.period]);
+  }, [data?.workspace.id, data?.offer, data?.canManage, dataScope, sessionScope]);
 
   const runAction = useCallback(async (actionId: string, path: string, body: unknown) => {
+    if (actionGuard.current || !data?.canManage || data.role !== "owner" || !sessionScope || dataScope !== sessionScope || error || unsupported || loading) return;
+    const kind: BillingAttemptKind | null = path.endsWith("/subscribe") ? "subscription" : path.endsWith("/topup") ? "topup" : null;
+    if (kind && Object.values(attemptStates).some((state) => state === "pending" || state === "unknown")) return;
+    if (kind === "subscription" && data.offer?.checkout.available !== true) return;
+    if (kind && !savedAttempt(kind, data.workspace.id, null)) {
+      setAttemptStates((prev) => ({ ...prev, [kind]: "unknown" }));
+      setActionError(t("Checkout status is unknown. Refresh before trying another payment."));
+      return;
+    }
+    actionGuard.current = true;
     setBusyAction(actionId);
     setActionError(null);
+    if (kind) setAttemptStates((prev) => ({ ...prev, [kind]: "unknown" }));
     try {
       await withPrivateOperation(async (op) => {
         const response = await privateFetch(
-          path,
+          kind ? "/api/account/billing/checkout" : path,
           {
             method: "POST",
             headers: {
@@ -458,24 +567,21 @@ function HostedBilling({
               "Content-Type": "application/json",
               "X-Cadence-Board": "1",
             },
-            body: JSON.stringify(body),
+            body: JSON.stringify(kind ? { ...(body as object), kind } : body),
           },
           op,
         );
         const payload: unknown = await response.json().catch(() => null);
         op.assertCurrent();
-        if (!response.ok) {
-          const msg =
-            payload &&
-            typeof payload === "object" &&
-            "error" in payload &&
-            payload.error &&
-            typeof payload.error === "object" &&
-            "message" in payload.error &&
-            typeof payload.error.message === "string"
-              ? payload.error.message
-              : t("Unable to start Stripe checkout. Please try again.");
-          setActionError(msg);
+        if (scopeRef.current !== sessionScope) return;
+        if (!response.ok) throw new Error("Billing action unavailable");
+        if (kind) {
+          const result = parseTrackedCheckout(payload, kind);
+          if (!result || !savedAttempt(kind, data.workspace.id, result.attempt.attemptId)) throw new Error("Checkout unavailable");
+          setAttemptStates((prev) => ({ ...prev, [kind]: "pending" }));
+          if (result.state === "ready" && result.url) navigateExternal(result.url);
+          else if (result.state === "blocked") setActionError(t("Checkout is pending. Refresh to check its status."));
+          else setActionError(t("Unable to open billing checkout because the redirect link was invalid."));
           return;
         }
         const safeUrl = parseCheckoutUrlResponse(payload);
@@ -486,11 +592,87 @@ function HostedBilling({
         navigateExternal(safeUrl);
       });
     } catch {
-      setActionError(t("Unable to start Stripe checkout. Please try again."));
+      setActionError(kind
+        ? t("Checkout status is unknown. Refresh before trying another payment.")
+        : t("Unable to start Stripe checkout. Please try again."));
     } finally {
+      actionGuard.current = false;
       setBusyAction(null);
     }
-  }, [navigateExternal, t]);
+  }, [data, sessionScope, dataScope, error, unsupported, loading, attemptStates, savedAttempt, navigateExternal, t]);
+
+  const openCheckoutUrl = safeStripeCheckoutUrl(data?.offer?.checkout.url ?? null);
+  const resumeUrl = openCheckoutUrl?.startsWith("https://checkout.stripe.com/") ? openCheckoutUrl : null;
+
+  const resumeCheckout = useCallback(async () => {
+    const checkout = data?.offer?.checkout;
+    const id = checkout?.id;
+    if (actionGuard.current || !data?.canManage || data.role !== "owner" || !sessionScope
+      || dataScope !== sessionScope || error || loading || unsupported || checkout?.state !== "open"
+      || attemptStates.subscription !== "pending" || !isBillingAttempt("subscription", id)
+      || !resumeUrl) return;
+    actionGuard.current = true;
+    setBusyAction("resume");
+    try {
+      await withPrivateOperation(async (op) => {
+        const query = new URLSearchParams({ kind: "subscription", attemptId: id });
+        const response = await privateFetch(`/api/account/billing/attempt?${query}`, { headers: sessionHeaders() }, op);
+        const state = parseBillingAttempt(response.ok ? await response.json() : null, { kind: "subscription", attemptId: id });
+        op.assertCurrent();
+        if (scopeRef.current !== sessionScope) return;
+        const persisted = savedAttempt("subscription", data.workspace.id, id);
+        setAttemptStates((prev) => ({ ...prev, subscription: persisted ? state : "unknown" }));
+        if (persisted && state === "pending") navigateExternal(resumeUrl);
+      });
+    } catch {
+      setAttemptStates((prev) => ({ ...prev, subscription: "unknown" }));
+    } finally {
+      actionGuard.current = false;
+      setBusyAction(null);
+    }
+  }, [data, sessionScope, dataScope, error, loading, unsupported, attemptStates.subscription, savedAttempt, navigateExternal, resumeUrl]);
+
+  const closeCheckout = useCallback(async () => {
+    const id = data?.offer?.checkout.id;
+    if (actionGuard.current || !data?.canManage || data.role !== "owner" || !sessionScope || dataScope !== sessionScope
+      || !isBillingAttempt("subscription", id) || id !== confirmClose || error || loading || unsupported) return;
+    const stored = readBillingAttempt("subscription", data.workspace.id, sessionScope);
+    if (data.offer?.checkout.state !== "open" || stored === "unknown"
+      || (stored && stored.attemptId !== id)) return;
+    if (!savedAttempt("subscription", data.workspace.id, id)) {
+      setAttemptStates((prev) => ({ ...prev, subscription: "unknown" }));
+      return;
+    }
+    actionGuard.current = true;
+    setBusyAction("cancel");
+    setAttemptStates((prev) => ({ ...prev, subscription: "unknown" }));
+    try {
+      await withPrivateOperation(async (op) => {
+        const response = await privateFetch("/api/account/billing/subscribe/cancel", {
+          method: "POST",
+          headers: { ...sessionHeaders(), "Content-Type": "application/json", "X-Cadence-Board": "1" },
+          body: JSON.stringify({ checkoutId: id }),
+        }, op);
+        const result: unknown = response.ok ? await response.json() : null;
+        op.assertCurrent();
+        if (!result || typeof result !== "object" || !("checkoutId" in result) || result.checkoutId !== id
+          || !("state" in result) || (result.state !== "cancelled" && result.state !== "completed")) return;
+        const query = new URLSearchParams({ kind: "subscription", attemptId: id });
+        const check = await privateFetch(`/api/account/billing/attempt?${query}`, { headers: sessionHeaders() }, op);
+        const payload: unknown = check.ok ? await check.json() : null;
+        op.assertCurrent();
+        if (scopeRef.current !== sessionScope) return;
+        setAttemptStates((prev) => ({ ...prev, subscription: parseBillingAttempt(payload, { kind: "subscription", attemptId: id }) }));
+      });
+    } catch {
+      setAttemptStates((prev) => ({ ...prev, subscription: "unknown" }));
+    } finally {
+      actionGuard.current = false;
+      setBusyAction(null);
+      setConfirmClose(null);
+      void refresh();
+    }
+  }, [data, sessionScope, dataScope, confirmClose, error, loading, unsupported, savedAttempt, refresh]);
 
   const openModal = useCallback((kind: "plans" | "extra") => {
     setActionError(null);
@@ -523,8 +705,13 @@ function HostedBilling({
   const planProvider = account?.plan?.provider ?? offer?.subscription.provider;
   const isIapManaged = planProvider === "apple" || planProvider === "google";
   const subActive = account?.plan?.status === "active" || account?.plan?.status === "past_due";
-  const openCheckoutUrl =
-    offer?.checkout.state === "open" ? safeStripeCheckoutUrl(offer.checkout.url) : null;
+  const storedSubscription = data && sessionScope ? readBillingAttempt("subscription", data.workspace.id, sessionScope) : "unknown";
+  const canCloseCheckout = offer?.checkout.state === "open" && isBillingAttempt("subscription", offer.checkout.id)
+    && attemptStates.subscription !== "closed" && attemptStates.subscription !== "confirmed"
+    && (storedSubscription === null || (storedSubscription !== "unknown" && storedSubscription.attemptId === offer.checkout.id));
+  const canResumeCheckout = canCloseCheckout && attemptStates.subscription === "pending" && resumeUrl !== null;
+  const purchasesBlocked = loading || error || unsupported || !sessionScope || dataScope !== sessionScope || busyAction !== null;
+  const unresolvedPayment = Object.values(attemptStates).some((state) => state === "pending" || state === "unknown");
   const summary = account ? resolveUsageSummary(account, offer) : null;
   const isExtraPrimary = summary?.mode === "overflow" || summary?.mode === "refill_only";
   const dailyList = data?.usage.dailyUsage ?? [];
@@ -584,23 +771,19 @@ function HostedBilling({
         </div>
       </header>
 
-      {returnBanner && (
-        <div
-          className={`account-notice ${returnBanner.status === "success" ? "billing-notice-ok" : ""}`}
-          role="status"
-        >
-          <strong>
-            {returnBanner.status === "success"
-              ? returnBanner.kind === "subscription"
-                ? t("Subscription updated")
-                : t("Top-up payment received")
-              : t("Checkout cancelled")}
-          </strong>
-          <p>
-            {returnBanner.status === "success"
-              ? t("Your workspace balance and plan status are refreshing.")
-              : t("No charge was made. You can pick a plan or extra usage pack anytime.")}
-          </p>
+      {data?.role === "owner" && dataScope === sessionScope && (returnBanner || attemptStates.subscription || attemptStates.topup) && (
+        <div className="account-notice" role="status">
+          {returnBanner?.status === "cancel" && <strong>{t("You left Checkout")}</strong>}
+          {returnBanner?.status === "cancel" && <p>{t("Payment may still have been processed.")}</p>}
+          {(["subscription", "topup"] as const).map((kind) => {
+            const state = attemptStates[kind];
+            if (!state && returnBanner?.kind !== kind) return null;
+            return <p key={kind}>{state === "confirmed"
+              ? t("Checkout confirmed. Current access is shown below.")
+              : state === "closed" ? t("Checkout closed.")
+                : state === "pending" ? t("Confirming payment")
+                  : t("Checkout status is unknown. Refresh before trying another payment.")}</p>;
+          })}
         </div>
       )}
 
@@ -633,7 +816,7 @@ function HostedBilling({
         <div className="account-state" role="status">{t("Loading billing…")}</div>
       )}
 
-      {data && !unsupported && (
+      {data && dataScope === (sessionScope ?? null) && (data.role !== "owner" || !!sessionScope) && !unsupported && (
         <>
           {workspaceLabel && (
             <div className="account-identity">
@@ -810,11 +993,16 @@ function HostedBilling({
                         )}
                       </div>
 
-                      {openCheckoutUrl && (
+                      {canCloseCheckout && (
                         <div className="billing-card-actions">
-                          <a className="btn btn-primary btn-sm" href={openCheckoutUrl}>
-                            {t("Resume checkout")}
-                          </a>
+                          {canResumeCheckout && (
+                            <Button size="sm" disabled={purchasesBlocked} loading={busyAction === "resume"} onClick={() => void resumeCheckout()}>
+                              {t("Resume checkout")}
+                            </Button>
+                          )}
+                          <Button size="sm" disabled={purchasesBlocked} onClick={() => setConfirmClose(offer?.checkout.id ?? null)}>
+                            {t("Close Checkout")}
+                          </Button>
                         </div>
                       )}
                     </article>
@@ -928,6 +1116,23 @@ function HostedBilling({
                 </section>
               )}
 
+              {confirmClose && confirmClose === offer?.checkout.id && canCloseCheckout && (
+                <BillingModal
+                  title={t("Close Checkout")}
+                  sizeClass="billing-modal-extra"
+                  testId="billing-close-modal"
+                  busy={busyAction === "cancel"}
+                  closeLabel={t("Keep Checkout")}
+                  onClose={() => setConfirmClose(null)}
+                >
+                  <p className="billing-manage-sub">{t("Closing Checkout does not cancel a completed payment.")}</p>
+                  <div className="billing-card-actions">
+                    <Button size="sm" disabled={busyAction !== null} onClick={() => setConfirmClose(null)}>{t("Keep Checkout")}</Button>
+                    <Button size="sm" disabled={purchasesBlocked} loading={busyAction === "cancel"} onClick={() => void closeCheckout()}>{t("Confirm close Checkout")}</Button>
+                  </div>
+                </BillingModal>
+              )}
+
               {activeModal === "plans" && allPlans.length > 0 && (
                 <BillingModal
                   title={t("Subscription plans")}
@@ -992,12 +1197,14 @@ function HostedBilling({
                           className="card billing-catalog-card"
                           data-current={currentPlan || undefined}
                           data-plan-id={plan.id}
+                          data-selected={handoffPlan === plan.id || undefined}
                         >
                           <div>
                             <div className="billing-plan-card-head">
                               <strong>{plan.label}</strong>
                               <span className="billing-multiplier-badge">{capacity}</span>
                             </div>
+                            {handoffPlan === plan.id && <p>{t("Selected plan")}</p>}
                             <div className="billing-price-row">
                               <span className="billing-price-usd">{usd}</span>
                               <span className="billing-price-period">
@@ -1029,7 +1236,7 @@ function HostedBilling({
                                 full
                                 size="sm"
                                 variant="primary"
-                                disabled={offer?.checkout.available === false || busyAction !== null}
+                                disabled={purchasesBlocked || unresolvedPayment || offer?.checkout.available !== true}
                                 loading={busyAction === actionKey}
                                 onClick={() => void runAction(actionKey, "/api/account/billing/subscribe", { planId: plan.id })}
                               >
@@ -1111,7 +1318,7 @@ function HostedBilling({
                             full
                             size="sm"
                             variant="primary"
-                            disabled={!pack.available || busyAction !== null}
+                            disabled={!pack.available || purchasesBlocked || unresolvedPayment}
                             loading={busyAction === actionKey}
                             onClick={() => void runAction(actionKey, "/api/account/billing/topup", { pack: pack.id })}
                           >
