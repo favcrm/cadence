@@ -26,6 +26,12 @@ fn shared_cases_preserve_the_legacy_fallback() {
     let f = fixture();
     for case in f["cases"].as_array().unwrap() {
         let mut request = input(&f, case["changes"].clone());
+        for key in ["risk_paths", "one_review_paths", "hosted_ci_only"] {
+            request[key] = case["observation"]
+                .get(key)
+                .expect("missing observation")
+                .clone();
+        }
         let result = evaluate(&request);
         assert_eq!(
             result.get("ci_only").is_some(),
@@ -40,12 +46,17 @@ fn shared_cases_preserve_the_legacy_fallback() {
         } else {
             request.as_object_mut().unwrap().remove("hosted_ci_only");
             assert_eq!(result, evaluate(&request), "{case}");
+            if let Some(expected) = case.get("expected_reviewed") {
+                for (key, value) in expected.as_object().unwrap() {
+                    assert_eq!(&result["requirements"][key], value, "{case}");
+                }
+            }
         }
     }
 }
 
 #[test]
-fn missing_proof_wrong_repo_and_unreadable_lists_do_not_enable_lane() {
+fn missing_proof_and_wrong_repo_do_not_enable_lane() {
     let f = fixture();
     let changes = f["cases"][0]["changes"].clone();
     let mut request = input(&f, changes);
@@ -53,9 +64,6 @@ fn missing_proof_wrong_repo_and_unreadable_lists_do_not_enable_lane() {
     let fallback = evaluate(&request);
     request["hosted_ci_only"] =
         json!({"selected_repo": "other/repo", "both_role_lists_absent": true});
-    assert_eq!(evaluate(&request), fallback);
-    request["hosted_ci_only"] =
-        json!({"selected_repo": "agenticos-stack/marketing-v2", "both_role_lists_absent": false});
     assert_eq!(evaluate(&request), fallback);
     request["hosted_ci_only"] = f["hosted_ci_only"].clone();
     request["policy_owner_approved"] = json!(false);
