@@ -75,8 +75,7 @@ one_review_exclude = [
   # risk-paths.toml trigger 1: trust boundary and identity
   "src/peer.rs",
   "src/daemon.rs",
-  "src/daemon_shared.rs",
-  "src/daemon/crate_entry.rs",
+  "src/daemon/crate_root.rs",
   "crates/cadence-daemon/**",
   "src/daemon/identity.rs",
   "src/daemon/caller_rule.rs",

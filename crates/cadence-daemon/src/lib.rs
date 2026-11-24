@@ -46,7 +46,7 @@ mod board_schema_test;
 #[path = "../../../src/daemon/board_session_schema.rs"]
 mod board_session_schema;
 
-#[path = "../../../src/daemon/crate_entry.rs"]
+#[path = "../../../src/daemon/crate_root.rs"]
 pub mod daemon;
 pub use daemon::*;
 
