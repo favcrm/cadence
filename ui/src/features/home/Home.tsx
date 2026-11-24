@@ -8,6 +8,7 @@ import { resources, threadReader } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
+import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
@@ -74,7 +75,7 @@ import { closeDrawer as closeCanvas } from "../canvas/canvasStore";
 import { useSendHandoff } from "./sendHandoff";
 import { memberScope } from "./memberThread";
 import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
-import { formatElapsed } from "./turnText";
+import { formatElapsed, shortId } from "./turnText";
 import CredentialRequestList from "../connections/CredentialRequestCard";
 import {
   initialFollow,
@@ -910,6 +911,39 @@ export default function Home({
   );
 }
 
+function ConversationIdCopy({ id }: { id: string }) {
+  const t = useTranslate();
+  const [result, setResult] = useState<{ copied: boolean }>();
+  useEffect(() => {
+    if (!result) return;
+    const timeout = window.setTimeout(() => setResult(undefined), 2000);
+    return () => window.clearTimeout(timeout);
+  }, [result]);
+
+  return (
+    <div className="relative flex shrink-0 items-center gap-1.5 whitespace-nowrap">
+      <span className="sr-only sm:not-sr-only text-micro text-ink-500">{t("Conversation ID")}:</span>
+      <code className="num text-micro text-ink-300" title={id}>{shortId(id)}</code>
+      <Button size="sm" variant="ghost" onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(id);
+          setResult({ copied: true });
+        } catch {
+          setResult({ copied: false });
+        }
+      }}>
+        {t("Copy ID")}
+      </Button>
+      <span
+        role="status"
+        className={result ? "pointer-events-none absolute right-0 top-full z-10 mt-1 rounded border border-ink-700 bg-ink-900 px-2 py-1 text-micro text-ink-200" : "sr-only"}
+      >
+        {result && t(result.copied ? "Conversation ID copied" : "Could not copy the conversation ID")}
+      </span>
+    </div>
+  );
+}
+
 /** The shared master-transport pane: Native coordinator or verified hosted
  *  actor. The outer Home chooses the layout without changing recipients. */
 function MasterHome({
@@ -1716,6 +1750,7 @@ function MasterHome({
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
+              {homeConversation && <ConversationIdCopy key={homeConversation} id={homeConversation} />}
               {compactHome && latestLabel && (
                 <button
                   type="button"
