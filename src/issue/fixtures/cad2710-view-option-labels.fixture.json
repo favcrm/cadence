@@ -1128,7 +1128,17 @@
           "d": { "type": "date", "required": false },
           "s": { "type": "string", "values": null }
         }
-      }
+      },
+      [
+        "compact",
+        { "en": "Compact" },
+        "reports",
+        null,
+        {
+          "d": [{ "date": null }],
+          "a": ["enum", ["x"], true, { "x": { "en": "Preferred", "EN": "Alternate" } }]
+        }
+      ]
     ],
     "views_out": [
       {
@@ -1163,6 +1173,20 @@
         "label": { "zh-TW": "預設" },
         "section": "reports",
         "params": { "d": { "type": "date" }, "s": { "type": "string" } }
+      },
+      {
+        "id": "compact",
+        "label": { "en": "Compact" },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "required": true,
+            "labels": { "x": { "EN": "Alternate", "en": "Preferred" } }
+          },
+          "d": { "type": "date" }
+        }
       }
     ]
   }
