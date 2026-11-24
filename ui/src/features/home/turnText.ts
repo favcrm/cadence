@@ -143,17 +143,45 @@ export function toolSubject(text: string): string {
   return subject.length > SUBJECT_MAX ? `${subject.slice(0, SUBJECT_MAX - 1)}…` : subject;
 }
 
-/** A failed tool's reason from its JSON result (`message`, else `error`),
- *  or null when the result is not such an object. */
+/** Extract the primary diagnostic message from a `<harness>...</harness>` block,
+ *  or null when `text` does not open with one. */
+export function unwrapHarnessText(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("<harness>")) return null;
+  const openEnd = "<harness>".length;
+  const closeIdx = trimmed.indexOf("</harness>", openEnd);
+  const inner = (closeIdx >= 0 ? trimmed.slice(openEnd, closeIdx) : trimmed.slice(openEnd)).trim();
+  if (inner === "") return null;
+  const lines = inner
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  const tagged = (severity: string) =>
+    lines.find((line) => new RegExp(`^\\[${severity}\\]`, "i").test(line));
+  const chosen = tagged("error") ?? tagged("warn") ?? tagged("info") ?? lines[0];
+  if (!chosen) return null;
+  const msg = chosen.replace(/^\[(?:error|warn|info)\]\s*/i, "").trim();
+  return msg === "" ? null : msg;
+}
+
+/** A failed tool's reason from a `<harness>` block and/or JSON result (`message`,
+ *  else `error`), or null when the result has neither. */
 export function errorReason(text: string): string | null {
+  const unwrapped = unwrapHarnessText(text);
+  const candidate = unwrapped ?? text;
   try {
-    const value = JSON.parse(text) as Record<string, unknown> | null;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    for (const k of ["message", "error"]) if (typeof value[k] === "string" && (value[k] as string).trim() !== "") return value[k] as string;
+    const value = JSON.parse(candidate) as Record<string, unknown> | null;
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const k of ["message", "error"]) {
+        if (typeof value[k] === "string" && (value[k] as string).trim() !== "") {
+          return value[k] as string;
+        }
+      }
+    }
   } catch {
     /* not JSON */
   }
-  return null;
+  return unwrapped;
 }
 
 /** How many results a JSON tool result holds: an array's length, or the

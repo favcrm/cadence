@@ -6,6 +6,7 @@ import { dayText } from "../src/features/home/DayDivider";
 import { translateUiText } from "../src/lib/locale";
 import {
   elapsedSecs,
+  errorReason,
   formatElapsed,
   isIdToken,
   resultCount,
@@ -14,6 +15,7 @@ import {
   toolKey,
   toolLabel,
   toolSubject,
+  unwrapHarnessText,
 } from "../src/features/home/turnText";
 declare function require(name: string): any;
 
@@ -173,6 +175,28 @@ check(done.includes(">0 results<"), "a known tool's JSON result reads as a count
   ]);
   check(failed.includes("rate limited, retry later"), "a known tool's error keeps its reason in the row");
   check(failed.includes(">rate limited, retry later<"), "the reason reads as text, not raw JSON; the raw result stays in the title");
+}
+{
+  check(
+    unwrapHarnessText("<harness>\n[error] /fields/0/options: is required for choice and multichoice fields\n</harness>") ===
+      "/fields/0/options: is required for choice and multichoice fields",
+    "unwrapHarnessText extracts [error] diagnostic",
+  );
+  check(
+    errorReason('<harness>\n[error] {"error":"bad json args"}\n</harness>') === "bad json args",
+    "errorReason unwraps JSON inside <harness>",
+  );
+  check(unwrapHarnessText("<harness>\n[error] partial") === "partial", "unwrapHarnessText handles unclosed block");
+  const harnessFailed = turn([
+    agent(1, "tool_call", 'ask_form {"fields":[{"id":"a"}]}', 1, { tool_use_id: "h1" }),
+    agent(2, "tool_result", "<harness>\n[error] /fields/0/options: is required for choice and multichoice fields\n</harness>", 2, { tool_use_id: "h1", is_error: true }),
+    agent(3, "turn_result", "Done.", 3),
+  ]);
+  check(
+    harnessFailed.includes("/fields/0/options: is required for choice and multichoice fields") &&
+      !harnessFailed.includes(">&lt;harness&gt;<"),
+    "failed tool step renders unwrapped diagnostic instead of bare <harness>",
+  );
 }
 {
   // Review notes on #1778: a saved artifact still reads "in the canvas"; one result is singular;

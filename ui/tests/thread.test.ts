@@ -25,6 +25,7 @@ import {
   unnamedTurnAnswered,
   itemMessage,
   sendBefore,
+  stepSummary,
   rowPaintKey,
   type ThreadState,
 } from "../src/features/home/thread";
@@ -683,4 +684,9 @@ main().catch((e) => {
   );
   equal(inFlightTurnKey(gap, "m-a"), "e4", "a system gap lets the tail run be adopted");
   equal(sendBefore(gap, [gap[3]], new Set(["m-b"])), "m-a", "a queued user row is skipped when naming the run's send");
+  equal(
+    stepSummary("<harness>\n[error] invalid_request: args must be one JSON object.\n</harness>"),
+    "invalid_request: args must be one JSON object.",
+    "stepSummary unwraps <harness> diagnostic blocks instead of showing bare tag",
+  );
 }

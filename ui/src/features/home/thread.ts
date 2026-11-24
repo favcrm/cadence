@@ -1,5 +1,6 @@
 import type { SseEvent } from "../../lib/sse";
 import { answeredData, parse, walk } from "./formModel";
+import { unwrapHarnessText } from "./turnText";
 
 /**
  * The master's thread as the Home screen holds it (CAD-328): the stored
@@ -788,10 +789,12 @@ export interface ToolStep {
   done: boolean;
 }
 
-/** First line of a summary, trimmed — entries are one-liners already,
- * but a provider detail can smuggle newlines onto a row. */
+/** First line of a summary, trimmed — unwrapping `<harness>` blocks so tool
+ *  step rows show the underlying diagnostic rather than the tag itself. */
 export function stepSummary(text: string | null | undefined): string {
-  const line = (text ?? "").split("\n", 1)[0].trim();
+  const raw = text ?? "";
+  const candidate = unwrapHarnessText(raw) ?? raw;
+  const line = candidate.split("\n", 1)[0].trim();
   return line.length > 120 ? `${line.slice(0, 117)}…` : line;
 }
 

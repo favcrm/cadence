@@ -10,6 +10,7 @@ import { Harness } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { GenerationIdentity, RuntimeTool } from "../src/contract.ts";
 import {
+  DEFAULT_ERROR_LOOP_LIMIT,
   DEFAULT_LOOP_GUARD_LIMIT,
   LoopGuard,
   stableJson,
@@ -150,6 +151,35 @@ describe("stableJson and LoopGuard", () => {
     }
     guard.reset();
     expect(guard.record(2, "lookup", { a: 1, b: 2 })).toBeUndefined();
+  });
+
+  it("warns on 3rd consecutive identical error with varied args and blocks the 4th until pivot or success", () => {
+    const guard = new LoopGuard();
+    expect(DEFAULT_ERROR_LOOP_LIMIT).toBe(3);
+
+    const err0 = { diagnostics: [{ severity: "error" as const, message: "/fields/0/options: is required for choice and multichoice fields" }] };
+    const err1 = { diagnostics: [{ severity: "error" as const, message: "/fields/1/options: is required for choice and multichoice fields" }] };
+    expect(guard.record(1, "ask_form", { fields: [{ id: "a", type: "multichoice" }] })).toBeUndefined();
+    expect(guard.recordResult(1, "ask_form", err0)).toEqual({});
+    expect(guard.record(1, "ask_form", { fields: [{ id: "b", type: "multichoice" }] })).toBeUndefined();
+    expect(guard.recordResult(1, "ask_form", err1)).toEqual({});
+    expect(guard.record(1, "ask_form", { fields: [{ id: "c", type: "multichoice" }] })).toBeUndefined();
+    const res3 = guard.recordResult(1, "ask_form", err0);
+    expect(res3.warn).toContain("Repeated failure (3 consecutive identical errors)");
+
+    // 4th attempt is blocked even with reworded args, and blocked results don't reset/corrupt state.
+    const block4 = guard.record(1, "ask_form", { fields: [{ id: "d", type: "multichoice" }] });
+    expect(block4).toContain("Loop guard stopped repeated failing 'ask_form' calls");
+    expect(
+      guard.recordResult(1, "ask_form", {
+        diagnostics: [{ severity: "error", code: "blocked", message: block4! }],
+      }),
+    ).toEqual({});
+
+    // Pivoting to another tool resets the error streak.
+    expect(guard.record(1, "find_tools", { query: "help" })).toBeUndefined();
+    expect(guard.record(1, "ask_form", { fields: [{ id: "e", type: "text", label: "Name" }] })).toBeUndefined();
+    expect(guard.recordResult(1, "ask_form", { output: [{ type: "text", text: '{"state":"asked"}' }] })).toEqual({});
   });
 });
 
