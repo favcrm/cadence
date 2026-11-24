@@ -47,7 +47,7 @@ async function policyRequest(signal: AbortSignal, write?: { requireTwoFactor: bo
   }, signal);
 }
 
-export default function WorkspaceSecurityPolicy() {
+export default function WorkspaceSecurityPolicy({ onSaved }: { onSaved: (signal: AbortSignal) => Promise<void> }) {
   const t = useTranslate();
   const id = useId();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -99,6 +99,7 @@ export default function WorkspaceSecurityPolicy() {
       if (serial !== sequence.current || signal.aborted) return;
       if (result.detail.policy.requireTwoFactor !== desired) throw new Error("Unexpected policy receipt");
       setSnapshot(result); setDesired(result.detail.policy.requireTwoFactor); setCode(""); setEmailCode(""); setChallenge(null); setStepUp(false); setNotice("Workspace security policy saved.");
+      void onSaved(signal);
     } catch (failure) {
       if (serial !== sequence.current || signal.aborted) return;
       if (failure instanceof ApiError && failure.code === "step_up_required") {

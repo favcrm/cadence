@@ -194,7 +194,9 @@ async function run(): Promise<void> {
   let nextBillingStatus = 200;
   let nextBillingPayload: unknown = syntheticSnapshot;
   let nextPostPayload: unknown = recovery.subscription.ready;
+  let nextPostStatus = 200;
   let attemptState = "pending";
+  let requestedSubscriptionAttempt: string | null = null;
 
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
@@ -237,13 +239,14 @@ async function run(): Promise<void> {
     }
     if (path.startsWith("/api/account/billing/attempt?")) {
       const query = new URL(path, "https://acme.cadencecloud.app").searchParams;
+      requestedSubscriptionAttempt = query.get("attemptId");
       if (query.get("kind") !== "subscription" || query.get("attemptId") !== recovery.subscription.ready.attemptId) {
         return new Response(null, { status: 404 });
       }
       return Response.json({ ...recovery.subscription.pending, state: attemptState });
     }
     return new Response(JSON.stringify(nextPostPayload), {
-      status: 200,
+      status: nextPostStatus,
       headers: { "Content-Type": "application/json" },
     });
   }) as typeof fetch;
@@ -616,7 +619,7 @@ async function run(): Promise<void> {
     account: {
       ...syntheticSnapshot.account,
       plan: { name: "Synth Basic", status: "active", provider: "stripe", planId: "synth_basic_mo" },
-      trial: undefined,
+      trial: null,
       usageSummary: {
         mode: "monthly_standby" as const,
         cycle: { usedPercent: 38, remainingPercent: 62, resetsAt: "2026-12-01T00:00:00Z" },
@@ -720,7 +723,7 @@ async function run(): Promise<void> {
     account: {
       ...syntheticSnapshot.account,
       plan: { name: "Synth Basic", status: "active", provider: "stripe", planId: "synth_basic_mo" },
-      trial: undefined,
+      trial: null,
       usageSummary: {
         mode: "overflow" as const,
         cycle: { usedPercent: 100, remainingPercent: 0, resetsAt: "2026-12-01T00:00:00Z" },
@@ -799,14 +802,62 @@ async function run(): Promise<void> {
   );
 
   await unmount();
+
+  // A definite validation refusal must not pin an unidentified payment.
+  nextBillingStatus = 200;
+  nextBillingPayload = syntheticSnapshot;
+  nextPostStatus = 400;
+  nextPostPayload = { ok: false, error: { code: "invalid_request", message: "Pack unavailable" } };
+  unmount = await mountView(() => waitForDom(
+    React.act, host, () => Boolean(host.querySelector("#billing-open-extra")), "Billing after unavailable option",
+  ));
+  await React.act(async () => (host.querySelector("#billing-open-extra") as HTMLButtonElement).click());
+  const refusedPack = host.querySelector('[data-pack-id="pack_alpha"] button') as HTMLButtonElement;
+  await React.act(async () => refusedPack.click());
+  await waitForDom(React.act, host, () => Boolean(host.textContent?.includes("The selected checkout option is no longer available.")), "definite checkout refusal");
+  assert(!refusedPack.disabled, "definite refusal does not strand purchases");
+  await unmount();
+
+  nextPostStatus = 503;
+  nextPostPayload = { ok: false, error: { code: "capability_unavailable", message: "Response lost" } };
+  unmount = await mountView(() => waitForDom(
+    React.act, host, () => Boolean(host.querySelector("#billing-open-plans")), "Billing before ambiguous checkout",
+  ));
+  await React.act(async () => (host.querySelector("#billing-open-plans") as HTMLButtonElement).click());
+  const startUnknown = host.querySelector('[data-plan-id="synth_basic_mo"] button') as HTMLButtonElement;
+  await React.act(async () => startUnknown.click());
+  await waitForDom(React.act, host, () => startUnknown.disabled, "unknown payment blocks another start");
+  await unmount();
+  attemptState = "pending";
+  requestedSubscriptionAttempt = null;
+  nextBillingPayload = {
+    ...syntheticSnapshot,
+    offer: {
+      ...syntheticSnapshot.offer,
+      checkout: { ...syntheticSnapshot.offer.checkout, id: recovery.subscription.ready.attemptId, state: "open", url: recovery.subscription.ready.url },
+    },
+  };
+  unmount = await mountView(() => waitForDom(
+    React.act,
+    host,
+    () => Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Resume checkout" && !button.disabled),
+    "authoritative open checkout recovered after lost response",
+  ));
+  equal(requestedSubscriptionAttempt, recovery.subscription.ready.attemptId, "refresh verifies the newly observed exact checkout");
+  await unmount();
   host.remove();
   console.log("hostedBilling checks passed");
 }
 
 declare const process: { cwd(): string; exit: (code?: number) => void };
+const watchdog = setTimeout(() => {
+  console.error("Hosted Billing checks did not finish");
+  process.exit(1);
+}, 15_000);
 run().then(
-  () => process.exit(0),
+  () => { clearTimeout(watchdog); process.exit(0); },
   (err) => {
+    clearTimeout(watchdog);
     console.error(err);
     process.exit(1);
   },

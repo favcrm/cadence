@@ -1072,7 +1072,7 @@ export default function Security({
       )}
 
       {hosted && policyScope && viewer?.operator === true && !viewer.readOnly && (
-        <WorkspaceSecurityPolicy key={policyScope} />
+        <WorkspaceSecurityPolicy key={policyScope} onSaved={load} />
       )}
 
       <Toast msg={toast} />
