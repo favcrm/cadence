@@ -1517,7 +1517,7 @@ export const api = {
     custom_headers?: Array<{ name: string; value: string }>;
     oauth_client?: { client_id: string; client_secret?: string; scopes?: string[] };
     required_scopes?: string[];
-    standing_read_profile?: "emw_catalog_v1";
+    standing_read_profile?: string;
     return_to?: string;
   }) => post<CustomMcpCreatePayload>("/api/connections/mcp", body),
   customMcpOAuthStart: (id: string, body?: { return_to?: string }) =>

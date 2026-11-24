@@ -497,7 +497,7 @@ export function CustomMcpInspectDrawer({
   const toolsDirty = changedTools.length > 0;
   const guideDirty = guideDraft !== (connection.agent_guide_md ?? "");
   const isOAuth = connection.auth_kind === "oauth" || connection.auth_kind === "oauth_static";
-  const isStandingCatalog = connection.standing_read_profile === "emw_catalog_v1" || connection.standing_read_access === "confirm";
+  const isStandingCatalog = !!connection.standing_read_profile || connection.standing_read_access === "confirm";
   const hasDrift =
     connection.status === "needs_review" ||
     connection.tools_summary.drifted > 0 ||
@@ -527,11 +527,35 @@ export function CustomMcpInspectDrawer({
 
   const allowCatalogReads = () => runAction("catalog", async () => {
     if (!Number.isSafeInteger(connection.snapshot_revision) || connection.snapshot_revision <= 0) {
-      throw new Error("Refresh and review the connection before allowing catalog reads.");
+      throw new Error("Refresh and review the connection before allowing read access.");
+    }
+    const list = await api.customMcpList();
+    const row = list.connections.find((item) => item.id === connection.id);
+    const offer = list.standing_read_offers?.find((item) => {
+      try {
+        return new URL(item.endpoint_url).href === new URL(connection.endpoint_url).href &&
+          item.required_scopes.length === connection.oauth_scopes.length &&
+          item.required_scopes.every((scope) => connection.oauth_scopes.includes(scope)) &&
+          (!connection.standing_read_profile || item.profile === connection.standing_read_profile);
+      } catch { return false; }
+    });
+    if (!offer || !row || !row.connected_by_you || row.standing_read_access !== "confirm" ||
+        row.endpoint_url !== connection.endpoint_url || row.snapshot_revision !== connection.snapshot_revision ||
+        row.oauth_scopes.length !== offer.required_scopes.length ||
+        !offer.required_scopes.every((scope) => row.oauth_scopes.includes(scope)) ||
+        (row.standing_read_profile && row.standing_read_profile !== offer.profile)) {
+      throw new Error("Cadence could not verify this Custom MCP connection.");
     }
     const res = await api.customMcpAllowCatalogReads(connection.id, connection.snapshot_revision);
+    if (res.connection.id !== row.id || !res.connection.connected_by_you ||
+        res.connection.endpoint_url !== row.endpoint_url || res.connection.standing_read_profile !== offer.profile ||
+        res.connection.standing_read_access !== "allowed" ||
+        res.connection.oauth_scopes.length !== offer.required_scopes.length ||
+        !offer.required_scopes.every((scope) => res.connection.oauth_scopes.includes(scope))) {
+      throw new Error("Cadence could not verify this Custom MCP connection.");
+    }
     onUpdated(res.connection);
-    setFeedback({ ok: true, text: t("Atlas catalog access updated.") });
+    setFeedback({ ok: true, text: t("Read access updated.") });
   });
 
   const saveToolModes = () => {
@@ -675,11 +699,11 @@ export function CustomMcpInspectDrawer({
   const disconnectControl = canEdit && (
     <div className="border-t border-ink-700 pt-3 space-y-2">
       {!revokeOpen ? (
-        <Button size="sm" variant="danger" disabled={busyAction !== null} onClick={() => setRevokeOpen(true)}>{t(isStandingCatalog ? "Disconnect EMW" : "Disconnect server…")}</Button>
+        <Button size="sm" variant="danger" disabled={busyAction !== null} onClick={() => setRevokeOpen(true)}>{t("Disconnect server…")}</Button>
       ) : (
         <div className="space-y-2">
           <p className="text-label text-ink-200 break-words">
-            {t(isStandingCatalog ? "Disconnecting stops Atlas from using this catalog connection." : "Disconnecting removes stored credentials and pinned tools for this Custom MCP server immediately.")}
+            {t(isStandingCatalog ? "Disconnecting stops Atlas from using this connection." : "Disconnecting removes stored credentials and pinned tools for this Custom MCP server immediately.")}
           </p>
           {!isStandingCatalog && (
             <label className="flex items-start gap-2 text-label text-ink-300">
@@ -707,14 +731,14 @@ export function CustomMcpInspectDrawer({
       {okBanner}
       {isStandingCatalog && (
         <div className="rounded border border-ink-700 bg-ink-850 px-3 py-2 space-y-2">
-          <p className="text-label font-medium text-ink-100">{t(connection.standing_read_access === "allowed" ? "Connected · Catalog read access" : "EMW catalog access")}</p>
+          <p className="text-label font-medium text-ink-100">{t(connection.standing_read_access === "allowed" ? "Connected · Read access" : "Read access")}</p>
           <p className="text-micro text-ink-300">{t(connection.standing_read_access === "allowed"
-            ? "Atlas can read the EMW catalog in your chats. Other people, agents and scheduled runs cannot use this access."
-            : "Atlas can use catalog read access only in your chats.")}</p>
+            ? "Atlas can read in your chats. Other people, agents and scheduled runs cannot use this access."
+            : "Atlas can use this read access only in your chats.")}</p>
           {canEdit && connection.connected_by_you && connection.standing_read_access === "confirm" && (
             <>
-              <p className="text-micro text-ink-300">{t("Use your existing sign-in and make this connection personal. Atlas can read the catalog until you disconnect.")}</p>
-              <Button size="sm" variant="primary" loading={busyAction === "catalog"} disabled={busyAction !== null} onClick={() => void allowCatalogReads()}>{t("Allow Atlas catalog reads")}</Button>
+              <p className="text-micro text-ink-300">{t("Use your existing sign-in and make this connection personal. Atlas can read until you disconnect.")}</p>
+              <Button size="sm" variant="primary" loading={busyAction === "catalog"} disabled={busyAction !== null} onClick={() => void allowCatalogReads()}>{t("Allow Atlas read access")}</Button>
             </>
           )}
           {disconnectControl}
