@@ -30342,12 +30342,37 @@ var CompactionTask = defineTask({
         return failNoModel2(runtime, ref, context);
       const view = await runtime.context(runtime.conversationId, context, { at: tail });
       const cut = view.entries.findIndex((entry) => entry.id === firstKept);
+      const source = {
+        entries: view.entries.slice(0, cut),
+        messages: summarizedMessages(view, cut),
+        serialize: serializeConversation
+      };
+      let rendered;
+      let renderFailed = false;
+      await runtime.hooks.each("renderCompactionSource", async (hook) => {
+        if (rendered !== undefined || renderFailed)
+          return;
+        try {
+          rendered = await hook(source, runtime, context);
+        } catch {
+          runtime.signal.throwIfAborted();
+          renderFailed = true;
+        }
+      });
+      if (renderFailed) {
+        const message = "Compaction source could not be safely rendered";
+        await runtime.commit(async (tx) => {
+          failCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId, message);
+          return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "source_error" } } } };
+        }, context);
+        return;
+      }
       const now = runtime.now();
       const messages = [
         { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
         {
           role: "user",
-          content: [{ type: "text", text: summaryPrompt(summarizedMessages(view, cut), task.input.instructions) }],
+          content: [{ type: "text", text: summaryPrompt(rendered ?? serializeConversation(source.messages), task.input.instructions) }],
           timestamp: now
         }
       ];
@@ -30523,17 +30548,17 @@ function summaryFailure(message) {
     return "Summarization attempted to call a tool";
   return "Summarization produced no text";
 }
-function summaryPrompt(messages, instructions) {
+function summaryPrompt(source, instructions) {
   const focus = instructions === undefined ? "" : `
 
 Additional focus: ${instructions}`;
   return `<conversation>
-${serializeConversation(messages)}
+${source}
 </conversation>
 
 ${SUMMARIZATION_PROMPT}${focus}`;
 }
-function serializeConversation(messages) {
+function serializeConversation(messages, formatArgument = (json) => json) {
   const parts = [];
   for (const message of messages) {
     if (message.role === "user") {
@@ -30543,7 +30568,7 @@ function serializeConversation(messages) {
     } else if (message.role === "assistant") {
       const text = message.content.flatMap((content) => content.type === "text" ? [content.text] : []);
       const calls = message.content.flatMap((content) => content.type === "toolCall" ? [
-        `${content.name}(${Object.entries(content.arguments).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(", ")})`
+        `${content.name}(${Object.entries(content.arguments).map(([key, value]) => `${key}=${formatArgument(JSON.stringify(value))}`).join(", ")})`
       ] : []);
       if (text.length > 0)
         parts.push(`[Assistant]: ${text.join(`
@@ -50765,6 +50790,69 @@ function redactToolErrors(text) {
   return out + text.slice(parts.at(-1).end);
 }
 
+// src/summary-tool-failures.ts
+var TRANSIENT_FAILURE_NOTE = "[Runtime note]: Tool failures above are transient runtime events, not facts about the tools. " + "Record at most that an earlier call failed and that the next turn should try it again normally.";
+var CALLS_PREFIX = "[Assistant tool calls]: ";
+var ASSISTANT_PREFIX = "[Assistant]: ";
+var CALL_NAME = /(?:^|; )([A-Za-z_][\w.-]*)\(/g;
+var failedResult = (body) => body.includes(`<harness>
+`) && body.includes(`
+[error] `);
+var SENTENCE = /[^.!?\n]+[.!?]?/g;
+var STANDING_CLAIM = new RegExp([
+  String.raw`\b(?:avoid|stop|skip|never|don'?t|do not)\b`,
+  String.raw`\b(?:does ?n[o']t|do ?n[o']t|can'?t|cannot|won'?t|isn'?t|is not)\s+(?:work|working|available|open)`,
+  String.raw`\b(?:broken|unavailable|not working|keeps? (?:failing|refusing)|refus(?:es|ing))\b`,
+  String.raw`\buntil\b[^.!?\n]{0,30}\b(?:fixed|resolved|works)\b`
+].join("|"), "i");
+function escape3(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function rewrite(body, failed) {
+  const names = [...failed].map((name) => ({ name, pattern: new RegExp(String.raw`(?<![\w.-])${escape3(name)}(?![\w-])`) }));
+  return body.replace(SENTENCE, (sentence) => {
+    const tool = names.find(({ pattern }) => pattern.test(sentence));
+    if (!tool || !STANDING_CLAIM.test(sentence))
+      return sentence;
+    const leading = sentence.slice(0, sentence.length - sentence.trimStart().length);
+    return `${leading}An earlier ${tool.name} call failed; try it again normally.`;
+  });
+}
+function settleToolFailures(text) {
+  if (!text.includes("<harness>"))
+    return text;
+  const parts = segments(text);
+  const pending = [];
+  const failed = new Set;
+  const bodies = parts.map((part) => {
+    const body = text.slice(part.start, part.end);
+    if (part.role === "Assistant tool calls") {
+      for (const match of body.slice(CALLS_PREFIX.length).matchAll(CALL_NAME))
+        pending.push(match[1]);
+    } else if (part.role === "Tool result") {
+      const name = pending.shift();
+      if (name !== undefined && failedResult(body))
+        failed.add(name);
+    } else if (part.role === "Assistant" && failed.size > 0) {
+      return ASSISTANT_PREFIX + rewrite(body.slice(ASSISTANT_PREFIX.length), failed);
+    }
+    return body;
+  });
+  if (failed.size === 0)
+    return text;
+  let out = text.slice(0, parts[0].start);
+  parts.forEach((part, index) => {
+    out += bodies[index];
+    const next = parts[index + 1];
+    out += text.slice(part.end, next === undefined ? part.end : next.start);
+  });
+  out += text.slice(parts.at(-1).end);
+  const end = out.lastIndexOf(CONVERSATION_END);
+  return end < 0 ? out : `${out.slice(0, end)}
+
+${TRANSIENT_FAILURE_NOTE}${out.slice(end)}`;
+}
+
 // src/model.ts
 var MODEL_CONTEXT_WINDOW = 128000;
 var HOSTED_COMPACTION_POLICY = {
@@ -50878,7 +50966,7 @@ function splitSummaryMessages(input) {
   if (source === null)
     return input;
   const { system, user } = source;
-  const text = redactToolErrors(shortenToolCallArguments(source.text));
+  const text = settleToolFailures(redactToolErrors(shortenToolCallArguments(source.text)));
   const limit = 64000;
   if (text === source.text && text.length <= limit)
     return input;

@@ -40,7 +40,7 @@ const ERROR_CODE = /^[A-Za-z][A-Za-z0-9_.-]{5,}$/;
 
 const ROLE = String.raw`\[(?:User|Assistant|Assistant tool calls|Tool result)\]: `;
 const SEGMENT_START = new RegExp(String.raw`(?:^|\n\n|<conversation>\n)(?=${ROLE})`, "g");
-const CONVERSATION_END = "\n</conversation>";
+export const CONVERSATION_END = "\n</conversation>";
 
 const HARNESS_OPEN = "<harness>";
 const HARNESS_CLOSE = "</harness>";
@@ -52,9 +52,10 @@ const MAX_BLOCK = 2_000;
 /** The engine's diagnostic severities (pi-durable `Diagnostic`). */
 const DIAGNOSTIC = /^\[(info|warn|error)\] ?(.*)$/;
 
-type Segment = { role: string; start: number; end: number };
+export type Segment = { role: string; start: number; end: number };
 
-function segments(text: string): Segment[] {
+/** The engine's serialized segments, found by role prefix; the closing tag and prompt are not part of any. */
+export function segments(text: string): Segment[] {
   const end = text.lastIndexOf(CONVERSATION_END);
   const limit = end < 0 ? text.length : end;
   const starts: number[] = [];

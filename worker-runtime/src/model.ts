@@ -8,6 +8,7 @@ import {
   MAX_IMAGE_PARTS,
 } from "./image-limits.ts";
 import { redactToolErrors } from "./summary-tool-errors.ts";
+import { settleToolFailures } from "./summary-tool-failures.ts";
 
 /**
  * Model transport for one hosted conversation.
@@ -270,13 +271,14 @@ export interface MeteredBinding {
  * hosted gateway limits each message to 64,000 characters, independently of
  * the overall byte budget. Preserve the source in consecutive messages, only
  * for the engine's attested summarization request. Tool error text is removed
- * first (CAD-2744, `redactToolErrors`), so the split never decides what stays.
+ * first (CAD-2744, `redactToolErrors`) and failed calls are marked transient
+ * (CAD-2745, `settleToolFailures`), so the split never decides what stays.
  */
 function splitSummaryMessages(input: Record<string, unknown>): Record<string, unknown> {
   const source = summarySource(input);
   if (source === null) return input;
   const { system, user } = source;
-  const text = redactToolErrors(shortenToolCallArguments(source.text));
+  const text = settleToolFailures(redactToolErrors(shortenToolCallArguments(source.text)));
   const limit = 64_000;
   if (text === source.text && text.length <= limit) return input;
   if (text.length <= limit) return { ...input, messages: [system, { ...user, content: text }] };
