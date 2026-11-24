@@ -34,7 +34,8 @@ it("keeps user quotations and wrapped limits, rewrites unmarked failures, and cl
   const first = `Open the canvas.\n${"a".repeat(34_000)}`;
   const second = `${USER_QUOTE}\n${"b".repeat(34_000)}`;
   const third = "Try once more.";
-  const successLog = `Board 42 opened.\n<harness>\n[error] ${TOOL_ERROR_REDACTED}\n</harness>`;
+  const cachedError = "cached_board_23: old list was unavailable";
+  const successLog = `Board 42 opened.\n<harness>\n[error] ${cachedError}\n</harness>`;
   const keep = "Do not retry canvas_open.";
   let attempts = 0;
   let summary: string[] = [];
@@ -69,6 +70,7 @@ it("keeps user quotations and wrapped limits, rewrites unmarked failures, and cl
     if (last.role === "tool") {
       if (attempts === 1) expect(last.content).toContain("canvas_slot_77");
       if (attempts === 2) expect(last.content).toContain(UNMARKED_ERROR);
+      if (attempts === 3) expect(last.content).toContain(cachedError);
       return answer(attempts === 1 ? FIRST_ANSWER : attempts === 2 ? SECOND_ANSWER : keep);
     }
     if (last.content === first || last.content === second) return toolCall(++attempts);
@@ -105,7 +107,7 @@ it("keeps user quotations and wrapped limits, rewrites unmarked failures, and cl
     `[Assistant]: ${QUOTED_REPORT} An earlier canvas_open call failed; try it again normally. The archive probe said (tool error text omitted).`,
     `[User]: ${third}`,
     "[Assistant tool calls]: silent_probe(); canvas_open()",
-    `[Tool result]: ${successLog}`,
+    `[Tool result]: Board 42 opened.\n<harness>\n[error] ${TOOL_ERROR_REDACTED}\n</harness>`,
     `[Assistant]: ${keep}`,
     TRANSIENT_FAILURE_NOTE,
   ].join("\n\n");

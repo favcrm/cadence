@@ -47,12 +47,30 @@ it("keeps a paraphrased no-retry instruction and summarizes status without recom
 it.each([
   "Skip calling canvas_open for now.",
   "Avoid calling canvas_open until it works.",
+  "Do not keep retrying canvas_open; stop and avoid calling it until it works.",
 ])("does not narrow the user's no-retry rule to an assistant's temporary limit: %p", (text) => {
   const restricted = new Map<string, Set<string>>();
   collectUserToolRestrictions("Do not call canvas_open again.", restricted);
   expect(rewriteGiveUps(text, failed, restricted)).toBe(
     "An earlier canvas_open call failed. The user said not to call canvas_open again.",
   );
+});
+
+it("does not preserve a temporary assistant give-up alongside a blanket user ban", () => {
+  const restricted = new Map<string, Set<string>>();
+  collectUserToolRestrictions("Never call canvas_open.", restricted);
+  expect(rewriteGiveUps("Skip calling canvas_open for now.", failed, restricted))
+    .toBe("An earlier canvas_open call failed.");
+});
+
+it.each([
+  "If the board is read-only; do not retry canvas_open.",
+  "Use the backup; unless the board is writable; do not retry canvas_open.",
+])("does not promote a scoped semicolon consequence into a blanket prohibition: %p", (text) => {
+  const restricted = new Map<string, Set<string>>();
+  collectUserToolRestrictions(text, restricted);
+  expect(rewriteGiveUps("Do not retry canvas_open.", failed, restricted))
+    .toBe("An earlier canvas_open call failed; try it again normally.");
 });
 
 it("keeps a user restriction on either side of a top-level semicolon", () => {

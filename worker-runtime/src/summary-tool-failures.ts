@@ -17,7 +17,7 @@ const AVOID = new RegExp(`^${AVOID_CLAIM}$`, "i");
 // This continuation only repeats the preceding directive about the same tool.
 // Do not split assistant prose at arbitrary semicolons.
 const GIVE_UP = new RegExp(
-  String.raw`^${AVOID_CLAIM}(?:[ \t]*;[ \t]*(?:stop and )?avoid (?:${ACTION}) it(?: (?:${LIMIT}))?)?$`, "i",
+  String.raw`^${AVOID_CLAIM}(?:[ \t]*;[ \t]*(?<continuation>(?:stop and )?avoid (?:${ACTION}) it(?: (?:${LIMIT}))?))?$`, "i",
 );
 const TIME = "right now|currently|at the moment|for now|any ?more|still|today";
 const OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED]
@@ -56,7 +56,7 @@ export function rewriteGiveUps(body: string, failed: ReadonlySet<string>, userRu
     const tool = avoid?.tool ?? BROKEN.exec(claim)?.groups?.tool;
     if (tool === undefined || !failed.has(tool)) continue;
     const scopes = userRules.get(tool);
-    if (avoid && (scopes?.has("") || scopes?.has(restrictionScope(avoid)))) continue;
+    if (avoid && avoid.continuation === undefined && scopes?.has(restrictionScope(avoid))) continue;
     out += body.slice(from, start + leading);
     out += `An earlier ${tool} call failed`;
     if (!scopes) out += "; try it again normally.";

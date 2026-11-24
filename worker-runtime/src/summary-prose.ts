@@ -3,22 +3,27 @@
 // quotation. Do not infer a boundary after a quoted label in a condition.
 const REPORTING_LEAD_IN =
   /^\s*(?:(?:the|a|an|this|that|our|its)[ \t]+(?:(?!(?:if|unless|until|when|whenever|while|before|after|only|that|which|who|because|provided|assuming|since|as|whether)\b)[A-Za-z][\w-]*[ \t]+){1,3}|(?:i|we|it|they|you)[ \t]+)(?:say|says|said|return|returns|returned|read|reads|report|reports|reported|write|writes|wrote|show|shows|showed|display|displays|displayed)(?:[ \t]*[,:])?[ \t]*$/i;
+const CONDITIONAL_LEAD_IN =
+  /^\s*(?:(?:[-+*]|\d+[.)])[ \t]+)?(?:if|only if|even if|unless|when|whenever|while|until|before|after|provided|assuming|in case)\b/i;
 
 export function* proseClauses(text: string, semicolons: boolean): Generator<readonly [start: number, end: number]> {
   let start = 0;
   let quoted = false;
+  let scopedSemicolon = false;
   let codeClosers: Map<number, number> | undefined;
   let unclosedQuotes: Set<string> | undefined;
   for (let at = 0; at < text.length;) {
     const mark = text[at]!;
     if (at === start && (at === 0 || text[at - 1] === "\n") && isCodeIndent(text, at)) {
       start = at = indentedCodeEnd(text, at);
+      scopedSemicolon = false;
       continue;
     }
     if (mark === ">" && blockStart(text, at)) {
       if (!quoted && start < at) yield [start, at];
       start = at = blockQuoteEnd(text, at);
       quoted = false;
+      scopedSemicolon = false;
       continue;
     }
     if (mark === "`" || mark === "~") {
@@ -28,6 +33,7 @@ export function* proseClauses(text: string, semicolons: boolean): Generator<read
         if (!quoted && start < at) yield [start, at];
         start = at = fenceEnd(text, after, mark, width);
         quoted = false;
+        scopedSemicolon = false;
         continue;
       }
       if (mark === "`") {
@@ -57,6 +63,7 @@ export function* proseClauses(text: string, semicolons: boolean): Generator<read
           if (!quoted && terminal > at && /[.!?]/.test(text[terminal]!) &&
             /\s/.test(text[end] ?? "") && REPORTING_LEAD_IN.test(text.slice(start, opener))) {
             start = end;
+            scopedSemicolon = false;
           } else quoted = true;
           at = end;
           continue;
@@ -72,19 +79,26 @@ export function* proseClauses(text: string, semicolons: boolean): Generator<read
       at = after + ((after - at) % 2 === 1 && /[;.!?]/.test(text[after] ?? "") ? 1 : 0);
       continue;
     } else if (mark === ";" && semicolons) {
-      if (!quoted && start < at) yield [start, at];
-      start = at + 1;
-      quoted = false;
+      // A semicolon after a conditional lead-in cannot promote its consequence
+      // into a standalone user rule. Keep the rest of the sentence attached.
+      if (!scopedSemicolon) scopedSemicolon = CONDITIONAL_LEAD_IN.test(text.slice(start, at));
+      if (!scopedSemicolon) {
+        if (!quoted && start < at) yield [start, at];
+        start = at + 1;
+        quoted = false;
+      }
     } else if (/[.!?]/.test(mark) && (at + 1 === text.length || /\s/.test(text[at + 1]!))) {
       if (!quoted) yield [start, at + 1];
       start = at + 1;
       quoted = false;
+      scopedSemicolon = false;
     } else if (mark === "\n") {
       const blank = blankLineEnd(text, at + 1);
       if (blank !== undefined) {
         if (!quoted && start < at) yield [start, at];
         start = at = blank;
         quoted = false;
+        scopedSemicolon = false;
         continue;
       }
     }

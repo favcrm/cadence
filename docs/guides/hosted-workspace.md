@@ -235,12 +235,14 @@ The runtime shapes the source from Pi's pinned messages before serialization.
 It redacts structured tool errors and active-turn loop-guard warnings from
 the summary source. It refuses to send a summary request if the stored
 diagnostics disagree with their rendered block.
-It rewrites standalone assistant give-ups only when the tool's latest known
-call failed.
+Rendered errors can also be redacted on successful results without counting
+them as failures. Standalone assistant give-ups change only after a native
+failure for the same tool.
 A successful retry clears that failure. A temporary give-up cannot relax a
 user's explicit no-repeat rule. Quoted examples and code are not user restrictions
 or assistant claims. A complete reporting sentence may end inside its closing
 quote, but punctuation inside a conditional label does not split that condition.
+Semicolons do not detach the consequence from an explicit condition.
 User text, including pasted role labels, and the stored transcript are unchanged
 (CAD-2744, CAD-2745).
 

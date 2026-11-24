@@ -1,6 +1,6 @@
 import { expect, it } from "bun:test";
 import {
-  errorEchoScrubber, redactFailedOutput, redactQuotedHarness,
+  errorEchoScrubber, redactRenderedDiagnostics, redactQuotedHarness,
   TOOL_ERROR_REDACTED, TOOL_ERROR_TEXT_OMITTED,
 } from "../src/summary-tool-errors.ts";
 
@@ -43,7 +43,7 @@ it("scrubs multiline diagnostics without dropping the surrounding tool output or
   const diagnostic = `${message}\n[stderr] archive index could not be read`;
   const errors = new Set<string>();
   const output = `12 rows\n${harness(`[error] ${diagnostic}`, "[warn] output shortened")}\nDone.`;
-  expect(redactFailedOutput(output, errors)).toBe(
+  expect(redactRenderedDiagnostics(output, errors)).toBe(
     `12 rows\n${harness(`[error] ${TOOL_ERROR_REDACTED}`, "[warn] output shortened")}\nDone.`,
   );
   expect(errorEchoScrubber(errors)(`Saw ${diagnostic} on retry.`)).toBe(
@@ -53,9 +53,9 @@ it("scrubs multiline diagnostics without dropping the surrounding tool output or
 
 it("does not swallow a later valid result after an unclosed diagnostic", () => {
   const unclosed = `Rows read: 12\n<harness>\n[error] ${message.slice(0, 20)}`;
-  expect(redactFailedOutput(unclosed, new Set())).toBe(unclosed);
+  expect(redactRenderedDiagnostics(unclosed, new Set())).toBe(unclosed);
   const output = `${unclosed}\n${harness(`[error] ${message}`)}`;
-  expect(redactFailedOutput(output, new Set())).toBe(
+  expect(redactRenderedDiagnostics(output, new Set())).toBe(
     `${unclosed}\n${harness(`[error] ${TOOL_ERROR_REDACTED}`)}`,
   );
 });
@@ -65,7 +65,7 @@ it.each([
   harness(`[error] ${TOOL_ERROR_REDACTED}`),
 ])("leaves non-errors and an already redacted diagnostic unchanged: %p", (output) => {
   const errors = new Set<string>();
-  expect(redactFailedOutput(output, errors)).toBe(output);
+  expect(redactRenderedDiagnostics(output, errors)).toBe(output);
   expect(redactQuotedHarness(output, errors)).toBe(output);
   expect(errorEchoScrubber(errors)(output)).toBe(output);
 });

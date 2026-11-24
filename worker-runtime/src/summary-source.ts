@@ -1,6 +1,6 @@
 import type { Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { CompactionEntry, ToolResultEntry, type CompactionHooks, type ToolDiagnostic } from "@earendil-works/pi-durable";
-import { errorEchoScrubber, redactFailedOutput, redactQuotedHarness, TOOL_ERROR_REDACTED } from "./summary-tool-errors.ts";
+import { errorEchoScrubber, redactRenderedDiagnostics, redactQuotedHarness, TOOL_ERROR_REDACTED } from "./summary-tool-errors.ts";
 import { collectUserToolRestrictions, rewriteGiveUps, TRANSIENT_FAILURE_NOTE } from "./summary-tool-failures.ts";
 import { LOOP_GUARD_WARNING_CODE } from "./loop-guard.ts";
 
@@ -50,11 +50,12 @@ export const renderSummarySource: CompactionHooks["renderCompactionSource"] = ({
         if (lines.length > 0) content.push({ type: "text", text: render(lines) });
         shaped = { ...message, content };
       }
-      if (message.isError) {
-        const before = visibleText(shaped.content);
-        const redacted = redactFailedOutput(before, errors);
-        if (redacted !== before) shaped = { ...shaped, content: [{ type: "text", text: redacted }] };
-      }
+      // Some tools return rendered harness blocks without separate metadata.
+      // Redact them for CAD-2744 compatibility, but use only native outcome
+      // metadata to decide whether assistant give-up prose is attributable.
+      const before = visibleText(shaped.content);
+      const redacted = redactRenderedDiagnostics(before, errors);
+      if (redacted !== before) shaped = { ...shaped, content: [{ type: "text", text: redacted }] };
       outcomes.set(message, { failed, shaped });
     }
   }

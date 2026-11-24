@@ -52,8 +52,8 @@ export function redactQuotedHarness(body: string, removed: Set<string>): string 
   return redactHarnessBlocks(body, removed, HARNESS_OPEN, HARNESS_CLOSE, /(\[(?:info|warn|error)\])/);
 }
 
-/** Explicitly failed tools can return rendered diagnostics without a separate metadata array. */
-export function redactFailedOutput(body: string, removed: Set<string>): string {
+/** Tool output can contain rendered diagnostics without a separate metadata array. */
+export function redactRenderedDiagnostics(body: string, removed: Set<string>): string {
   return redactHarnessBlocks(body, removed, `${HARNESS_OPEN}\n`, `\n${HARNESS_CLOSE}`, /^(\[(?:info|warn|error)\])/m);
 }
 

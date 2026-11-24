@@ -57342,7 +57342,7 @@ function eachBlock(body, open, close, rewrite) {
 function redactQuotedHarness(body, removed) {
   return redactHarnessBlocks(body, removed, HARNESS_OPEN, HARNESS_CLOSE, /(\[(?:info|warn|error)\])/);
 }
-function redactFailedOutput(body, removed) {
+function redactRenderedDiagnostics(body, removed) {
   return redactHarnessBlocks(body, removed, `${HARNESS_OPEN}
 `, `
 ${HARNESS_CLOSE}`, /^(\[(?:info|warn|error)\])/m);
@@ -57390,9 +57390,11 @@ function errorEchoScrubber(removed) {
 
 // src/summary-prose.ts
 var REPORTING_LEAD_IN = /^\s*(?:(?:the|a|an|this|that|our|its)[ \t]+(?:(?!(?:if|unless|until|when|whenever|while|before|after|only|that|which|who|because|provided|assuming|since|as|whether)\b)[A-Za-z][\w-]*[ \t]+){1,3}|(?:i|we|it|they|you)[ \t]+)(?:say|says|said|return|returns|returned|read|reads|report|reports|reported|write|writes|wrote|show|shows|showed|display|displays|displayed)(?:[ \t]*[,:])?[ \t]*$/i;
+var CONDITIONAL_LEAD_IN = /^\s*(?:(?:[-+*]|\d+[.)])[ \t]+)?(?:if|only if|even if|unless|when|whenever|while|until|before|after|provided|assuming|in case)\b/i;
 function* proseClauses(text, semicolons) {
   let start = 0;
   let quoted = false;
+  let scopedSemicolon = false;
   let codeClosers;
   let unclosedQuotes;
   for (let at = 0;at < text.length; ) {
@@ -57400,6 +57402,7 @@ function* proseClauses(text, semicolons) {
     if (at === start && (at === 0 || text[at - 1] === `
 `) && isCodeIndent(text, at)) {
       start = at = indentedCodeEnd(text, at);
+      scopedSemicolon = false;
       continue;
     }
     if (mark === ">" && blockStart(text, at)) {
@@ -57407,6 +57410,7 @@ function* proseClauses(text, semicolons) {
         yield [start, at];
       start = at = blockQuoteEnd(text, at);
       quoted = false;
+      scopedSemicolon = false;
       continue;
     }
     if (mark === "`" || mark === "~") {
@@ -57417,6 +57421,7 @@ function* proseClauses(text, semicolons) {
           yield [start, at];
         start = at = fenceEnd(text, after, mark, width);
         quoted = false;
+        scopedSemicolon = false;
         continue;
       }
       if (mark === "`") {
@@ -57444,6 +57449,7 @@ function* proseClauses(text, semicolons) {
           const terminal = end - (text[end - 2] === "\\" ? 3 : 2);
           if (!quoted && terminal > at && /[.!?]/.test(text[terminal]) && /\s/.test(text[end] ?? "") && REPORTING_LEAD_IN.test(text.slice(start, opener))) {
             start = end;
+            scopedSemicolon = false;
           } else
             quoted = true;
           at = end;
@@ -57457,15 +57463,20 @@ function* proseClauses(text, semicolons) {
       at = after + ((after - at) % 2 === 1 && /[;.!?]/.test(text[after] ?? "") ? 1 : 0);
       continue;
     } else if (mark === ";" && semicolons) {
-      if (!quoted && start < at)
-        yield [start, at];
-      start = at + 1;
-      quoted = false;
+      if (!scopedSemicolon)
+        scopedSemicolon = CONDITIONAL_LEAD_IN.test(text.slice(start, at));
+      if (!scopedSemicolon) {
+        if (!quoted && start < at)
+          yield [start, at];
+        start = at + 1;
+        quoted = false;
+      }
     } else if (/[.!?]/.test(mark) && (at + 1 === text.length || /\s/.test(text[at + 1]))) {
       if (!quoted)
         yield [start, at + 1];
       start = at + 1;
       quoted = false;
+      scopedSemicolon = false;
     } else if (mark === `
 `) {
       const blank = blankLineEnd(text, at + 1);
@@ -57474,6 +57485,7 @@ function* proseClauses(text, semicolons) {
           yield [start, at];
         start = at = blank;
         quoted = false;
+        scopedSemicolon = false;
         continue;
       }
     }
@@ -57600,7 +57612,7 @@ var AVOID_ACTION = String.raw`(?:(?:(?:I|we|you) (?:will |should )?)?(?:avoid|st
 var LIMIT = "again|for now|until (?:it )?(?:is fixed|is resolved|works|fixed|resolved)";
 var AVOID_CLAIM = String.raw`${AVOID_ACTION} ${TOOL}(?: (?<condition>${LIMIT}))?`;
 var AVOID = new RegExp(`^${AVOID_CLAIM}$`, "i");
-var GIVE_UP = new RegExp(String.raw`^${AVOID_CLAIM}(?:[ \t]*;[ \t]*(?:stop and )?avoid (?:${ACTION}) it(?: (?:${LIMIT}))?)?$`, "i");
+var GIVE_UP = new RegExp(String.raw`^${AVOID_CLAIM}(?:[ \t]*;[ \t]*(?<continuation>(?:stop and )?avoid (?:${ACTION}) it(?: (?:${LIMIT}))?))?$`, "i");
 var TIME2 = "right now|currently|at the moment|for now|any ?more|still|today";
 var OMITTED_ERROR = [TOOL_ERROR_TEXT_OMITTED, TOOL_ERROR_CODE_OMITTED].map((marker) => marker.replace(/[()]/g, "\\$&")).join("|");
 var BROKEN = new RegExp(String.raw`^${TOOL} (?:(?:does not work|doesn't work|won't work|is broken|is not working|isn't working|keeps failing|keeps refusing)(?: (?:${TIME2}|though)| with (?:${OMITTED_ERROR})(?:: (?:${OMITTED_ERROR}))?|, avoid it)?|(?:is unavailable|is not available|isn't available) (?:${TIME2}))$`, "i");
@@ -57636,7 +57648,7 @@ function rewriteGiveUps(body, failed, userRules) {
     if (tool === undefined || !failed.has(tool))
       continue;
     const scopes = userRules.get(tool);
-    if (avoid && (scopes?.has("") || scopes?.has(restrictionScope(avoid))))
+    if (avoid && avoid.continuation === undefined && scopes?.has(restrictionScope(avoid)))
       continue;
     out += body.slice(from, start + leading);
     out += `An earlier ${tool} call failed`;
@@ -57696,12 +57708,10 @@ ${lines.join(`
           content.push({ type: "text", text: render(lines) });
         shaped = { ...message, content };
       }
-      if (message.isError) {
-        const before = visibleText(shaped.content);
-        const redacted = redactFailedOutput(before, errors);
-        if (redacted !== before)
-          shaped = { ...shaped, content: [{ type: "text", text: redacted }] };
-      }
+      const before = visibleText(shaped.content);
+      const redacted = redactRenderedDiagnostics(before, errors);
+      if (redacted !== before)
+        shaped = { ...shaped, content: [{ type: "text", text: redacted }] };
       outcomes.set(message, { failed, shaped });
     }
   }
