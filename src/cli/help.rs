@@ -144,6 +144,7 @@ const ADVANCED: &[&str] = &[
     "template",
     "test",
     "thread",
+    "channel",
     "topic",
     "web",
     "workflow",

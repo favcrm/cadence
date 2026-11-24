@@ -888,6 +888,22 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             cli.command_path,
         );
     }
+    // Hosted channels (`ls | read | post`) work for both human logins and
+    // agents, and must not fall through to a local daemon when invoked locally.
+    if matches!(cli.command, Commands::Channel { .. }) {
+        let tracker = tracker_pin()?;
+        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
+            org::Resolved::Remote(target) => target,
+            org::Resolved::Local(_) => return channel::run_local(),
+        };
+        return remote::run(
+            target,
+            cli.command,
+            cli.wake_timeout,
+            cli.state_dir,
+            cli.command_path,
+        );
+    }
     // CAD-1429: every `web` action is a hosted operation against one pinned
     // remote workspace. Resolve it once here; a local or unselected org
     // refuses before any request is built. It runs before the client-only
@@ -1116,6 +1132,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::Job { .. }
         | Commands::Thread { .. }
         | Commands::Topic { .. }
+        | Commands::Channel { .. }
         | Commands::Monitor { .. }
         | Commands::Endpoint { .. }
         | Commands::Routine { .. }

@@ -6,6 +6,7 @@ import { IconSettings } from "../../ui/icons";
 import { WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentDetail, HiredProfile } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
+import { AgentChannels } from "./AgentChannels";
 import { ConnectRuntime, ProfileDetails, workText } from "./ProfileSeat";
 import type { ToastMsg } from "../../ui/Toast";
 import { RecoveryBlock } from "./AgentProfile";
@@ -505,6 +506,7 @@ export default function AgentPage({
                     work={hiredWork}
                     onOpenIssue={onOpenIssue}
                   />
+                  {boardIsHosted && !isMaster && <AgentChannels profileId={hired.id} />}
                   <ConnectRuntime profile={hired} hosted={boardIsHosted} groups={groups} />
                 </div>
               ) : (

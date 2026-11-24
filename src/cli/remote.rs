@@ -1237,6 +1237,7 @@ fn verb_for(
             "message_ack"
         }
         Commands::Team { action } => team_for(action, &mut args),
+        Commands::Channel { action } => channel_for(action, &mut args)?,
         // CAD-1586: `cadence master status` on a remote org — the hosted
         // `master_status` verb (settings.read) carrying only an optional
         // grant id; it translates to the same `master.status` settings
@@ -2597,6 +2598,73 @@ fn team_for(
     }
 }
 
+fn channel_for(
+    action: &ChannelAction,
+    args: &mut serde_json::Map<String, Value>,
+) -> Result<&'static str> {
+    fn bounded(value: &str, max: usize, label: &str) -> Result<String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > max
+            || trimmed.bytes().any(|b| b.is_ascii_control())
+        {
+            return Err(Error::rejected(format!(
+                "remote `channel` {label} must be 1..={max} non-control bytes — nothing was sent"
+            )));
+        }
+        Ok(trimmed.to_string())
+    }
+    match action {
+        ChannelAction::Ls => Ok("channel_list"),
+        ChannelAction::Read {
+            room,
+            before,
+            limit,
+        } => {
+            args.insert("room".into(), json!(bounded(room, 128, "room id")?));
+            if let Some(cursor) = before {
+                args.insert(
+                    "before".into(),
+                    json!(bounded(cursor, 512, "`--before` cursor")?),
+                );
+            }
+            if let Some(n) = limit {
+                if !(1..=100).contains(n) {
+                    return Err(Error::rejected(
+                        "remote `channel read` `--limit` must be 1 to 100 — nothing was sent",
+                    ));
+                }
+                args.insert("limit".into(), json!(n));
+            }
+            Ok("channel_read")
+        }
+        ChannelAction::Post {
+            room,
+            text,
+            client_id,
+        } => {
+            args.insert("room".into(), json!(bounded(room, 128, "room id")?));
+            if text.trim().is_empty() {
+                return Err(Error::rejected(
+                    "remote `channel post` body cannot be empty — nothing was sent",
+                ));
+            }
+            if text.len() > 16_000 {
+                return Err(Error::rejected(
+                    "remote `channel post` body exceeds the 16000 byte limit — nothing was sent",
+                ));
+            }
+            let id = match client_id.as_deref() {
+                Some(raw) => bounded(raw, 128, "`--id`")?,
+                None => format!("chn-{}", Uuid::new_v4()),
+            };
+            args.insert("body".into(), json!(text));
+            args.insert("client_id".into(), json!(id));
+            Ok("channel_post")
+        }
+    }
+}
+
 fn unavailable(command_path: Option<&str>) -> Error {
     let path = command_path.unwrap_or("<command>");
     let listed = "`cadence commands --all` lists every verb this client offers.";
@@ -2638,6 +2706,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Inbox { .. } => "inbox",
         Commands::Status { .. } => "status",
         Commands::Team { .. } => "team <verb>",
+        Commands::Channel { .. } => "channel <verb>",
         Commands::Settings { .. } => "settings agents <verb>",
         Commands::Master { .. } => "master <verb>",
         _ => "<command>",
@@ -3093,6 +3162,18 @@ where
                 .map(str::to_string)
         })
         .flatten();
+    let channel_post_key = (verb == "channel_post")
+        .then(|| {
+            args.get("room")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .zip(
+                    args.get("client_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                )
+        })
+        .flatten();
     let stage_operation = args.get("operation") == Some(&json!("connected_effect"));
     let platform_key = (verb == "platform_call")
         .then(|| args.get("key").and_then(Value::as_str).map(str::to_string))
@@ -3263,6 +3344,16 @@ where
                          read {id} --org {}` returns your durable message and its state. \
                          If nothing is recorded, retry `send` with the same --message {id} \
                          — the same id and content does not enqueue another message.",
+                        target.org
+                    ));
+                }
+                if let Some((room, id)) = channel_post_key.filter(|_| error.kind() == "unknown") {
+                    eprint_line(&format!(
+                        "remote channel post `{id}` to `{room}` was not confirmed — it may or \
+                         may not have been recorded. Reconcile before resubmitting: `cadence \
+                         channel read {room} --org {}` checks recent messages, or retry `channel \
+                         post` with the same --id {id}, room and text — an identical retry \
+                         deduplicates without double-posting.",
                         target.org
                     ));
                 }
@@ -7421,6 +7512,122 @@ mod read_contract_tests {
             assert_eq!(error.kind(), "rejected", "{total}: {error}");
             assert!(!out.exists(), "{total}: {error}");
         }
+    }
+
+    #[test]
+    fn remote_channel_commands_map_validate_and_mint_client_id() {
+        let (verb, args) = outcome(&Commands::Channel {
+            action: ChannelAction::Ls,
+        })
+        .unwrap();
+        assert_eq!(verb, "channel_list");
+        assert_eq!(args, json!({}));
+
+        let (verb, args) = outcome(&Commands::Channel {
+            action: ChannelAction::Read {
+                room: " room-1 ".into(),
+                before: Some("cur-9".into()),
+                limit: Some(25),
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "channel_read");
+        assert_eq!(
+            args,
+            json!({"room": "room-1", "before": "cur-9", "limit": 25})
+        );
+
+        let (verb, args) = outcome(&Commands::Channel {
+            action: ChannelAction::Post {
+                room: "room-1".into(),
+                text: "Ship update".into(),
+                client_id: Some("cid-1".into()),
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "channel_post");
+        assert_eq!(
+            args,
+            json!({"room": "room-1", "body": "Ship update", "client_id": "cid-1"})
+        );
+
+        let (verb, auto_args) = outcome(&Commands::Channel {
+            action: ChannelAction::Post {
+                room: "room-1".into(),
+                text: "Auto id".into(),
+                client_id: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, "channel_post");
+        let generated = auto_args["client_id"].as_str().unwrap();
+        assert!(generated.starts_with("chn-"), "{generated}");
+        assert!(generated.len() > 8 && generated.len() <= 128);
+
+        for invalid in [
+            Commands::Channel {
+                action: ChannelAction::Read {
+                    room: "   ".into(),
+                    before: None,
+                    limit: None,
+                },
+            },
+            Commands::Channel {
+                action: ChannelAction::Read {
+                    room: "r".repeat(129),
+                    before: None,
+                    limit: None,
+                },
+            },
+            Commands::Channel {
+                action: ChannelAction::Read {
+                    room: "room-1".into(),
+                    before: Some("   ".into()),
+                    limit: None,
+                },
+            },
+            Commands::Channel {
+                action: ChannelAction::Read {
+                    room: "room-1".into(),
+                    before: None,
+                    limit: Some(0),
+                },
+            },
+            Commands::Channel {
+                action: ChannelAction::Read {
+                    room: "room-1".into(),
+                    before: None,
+                    limit: Some(101),
+                },
+            },
+            Commands::Channel {
+                action: ChannelAction::Post {
+                    room: "room-1".into(),
+                    text: "   ".into(),
+                    client_id: Some("cid-1".into()),
+                },
+            },
+            Commands::Channel {
+                action: ChannelAction::Post {
+                    room: "room-1".into(),
+                    text: "x".repeat(16_001),
+                    client_id: Some("cid-1".into()),
+                },
+            },
+            Commands::Channel {
+                action: ChannelAction::Post {
+                    room: "room-1".into(),
+                    text: "ok".into(),
+                    client_id: Some("bad\nid".into()),
+                },
+            },
+        ] {
+            assert!(outcome(&invalid).is_err());
+        }
+
+        let local_err = super::super::channel::run_local().unwrap_err().to_string();
+        assert!(local_err.contains("--org"), "{local_err}");
+        assert!(local_err.contains("cadence topic"), "{local_err}");
     }
 }
 
