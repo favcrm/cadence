@@ -8,11 +8,17 @@ These provider accounts are different from local organization/socket routing.
 
 ## Custom MCP setup from chat
 
-The owner opens the connection card and approves the requested scopes at the
-provider. On return, Cadence checks the connection, endpoint, owner and required
-scopes before showing **Continue in chat**. Continuing does not enable tools or
-approve any action.
-Retrying **Continue in chat** after a lost response resumes the same turn.
+For the EMW catalog, choose **Connect EMW for catalog reads** and authorize
+it on EMW's page. Cadence verifies the grant and resumes the pending catalog
+request in the original chat. The owner's Atlas can reuse that read access in
+interactive chats. **Disconnect EMW** in Settings → Connections stops later
+reads. Reconnect if EMW sign-in expires. The grant does not include writes,
+other users or agents, or scheduled runs.
+
+For other Custom MCP servers, the owner approves the requested scopes at the
+provider. Cadence checks the connection, endpoint, owner and required scopes
+before offering **Continue in chat**. Continuing does not enable tools or
+approve any action. Retrying after a lost response resumes the same turn.
 
 Use **Review tool access** on the card to enable a specific tool offered for
 read access. The tool can then run without per-call approval, subject to existing

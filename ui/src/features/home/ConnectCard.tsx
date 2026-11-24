@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { ApiError, api } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { usingPrivateOperation } from "../../lib/privateSession";
@@ -202,19 +202,20 @@ export function ConnectCard({ entry, density = "full" }: { entry: ThreadEntry; d
 }
 
 // Browser storage only locates the original attempt. It never establishes a grant.
-type SetupAttempt = { id: string; endpoint: string; nonce: string };
+type SetupAttempt = { id: string; endpoint: string; nonce: string; profile?: "emw_catalog_v1" };
+const EMW_ENDPOINT = "https://emw-mcp.simplebuild.site/";
 
 function parseSetupAttempt(value: string | null, endpoint: string): SetupAttempt | null {
   try {
-    const [id, savedEndpoint = endpoint, nonce = ""] = (value ?? "").split("\n");
-    return id ? { id, endpoint: new URL(savedEndpoint).href, nonce } : null;
+    const [id, savedEndpoint = endpoint, nonce = "", profile] = (value ?? "").split("\n");
+    return id ? { id, endpoint: new URL(savedEndpoint).href, nonce, ...(profile === "emw_catalog_v1" ? { profile } : {}) } : null;
   } catch {
     return null;
   }
 }
 
 function sameSetupAttempt(a: SetupAttempt | null, b: SetupAttempt | null): boolean {
-  return a !== null && b !== null && a.id === b.id && a.endpoint === b.endpoint && a.nonce === b.nonce;
+  return a !== null && b !== null && a.id === b.id && a.endpoint === b.endpoint && a.nonce === b.nonce && a.profile === b.profile;
 }
 
 function readSetupAttempt(key: string, endpoint: string): SetupAttempt | null {
@@ -257,9 +258,13 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   const [drawer, setDrawer] = useState<"connect" | "edit" | null>(null);
   const [busy, setBusy] = useState(false);
   const [resumed, setResumed] = useState(false);
+  const [resumedPreset, setResumedPreset] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connection, setConnection] = useState<CustomMcpConnectionSummary | null>(null);
   const [recheck, setRecheck] = useState(0);
+  const [profileAvailable, setProfileAvailable] = useState(false);
+  const [authorizationUrl, setAuthorizationUrl] = useState<string | null>(null);
+  const autoResumeAttempt = useRef<string | null>(null);
   const url = new URL(window.location.href);
   const originalHref = url.href;
   const callback = url.searchParams.get("mcp_setup") === String(entry.seq) ? customMcpReturn(url.search) : null;
@@ -267,13 +272,24 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   const attempt = conversation ? readSetupAttempt(key, setup.endpointUrl) : null;
   const connId = attempt?.id;
   const endpoint = attempt?.endpoint ?? setup.endpointUrl;
+  const isEmw = new URL(setup.endpointUrl).href === EMW_ENDPOINT;
+  const presetAttempt = attempt?.profile === "emw_catalog_v1";
   const outcome = connId && callback?.connectionId === connId &&
     url.searchParams.get("mcp_attempt") === (attempt?.nonce || null) ? callback.outcome : null;
-  const requiredScopes = setup.requiredScopes?.join(" ");
+  const requiredScopes = presetAttempt ? "catalog:read" : setup.requiredScopes?.join(" ");
   url.search = withoutConnectParams(url.search);
   url.searchParams.delete("mcp_attempt");
   url.searchParams.set("mcp_setup", String(entry.seq));
   const returnTo = url.href;
+
+  useEffect(() => {
+    if (!isEmw) return;
+    const controller = new AbortController();
+    void usingPrivateOperation(undefined, (operation) => api.customMcpList(true, operation), controller.signal)
+      .then((list) => { if (!controller.signal.aborted) setProfileAvailable(list.standing_read_profile === "emw_catalog_v1"); },
+        () => { if (!controller.signal.aborted) setProfileAvailable(false); });
+    return () => controller.abort();
+  }, [isEmw]);
 
   function verified(row: CustomMcpConnectionSummary | undefined): row is CustomMcpConnectionSummary {
     return row !== undefined && row.id === connId && row.connected_by_you === true &&
@@ -288,8 +304,11 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
     setConnection(null);
     setError(null);
     void usingPrivateOperation(undefined, async (operation) => {
-      const { connections } = await api.customMcpList(true, operation);
-      return connections.find(verified);
+      const list = await api.customMcpList(true, operation);
+      if (presetAttempt && list.standing_read_profile !== "emw_catalog_v1") return undefined;
+      return list.connections.find((row) => verified(row) && (presetAttempt
+        ? endpoint === EMW_ENDPOINT && !!attempt?.nonce && row.standing_read_profile === "emw_catalog_v1" && row.standing_read_access === "allowed"
+        : row.standing_read_profile !== "emw_catalog_v1"));
     }, controller.signal).then((row) => {
       if (controller.signal.aborted) return;
       if (row) setConnection(row);
@@ -298,10 +317,10 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       if (!controller.signal.aborted) setError(customMcpErrorText(e));
     });
     return () => controller.abort();
-  }, [connId, endpoint, outcome, requiredScopes, setup.label, resumed, recheck]);
+  }, [connId, endpoint, outcome, requiredScopes, setup.label, resumed, recheck, presetAttempt]);
 
-  function remember(id: string, endpointUrl: string, nonce: string) {
-    const value = `${id}\n${new URL(endpointUrl).href}\n${nonce}`;
+  function remember(id: string, endpointUrl: string, nonce: string, profile?: "emw_catalog_v1") {
+    const value = `${id}\n${new URL(endpointUrl).href}\n${nonce}${profile ? `\n${profile}` : ""}`;
     // A same-origin tab can recover an attempt; restricted browsers still support same-tab return.
     try {
       window.localStorage.setItem(key, value);
@@ -357,7 +376,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   }
 
   function retryOAuth() {
-    if (!connId || !attempt) return;
+    if (!connId || !attempt || (presetAttempt && !profileAvailable)) return;
     void run(async () => {
       try {
         const nonce = crypto.randomUUID();
@@ -378,7 +397,7 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
         }
         if (window.location.href !== originalHref ||
             !sameSetupAttempt(readSetupAttempt(key, setup.endpointUrl), attempt)) return;
-        remember(connId, endpoint, nonce);
+        remember(connId, endpoint, nonce, attempt.profile);
         window.location.assign(authUrl);
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) forget(attempt);
@@ -390,17 +409,22 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   function continueReply() {
     if (!conversation || !connId || !attempt) return;
     void run(() => usingPrivateOperation(undefined, async (operation) => {
-      const { connections } = await api.customMcpList(true, operation);
-      const row = connections.find(verified);
-      if (row?.status !== "active" || !liveCallback(attempt)) {
-        setConnection(row ?? null);
+      const list = await api.customMcpList(true, operation);
+      const row = list.connections.find(verified);
+      if (row?.status !== "active" || !liveCallback(attempt) ||
+          (presetAttempt ? (endpoint !== EMW_ENDPOINT || !attempt.nonce || list.standing_read_profile !== "emw_catalog_v1" ||
+            row.standing_read_profile !== "emw_catalog_v1" || row.standing_read_access !== "allowed")
+            : row.standing_read_profile === "emw_catalog_v1")) {
+        setConnection(presetAttempt ? null : row ?? null);
         setError("Cadence could not verify this Custom MCP connection.");
         return;
       }
       const message = await setupMessageId(conversation, entry.seq, attempt);
       if (!liveCallback(attempt)) return;
       const sent = await sendToMaster(
-        `Custom MCP connection ${connId} is connected. Continue my original request using only currently permitted tools. If a tool is unavailable, explain what access is needed.`,
+        presetAttempt
+          ? `EMW catalog connection ${connId} is ready. If my request in this chat is waiting for an EMW catalog read, finish only that read using catalog.search. If I only asked to connect, confirm that it is connected without running any tools.`
+          : `Custom MCP connection ${connId} is connected. Continue my original request using only currently permitted tools. If a tool is unavailable, explain what access is needed.`,
         message, undefined, undefined, conversation, operation,
       );
       if (!sent.ok) {
@@ -408,9 +432,44 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
         return;
       }
       const current = liveCallback(attempt);
+      if (current && presetAttempt) setResumedPreset(true);
       forget(attempt);
       if (current) setResumed(true);
     }));
+  }
+
+  useEffect(() => {
+    if (!presetAttempt || !attempt?.nonce || !profileAvailable || !connection ||
+        connection.status !== "active" || resumed || autoResumeAttempt.current === attempt.nonce) return;
+    autoResumeAttempt.current = attempt.nonce;
+    continueReply();
+  }, [presetAttempt, attempt?.nonce, profileAvailable, connection, resumed]);
+
+  function connectEmw() {
+    if (!conversation || !profileAvailable || !isEmw) return;
+    void run(async () => {
+      const list = await api.customMcpList();
+      if (list.standing_read_profile !== "emw_catalog_v1") {
+        setProfileAvailable(false);
+        throw new Error("Catalog access is no longer available. Please try again.");
+      }
+      const nonce = crypto.randomUUID();
+      const target = new URL(returnTo);
+      target.searchParams.set("mcp_attempt", nonce);
+      const reply = await api.customMcpCreate({
+        name: setup.label, endpoint_url: EMW_ENDPOINT, auth_kind: "oauth", visibility: "personal",
+        required_scopes: ["catalog:read"], standing_read_profile: "emw_catalog_v1", return_to: target.href,
+      });
+      if (reply.mode !== "oauth_redirect") throw new Error("This server did not start OAuth sign-in.");
+      const safeUrl = customMcpAuthorizationUrl(reply);
+      const scopes = safeUrl ? new URL(safeUrl).searchParams.getAll("scope") : [];
+      if (!safeUrl || scopes.length !== 1 || !matchesSetupScopes(scopes[0].split(" "), "catalog:read")) {
+        throw new Error("The provider did not request exactly the required OAuth scopes.");
+      }
+      if (window.location.href !== originalHref) return;
+      remember(reply.connection_id, EMW_ENDPOINT, nonce, "emw_catalog_v1");
+      setAuthorizationUrl(safeUrl);
+    });
   }
 
   function enableRead(pin: CustomMcpToolPin) {
@@ -454,10 +513,18 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
   let status: string | null = null;
   let actions;
   if (resumed) {
-    actions = <span className="text-micro text-ok font-medium">{t("Reply resumed")}</span>;
+    status = resumedPreset ? "Connected · Catalog read access" : null;
+    actions = resumedPreset
+      ? <a className="btn btn-sm btn-ghost" href={settings}>{t("Manage in Connections")}</a>
+      : <span className="text-micro text-ok font-medium">{t("Reply resumed")}</span>;
+  } else if (active && presetAttempt) {
+    status = "Connected · Catalog read access";
+    actions = error ? <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Resume")}</button> : null;
   } else if (active) {
     status = canRead ? "Connected." : "Connected. No tools can run automatically.";
     actions = <button type="button" className="btn btn-primary" disabled={busy} onClick={continueReply}>{t("Continue in chat")}</button>;
+  } else if (authorizationUrl) {
+    actions = <a href={authorizationUrl} className="btn btn-primary">{t("Continue to OAuth sign-in →")}</a>;
   } else if (connId) {
     if (outcome === "connected" && !current && !error) status = "Checking connection…";
     else if (current?.status === "needs_review") status = "The server changed its tools. Review the changes in Connections.";
@@ -470,12 +537,14 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
       <div className="flex flex-wrap gap-2">
         {outcome === "connected" && !current ? (
           <button type="button" className="btn btn-secondary" disabled={!error || busy} onClick={() => setRecheck((value) => value + 1)}>{t("Check connection")}</button>
-        ) : current?.status !== "needs_review" ? (
+        ) : current?.status !== "needs_review" && (!presetAttempt || profileAvailable) ? (
           <button type="button" className="btn btn-primary" disabled={busy} onClick={retryOAuth}>{t("Retry OAuth sign-in")}</button>
         ) : null}
         <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setDrawer("edit")}>{t("Edit endpoint")}</button>
       </div>
     );
+  } else if (isEmw && profileAvailable && !connId) {
+    actions = <button type="button" className="btn btn-primary" disabled={!conversation || busy} onClick={connectEmw}>{t("Connect EMW for catalog reads")}</button>;
   } else {
     actions = (
       <div className="flex flex-wrap gap-2">
@@ -492,8 +561,9 @@ function CustomMcpSetupCard({ entry, setup, density, conversation }: {
         footer={actions}
       >
         <p className="text-label text-ink-300 break-words">{plainText(entry.text, 500)}</p>
+        {isEmw && profileAvailable && !connId && <p className="text-micro text-ink-300">{t("Allow Atlas to read the EMW catalog in your personal chats until you disconnect. Other agents and workspace members cannot use this access.")}</p>}
         {status && <p className={`text-micro ${active ? "text-ok" : "text-warn"}`} role="status">{t(status)}</p>}
-        {active && (
+        {active && !presetAttempt && (
           <details className="text-micro text-ink-300">
             <summary className="cursor-pointer">{t("Review tool access")}</summary>
             <p>{t("Tools you enable can run without asking again.")}</p>
