@@ -152,6 +152,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     "document_types",
     "message_read",
     "message_inbox",
+    "channel_list",
+    "channel_read",
     "team_list",
     "team_invites",
     // CAD-1999: the hosted org's own project registry — the projects a
@@ -203,6 +205,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     "workspace_skill_delete",
     "message_send",
     "message_ack",
+    "channel_post",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
@@ -365,8 +368,10 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         // Asking for one scope makes a login without it a refusal at mint, which
         // can be named. Asking for both would mint a narrower envelope, and the
         // call would then get a bare 401 that reads like an expired login.
-        "issue_message_send" | "issue_messages_read" | "message_ack" => &["cli.write"],
-        "issue_messages" => &["cli.read"],
+        "issue_message_send" | "issue_messages_read" | "message_ack" | "channel_post" => {
+            &["cli.write"]
+        }
+        "issue_messages" | "channel_list" | "channel_read" => &["cli.read"],
         _ => &["cli.read", "cli.write"],
     }
 }
@@ -426,6 +431,8 @@ const RECONCILE_ISSUE_MESSAGES_READ: &str =
     it only moves forward";
 const RECONCILE_MESSAGE_ACK: &str =
     "run `cadence inbox <alias> --peek` to check which messages remain unacknowledged";
+const RECONCILE_CHANNEL_POST: &str =
+    "the channel post may or may not have been recorded — read `channel read <room>` or repeat the same `channel post` with the same --id, room and text: an identical retry deduplicates and stores nothing new, and any difference is refused as a conflict";
 const RECONCILE_PROJECT_POLICY: &str = "the recorded policy may or may not have been written — read the project's recorded policy again before repeating it";
 const RECONCILE_PROJECT_NEW: &str = "the project may or may not have been registered — read `issue project ls` with the same explicit --org before repeating it; the same key, name and prefix is the same project";
 const RECONCILE_PROFILE_CREATE: &str = "the profile may or may not have been saved — read `agent profiles` with the same explicit --org before repeating it; the same alias is refused as taken if it landed";
@@ -506,6 +513,8 @@ fn cli_effect(verb: &str) -> Effect {
         | "document_types"
         | "message_read"
         | "message_inbox"
+        | "channel_list"
+        | "channel_read"
         | "team_list"
         | "team_invites"
         | "master_status"
@@ -560,6 +569,7 @@ fn cli_effect(verb: &str) -> Effect {
         "platform_call" => mutation(RECONCILE_PLATFORM_CALL),
         "message_send" => mutation(RECONCILE_SEND),
         "message_ack" => mutation(RECONCILE_MESSAGE_ACK),
+        "channel_post" => mutation(RECONCILE_CHANNEL_POST),
         // `settings_agents` is refined per operation by [`call_effect`]; without
         // the operation this is a write, the same fail-closed default
         // [`settings_op_scope`] takes.
@@ -5407,6 +5417,64 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
                  passive inbox inspection requires a human workspace owner",
             ))
         }
+        ("channel_post", Some("client_id_conflict")) => Some((
+            "client_id_conflict",
+            "that --id was already used with different content or in another channel — pick \
+             a new --id; nothing was posted",
+        )),
+        ("channel_post", Some("agent_chain_limit_reached")) => Some((
+            "agent_chain_limit_reached",
+            "the consecutive autonomous agent reply limit was reached in this channel; wait for \
+             a human message before agents post again",
+        )),
+        ("channel_post", Some("channels_post_disabled")) => Some((
+            "channels_post_disabled",
+            "proactive channel posting is off for this agent profile — ask the workspace owner \
+             to enable `channels_post` on its Agent page before posting autonomously",
+        )),
+        ("channel_post", Some("dm_not_supported")) => Some((
+            "dm_not_supported",
+            "channel tools do not access direct-message rooms — use a shared channel room id",
+        )),
+        ("channel_post", Some("reviewer_read_only")) => Some((
+            "reviewer_read_only",
+            "a read-only reviewer session cannot post to channels; nothing was sent",
+        )),
+        ("channel_read" | "channel_post", Some("not_member")) => Some((
+            "not_member",
+            "you are not an active member of that channel; nothing was read or sent",
+        )),
+        ("channel_read" | "channel_post", Some("human_room_forbidden")) => Some((
+            "human_room_forbidden",
+            "this identity is not permitted to access that room; nothing was read or sent",
+        )),
+        ("channel_read" | "channel_post", Some("not_found")) => Some((
+            "not_found",
+            "this workspace has no channel with that id; run `cadence channel ls --org <name>` \
+             to list visible channels. Nothing was read or sent",
+        )),
+        ("channel_read" | "channel_post", Some("human_room_not_found")) => Some((
+            "human_room_not_found",
+            "this workspace has no channel with that id; run `cadence channel ls --org <name>` \
+             to list visible channels. Nothing was read or sent",
+        )),
+        ("channel_list" | "channel_read" | "channel_post", Some("not_permitted")) => Some((
+            "not_permitted",
+            "this login is not permitted to access channels here (Home assistants and unpaired \
+             callers cannot read or post channels); nothing was read or sent",
+        )),
+        ("channel_list" | "channel_read" | "channel_post", Some("insufficient_scope")) => {
+            Some((
+                "insufficient_scope",
+                "this remote login lacks the required CLI scope (`cli.read` / `cli.write`) for \
+                 channel access — re-login with the required scope and retry",
+            ))
+        }
+        ("channel_list" | "channel_read" | "channel_post", Some("invalid_request")) => Some((
+            "invalid_request",
+            "the channel call was refused at the request boundary: check room id, cursor, limit, \
+             and body bounds (or ensure the hosted server supports channels). Nothing was changed",
+        )),
         ("issue_message_send", Some("message_id_conflict")) => Some((
             "message_id_conflict",
             "that --message id was already used with different content, on another ticket, \
@@ -7053,6 +7121,24 @@ fn ack_receipt_correlates(
             })
 }
 
+/// Hosted `channel_post` returns either `{ post, created }` (human) or
+/// `{ post, duplicate, agent_chain_count, agent_chain_limit }` (agent).
+/// Requiring a post id + string body plus one explicit idempotency flag ensures
+/// an empty or malformed 2xx cannot claim a post landed.
+fn channel_post_receipt_correlates(receipt: &Value) -> bool {
+    let Some(post) = receipt.get("post").and_then(Value::as_object) else {
+        return false;
+    };
+    let post_ok = post
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+        && post.get("body").and_then(Value::as_str).is_some();
+    let flag_ok = receipt.get("created").is_some_and(Value::is_boolean)
+        || receipt.get("duplicate").is_some_and(Value::is_boolean);
+    post_ok && flag_ok
+}
+
 /// A hosted issue-id prefix as the registry stores it: 1-16 ASCII
 /// letters/digits starting with a letter (the board normalizes case, so the
 /// shape is what matters; the caller's own spelling is compared
@@ -7616,6 +7702,7 @@ fn call_verb_until_retry(
                 "agent_enroll_start" | "agent_enroll_approve" | "agent_enroll_revoke" => {
                     !enroll_receipt_correlates(verb, reply, &arguments)
                 }
+                "channel_post" => !channel_post_receipt_correlates(reply),
                 _ => false,
             });
         if receipt_missing {
@@ -7698,10 +7785,16 @@ fn call_verb_until_retry(
         if status == 501
             && matches!(
                 verb,
-                "issue_message_send" | "issue_messages" | "issue_messages_read" | "message_ack"
+                "issue_message_send"
+                    | "issue_messages"
+                    | "issue_messages_read"
+                    | "message_ack"
+                    | "channel_list"
+                    | "channel_read"
+                    | "channel_post"
             )
         {
-            let nothing = if verb == "issue_messages" {
+            let nothing = if matches!(verb, "issue_messages" | "channel_list" | "channel_read") {
                 "read"
             } else {
                 "changed"
@@ -7710,6 +7803,9 @@ fn call_verb_until_retry(
                 "issue_message_send" => "issue say",
                 "issue_messages_read" => "issue messages-read",
                 "message_ack" => "inbox ack",
+                "channel_list" => "channel ls",
+                "channel_read" => "channel read",
+                "channel_post" => "channel post",
                 _ => "issue messages",
             };
             return Err(Error::invalid(

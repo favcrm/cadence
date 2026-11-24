@@ -387,3 +387,26 @@ export function rebindPush(endpoint: string): Promise<{ device_id: string | null
 export function unenrollPush(deviceId: string): Promise<{ removed: boolean }> {
   return call("DELETE", `/api/human-threads/push/subscriptions/${encodeURIComponent(deviceId)}`);
 }
+
+/**
+ * `GET /api/human-threads/agents/:uid/rooms` — non-DM channels that both this
+ * hosted agent profile and the signed-in viewer belong to. Older boards or
+ * single-user native daemons without this route answer 404/501 and render empty.
+ */
+export async function humanAgentRooms(uid: string, signal?: AbortSignal): Promise<HumanRoomSummary[]> {
+  try {
+    const data = await call<{ rooms?: HumanRoomSummary[] }>(
+      "GET",
+      `/api/human-threads/agents/${encodeURIComponent(uid)}/rooms`,
+      undefined,
+      undefined,
+      signal,
+    );
+    return Array.isArray(data.rooms) ? data.rooms : [];
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 404 || error.status === 501)) {
+      return [];
+    }
+    throw error;
+  }
+}

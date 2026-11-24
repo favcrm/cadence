@@ -226,6 +226,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Job { action } => job::run(state_dir, action),
         Commands::Thread { action } => thread::run(state_dir, action),
         Commands::Topic { action } => topic::run(state_dir, action),
+        Commands::Channel { .. } => channel::run_local(),
         Commands::Monitor { action } => monitor::run(state_dir, action),
         Commands::Endpoint { action } => crate::cli::endpoint::run(state_dir, action),
         Commands::Routine { action } => crate::cli::routine::run(state_dir, action),

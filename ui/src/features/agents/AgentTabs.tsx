@@ -59,6 +59,7 @@ import {
   type SkillDeps,
 } from "./workspaceSkills";
 import { OPT_IN_TOOL_GROUPS, toolGroupOn, withEnabledGroup } from "./profileTools";
+import { AgentChannels } from "./AgentChannels";
 
 export interface TabContext {
   alias: string;
@@ -320,6 +321,10 @@ export function Work({ c }: { c: TabContext }) {
   const notes = attentionNotes(c.observed, t);
   const unavailable = c.detailFailed && !c.observed;
   const attentionCount = notes.length + (parts?.attention.length ?? 0);
+  const hostedProfileId =
+    c.hostedBoard && c.alias !== MASTER
+      ? (c.hired?.id ?? (c.doc.kind === "hosted" && c.doc.read === "ready" ? (c.doc.profile?.id ?? null) : null))
+      : null;
   return (
     <div className="ap-body">
       <Panel title="Doing now" mark="doing">
@@ -391,6 +396,7 @@ export function Work({ c }: { c: TabContext }) {
           <Note>{t(reading(c) ? "Loading…" : "No results yet.")}</Note>
         )}
       </Panel>
+      {hostedProfileId && <AgentChannels profileId={hostedProfileId} />}
     </div>
   );
 }

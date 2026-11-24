@@ -1315,6 +1315,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: TopicAction,
     },
+    /// Hosted workspace channels (`channel ls`, `channel read <room>`,
+    /// `channel post <room> <text> --id <key>`). Requires `--org`; local
+    /// daemon rooms live under `cadence topic`.
+    Channel {
+        #[command(subcommand)]
+        action: ChannelAction,
+    },
     /// Put a file on the agent canvas (CAD-1726): `artifact put --kind md
     /// --title T --file F`. Only the master's live turn may; the same
     /// `--id` again adds a version.

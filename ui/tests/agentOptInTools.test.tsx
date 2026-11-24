@@ -52,7 +52,7 @@ async function main() {
   assert(!toolGroupOn(profile(), "cadence_writes"), "absent enabled_tools shows Cadence writes off");
   assert(!toolGroupOn(profile({ disabled_tools: [] }), "cadence_writes"), "not being in disabled_tools does not turn an opt-in group on");
   assert(toolGroupOn(profile({ enabled_tools: ["cadence_writes"] }), "cadence_writes"), "enabled_tools turns it on");
-  for (const wabaGroup of ["whatsapp_read", "whatsapp_stage", "whatsapp_manage"]) {
+  for (const wabaGroup of ["whatsapp_read", "whatsapp_stage", "whatsapp_manage", "channels_post"]) {
     assert(!toolGroupOn(profile(), wabaGroup), `absent enabled_tools shows ${wabaGroup} off`);
     assert(!toolGroupOn(profile({ disabled_tools: ["board"] }), wabaGroup), `not being in disabled_tools never turns ${wabaGroup} on`);
     assert(toolGroupOn(profile({ enabled_tools: [wabaGroup] }), wabaGroup), `enabled_tools turns ${wabaGroup} on`);
@@ -95,7 +95,7 @@ async function main() {
 
   await mount(profile(), true);
   assert(host.textContent?.includes("Cadence writes"), "the toggle is listed");
-  for (const label of ["WhatsApp read", "WhatsApp draft & stage", "WhatsApp lifecycle"]) {
+  for (const label of ["WhatsApp read", "WhatsApp draft & stage", "WhatsApp lifecycle", "Proactive channel posting"]) {
     assert(host.textContent?.includes(label), `${label} toggle is listed`);
     assert(sw(label)?.getAttribute("aria-checked") === "false", `${label} defaults to off`);
   }
@@ -109,6 +109,11 @@ async function main() {
     sw("WhatsApp read")!.click();
   });
   assert(JSON.stringify(sent[sent.length - 1]) === JSON.stringify(["whatsapp_read"]), "an owner can toggle WhatsApp read");
+
+  await React.act(async () => {
+    sw("Proactive channel posting")!.click();
+  });
+  assert(JSON.stringify(sent[sent.length - 1]) === JSON.stringify(["channels_post"]), "an owner can toggle Proactive channel posting");
 
   await mount(profile({ enabled_tools: ["cadence_writes", "whatsapp_read", "whatsapp_stage"] }), true);
   assert(sw("WhatsApp read")?.getAttribute("aria-checked") === "true", "WhatsApp read reflects enabled_tools");
@@ -135,10 +140,10 @@ async function main() {
     `${el.getAttribute("data-state")}:${el.textContent}`,
   );
   assert(
-    JSON.stringify(states) === JSON.stringify(["on:On", "off:Off", "off:Off", "on:On"]),
+    JSON.stringify(states) === JSON.stringify(["on:On", "off:Off", "off:Off", "on:On", "off:Off"]),
     `a non-owner still sees all opt-in states read-only: ${JSON.stringify(states)}`,
   );
-  assert(sent.length === 4, "a non-owner sends nothing");
+  assert(sent.length === 5, "a non-owner sends nothing");
 
   // The real hook: body is the stored fields plus enabled_tools at the page's revision; a 409 is a conflict.
   const writes: object[] = [];

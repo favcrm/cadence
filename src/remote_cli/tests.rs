@@ -10827,3 +10827,124 @@ fn cad2747_renewal_preserves_assistant_actor_mode_and_refuses_elevation() {
         "renewal must refuse dropping assistant actor_mode"
     );
 }
+
+#[test]
+fn channel_verbs_scopes_effects_assistant_allowlist_and_post_receipt() {
+    use super::actor_credential::is_assistant_allowed_call;
+    use super::{
+        cli_requested_scopes, lost_mutation_note, mutating_cli_verb, Surface, REMOTE_VERBS,
+    };
+
+    for verb in ["channel_list", "channel_read", "channel_post"] {
+        assert!(REMOTE_VERBS.contains(&verb), "{verb} in REMOTE_VERBS");
+        assert!(
+            is_assistant_allowed_call(Surface::Cli, verb, None),
+            "{verb} allowed through assistant/--agent boundary"
+        );
+    }
+    assert_eq!(cli_requested_scopes("channel_list"), &["cli.read"]);
+    assert_eq!(cli_requested_scopes("channel_read"), &["cli.read"]);
+    assert_eq!(cli_requested_scopes("channel_post"), &["cli.write"]);
+    assert!(!mutating_cli_verb("channel_list"));
+    assert!(!mutating_cli_verb("channel_read"));
+    assert!(mutating_cli_verb("channel_post"));
+    assert!(
+        lost_mutation_note("channel_post").contains("channel read"),
+        "reconcile note tells caller to inspect or retry with --id"
+    );
+
+    let post_args: Map<String, Value> = json!({
+        "room": "room-1",
+        "body": "hello channel",
+        "client_id": "chn-1",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    let human_receipt = json!({
+        "post": {
+            "id": "post-1",
+            "read_cursor": "1:post-1",
+            "sender": {"id": "human-1", "label": "Alice", "kind": "human"},
+            "body": "hello channel",
+            "created": 100,
+            "silent": false,
+            "outcomes": []
+        },
+        "created": true
+    });
+    let (out, _) = run(
+        vec![(200, "", human_receipt.clone())],
+        "channel_post",
+        post_args.clone(),
+        10,
+    );
+    assert_eq!(out.unwrap(), human_receipt);
+
+    let agent_receipt = json!({
+        "post": {
+            "id": "post-2",
+            "read_cursor": "2:post-2",
+            "sender": {"id": "ap_1", "label": "builder", "kind": "agent"},
+            "body": "hello channel",
+            "created": 101,
+            "silent": false,
+            "outcomes": []
+        },
+        "duplicate": false,
+        "agent_chain_count": 1,
+        "agent_chain_limit": 5
+    });
+    let (out, _) = run(
+        vec![(200, "", agent_receipt.clone())],
+        "channel_post",
+        post_args.clone(),
+        10,
+    );
+    assert_eq!(out.unwrap(), agent_receipt);
+
+    for bad_receipt in [
+        json!({}),
+        json!({"created": true}),
+        json!({"post": {"id": "", "body": "x"}, "created": true}),
+        json!({"post": {"id": "post-1", "body": "x"}}),
+    ] {
+        let (out, requests) = run(
+            vec![(200, "", bad_receipt)],
+            "channel_post",
+            post_args.clone(),
+            10,
+        );
+        assert_eq!(out.unwrap_err().kind(), "unknown");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    let refusal =
+        |code: &str| json!({"ok": false, "error": {"code": code, "message": "raw-internal-leak"}});
+    for (verb, status, code) in [
+        ("channel_post", 409u16, "client_id_conflict"),
+        ("channel_post", 429, "agent_chain_limit_reached"),
+        ("channel_post", 403, "channels_post_disabled"),
+        ("channel_post", 403, "dm_not_supported"),
+        ("channel_post", 403, "reviewer_read_only"),
+        ("channel_read", 403, "not_member"),
+        ("channel_read", 403, "human_room_forbidden"),
+        ("channel_read", 404, "not_found"),
+        ("channel_post", 404, "human_room_not_found"),
+        ("channel_list", 403, "not_permitted"),
+        ("channel_list", 403, "insufficient_scope"),
+        ("channel_read", 400, "invalid_request"),
+        ("channel_post", 501, "not_implemented"),
+    ] {
+        let (out, requests) = run(vec![(status, "", refusal(code))], verb, Map::new(), 10);
+        let err = out.unwrap_err();
+        assert_eq!(err.code(), Some(code), "{verb} {status} {code}: {err}");
+        assert!(
+            !err.to_string().contains("raw-internal-leak"),
+            "{verb}: {err}"
+        );
+        assert_ne!(err.kind(), "unknown", "{verb} {status} {code}: {err}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+}

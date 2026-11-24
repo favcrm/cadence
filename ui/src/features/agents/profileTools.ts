@@ -25,6 +25,11 @@ export const OPT_IN_TOOL_GROUPS: { id: string; label: string; text: string }[] =
     label: "WhatsApp lifecycle",
     text: "Lets this agent stage WhatsApp connect, start, stop, disconnect, link, and rescope actions in Home for owner approval (never exposes QR secrets)",
   },
+  {
+    id: "channels_post",
+    label: "Proactive channel posting",
+    text: "Lets this agent post to channels it belongs to when running autonomously",
+  },
 ];
 
 const isOptIn = (group: string): boolean => OPT_IN_TOOL_GROUPS.some((g) => g.id === group);
