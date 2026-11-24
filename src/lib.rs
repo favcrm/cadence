@@ -89,7 +89,6 @@ pub mod error;
 pub mod fd_fs;
 pub mod filter;
 pub mod gh_guard;
-pub mod github_connect;
 pub mod home;
 #[doc(hidden)]
 pub mod ident;

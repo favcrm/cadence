@@ -147,27 +147,7 @@ fn pr_number(subject: &str) -> Option<u64> {
     Some(n)
 }
 
-/// Every rollup entry other than the `qa-verdict` gate must be a pass:
-/// CheckRun → COMPLETED + SUCCESS/SKIPPED/NEUTRAL, StatusContext →
-/// SUCCESS. An empty rollup means no CI configured — treated green;
-/// the human gate is the verdict.
-fn checks_green(rollup: &[Value]) -> bool {
-    rollup.iter().all(|e| {
-        let name = e["context"].as_str().or(e["name"].as_str()).unwrap_or("");
-        if name.eq_ignore_ascii_case("qa-verdict") {
-            return true;
-        }
-        if e["__typename"].as_str() == Some("CheckRun") || e["conclusion"].is_string() {
-            let done = e["status"].as_str() == Some("COMPLETED") || e["status"].is_null();
-            let ok = matches!(
-                e["conclusion"].as_str(),
-                Some("SUCCESS" | "SKIPPED" | "NEUTRAL")
-            );
-            return done && ok;
-        }
-        e["state"].as_str() == Some("SUCCESS")
-    })
-}
+use cadence_agent::overview::checks_green_pub as checks_green;
 
 /// The `qa-verdict` commit status on the rollup — "SUCCESS", "FAILURE",
 /// "PENDING", or `None` when nobody posted one.
