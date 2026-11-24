@@ -15,10 +15,31 @@ function assert(value: unknown, why: string): asserts value {
   if (!value) throw new Error(why);
 }
 
+async function nextTurn(): Promise<void> {
+  await Promise.resolve();
+  await new Promise<void>((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      channel.port2.close();
+      resolve();
+    };
+    channel.port2.postMessage(null);
+  });
+}
+
 async function flush(): Promise<void> {
-  await Promise.resolve();
-  await new Promise((resolve) => setTimeout(resolve, 15));
-  await Promise.resolve();
+  for (let i = 0; i < 4; i++) {
+    await nextTurn();
+  }
+}
+
+async function waitUntil(predicate: () => boolean, why: string, maxTurns = 100): Promise<void> {
+  for (let i = 0; i < maxTurns; i++) {
+    if (predicate()) return;
+    await nextTurn();
+  }
+  throw new Error(`Timed out waiting for: ${why}`);
 }
 
 function setTextarea(box: HTMLTextAreaElement, value: string): void {
@@ -140,6 +161,10 @@ async function main() {
   assert(
     shouldNotifyWhatsAppArrival(baseSnap, nextSnap, { installId: "waba-1", conversationId: "15550001111@s.whatsapp.net" }, "waba-1", true),
     "notifies when viewing another conversation",
+  );
+  assert(
+    !shouldNotifyWhatsAppArrival(nextSnap, baseSnap, { installId: "waba-1", conversationId: "15550002222@s.whatsapp.net" }, "waba-1", true),
+    "clearing newest unread thread falling back to older unread thread does not re-toast",
   );
   assert(
     formatWhatsAppUnreadNote(nextSnap.latest!, (s) => s) === "🎤 Voice message",
@@ -370,10 +395,19 @@ async function main() {
   document.body.appendChild(container);
   const root = createRoot(container);
   try {
-    await React.act(async () => {
-      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "a1", selection: makeSelection("15550001111@s.whatsapp.net") })));
-      await flush();
-    });
+    const renderComposer = async (key: string, conversationId: string) => {
+      await React.act(async () => {
+        root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key, selection: makeSelection(conversationId) })));
+      });
+      await React.act(async () => {
+        await waitUntil(() => {
+          const box = container.querySelector("textarea") as HTMLTextAreaElement | null;
+          return !!box && !box.readOnly;
+        }, `${key} recipient verification settled`);
+      });
+    };
+
+    await renderComposer("a1", "15550001111@s.whatsapp.net");
     let tArea = container.querySelector("textarea") as HTMLTextAreaElement;
     await React.act(async () => {
       setTextarea(tArea, "Hello Alice");
@@ -383,10 +417,7 @@ async function main() {
     assert(getWhatsAppDraftPreviews("install-ux-test")["15550001111@s.whatsapp.net"] === "Hello Alice", "draft preview saved for chat A");
 
     // Switch to chat B
-    await React.act(async () => {
-      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "b1", selection: makeSelection("15550002222@s.whatsapp.net") })));
-      await flush();
-    });
+    await renderComposer("b1", "15550002222@s.whatsapp.net");
     tArea = container.querySelector("textarea") as HTMLTextAreaElement;
     assert(tArea.value === "", "chat B starts with empty draft");
     await React.act(async () => {
@@ -395,15 +426,18 @@ async function main() {
     });
 
     // Switch back to chat A -> draft restored -> send clears draft + emits pending & sent + calls onSentRefreshUnread
-    await React.act(async () => {
-      root.render(React.createElement(LocaleProvider, null, React.createElement(WhatsAppReplyComposer, { key: "a2", selection: makeSelection("15550001111@s.whatsapp.net") })));
-      await flush();
-    });
+    await renderComposer("a2", "15550001111@s.whatsapp.net");
     tArea = container.querySelector("textarea") as HTMLTextAreaElement;
     assert(tArea.value === "Hello Alice", "switching back to chat A restores draft");
     const sendBtn = container.querySelector("button.wa-reply-send") as HTMLButtonElement;
     await React.act(async () => {
       trustedClick(sendBtn);
+    });
+    await React.act(async () => {
+      await waitUntil(
+        () => echoEvents.length >= 2 && !getWhatsAppDraftPreviews("install-ux-test")["15550001111@s.whatsapp.net"],
+        "pending/sent echoes emitted and draft cleared",
+      );
       await flush();
     });
     assert(!getWhatsAppDraftPreviews("install-ux-test")["15550001111@s.whatsapp.net"], "sending clears sent thread draft");

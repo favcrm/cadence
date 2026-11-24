@@ -180,11 +180,17 @@ export function shouldNotifyWhatsAppArrival(
   if (documentVisible && view?.installId === installId && view.conversationId === next.latest.conversationId) {
     return false;
   }
-  if (next.latest.lastInboundAt !== null && next.latest.lastInboundAt !== prev.latest?.lastInboundAt) {
+  const prevMs = prev.latest?.lastInboundAt ? Date.parse(prev.latest.lastInboundAt) : NaN;
+  const nextMs = next.latest.lastInboundAt ? Date.parse(next.latest.lastInboundAt) : NaN;
+  if (Number.isFinite(nextMs) && (!Number.isFinite(prevMs) || nextMs > prevMs)) {
     return true;
   }
   if (next.totalUnread > prev.totalUnread) return true;
-  if (next.latest.conversationId !== prev.latest?.conversationId && next.latest.unreadCount > 0) {
+  if (
+    next.latest.lastInboundAt !== null &&
+    next.latest.lastInboundAt !== prev.latest?.lastInboundAt &&
+    next.totalUnread >= prev.totalUnread
+  ) {
     return true;
   }
   return false;
