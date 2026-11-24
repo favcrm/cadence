@@ -214,25 +214,22 @@ export async function fetchWhatsAppUnread(
     return { ok: false, unsupported: unsupportedInstalls.has(installId) };
   }
   try {
-    const res = await withPrivateOperation(
-      (op) =>
-        op.fetch(`/api/apps/${encodeURIComponent(installId)}/whatsapp-unread`, {
-          method: "GET",
-          cache: "no-store",
-        }),
-      signal,
-    );
-    if (res === null) return { ok: false };
-    if (res.status === 404 || res.status === 501) {
-      unsupportedInstalls.add(installId);
-      clearWhatsAppUnreadSnapshot(installId);
-      return { ok: false, unsupported: true };
-    }
-    if (!res.ok) return { ok: false };
-    const raw = await res.json();
-    const parsed = parseWhatsAppUnreadSnapshot(raw);
-    if (!parsed) return { ok: false };
-    return { ok: true, data: parsed };
+    return await withPrivateOperation(async (op) => {
+      const res = await op.fetch(`/api/apps/${encodeURIComponent(installId)}/whatsapp-unread`, {
+        method: "GET",
+        cache: "no-store",
+      });
+      if (res.status === 404 || res.status === 501) {
+        unsupportedInstalls.add(installId);
+        clearWhatsAppUnreadSnapshot(installId);
+        return { ok: false as const, unsupported: true };
+      }
+      if (!res.ok) return { ok: false as const };
+      const raw: unknown = await res.json();
+      const parsed = parseWhatsAppUnreadSnapshot(raw);
+      if (!parsed) return { ok: false as const };
+      return { ok: true as const, data: parsed };
+    }, signal);
   } catch {
     return { ok: false };
   }
@@ -248,29 +245,29 @@ export async function markWhatsAppThreadUnread(
     return { ok: false, unsupported: unsupportedInstalls.has(installId) };
   }
   try {
-    const res = await withPrivateOperation((op) =>
-      op.fetch(`/api/apps/${encodeURIComponent(installId)}/whatsapp-unread/read`, {
+    const result = await withPrivateOperation(async (op) => {
+      const res = await op.fetch(`/api/apps/${encodeURIComponent(installId)}/whatsapp-unread/read`, {
         method: "POST",
         headers: { ...sessionHeaders(), "content-type": "application/json" },
         body: JSON.stringify({ provider, conversation_id: conversationId, unread }),
         cache: "no-store",
-      }),
-    );
-    if (res === null) return { ok: false };
-    if (res.status === 404 || res.status === 501) {
-      // Distinguish route-missing 404 on older workers from conversation_not_found JSON error.
-      const body = await res.json().catch(() => null);
-      if (!isRecord(body) || body.error === undefined) {
-        unsupportedInstalls.add(installId);
+      });
+      if (res.status === 404 || res.status === 501) {
+        // Distinguish route-missing 404 on older workers from conversation_not_found JSON error.
+        const body = await res.json().catch(() => null);
+        if (!isRecord(body) || body.error === undefined) {
+          unsupportedInstalls.add(installId);
+        }
+        return { ok: false, unsupported: !isRecord(body) || body.error === undefined };
       }
-      return { ok: false, unsupported: !isRecord(body) || body.error === undefined };
-    }
-    if (!res.ok) return { ok: false };
-    const body = await res.json().catch(() => null);
-    const unreadCount =
-      isRecord(body) && typeof body.unread_count === "number" ? body.unread_count : null;
-    requestWhatsAppUnreadRefresh(installId);
-    return { ok: true, unreadCount };
+      if (!res.ok) return { ok: false };
+      const body = await res.json().catch(() => null);
+      const unreadCount =
+        isRecord(body) && typeof body.unread_count === "number" ? body.unread_count : null;
+      return { ok: true, unreadCount };
+    });
+    if (result.ok) requestWhatsAppUnreadRefresh(installId);
+    return result;
   } catch {
     return { ok: false };
   }

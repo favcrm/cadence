@@ -77,6 +77,8 @@ async function main() {
   const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
   const { resetPrivateSession, allowPrivateReads } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
   const {
+    fetchWhatsAppUnread,
+    markWhatsAppThreadUnread,
     parseWhatsAppUnreadSnapshot,
     shouldNotifyWhatsAppArrival,
     formatWhatsAppUnreadNote,
@@ -428,6 +430,42 @@ async function main() {
       root.unmount();
     });
     container.remove();
+  }
+
+  // 5. Regression: fetchWhatsAppUnread and markWhatsAppThreadUnread must read res.json() inside withPrivateOperation
+  // before operation.dispose() aborts init.signal.
+  {
+    const realFetch = globalThis.fetch;
+    let getAbortedDuringJson: boolean | null = null;
+    let postAbortedDuringJson: boolean | null = null;
+    try {
+      (globalThis as Record<string, unknown>).fetch = async (_url: unknown, init?: { method?: string; signal?: AbortSignal }) => {
+        const sig = init?.signal;
+        const isPost = (init?.method ?? "GET") === "POST";
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            await Promise.resolve();
+            if (isPost) postAbortedDuringJson = sig?.aborted ?? null;
+            else getAbortedDuringJson = sig?.aborted ?? null;
+            if (isPost) return { ok: true, unread_count: 0 };
+            return { provider: "linked", available: true, total_unread: 1, unread_threads: 1, latest: null };
+          },
+          clone() {
+            return this;
+          },
+        };
+      };
+      const got = await fetchWhatsAppUnread("install-abort-check");
+      assert(got.ok && got.data.totalUnread === 1, "fetchWhatsAppUnread resolves inside withPrivateOperation");
+      assert(getAbortedDuringJson === false, "GET signal remains un-aborted during res.json()");
+      const marked = await markWhatsAppThreadUnread("install-abort-check", "linked", "15550001111@s.whatsapp.net", false);
+      assert(marked.ok && marked.unreadCount === 0, "markWhatsAppThreadUnread resolves inside withPrivateOperation");
+      assert(postAbortedDuringJson === false, "POST signal remains un-aborted during res.json()");
+    } finally {
+      (globalThis as Record<string, unknown>).fetch = realFetch;
+    }
   }
 
   console.log("whatsappUx.test.tsx: ALL PASSED");
