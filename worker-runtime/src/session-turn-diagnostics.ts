@@ -15,7 +15,8 @@ const MAX_EVENTS = 100;
 const MAX_MODEL_MESSAGES = 4;
 const MAX_RECORD_BYTES = 128 * 1024;
 const IDENTIFIER = /^[A-Za-z0-9_.:-]{1,200}$/;
-const MODEL = /^[A-Za-z0-9_-][A-Za-z0-9_./:-]{0,159}$/;
+const MODEL = /^(?:@cf\/)?[A-Za-z0-9_-][A-Za-z0-9_./:+~-]*$/;
+const PROVIDER_CODES = ["auth", "rate-limit", "not-found", "bad-request", "provider-error", "gateway-error", "unknown"] as const;
 const STOP_REASONS = ["stop", "length", "toolUse", "error", "aborted", "pending", "deferred"] as const;
 const UNANSWERED_REASONS = [
   "model_error", "no_model", "aborted", "reset", "stale", "faulted", "orphaned",
@@ -27,7 +28,8 @@ function known<T extends string>(allowed: readonly T[], value: unknown): T | nul
 }
 
 function safeModel(value: unknown): string | null {
-  return typeof value === "string" && MODEL.test(value) && !value.includes("://") ? value : null;
+  return typeof value === "string" && value.length <= 160 && MODEL.test(value) &&
+    !value.includes("://") ? value : null;
 }
 
 /** A settlement has no timestamp. Show it on its exact placed input, not as a timed event. */
@@ -142,8 +144,8 @@ export function readSessionTurnDiagnostics(
                SELECT json_object(
                  'status', CASE WHEN json_type(d.value, '$.details.status')='integer'
                    THEN json_extract(d.value, '$.details.status') END,
-                 'code', CASE WHEN json_type(d.value, '$.details.code')='integer'
-                   THEN json_extract(d.value, '$.details.code') END
+                 'code', CASE WHEN json_type(d.value, '$.details.code')='text'
+                   THEN substr(json_extract(d.value, '$.details.code'), 1, 32) END
                ) FROM json_each(m.value, '$.diagnostics') d
                WHERE d.type='object' AND json_extract(d.value, '$.type')='cloudflare-error'
                ORDER BY d.key DESC LIMIT 1
@@ -205,7 +207,7 @@ export function readSessionTurnDiagnostics(
             kind: "model_attempt", at, model: safeModel(entry.model),
             responseModel: safeModel(entry.responseModel), stopReason: known(STOP_REASONS, entry.stop),
             httpStatus: boundedInteger(entry.failure?.status, 400, 599),
-            providerCode: boundedInteger(entry.failure?.code, 0, 999_999),
+            providerCode: known(PROVIDER_CODES, entry.failure?.code),
           });
           for (const call of entry.calls) {
             const toolName = safeToolName(call.name);

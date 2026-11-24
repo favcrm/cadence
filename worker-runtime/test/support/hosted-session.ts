@@ -62,10 +62,10 @@ function sqliteFacade(database: Database): SqliteDatabase {
   };
 }
 
-export const chunk = (delta: Record<string, unknown>, finish: string | null = null) =>
+export const chunk = (delta: Record<string, unknown>, finish: string | null = null, model = "synthetic-model") =>
   `data: ${JSON.stringify({
     id: "synthetic-response", object: "chat.completion.chunk", created: 1,
-    model: "synthetic-model", choices: [{ index: 0, delta, finish_reason: finish }],
+    model, choices: [{ index: 0, delta, finish_reason: finish }],
   })}\n\n`;
 export function answer(text: string) {
   return new Response(

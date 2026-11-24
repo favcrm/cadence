@@ -2,7 +2,7 @@
   "toolFailure": {
     "events": [
       { "kind": "input", "at": null, "messageId": "operation-1", "settlement": { "outcome": "answered" } },
-      { "kind": "model_attempt", "at": null, "model": "default", "responseModel": "synthetic-model", "stopReason": "toolUse", "httpStatus": null, "providerCode": null },
+      { "kind": "model_attempt", "at": null, "model": "default", "responseModel": "@cf/example/synthetic-model", "stopReason": "toolUse", "httpStatus": null, "providerCode": null },
       { "kind": "tool_call", "at": null, "toolName": "lookup_audit_catalog", "toolUseId": "lookup:1" },
       { "kind": "tool_result", "at": null, "toolName": "lookup_audit_catalog", "toolUseId": "lookup:1", "outcome": "error" },
       { "kind": "model_attempt", "at": null, "model": "default", "responseModel": "synthetic-model", "stopReason": "stop", "httpStatus": null, "providerCode": null }
@@ -12,7 +12,7 @@
   "modelFailure": {
     "events": [
       { "kind": "input", "at": null, "messageId": "operation-2", "settlement": { "outcome": "unanswered", "reason": "model_error" } },
-      { "kind": "model_attempt", "at": null, "model": "default", "responseModel": null, "stopReason": "error", "httpStatus": 403, "providerCode": null }
+      { "kind": "model_attempt", "at": null, "model": "default", "responseModel": null, "stopReason": "error", "httpStatus": 403, "providerCode": "auth" }
     ],
     "nextBefore": null
   }

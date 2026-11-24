@@ -57348,7 +57348,8 @@ var MAX_EVENTS = 100;
 var MAX_MODEL_MESSAGES = 4;
 var MAX_RECORD_BYTES2 = 128 * 1024;
 var IDENTIFIER = /^[A-Za-z0-9_.:-]{1,200}$/;
-var MODEL = /^[A-Za-z0-9_-][A-Za-z0-9_./:-]{0,159}$/;
+var MODEL = /^(?:@cf\/)?[A-Za-z0-9_-][A-Za-z0-9_./:+~-]*$/;
+var PROVIDER_CODES = ["auth", "rate-limit", "not-found", "bad-request", "provider-error", "gateway-error", "unknown"];
 var STOP_REASONS = ["stop", "length", "toolUse", "error", "aborted", "pending", "deferred"];
 var UNANSWERED_REASONS = [
   "model_error",
@@ -57367,7 +57368,7 @@ function known(allowed, value) {
   return typeof value === "string" && allowed.includes(value) ? value : null;
 }
 function safeModel(value) {
-  return typeof value === "string" && MODEL.test(value) && !value.includes("://") ? value : null;
+  return typeof value === "string" && value.length <= 160 && MODEL.test(value) && !value.includes("://") ? value : null;
 }
 function inputSettlement(sql, messageId, entryId, upper) {
   const rows = sql.exec(`WITH candidates AS MATERIALIZED (
@@ -57445,8 +57446,8 @@ function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
                SELECT json_object(
                  'status', CASE WHEN json_type(d.value, '$.details.status')='integer'
                    THEN json_extract(d.value, '$.details.status') END,
-                 'code', CASE WHEN json_type(d.value, '$.details.code')='integer'
-                   THEN json_extract(d.value, '$.details.code') END
+                 'code', CASE WHEN json_type(d.value, '$.details.code')='text'
+                   THEN substr(json_extract(d.value, '$.details.code'), 1, 32) END
                ) FROM json_each(m.value, '$.diagnostics') d
                WHERE d.type='object' AND json_extract(d.value, '$.type')='cloudflare-error'
                ORDER BY d.key DESC LIMIT 1
@@ -57513,7 +57514,7 @@ function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
             responseModel: safeModel(entry.responseModel),
             stopReason: known(STOP_REASONS, entry.stop),
             httpStatus: boundedInteger(entry.failure?.status, 400, 599),
-            providerCode: boundedInteger(entry.failure?.code, 0, 999999)
+            providerCode: known(PROVIDER_CODES, entry.failure?.code)
           });
           for (const call of entry.calls) {
             const toolName = safeToolName(call.name);

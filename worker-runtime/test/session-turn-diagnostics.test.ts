@@ -10,13 +10,16 @@ afterEach(async () => {
 it("distinguishes a failed tool from a failed model across a reset without returning content or running anything", async () => {
   let executed = 0;
   const run = await session((requests) => {
-    if (requests.length === 1) return new Response(
-      chunk({ role: "assistant", content: "" }) + chunk({ tool_calls: [{
-        index: 0, id: "lookup:1", type: "function",
-        function: { name: "lookup_audit_catalog", arguments: '{"query":"private-tool-argument"}' },
-      }] }) + chunk({}, "tool_calls") + "data: [DONE]\n\n",
-      { headers: { "content-type": "text/event-stream" } },
-    );
+    if (requests.length === 1) {
+      const model = "@cf/example/synthetic-model";
+      return new Response(
+        chunk({ role: "assistant", content: "" }, null, model) + chunk({ tool_calls: [{
+          index: 0, id: "lookup:1", type: "function",
+          function: { name: "lookup_audit_catalog", arguments: '{"query":"private-tool-argument"}' },
+        }] }, null, model) + chunk({}, "tool_calls", model) + "data: [DONE]\n\n",
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    }
     if (requests.length === 2) return answer("private-answer-text");
     return Response.json({ error: { message: "Forbidden: private-model-error-body" } }, { status: 403 });
   }, { tools: [{ name: "test", tools: [{

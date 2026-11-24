@@ -461,7 +461,7 @@ export type HostedTurnDiagnosticEvent = { at: number | null } & (
       responseModel: string | null;
       stopReason: "stop" | "length" | "toolUse" | "error" | "aborted" | "pending" | "deferred" | null;
       httpStatus: number | null;
-      providerCode: number | null;
+      providerCode: "auth" | "rate-limit" | "not-found" | "bad-request" | "provider-error" | "gateway-error" | "unknown" | null;
     }
   | { kind: "evidence_gap"; code: "record_too_large" | "too_many_events" | "identifier_unavailable" }
 );
