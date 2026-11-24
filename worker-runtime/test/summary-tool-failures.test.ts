@@ -48,6 +48,7 @@ it("does not infer restrictions from quoted examples or Markdown code", () => {
     "Copy this example: `setup; do not retry canvas_open; wrap up`.",
     'Copy this example: "setup; do not retry canvas_open; wrap up".',
     "Copy this example: ‘Setup; don’t retry; do not retry canvas_open; wrap up’.",
+    "Copy this example: 「setup; do not retry canvas_open; wrap up」.",
     "Copy this example: ``setup `value`; do not retry canvas_open; wrap up``.",
     "Example:\n\n```text\nsetup; do not retry canvas_open; wrap up\n```",
     "Example:\n\n~~~text\nsetup; do not retry canvas_open; wrap up\n~~~",
@@ -73,9 +74,24 @@ it("recognizes a real instruction after a quoted block", () => {
 });
 
 it("only rewrites the unquoted claim beside an assistant's example", () => {
-  const quote = 'The guide says: "Run once. Do not retry canvas_open. Use the backup".';
-  const text = `${quote} canvas_open does not work right now.`;
-  expect(rewriteGiveUps(text, failed, new Map())).toBe(`${quote} An earlier canvas_open call failed; try it again normally.`);
+  for (const quote of [
+    'The guide says: "Run once. Do not retry canvas_open. Use the backup".',
+    'The guide says: "Run once. Do not retry canvas_open. Use the backup."',
+  ]) {
+    const text = `${quote} canvas_open does not work right now.`;
+    expect(rewriteGiveUps(text, failed, new Map())).toBe(`${quote} An earlier canvas_open call failed; try it again normally.`);
+  }
+});
+
+it("keeps scanning after inch marks and unmatched inline delimiters", () => {
+  for (const prefix of ['A 12" display.', 'The literal " mark.', "The literal ` mark."]) {
+    const restriction = "Do not retry canvas_open.";
+    const text = `${prefix} ${restriction}`;
+    const restricted = new Map<string, Set<string>>();
+    collectUserToolRestrictions(text, restricted);
+    expect(rewriteGiveUps(restriction, failed, restricted)).toBe(restriction);
+    expect(rewriteGiveUps(text, failed, new Map())).toBe(`${prefix} An earlier canvas_open call failed; try it again normally.`);
+  }
 });
 
 it("keeps corrections, facts, and scoped limits after a failed call", () => {

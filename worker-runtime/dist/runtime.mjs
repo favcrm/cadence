@@ -57376,6 +57376,8 @@ function errorEchoScrubber(removed) {
 function* proseClauses(text, semicolons) {
   let start = 0;
   let quoted = false;
+  let codeClosers;
+  let unclosedQuotes;
   for (let at = 0;at < text.length; ) {
     const mark = text[at];
     if (at === start && (at === 0 || text[at - 1] === `
@@ -57401,19 +57403,30 @@ function* proseClauses(text, semicolons) {
         continue;
       }
       if (mark === "`") {
-        const close = codeEnd(text, after, width);
-        if (close === text.length || width !== 1 || !/^[A-Za-z_][\w.-]*$/.test(text.slice(after, close)))
-          quoted = true;
-        at = close < text.length ? close + width : close;
-      } else
-        at = after;
+        const close = (codeClosers ??= indexCodeClosers(text, at)).get(at);
+        if (close !== undefined) {
+          if (width !== 1 || !/^[A-Za-z_][\w.-]*$/.test(text.slice(after, close)))
+            quoted = true;
+          at = close + width;
+          continue;
+        }
+      }
+      at = after;
       continue;
     }
-    const close = quoteCloser(mark);
-    if (close !== undefined && (!(mark === "'" || mark === "‘") || !word2(text[at - 1]))) {
-      quoted = true;
-      at = quoteEnd(text, at + 1, close);
-      continue;
+    const close = QUOTE_CLOSER[mark];
+    if (close !== undefined && !unclosedQuotes?.has(close) && !literalQuote(text, at, mark)) {
+      const end = quoteEnd(text, at + 1, close);
+      if (end !== undefined) {
+        quoted = true;
+        if (/[.!?]/.test(text[end - 2] ?? "") && /\s/.test(text[end] ?? "")) {
+          start = end;
+          quoted = false;
+        }
+        at = end;
+        continue;
+      }
+      (unclosedQuotes ??= new Set).add(close);
     }
     if (mark === "\\") {
       if (/[;.!?]/.test(text[at + 1] ?? ""))
@@ -57506,24 +57519,40 @@ function fenceEnd(text, start, mark, width) {
   }
   return text.length;
 }
-function codeEnd(text, start, width) {
-  for (let at = text.indexOf("`", start);at !== -1; ) {
-    const end = runEnd(text, at, "`");
-    if (end - at === width)
-      return at;
-    at = text.indexOf("`", end);
+function indexCodeClosers(text, start) {
+  const lastByWidth = new Map;
+  const closers = new Map;
+  const markers = /^ {0,3}(?:`{3,}|~{3,})|`+|\n(?:[ \t\r]*\n)+/gm;
+  markers.lastIndex = start;
+  for (const match of text.matchAll(markers)) {
+    const marker = match[0];
+    if (!marker.startsWith("`") || marker.length >= 3 && blockStart(text, match.index)) {
+      lastByWidth.clear();
+      continue;
+    }
+    const prior = lastByWidth.get(marker.length);
+    if (prior !== undefined)
+      closers.set(prior, match.index);
+    lastByWidth.set(marker.length, match.index);
   }
-  return text.length;
+  return closers;
 }
-function quoteCloser(mark) {
-  if (mark === '"' || mark === "'")
-    return mark;
-  if (mark === "“")
-    return "”";
-  if (mark === "‘")
-    return "’";
-  return;
+function literalQuote(text, at, mark) {
+  const before = text[at - 1];
+  if (mark === "'" || mark === "‘")
+    return word2(before);
+  return mark === '"' && before !== undefined && /\d/.test(before);
 }
+var QUOTE_CLOSER = {
+  '"': '"',
+  "'": "'",
+  "“": "”",
+  "‘": "’",
+  "«": "»",
+  "‹": "›",
+  "「": "」",
+  "『": "』"
+};
 function word2(char) {
   return char !== undefined && /[\p{L}\p{N}_]/u.test(char);
 }
@@ -57535,7 +57564,6 @@ function quoteEnd(text, start, close) {
     else if (text[at] === close && !(apostrophe && word2(text[at - 1]) && word2(text[at + 1])))
       return at + 1;
   }
-  return text.length;
 }
 
 // src/summary-tool-failures.ts

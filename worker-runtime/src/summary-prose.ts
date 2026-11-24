@@ -2,6 +2,8 @@
 export function* proseClauses(text: string, semicolons: boolean): Generator<readonly [start: number, end: number]> {
   let start = 0;
   let quoted = false;
+  let codeClosers: Map<number, number> | undefined;
+  let unclosedQuotes: Set<string> | undefined;
   for (let at = 0; at < text.length;) {
     const mark = text[at]!;
     if (at === start && (at === 0 || text[at - 1] === "\n") && isCodeIndent(text, at)) {
@@ -24,18 +26,33 @@ export function* proseClauses(text: string, semicolons: boolean): Generator<read
         continue;
       }
       if (mark === "`") {
-        const close = codeEnd(text, after, width);
-        // Keep a backtick-quoted tool identifier, not arbitrary code or prose.
-        if (close === text.length || width !== 1 || !/^[A-Za-z_][\w.-]*$/.test(text.slice(after, close))) quoted = true;
-        at = close < text.length ? close + width : close;
-      } else at = after;
+        const close = (codeClosers ??= indexCodeClosers(text, at)).get(at);
+        if (close !== undefined) {
+          // Keep a backtick-quoted tool identifier, not arbitrary code or prose.
+          if (width !== 1 || !/^[A-Za-z_][\w.-]*$/.test(text.slice(after, close))) quoted = true;
+          at = close + width;
+          continue;
+        }
+      }
+      at = after;
       continue;
     }
-    const close = quoteCloser(mark);
-    if (close !== undefined && (!(mark === "'" || mark === "‘") || !word(text[at - 1]))) {
-      quoted = true;
-      at = quoteEnd(text, at + 1, close);
-      continue;
+    const close = QUOTE_CLOSER[mark];
+    if (close !== undefined && !unclosedQuotes?.has(close) && !literalQuote(text, at, mark)) {
+      const end = quoteEnd(text, at + 1, close);
+      if (end !== undefined) {
+        quoted = true;
+        // In prose, sentence punctuation can precede a closing quote.
+        if (/[.!?]/.test(text[end - 2] ?? "") && /\s/.test(text[end] ?? "")) {
+          start = end;
+          quoted = false;
+        }
+        at = end;
+        continue;
+      }
+      // No later opener of this kind can have a closer either. Each quote
+      // kind can scan to the end unsuccessfully at most once.
+      (unclosedQuotes ??= new Set()).add(close);
     }
     if (mark === "\\") {
       // Escaped punctuation is not a clause boundary. Escaped quotes above
@@ -118,31 +135,43 @@ function fenceEnd(text: string, start: number, mark: string, width: number): num
   return text.length;
 }
 
-function codeEnd(text: string, start: number, width: number): number {
-  for (let at = text.indexOf("`", start); at !== -1;) {
-    const end = runEnd(text, at, "`");
-    if (end - at === width) return at;
-    at = text.indexOf("`", end);
+/** Pair equal-width runs within a paragraph once; unmatched backticks remain literal. */
+function indexCodeClosers(text: string, start: number): Map<number, number> {
+  const lastByWidth = new Map<number, number>();
+  const closers = new Map<number, number>();
+  const markers = /^ {0,3}(?:`{3,}|~{3,})|`+|\n(?:[ \t\r]*\n)+/gm;
+  markers.lastIndex = start;
+  for (const match of text.matchAll(markers)) {
+    const marker = match[0];
+    if (!marker.startsWith("`") || (marker.length >= 3 && blockStart(text, match.index))) {
+      lastByWidth.clear();
+      continue;
+    }
+    const prior = lastByWidth.get(marker.length);
+    if (prior !== undefined) closers.set(prior, match.index);
+    lastByWidth.set(marker.length, match.index);
   }
-  return text.length;
+  return closers;
 }
 
-function quoteCloser(mark: string): string | undefined {
-  if (mark === '"' || mark === "'") return mark;
-  if (mark === "“") return "”";
-  if (mark === "‘") return "’";
-  return undefined;
+function literalQuote(text: string, at: number, mark: string): boolean {
+  const before = text[at - 1];
+  if (mark === "'" || mark === "‘") return word(before);
+  return mark === '"' && before !== undefined && /\d/.test(before);
 }
+
+const QUOTE_CLOSER: Readonly<Record<string, string>> = {
+  '"': '"', "'": "'", "“": "”", "‘": "’", "«": "»", "‹": "›", "「": "」", "『": "』",
+};
 
 function word(char: string | undefined): boolean {
   return char !== undefined && /[\p{L}\p{N}_]/u.test(char);
 }
 
-function quoteEnd(text: string, start: number, close: string): number {
+function quoteEnd(text: string, start: number, close: string): number | undefined {
   const apostrophe = close === "'" || close === "’";
   for (let at = start; at < text.length; at++) {
     if (text[at] === "\\") at++;
     else if (text[at] === close && !(apostrophe && word(text[at - 1]) && word(text[at + 1]))) return at + 1;
   }
-  return text.length;
 }
