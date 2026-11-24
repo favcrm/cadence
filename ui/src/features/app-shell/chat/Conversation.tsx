@@ -2245,7 +2245,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       </StagedSourceContext.Provider>
       <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} appLabel={mode.appLabel ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {decisionsOn && convId !== null && decisionStore !== null && (
-        <ConversationDecisions key={`${installId}\u0000${convId}`} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
+        <ConversationDecisions key={`${installId}\u0000${convId}`} canAlwaysAllow={viewer.operator === true && !viewer.readOnly} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}
       {unseen > 0 && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
