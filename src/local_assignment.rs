@@ -2139,9 +2139,10 @@ impl<H: CoordHttp> Coordinator<H> {
         let mut no_spawn = |_: &SpawnSpec, _: &Path, _: &str| -> Result<(String, String)> {
             Err(Error::rejected("spawn target is not enabled in this mode"))
         };
-        let mut no_resume = |_: &ResumeSpec, _: &str, _: &Path, _: &str, _: bool| -> Result<String> {
-            Err(Error::rejected("resume target is not enabled in this mode"))
-        };
+        let mut no_resume =
+            |_: &ResumeSpec, _: &str, _: &Path, _: &str, _: bool| -> Result<String> {
+                Err(Error::rejected("resume target is not enabled in this mode"))
+            };
         self.activate_target(
             assignment,
             name,
@@ -2288,16 +2289,8 @@ impl<H: CoordHttp> Coordinator<H> {
                 self.origin_for_message(&message_id)?;
             let (target_alias, spawned_adapter, resumed_adapter, eff_runner_id) =
                 if let Some((spec, alias, is_seat)) = resume_resolved {
-                    match resume_actor(
-                        spec,
-                        &alias,
-                        &dir,
-                        &current.assignment_id,
-                        is_seat,
-                    ) {
-                        Ok(adapter) => {
-                            (alias, None, Some(adapter), Some(spec.runner_id.clone()))
-                        }
+                    match resume_actor(spec, &alias, &dir, &current.assignment_id, is_seat) {
+                        Ok(adapter) => (alias, None, Some(adapter), Some(spec.runner_id.clone())),
                         Err(error) => return Err(self.activation_failure(&current, error)),
                     }
                 } else if let PickupTarget::Spawn { spec, .. } = &target {
@@ -2850,9 +2843,10 @@ impl<H: CoordHttp> Coordinator<H> {
         let mut no_spawn = |_: &SpawnSpec, _: &Path, _: &str| -> Result<(String, String)> {
             Err(Error::rejected("spawn target is not enabled in this mode"))
         };
-        let mut no_resume = |_: &ResumeSpec, _: &str, _: &Path, _: &str, _: bool| -> Result<String> {
-            Err(Error::rejected("resume target is not enabled in this mode"))
-        };
+        let mut no_resume =
+            |_: &ResumeSpec, _: &str, _: &Path, _: &str, _: bool| -> Result<String> {
+                Err(Error::rejected("resume target is not enabled in this mode"))
+            };
         let mut resolve = |_row: &Assignment| -> Result<Option<PickupTarget>> {
             Ok(Some(PickupTarget::Seat {
                 alias: alias.clone(),
@@ -3894,8 +3888,10 @@ mod assignment_contract_tests {
                     let row = board.get_mut(&id).unwrap();
                     row["state"] = json!(state);
                     row["text"] = body.get("text").cloned().unwrap_or(Value::Null);
-                    row["reported_head_sha"] =
-                        body.get("reported_head_sha").cloned().unwrap_or(Value::Null);
+                    row["reported_head_sha"] = body
+                        .get("reported_head_sha")
+                        .cloned()
+                        .unwrap_or(Value::Null);
                     return Ok(Reply {
                         status: 200,
                         body: row.clone(),
@@ -3911,37 +3907,40 @@ mod assignment_contract_tests {
         fs::create_dir(&repo).unwrap();
         fs::create_dir(&authority).unwrap();
         fs::set_permissions(&authority, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(crate::reaper::status(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(&repo)
-        )
-        .unwrap()
-        .success());
-        assert!(crate::reaper::status(
-            Command::new("git")
-                .args(["-C"])
-                .arg(&repo)
-                .args(["config", "user.email", "test@example.com"])
-        )
-        .unwrap()
-        .success());
-        assert!(crate::reaper::status(
-            Command::new("git")
-                .args(["-C"])
-                .arg(&repo)
-                .args(["config", "user.name", "Test User"])
-        )
-        .unwrap()
-        .success());
-        assert!(crate::reaper::status(
-            Command::new("git")
-                .args(["-C"])
-                .arg(&repo)
-                .args(["commit", "--allow-empty", "-m", "init", "--quiet"])
-        )
-        .unwrap()
-        .success());
+        assert!(
+            crate::reaper::status(Command::new("git").args(["init", "--quiet"]).arg(&repo))
+                .unwrap()
+                .success()
+        );
+        assert!(
+            crate::reaper::status(Command::new("git").args(["-C"]).arg(&repo).args([
+                "config",
+                "user.email",
+                "test@example.com"
+            ]))
+            .unwrap()
+            .success()
+        );
+        assert!(
+            crate::reaper::status(Command::new("git").args(["-C"]).arg(&repo).args([
+                "config",
+                "user.name",
+                "Test User"
+            ]))
+            .unwrap()
+            .success()
+        );
+        assert!(
+            crate::reaper::status(Command::new("git").args(["-C"]).arg(&repo).args([
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+                "--quiet"
+            ]))
+            .unwrap()
+            .success()
+        );
 
         let hla_1 = "hla_00000000-0000-4000-8000-000000000101";
         let hla_2 = "hla_00000000-0000-4000-8000-000000000102";
@@ -3998,15 +3997,19 @@ mod assignment_contract_tests {
             Ok(("omp-lane1".to_string(), format!("{}/rpc", spec.provider)))
         };
         let resumed_ref = Rc::clone(&resumed_calls);
-        let mut resume_fn =
-            |spec: &ResumeSpec, alias: &str, wt: &Path, _id: &str, is_seat: bool| -> Result<String> {
-                assert!(!is_seat);
-                assert_eq!(spec.runner_id, runner_1);
-                resumed_ref
-                    .borrow_mut()
-                    .push((alias.to_string(), wt.display().to_string()));
-                Ok("omp/rpc".to_string())
-            };
+        let mut resume_fn = |spec: &ResumeSpec,
+                             alias: &str,
+                             wt: &Path,
+                             _id: &str,
+                             is_seat: bool|
+         -> Result<String> {
+            assert!(!is_seat);
+            assert_eq!(spec.runner_id, runner_1);
+            resumed_ref
+                .borrow_mut()
+                .push((alias.to_string(), wt.display().to_string()));
+            Ok("omp/rpc".to_string())
+        };
         let deliver_flag = Rc::new(RefCell::new(true));
         let deliveries_ref = Rc::clone(&deliveries);
         let flag_ref = Rc::clone(&deliver_flag);
@@ -4054,7 +4057,10 @@ mod assignment_contract_tests {
             )
             .unwrap();
         assert_eq!(r1["refused"].as_array().unwrap().len(), 1);
-        let wt_parent = layout::worktree_dir(&repo, "x").parent().unwrap().to_path_buf();
+        let wt_parent = layout::worktree_dir(&repo, "x")
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let entries_after_gen1: Vec<String> = fs::read_dir(&wt_parent)
             .unwrap()
             .filter_map(|e| e.ok().map(|f| f.file_name().to_string_lossy().into_owned()))
@@ -4069,7 +4075,9 @@ mod assignment_contract_tests {
         retry_row["claim_id"] = Value::Null;
         retry_row["client_agent_id"] = Value::Null;
         retry_row["text"] = json!("retry guidance");
-        board.borrow_mut().insert(hla_1.to_string(), retry_row.clone());
+        board
+            .borrow_mut()
+            .insert(hla_1.to_string(), retry_row.clone());
 
         let r2 = coord
             .pickup_rows_routed(
@@ -4095,7 +4103,10 @@ mod assignment_contract_tests {
         );
         let first_wt = deliveries.borrow()[0].worktree.clone();
         assert_eq!(deliveries.borrow()[0].alias, "omp-lane1");
-        assert_eq!(deliveries.borrow()[0].note.as_deref(), Some("retry guidance"));
+        assert_eq!(
+            deliveries.borrow()[0].note.as_deref(),
+            Some("retry guidance")
+        );
 
         // 3. hla_1 finishes (`result`); owner dispatches hla_2 (`action: resume`).
         let (claim_id, gen) = coord.origin_for_assignment(hla_1).unwrap();
@@ -4133,7 +4144,9 @@ mod assignment_contract_tests {
                 "model": "sonnet-4",
             }
         });
-        board.borrow_mut().insert(hla_2.to_string(), resume_row.clone());
+        board
+            .borrow_mut()
+            .insert(hla_2.to_string(), resume_row.clone());
         let r3 = coord
             .pickup_rows_routed(
                 vec![parse_assignment(&resume_row).unwrap()],
@@ -4168,7 +4181,9 @@ mod assignment_contract_tests {
         let mut wrong_issue = resume_row.clone();
         wrong_issue["assignment_id"] = json!(hla_3);
         wrong_issue["issue_id"] = json!("CAD-9999");
-        board.borrow_mut().insert(hla_3.to_string(), wrong_issue.clone());
+        board
+            .borrow_mut()
+            .insert(hla_3.to_string(), wrong_issue.clone());
         let r4 = coord
             .pickup_rows_routed(
                 vec![parse_assignment(&wrong_issue).unwrap()],
@@ -4191,7 +4206,9 @@ mod assignment_contract_tests {
         let mut wrong_runner = resume_row.clone();
         wrong_runner["assignment_id"] = json!(hla_4);
         wrong_runner["resume"]["runner_id"] = json!(runner_other);
-        board.borrow_mut().insert(hla_4.to_string(), wrong_runner.clone());
+        board
+            .borrow_mut()
+            .insert(hla_4.to_string(), wrong_runner.clone());
         let r5 = coord
             .pickup_rows_routed(
                 vec![parse_assignment(&wrong_runner).unwrap()],
@@ -4211,7 +4228,9 @@ mod assignment_contract_tests {
         missing_prior["assignment_id"] = json!(hla_other);
         missing_prior["resume"]["prior_assignment_id"] =
             json!("hla_00000000-0000-4000-8000-000000000777");
-        board.borrow_mut().insert(hla_other.to_string(), missing_prior.clone());
+        board
+            .borrow_mut()
+            .insert(hla_other.to_string(), missing_prior.clone());
         let r6 = coord
             .pickup_rows_routed(
                 vec![parse_assignment(&missing_prior).unwrap()],

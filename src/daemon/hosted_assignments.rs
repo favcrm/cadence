@@ -167,8 +167,14 @@ impl Shared {
                 .as_ref()
                 .and_then(|p| p.get("effort"))
                 .and_then(Value::as_str);
-            let model_changed = spec.model.as_deref().is_some_and(|m| Some(m) != current_model);
-            let effort_changed = spec.effort.as_deref().is_some_and(|e| Some(e) != current_effort);
+            let model_changed = spec
+                .model
+                .as_deref()
+                .is_some_and(|m| Some(m) != current_model);
+            let effort_changed = spec
+                .effort
+                .as_deref()
+                .is_some_and(|e| Some(e) != current_effort);
             if model_changed || effort_changed {
                 return Err(Error::invalid(
                     "agent_live_override_refused",
@@ -447,24 +453,16 @@ impl Shared {
                                   assignment_id: &str,
                                   is_seat: bool| {
                                 if !is_seat {
-                                    let mut lanes = active_for_resume
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    reserve_spawn_slot(
-                                        &mut lanes,
-                                        assignment_id,
-                                        max_spawn_lanes,
-                                    )?;
+                                    let mut lanes =
+                                        active_for_resume.lock().unwrap_or_else(|e| e.into_inner());
+                                    reserve_spawn_slot(&mut lanes, assignment_id, max_spawn_lanes)?;
                                     if let Some(entry) = lanes.get_mut(assignment_id) {
                                         entry.alias = alias.to_string();
                                     }
                                 }
-                                match shared_resume.resume_hosted_worker(
-                                    spec,
-                                    alias,
-                                    worktree,
-                                    is_seat,
-                                ) {
+                                match shared_resume
+                                    .resume_hosted_worker(spec, alias, worktree, is_seat)
+                                {
                                     Ok(adapter) => Ok(adapter),
                                     Err(err) => {
                                         if !is_seat {
@@ -817,7 +815,9 @@ mod tests {
         assert!(shared.store.agent("fake-abc123").unwrap().enabled);
 
         // Shut down spawned actor thread cleanly before tempdir cleanup
-        shared.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        shared
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         shared.wake();
         let ctls: Vec<_> = shared
             .lifecycle

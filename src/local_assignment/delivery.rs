@@ -887,11 +887,7 @@ fn kickoff_line(
         kickoff.worktree,
         kickoff.message_id
     );
-    if let Some(guidance) = kickoff
-        .note
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
+    if let Some(guidance) = kickoff.note.map(str::trim).filter(|text| !text.is_empty()) {
         let sanitized: String = guidance
             .chars()
             .map(|ch| if ch.is_control() { ' ' } else { ch })
