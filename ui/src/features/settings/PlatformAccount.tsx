@@ -4,22 +4,24 @@ import { IconRefresh } from "../../ui/icons";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
 import {
-  creditSplitPercentages,
   displayAmount,
   formatApproxHkdFromMinor,
   formatApproxHkdFromScaled,
-  formatCredits,
-  formatSignedCredits,
+  formatUsagePercent,
   formatUsdFromMinor,
   formatUsdFromScaled,
   isPlatformAccount,
+  packCapacityLabel,
   parseCheckoutUrlResponse,
   parseHostedBilling,
+  planCapacityLabel,
   readBillingReturnParams,
+  resolveUsageSummary,
   safeManageUrl,
   safeStripeCheckoutUrl,
   type HostedBillingOfferPlan,
   type HostedBillingSnapshot,
+  type HostedBillingUsageRow,
   type PlatformAccount as Account,
 } from "./accountDisplay";
 import "./account.css";
@@ -234,6 +236,14 @@ function HostedBilling({
   const [checkedAt, setCheckedAt] = useState<Date | null>(null);
   const [interval, setInterval] = useState<"month" | "year">("month");
   const [returnBanner, setReturnBanner] = useState<{ kind: "subscription" | "topup"; status: "success" | "cancel" } | null>(null);
+  const [usageTab, setUsageTab] = useState<"daily" | "log" | "events" | null>(null);
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
+  const [hoverDay, setHoverDay] = useState<string | null>(null);
+  const [dailyPage, setDailyPage] = useState(1);
+  const [logPage, setLogPage] = useState(1);
+  const [extraUsageRows, setExtraUsageRows] = useState<HostedBillingUsageRow[]>([]);
+  const [extraUsageCursor, setExtraUsageCursor] = useState<string | null | undefined>(undefined);
+  const [loadingMoreUsage, setLoadingMoreUsage] = useState(false);
 
   const navigateExternal = useCallback((url: string) => {
     if (onRedirect) onRedirect(url);
@@ -261,6 +271,9 @@ function HostedBilling({
         if (!parsed) throw new Error("Billing response malformed");
         setUnsupported(false);
         setData(parsed);
+        setExtraUsageRows([]);
+        setExtraUsageCursor(undefined);
+        setLogPage(1);
         setCheckedAt(new Date());
         onBillingSnapshot?.(parsed);
       }, opts.signal);
@@ -383,16 +396,52 @@ function HostedBilling({
   const subActive = account?.plan?.status === "active" || account?.plan?.status === "past_due";
   const openCheckoutUrl =
     offer?.checkout.state === "open" ? safeStripeCheckoutUrl(offer.checkout.url) : null;
-  const split = account
-    ? creditSplitPercentages(account.balance.includedAmount, account.balance.refillAmount)
-    : { includedPct: 0, refillPct: 0 };
+  const summary = account ? resolveUsageSummary(account, offer) : null;
+  const isExtraPrimary = summary?.mode === "overflow" || summary?.mode === "refill_only";
+  const dailyList = data?.usage.dailyUsage ?? [];
+  const activeTab: "daily" | "log" | "events" =
+    usageTab ?? (dailyList.length > 0 ? "daily" : "log");
+
+  const combinedLogRows = [
+    ...(data?.usage.rows ?? []),
+    ...extraUsageRows,
+  ];
+  const currentCursor =
+    extraUsageCursor !== undefined ? extraUsageCursor : (data?.usage.cursor ?? null);
+
+  const loadOlderUsagePage = useCallback(async () => {
+    if (!currentCursor || loadingMoreUsage) return;
+    setLoadingMoreUsage(true);
+    try {
+      await withPrivateOperation(async (op) => {
+        const response = await privateFetch(
+          `/api/account/billing?cursor=${encodeURIComponent(currentCursor)}`,
+          { headers: sessionHeaders() },
+          op,
+        );
+        op.assertCurrent();
+        if (!response.ok) return;
+        const payload: unknown = await response.json();
+        op.assertCurrent();
+        const parsed = parseHostedBilling(payload);
+        if (!parsed) return;
+        setExtraUsageRows((prev) => [...prev, ...parsed.usage.rows]);
+        setExtraUsageCursor(parsed.usage.cursor);
+        setLogPage((p) => p + 1);
+      });
+    } catch {
+      /* keep existing loaded rows visible */
+    } finally {
+      setLoadingMoreUsage(false);
+    }
+  }, [currentCursor, loadingMoreUsage]);
 
   return (
     <section className="account-workspace" aria-labelledby="account-title" aria-busy={loading}>
       <header className="account-heading">
         <div>
           <h1 id="account-title">{t("Billing")}</h1>
-          <p>{t("Manage credits, plans, refill packs and recent usage for this workspace.")}</p>
+          <p>{t("Manage monthly usage, extra usage packs, plans and usage activity for this workspace.")}</p>
           {checkedAt && (
             <p className="account-checked">
               {t("Last checked")} <time dateTime={checkedAt.toISOString()}>{checkedAt.toLocaleString()}</time>
@@ -431,7 +480,7 @@ function HostedBilling({
           <p>
             {returnBanner.status === "success"
               ? t("Your workspace balance and plan status are refreshing.")
-              : t("No charge was made. You can pick a plan or refill pack anytime.")}
+              : t("No charge was made. You can pick a plan or extra usage pack anytime.")}
           </p>
         </div>
       )}
@@ -474,10 +523,10 @@ function HostedBilling({
             </div>
           )}
 
-          {(!data.canManage || !account) ? (
+          {(!data.canManage || !account || !summary) ? (
             <div className="account-state" data-testid="billing-member-readonly">
               <h2>{t("Billing is managed by workspace owners.")}</h2>
-              <p>{t("Only workspace owners can view balances, change plans, or purchase credit packs.")}</p>
+              <p>{t("Only workspace owners can view capacity, change plans, or purchase extra usage packs.")}</p>
             </div>
           ) : (
             <>
@@ -488,6 +537,52 @@ function HostedBilling({
                     {t("Unsettled provider charges:")}{" "}
                     {formatUsdFromScaled(data.receivable, numLocale) ?? data.receivable}
                   </p>
+                </div>
+              )}
+
+              {summary.mode === "overflow" && (
+                <div className="account-notice billing-notice-info billing-notice-row" role="status" data-testid="billing-overflow-banner">
+                  <div>
+                    <strong>{t("Monthly allowance reached — Extra usage active")}</strong>
+                    <p>{t("Requests are now drawing automatically from your prepaid extra usage pool.")}</p>
+                  </div>
+                  {allPlans.length > 0 && (
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      onClick={() => document.getElementById("billing-plans")?.scrollIntoView({ behavior: "smooth" })}
+                    >
+                      {t("Upgrade plan")}
+                    </Button>
+                  )}
+                </div>
+              )}
+
+              {summary.mode === "depleted" && (
+                <div className="account-notice billing-notice-row" data-tone="fail" role="status" data-testid="billing-depleted-banner">
+                  <div>
+                    <strong>{t("Monthly allowance reached — agent runs paused")}</strong>
+                    <p>{t("Capacity is paused until your cycle resets or you upgrade or add an extra usage pack.")}</p>
+                  </div>
+                  <div className="billing-banner-actions">
+                    {allPlans.length > 0 && (
+                      <Button
+                        size="sm"
+                        onClick={() => document.getElementById("billing-plans")?.scrollIntoView({ behavior: "smooth" })}
+                      >
+                        {t("Upgrade plan")}
+                      </Button>
+                    )}
+                    {account.packs.length > 0 && (
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        onClick={() => document.getElementById("billing-packs")?.scrollIntoView({ behavior: "smooth" })}
+                      >
+                        {t("Add extra usage")}
+                      </Button>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -507,54 +602,149 @@ function HostedBilling({
               )}
 
               <section className="account-summary" aria-label={t("Account summary")}>
-                <article className="card account-summary-card">
+                <article className="card account-summary-card" data-testid="billing-usage-summary">
+                  {summary.mode === "overflow" && (
+                    <div className="billing-completed-cycle" data-testid="billing-completed-cycle">
+                      <div className="billing-completed-row">
+                        <span>{t("Monthly allowance · 100% used")}</span>
+                        {summary.cycle?.resetsAt && (
+                          <span>
+                            {t("Resets {date}").replace("{date}", new Date(summary.cycle.resetsAt).toLocaleDateString())}
+                          </span>
+                        )}
+                      </div>
+                      <div className="billing-completed-track" aria-hidden="true">
+                        <div className="billing-completed-fill" />
+                      </div>
+                    </div>
+                  )}
+
                   <div className="billing-card-head">
-                    <h2>{t("Available credits")}</h2>
+                    <div className="billing-head-left">
+                      <h2>
+                        {isExtraPrimary
+                          ? t("Extra usage")
+                          : summary.mode === "trial"
+                            ? t("Trial usage")
+                            : summary.mode === "depleted"
+                              ? t("Monthly allowance reached")
+                              : t("Monthly usage")}
+                      </h2>
+                      {isExtraPrimary && (
+                        <span className="billing-status-pill" data-tone="info">{t("Active")}</span>
+                      )}
+                    </div>
                     {account.packs.length > 0 && (
                       <Button
                         size="sm"
                         onClick={() => document.getElementById("billing-packs")?.scrollIntoView({ behavior: "smooth" })}
                       >
-                        {t("Buy refill credits")}
+                        {t("Add extra usage")}
                       </Button>
                     )}
                   </div>
-                  <p className="account-balance" data-testid="billing-total-credits">
-                    <span>{formatCredits(account.balance.amount, numLocale) ?? account.balance.amount}</span>
-                    <span className="billing-unit">{t("credits")}</span>
-                  </p>
-                  <div className="billing-split-bar" aria-hidden="true">
-                    <div className="billing-split-included" style={{ width: `${split.includedPct}%` }} />
-                    <div className="billing-split-refill" style={{ width: `${split.refillPct}%` }} />
-                  </div>
-                  <div className="billing-split-legend">
-                    <span className="billing-split-item">
-                      <span className="billing-swatch" data-kind="included" aria-hidden="true" />
-                      {t("Included / Trial")}:{" "}
-                      <strong>{formatCredits(account.balance.includedAmount, numLocale) ?? account.balance.includedAmount}</strong>
-                    </span>
-                    <span className="billing-split-item">
-                      <span className="billing-swatch" data-kind="refill" aria-hidden="true" />
-                      {t("Refill credits (never expire)")}:{" "}
-                      <strong>{formatCredits(account.balance.refillAmount, numLocale) ?? account.balance.refillAmount}</strong>
-                    </span>
-                  </div>
-                  {account.balance.low && (
-                    <p className="account-balance-warning" role="status">
-                      {account.balance.zero ? t("No model credit available.") : t("Model credit is running low.")}
-                    </p>
+
+                  {(() => {
+                    const shownPct = isExtraPrimary
+                      ? summary.extra.poolUsedPercent
+                      : (summary.cycle?.usedPercent ?? 100);
+                    const remPct = isExtraPrimary
+                      ? summary.extra.poolRemainingPercent
+                      : (summary.cycle?.remainingPercent ?? 0);
+                    const barTone =
+                      summary.mode === "depleted"
+                        ? "fail"
+                        : isExtraPrimary
+                          ? "info"
+                          : shownPct >= 80
+                            ? "warn"
+                            : "ok";
+                    return (
+                      <>
+                        <div className="billing-usage-row">
+                          <p className="account-balance" data-testid="billing-usage-percent">
+                            {shownPct}%
+                          </p>
+                          <span className="billing-usage-sub">
+                            {isExtraPrimary
+                              ? t("of extra usage pool used")
+                              : summary.mode === "trial"
+                                ? t("of trial allowance used")
+                                : t("of monthly allowance used")}
+                          </span>
+                        </div>
+                        <div className="billing-usage-track" aria-hidden="true">
+                          <div className="billing-usage-fill" data-tone={barTone} style={{ width: `${shownPct}%` }} />
+                        </div>
+                        <div className="billing-usage-meta">
+                          <span>{t("{pct}% remaining").replace("{pct}", String(remPct))}</span>
+                          {isExtraPrimary ? (
+                            <span>{t("Prepaid · Never expires · No surprise overage bills")}</span>
+                          ) : summary.cycle?.resetsAt ? (
+                            <span>
+                              {summary.mode === "trial"
+                                ? `${t("Trial ends")} ${new Date(summary.cycle.resetsAt).toLocaleDateString()}`
+                                : t("Resets {date}").replace("{date}", new Date(summary.cycle.resetsAt).toLocaleDateString())}
+                            </span>
+                          ) : null}
+                        </div>
+                      </>
+                    );
+                  })()}
+
+                  {summary.mode === "monthly_standby" && summary.extra.hasReserve && (
+                    <div className="billing-extra-standby" data-testid="billing-extra-standby">
+                      <span className="billing-extra-standby-left">
+                        <span className="billing-swatch" data-kind="included" aria-hidden="true" />
+                        <span>{t("Extra usage")}</span>
+                        <span className="billing-status-pill">{t("Standby")}</span>
+                      </span>
+                      <span>
+                        {t("{pct}% left · Applies automatically at 100%").replace(
+                          "{pct}",
+                          String(summary.extra.poolRemainingPercent),
+                        )}
+                      </span>
+                    </div>
                   )}
                 </article>
 
-                <article className="card account-summary-card">
+                <article className="card account-summary-card" data-testid="billing-plan-card">
                   <div className="billing-card-head">
                     <h2>{t("Billing plan")}</h2>
-                    {account.trial?.status === "active" && (
-                      <span className="chip bg-accent/15 text-accent">{t("Free trial")}</span>
-                    )}
+                    <span
+                      className="billing-status-pill"
+                      data-tone={
+                        summary.mode === "depleted"
+                          ? "fail"
+                          : summary.mode === "overflow"
+                            ? "info"
+                            : subActive
+                              ? "ok"
+                              : account.trial?.status === "active"
+                                ? "info"
+                                : undefined
+                      }
+                    >
+                      {summary.mode === "overflow"
+                        ? t("In overflow")
+                        : account.plan?.status === "active"
+                          ? t("Active")
+                          : account.plan?.status === "past_due"
+                            ? t("Past due")
+                            : account.trial?.status === "active"
+                              ? t("Trial active")
+                              : summary.mode === "refill_only"
+                                ? t("Pay-as-you-go")
+                                : t("No active subscription")}
+                    </span>
                   </div>
                   <p className="account-plan">
-                    {account.plan?.name || (account.trial?.status === "active" ? t("Free trial") : t("No plan"))}
+                    {subActive && account.plan
+                      ? account.plan.name
+                      : account.trial?.status === "active"
+                        ? t("Free trial")
+                        : t("No active plan")}
                   </p>
                   <p className="account-plan-status">
                     {account.plan?.status === "active"
@@ -563,7 +753,9 @@ function HostedBilling({
                         ? t("Past due")
                         : account.trial?.status === "active"
                           ? t("Trial active")
-                          : t("No active subscription")}
+                          : summary.mode === "refill_only"
+                            ? t("Pay-as-you-go (Extra usage)")
+                            : t("No active subscription")}
                   </p>
                   {account.trial?.status === "active" && (
                     <p className="billing-trial-meta">
@@ -586,7 +778,7 @@ function HostedBilling({
               </section>
 
               {allPlans.length > 0 && (
-                <section className="billing-section" aria-labelledby="billing-plans-title">
+                <section id="billing-plans" className="billing-section" aria-labelledby="billing-plans-title">
                   <div className="account-section-heading">
                     <h2 id="billing-plans-title">{t("Subscription plans")}</h2>
                     {showIntervalToggle && (
@@ -617,7 +809,7 @@ function HostedBilling({
                         (account.plan?.planId ? account.plan.planId === plan.id : account.plan?.name === plan.label);
                       const usd = formatUsdFromScaled(plan.amount, numLocale) ?? plan.amount;
                       const hkd = isZh ? formatApproxHkdFromScaled(plan.amount) : null;
-                      const included = formatCredits(plan.includedCredit, numLocale) ?? plan.includedCredit;
+                      const capacity = planCapacityLabel(allPlans, plan);
                       const actionKey = `sub:${plan.id}`;
                       return (
                         <article
@@ -627,9 +819,9 @@ function HostedBilling({
                           data-plan-id={plan.id}
                         >
                           <div>
-                            <div className="billing-card-head">
+                            <div className="billing-plan-card-head">
                               <strong>{plan.label}</strong>
-                              {currentPlan && <span className="chip bg-accent/15 text-accent">{t("Current plan")}</span>}
+                              <span className="billing-multiplier-badge">{capacity}</span>
                             </div>
                             <div className="billing-price-row">
                               <span className="billing-price-usd">{usd}</span>
@@ -639,7 +831,7 @@ function HostedBilling({
                               {hkd && <span className="billing-price-hkd">{hkd}</span>}
                             </div>
                             <p className="billing-included-credits">
-                              {included} {t("credits / mo")}
+                              {capacity} {t("monthly usage capacity")}
                             </p>
                           </div>
                           <div>
@@ -680,25 +872,28 @@ function HostedBilling({
               {account.packs.length > 0 && (
                 <section id="billing-packs" className="billing-section" aria-labelledby="billing-packs-title">
                   <div className="account-section-heading">
-                    <h2 id="billing-packs-title">{t("Refill packs")}</h2>
-                    <span>{t("Credits never expire")}</span>
+                    <h2 id="billing-packs-title">{t("Extra usage packs")}</h2>
+                    <span>{t("Prepaid · Never expires · No surprise overage bills")}</span>
                   </div>
                   <div className="billing-catalog-grid">
                     {account.packs.map((pack) => {
                       const usd = formatUsdFromMinor(pack.chargeMinor, numLocale) ?? `${pack.chargeMinor}`;
                       const hkd = isZh ? formatApproxHkdFromMinor(pack.chargeMinor) : null;
-                      const creditCount = formatCredits(pack.credit, numLocale) ?? pack.credit;
+                      const capacity = packCapacityLabel(account.packs, allPlans, pack);
                       const actionKey = `pack:${pack.id}`;
                       return (
                         <article key={pack.id} className="card billing-catalog-card" data-pack-id={pack.id}>
                           <div>
-                            <strong>{pack.label}</strong>
+                            <div className="billing-plan-card-head">
+                              <strong>{pack.label}</strong>
+                              <span className="billing-multiplier-badge">{capacity}</span>
+                            </div>
                             <div className="billing-price-row">
                               <span className="billing-price-usd">{usd}</span>
                               {hkd && <span className="billing-price-hkd">{hkd}</span>}
                             </div>
                             <p className="billing-included-credits">
-                              {creditCount} {t("credits")}
+                              {t("{capacity} standard monthly capacity").replace("{capacity}", capacity)}
                             </p>
                           </div>
                           <Button
@@ -723,43 +918,363 @@ function HostedBilling({
                 </p>
               )}
 
-              <section className="account-usage" aria-labelledby="account-usage-title">
-                <div className="account-section-heading">
-                  <h2 id="account-usage-title">{t("Recent usage")}</h2>
-                  {data.usage.rows.length > 0 && (
-                    <span>
-                      {data.usage.rows.length} {data.usage.rows.length === 1 ? t("entry") : t("entries")}
-                    </span>
-                  )}
-                </div>
-                {data.usage.rows.length === 0 ? (
-                  <div className="account-state">{t("No recent usage to show.")}</div>
-                ) : (
-                  <div className="card account-usage-table">
-                    <table>
-                      <caption className="sr-only">{t("Recent account usage")}</caption>
-                      <thead>
-                        <tr>
-                          <th scope="col">{t("Date")}</th>
-                          <th scope="col">{t("Description")}</th>
-                          <th scope="col">{t("Credits")}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {data.usage.rows.map((row, index) => (
-                          <tr key={`${row.date}-${index}`}>
-                            <td><time dateTime={row.date}>{row.date.slice(0, 10)}</time></td>
-                            <td>{row.description}</td>
-                            <td>
-                              {formatSignedCredits(row.amount, numLocale) ?? row.amount} {t("credits")}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </section>
+              {(() => {
+                const dailyReversed = [...dailyList].reverse();
+                const filteredDaily = selectedDay
+                  ? dailyReversed.filter((d) => d.date === selectedDay)
+                  : dailyReversed;
+                const dailyPageSize = 7;
+                const dailyTotalPages = Math.max(1, Math.ceil(filteredDaily.length / dailyPageSize));
+                const safeDailyPage = Math.min(dailyPage, dailyTotalPages);
+                const visibleDaily = filteredDaily.slice(
+                  (safeDailyPage - 1) * dailyPageSize,
+                  safeDailyPage * dailyPageSize,
+                );
+
+                const filteredLog = selectedDay
+                  ? combinedLogRows.filter((row) => row.date.slice(0, 10) === selectedDay)
+                  : combinedLogRows;
+                const logPageSize = 8;
+                const loadedLogPages = Math.max(1, Math.ceil(filteredLog.length / logPageSize));
+                const safeLogPage = Math.min(logPage, loadedLogPages);
+                const visibleLog = filteredLog.slice(
+                  (safeLogPage - 1) * logPageSize,
+                  safeLogPage * logPageSize,
+                );
+                const milestoneRows = combinedLogRows.filter((row) => row.kind !== "charge");
+
+                const sourceLabel = (src: "monthly" | "extra" | "mixed") =>
+                  src === "extra"
+                    ? t("Extra usage")
+                    : src === "mixed"
+                      ? t("Monthly + Extra")
+                      : t("Monthly plan");
+
+                const maxChartPct = Math.max(0.1, ...dailyList.map((d) => d.totalPercent));
+                const inspectDay = hoverDay ?? selectedDay;
+                const inspectedObj = inspectDay ? dailyList.find((d) => d.date === inspectDay) : null;
+                const totalChartPct = dailyList.reduce((acc, d) => acc + d.totalPercent, 0).toFixed(1);
+
+                return (
+                  <section className="account-usage" aria-labelledby="account-usage-title">
+                    <div className="account-section-heading">
+                      <div className="billing-head-left">
+                        <h2 id="account-usage-title">{t("Usage activity")}</h2>
+                        {selectedDay && activeTab !== "events" && (
+                          <button
+                            type="button"
+                            className="billing-filter-chip"
+                            data-testid="billing-day-filter"
+                            onClick={() => {
+                              setSelectedDay(null);
+                              setDailyPage(1);
+                              setLogPage(1);
+                            }}
+                          >
+                            {t("Filtered: {date} ×").replace("{date}", selectedDay)}
+                          </button>
+                        )}
+                      </div>
+                      <div className="billing-usage-controls">
+                        <div className="billing-interval-toggle" role="group" aria-label={t("Usage activity")}>
+                          {(["daily", "log", "events"] as const).map((tabKey) => (
+                            <button
+                              key={tabKey}
+                              type="button"
+                              className="billing-interval-btn"
+                              aria-pressed={activeTab === tabKey}
+                              data-usage-tab={tabKey}
+                              onClick={() => {
+                                setUsageTab(tabKey);
+                                setDailyPage(1);
+                                setLogPage(1);
+                              }}
+                            >
+                              {tabKey === "daily"
+                                ? t("Daily summary")
+                                : tabKey === "log"
+                                  ? t("Activity log")
+                                  : t("Billing events")}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {activeTab !== "events" && dailyList.length > 0 && (
+                      <div className="card billing-chart-card" data-testid="billing-usage-chart">
+                        <div className="billing-chart-head">
+                          <div className="billing-chart-title">
+                            <strong>{t("14-day usage: {pct}%").replace("{pct}", totalChartPct)}</strong>
+                            <span className="billing-chart-readout">
+                              {inspectedObj
+                                ? `${inspectedObj.date} · ${t("{count} runs").replace("{count}", String(inspectedObj.runCount))} · ${formatUsagePercent(inspectedObj.totalPercent) ?? "0.0%"}`
+                                : t("Click any day bar to filter")}
+                            </span>
+                          </div>
+                          <div className="billing-chart-legend">
+                            <span className="billing-legend-item">
+                              <span className="billing-swatch" data-kind="included" aria-hidden="true" />
+                              {t("Monthly plan")}
+                            </span>
+                            <span className="billing-legend-item">
+                              <span className="billing-swatch" data-kind="refill" aria-hidden="true" />
+                              {t("Extra usage")}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="billing-bars-grid" role="group" aria-label={t("14-day daily usage")}>
+                          {dailyList.map((day) => {
+                            const hPct = Math.max(10, Math.round((day.totalPercent / maxChartPct) * 100));
+                            const extraH =
+                              day.source === "extra"
+                                ? hPct
+                                : day.source === "mixed"
+                                  ? Math.max(5, Math.round(hPct / 2))
+                                  : 0;
+                            const monthlyH = hPct - extraH;
+                            return (
+                              <button
+                                key={day.date}
+                                type="button"
+                                className="billing-bar-btn"
+                                data-chart-day={day.date}
+                                aria-pressed={selectedDay === day.date}
+                                title={`${day.date} · ${day.runCount} runs · ${formatUsagePercent(day.totalPercent) ?? "0.0%"}`}
+                                onMouseEnter={() => setHoverDay(day.date)}
+                                onMouseLeave={() => setHoverDay(null)}
+                                onClick={() => {
+                                  setSelectedDay((prev) => (prev === day.date ? null : day.date));
+                                  setDailyPage(1);
+                                  setLogPage(1);
+                                }}
+                              >
+                                <span className="billing-bar-col">
+                                  {extraH > 0 && <span className="billing-bar-extra" style={{ height: `${extraH}%` }} />}
+                                  {monthlyH > 0 && <span className="billing-bar-monthly" style={{ height: `${monthlyH}%` }} />}
+                                </span>
+                                <span className="billing-bar-day">{day.date.slice(8)}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {activeTab === "daily" ? (
+                      visibleDaily.length === 0 ? (
+                        <div className="account-state">{t("No recent usage to show.")}</div>
+                      ) : (
+                        <div className="card account-usage-table">
+                          <table>
+                            <caption className="sr-only">{t("Daily workspace usage summary")}</caption>
+                            <thead>
+                              <tr>
+                                <th scope="col">{t("Date")}</th>
+                                <th scope="col">{t("Activity")}</th>
+                                <th scope="col">{t("Source")}</th>
+                                <th scope="col">{t("% of monthly allowance")}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {visibleDaily.map((day) => {
+                                const barW = Math.min(100, Math.round((day.totalPercent / maxChartPct) * 100));
+                                return (
+                                  <tr key={day.date}>
+                                    <td><time dateTime={day.date}>{day.date}</time></td>
+                                    <td>
+                                      <div className="billing-activity-cell">
+                                        <div className="billing-activity-top">
+                                          <span>{t("{count} runs").replace("{count}", String(day.runCount))}</span>
+                                          <button
+                                            type="button"
+                                            className="billing-view-runs"
+                                            onClick={() => {
+                                              setSelectedDay(day.date);
+                                              setUsageTab("log");
+                                              setLogPage(1);
+                                            }}
+                                          >
+                                            {t("View runs")}
+                                          </button>
+                                        </div>
+                                        {day.models.length > 0 && (
+                                          <div className="billing-model-chips">
+                                            {day.models.map((m) => (
+                                              <span key={m} className="billing-model-chip">{m}</span>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </td>
+                                    <td>
+                                      <span className="billing-source-pill" data-source={day.source}>
+                                        {sourceLabel(day.source)}
+                                      </span>
+                                    </td>
+                                    <td>
+                                      <span className="billing-share-cell">
+                                        <span className="billing-inline-track" aria-hidden="true">
+                                          <span className="billing-inline-fill" data-source={day.source} style={{ width: `${barW}%` }} />
+                                        </span>
+                                        <span>{formatUsagePercent(day.totalPercent) ?? "0.0%"}</span>
+                                      </span>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                          <div className="billing-pagination" data-testid="billing-pagination">
+                            <span>
+                              {t("Page {page} of {total}")
+                                .replace("{page}", String(safeDailyPage))
+                                .replace("{total}", String(dailyTotalPages))}
+                            </span>
+                            <div className="billing-pagination-controls">
+                              <Button
+                                size="sm"
+                                disabled={safeDailyPage <= 1}
+                                onClick={() => setDailyPage((p) => Math.max(1, p - 1))}
+                              >
+                                {t("Previous")}
+                              </Button>
+                              <Button
+                                size="sm"
+                                disabled={safeDailyPage >= dailyTotalPages}
+                                onClick={() => setDailyPage((p) => Math.min(dailyTotalPages, p + 1))}
+                              >
+                                {t("Next")}
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    ) : activeTab === "events" ? (
+                      milestoneRows.length === 0 ? (
+                        <div className="account-state">{t("No billing events to show.")}</div>
+                      ) : (
+                        <div className="card account-usage-table">
+                          <table>
+                            <caption className="sr-only">{t("Billing milestones")}</caption>
+                            <thead>
+                              <tr>
+                                <th scope="col">{t("Date")}</th>
+                                <th scope="col">{t("Event")}</th>
+                                <th scope="col">{t("Source")}</th>
+                                <th scope="col">{t("Outcome")}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {milestoneRows.map((row, idx) => {
+                                const src = row.source ?? (row.kind === "grant" ? "monthly" : "extra");
+                                return (
+                                  <tr key={`${row.date}-${idx}`}>
+                                    <td><time dateTime={row.date}>{row.date.slice(0, 10)}</time></td>
+                                    <td>{row.description}</td>
+                                    <td>
+                                      <span className="billing-source-pill" data-source={src}>
+                                        {sourceLabel(src)}
+                                      </span>
+                                    </td>
+                                    <td>
+                                      <span className="billing-status-pill" data-tone={row.kind === "grant" ? "ok" : "info"}>
+                                        {row.kind === "credit"
+                                          ? t("Refill added")
+                                          : row.kind === "grant"
+                                            ? t("Cycle reset")
+                                            : t("Adjustment")}
+                                      </span>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )
+                    ) : visibleLog.length === 0 ? (
+                      <div className="account-state">{t("No recent usage to show.")}</div>
+                    ) : (
+                      <div className="card account-usage-table">
+                        <table>
+                          <caption className="sr-only">{t("Recent account usage")}</caption>
+                          <thead>
+                            <tr>
+                              <th scope="col">{t("Time")}</th>
+                              <th scope="col">{t("Model / Feature")}</th>
+                              <th scope="col">{t("Source")}</th>
+                              <th scope="col">{t("% of monthly allowance")}</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {visibleLog.map((row, index) => {
+                              const share =
+                                row.kind === "charge"
+                                  ? (formatUsagePercent(row.usagePercent) ?? "—")
+                                  : row.kind === "credit"
+                                    ? t("Refill added")
+                                    : row.kind === "grant"
+                                      ? t("Cycle reset")
+                                      : t("Adjustment");
+                              const src = row.source ?? (row.kind === "grant" ? "monthly" : "extra");
+                              return (
+                                <tr key={`${row.date}-${index}`}>
+                                  <td>
+                                    <time dateTime={row.date}>
+                                      {new Date(row.date).toLocaleString(numLocale, {
+                                        month: "short",
+                                        day: "numeric",
+                                        hour: "2-digit",
+                                        minute: "2-digit",
+                                      })}
+                                    </time>
+                                  </td>
+                                  <td>{row.model ? `${row.model} · ${row.description}` : row.description}</td>
+                                  <td>
+                                    <span className="billing-source-pill" data-source={src}>
+                                      {sourceLabel(src)}
+                                    </span>
+                                  </td>
+                                  <td>{share}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                        <div className="billing-pagination" data-testid="billing-pagination">
+                          <span>
+                            {t("Page {page}").replace("{page}", String(safeLogPage))}
+                          </span>
+                          <div className="billing-pagination-controls">
+                            <Button
+                              size="sm"
+                              disabled={safeLogPage <= 1}
+                              onClick={() => setLogPage((p) => Math.max(1, p - 1))}
+                            >
+                              {t("Previous")}
+                            </Button>
+                            <Button
+                              size="sm"
+                              loading={loadingMoreUsage}
+                              disabled={safeLogPage >= loadedLogPages && !currentCursor}
+                              onClick={() => {
+                                if (safeLogPage < loadedLogPages) {
+                                  setLogPage((p) => p + 1);
+                                } else if (currentCursor) {
+                                  void loadOlderUsagePage();
+                                }
+                              }}
+                            >
+                              {t("Next")}
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </section>
+                );
+              })()}
             </>
           )}
         </>

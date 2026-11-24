@@ -45,8 +45,8 @@ import { documentsViewer } from "./features/documents/documentsAccess";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import {
-  formatCredits,
   parseHostedBilling,
+  sidebarBillingStatus,
   type HostedBillingSnapshot,
 } from "./features/settings/accountDisplay";
 import Connections from "./features/settings/Connections";
@@ -1201,31 +1201,50 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     agentsLoaded &&
     nonMasterAgents.length === 0 &&
     (agents?.profiles?.length ?? 0) === 0;
-  const sidebarBillingPill =
-    meta?.hosted === true &&
-    meta?.signed_in === true &&
-    billingHref &&
-    billingSummary?.canManage &&
-    billingSummary.account ? (
+  const sidebarBillingPill = (() => {
+    if (
+      meta?.hosted !== true ||
+      meta?.signed_in !== true ||
+      !billingHref ||
+      !billingSummary?.canManage ||
+      !billingSummary.account
+    ) {
+      return undefined;
+    }
+    const status = sidebarBillingStatus(billingSummary.account, billingSummary.offer);
+    const labelText =
+      status.labelKind === "plan" && status.planName
+        ? status.planName
+        : status.labelKind === "trial"
+          ? t("Free trial")
+          : t("Billing");
+    const metricText =
+      status.metricKind === "extra_left"
+        ? t("Extra · {pct}% left").replace("{pct}", String(status.percent))
+        : status.metricKind === "depleted"
+          ? t("{pct}% used").replace("{pct}", "100")
+          : t("{pct}% used").replace("{pct}", String(status.percent));
+    return (
       <Link
         href={billingHref}
         className="sidebar-billing-pill"
-        data-low={(billingSummary.account.balance.low || billingSummary.account.balance.zero) || undefined}
+        data-tone={status.tone}
+        data-low={status.tone === "warn" || status.tone === "fail" ? "true" : undefined}
+        data-testid="sidebar-billing-pill"
       >
-        <span className="sidebar-billing-pill-plan">
-          {billingSummary.account.plan?.status === "active" || billingSummary.account.plan?.status === "past_due"
-            ? billingSummary.account.plan.name
-            : billingSummary.account.trial?.status === "active"
-              ? t("Free trial")
-              : t("Billing")}
-        </span>
-        <span className="sidebar-billing-pill-credits">
-          {formatCredits(billingSummary.account.balance.amount, locale === "zh-TW" ? "zh-Hant-HK" : "en-US") ??
-            billingSummary.account.balance.amount}{" "}
-          {t("credits")}
-        </span>
+        <div className="sidebar-pill-row">
+          <span className="sidebar-billing-pill-plan">{labelText}</span>
+          <span className="sidebar-billing-pill-metric">
+            <span className="sidebar-status-dot" aria-hidden="true" />
+            <span>{metricText}</span>
+          </span>
+        </div>
+        <div className="sidebar-mini-track" aria-hidden="true">
+          <div className="sidebar-mini-fill" style={{ width: `${status.percent}%` }} />
+        </div>
       </Link>
-    ) : undefined;
+    );
+  })();
 
   return (
     <WriteGate.Provider value={meta === null

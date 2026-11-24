@@ -201,11 +201,123 @@ async function run(): Promise<void> {
         headers: { "Content-Type": "application/json" },
       });
     }
+    if (path.startsWith("/api/account/billing?cursor=")) {
+      const base =
+        typeof nextBillingPayload === "object" && nextBillingPayload !== null
+          ? (nextBillingPayload as typeof syntheticSnapshot)
+          : syntheticSnapshot;
+      return new Response(
+        JSON.stringify({
+          ...base,
+          usage: {
+            rows: [
+              {
+                date: "2026-11-10T09:15:00Z",
+                description: "Older run",
+                amount: "-0.850000",
+                kind: "charge" as const,
+                model: "Claude Haiku",
+                source: "monthly" as const,
+                usagePercent: 5.0,
+              },
+            ],
+            cursor: null,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     return new Response(JSON.stringify(nextPostPayload), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
   }) as typeof fetch;
+
+  // Percentage usage & sidebar helper unit assertions
+  const sampleRichUsage = {
+    mode: "monthly_standby" as const,
+    cycle: { usedPercent: 38, remainingPercent: 62, resetsAt: "2026-12-01T00:00:00Z" },
+    extra: { hasReserve: true, poolRemainingPercent: 100, poolUsedPercent: 0, status: "standby" as const },
+    denominatorBasis: "monthly_plan" as const,
+  };
+  assert(
+    display.parseHostedBilling({
+      ...syntheticSnapshot,
+      account: { ...syntheticSnapshot.account, usageSummary: sampleRichUsage },
+      usage: {
+        ...syntheticSnapshot.usage,
+        dailyUsage: [
+          {
+            date: "2026-11-22",
+            totalPercent: 8.8,
+            monthlyPercent: 8.8,
+            extraPercent: 0,
+            runCount: 3,
+            models: ["Claude Sonnet"],
+            source: "monthly" as const,
+          },
+        ],
+      },
+    }) !== null,
+    "parses snapshot with usageSummary and dailyUsage",
+  );
+  equal(
+    display.planCapacityLabel(syntheticSnapshot.offer.plans, syntheticSnapshot.offer.plans[0]),
+    "1×",
+    "base monthly plan shows 1×",
+  );
+  equal(
+    display.packCapacityLabel(
+      [{ id: "p50", label: "Half", chargeMinor: 500, credit: "8.500000", available: true }],
+      syntheticSnapshot.offer.plans,
+      { id: "p50", label: "Half", chargeMinor: 500, credit: "8.500000", available: true },
+    ),
+    "+50%",
+    "pack smaller than monthly plan formats as +50%",
+  );
+  equal(display.formatUsagePercent(0.04), "<0.1%", "tiny share formats as <0.1%");
+  equal(display.formatUsagePercent(1.44), "1.4%", "standard share formats with 1 decimal");
+
+  const sidebarStandby = display.sidebarBillingStatus(
+    { ...syntheticSnapshot.account, plan: { name: "Synth Pro", status: "active", planId: "synth_basic_mo" }, usageSummary: sampleRichUsage },
+    syntheticSnapshot.offer,
+  );
+  equal(sidebarStandby.metricKind, "used", "standby sidebar tracks monthly % used");
+  equal(sidebarStandby.percent, 38, "standby sidebar reports 38% used");
+  equal(sidebarStandby.tone, "ok", "38% used sidebar tone is ok");
+
+  const sidebarOverflow = display.sidebarBillingStatus(
+    {
+      ...syntheticSnapshot.account,
+      plan: { name: "Synth Pro", status: "active", planId: "synth_basic_mo" },
+      usageSummary: {
+        mode: "overflow",
+        cycle: { usedPercent: 100, remainingPercent: 0, resetsAt: "2026-12-01T00:00:00Z" },
+        extra: { hasReserve: true, poolRemainingPercent: 79, poolUsedPercent: 21, status: "active" },
+        denominatorBasis: "monthly_plan",
+      },
+    },
+    syntheticSnapshot.offer,
+  );
+  equal(sidebarOverflow.metricKind, "extra_left", "overflow sidebar switches to extra remaining %");
+  equal(sidebarOverflow.percent, 79, "overflow sidebar shows 79% left");
+  equal(sidebarOverflow.tone, "info", "overflow sidebar tone is info");
+
+  const sidebarDepleted = display.sidebarBillingStatus(
+    {
+      ...syntheticSnapshot.account,
+      plan: { name: "Synth Pro", status: "active", planId: "synth_basic_mo" },
+      usageSummary: {
+        mode: "depleted",
+        cycle: { usedPercent: 100, remainingPercent: 0, resetsAt: "2026-12-01T00:00:00Z" },
+        extra: { hasReserve: false, poolRemainingPercent: 0, poolUsedPercent: 0, status: "depleted" },
+        denominatorBasis: "monthly_plan",
+      },
+    },
+    syntheticSnapshot.offer,
+  );
+  equal(sidebarDepleted.metricKind, "depleted", "depleted sidebar tracks depleted state");
+  equal(sidebarDepleted.tone, "fail", "depleted sidebar tone is fail");
 
   const redirects: string[] = [];
   let redirectSignal = createEventSignal<string>();
@@ -245,19 +357,29 @@ async function run(): Promise<void> {
     };
   };
 
-  // 1. Owner view with split balance, monthly/yearly toggle, packs, subscribe & topup CSRF headers
+  // 1. Owner view with percentage usage summary, monthly/yearly toggle, multiplier badges, subscribe & topup CSRF headers
   let unmount = await mountView(() =>
     waitForDom(
       React.act,
       host,
-      () => Boolean(host.querySelector('[data-testid="billing-total-credits"]')),
+      () => Boolean(host.querySelector('[data-testid="billing-usage-summary"]')),
       "owner billing summary",
     ),
   );
   assert(reportedSnapshot !== null, "onBillingSnapshot reports parsed snapshot");
-  assert(host.textContent?.includes("2,000"), "total credits displayed");
-  assert(host.textContent?.includes("500") && host.textContent?.includes("1,500"), "split credits displayed");
+  equal(
+    host.querySelector('[data-testid="billing-usage-percent"]')?.textContent?.trim(),
+    "12%",
+    "trial percentage used displayed",
+  );
+  assert(host.textContent?.includes("88% remaining"), "remaining percentage displayed");
+  const renderedText = host.textContent ?? "";
+  assert(
+    !/\b(2,000|1,500|500)\b/.test(renderedText) && !/\bcredits\b/i.test(renderedText),
+    "no raw credit counts rendered",
+  );
   assert(host.textContent?.includes("Free trial"), "active trial badge visible");
+  assert(host.textContent?.includes("1× monthly usage capacity"), "relative plan capacity multiplier displayed");
   assert(host.textContent?.includes("$17"), "monthly USD price shown by default");
   assert(!host.textContent?.includes("$163"), "yearly price hidden until toggled");
 
@@ -366,7 +488,7 @@ async function run(): Promise<void> {
       "member read-only notice",
     ),
   );
-  assert(!host.querySelector('[data-testid="billing-total-credits"]'), "member hides credit balance");
+  assert(!host.querySelector('[data-testid="billing-usage-summary"]'), "member hides usage summary");
   assert(!host.querySelector("#billing-packs"), "member hides refill packs");
   await unmount();
 
@@ -394,7 +516,187 @@ async function run(): Promise<void> {
   equal(manageBtns.length, 0, "IAP subscription hides Stripe portal button");
   await unmount();
 
-  // 6. 404 graceful degradation
+  // 6. Standby extra usage, 14-day chart filter, 3 tabs & pagination
+  const daily8Days = Array.from({ length: 8 }, (_, idx) => {
+    const pct = Number((1.5 + idx * 0.5).toFixed(1));
+    return {
+      date: `2026-11-${String(15 + idx).padStart(2, "0")}`,
+      totalPercent: pct,
+      monthlyPercent: pct,
+      extraPercent: 0,
+      runCount: idx + 1,
+      models: ["Claude Sonnet"],
+      source: "monthly" as const,
+    };
+  });
+  nextBillingPayload = {
+    ...syntheticSnapshot,
+    account: {
+      ...syntheticSnapshot.account,
+      plan: { name: "Synth Basic", status: "active", provider: "stripe", planId: "synth_basic_mo" },
+      trial: undefined,
+      usageSummary: {
+        mode: "monthly_standby" as const,
+        cycle: { usedPercent: 38, remainingPercent: 62, resetsAt: "2026-12-01T00:00:00Z" },
+        extra: { hasReserve: true, poolRemainingPercent: 100, poolUsedPercent: 0, status: "standby" as const },
+        denominatorBasis: "monthly_plan" as const,
+      },
+    },
+    usage: {
+      rows: [
+        {
+          date: "2026-11-22T11:00:00Z",
+          description: "Model usage",
+          amount: "-1.500000",
+          kind: "charge" as const,
+          model: "Claude Sonnet",
+          source: "monthly" as const,
+          usagePercent: 8.8,
+        },
+        {
+          date: "2026-11-21T08:00:00Z",
+          description: "Wallet credit",
+          amount: "15.000000",
+          kind: "credit" as const,
+          model: null,
+          source: "extra" as const,
+          usagePercent: null,
+        },
+      ],
+      cursor: "cur_page_2",
+      dailyUsage: daily8Days,
+    },
+  };
+  unmount = await mountView(() =>
+    waitForDom(
+      React.act,
+      host,
+      () => Boolean(host.querySelector('[data-testid="billing-extra-standby"]')),
+      "standby strip and daily chart",
+    ),
+  );
+  equal(
+    host.querySelector('[data-testid="billing-usage-percent"]')?.textContent?.trim(),
+    "38%",
+    "active monthly plan shows 38% used",
+  );
+  assert(
+    host.querySelector('[data-testid="billing-extra-standby"]')?.textContent?.includes("Standby"),
+    "standby extra strip shown when monthly < 100%",
+  );
+  assert(
+    host.querySelector('[data-testid="billing-extra-standby"]')?.textContent?.includes("100% left"),
+    "standby strip shows 100% left in pool",
+  );
+  assert(Boolean(host.querySelector('[data-testid="billing-usage-chart"]')), "14-day chart rendered");
+  assert(
+    host.querySelector('[data-testid="billing-pagination"]')?.textContent?.includes("Page 1 of 2"),
+    "daily summary paginates 7 days per page",
+  );
+  const nextDailyBtn = Array.from(
+    host.querySelectorAll('[data-testid="billing-pagination"] button'),
+  ).find((b) => b.textContent === "Next") as HTMLButtonElement;
+  await React.act(async () => nextDailyBtn.click());
+  assert(
+    host.querySelector('[data-testid="billing-pagination"]')?.textContent?.includes("Page 2 of 2"),
+    "daily summary advances to page 2",
+  );
+
+  // Click chart day bar to filter, then switch to Activity log & fetch cursor page
+  const dayBar = host.querySelector('[data-chart-day="2026-11-22"]') as HTMLButtonElement;
+  await React.act(async () => dayBar.click());
+  assert(Boolean(host.querySelector('[data-testid="billing-day-filter"]')), "day filter chip appears after chart click");
+
+  const logTabBtn = host.querySelector('[data-usage-tab="log"]') as HTMLButtonElement;
+  await React.act(async () => logTabBtn.click());
+  assert(host.textContent?.includes("Claude Sonnet"), "activity log renders model name");
+  assert(host.textContent?.includes("8.8%"), "activity log renders usage percentage");
+
+  // Clear filter and fetch older cursor page
+  const clearFilterBtn = host.querySelector('[data-testid="billing-day-filter"]') as HTMLButtonElement;
+  await React.act(async () => clearFilterBtn.click());
+  const nextLogBtn = Array.from(
+    host.querySelectorAll('[data-testid="billing-pagination"] button'),
+  ).find((b) => b.textContent === "Next") as HTMLButtonElement;
+  await React.act(async () => nextLogBtn.click());
+  await waitForDom(
+    React.act,
+    host,
+    () => Boolean(host.textContent?.includes("Claude Haiku")),
+    "cursor page fetched",
+  );
+
+  const eventsTabBtn = host.querySelector('[data-usage-tab="events"]') as HTMLButtonElement;
+  await React.act(async () => eventsTabBtn.click());
+  assert(host.textContent?.includes("Refill added"), "billing events tab shows refill milestone");
+  await unmount();
+
+  // 7. Overflow & Depleted lifecycle states + inactive plan renders "No active plan"
+  nextBillingPayload = {
+    ...syntheticSnapshot,
+    account: {
+      ...syntheticSnapshot.account,
+      plan: { name: "Synth Basic", status: "active", provider: "stripe", planId: "synth_basic_mo" },
+      trial: undefined,
+      usageSummary: {
+        mode: "overflow" as const,
+        cycle: { usedPercent: 100, remainingPercent: 0, resetsAt: "2026-12-01T00:00:00Z" },
+        extra: { hasReserve: true, poolRemainingPercent: 79, poolUsedPercent: 21, status: "active" as const },
+        denominatorBasis: "monthly_plan" as const,
+      },
+    },
+  };
+  unmount = await mountView(() =>
+    waitForDom(
+      React.act,
+      host,
+      () => Boolean(host.querySelector('[data-testid="billing-overflow-banner"]')),
+      "overflow billing summary",
+    ),
+  );
+  assert(Boolean(host.querySelector('[data-testid="billing-completed-cycle"]')), "completed monthly strip visible in overflow");
+  equal(
+    host.querySelector('[data-testid="billing-usage-percent"]')?.textContent?.trim(),
+    "21%",
+    "overflow promotes extra pool used %",
+  );
+  assert(host.textContent?.includes("79% remaining"), "overflow shows 79% extra remaining");
+  await unmount();
+
+  nextBillingPayload = {
+    ...syntheticSnapshot,
+    account: {
+      ...syntheticSnapshot.account,
+      plan: { name: "Synth Pro", status: "inactive" },
+      trial: { status: "expired", startedAt: "2026-11-01T00:00:00Z", deadlineAt: "2026-11-08T00:00:00Z", credit: "0.000000", tokenCap: 100000, tokensUsed: 100000 },
+      balance: { amount: "0.000000", currency: "USD" as const, low: true, zero: true, includedAmount: "0.000000", refillAmount: "0.000000" },
+      usageSummary: {
+        mode: "depleted" as const,
+        cycle: null,
+        extra: { hasReserve: false, poolRemainingPercent: 0, poolUsedPercent: 0, status: "depleted" as const },
+        denominatorBasis: "standard_month" as const,
+      },
+    },
+  };
+  unmount = await mountView(() =>
+    waitForDom(
+      React.act,
+      host,
+      () => Boolean(host.querySelector('[data-testid="billing-depleted-banner"]')),
+      "depleted billing summary",
+    ),
+  );
+  assert(
+    host.querySelector('[data-testid="billing-plan-card"]')?.textContent?.includes("No active plan"),
+    "inactive subscription does not display stale plan name",
+  );
+  assert(
+    !host.querySelector('[data-testid="billing-plan-card"]')?.textContent?.includes("Synth Pro"),
+    "stale inactive plan name is hidden",
+  );
+  await unmount();
+
+  // 8. 404 graceful degradation
   nextBillingStatus = 404;
   nextBillingPayload = { error: { code: "not_found", message: "Not found" } };
   unmount = await mountView(() =>
