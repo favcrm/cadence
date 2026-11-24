@@ -128,7 +128,9 @@ cache or exfiltrate the key. Therefore:
   exact cache hit it skips the build; on a miss it compiles the test-seam
   library and suite without running tests, then saves only dependencies
   to `gate-test-ld2` on success. It has no sccache credentials or environment.
-  `changed-tests` still restores read-only, and no main push runs the pilot.
+  Record whether a fallback cache was restored before comparing the seed's
+  build time with a cold build. `changed-tests` still restores read-only,
+  and no main push runs the pilot.
 - Every other job, including all gate jobs on `pull_request` and `merge_group`
   and on main pushes, gets only the read-only pair and no `environment:`.
 

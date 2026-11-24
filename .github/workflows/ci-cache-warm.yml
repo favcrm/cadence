@@ -127,9 +127,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: gate-test-ld2
-          # A lookup hit skips the compile without downloading; a miss still
-          # registers the action's usual dependency-only post-job save.
-          lookup-only: true
+          save-if: true
           cache-workspace-crates: false
           cache-on-failure: false
       - name: Enable the changed-tests linker
