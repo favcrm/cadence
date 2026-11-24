@@ -1,6 +1,6 @@
 {
-  "description": "AOS-714 / CAD-2710: shared valid and invalid cases for an enum view param's optional `labels`. Both readers wrap each `view` as the only entry of a screen's `views`, with navigation sections [customers, reports], and read it: Cadence cadence-core app_screen_decl validate_map, hosted apps/api readScreenViews. Keep this file byte-identical in both repos. Option-label text is refused when empty after removing Unicode White_Space characters and U+FEFF, or when it holds a control character, U+2028 or U+2029. Cases that need raw JSON (a repeated key) cannot be written here and are covered by the Cadence tests only.",
-  "version": "view-option-labels.v1",
+  "description": "AOS-714 / CAD-2710: shared valid and invalid cases for an enum view param's optional `labels`. Both readers wrap each `view` as the only entry of a screen's `views`, with navigation sections [customers, reports], and read it: Cadence cadence-core app_screen_decl validate_map, hosted apps/api readScreenViews. Keep this file byte-identical in both repos. Option-label text is refused when empty after removing Unicode White_Space characters and U+FEFF, or when it holds a control character, U+2028 or U+2029. AOS-732 (v2) adds view-level cases so the hosted reader accepts exactly what the Cadence checker accepts: a view label needs 1 to 8 locales but no `en`, an enum value may be blank, and `required: false`, `record_id: null` and `values: null` on a date or string param read as absent (see `projection`). Cases that need raw JSON (a repeated key) cannot be written here and are covered by the Cadence tests only.",
+  "version": "view-option-labels.v2",
   "sections": ["customers", "reports"],
   "valid": [
     {
@@ -324,6 +324,42 @@
             }
           }
         }
+      }
+    },
+    {
+      "name": "view label in one locale, without en",
+      "view": {
+        "id": "v",
+        "label": { "zh-TW": "損益表" },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": ["x", "y"] } }
+      }
+    },
+    {
+      "name": "view label in eight locales",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V",
+          "de": "V",
+          "es": "V",
+          "fr": "V",
+          "ja": "V",
+          "ko": "V",
+          "zh-HK": "V",
+          "zh-TW": "V"
+        },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": ["x", "y"] } }
+      }
+    },
+    {
+      "name": "blank enum value",
+      "view": {
+        "id": "v",
+        "label": { "en": "V" },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": [" ", "x"] } }
       }
     }
   ],
@@ -969,10 +1005,92 @@
           }
         }
       }
+    },
+    {
+      "name": "view label with no locale",
+      "view": {
+        "id": "v",
+        "label": {},
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": ["x", "y"] } }
+      }
+    },
+    {
+      "name": "view label in nine locales",
+      "view": {
+        "id": "v",
+        "label": {
+          "en": "V",
+          "de": "V",
+          "es": "V",
+          "fr": "V",
+          "ja": "V",
+          "ko": "V",
+          "zh-HK": "V",
+          "zh-TW": "V",
+          "it": "V"
+        },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": ["x", "y"] } }
+      }
+    },
+    {
+      "name": "view label holding U+2028",
+      "view": {
+        "id": "v",
+        "label": { "en": "P\u2028L" },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": ["x", "y"] } }
+      }
+    },
+    {
+      "name": "view label of whitespace only",
+      "view": {
+        "id": "v",
+        "label": { "zh-TW": "　" },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": ["x", "y"] } }
+      }
+    },
+    {
+      "name": "enum value holding U+2028",
+      "view": {
+        "id": "v",
+        "label": { "en": "V" },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": ["x\u2028y"] } }
+      }
+    },
+    {
+      "name": "enum param with values null",
+      "view": {
+        "id": "v",
+        "label": { "en": "V" },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": null } }
+      }
+    },
+    {
+      "name": "labels null",
+      "view": {
+        "id": "v",
+        "label": { "en": "V" },
+        "section": "reports",
+        "params": { "a": { "type": "enum", "values": ["x"], "labels": null } }
+      }
+    },
+    {
+      "name": "required null",
+      "view": {
+        "id": "v",
+        "label": { "en": "V" },
+        "section": "reports",
+        "params": { "a": { "type": "date", "required": null } }
+      }
     }
   ],
   "projection": {
-    "description": "The installation read's `views` for a bundle declaring `views_in`: the same views, `params` left out when a view declares none; `views` is null when the bundle declares no valid views.",
+    "description": "The installation read's `views` for a bundle declaring `views_in`: the same views, `params` left out when a view declares none, `required: false`, `record_id: null` and `values: null` left out; `views` is null when the bundle declares no valid views.",
     "views_in": [
       {
         "id": "labelled",
@@ -1000,7 +1118,27 @@
           "en": "Plain"
         },
         "section": "customers"
-      }
+      },
+      {
+        "id": "defaults",
+        "label": { "zh-TW": "預設" },
+        "section": "reports",
+        "record_id": null,
+        "params": {
+          "d": { "type": "date", "required": false },
+          "s": { "type": "string", "values": null }
+        }
+      },
+      [
+        "compact",
+        { "en": "Compact" },
+        "reports",
+        null,
+        {
+          "d": [{ "date": null }],
+          "a": ["enum", ["x"], true, { "x": { "en": "Preferred", "EN": "Alternate" } }]
+        }
+      ]
     ],
     "views_out": [
       {
@@ -1029,6 +1167,26 @@
           "en": "Plain"
         },
         "section": "customers"
+      },
+      {
+        "id": "defaults",
+        "label": { "zh-TW": "預設" },
+        "section": "reports",
+        "params": { "d": { "type": "date" }, "s": { "type": "string" } }
+      },
+      {
+        "id": "compact",
+        "label": { "en": "Compact" },
+        "section": "reports",
+        "params": {
+          "a": {
+            "type": "enum",
+            "values": ["x"],
+            "required": true,
+            "labels": { "x": { "EN": "Alternate", "en": "Preferred" } }
+          },
+          "d": { "type": "date" }
+        }
       }
     ]
   }
