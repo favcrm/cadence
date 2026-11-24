@@ -404,6 +404,9 @@ a `reasons` list. `delivery enqueue` answers `state: enqueued` or refuses. Read 
 | `project_mismatch` | The issue belongs to another project. |
 | `reviewer_not_bound` | The caller is not made eligible for the project. The owner runs `audit reviewers set`. |
 | `identity_unattested` | The caller has no attested GitHub login. The owner runs `audit identities set`. |
+| `reviewer_profile_not_eligible` | The calling agent's profile is not an active, enrolled agent profile. Use an active profile. |
+| `reviewer_is_author` | The agent profile worked on this ticket, so it cannot review it. Use a profile that did not. |
+| `agent_review_kind_not_allowed` | An agent files only `standards` and `spec-security` verdicts; Browser QA and combined stay with people. |
 | `409 container_required`, or a read-side `not_implemented`, `invalid_request` or 503 `capability_unavailable` on a gate verb | The board cannot serve the verb: the tenant server is older than this client. Update the tenant server first, then the client. The gate treats this as a refusal, never as "no evidence was filed", and the client never falls back to older repository-scoped evidence. |
 | A write-side 503 `capability_unavailable` | The outcome is unknown. Read the evidence back (`audit approval`, `audit verdicts`) before retrying. |
 | `gate_refused`, `head_moved`, `not_permitted` | The gate refused a rule (read its `reasons`), the PR head moved since you read it (check again at the new head), or the caller may not do this (owner verbs are owner-only). |
