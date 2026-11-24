@@ -243,6 +243,8 @@ pub const REMOTE_VERBS: &[&str] = &[
     "audit_verdicts_project",
     "audit_verdict_project",
     "audit_approve_project",
+    "review_producer",
+    "review_producer_attest",
     // CAD-2197: the operator's head-pinned acceptance of a workflow revise.
     "audit_accept_revise_project",
     "audit_reviewers_project",
@@ -293,6 +295,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_reviewers_project"
         | "audit_identities"
         | "delivery_check"
+        | "review_producer"
         | "audit_scope_project"
         | "audit_designations_project"
         | "audit_digest_project"
@@ -343,6 +346,7 @@ fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
         | "audit_identities_set"
         | "delivery_policy_set"
         | "delivery_enqueue"
+        | "review_producer_attest"
         | "audit_revoke_project"
         | "audit_approve_scope_project"
         | "audit_designate_project" => &["cli.write", "audit.approve"],
@@ -431,6 +435,7 @@ const RECONCILE_SETTINGS_GRANTS: &str = "the grant change may or may not have be
 const RECONCILE_MASTER_STATUS: &str = "the master resume may or may not have been applied — read `master status` with the same explicit --org before repeating it";
 const RECONCILE_AUDIT_APPROVE: &str = "the approval may or may not have been recorded — read `audit approval` for the same repo and head before repeating it";
 const RECONCILE_AUDIT_APPROVE_PROJECT: &str = "the approval may or may not have been recorded — read `audit approval` for the same issue, repo and head before repeating it";
+const RECONCILE_REVIEW_PRODUCER: &str = "the producer attestation may have been recorded — read `audit producer` for the same issue, repo, PR and head before repeating it";
 const RECONCILE_AUDIT_VERDICT: &str = "the verdict may or may not have been recorded — read `audit verdicts` for the same head before repeating it";
 const RECONCILE_AUDIT_REVIEWERS: &str = "the attestation may or may not have been recorded — read `audit reviewers` for the same repo before repeating it";
 const RECONCILE_AUDIT_REVIEWERS_PROJECT: &str = "the project's eligibility map may or may not have been recorded — read `audit reviewers` for the same project before repeating it";
@@ -500,6 +505,7 @@ fn cli_effect(verb: &str) -> Effect {
         | "audit_reviewers_project"
         | "audit_identities"
         | "delivery_check"
+        | "review_producer"
         | "audit_scope_project"
         | "audit_designations_project"
         | "audit_digest_project"
@@ -542,6 +548,7 @@ fn cli_effect(verb: &str) -> Effect {
         "delivery_policy_set" => mutation(RECONCILE_DELIVERY_POLICY),
         "audit_approve" => mutation(RECONCILE_AUDIT_APPROVE),
         "audit_approve_project" => mutation(RECONCILE_AUDIT_APPROVE_PROJECT),
+        "review_producer_attest" => mutation(RECONCILE_REVIEW_PRODUCER),
         "audit_verdict" | "audit_verdict_project" => mutation(RECONCILE_AUDIT_VERDICT),
         "audit_reviewers_set" => mutation(RECONCILE_AUDIT_REVIEWERS),
         "audit_reviewers_project_set" => mutation(RECONCILE_AUDIT_REVIEWERS_PROJECT),
@@ -2593,6 +2600,8 @@ pub const PROJECT_SCOPED_GATE_VERBS: &[&str] = &[
 pub const HOSTED_MERGE_GATE_VERBS: &[&str] = &[
     "delivery_check",
     "delivery_enqueue",
+    "review_producer",
+    "review_producer_attest",
     "audit_revoke_project",
     "audit_approve_scope_project",
     "audit_scope_project",

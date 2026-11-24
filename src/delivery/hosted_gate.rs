@@ -732,6 +732,85 @@ impl GateBinding {
     }
 }
 
+/// An exact-head author attestation is never an approval or a queue request.
+pub fn review_producer(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    binding: &GateBinding,
+    source: Option<&str>,
+    human_only: bool,
+    profiles: &[String],
+) -> Result<Value> {
+    let mut arguments = binding.arguments();
+    let mut profiles = profiles.to_vec();
+    profiles.sort_unstable();
+    let kind = if human_only {
+        "human-only"
+    } else {
+        "profile-assisted"
+    };
+    let verb = if let Some(source) = source {
+        if source.trim().is_empty()
+            || source.chars().any(char::is_control)
+            || human_only != profiles.is_empty()
+            || profiles.len() > 16
+            || profiles.windows(2).any(|pair| pair[0] == pair[1])
+            || profiles.iter().any(|profile| {
+                !profile.strip_prefix("ap_").is_some_and(|id| {
+                    (8..=64).contains(&id.len())
+                        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+            })
+        {
+            return Err(refuse(
+                "attest with --source and either --human-only or distinct --producer-profile ids",
+            ));
+        }
+        arguments.insert("source".into(), json!(source));
+        arguments.insert("kind".into(), json!(kind));
+        arguments.insert("profile_ids".into(), json!(profiles));
+        "review_producer_attest"
+    } else {
+        "review_producer"
+    };
+    let body = call(target, wake_timeout, verb, arguments)?;
+    if let Some(source) = source {
+        check_receipt(verb, || {
+            review_producer_answer(&body, binding, verb)?;
+            let producer = &body["producer"];
+            if producer["source"].as_str() != Some(source)
+                || producer["kind"].as_str() != Some(kind)
+                || producer["profile_ids"] != json!(profiles)
+                || body["duplicate"].as_bool().is_none()
+            {
+                return Err(refuse(
+                    "producer attestation did not echo the requested evidence",
+                ));
+            }
+            Ok(body)
+        })
+    } else {
+        review_producer_answer(&body, binding, verb)?;
+        Ok(body)
+    }
+}
+
+fn review_producer_answer(body: &Value, binding: &GateBinding, verb: &str) -> Result<()> {
+    let tuple = match body["state"].as_str() {
+        Some("recorded") if body["producer"]["profile_ids"].is_array() => &body["producer"],
+        Some("not_recorded") if verb == "review_producer" => body,
+        _ => {
+            return Err(refuse(format!(
+                "`{verb}` returned no usable producer state"
+            )))
+        }
+    };
+    if tuple["pr"].as_u64() != Some(binding.pr) {
+        return Err(refuse(format!("`{verb}` answered for another PR")));
+    }
+    binding.echoes(tuple, verb, true)
+}
+
 /// `cadence audit approval` for a hosted org: `(document, exit code)` in the
 /// local command's shape (see [`approval_answer`]). `audit_approval_project`
 /// binds the project and the issue the approval authorizes, so an approval
@@ -2448,6 +2527,25 @@ mod tests {
         json!({"state": "in-force", "project": "cadence", "issue": "CAD-1",
                "approval_id": "merge-pr7-0123456789ab", "action": "merge",
                "source": "chris on the board", "recorded_via": "operator-connection"})
+    }
+
+    #[test]
+    fn producer_readback_rejects_moved_heads_and_ambiguous_receipts() {
+        let binding = binding();
+        let mut reply = json!({
+            "state": "recorded",
+            "producer": {
+                "project": "cadence", "issue": "CAD-1", "repo": "favcrm/cadence", "pr": 7,
+                "head": HEAD, "kind": "human-only", "profile_ids": []
+            }
+        });
+        assert!(review_producer_answer(&reply, &binding, "review_producer").is_ok());
+        reply["producer"]["head"] = json!(OTHER);
+        assert!(review_producer_answer(&reply, &binding, "review_producer").is_err());
+        let mut absent = Value::Object(binding.arguments());
+        absent["state"] = json!("not_recorded");
+        assert!(review_producer_answer(&absent, &binding, "review_producer").is_ok());
+        assert!(review_producer_answer(&absent, &binding, "review_producer_attest").is_err());
     }
 
     #[test]

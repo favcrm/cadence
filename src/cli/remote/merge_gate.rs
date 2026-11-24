@@ -158,6 +158,42 @@ pub(super) fn merge_gate(
         }
         Commands::Audit {
             action:
+                Some(AuditAction::Producer {
+                    project,
+                    repo,
+                    issue,
+                    pr,
+                    head,
+                    source,
+                    human_only,
+                    profile,
+                }),
+            ..
+        } => {
+            if source.is_some() {
+                refuse_managed(target, "audit producer --source")?;
+            }
+            let binding = GateBinding::new(project, repo, issue, *pr, &full_head(head)?)?;
+            let result = hosted_gate::review_producer(
+                target,
+                wake_timeout,
+                &binding,
+                source.as_deref(),
+                *human_only,
+                profile,
+            )
+            .map_err(|error| {
+                scope_hint(
+                    error,
+                    &saved_capabilities(target),
+                    "audit.approve",
+                    "cadence login --audit-approve",
+                )
+            })?;
+            printed((result, 0))
+        }
+        Commands::Audit {
+            action:
                 Some(AuditAction::Approval {
                     pr,
                     head,
