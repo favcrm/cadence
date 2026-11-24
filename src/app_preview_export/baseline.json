@@ -1,6 +1,6 @@
 {
   "contract": "app-screen-projection-fixtures/10",
-  "artifact_sha256": "f1e119ec869899f81708735c7e344cc2c2ebac64ecc8df88d5b1b588b012b26a",
+  "artifact_sha256": "71acaa78c798af0f3b26711db5f3af529901941927f4b2372aa37b4e31d9164a",
   "golden_sha256": "1007c16866a6e0f4f1f3bcf0d141e7c19ee6817217746f28814d1254b3f360f1",
   "scenarios": [
     "empty",
