@@ -1,8 +1,15 @@
 import { useEffect, useId, useRef, useState, type FocusEvent, type KeyboardEvent, type ReactNode } from "react";
 import { closeSession } from "../features/auth/session";
+import {
+  parseHostedWorkspaces,
+  safeWorkspaceUrl,
+  type HostedWorkspacesPayload,
+} from "../features/settings/accountDisplay";
+import { privateFetch, withPrivateOperation } from "../lib/privateSession";
+import { sessionHeaders } from "../lib/sessionKey";
 import type { Meta } from "../lib/types";
 import { useLocale } from "../lib/locale";
-import { IconChevron } from "./icons";
+import { IconCheck, IconChevron } from "./icons";
 import Link from "./Link";
 
 /** The shared account menu for the desktop sidebar and mobile header. */
@@ -12,6 +19,7 @@ export default function AccountMenu({
   trigger,
   placement,
   settingsHref,
+  billingHref,
   securityHref,
   footer,
   onOpenChange,
@@ -21,6 +29,7 @@ export default function AccountMenu({
   trigger: "avatar" | "row";
   placement: "below-end" | "above-start";
   settingsHref?: string;
+  billingHref?: string;
   securityHref?: string;
   /** Slot at the end of the panel for the version line (CAD-1034). */
   footer?: ReactNode;
@@ -30,6 +39,11 @@ export default function AccountMenu({
   const panelId = useId();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [wsCache, setWsCache] = useState<{
+    sessionKeyId: string;
+    status: "ready" | "unavailable";
+    data: HostedWorkspacesPayload | null;
+  } | null>(null);
   const signingOut = useRef(false);
   const { locale, t } = useLocale();
   const rootRef = useRef<HTMLDivElement>(null);
@@ -37,6 +51,10 @@ export default function AccountMenu({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const user = meta?.session?.user;
   const name = user?.name || user?.email || user?.handle || user?.sub || "operator";
+  const hostedSessionKey =
+    meta?.hosted === true && meta?.signed_in === true
+      ? (meta.session?.id ?? "hosted")
+      : null;
 
   useEffect(() => {
     if (!open) return;
@@ -52,6 +70,29 @@ export default function AccountMenu({
     document.addEventListener("pointerdown", closeOutside);
     return () => document.removeEventListener("pointerdown", closeOutside);
   }, [open]);
+
+  useEffect(() => {
+    if (!open || hostedSessionKey === null) return;
+    if (wsCache?.sessionKeyId === hostedSessionKey) return;
+    const abort = new AbortController();
+    void withPrivateOperation(async (op) => {
+      const response = await privateFetch("/api/account/workspaces", { headers: sessionHeaders() }, op);
+      op.assertCurrent();
+      if (!response.ok) {
+        setWsCache({ sessionKeyId: hostedSessionKey, status: "unavailable", data: null });
+        return;
+      }
+      const raw: unknown = await response.json().catch(() => null);
+      op.assertCurrent();
+      const parsed = parseHostedWorkspaces(raw);
+      if (!parsed || parsed.workspaces.length === 0) {
+        setWsCache({ sessionKeyId: hostedSessionKey, status: "unavailable", data: null });
+        return;
+      }
+      setWsCache({ sessionKeyId: hostedSessionKey, status: "ready", data: parsed });
+    }, abort.signal).catch(() => undefined);
+    return () => abort.abort();
+  }, [open, hostedSessionKey, wsCache?.sessionKeyId]);
 
   if (!meta || meta.signed_in !== true) return null;
 
@@ -96,6 +137,12 @@ export default function AccountMenu({
   const roleLabel = locale !== "zh-TW" ? role : role === "operator" ? t("Operator role") : role === "member" ? t("Member role") : role;
   // CAD-1555: a read-only board says so next to the role, never just "operator".
   const accessLabel = meta.read_only ? `${roleLabel} · ${t("Read only")}` : roleLabel;
+  const workspacesPayload =
+    hostedSessionKey !== null && wsCache?.sessionKeyId === hostedSessionKey && wsCache.status === "ready"
+      ? wsCache.data
+      : null;
+  const createWorkspaceUrl = workspacesPayload ? safeWorkspaceUrl(workspacesPayload.createWorkspaceUrl) : null;
+
   return (
     <div ref={rootRef} className={avatar ? "header-control-wrap shrink-0" : "relative shrink-0"} data-account-menu onKeyDown={onKeyDown} onBlur={onBlur}>
       <button
@@ -141,10 +188,80 @@ export default function AccountMenu({
               {user?.role && <span className="chip bg-ink-800 text-ink-400 mt-1">{accessLabel}</span>}
             </div>
           </div>
+          {workspacesPayload && (
+            <>
+              <div className="my-1 border-t border-ink-700" />
+              <div className="px-2 py-1" data-workspace-switcher>
+                <p className="text-micro font-medium text-ink-500 pb-1">{t("Workspaces")}</p>
+                <div className="flex flex-col gap-0.5">
+                  {workspacesPayload.workspaces.map((ws) => {
+                    const label = locale === "zh-TW" && ws.nameZh?.trim() ? ws.nameZh.trim() : ws.name;
+                    const wsUrl =
+                      ws.current || ws.boardState !== "active"
+                        ? null
+                        : safeWorkspaceUrl(ws.boardUrl);
+                    const roleText =
+                      ws.role === "owner" ? t("Workspace owner") : t("Workspace member");
+                    if (ws.current) {
+                      return (
+                        <div
+                          key={ws.workspaceId}
+                          aria-current="true"
+                          className="flex items-center justify-between gap-2 rounded-md bg-ink-800/80 px-2 py-1.5 text-secondary text-ink-100"
+                        >
+                          <span className="truncate font-medium">{label}</span>
+                          <span className="inline-flex items-center gap-1 shrink-0 text-micro text-accent">
+                            <IconCheck size={11} />
+                            <span>{t("Current workspace")}</span>
+                          </span>
+                        </div>
+                      );
+                    }
+                    if (!wsUrl) {
+                      return (
+                        <div
+                          key={ws.workspaceId}
+                          className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-secondary text-ink-400"
+                        >
+                          <span className="truncate">{label}</span>
+                          <span className="text-micro text-ink-500 shrink-0">{roleText}</span>
+                        </div>
+                      );
+                    }
+                    return (
+                      <a
+                        key={ws.workspaceId}
+                        href={wsUrl}
+                        className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-secondary text-ink-200 hover:bg-ink-800"
+                      >
+                        <span className="truncate">{label}</span>
+                        <span className="text-micro text-ink-500 shrink-0">{roleText}</span>
+                      </a>
+                    );
+                  })}
+                </div>
+                {createWorkspaceUrl && (
+                  <a
+                    href={createWorkspaceUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-1 block rounded-md px-2 py-1.5 text-secondary text-ink-300 hover:bg-ink-800 hover:text-ink-100"
+                  >
+                    + {t("Create another workspace")}
+                  </a>
+                )}
+              </div>
+            </>
+          )}
           <div className="my-1 border-t border-ink-700" />
           {settingsHref && (
             <Link href={settingsHref} onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">
               {t("Settings")}
+            </Link>
+          )}
+          {billingHref && (
+            <Link href={billingHref} onClick={() => setOpen(false)} className="block rounded-md px-2.5 py-2 text-secondary text-ink-200 hover:bg-ink-800">
+              {t("Billing")}
             </Link>
           )}
           {securityHref && (

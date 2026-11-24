@@ -1,5 +1,6 @@
 /** The agent page's sections; the active one rides the URL as `?tab=`. */
 export const AGENT_TABS = [
+  { id: "overview", label: "Overview" },
   { id: "instructions", label: "Instructions" },
   { id: "routines", label: "Routines" },
   { id: "skills", label: "Skills" },
@@ -7,8 +8,8 @@ export const AGENT_TABS = [
   { id: "history", label: "History" },
 ] as const;
 
-/** Beyond the strip: `overview` is the chat, `settings` the gear drawer. */
-export type AgentTab = (typeof AGENT_TABS)[number]["id"] | "overview" | "settings";
+/** Beyond the strip: `settings` opens the gear drawer over the active tab. */
+export type AgentTab = (typeof AGENT_TABS)[number]["id"] | "settings";
 
 /** Where a link to a section that has moved lands. */
 const MOVED_TABS = new Map<string, AgentTab>([

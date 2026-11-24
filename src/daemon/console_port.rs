@@ -32,7 +32,7 @@ pub trait ProtectedConsoleProvider: Send + Sync {
         &self,
         caller: &RuntimeCaller,
         client_message_id: &str,
-        server_message_id: &str,
+        claim: &crate::store::NativeTurnClaim,
         turn_token: &str,
     ) -> Result<Box<dyn NativeTaskGuard>>;
     fn stop_agent(&self, agent_uid: &str, reason: &str);

@@ -81,6 +81,9 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
   const stage = effective(canvas.layout, canvas.tabs.map((x) => x.id)).panes;
   const asked = model.placement === "beside" || model.placement === "below";
   const placed = tab === undefined || !asked ? null : stage.includes(tab.id) ? "pane" : stage.length >= MAX_PANES ? "full" : null;
+  // The pane it opened next to: the one before it on the stage.
+  const anchor = placed === "pane" && tab !== undefined ? canvas.tabs.find((x) => x.id === stage[stage.indexOf(tab.id) - 1])?.title : undefined;
+  const placedText = anchor === undefined ? t("Opened in a pane") : t(model.placement === "below" ? "Opened below {view}" : "Opened beside {view}").replace("{view}", anchor);
   const moved = ref !== null && tab?.app !== undefined && !sameRoute(tab.app.route, ref.route);
   const where: ViewPlace = viewHere(model, scope) ? "here" : moved ? "moved" : ref !== null && canvas.open && canvas.active === appViewId(ref) ? "showing" : "closed";
   const state = viewState(probe.status, ref !== null, where);
@@ -123,7 +126,7 @@ export function ViewCard({ entry, density = "full" }: { entry: ThreadEntry; dens
       <p className="text-label text-ink-300 viewcard-place" title={`${model.appLabel} · ${place}`}>
         {model.appLabel} · {place}
       </p>
-      {placed === null ? null : <p className="text-label text-ink-300 viewcard-placed" data-view-placed={placed}>{placed === "pane" ? `◩ ${t("Opened in a pane")}` : t("All four panes are in use, so this opened as a background tab")}</p>}
+      {placed === null ? null : <p className="text-label text-ink-300 viewcard-placed" data-view-placed={placed}>{placed === "pane" ? `◩ ${placedText}` : t("All four panes are in use, so this opened as a background tab")}</p>}
       {params === "" ? null : <p className="text-label text-ink-300 viewcard-params" data-view-params title={params}>{params}</p>}
     </TurnCard>
   );

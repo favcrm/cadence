@@ -48,6 +48,11 @@ path = "src/bin/cadence-installer-observer/main.rs"
 name = "cadence-runtime-owner"
 path = "src/bin/cadence-runtime-owner/main.rs"
 
+# CAD-2721: keep the required CI check's entry point under protected tests/**.
+[[example]]
+name = "board_assertion_fixture"
+path = "tests/fixtures/agenticos/board_assertion_fixture.rs"
+
 [features]
 # Embed the built `ui/` SPA into the binary. Requires `bun run build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves

@@ -102,8 +102,8 @@ async function main() {
   for (let i = 0; i < 40; i++) await flush();
 
   const drawer = document.querySelector('[data-drawer="work-item"]');
-  assert(drawer, "the deep-linked work item opens over Threads");
-  assert(drawer.textContent?.includes("From Threads"), "the detail names its Threads origin");
+  assert(drawer, "the deep-linked work item opens over Channels");
+  assert(drawer.textContent?.includes("From Channels"), "the detail names its Channels origin");
   assert(drawer.textContent?.includes("Ship the queue"), "the detail shows the referenced issue");
   assert(window.location.search.includes("issue=D-5"), "the open detail is in the URL");
   assert(requests.some((r) => r.startsWith("/api/work-conversations?") && r.includes("project=cadence")), "the scoped list request keeps project=cadence");

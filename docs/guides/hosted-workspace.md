@@ -57,6 +57,7 @@ installation. It sends only a sign-in and one read, then reports each step:
 | Hosted tickets and wiki | The tenant Worker owns supported hosted reads and writes. Availability is per operation; native-only operations do not become available merely because the board is reachable. |
 | Published immutable package bytes | Hosted package storage; an exact listing/version/digest is provenance, not authority. |
 | Pure app `needs.requires` compatibility rules | Canonical Rust `crates/cadence-core`, called natively and compiled to WASM for the hosted adapter. Transport, authentication, storage and app execution are not moved into this kernel. |
+| Pure Works draft grammar and review/export gates | Canonical Rust `crates/cadence-core`, called by the native store and compiled to WASM for a hosted adapter. It judges domain input only: caller identity, stored current state, revision CAS, idempotency and export authority stay host-side. |
 
 Directory and FYI metadata do not invoke a model. A connected local agent can
 receive an explicit assignment; an FYI is not an assignment. Hosted ticket and
@@ -65,7 +66,8 @@ or unavailable hosted operation is not a reason to fall back to local state.
 
 Shared hosted work stays in its selected workspace; it is not a mirror of the
 teammate's standalone local tracker. Sharing currently extracts only the pure
-requirements kernel, not the whole daemon or CRM backend into WASM. Each adapter
+requirements and Works rules kernel, not the whole daemon or CRM backend into
+WASM. Each adapter
 must supply its actual host version and supported contracts; a shared rule result
 does not confer platform capabilities or native execution authority.
 

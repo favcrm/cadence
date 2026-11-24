@@ -946,7 +946,12 @@ impl ProviderAdapter for ClaudeAdapter {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
-        self.run_turn_slotted(prompt, None, client_message_id, on_started)
+        self.run_turn_slotted(
+            prompt,
+            None,
+            super::TurnMessage::unclaimed(client_message_id),
+            on_started,
+        )
     }
 
     /// CAD-1009: the token is minted here, before the `user` line is
@@ -956,7 +961,7 @@ impl ProviderAdapter for ClaudeAdapter {
         &self,
         prompt: &str,
         slot: Option<&str>,
-        _client_message_id: &str,
+        _message: super::TurnMessage<'_>,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         let generation = self.shared.generation.lock().unwrap().clone();

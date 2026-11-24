@@ -409,6 +409,10 @@ pub enum ScreenOperation {
     // execution stays unavailable and read-only mounts never advertise it.
     #[serde(rename = "connections.assets")]
     ConnectionsAssets,
+    // CAD-2734: owner-only hosted connect launch for an ad/app toolkit;
+    // executes host top-level redirect without exposing URLs inside the iframe.
+    #[serde(rename = "connections.connect")]
+    ConnectionsConnect,
 }
 
 impl ScreenOperation {
@@ -2322,6 +2326,21 @@ mod tests {
         assert!(!ScreenOperation::ConnectionsAssets.is_screen_read());
         assert_eq!(ScreenOperation::ConnectionsAssets.args_limit(), 16_384);
         let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &["connections.assets"]);
+        assert!(validate_map(&slot_only, &bodies).is_err());
+    }
+
+    /// CAD-2734: `connections.connect` is an owner-only hosted CALL that parses
+    /// with `records.call` alone; it is not a SLOT and not a read-only-mount verb.
+    #[test]
+    fn connections_connect_is_an_owner_call_that_parses() {
+        let bodies = BTreeMap::from([("client.js".to_string(), BODY.to_string())]);
+        let call = records_declaration(BODY, &[MAY_RECORDS_CALL], &["connections.connect"]);
+        let checked = validate_map(&call, &bodies).expect("connections.connect validates");
+        assert_eq!(checked.operations(), &[ScreenOperation::ConnectionsConnect]);
+        assert!(!ScreenOperation::ConnectionsConnect.is_slot());
+        assert!(!ScreenOperation::ConnectionsConnect.is_screen_read());
+        assert_eq!(ScreenOperation::ConnectionsConnect.args_limit(), 16_384);
+        let slot_only = records_declaration(BODY, &[MAY_RECORDS_SLOT], &["connections.connect"]);
         assert!(validate_map(&slot_only, &bodies).is_err());
     }
 

@@ -26,7 +26,7 @@ export function workItemOriginLabel(origin: WorkItemOrigin): string {
   switch (origin) {
     case "home": return "From Home";
     case "myWork": return "From My work";
-    case "threads": return "From Threads";
+    case "threads": return "From Channels";
     default: return "From the board";
   }
 }

@@ -308,3 +308,274 @@ fn uploaded_image_receipt_retains_a_bounded_asset() {
         })
         .is_err());
 }
+
+#[test]
+fn paid_image_result_requires_the_persisted_active_job_and_claim_after_reopen() {
+    use crate::store::app_records::RecordStore;
+    use crate::store::app_social_drafts::ImageSettlement;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("core.sqlite3");
+    let store = Store::open_for_schema_tests(&path).unwrap();
+    let records = RecordStore::open(dir.path(), "install1").unwrap();
+    let input = json!({"prompt": "a blue vase"});
+    let plan = json!({"prompt": "a blue vase", "size": "square"});
+    let input_digest = crate::store::app_runs::material_digest(&input);
+    let config =
+        json!({"schema": 1, "install_id": "install1", "context": null, "provider": "image"});
+    let binding = crate::store::app_bindings::config_digest("install1", None, "image", &config);
+    let spec = json!({
+        "alias": "image.generate", "slot": "image",
+        "binding_digest": binding, "input_digest": input_digest,
+        "input": input,
+        "authority": {
+            "install_id": "install1", "context_id": "context1", "slot": "image",
+            "binding": {"digest": binding, "config": config}, "inputs": plan,
+            "call_id": "call-1", "invocation_id": "call-1"
+        }
+    });
+    records
+        .app_social_generation_begin(
+            "context1",
+            "intent-1",
+            "image.generate",
+            "image",
+            &input_digest,
+            &plan,
+            &json!({"operation": "image"}),
+            "request-1",
+        )
+        .unwrap();
+    let claim = store
+        .app_tool_claim_receipt(AppToolClaim {
+            request: "request-1",
+            install: "install1",
+            alias: "image.generate",
+            slot: "image",
+            binding_digest: &binding,
+            input_digest: &input_digest,
+            call_id: "call-1",
+        })
+        .unwrap();
+    records
+        .app_social_image_job_start(
+            "context1",
+            "intent-1",
+            "request-1",
+            "call-1",
+            &spec,
+            &claim,
+            9999999999.0,
+        )
+        .unwrap();
+    drop(records);
+    drop(store);
+
+    // There is deliberately no live installation in core: the persisted
+    // pre-call evidence is enough to finish after a restart/removal.
+    let store = Store::open_for_schema_tests(&path).unwrap();
+    let records = RecordStore::open(dir.path(), "install1").unwrap();
+    let authority = records
+        .app_social_image_job_authority("call-1")
+        .unwrap()
+        .unwrap();
+    let alien = RecordStore::open(dir.path(), "install2").unwrap();
+    assert!(alien
+        .app_social_image_record_result(&store, &authority, &json!({"kind": "image"}), None,)
+        .is_err());
+    records
+        .app_social_image_job_settle_authorized(
+            &authority,
+            ImageSettlement::Uncertain {
+                reason: "uncertain",
+            },
+        )
+        .unwrap();
+    assert!(records
+        .app_social_image_job_resume("call-1", 9999999999.0)
+        .unwrap());
+    assert!(records
+        .app_social_image_record_result(&store, &authority, &json!({"kind": "image"}), None,)
+        .is_err());
+    let authority = records
+        .app_social_image_job_authority("call-1")
+        .unwrap()
+        .unwrap();
+    let receipt = records
+        .app_social_image_record_result(&store, &authority, &json!({"kind": "image"}), None)
+        .unwrap();
+    assert_eq!(receipt["id"], "call-1");
+    // Crash after retention, before settlement: replay reads the same
+    // checked receipt without a provider call.
+    drop(records);
+    drop(store);
+    let store = Store::open_for_schema_tests(&path).unwrap();
+    let records = RecordStore::open(dir.path(), "install1").unwrap();
+    let authority = records
+        .app_social_image_job_authority("call-1")
+        .unwrap()
+        .unwrap();
+    let replay = records
+        .app_social_image_result_for_job(&store, &authority)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay["id"], "call-1");
+    records
+        .app_social_image_complete(&store, &authority)
+        .unwrap();
+    assert!(records
+        .app_social_tool_receipt_contains("context1", "call-1")
+        .unwrap());
+    assert!(records
+        .app_social_image_record_result(&store, &authority, &json!({"kind": "other"}), None,)
+        .is_err());
+    assert!(records
+        .app_social_image_result_for_job(&store, &authority)
+        .is_err());
+}
+
+#[test]
+fn paid_image_job_refuses_alien_frozen_identity_and_mismatched_claims() {
+    use crate::store::app_records::RecordStore;
+
+    for field in [
+        "install",
+        "context",
+        "call",
+        "binding",
+        "config",
+        "input",
+        "plan",
+        "claim",
+        "claim_request",
+        "claim_call",
+        "claim_install",
+        "claim_input",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_for_schema_tests(&dir.path().join("core.sqlite3")).unwrap();
+        let records = RecordStore::open(dir.path(), "install1").unwrap();
+        let input = json!({"prompt": "vase"});
+        let plan = json!({"subject": "vase"});
+        let digest = crate::store::app_runs::material_digest(&input);
+        let config =
+            json!({"schema": 1, "install_id": "install1", "context": null, "provider": "image"});
+        let binding = crate::store::app_bindings::config_digest("install1", None, "image", &config);
+        let mut spec = json!({
+            "alias": "image.generate", "slot": "image",
+            "binding_digest": binding, "input_digest": digest, "input": input,
+            "authority": {
+                "install_id": "install1", "context_id": "context1", "slot": "image",
+                "binding": {"digest": binding, "config": config}, "inputs": plan,
+                "call_id": "call-1", "invocation_id": "call-1"
+            }
+        });
+        match field {
+            "install" => spec["authority"]["install_id"] = json!("install2"),
+            "context" => spec["authority"]["context_id"] = json!("context2"),
+            "call" => spec["authority"]["call_id"] = json!("call-2"),
+            "binding" => spec["authority"]["binding"]["digest"] = json!("binding-2"),
+            "config" => spec["authority"]["binding"]["config"]["provider"] = json!("other"),
+            "input" => spec["input"] = json!({"prompt": "other"}),
+            "plan" => spec["authority"]["inputs"] = json!({"subject": "other"}),
+            _ => {}
+        }
+        records
+            .app_social_generation_begin(
+                "context1",
+                "intent-1",
+                "image.generate",
+                "image",
+                &digest,
+                &plan,
+                &json!({"operation": "image"}),
+                "request-1",
+            )
+            .unwrap();
+        let claim = store
+            .app_tool_claim_receipt(AppToolClaim {
+                request: if field == "claim_request" {
+                    "request-2"
+                } else {
+                    "request-1"
+                },
+                install: if field == "claim_install" {
+                    "install2"
+                } else {
+                    "install1"
+                },
+                alias: "image.generate",
+                slot: "image",
+                binding_digest: if field == "claim" {
+                    "binding-2"
+                } else {
+                    &binding
+                },
+                input_digest: if field == "claim_input" {
+                    "other"
+                } else {
+                    &digest
+                },
+                call_id: if field == "claim_call" {
+                    "call-2"
+                } else {
+                    "call-1"
+                },
+            })
+            .unwrap();
+        assert!(
+            records
+                .app_social_image_job_start(
+                    "context1",
+                    "intent-1",
+                    "request-1",
+                    "call-1",
+                    &spec,
+                    &claim,
+                    9999999999.0,
+                )
+                .is_err(),
+            "{field}"
+        );
+        assert!(records
+            .app_social_image_job_authority("call-1")
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn paid_tool_claim_receipt_requires_a_persisted_claim_and_exact_input() {
+    let (_dir, store) = fresh();
+    let input = json!({"prompt": "vase"});
+    let digest = crate::store::app_runs::material_digest(&input);
+    let claim = AppToolClaim {
+        request: "request-1",
+        install: "install1",
+        alias: "image.generate",
+        slot: "image",
+        binding_digest: "binding-1",
+        input_digest: &digest,
+        call_id: "call-1",
+    };
+    let authority = store.app_tool_claim_receipt(claim).unwrap();
+    assert!(store
+        .app_tool_claim_receipt(AppToolClaim {
+            request: "request-2",
+            ..claim
+        })
+        .is_err());
+    assert!(authority
+        .record(&store, &json!({"prompt": "different"}), &json!({}), None)
+        .is_err());
+    let receipt = authority
+        .record(&store, &input, &json!({"kind": "image"}), None)
+        .unwrap();
+    assert_eq!(receipt["id"], "call-1");
+    assert_eq!(
+        authority
+            .record(&store, &input, &json!({"kind": "image"}), None)
+            .unwrap()["id"],
+        "call-1"
+    );
+}

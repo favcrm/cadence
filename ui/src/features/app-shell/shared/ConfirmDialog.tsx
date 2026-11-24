@@ -15,6 +15,8 @@ export default function ConfirmDialog({
   inputLabel,
   confirmLabel,
   confirmVariant = "danger",
+  role = "dialog",
+  initialFocus = "dialog",
   pending,
   error,
   onConfirm,
@@ -31,6 +33,10 @@ export default function ConfirmDialog({
   /** The confirm button's weight: `danger` (the default) for a destructive
    *  action, `primary` for one that is not, such as an approval. */
   confirmVariant?: "danger" | "primary";
+  /** Modal ARIA role (`alertdialog` for destructive removal confirms). */
+  role?: "dialog" | "alertdialog";
+  /** Initial focus when `expect` is unset (`dialog` preserves legacy focus; `cancel` safely defaults focus to Cancel). */
+  initialFocus?: "dialog" | "cancel";
   pending: boolean;
   error: string | null;
   onConfirm: () => void;
@@ -39,22 +45,34 @@ export default function ConfirmDialog({
   const t = useTranslate();
   const [typed, setTyped] = useState("");
   const inputId = useId();
+  const cancelButtonId = useId();
   const inputRef = useRef<HTMLInputElement | null>(null);
   const dialogRef = useRef<HTMLElement | null>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const gatedInput = useRef(expect !== undefined);
   gatedInput.current = expect !== undefined;
+  const focusCancel = useRef(initialFocus === "cancel");
+  focusCancel.current = initialFocus === "cancel";
   const gated = expect !== undefined ? typed.trim() === (match ?? "") : true;
 
   useEffect(() => {
     const active = document.activeElement;
     openerRef.current = active instanceof HTMLElement ? active : null;
-    (gatedInput.current ? inputRef.current : dialogRef.current)?.focus();
+    if (gatedInput.current) {
+      inputRef.current?.focus();
+    } else if (focusCancel.current) {
+      const cancelBtn = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>("button") ?? []).find(
+        (b) => b.id === cancelButtonId,
+      );
+      (cancelBtn ?? dialogRef.current)?.focus();
+    } else {
+      dialogRef.current?.focus();
+    }
     return () => {
       const opener = openerRef.current;
       if (opener?.isConnected) opener.focus();
     };
-  }, []);
+  }, [cancelButtonId]);
 
   const focusable = (): HTMLElement[] => {
     const root = dialogRef.current;
@@ -101,7 +119,7 @@ export default function ConfirmDialog({
         ref={dialogRef}
         tabIndex={-1}
         className="card s-confirm crm-confirm grid gap-3"
-        role="dialog"
+        role={role}
         aria-modal="true"
         aria-label={title}
         onKeyDown={onKeyDown}
@@ -132,7 +150,7 @@ export default function ConfirmDialog({
           </p>
         )}
         <div className="s-toolbar crm-toolbar">
-          <Button size="sm" onClick={onCancel} disabled={pending}>
+          <Button id={cancelButtonId} size="sm" onClick={onCancel} disabled={pending}>
             {t("Cancel")}
           </Button>
           <Button

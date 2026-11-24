@@ -1866,6 +1866,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=70", [])?;
                 tx.commit()?;
             }
+            if version < 71 {
+                // CAD-2711: channel chain brake, multi-agent @mention request bindings,
+                // post mention outcomes, and membership audit events. New tables only.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::human_threads::SCHEMA_V71)?;
+                tx.execute("UPDATE schema_version SET version=71", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

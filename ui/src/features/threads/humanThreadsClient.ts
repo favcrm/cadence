@@ -2,6 +2,7 @@ import { ApiError } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
+import type { MentionOutcome } from "../mentions/mentions";
 
 /**
  * CAD-1412 human rooms wire client (`/api/human-threads/*`, same origin).
@@ -40,6 +41,14 @@ export interface HumanPost {
   /** Already sanitized by the daemon (`conversations::body`). Plain text. */
   body: string;
   created: number;
+  silent: boolean;
+  outcomes: MentionOutcome[];
+}
+
+export interface HumanRoomEvent {
+  id: string;
+  text: string;
+  created: number;
 }
 
 export interface HumanRoomPage {
@@ -47,10 +56,16 @@ export interface HumanRoomPage {
   scope_id: string;
   members: HumanMember[];
   posts: HumanPost[];
+  events: HumanRoomEvent[];
   before: string | null;
   more_before: boolean;
   /** Fresh permission hint for an explicit Ask. */
   can_ask: boolean;
+  /** True when the caller is the channel creator or workspace owner. */
+  can_manage: boolean;
+  /** Consecutive agent turns since the last human message. */
+  agent_chain_count: number;
+  agent_chain_limit: number;
 }
 
 /** A current agent on the trusted catalog (`uid` is the durable id, never an alias hash). */
@@ -132,6 +147,15 @@ function opaqueCursor(value: unknown): value is string {
   return typeof value === "string" && value.startsWith("csc1_") && value.length > 5;
 }
 
+function mentionOutcome(value: unknown): value is MentionOutcome {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const o = value as Record<string, unknown>;
+  return typeof o.kind === "string"
+    && typeof o.handle === "string"
+    && typeof o.label === "string"
+    && (o.reason === undefined || typeof o.reason === "string");
+}
+
 function humanPost(value: unknown): value is HumanPost {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const post = value as Record<string, unknown>;
@@ -143,8 +167,18 @@ function humanPost(value: unknown): value is HumanPost {
     && opaqueCursor(post.read_cursor)
     && typeof post.body === "string"
     && typeof post.created === "number"
+    && typeof post.silent === "boolean"
+    && Array.isArray(post.outcomes) && post.outcomes.every(mentionOutcome)
     && (who.id === null || typeof who.id === "string")
     && typeof who.label === "string";
+}
+
+function roomEvent(value: unknown): value is HumanRoomEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const ev = value as Record<string, unknown>;
+  return typeof ev.id === "string" && ev.id.length > 0
+    && typeof ev.text === "string"
+    && typeof ev.created === "number";
 }
 
 function invalidRoomResponse(): ApiError {
@@ -164,7 +198,11 @@ export function readHumanRoom(id: string, at: { before?: string; limit?: number 
         && (member.kind === "human" || member.kind === "agent")
         && typeof member.id === "string" && typeof member.label === "string")
       || !Array.isArray(page.posts) || !page.posts.every(humanPost)
+      || !Array.isArray(page.events) || !page.events.every(roomEvent)
       || typeof page.can_ask !== "boolean"
+      || typeof page.can_manage !== "boolean"
+      || typeof page.agent_chain_count !== "number"
+      || typeof page.agent_chain_limit !== "number"
       || typeof page.more_before !== "boolean"
       || !(page.before === null || opaqueCursor(page.before))
       || (page.posts.length > 0 && page.before === null)) {
@@ -174,9 +212,18 @@ export function readHumanRoom(id: string, at: { before?: string; limit?: number 
   });
 }
 
-/** `POST /api/human-threads/rooms/<id>/posts` — a turnless post. */
-export function postHumanRoom(id: string, clientId: string, body: string): Promise<{ post: HumanPost; created: boolean }> {
-  return call<{ post: HumanPost; created: boolean }>("POST", `${roomPath(id)}/posts`, { client_id: clientId, body }).then((receipt) => {
+/** `POST /api/human-threads/rooms/<id>/posts` — post and dispatch active `@mentions` (unless `silent`). */
+export function postHumanRoom(
+  id: string,
+  clientId: string,
+  body: string,
+  silent = false,
+): Promise<{ post: HumanPost; created: boolean }> {
+  return call<{ post: HumanPost; created: boolean }>(
+    "POST",
+    `${roomPath(id)}/posts`,
+    silent ? { client_id: clientId, body, silent: true } : { client_id: clientId, body },
+  ).then((receipt) => {
     if (!humanPost(receipt.post) || typeof receipt.created !== "boolean") throw invalidRoomResponse();
     return receipt;
   });

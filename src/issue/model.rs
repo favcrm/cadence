@@ -206,6 +206,9 @@ pub struct Plan {
     /// app is still open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
+    /// CAD-224: pinned source and scope evidence for an ordinary goal-intake plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake: Option<super::plan::GoalIntake>,
 }
 
 /// Plan states, in order.

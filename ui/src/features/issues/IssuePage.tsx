@@ -13,6 +13,8 @@ import { navigate } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import SectionTabs from "../../ui/SectionTabs";
+import { buildMentionCandidates } from "../mentions/candidates";
+import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import "./issues.css";
 import KickoffDialog from "./KickoffDialog";
 import IdeaCard from "../home/IdeaCard";
@@ -152,6 +154,7 @@ function PageBody({
   tab,
   tabHref,
   issues,
+  agents,
   detail,
   history,
   lane,
@@ -180,6 +183,7 @@ function PageBody({
 }) {
   const { t } = useLocale();
   const fieldsId = useId();
+  const teammates = useWorkspaceTeammates(hosted === true);
   const items = acceptanceItems(detail.body);
   const rows = timelineRows(detail, history.data ?? []);
   const pr = prRef(detail.refs);
@@ -417,6 +421,11 @@ function PageBody({
               onWrite={onWrite}
               onError={onError}
               onOpen={onOpen}
+              mentionCandidates={buildMentionCandidates(
+                agents?.agents,
+                teammates,
+                t("Teammate · notify"),
+              )}
             />
           )}
           {activeTab === "conversation" &&

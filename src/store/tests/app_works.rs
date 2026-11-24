@@ -1,6 +1,6 @@
 use super::*;
 use crate::store::app_records::RecordStore;
-use crate::store::app_works::WorksDraft;
+use cadence_core::works::Draft;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -10,8 +10,8 @@ fn open() -> (TempDir, RecordStore) {
     (dir, store)
 }
 
-fn draft(kind: &str, title: &str, content: Value) -> WorksDraft {
-    WorksDraft::parse(&json!({
+fn draft(kind: &str, title: &str, content: Value) -> Draft {
+    Draft::parse(&json!({
         "kind": kind,
         "title": title,
         "content": content,
@@ -20,7 +20,7 @@ fn draft(kind: &str, title: &str, content: Value) -> WorksDraft {
     .unwrap()
 }
 
-fn doc(title: &str) -> WorksDraft {
+fn doc(title: &str) -> Draft {
     draft(
         "doc",
         title,
@@ -41,6 +41,12 @@ fn cad1649_create_get_review_and_export() {
     assert_eq!(created["revision"], 1);
     assert_eq!(created["reviewState"], "draft");
     assert_eq!(created["exportState"], "blocked");
+    // The canonical material and its digest are shared with every host, so a
+    // change to either must fail here: this is the pre-extraction value.
+    assert_eq!(
+        created["contentDigest"],
+        "sha256:7a524ebc8b6e56b89e928bbb226cba2140c6dab4acd83e8c4c2b40c1c31b04f0"
+    );
     let fetched = store.app_works_get("ctx-1", "retention").unwrap();
     assert_eq!(fetched["title"], "Retention");
     assert_eq!(fetched["contentDigest"], created["contentDigest"]);
@@ -154,10 +160,24 @@ fn cad1649_trash_restore_and_context_scope() {
         .app_works_create("ctx-1", &doc("Retention"), "alice", "create-1", None)
         .unwrap();
     assert_eq!(created["revision"], 1);
+    // Trash does not clear a pending review, so a review of a trashed record
+    // must refuse as missing before the revision or pending checks — and the
+    // hosted `works.review.check` reads the same host-proven trash flag.
+    store
+        .app_works_request_review("ctx-1", "retention", 1, "alice", None)
+        .unwrap();
     let trashed = store
         .app_works_trash("ctx-1", "retention", 1, "alice", "trash-1", None)
         .unwrap();
     assert_eq!(trashed["trashed"], true);
+    let error = store
+        .app_works_review("ctx-1", "retention", 1, "approve", None, "bob", None)
+        .unwrap_err();
+    assert_eq!(error.code(), Some("not_found"));
+    let error = store
+        .app_works_review("ctx-1", "retention", 2, "approve", None, "bob", None)
+        .unwrap_err();
+    assert_eq!(error.code(), Some("not_found"));
     let error = store.app_works_get("ctx-1", "retention").unwrap_err();
     assert_eq!(error.code(), Some("not_found"));
     let restored = store
@@ -180,14 +200,14 @@ fn cad1649_trash_restore_and_context_scope() {
 #[test]
 fn cad1649_invalid_content_refuses_without_write() {
     let (_dir, store) = open();
-    assert!(WorksDraft::parse(&json!({
+    assert!(Draft::parse(&json!({
         "kind": "other",
         "title": "X",
         "content": {"blocks": [{"type": "h2", "text": "X"}]},
         "tags": [],
     }))
     .is_err());
-    assert!(WorksDraft::parse(&json!({
+    assert!(Draft::parse(&json!({
         "kind": "doc",
         "title": "X",
         "content": {"blocks": [{"type": "bogus", "text": "X"}]},
@@ -237,14 +257,14 @@ fn cad1649_content_cannot_shadow_metadata() {
         "reviewedRevision": 1,
         "exportState": "ready",
     });
-    assert!(WorksDraft::parse(&json!({
+    assert!(Draft::parse(&json!({
         "kind": "doc",
         "title": "Retention",
         "content": forged.clone(),
         "tags": [],
     }))
     .is_err());
-    assert!(WorksDraft::parse(&json!({
+    assert!(Draft::parse(&json!({
         "kind": "doc",
         "title": "Retention",
         "content": {"blocks": [{"type": "h2", "text": "Retention", "author": "mallory"}]},

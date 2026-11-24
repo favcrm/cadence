@@ -540,8 +540,8 @@ impl Shared {
                 continue;
             }
             match self.take_app_aware(alias)? {
-                Take::Stop => return Ok(()),
-                Take::Empty => {
+                (Take::Stop, _) => return Ok(()),
+                (Take::Empty, _) => {
                     if adapter.disconnected() {
                         // Submitted PTY messages may have reached the
                         // provider; fence them rather than replay.
@@ -553,7 +553,7 @@ impl Shared {
                     ctl.wake
                         .wait_if_unchanged(ticket, Instant::now() + self.idle_poll);
                 }
-                Take::Message(message) => {
+                (Take::Message(message), claim) => {
                     // A gate refusal requeues the same message, so its
                     // proven render-miss budget must survive the wait. If a
                     // queued row was cancelled while waiting, start the next
@@ -742,7 +742,7 @@ impl Shared {
                             let first = adapter.run_turn_slotted(
                                 &prompt,
                                 slot.as_deref(),
-                                &message.id,
+                                adapter::TurnMessage::from_actor(&message.id, claim.as_ref()),
                                 &on_started,
                             )?;
                             let reset = if nudge {
@@ -819,7 +819,7 @@ impl Shared {
                             adapter.run_turn_slotted(
                                 &prompt,
                                 slot.as_deref(),
-                                &message.id,
+                                adapter::TurnMessage::from_actor(&message.id, claim.as_ref()),
                                 &on_started,
                             )
                         });

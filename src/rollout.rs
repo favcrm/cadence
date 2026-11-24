@@ -163,7 +163,12 @@ pub use migration::{
 /// v70 (CAD-2019 / CAD-2316 / CAD-2022) adds
 /// `business_template_versions.source_format` (docx/html/authoring) and
 /// `business_documents.has_unresolved_pricing`.
-pub const SCHEMA_VERSION: i64 = 70;
+///
+/// v71 (CAD-2711) adds `human_room_state`, `human_room_post_requests`,
+/// `human_room_post_meta`, and `human_room_events` for unified `@mention`
+/// outcomes, Human-Turn Brake counters, multi-agent request bindings, and
+/// channel membership audit events.
+pub const SCHEMA_VERSION: i64 = 71;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

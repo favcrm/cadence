@@ -109,7 +109,7 @@ export type Screen = Route["screen"];
 export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
   { screen: "myWork", label: "My work", route: { screen: "myWork" } },
-  { screen: "threads", label: "Threads", route: { screen: "threads" } },
+  { screen: "threads", label: "Channels", route: { screen: "threads" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "overview" } },
   { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
   // CAD-2286: hosted only; App hides it unless the capability probe answers available.
@@ -299,7 +299,7 @@ export function matchRoute(pathname: string): Route {
       const profileId = segment(b);
       if (profileId && /^ap_[A-Za-z0-9_-]+$/.test(profileId)) return { screen: "agents", alias: null, profileId };
     }
-    if (head === "threads" && !a) return { screen: "threads" };
+    if ((head === "threads" || head === "channels") && !a) return { screen: "threads" };
     if (head === "setup" && !a) return { screen: "setup" };
     if (head === "login" && !a) return { screen: "login" };
     // `?item=<effect_id>` deep-links one published item (CAD-546).

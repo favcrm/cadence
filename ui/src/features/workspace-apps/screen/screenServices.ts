@@ -224,6 +224,25 @@ export type HostCommand = { operation: string; args: ActionArgs; conversation_id
 export type ScreenRefusalReason = { status: number; code: string | null };
 export interface RecordHost { current(): boolean; command(command: HostCommand): void; refused(reason?: ScreenRefusalReason): void }
 
+/** Validate a `connections.connect` host_command payload (`{ url: "https://..." }` only). */
+export function hostedConnectCommandUrl(args: Record<string, unknown>): string | null {
+  const keys = Object.keys(args);
+  if (keys.length !== 1 || keys[0] !== "url") return null;
+  const raw = args.url;
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 4096) return null;
+  for (let i = 0; i < raw.length; i += 1) {
+    const code = raw.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return null;
+  }
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
 /** One admitted mount; no caller-selected native route or RPC. */
 export function recordServices(receipt: MountReceipt, domain: string, host: RecordHost) {
   const csv = new Map<string, { token: string; expires: number }>();
@@ -309,7 +328,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
           data = { state: "uncertain" };
         }
         if (WRITES.has(operation)) invalidateDisplay(domain);
-        else if (operation !== "catalog.status" && receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
+        else if (operation !== "catalog.status" && operation !== "connections.connect" && receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
         return { ok: true, data };
       } catch (error) {
         const refusal = failed(error, operation);

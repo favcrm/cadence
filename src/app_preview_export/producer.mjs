@@ -247,6 +247,7 @@ var RECORD_CALL_VERBS = [
 	"calendar.query",
 	"routines.list",
 	"connections.assets",
+	"connections.connect",
 	"catalog.call",
 	"catalog.status"
 ];

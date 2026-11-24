@@ -170,6 +170,8 @@ feed([fc("a")]);
 feed([fc("b", "beside")]);
 assert(card("b", "beside").includes('data-view-placed="pane"'), "the card says it opened in a pane");
 assert(!card("a").includes("data-view-placed"), "a card with no placement says nothing");
+assert(/Opened beside [^<]+</.test(card("b", "beside")), "CAD-2682: the card names the view it opened beside");
+assert(!card("b", "beside").includes("Opened in a pane"), "CAD-2682: the generic wording is only the fallback");
 feed([fc("c", "beside"), fc("d", "beside")]);
 feed([fc("e", "beside", "t4")]);
 assert(card("e", "beside").includes('data-view-placed="full"'), "with four panes the card says it opened as a background tab");

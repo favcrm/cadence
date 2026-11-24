@@ -528,6 +528,8 @@ either a scoped page or a proven operator's numeric page; an older daemon that
 does neither is refused. Native scoped acknowledgement holds the tracker and
 slot guards while rechecking identity, project access, monitor
 coverage and private-job denials in the same transaction as the alert write.
+The response's scoped acknowledgement token is encoded before commit; if
+encoding fails, the alert and its acknowledgement event stay unchanged.
 This serializes supported authority changes; it does not isolate an agent that
 can modify the same user's files or database directly.
 

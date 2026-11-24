@@ -7,7 +7,12 @@ import {
 } from "../src/features/workspace-apps/screen/screenProtocol";
 import { parseMount, ScreenChannel, type MountReceipt } from "../src/features/workspace-apps/screen/screenLifecycle";
 import { READ_ONLY_OPERATIONS, readOnlyReceipt } from "../src/features/workspace-apps/screen/screenReadOnly";
-import { recordServices, SCREEN_READ_VERBS } from "../src/features/workspace-apps/screen/screenServices";
+import {
+  hostedConnectCommandUrl,
+  recordServices,
+  SCREEN_READ_VERBS,
+  type HostCommand,
+} from "../src/features/workspace-apps/screen/screenServices";
 
 // CAD-2706: `connections.assets` is an owner-only CALL verb (not a SLOT, and
 // excluded from the read-only screen allowlist). Only `fetch` is supplied to
@@ -132,6 +137,65 @@ async function run(): Promise<void> {
   assert.equal(requests[0].operation, VERB, "operation forwarded verbatim");
   assert.equal(requests[0].args.toolkit, "metaads", "toolkit forwarded verbatim");
   assert.equal(refused, 0, "the mount is not retired");
+
+  // CAD-2734: `connections.connect` is an owner-only CALL verb (never a SLOT or read-only verb)
+  const CONNECT_VERB = "connections.connect" as const;
+  assert.ok((RECORD_CALL_VERBS as readonly string[]).includes(CONNECT_VERB), `${CONNECT_VERB} is a CALL verb`);
+  assert.equal((RECORD_SLOT_VERBS as readonly string[]).includes(CONNECT_VERB), false, `${CONNECT_VERB} is never a SLOT`);
+  assert.equal(SCREEN_READ_VERBS.has(CONNECT_VERB), false, `${CONNECT_VERB} is not in SCREEN_READ_VERBS`);
+  assert.equal(READ_ONLY_OPERATIONS.includes(CONNECT_VERB), false, `${CONNECT_VERB} is not in READ_ONLY_OPERATIONS`);
+  assert.equal(recordArgsLimit(CONNECT_VERB), 16384, "connections.connect keeps the default argument limit");
+
+  const connectReceipt: MountReceipt = { ...receipt, operations: ["records.list", CONNECT_VERB] };
+  assert.equal(
+    JSON.stringify(readOnlyReceipt(connectReceipt).operations),
+    JSON.stringify(["records.list"]),
+    "a read-only mount strips connections.connect",
+  );
+  const parsedConnect = parseChild(
+    { v: 2, op: "call", id: "k2", verb: CONNECT_VERB, args: { toolkit: "metaads", section: "accounts" } },
+    [CONNECT_VERB],
+  );
+  assert.ok(parsedConnect !== null && parsedConnect.op === "call" && parsedConnect.verb === CONNECT_VERB, "connections.connect parses as a granted call");
+
+  // hostedConnectCommandUrl accepts https URLs and refuses non-https, extra keys, or controls.
+  assert.equal(hostedConnectCommandUrl({ url: "https://connect.composio.dev/link/123" }), "https://connect.composio.dev/link/123");
+  assert.equal(hostedConnectCommandUrl({ url: "http://connect.composio.dev/link/123" }), null, "http URL refused");
+  assert.equal(hostedConnectCommandUrl({ url: "javascript:alert(1)" }), null, "javascript URL refused");
+  assert.equal(hostedConnectCommandUrl({ url: "https://example.com/a\nb" }), null, "control char refused");
+  assert.equal(hostedConnectCommandUrl({ url: "https://example.com/", extra: 1 }), null, "extra key refused");
+
+  const hostedRedirectUrl = "https://connect.composio.dev/link/metaads-session";
+  globalThis.fetch = ((url: string, init?: RequestInit) => {
+    assert.equal(url, "/api/app-screen-services/call", "connections.connect uses service call route");
+    const body = JSON.parse(String(init?.body));
+    requests.push({ operation: body.operation, args: body.args });
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          started: true,
+          toolkit: "metaads",
+          host_command: { operation: CONNECT_VERB, args: { url: hostedRedirectUrl } },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+  }) as typeof fetch;
+
+  const hostCommands: HostCommand[] = [];
+  const connectServices = recordServices(connectReceipt, "ads-connect-domain", {
+    current: () => true,
+    refused: () => { refused += 1; },
+    command: c => { hostCommands.push(c); },
+  });
+  const connectReply = await connectServices.call(CONNECT_VERB, { toolkit: "metaads", section: "accounts" });
+  if (!connectReply.ok) throw new Error("connections.connect must resolve ok");
+  assert.equal(hostCommands.length, 1, "host_command delivered to host callback");
+  assert.equal(hostCommands[0].operation, CONNECT_VERB, "host_command names connections.connect");
+  assert.equal(hostCommands[0].args.url, hostedRedirectUrl, "host_command carries the https URL");
+  const stripped = connectReply.data as Record<string, unknown>;
+  assert.equal("host_command" in stripped, false, "host_command is stripped before reaching the iframe");
+  assert.equal(refused, 0, "the connect mount is not retired");
 }
 
 run().catch(error => { throw error; });

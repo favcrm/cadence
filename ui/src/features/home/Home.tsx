@@ -9,7 +9,11 @@ import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
+import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
+import { buildMentionCandidates } from "../mentions/candidates";
+import { HomeMentionHandoffCard, useHomeMentionHandoff } from "../mentions/HomeMentionHandoff";
+import { useWorkspaceTeammates } from "../mentions/useWorkspacePeople";
 import {
   composerBlock,
   kvRows,
@@ -109,6 +113,12 @@ const EXAMPLES = [
   "Plan a small feature for one of my projects and show me the tickets before anyone starts.",
   "What is every agent working on right now, and is anything stuck?",
   "Summarise what changed on the tracker since yesterday.",
+];
+
+const DAY0_EXAMPLES = [
+  "Help me set up my first project and break down the initial milestones.",
+  "Draft a weekly operating plan for my team and turn the key tasks into tickets.",
+  "What can you help me organize, automate, and track in this workspace?",
 ];
 
 
@@ -537,15 +547,24 @@ function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean 
   );
 }
 
-function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabled: boolean }) {
+function Examples({
+  onPick,
+  disabled,
+  workspaceEmpty = false,
+}: {
+  onPick: (text: string) => void;
+  disabled: boolean;
+  workspaceEmpty?: boolean;
+}) {
   const t = useTranslate();
   const actor = useAssistantActor();
+  const list = workspaceEmpty ? DAY0_EXAMPLES : EXAMPLES;
   return (
     <div className="card px-4 py-4" data-empty="thread">
       <h2 className="text-cardtitle font-semibold text-ink-100">{`${t("Ask")} ${displayName(actor.read, actor.scope, t)}`}</h2>
       <p className="text-secondary text-ink-400 mt-1">{t("No conversation yet. Try one of these:")}</p>
       <div className="mt-3 grid gap-2">
-        {EXAMPLES.map((ex) => (
+        {list.map((ex) => (
           <button
             key={ex}
             disabled={disabled}
@@ -776,6 +795,7 @@ export default function Home({
   credentialRequestsEnabled = true,
   templateReviewEnabled = false,
   templateReviewCanApprove = false,
+  workspaceEmpty = false,
 }: {
   readOnly: boolean;
   privateChat?: boolean;
@@ -815,6 +835,8 @@ export default function Home({
    *  panel below the Assistant heading so the Needs-you rail beside it
    *  keeps the workspace's top edge. */
   setupNotice?: ReactNode;
+  /** True when the workspace has zero projects, agents, and profiles yet. */
+  workspaceEmpty?: boolean;
 }) {
   // `?chat=assistant` is a UI-mode selector only — it names the signed-in
   // user's OWN private assistant, never another actor. It changes no actor
@@ -881,6 +903,7 @@ export default function Home({
         templateRail={review.rail}
         templateCount={review.pendingCount}
         templateList={review.templateList}
+        workspaceEmpty={workspaceEmpty}
       />
       {review.drawer}
     </>
@@ -905,6 +928,7 @@ function MasterHome({
   templateRail,
   templateCount,
   templateList,
+  workspaceEmpty = false,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
@@ -922,10 +946,12 @@ function MasterHome({
   permissionsHref: string;
   resolveAppPath: (installId: string) => string | null;
   setupNotice?: ReactNode;
+  workspaceEmpty?: boolean;
 }) {
   const t = useTranslate();
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
+  const teammates = useWorkspaceTeammates(hosted === true);
   const master = useQuery(resources.masterState);
   const [seed, setSeed] = useState<{ text: string; n: number; refs?: ThreadRef[] }>({
     text: "",
@@ -960,6 +986,11 @@ function MasterHome({
   const dockRef = useRef<HTMLDivElement | null>(null);
   /** Older history just paged in above: not an arrival, never a pill. */
   const earlierLanded = useRef(false);
+  const homeMentionCandidates = useMemo(
+    () => buildMentionCandidates(agents.data?.agents, teammates, t("Teammate · consent to share"), MASTER),
+    [agents.data?.agents, teammates, t],
+  );
+  const mentionHandoff = useHomeMentionHandoff(homeMentionCandidates, dockRef);
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
@@ -1753,7 +1784,11 @@ function MasterHome({
             )}
             {thread.data?.cloudWithheld == null && empty && !showNotStarted && bootstrapCardIdentity === null && (
               <div className="chat-empty">
-                <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
+                <Examples
+                  onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))}
+                  disabled={!!block}
+                  workspaceEmpty={workspaceEmpty}
+                />
               </div>
             )}
 
@@ -1881,13 +1916,23 @@ function MasterHome({
               stop={canStop ? { onStop: () => { if (runningMessage) runTurnCommand("stop", runningMessage); } } : null}
               textareaId={HOME_COMPOSER_ID}
               onArrowUpEmpty={turnBar.kind === "approval" && pendingPermission !== null ? focusApprovalBar : undefined}
+              mentionCandidates={homeMentionCandidates}
+              allowNote
+              onDraftChange={mentionHandoff.onDraftChange}
+              beforeSend={mentionHandoff.beforeSend}
               attachEnabled={canAttach}
               attachDestination={attachDestination}
               attachReason={readOnly
-                ? "The board is read-only."
+                ? t("The board is read-only.")
                 : missing
-                  ? "The Master conversation is unavailable."
-                  : "A Home conversation must be ready before attaching files."}
+                  ? t("The Master conversation is unavailable.")
+                  : t("A Home conversation must be ready before attaching files.")}
+            />
+            <HomeMentionHandoffCard
+              teammates={mentionHandoff.mentionedTeammates}
+              sendBlockedForConsent={mentionHandoff.handoffHold}
+              onOpenChannels={() => navigate("/threads")}
+              onKeepPrivate={mentionHandoff.onKeepPrivate}
             />
           </div>
         </div>

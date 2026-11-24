@@ -55252,7 +55252,7 @@ function withSummaryBudget(input) {
     return input;
   return { ...input, [field]: SUMMARY_MAX_OUTPUT_TOKENS };
 }
-var SUMMARY_INSTRUCTION = "Keep the user's goals, decisions, preferences, facts about their business and open tasks. " + `Do not record tool errors, refusals, retries or "X doesn't work" as lasting facts or as instructions; ` + "at most say that an earlier attempt to do X failed and to try again normally. " + "Do not copy tool-call argument shapes into the summary.";
+var SUMMARY_INSTRUCTION = "Keep the user's goals, decisions, preferences, facts about their business and open tasks. " + `Do not record tool errors, refusals, retries or "X doesn't work" as lasting facts or as instructions; ` + "at most say that an earlier attempt to do X failed and to try again normally. " + "For tool calls this replaces the request to preserve exact error messages: do not quote a tool's error code, " + "error text or loop-guard message, and do not copy tool-call argument shapes into the summary.";
 function withSummaryInstruction(input) {
   const source = summarySource(input);
   if (source === null)

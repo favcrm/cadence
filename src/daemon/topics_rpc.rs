@@ -351,20 +351,66 @@ impl Shared {
             .store
             .topic(topic_key)?
             .ok_or_else(|| Error::rejected("Unknown topic"))?;
+        self.enforce_member_turn_topic_scope(&caller, &topic, "topic_publish")?;
         let text = required_str(params, "text")?;
         let client_id = required_str(params, "id")?;
         identifier(client_id, "post ID")?;
         if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
             let uid = self.human_room_agent(&caller, "topic_publish")?;
             let org = crate::board_identity::read_config(&self.state_dir)?.company;
-            let (post, fresh) = self
+            let receipt = self
                 .store
                 .human_agent_post(&org, &uid, &topic.id, client_id, text)?;
+            let existing_meta = self.store.human_room_post_meta(&receipt.post.id)?;
+            if !receipt.fresh && existing_meta.is_some() {
+                let stored = existing_meta.unwrap_or_default();
+                return Ok(json!({
+                    "topic": topic.id,
+                    "message": receipt.post.id,
+                    "duplicate": true,
+                    "deliveries": [],
+                    "outcomes": stored.outcomes,
+                    "chain_count": receipt.chain_count,
+                    "chain_limit": receipt.chain_limit,
+                }));
+            }
+            let sender_alias = self
+                .store
+                .alias_of_uid(&uid)?
+                .ok_or_else(|| Error::rejected("Agent not found"))?;
+            let hop_member_origin = self
+                .store
+                .running_channel_authority(&sender_alias)?
+                .and_then(|turn| (turn.authority_mode == "member").then_some(turn.origin_actor));
+            let org_principals = self.store.org_human_principals(&org)?;
+            let resolved = self.resolve_and_dispatch_channel_mentions(
+                super::human_threads_rpc::ChannelMentionDispatchArgs {
+                    org: &org,
+                    room: &receipt.room,
+                    room_kind: crate::store::human_threads::KIND_MIXED_GROUP,
+                    topic: &topic.id,
+                    post_id: &receipt.post.id,
+                    client_id,
+                    body: text,
+                    explicit_silent: false,
+                    mode: super::human_threads_rpc::ChannelMentionMode::AgentHop {
+                        sender_agent_uid: &uid,
+                        sender_alias: &sender_alias,
+                        hop_member_origin: hop_member_origin.as_deref(),
+                        chain_count: receipt.chain_count,
+                        chain_limit: receipt.chain_limit,
+                        org_principals: &org_principals,
+                    },
+                },
+            )?;
             return Ok(json!({
                 "topic": topic.id,
-                "message": post.id,
-                "duplicate": !fresh,
-                "deliveries": [],
+                "message": receipt.post.id,
+                "duplicate": false,
+                "deliveries": resolved.deliveries,
+                "outcomes": resolved.meta.outcomes,
+                "chain_count": receipt.chain_count,
+                "chain_limit": receipt.chain_limit,
             }));
         }
         self.may_use_topic(&caller, &topic, "topic_publish")?;
@@ -544,6 +590,46 @@ impl Shared {
         }))
     }
 
+    fn enforce_member_turn_topic_scope(
+        &self,
+        caller: &crate::peer::AgentCaller,
+        topic: &crate::store::Topic,
+        verb: &str,
+    ) -> Result<()> {
+        let crate::peer::AgentCaller::Agent(alias) = caller else {
+            return Ok(());
+        };
+        let Some(turn) = self.store.running_channel_authority(alias)? else {
+            return Ok(());
+        };
+        if turn.authority_mode != "member" {
+            return Ok(());
+        }
+        if topic.kind != crate::store::human_threads::ROOM_TOPIC_TYPE
+            || turn.topic_id.as_deref() != Some(topic.id.as_str())
+        {
+            return Err(Error::invalid(
+                "member_authority_refused",
+                format!(
+                    "{verb} refused: member channel turn is restricted to its originating channel"
+                ),
+            ));
+        }
+        let org = crate::board_identity::read_config(&self.state_dir)?.company;
+        if !self
+            .store
+            .human_is_active_member_of_topic(&org, &turn.origin_actor, &topic.id)?
+        {
+            return Err(Error::invalid(
+                "member_authority_refused",
+                format!(
+                    "{verb} refused: originating channel member no longer has access to this channel"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// `topic_read {topic, tail?|before?|after?, limit?}` — the shared
     /// transcript page. Read-only, and a non-member agent is refused.
     pub(super) fn rpc_topic_read(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -559,6 +645,7 @@ impl Shared {
             .store
             .topic(topic_key)?
             .ok_or_else(|| Error::rejected("Unknown topic"))?;
+        self.enforce_member_turn_topic_scope(&caller, &topic, "topic_read")?;
         let limit = optional_i64(params, "limit").unwrap_or(50);
         if !(1..=crate::store::THREAD_PAGE_MAX).contains(&limit) {
             return Err(Error::rejected(format!(

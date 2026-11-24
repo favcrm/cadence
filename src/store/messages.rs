@@ -6,11 +6,35 @@ use crate::proto::identifier;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::agents::Agent;
 use super::schema::Take;
 use super::StoreConn;
 use super::{now, Sender, Store};
+
+/// Proof of this Store's exact durable take, not merely a message id.
+/// Only the actor's take can produce this value; ordinary reads cannot.
+pub(crate) struct NativeTurnClaim {
+    store: Arc<super::seal::GuardState>,
+    agent_uid: String,
+    message_seq: i64,
+    submission_seq: i64,
+}
+
+impl NativeTurnClaim {
+    pub(super) fn belongs_to(&self, store: &Store, uid: &str, message_seq: i64) -> bool {
+        Arc::ptr_eq(&self.store, &store.seal_state)
+            && self.agent_uid == uid
+            && self.message_seq == message_seq
+    }
+
+    pub(super) fn submission_seq(&self) -> i64 {
+        self.submission_seq
+    }
+}
+
+pub(crate) type ActorTake = (Take, Option<NativeTurnClaim>);
 
 // Deterministic cost evidence for recurring read paths. Thread-local so
 // unrelated parallel tests cannot add to a caller's measurement.
@@ -898,6 +922,59 @@ impl Store {
         selection: Option<IssueSelection>,
         request_post: Option<&str>,
     ) -> Result<(bool, String)> {
+        self.enqueue_steered_for_with_channel_binding(
+            alias,
+            expected_uid,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            steer,
+            refs,
+            app,
+            attachments,
+            conversation,
+            human,
+            media_refs,
+            authorized_until,
+            selection,
+            request_post,
+            None,
+        )
+    }
+
+    /// Variant of [`Self::enqueue_steered_for_with_conversation`] that binds a
+    /// channel/ticket `@mention` provenance row atomically inside the enqueue write tx
+    /// before any caller wakes the agent.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_steered_for_with_channel_binding(
+        &self,
+        alias: &str,
+        expected_uid: Option<&str>,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        conversation: Option<&str>,
+        human: Option<&Value>,
+        media_refs: Option<&Value>,
+        authorized_until: Option<f64>,
+        selection: Option<IssueSelection>,
+        request_post: Option<&str>,
+        channel_binding: Option<super::human_threads::ChannelPostRequestBinding<'_>>,
+    ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             if let Some(uid) = expected_uid {
@@ -966,6 +1043,19 @@ impl Store {
             )?;
             if let Some(post) = request_post {
                 super::topics::bind_request_in(&tx, post, id)?;
+            }
+            if let Some(cb) = channel_binding {
+                if cb.bind_primary_topic_post {
+                    super::topics::bind_request_in(&tx, cb.post_id, id)?;
+                }
+                Self::human_room_bind_post_request_in(
+                    &tx,
+                    cb.post_id,
+                    cb.agent_uid,
+                    id,
+                    cb.origin_actor,
+                    cb.authority_mode,
+                )?;
             }
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
@@ -2213,11 +2303,29 @@ impl Store {
         alias: &str,
         proof: Option<(&str, &str)>,
     ) -> Result<Take> {
+        self.take_queued_inner(alias, proof, false)
+            .map(|(take, _)| take)
+    }
+
+    pub(crate) fn take_queued_for_actor(
+        &self,
+        alias: &str,
+        proof: Option<(&str, &str)>,
+    ) -> Result<ActorTake> {
+        self.take_queued_inner(alias, proof, true)
+    }
+
+    fn take_queued_inner(
+        &self,
+        alias: &str,
+        proof: Option<(&str, &str)>,
+        actor: bool,
+    ) -> Result<ActorTake> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
             if !agent.enabled {
-                return Ok(Take::Stop);
+                return Ok((Take::Stop, None));
             }
             // CAD-250: the actor serializes report-owing turns. While one is
             // `running` (delivered, its report still owed), only routed
@@ -2263,7 +2371,7 @@ impl Store {
                     // been failed as unresolved before the queue became empty.
                     // Commit that durable evidence even though no message is
                     // returned to the actor.
-                    return Ok(Take::Empty);
+                    return Ok((Take::Empty, None));
                 };
                 if message.source == "app_run_dispatch" {
                     let (expected, bundle) = proof.ok_or_else(|| {
@@ -2346,7 +2454,16 @@ impl Store {
                     params![now(), alias],
                 )?;
                 Self::event(&tx, alias, "submitting", json!({"message": message.id}))?;
-                return Ok(Take::Message(Box::new(message)));
+                let claim = (actor && agent.provider == "pi" && agent.endpoint_kind == "managed")
+                    .then(|| NativeTurnClaim {
+                        store: Arc::clone(&self.seal_state),
+                        agent_uid: agent.uid,
+                        message_seq: message.seq,
+                        // This is the submitting row just inserted above. It
+                        // distinguishes retries even at identical clock ticks.
+                        submission_seq: tx.last_insert_rowid(),
+                    });
+                return Ok((Take::Message(Box::new(message)), claim));
             }
         })
     }

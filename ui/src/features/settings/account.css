@@ -214,3 +214,174 @@
     padding: 0.75rem;
   }
 }
+
+/* Hosted self-service billing extensions */
+.billing-section {
+  margin-block-end: 1.5rem;
+}
+.billing-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.billing-unit {
+  font-size: var(--text-label);
+  font-weight: 500;
+  color: var(--color-ink-400);
+}
+.billing-split-bar {
+  display: flex;
+  inline-size: 100%;
+  block-size: 0.5rem;
+  border-radius: 9999px;
+  overflow: hidden;
+  background: var(--color-ink-800);
+  margin-block-start: 0.875rem;
+}
+.billing-split-included {
+  background: var(--color-accent);
+  block-size: 100%;
+}
+.billing-split-refill {
+  background: color-mix(in oklab, var(--color-ink-300) 65%, transparent);
+  block-size: 100%;
+}
+.billing-split-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+  margin-block-start: 0.625rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.billing-split-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+.billing-swatch {
+  inline-size: 0.5rem;
+  block-size: 0.5rem;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+.billing-swatch[data-kind="included"] {
+  background: var(--color-accent);
+}
+.billing-swatch[data-kind="refill"] {
+  background: color-mix(in oklab, var(--color-ink-300) 65%, transparent);
+}
+.billing-card-actions {
+  margin-block-start: 0.875rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.billing-trial-meta {
+  margin-block-start: 0.5rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.billing-interval-toggle {
+  display: inline-flex;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  padding: 0.125rem;
+  background: var(--color-ink-850);
+  gap: 0.125rem;
+}
+.billing-interval-btn {
+  border-radius: 0.375rem;
+  padding: 0.25rem 0.625rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+  cursor: pointer;
+}
+.billing-interval-btn[aria-pressed="true"] {
+  background: var(--color-ink-700);
+  color: var(--color-ink-100);
+  font-weight: 500;
+}
+.billing-catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13.5rem, 1fr));
+  gap: 0.75rem;
+}
+.billing-catalog-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 0.875rem;
+  padding: 1.125rem;
+  min-inline-size: 0;
+}
+.billing-catalog-card[data-current="true"] {
+  border-color: var(--color-accent);
+}
+.billing-price-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.375rem 0.5rem;
+  margin-block-start: 0.375rem;
+}
+.billing-price-usd {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--color-ink-100);
+  font-variant-numeric: tabular-nums;
+}
+.billing-price-period,
+.billing-price-hkd {
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.billing-included-credits {
+  margin-block-start: 0.375rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-300);
+}
+.billing-disclosure {
+  margin-block-start: 0.625rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-500);
+}
+.billing-notice-ok {
+  border-inline-start-color: var(--color-accent);
+}
+.sidebar-billing-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.4375rem 0.625rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+  font-size: var(--text-label);
+  color: var(--color-ink-200);
+  text-decoration: none;
+  min-inline-size: 0;
+}
+.sidebar-billing-pill:hover {
+  border-color: var(--color-ink-600);
+  background: var(--color-ink-800);
+}
+.sidebar-billing-pill[data-low="true"] {
+  border-color: color-mix(in oklab, var(--color-warn) 55%, var(--color-ink-700));
+}
+.sidebar-billing-pill-plan {
+  font-weight: 500;
+  color: var(--color-ink-100);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sidebar-billing-pill-credits {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-ink-400);
+  white-space: nowrap;
+  flex-shrink: 0;
+}

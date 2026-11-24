@@ -133,6 +133,7 @@ export function reduceSelectKey(
   key: string,
   now: number,
   mods: KeyMods = {},
+  keepOpen = false,
 ): KeyResult {
   const list = filterOptions(options, searchOn ? model.query : "");
 
@@ -174,7 +175,7 @@ export function reduceSelectKey(
     }
     const option = list[model.active];
     if (!canPick(option)) return { model, pick: null, prevent: true };
-    return { model: closedSelect(), pick: option.value, prevent: true };
+    return { model: keepOpen ? { ...model } : closedSelect(), pick: option.value, prevent: true };
   }
 
   if (key.length === 1 && !mods.meta && !mods.ctrl && !mods.alt && !searchOn) {
@@ -217,9 +218,9 @@ export function reduceOutside(model: SelectModel): SelectModel {
   return closedSelect();
 }
 
-export function reducePick(model: SelectModel, option: SelectOption | undefined): KeyResult {
+export function reducePick(model: SelectModel, option: SelectOption | undefined, keepOpen = false): KeyResult {
   if (!canPick(option)) return { model, pick: null, prevent: true };
-  return { model: closedSelect(), pick: option.value, prevent: true };
+  return { model: keepOpen ? { ...model } : closedSelect(), pick: option.value, prevent: true };
 }
 
 export type Placement = "above" | "below";

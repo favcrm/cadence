@@ -6,6 +6,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::issue::{finish, git, project};
@@ -412,7 +414,53 @@ pub(super) fn branch_base(root: &Path, branch: &str, fallback: &str) -> String {
     .unwrap_or_else(|| fallback.to_string())
 }
 
-pub(super) fn resolve_existing_base(root: &Path, branch: &str) -> Result<(String, String)> {
+/// Prove the original branch base from a surviving creation reflog entry.
+/// Never substitute the branch tip when creation history is unavailable.
+pub(crate) fn intake_branch_creation_base(root: &Path, branch: &str) -> Result<String> {
+    let unavailable = || {
+        Error::invalid(
+            "plan_evidence_stale",
+            format!("the original base of branch {branch} cannot be proven"),
+        )
+    };
+    let run = |args: &[&str]| -> Result<Vec<u8>> {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(root)
+            .arg("--no-optional-locks")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args);
+        let (output, bounds) =
+            crate::proc::run_bounded_limited(&mut command, Duration::from_secs(3), 64 * 1024)
+                .map_err(|_| unavailable())?;
+        if !output.status.success() || bounds.stdout_exceeded || bounds.stderr_exceeded {
+            return Err(unavailable());
+        }
+        Ok(output.stdout)
+    };
+    let reference = format!("refs/heads/{branch}");
+    let output = run(&["reflog", "show", "--format=%H%x09%gs", &reference])?;
+    let log = std::str::from_utf8(&output).map_err(|_| unavailable())?;
+    let (sha, message) = log
+        .lines()
+        .last()
+        .and_then(|line| line.split_once('\t'))
+        .ok_or_else(unavailable)?;
+    if !message.starts_with("branch: Created from ")
+        || !(sha.len() == 40 || sha.len() == 64)
+        || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(unavailable());
+    }
+    run(&["cat-file", "-e", &format!("{sha}^{{commit}}")])?;
+    Ok(sha.to_string())
+}
+
+pub(crate) fn resolve_existing_base(root: &Path, branch: &str) -> Result<(String, String)> {
     let base = git(
         root,
         &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],

@@ -3395,6 +3395,17 @@ impl Shared {
             // `pid` is the singleton-lock holder: `daemon start` tells
             // the child it spawned from a daemon that already ran.
             "health" => Ok({
+                let redact_inflight = match self.connection_caller(peer_pid) {
+                    Ok(caller_rule::Who::Agent(alias)) => {
+                        match self.store.running_channel_authority(&alias) {
+                            Ok(Some(t)) => t.authority_mode == "member",
+                            Ok(None) => false,
+                            Err(_) => true,
+                        }
+                    }
+                    Ok(_) => false,
+                    Err(_) => true,
+                };
                 let (adopted_live, adopted_oldest, adopted_reaped_total) =
                     crate::reaper::adopted_report(5);
                 json!({
@@ -3418,10 +3429,14 @@ impl Shared {
                 // Adopted orphans still running (never killed) and the
                 // adopted children reaped so far — CAD-308.
                 "adopted_live": adopted_live,
-                "adopted_oldest": adopted_oldest
-                    .iter()
-                    .map(|a| json!({"pid": a.pid, "comm": a.comm, "age_secs": a.age_secs}))
-                    .collect::<Vec<_>>(),
+                "adopted_oldest": if redact_inflight {
+                    json!([])
+                } else {
+                    json!(adopted_oldest
+                        .iter()
+                        .map(|a| json!({"pid": a.pid, "comm": a.comm, "age_secs": a.age_secs}))
+                        .collect::<Vec<_>>())
+                },
                 "adopted_reaped_total": adopted_reaped_total,
                 // CAD-538: the hosted lease, when held — provider, epoch,
                 // expiry and the fence reason after a loss.
@@ -3433,7 +3448,11 @@ impl Shared {
                 // CAD-561: a pending update and what it waits on, so
                 // `cadence daemon status` and the board's banner show it.
                 "pending_update": self.pending_update().map(|p| p.to_json()),
-                "update_waiting": self.inflight_turns().unwrap_or_default(),
+                "update_waiting": if redact_inflight {
+                    json!([])
+                } else {
+                    json!(self.inflight_turns().unwrap_or_default())
+                },
                 })
             }),
             // Build identity + process start — the deploy-drift check
@@ -3711,6 +3730,9 @@ impl Shared {
                         continue;
                     }
                     let mut j = agent.to_json();
+                    if self.store.assistant_for_alias(&agent.alias)?.is_some() {
+                        j["personal_assistant"] = json!(true);
+                    }
                     let mut tasks = open_tasks.remove(&agent.alias).unwrap_or_default();
                     tasks.retain(|task| {
                         identity::scope_allows_issue(
@@ -5492,6 +5514,7 @@ impl Shared {
             "human_room_remove" => self.rpc_human_room_remove(params, peer_pid),
             "human_agents_list" => self.rpc_human_agents_list(params, peer_pid),
             "human_room_ask" => self.rpc_human_room_ask(params, peer_pid),
+            "issue_comment_mentions" => self.rpc_issue_comment_mentions(params, peer_pid),
             "board_session_member" => self.rpc_board_session_member(params, peer_pid),
             "operator_session_logout" => self.rpc_operator_session_logout(params, peer_pid),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params, peer_pid),

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
 
-use crate::issue::project;
+use crate::issue::{areas, project};
 #[cfg(test)]
 use crate::memory;
 use crate::proc::{self, BoundedError};
@@ -211,7 +211,10 @@ fn bounded_git_with_limit(
     cmd.arg("-C")
         .arg(root)
         .arg("--no-optional-locks")
-        .env("GIT_OPTIONAL_LOCKS", "0");
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_TERMINAL_PROMPT", "0");
     for arg in args {
         cmd.arg(arg);
     }
@@ -487,29 +490,83 @@ fn unconfigured(project: &str, revision: Option<String>) -> PinnedContext {
 /// bounded readers and allowlist the board's context query uses; never
 /// accepts a caller-supplied path or revision.
 pub fn pin(selected: &project::Project, role: Option<&str>) -> PinnedContext {
+    pin_context(selected, role, None)
+}
+
+/// Pin required and cited sources for planning, independently of delivery opt-in.
+pub(crate) fn pin_for_plan(
+    selected: &project::Project,
+    cited: impl Fn(&str) -> bool,
+) -> PinnedContext {
+    pin_context(selected, None, Some(&cited))
+}
+
+fn pin_context(
+    selected: &project::Project,
+    role: Option<&str>,
+    cited: Option<&dyn Fn(&str) -> bool>,
+) -> PinnedContext {
+    let unavailable = |revision: Option<String>, message: String| {
+        let mut context = unconfigured(&selected.key, revision);
+        if cited.is_some() {
+            context.errors.push(shorten(&message, MAX_REASON_BYTES).0);
+        }
+        context
+    };
     // No declared local repository, several distinct ones, or one that is
     // not a readable absolute checkout: no committed opt-in can be
     // proven, so every existing dispatch path stays unchanged. (Two rows
     // naming one checkout are one repository — CAD-2001.)
-    let Ok((root, _)) = resolve_root(selected) else {
-        return unconfigured(&selected.key, None);
+    let (root, _) = match resolve_root(selected) {
+        Ok(source) => source,
+        Err(error) => {
+            return unavailable(
+                None,
+                format!("register an accessible repository root: {}", error.message),
+            )
+        }
     };
-    let Ok(head) = head_of(&root) else {
-        return unconfigured(&selected.key, None);
+    let head = match head_of(&root) {
+        Ok(head) => head,
+        Err(error) => {
+            return unavailable(
+                None,
+                format!("resolve a committed repository HEAD: {}", error.message),
+            )
+        }
     };
-    let Ok(Some(text)) = select_manifest(&root, &head, &selected.key).1 else {
-        // Absent, unreadable or oversized: the opt-in cannot be proven, so
-        // delivery stays off and dispatch behaves exactly as before. The
-        // board's context view reports an unusable manifest separately.
-        return unconfigured(&selected.key, Some(head));
+    let (manifest_path, result) = select_manifest(&root, &head, &selected.key);
+    let text = match result {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            return unavailable(
+                Some(head),
+                format!("track a project context manifest at {manifest_path}"),
+            )
+        }
+        Err(error) => {
+            return unavailable(
+                Some(head),
+                format!("read tracked manifest {manifest_path}: {}", error.reason()),
+            )
+        }
     };
     if text.len() > MAX_MANIFEST_BYTES {
-        return unconfigured(&selected.key, Some(head));
+        return unavailable(
+            Some(head),
+            format!("manifest {manifest_path} exceeds {MAX_MANIFEST_BYTES} bytes"),
+        );
     }
-    let Ok(manifest) = serde_yaml::from_str::<ContextManifest>(&text) else {
-        return unconfigured(&selected.key, Some(head));
+    let manifest = match serde_yaml::from_str::<ContextManifest>(&text) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return unavailable(
+                Some(head),
+                format!("fix malformed manifest {manifest_path}: {error}"),
+            )
+        }
     };
-    if !manifest.agent_delivery {
+    if cited.is_none() && !manifest.agent_delivery {
         // Explicit opt-in is required. An existing Overview/Project Context
         // manifest without it must not change dispatch behavior, and the
         // board reader keeps using the manifest as before.
@@ -531,17 +588,27 @@ pub fn pin(selected: &project::Project, role: Option<&str>) -> PinnedContext {
     let canonical = role.map(canonical_role);
     let mut documents = Vec::new();
     for document in manifest.documents.iter().take(MAX_MANIFEST_ENTRIES) {
-        let selected_here = canonical.is_none()
-            || document.required
-            || document.roles.is_empty()
-            || canonical.is_some_and(|role| {
-                document
-                    .roles
-                    .iter()
-                    .any(|candidate| candidate.as_str() == role)
-            });
+        let selected_here = if let Some(cited) = cited {
+            document.required || cited(&document.id)
+        } else {
+            canonical.is_none()
+                || document.required
+                || document.roles.is_empty()
+                || canonical.is_some_and(|role| {
+                    document
+                        .roles
+                        .iter()
+                        .any(|candidate| candidate.as_str() == role)
+                })
+        };
         let selection_reason = if document.required {
             "required".to_string()
+        } else if cited.is_some() {
+            if selected_here {
+                "cited".to_string()
+            } else {
+                "excluded:not-cited".to_string()
+            }
         } else if let Some(role) = canonical {
             if document.roles.is_empty() {
                 "optional-default".to_string()
@@ -608,6 +675,60 @@ pub fn repository_root(selected: &project::Project) -> Result<PathBuf, (String, 
     resolve_root(selected)
         .map(|(root, _)| root)
         .map_err(|error| (error.state.to_string(), error.message))
+}
+
+/// Check literal source paths against the registered repository at a pinned commit.
+pub(crate) fn check_plan_paths<'a>(
+    selected: &project::Project,
+    revision: &str,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), (String, String)> {
+    if !valid_revision(revision) {
+        return Err((
+            "invalid_revision".to_string(),
+            "pinned revision is not a full SHA-1".to_string(),
+        ));
+    }
+    let (root, _) = resolve_root(selected).map_err(|error| {
+        (
+            error.state.to_string(),
+            shorten(&error.message, MAX_REASON_BYTES).0,
+        )
+    })?;
+    for path in paths {
+        let display = shorten(&areas::scrub(path), MAX_PATH_BYTES).0;
+        let refusal = |state: &str, reason: &str| {
+            (
+                state.to_string(),
+                shorten(&format!("path '{display}': {reason}"), MAX_REASON_BYTES).0,
+            )
+        };
+        if let Err(error) = areas::check_path(path) {
+            return Err(refusal("invalid_path", &error.to_string()));
+        }
+        if path
+            .chars()
+            .any(|c| matches!(c, '*' | '?' | '[' | ']' | ':'))
+        {
+            return Err(refusal(
+                "invalid_path",
+                "literal paths only; globs are not allowed",
+            ));
+        }
+        let literal = path.strip_suffix('/').unwrap_or(path);
+        let entry = tree_entry(&root, revision, literal)
+            .map_err(|error| refusal(error.state(), &error.reason()))?
+            .ok_or_else(|| refusal("missing", "not tracked at the pinned revision"))?;
+        let is_tree = entry.kind == "tree" && entry.mode == "040000";
+        let is_file = entry.kind == "blob" && matches!(entry.mode.as_str(), "100644" | "100755");
+        if !is_tree && (!is_file || path.ends_with('/')) {
+            return Err(refusal(
+                "invalid_path",
+                "not a tracked regular file or directory",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Re-read `path` at the exact pinned `revision` and verify the recorded

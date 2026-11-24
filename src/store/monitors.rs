@@ -11,7 +11,7 @@ use uuid::Uuid;
 use super::events::row_event;
 use super::kickoff::kickoff_body;
 use super::messages::{IssueSelection, Priority};
-use super::plans::{DispatchPlan, DispatchPreparation, Task};
+use super::plans::{DispatchPlan, DispatchPreparation, PreparedJobKickoff, Task};
 use super::quota::automatic_quota_error;
 use super::StoreConn;
 use super::{is_terminal, now, Sender, Store};
@@ -482,7 +482,7 @@ impl Store {
         &self,
         monitor_id: &str,
         plan: &DispatchPlan,
-        delivery: Option<(String, IssueSelection)>,
+        delivery: Option<PreparedJobKickoff>,
         pending_aliases: &HashSet<String>,
         by: &str,
         expect: Option<&super::AssistDispatchExpect>,
@@ -582,9 +582,11 @@ impl Store {
                             task.state
                         )));
                     }
-                    if task
-                        .acceptance
-                        .as_deref()
+                    if prepared
+                        .as_ref()
+                        .and_then(|prepared| prepared.delivery.as_ref())
+                        .and_then(|delivery| delivery.intake_acceptance.as_deref())
+                        .or(task.acceptance.as_deref())
                         .is_none_or(|s| s.trim().is_empty())
                     {
                         return Err(Error::rejected(format!(
@@ -668,17 +670,17 @@ impl Store {
                             .plan
                             .verify_current(&task, &job, &worker, revision, &kickoff)?;
                     }
-                    let (body, selection) = match prepared {
+                    let (body, selection, intake_acceptance) = match prepared {
                         Some(prepared) => {
-                            let (body, selection) = prepared.delivery.ok_or_else(|| {
+                            let delivery = prepared.delivery.ok_or_else(|| {
                                 Error::rejected(format!(
                                     "Task '{}' no longer has the captured live kickoff — retry to select its new task context before dispatch",
                                     prepared.plan.task.id
                                 ))
                             })?;
-                            (body, Some(selection))
+                            (delivery.body, Some(delivery.selection), delivery.intake_acceptance)
                         }
-                        None => (kickoff_body(&job, &task, revision, &kickoff, &worker)?, None),
+                        None => (kickoff_body(&job, &task, revision, &kickoff, &worker)?, None, None),
                     };
                     let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
                     if matches!(&selection, Some(IssueSelection::Pin(_))) {
@@ -711,17 +713,20 @@ impl Store {
                     let at = now();
                     tx.execute(
                         "UPDATE tasks SET state='dispatched',revision=?,assignee=?,
-                         dispatch_message=?,head_sha=NULL,error=NULL,updated=?
-                         WHERE id=?",
+                         dispatch_message=?,head_sha=NULL,error=NULL,updated=? WHERE id=?",
                         params![revision, assignee, kickoff, at, task_id],
                     )?;
+                    let mut payload = json!({"task": task_id, "job": job.id, "assignee": assignee,
+                                             "revision": revision, "message": kickoff, "by": by,
+                                             "automatic": true});
+                    if let Some(scope) = intake_acceptance {
+                        payload["intake_acceptance"] = json!(scope);
+                    }
                     Self::event_scoped(
                         &tx,
                         &job.pm_alias,
                         "task_dispatched",
-                        json!({"task": task_id, "job": job.id, "assignee": assignee,
-                               "revision": revision, "message": kickoff, "by": by,
-                               "automatic": true}),
+                        payload,
                         Some(&job.id),
                         Some(task_id),
                     )?;

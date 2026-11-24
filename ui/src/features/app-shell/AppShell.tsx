@@ -14,7 +14,8 @@ import { chatScreenFor } from "./chatScreen";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
 import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
 import { isSocialContent } from "../workspace-apps/socialContentSupport";
-import { readReturnDrawer, withoutReturnDrawer } from "../workspace-apps/socialConnect";
+import { readReturnDrawer, withoutConnectParams, withoutReturnDrawer } from "../workspace-apps/socialConnect";
+import { hostedConnectCommandUrl } from "../workspace-apps/screen/screenServices";
 import { appSectionHref, sectionFromSearch } from "./appNav";
 import Conversation from "./chat/Conversation";
 import { beginLibraryImagePin, composerScope, settleLibraryImagePin } from "./chat/composerStore";
@@ -276,6 +277,16 @@ export default function AppShell({
     const rest = withoutReturnDrawer(window.location.search);
     if (rest !== window.location.search) navigate(window.location.pathname + rest, { replace: true });
   }, []);
+  // CAD-2734: a connections.connect flow returns with `aos_connect` and `toolkit`.
+  // Clear those one-shot return params from non-social app routes while preserving `section`
+  // (Social Content's WorkspaceApp consumes its own return params and toast once mounted).
+  useEffect(() => {
+    if (!installation || isSocialContent(installation)) return;
+    const live = new URLSearchParams(window.location.search);
+    if (!live.has("aos_connect") && !live.has("toolkit")) return;
+    const rest = withoutConnectParams(window.location.search);
+    if (rest !== window.location.search) navigate(window.location.pathname + rest, { replace: true });
+  }, [installId, href, installation]);
   // A different installation or scope is a different screen: the drawer never
   // outlives the frame that opened it.
   useEffect(() => { setScreenDrawer(null); setIndependentDrawer(null); }, [installId, contextId]);
@@ -1102,6 +1113,11 @@ export default function AppShell({
   const screenCommand = (command: HostCommand) => {
     if (!receiptReady || !contextAdoptionReady || !scope.contextId || viewer.operator !== true || viewer.readOnly) return;
     if (command.operation === "smtp.manage") { navigate("/settings/email"); return; }
+    if (command.operation === "connections.connect") {
+      const url = hostedConnectCommandUrl(command.args);
+      if (url) window.location.assign(url);
+      return;
+    }
     if (command.operation === "chat.campaign.open" || command.operation === "chat.campaign.brief") {
       const campaign = command.args.campaign_id;
       if (typeof campaign !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(campaign)) return;

@@ -83,6 +83,27 @@ pub fn acceptance_listing(items: &[AcceptanceItem]) -> Option<String> {
     (!items.is_empty()).then(|| inline_listing(items))
 }
 
+/// Render the approved Markdown as one anchored, unambiguous scope.
+pub(crate) fn intake_acceptance(scope: &str) -> Result<String> {
+    let scope = serde_json::to_string(scope).map_err(|e| Error::internal(e.to_string()))?;
+    Ok(format!(
+        "Approved issue acceptance Markdown (including qualifiers): {scope}"
+    ))
+}
+
+pub(crate) fn with_independent_acceptance(
+    mut rendered: String,
+    independent: Option<&str>,
+) -> Result<String> {
+    if let Some(recorded) = independent.filter(|s| !s.trim().is_empty()) {
+        rendered.push_str(". Independent task acceptance (where compatible): ");
+        rendered.push_str(
+            &serde_json::to_string(recorded).map_err(|e| Error::internal(e.to_string()))?,
+        );
+    }
+    Ok(rendered)
+}
+
 /// The CAD-300 listing of `items` at any length —
 /// `1) [ ] "a"; 2) [x] "b"`, numbered from 1.
 pub(crate) fn inline_listing(items: &[AcceptanceItem]) -> String {

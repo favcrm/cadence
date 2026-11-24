@@ -19,6 +19,9 @@ pub(crate) enum PlanAction {
         /// `## <ticket>` section each with optional `size: S|M|L`,
         /// `agent: <alias>`, `depends_on: 2, CAD-9` lines and a
         /// `### Acceptance` checklist. `-` reads stdin.
+        /// For goal intake, add `intake:` to the frontmatter and
+        /// `sources:`, `paths:` and optional `reuse:` to outcomes
+        /// (docs/CLI.md, “Goal-intake plans”).
         #[arg(long, conflicts_with = "workflow")]
         file: Option<PathBuf>,
         /// Propose the stored workflow `<pm>/<project>/workflows/<name>.md`:

@@ -39,6 +39,12 @@ Three storage concerns stay distinct:
   artifacts. A tracker reference binds work to the real repo/branch/worktree;
   folder names alone are not ownership proof.
 
+Standalone paid image jobs pin their pre-call reservation in runtime SQLite
+to the active job and generation intent in the installation's record DB. On
+restart, a matching retained receipt completes that same intent without a
+provider call or a live installation. A resumed job invalidates the previous
+attempt's settlement authority.
+
 Ordinary daemon RPC replies buffer JSON formatting writes per connection and
 flush after each newline-delimited response, including errors. This avoids a
 socket syscall for each formatting fragment without delaying a complete frame.

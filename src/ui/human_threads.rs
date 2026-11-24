@@ -122,21 +122,52 @@ fn exact_keys(object: &Map<String, Value>, keys: &[&str]) -> bool {
     object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
 }
 
+fn valid_mention_outcome(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if !obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "kind" | "handle" | "label" | "reason"))
+        || !obj.get("kind").is_some_and(Value::is_string)
+        || !obj.get("handle").is_some_and(Value::is_string)
+        || !obj.get("label").is_some_and(Value::is_string)
+    {
+        return false;
+    }
+    obj.get("reason").is_none_or(Value::is_string)
+}
+
 fn valid_room_post(value: &Value) -> bool {
     let Some(post) = value.as_object() else {
         return false;
     };
-    if !exact_keys(post, &["id", "sender", "body", "created", "read_cursor"])
-        || !post
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty())
+    if !exact_keys(
+        post,
+        &[
+            "id",
+            "sender",
+            "body",
+            "created",
+            "read_cursor",
+            "silent",
+            "outcomes",
+        ],
+    ) || !post
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
         || !post.get("body").is_some_and(Value::is_string)
         || !post.get("created").is_some_and(Value::is_number)
         || !post
             .get("read_cursor")
             .and_then(Value::as_str)
             .is_some_and(opaque_token)
+        || !post.get("silent").is_some_and(Value::is_boolean)
+        || !post
+            .get("outcomes")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().all(valid_mention_outcome))
     {
         return false;
     }
@@ -179,6 +210,10 @@ fn room_relay_gate(
                     "members",
                     "posts",
                     "can_ask",
+                    "can_manage",
+                    "agent_chain_count",
+                    "agent_chain_limit",
+                    "events",
                     "before",
                     "more_before",
                 ],
@@ -188,6 +223,15 @@ fn room_relay_gate(
                     .and_then(Value::as_str)
                     .is_some_and(|id| id.starts_with("csrid_") && id.len() > "csrid_".len())
                 || !body.get("can_ask").is_some_and(Value::is_boolean)
+                || !body.get("can_manage").is_some_and(Value::is_boolean)
+                || !body
+                    .get("agent_chain_count")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|n| n >= 0)
+                || !body
+                    .get("agent_chain_limit")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|n| n >= 0)
                 || !body.get("more_before").is_some_and(Value::is_boolean)
             {
                 return false;
@@ -206,6 +250,21 @@ fn room_relay_gate(
                 return false;
             };
             if !posts.iter().all(valid_room_post) {
+                return false;
+            }
+            let Some(events) = body.get("events").and_then(Value::as_array) else {
+                return false;
+            };
+            if !events.iter().all(|ev| {
+                ev.as_object().is_some_and(|e| {
+                    exact_keys(e, &["id", "text", "created"])
+                        && e.get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                        && e.get("text").is_some_and(Value::is_string)
+                        && e.get("created").is_some_and(Value::is_number)
+                })
+            }) {
                 return false;
             }
             let before = match body.get("before") {
@@ -437,7 +496,7 @@ fn route(method: &Method, rest: &str) -> Result<(Route, bool), HttpResp> {
         },
         (Method::Post, p) => match room_path(p) {
             Some((room, "/posts")) => Ok((
-                room_route("human_room_post", room, &["client_id", "body"]),
+                room_route("human_room_post", room, &["client_id", "body", "silent"]),
                 false,
             )),
             Some((room, "/ask")) => Ok((
@@ -648,6 +707,46 @@ fn daemon_failure(error: &crate::error::Error) -> HttpResp {
             403,
             "not_a_member",
             "you are not a current member of this organization",
+            None,
+        );
+    }
+    if error.code() == Some("not_room_manager") {
+        return coded_response(
+            403,
+            "not_room_manager",
+            "Only the channel creator or workspace owner can manage members",
+            None,
+        );
+    }
+    if error.code() == Some("dm_agents_refused") {
+        return coded_response(
+            400,
+            "dm_agents_refused",
+            "Shared agents cannot be added to 1:1 direct messages",
+            None,
+        );
+    }
+    if error.code() == Some("personal_assistant_excluded") {
+        return coded_response(
+            400,
+            "personal_assistant_excluded",
+            "Personal assistants cannot be added to shared channels",
+            None,
+        );
+    }
+    if error.code() == Some("agent_not_shareable") {
+        return coded_response(
+            400,
+            "agent_not_shareable",
+            "This agent cannot be added to shared channels",
+            None,
+        );
+    }
+    if error.code() == Some("waiting_for_person") {
+        return coded_response(
+            409,
+            "waiting_for_person",
+            "Channel paused after consecutive agent turns; a human message is required to resume",
             None,
         );
     }

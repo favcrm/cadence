@@ -30,9 +30,45 @@ pub fn create_plan(
     let proposer = actor_who(actor, None);
     let root = pm.dir.join(&project.key);
     let lock = pm.lock_for_paths(std::slice::from_ref(&root))?;
+    let existing = if let Some(input) = &doc.intake {
+        let issues = board::load_all(&pm.dir, Some(&project.key))?;
+        let previous = issues.iter().find_map(|issue| {
+            let plan = issue.front.plan.as_ref()?;
+            let evidence = plan.intake.as_ref()?;
+            (Some(evidence.request_digest.as_str()) == doc.request_digest.as_deref())
+                .then_some((issue, plan))
+        });
+        if let Some((issue, plan)) = previous {
+            return Ok(json!({
+                "epic": issue.front.id,
+                "project": project.key,
+                "title": issue.front.title,
+                "state": plan.state,
+                "tickets": plan.tickets,
+                "committed": false,
+                "replayed": true,
+            }));
+        }
+        if let Some(id) = &input.revises {
+            intake_predecessor(&issues, &project.key, id)?;
+        }
+        issues
+    } else {
+        Vec::new()
+    };
+    let reused: HashMap<&str, &board::Issue> = existing
+        .iter()
+        .filter(|issue| issue.front.plan.is_none() && issue.front.status != "dropped")
+        .map(|issue| (issue.front.id.as_str(), issue))
+        .collect();
+    let new_count = doc
+        .tickets
+        .iter()
+        .filter(|ticket| ticket.reuse.is_none())
+        .count();
     let avoid = avoid()?;
     let first = next_id(&root, &project.prefix)?;
-    let mut ids: Vec<String> = (0..=doc.tickets.len() as u64)
+    let mut ids: Vec<String> = (0..=new_count as u64)
         .map(|n| format!("{}-{}", project.prefix, first + n))
         .collect();
     // A reserved id skips the whole contiguous block, never packs it.
@@ -40,7 +76,7 @@ pub fn create_plan(
         if !ids.iter().any(|id| avoid.contains(id)) {
             break;
         }
-        ids = (0..=doc.tickets.len() as u64)
+        ids = (0..=new_count as u64)
             .map(|n| format!("{}-{}", project.prefix, first + offset + n))
             .collect();
     }
@@ -48,6 +84,26 @@ pub fn create_plan(
         return Err(Error::internal("could not allocate unreserved ticket ids"));
     }
     let epic = ids[0].clone();
+    let mut fresh_ids = ids.iter().skip(1);
+    let outcome_ids = doc
+        .tickets
+        .iter()
+        .map(|ticket| match ticket.reuse.as_deref() {
+            None => fresh_ids
+                .next()
+                .map(String::as_str)
+                .ok_or_else(|| Error::internal("missing allocated plan ticket")),
+            Some(id) => reused
+                .get(id)
+                .map(|issue| issue.front.id.as_str())
+                .ok_or_else(|| {
+                    Error::rejected(format!(
+                        "{id} is not an eligible existing issue in {}",
+                        project.key
+                    ))
+                }),
+        })
+        .collect::<Result<Vec<_>>>()?;
     let now = time::iso(time::now_epoch());
 
     let mut epic_front = Front::new(&epic, &doc.title, &now);
@@ -60,6 +116,7 @@ pub fn create_plan(
         reason: None,
         workflow: workflow.map(str::to_string),
         tickets: ids[1..].to_vec(),
+        intake: None,
     });
     epic_front.item_type = Some("epic".to_string());
     let mut epic_body = format!("{}\n\n## Goal\n\n{}\n", doc.title, doc.goal);
@@ -72,9 +129,21 @@ pub fn create_plan(
     if !doc.intro.is_empty() {
         epic_body.push_str(&format!("\n## Plan\n\n{}\n", doc.intro));
     }
-    let mut files: Vec<(PathBuf, Front, String)> = vec![(root.join(&epic), epic_front, epic_body)];
-    for (n, ticket) in doc.tickets.iter().enumerate() {
-        let id = &ids[n + 1];
+    let mut intake = crate::issue::plan::GoalIntake::prepare(&project, doc, &epic_body)?;
+    let mut files = Vec::with_capacity(ids.len());
+    files.push((root.join(&epic), epic_front, epic_body));
+    for (ticket, id) in doc.tickets.iter().zip(&outcome_ids) {
+        if let Some(reuse) = ticket.reuse.as_deref() {
+            let existing_issue = reused
+                .get(reuse)
+                .ok_or_else(|| Error::internal("missing reused issue"))?;
+            let evidence = intake
+                .as_mut()
+                .ok_or_else(|| Error::internal("reused issue outside goal intake"))?;
+            evidence.record(&existing_issue.front, &existing_issue.body, ticket)?;
+            files[0].1.relates.push(reuse.to_string());
+            continue;
+        }
         let mut front = Front::new(id, &ticket.title, &now);
         front.parent = Some(epic.clone());
         front.plan_epic = Some(epic.clone());
@@ -84,7 +153,7 @@ pub fn create_plan(
             .depends_on
             .iter()
             .map(|d| match d {
-                Dep::Ticket(k) => ids[k + 1].clone(),
+                Dep::Ticket(k) => outcome_ids[*k].to_string(),
                 Dep::Issue(i) => i.clone(),
             })
             .collect();
@@ -93,7 +162,24 @@ pub fn create_plan(
             body.push_str(&format!("\n{}\n", ticket.description));
         }
         let body = parse::replace_acceptance(&body, &ticket.acceptance)?;
+        if let Some(evidence) = &mut intake {
+            front.paths = ticket.paths.clone();
+            evidence.record(&front, &body, ticket)?;
+        }
         files.push((root.join(id), front, body));
+    }
+    if let Some(evidence) = intake {
+        if let Some(predecessor) = &evidence.revises {
+            files[0].1.relates.push(predecessor.clone());
+        }
+        files[0].1.relates.sort_unstable();
+        files[0].1.relates.dedup();
+        let plan = files[0]
+            .1
+            .plan
+            .as_mut()
+            .ok_or_else(|| Error::internal("plan epic metadata is missing"))?;
+        plan.intake = Some(evidence);
     }
     if let Some((dir, _, _)) = files.iter().find(|(dir, _, _)| dir.exists()) {
         return Err(Error::rejected(format!(
@@ -123,8 +209,7 @@ pub fn create_plan(
             &paths,
             &format!(
                 "{epic}: plan proposed — {} ({} tickets)",
-                doc.title,
-                doc.tickets.len()
+                doc.title, new_count
             ),
             &refs,
             actor,
@@ -150,6 +235,117 @@ pub fn create_plan(
     });
     attach_foreign(&mut out, &foreign);
     Ok(out)
+}
+
+fn intake_predecessor<'a>(
+    issues: &'a [board::Issue],
+    project: &str,
+    id: &str,
+) -> Result<&'a board::Issue> {
+    let issue = issues
+        .iter()
+        .find(|issue| issue.front.id == id && issue.project == project)
+        .ok_or_else(|| Error::rejected(format!("{id} is not a goal intake in this project")))?;
+    let intake = issue
+        .front
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.intake.as_ref())
+        .ok_or_else(|| Error::rejected(format!("{id} is not a goal intake")))?;
+    if let Some(next) = &intake.superseded_by {
+        return Err(Error::rejected(format!(
+            "{id} was superseded by {next}; revise that plan instead"
+        )));
+    }
+    Ok(issue)
+}
+
+/// The old plan members this revision removes, including carried ancestors.
+/// Refuse any revision that leaves retained work blocked on one of them.
+fn revision_retirements<'a>(
+    issues: &'a [board::Issue],
+    previous: &'a board::Issue,
+    intake: &crate::issue::plan::GoalIntake,
+) -> Result<HashSet<&'a str>> {
+    let by_id: HashMap<&str, &board::Issue> = issues
+        .iter()
+        .map(|issue| (issue.front.id.as_str(), issue))
+        .collect();
+    let mut ancestors = HashSet::new();
+    let mut retiring = HashSet::new();
+    let mut continuously_carried: HashSet<&str> =
+        intake.outcomes.keys().map(String::as_str).collect();
+    let mut cursor = Some(previous);
+    while let Some(issue) = cursor {
+        if !ancestors.insert(issue.front.id.as_str()) {
+            return Err(Error::rejected("cyclic intake revision history"));
+        }
+        let plan = issue
+            .front
+            .plan
+            .as_ref()
+            .ok_or_else(|| Error::rejected("invalid intake revision history"))?;
+        for id in &plan.tickets {
+            let id = id.as_str();
+            if !intake.outcomes.contains_key(id) {
+                retiring.insert(id);
+            } else if !continuously_carried.contains(id)
+                && !by_id
+                    .get(id)
+                    .is_some_and(|ticket| ticket.front.status == "done")
+            {
+                return Err(Error::invalid(
+                    "plan_revision_strands_dependency",
+                    format!("{id} was retired by an earlier revision and cannot be carried"),
+                ));
+            }
+        }
+        let record = plan
+            .intake
+            .as_ref()
+            .ok_or_else(|| Error::rejected("invalid intake revision history"))?;
+        continuously_carried.retain(|id| record.outcomes.contains_key(*id));
+        cursor = record
+            .revises
+            .as_deref()
+            .map(|id| {
+                by_id
+                    .get(id)
+                    .copied()
+                    .filter(|issue| issue.project == previous.project)
+                    .ok_or_else(|| Error::rejected(format!("intake ancestor {id} is missing")))
+            })
+            .transpose()?;
+    }
+    let mut pending: Vec<&str> = intake
+        .outcomes
+        .keys()
+        .filter_map(|id| by_id.get(id.as_str()))
+        .flat_map(|issue| issue.front.blocked_by.iter().map(String::as_str))
+        .collect();
+    let mut visited = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let dependency = by_id
+            .get(id)
+            .ok_or_else(|| Error::rejected(format!("intake dependency {id} is missing")))?;
+        if dependency.front.status == "done" {
+            continue;
+        }
+        if retiring.contains(id) {
+            return Err(Error::invalid(
+                "plan_revision_strands_dependency",
+                format!("retain unfinished prerequisite {id} in this revision"),
+            ));
+        }
+        if dependency.front.status == "dropped" {
+            continue;
+        }
+        pending.extend(dependency.front.blocked_by.iter().map(String::as_str));
+    }
+    Ok(retiring)
 }
 
 /// CAD-225: the canonical original semantics an unattended grant binds
@@ -255,6 +451,11 @@ pub(crate) fn create_granted_plan(
     on_intent: &mut dyn FnMut(&GrantedPreview) -> Result<()>,
 ) -> Result<Value> {
     use crate::issue::plan::Dep;
+    if doc.intake.is_some() {
+        return Err(Error::rejected(
+            "goal intake requires a separate operator decision, not an unattended grant",
+        ));
+    }
     let project = project::list(&pm.dir)?
         .into_iter()
         .find(|p| p.key == project_key)
@@ -331,6 +532,7 @@ pub(crate) fn create_granted_plan(
         reason: None,
         workflow: workflow.map(str::to_string),
         tickets: ids[1..].to_vec(),
+        intake: None,
     });
     epic_front.item_type = Some("epic".to_string());
     let mut epic_body = format!("{}\n\n## Goal\n\n{}\n", doc.title, doc.goal);
@@ -556,24 +758,110 @@ pub fn decide_plan(
             plan.state
         )));
     }
+    let issues = if approve {
+        let scope = if plan
+            .intake
+            .as_ref()
+            .is_some_and(|intake| intake.revises.is_some())
+        {
+            None
+        } else {
+            Some(project.key.as_str())
+        };
+        board::load_all(&pm.dir, scope)?
+    } else {
+        Vec::new()
+    };
+    let mut retiring = Vec::new();
+    let mut retired_ids = Vec::new();
+    if let Some(intake) = plan.intake.as_ref().filter(|_| approve) {
+        if let Some(next) = &intake.superseded_by {
+            return Err(Error::rejected(format!(
+                "plan {epic} was superseded by {next}"
+            )));
+        }
+        intake.require_goal(&body)?;
+        for id in intake.outcomes.keys() {
+            let issue = issues
+                .iter()
+                .find(|issue| &issue.front.id == id)
+                .ok_or_else(|| {
+                    Error::rejected(format!("plan outcome issue {id} no longer exists"))
+                })?;
+            intake.require_scope(&issue.front, &issue.body)?;
+        }
+        intake.require_sources(&project, None)?;
+        if let Some(id) = &intake.revises {
+            let previous = intake_predecessor(&issues, &project.key, id)?;
+            // Replacing an unapproved revision would leave its predecessor
+            // independently approvable, so only replace an unapproved root.
+            if previous.front.plan.as_ref().is_some_and(|plan| {
+                plan.state != "approved"
+                    && plan
+                        .intake
+                        .as_ref()
+                        .is_some_and(|record| record.revises.is_some())
+            }) {
+                return Err(Error::invalid(
+                    "plan_revision_noncontinuous",
+                    "an unapproved revision cannot be replaced; revise its predecessor instead",
+                ));
+            }
+            let retired = revision_retirements(&issues, previous, intake)?;
+            let mut prior = previous.front.clone();
+            let previous_plan = prior
+                .plan
+                .as_mut()
+                .ok_or_else(|| Error::internal("missing intake predecessor"))?;
+            if previous_plan.state != "approved"
+                && previous_plan
+                    .tickets
+                    .iter()
+                    .any(|id| intake.outcomes.contains_key(id))
+            {
+                return Err(Error::rejected(
+                    "a revision cannot carry tickets from a plan the operator never approved",
+                ));
+            }
+            let previous_intake = previous_plan
+                .intake
+                .as_mut()
+                .ok_or_else(|| Error::internal("missing predecessor evidence"))?;
+            previous_intake.superseded_by = Some(epic.to_string());
+            for ticket in issues.iter().filter(|ticket| {
+                retired.contains(ticket.front.id.as_str())
+                    && ticket.front.status == "ready"
+                    && ticket.front.claim.is_none()
+                    && !ticket.front.refs.iter().any(|reference| {
+                        reference.kind == "worktree" && reference.closed != Some(true)
+                    })
+            }) {
+                let mut front = ticket.front.clone();
+                front.status = "backlog".to_string();
+                retired_ids.push(front.id.clone());
+                retiring.push((ticket.dir.clone(), front, ticket.body.clone()));
+            }
+            retired_ids.push(prior.id.clone());
+            retiring.push((previous.dir.clone(), prior, previous.body.clone()));
+        }
+    }
     let state = if approve { "approved" } else { "rejected" };
     plan.state = state.to_string();
     plan.decided_by = Some(by.to_string());
     plan.decided_at = Some(time::iso(time::now_epoch()));
     plan.reason = reason.map(str::to_string);
-    let decided = plan.clone();
     let mut ready = vec![];
-    let mut writes = vec![(dir.clone(), front.clone(), body)];
-    if approve {
-        for kid in board::load_all(&pm.dir, Some(&project.key))? {
-            if decided.tickets.contains(&kid.front.id) && kid.front.status == "backlog" {
-                let mut f = kid.front.clone();
-                f.status = "ready".to_string();
-                ready.push(f.id.clone());
-                writes.push((kid.dir.clone(), f, kid.body.clone()));
-            }
+    for kid in issues {
+        if plan.tickets.contains(&kid.front.id) && kid.front.status == "backlog" {
+            let mut f = kid.front;
+            f.status = "ready".to_string();
+            ready.push(f.id.clone());
+            retiring.push((kid.dir, f, kid.body));
         }
     }
+    let decided_at = plan.decided_at.clone();
+    let mut writes = vec![(dir, front, body)];
+    writes.append(&mut retiring);
     // All or nothing: a failed write or commit restores every file.
     let originals: Vec<(PathBuf, String)> = writes
         .iter()
@@ -589,6 +877,7 @@ pub fn decide_plan(
     };
     let mut ids: Vec<&str> = vec![epic];
     ids.extend(ready.iter().map(String::as_str));
+    ids.extend(retired_ids.iter().map(String::as_str));
     let subject = if approve {
         format!(
             "{epic}: plan approved by {by} ({} tickets ready)",
@@ -616,9 +905,9 @@ pub fn decide_plan(
         "epic": epic,
         "project": project.key,
         "state": state,
-        "decided_by": decided.decided_by,
-        "decided_at": decided.decided_at,
-        "reason": decided.reason,
+        "decided_by": by,
+        "decided_at": decided_at,
+        "reason": reason,
         "ready": ready,
         "committed": true,
     });

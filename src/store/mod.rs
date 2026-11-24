@@ -88,6 +88,7 @@ pub use events::{
 pub(crate) use events::event_store_stats;
 pub mod conversations;
 pub mod human_threads;
+pub mod mentions;
 mod topics;
 pub use topics::{
     delivery_id as topic_delivery_id, post_id as topic_post_id, request_id as topic_request_id,
@@ -95,7 +96,7 @@ pub use topics::{
 };
 mod inbox;
 mod kickoff;
-pub(crate) use kickoff::last_sha_line;
+pub(crate) use kickoff::{captured_cloud_kickoff, last_sha_line};
 pub mod routines;
 pub mod workspace_settings;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
@@ -106,6 +107,7 @@ pub use messages::{
     report_timeout_secs, IssueSelection, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
     DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES, NUDGE_SOURCE,
 };
+pub(crate) use messages::{ActorTake, NativeTurnClaim};
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
 mod endpoint;
@@ -159,9 +161,7 @@ mod plans;
 pub mod social_publish;
 pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
 #[doc(hidden)]
-pub use plans::DispatchPlan;
-#[doc(hidden)]
-pub use plans::TaskHistoryEvent;
+pub use plans::{DispatchPlan, PreparedJobKickoff, TaskHistoryEvent};
 mod quota;
 mod schema;
 /// CAD-2215: the nullable `connection_metadata.cursor_keyring_fingerprint`

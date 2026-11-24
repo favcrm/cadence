@@ -1179,10 +1179,10 @@ impl Shared {
             );
             // Reserve the one paid op BEFORE provider I/O; a repeat of the
             // same id admits only the byte-identical intent.
-            self.store
-                .app_tool_claim(crate::store::app_tools::AppToolClaim {
-                    workspace,
-                    context: ctx.context_id.as_deref(),
+            let claim_receipt = self.store.app_tool_claim_in_workspace(
+                workspace,
+                ctx.context_id.as_deref(),
+                crate::store::app_tools::AppToolClaim {
                     request: request_id,
                     install: &ctx.install_id,
                     alias,
@@ -1190,7 +1190,8 @@ impl Shared {
                     binding_digest: &proof.digest,
                     input_digest: &input_digest,
                     call_id: &call_id,
-                })?;
+                },
+            )?;
             // Standalone invocation authority is distinct from workflow-run
             // authority; never manufacture run-shaped identifiers here.
             let mut authority = json!({
@@ -1238,6 +1239,7 @@ impl Shared {
                         request_id,
                         &call_id,
                         &spec,
+                        &claim_receipt,
                         self.image_job_deadline(),
                     )?;
                     self.spawn_image_job_worker(&ctx.install_id, &call_id);
@@ -1300,23 +1302,15 @@ impl Shared {
                     &credential,
                 )?;
             }
-            let receipt = self
-                .store
-                .app_tool_record(crate::store::app_tools::AppToolRecord {
-                    id: &call_id,
-                    request: request_id,
-                    install: &ctx.install_id,
-                    alias,
-                    slot,
-                    binding_digest: &proof.digest,
-                    input_digest: &input_digest,
-                    input: &input,
-                    result: &output.result,
-                    asset: output
-                        .asset
-                        .as_ref()
-                        .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
-                })?;
+            let receipt = claim_receipt.record(
+                &self.store,
+                &input,
+                &output.result,
+                output
+                    .asset
+                    .as_ref()
+                    .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
+            )?;
             if let Some((records, context, intent, _scope, _plan)) = &generation {
                 records.app_social_generation_finish(
                     context,

@@ -18,6 +18,8 @@ pub struct PlanDoc {
     /// Text between the frontmatter and the first ticket.
     pub intro: String,
     pub tickets: Vec<Ticket>,
+    pub intake: Option<IntakeInput>,
+    pub request_digest: Option<String>,
 }
 
 /// One ticket of a plan.
@@ -29,6 +31,9 @@ pub struct Ticket {
     pub depends_on: Vec<Dep>,
     pub size: Option<String>,
     pub agent: Option<String>,
+    pub sources: Vec<String>,
+    pub paths: Vec<String>,
+    pub reuse: Option<String>,
 }
 
 /// A ticket dependency: another ticket of the same plan (0-based) or an
@@ -39,6 +44,17 @@ pub enum Dep {
     Issue(String),
 }
 
+/// Structured requirements for an intake plan.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeInput {
+    pub constraints: Vec<String>,
+    pub success_criteria: Vec<String>,
+    #[serde(default)]
+    pub unknowns: Vec<String>,
+    pub revises: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlanMeta {
@@ -46,6 +62,7 @@ struct PlanMeta {
     goal: String,
     #[serde(default)]
     non_goals: NonGoals,
+    intake: Option<IntakeInput>,
 }
 
 #[derive(Deserialize, Default)]
@@ -92,6 +109,40 @@ pub fn parse_plan(text: &str) -> Result<PlanDoc> {
     .filter(|s| !s.is_empty())
     .collect();
 
+    let intake = meta
+        .intake
+        .map(|mut intake| -> Result<IntakeInput> {
+            if intake.success_criteria.is_empty() {
+                return Err(Error::rejected(
+                    "Plan intake success_criteria must not be empty",
+                ));
+            }
+            for (name, items) in [
+                ("constraints", &mut intake.constraints),
+                ("success_criteria", &mut intake.success_criteria),
+                ("unknowns", &mut intake.unknowns),
+            ] {
+                for item in items {
+                    if item.contains(['\n', '\r']) {
+                        return Err(Error::rejected(format!(
+                            "Plan intake {name} item must be one line"
+                        )));
+                    }
+                    *item = one_line(&format!("intake {name} item"), item)?;
+                }
+            }
+            if let Some(id) = &intake.revises {
+                if !model::valid_id(id) {
+                    return Err(Error::rejected("Plan intake revises must be an issue id"));
+                }
+            }
+            Ok(intake)
+        })
+        .transpose()?;
+    let request_digest = intake
+        .as_ref()
+        .map(|_| crate::delegation::sha256_hex(text.as_bytes()));
+
     // Split the body at level-two headings outside fenced code.
     let mut intro = String::new();
     let mut sections: Vec<(String, String)> = vec![];
@@ -118,18 +169,30 @@ pub fn parse_plan(text: &str) -> Result<PlanDoc> {
     let tickets = sections
         .iter()
         .enumerate()
-        .map(|(n, (heading, text))| parse_ticket(n, count, heading, text))
+        .map(|(n, (heading, text))| parse_ticket(n, count, heading, text, intake.is_some()))
         .collect::<Result<Vec<_>>>()?;
+    let mut reused = std::collections::HashSet::new();
+    for ticket in &tickets {
+        if let Some(id) = &ticket.reuse {
+            if !reused.insert(id) {
+                return Err(Error::rejected(format!(
+                    "Issue {id} is reused by more than one ticket"
+                )));
+            }
+        }
+    }
     Ok(PlanDoc {
         title,
         goal,
         non_goals,
         intro: intro.trim().to_string(),
         tickets,
+        intake,
+        request_digest,
     })
 }
 
-fn parse_ticket(n: usize, count: usize, heading: &str, text: &str) -> Result<Ticket> {
+fn parse_ticket(n: usize, count: usize, heading: &str, text: &str, intake: bool) -> Result<Ticket> {
     let label = format!("Ticket {} \"{heading}\"", n + 1);
     if heading.is_empty() {
         return Err(Error::rejected(format!("Ticket {} has no title", n + 1)));
@@ -137,6 +200,10 @@ fn parse_ticket(n: usize, count: usize, heading: &str, text: &str) -> Result<Tic
     let mut size = None;
     let mut agent = None;
     let mut depends_on = vec![];
+    let mut sources = None;
+    let mut paths = None;
+    let mut reuse = None;
+    let mut seen = std::collections::HashSet::new();
     let mut lines = text.split_inclusive('\n').peekable();
     // Metadata: `key: value` lines directly under the heading.
     while let Some(line) = lines.peek() {
@@ -144,6 +211,18 @@ fn parse_ticket(n: usize, count: usize, heading: &str, text: &str) -> Result<Tic
             break;
         };
         let value = value.trim();
+        let key = key.trim();
+        if intake
+            && matches!(
+                key,
+                "size" | "agent" | "depends_on" | "sources" | "paths" | "reuse"
+            )
+            && !seen.insert(key.to_string())
+        {
+            return Err(Error::rejected(format!(
+                "{label}: duplicate {key} metadata"
+            )));
+        }
         match key.trim() {
             "size" => {
                 let s = value.to_ascii_uppercase();
@@ -164,9 +243,55 @@ fn parse_ticket(n: usize, count: usize, heading: &str, text: &str) -> Result<Tic
                     depends_on.push(parse_dep(&label, n, count, token)?);
                 }
             }
+            "sources" | "paths" if intake => {
+                let list = value.trim_start_matches('[').trim_end_matches(']');
+                let items: Vec<String> = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if items.is_empty() {
+                    return Err(Error::rejected(format!("{label}: {key} must not be empty")));
+                }
+                let mut unique = std::collections::HashSet::new();
+                for item in &items {
+                    if !unique.insert(item) {
+                        return Err(Error::rejected(format!(
+                            "{label}: duplicate {key} item '{item}'"
+                        )));
+                    }
+                }
+                if key == "sources" {
+                    sources = Some(items);
+                } else {
+                    paths = Some(
+                        crate::issue::areas::parse_paths(list)
+                            .map_err(|e| Error::rejected(format!("{label}: {e}")))?,
+                    );
+                }
+            }
+            "reuse" if intake => {
+                if !model::valid_id(value) {
+                    return Err(Error::rejected(format!(
+                        "{label}: reuse must be an issue id"
+                    )));
+                }
+                reuse = Some(value.to_string());
+            }
             _ => break,
         }
         lines.next();
+    }
+    if intake && (sources.is_none() || paths.is_none()) {
+        return Err(Error::rejected(format!(
+            "{label}: intake requires nonempty sources and paths"
+        )));
+    }
+    if reuse.is_some() && seen.contains("depends_on") {
+        return Err(Error::rejected(format!(
+            "{label}: reused ticket cannot declare depends_on"
+        )));
     }
     // The rest: a `### Acceptance` subsection, everything else is the
     // description.
@@ -215,6 +340,9 @@ fn parse_ticket(n: usize, count: usize, heading: &str, text: &str) -> Result<Tic
         depends_on,
         size,
         agent,
+        sources: sources.unwrap_or_default(),
+        paths: paths.unwrap_or_default(),
+        reuse,
     })
 }
 

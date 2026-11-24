@@ -32,7 +32,8 @@ pub struct PreparedContext<'a> {
 /// proposed dispatch revision and message id, the actual assignee's
 /// runtime facts and — for a native admission — the caller's proof of the
 /// issue lane the job actually holds.
-pub(crate) struct JobContext<'a> {
+#[doc(hidden)]
+pub struct JobContext<'a> {
     pub job: &'a store::Job,
     pub task: &'a store::Task,
     pub revision: i64,
@@ -48,7 +49,8 @@ pub(crate) struct JobContext<'a> {
 
 /// The native caller's issue-lane proof, run once inside the guard's lazy
 /// factory — after opt-in and endpoint confirmation, before any spec read.
-pub(crate) type AdmissionScope<'a> =
+#[doc(hidden)]
+pub type AdmissionScope<'a> =
     &'a dyn Fn(&crate::issue::project::Project, &Front) -> crate::error::Result<()>;
 
 /// Synthetic identity of the optional lesson source and its aggregate gap

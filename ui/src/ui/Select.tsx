@@ -32,6 +32,14 @@ export type SelectProps = {
   /** Commits the option's `value` string. */
   onChange: (value: string) => void;
   options: SelectOption[];
+  /** Selected values for multi-select usage (renders checkmarks/aria-selected for all picks). */
+  selectedValues?: readonly string[];
+  /** Keep the dropdown open and preserve search focus after picking an item. */
+  keepOpenOnPick?: boolean;
+  /** Notifies the parent when the search box query changes (e.g. server-backed search). */
+  onSearchChange?: (query: string) => void;
+  loading?: boolean;
+  emptyText?: string;
   placeholder?: string;
   /** Force the search field. It also appears on its own above 8 options. */
   searchable?: boolean;
@@ -58,6 +66,11 @@ export function Select({
   value,
   onChange,
   options,
+  selectedValues,
+  keepOpenOnPick = false,
+  onSearchChange,
+  loading = false,
+  emptyText,
   placeholder,
   searchable,
   disabled,
@@ -91,25 +104,41 @@ export function Select({
   const activeId = model.open && model.active >= 0 ? `${base}-opt-${model.active}` : undefined;
 
   const apply = (nextModel: SelectModel) => {
+    const queryChanged = nextModel.query !== modelRef.current.query;
     modelRef.current = nextModel;
     setModel(nextModel);
+    if (queryChanged) onSearchChange?.(nextModel.query);
   };
 
   const finish = (pick: string | null, nextModel: SelectModel, restore: boolean) => {
     const wasOpen = modelRef.current.open;
     apply(nextModel);
-    if (pick !== null) onChange(pick);
+    if (pick !== null) {
+      onChange(pick);
+      if (keepOpenOnPick && nextModel.open && searchOn) {
+        searchRef.current?.focus();
+      }
+    }
     if (restore && wasOpen && !nextModel.open) restoreTrigger.current = true;
   };
 
   const onListKey = (event: ReactKeyboardEvent) => {
     if (disabled) return;
     const current = modelRef.current;
-    const result = reduceSelectKey(current, options, searchOn, value, event.key, Date.now(), {
-      meta: event.metaKey,
-      ctrl: event.ctrlKey,
-      alt: event.altKey,
-    });
+    const result = reduceSelectKey(
+      current,
+      options,
+      searchOn,
+      value,
+      event.key,
+      Date.now(),
+      {
+        meta: event.metaKey,
+        ctrl: event.ctrlKey,
+        alt: event.altKey,
+      },
+      keepOpenOnPick,
+    );
     if (result.prevent) event.preventDefault();
     // Escape that closes the open list belongs to the list: a drawer or dialog
     // listening above (DrawerShell on the window) must not close as well.
@@ -190,25 +219,29 @@ export function Select({
     lastGroup = option.group;
     const badge = optionBadgeText(option);
     const active = index === model.active;
+    const isPicked = selectedValues ? selectedValues.includes(option.value) : option.value === value;
     rows.push(
       <li
         key={`${option.value}-${index}`}
         id={`${base}-opt-${index}`}
         role="option"
-        aria-selected={option.value === value}
+        aria-selected={isPicked}
         aria-disabled={option.disabled || undefined}
         data-active={active || undefined}
         className="select-opt"
+        onMouseDown={(event) => {
+          if (keepOpenOnPick && searchOn) event.preventDefault();
+        }}
         onMouseEnter={() => {
           if (!option.disabled) apply({ ...modelRef.current, active: index });
         }}
         onClick={() => {
-          const result = reducePick(modelRef.current, option);
-          finish(result.pick, result.model, result.pick !== null);
+          const result = reducePick(modelRef.current, option, keepOpenOnPick);
+          finish(result.pick, result.model, result.pick !== null && !keepOpenOnPick);
         }}
       >
         <span className="select-check" aria-hidden="true">
-          {option.value === value ? <IconCheck size={12} /> : null}
+          {isPicked ? <IconCheck size={12} /> : null}
         </span>
         <span className="select-copy">
           <span className="select-label">{option.label}</span>
@@ -251,6 +284,7 @@ export function Select({
             <ul
               id={listId}
               role="listbox"
+              aria-multiselectable={keepOpenOnPick || undefined}
               aria-label={ariaLabel}
               tabIndex={-1}
               className="select-list"
@@ -260,7 +294,7 @@ export function Select({
                 rows
               ) : (
                 <li role="presentation" className="select-empty">
-                  {t("No matches")}
+                  {loading ? t("Searching…") : emptyText ?? t("No matches")}
                 </li>
               )}
             </ul>

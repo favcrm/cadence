@@ -1,0 +1,30 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.draft.validate",
+    "input": {
+      "kind": "doc",
+      "title": "  Retention  ",
+      "content": {
+        "blocks": [
+          { "type": "h2", "text": "Retention" },
+          { "type": "p", "text": "Body." }
+        ]
+      },
+      "tags": [" Ops ", "ops", "Ops"]
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.draft.validate",
+    "value": {
+      "valid": true,
+      "kind": "doc",
+      "title": "Retention",
+      "tags": ["Ops", "ops"],
+      "content_material": "cadence-app-material-v1\n{\"content\":{\"blocks\":[{\"text\":\"Retention\",\"type\":\"h2\"},{\"text\":\"Body.\",\"type\":\"p\"}]},\"kind\":\"doc\",\"title\":\"Retention\"}",
+      "payload_material": "cadence-app-material-v1\n{\"content\":{\"blocks\":[{\"text\":\"Retention\",\"type\":\"h2\"},{\"text\":\"Body.\",\"type\":\"p\"}]},\"kind\":\"doc\",\"tags\":[\"Ops\",\"ops\"],\"title\":\"Retention\"}",
+      "refusals": []
+    }
+  }
+}

@@ -63,9 +63,9 @@ pub(crate) struct AppToolRecord<'a> {
     pub asset: Option<(&'a str, &'a [u8])>,
 }
 
+#[derive(Clone, Copy)]
+#[doc(hidden)]
 pub struct AppToolClaim<'a> {
-    pub workspace: &'a crate::issue::app_catalog::workspace::RuntimeSnapshot<'a>,
-    pub context: Option<&'a str>,
     pub request: &'a str,
     pub install: &'a str,
     pub alias: &'a str,
@@ -73,6 +73,62 @@ pub struct AppToolClaim<'a> {
     pub binding_digest: &'a str,
     pub input_digest: &'a str,
     pub call_id: &'a str,
+}
+
+/// A claim returned only after its durable pre-call reservation.
+#[doc(hidden)]
+pub struct AppToolClaimReceipt<'a> {
+    request: &'a str,
+    install: &'a str,
+    alias: &'a str,
+    slot: &'a str,
+    binding_digest: &'a str,
+    input_digest: &'a str,
+    call_id: &'a str,
+}
+
+impl AppToolClaimReceipt<'_> {
+    pub(super) fn matches_image_job(
+        &self,
+        install: &str,
+        request: &str,
+        call_id: &str,
+        spec: &Value,
+    ) -> bool {
+        self.install == install
+            && self.request == request
+            && self.call_id == call_id
+            && spec["alias"] == self.alias
+            && spec["slot"] == self.slot
+            && spec["binding_digest"] == self.binding_digest
+            && spec["input_digest"] == self.input_digest
+            && app_runs::material_digest(&spec["input"]) == self.input_digest
+    }
+
+    #[doc(hidden)]
+    pub fn record(
+        &self,
+        store: &Store,
+        input: &Value,
+        result: &Value,
+        asset: Option<(&str, &[u8])>,
+    ) -> Result<Value> {
+        if app_runs::material_digest(input) != self.input_digest {
+            return Err(Error::rejected("tool result input differs from its claim"));
+        }
+        store.app_tool_record_in(AppToolRecord {
+            id: self.call_id,
+            request: self.request,
+            install: self.install,
+            alias: self.alias,
+            slot: self.slot,
+            binding_digest: self.binding_digest,
+            input_digest: self.input_digest,
+            input,
+            result,
+            asset,
+        })
+    }
 }
 
 struct ReceiptFields<'a> {
@@ -98,94 +154,168 @@ fn receipt_digest(f: &ReceiptFields<'_>) -> String {
 }
 
 impl Store {
+    fn insert_and_verify_claim(tx: &impl StoreConn, claim: AppToolClaim<'_>) -> Result<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO app_tool_claims VALUES(?,?,?,?,?,?,?,?)",
+            params![
+                claim.request,
+                claim.install,
+                claim.alias,
+                claim.slot,
+                claim.binding_digest,
+                claim.input_digest,
+                claim.call_id,
+                now()
+            ],
+        )?;
+        let existing: Option<(String, String, String, String, String, String)> = tx.query_opt(
+            "SELECT install_id,alias,slot,binding_digest,input_digest,call_id
+                     FROM app_tool_claims WHERE request_id=?",
+            [claim.request],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )?;
+        if let Some(existing) = existing {
+            if existing
+                != (
+                    claim.install.into(),
+                    claim.alias.into(),
+                    claim.slot.into(),
+                    claim.binding_digest.into(),
+                    claim.input_digest.into(),
+                    claim.call_id.into(),
+                )
+            {
+                return Err(Error::rejected(
+                    "tool request id already claimed a different operation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Reserve the one paid operation for this request id BEFORE provider
     /// I/O. A repeat of the same request id is admitted only when it is
     /// byte-for-byte the same intent (same install, alias, slot, binding,
     /// input and call id) — an uncertain transport retry. Any difference
     /// refuses so a recycled id can never run a second/changed operation.
     pub fn app_tool_claim(&self, claim: AppToolClaim<'_>) -> Result<()> {
-        let AppToolClaim {
-            workspace,
-            context,
-            request,
-            install,
-            alias,
-            slot,
-            binding_digest,
-            input_digest,
-            call_id,
-        } = claim;
+        self.write_tx(|conn| Self::insert_and_verify_claim(&*conn, claim))
+    }
+
+    #[doc(hidden)]
+    pub fn app_tool_claim_receipt<'a>(
+        &self,
+        claim: AppToolClaim<'a>,
+    ) -> Result<AppToolClaimReceipt<'a>> {
+        self.app_tool_claim(claim)?;
+        if !Self::app_tool_claimed(&*self.conn(), &claim)? {
+            return Err(Error::rejected(
+                "tool call id already belongs to another claim",
+            ));
+        }
+        Ok(AppToolClaimReceipt {
+            request: claim.request,
+            install: claim.install,
+            alias: claim.alias,
+            slot: claim.slot,
+            binding_digest: claim.binding_digest,
+            input_digest: claim.input_digest,
+            call_id: claim.call_id,
+        })
+    }
+
+    /// Reserve a paid operation inside a checked runtime snapshot and return
+    /// its durable receipt in one transaction.
+    #[doc(hidden)]
+    pub fn app_tool_claim_in_workspace<'a>(
+        &self,
+        workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot<'_>,
+        context: Option<&str>,
+        claim: AppToolClaim<'a>,
+    ) -> Result<AppToolClaimReceipt<'a>> {
         self.write_tx(|conn| {
-            let tx = &mut *conn;
+            let tx = &*conn;
             #[cfg(test)]
             let fixture = workspace.is_store_fixture();
             #[cfg(not(test))]
             let fixture = false;
             if !fixture {
-                let scope = context.map_or_else(|| "installation".to_owned(), |id| format!("context:{id}"));
-                let config: Option<String> = tx.query_row(
-                    "SELECT config FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=?
+                let scope =
+                    context.map_or_else(|| "installation".to_owned(), |id| format!("context:{id}"));
+                let config: Option<String> = tx
+                    .query_row(
+                        "SELECT config FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=?
                      AND digest=? AND state='configured' AND json_extract(config,'$.bundle_digest')=?",
-                    params![install, scope, slot, binding_digest, workspace.digest()], |r| r.get(0),
-                ).optional()?;
+                        params![
+                            claim.install,
+                            scope,
+                            claim.slot,
+                            claim.binding_digest,
+                            workspace.digest()
+                        ],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
                 let current = config
                     .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                    .is_some_and(|config| app_runs::material_digest(&json!({
-                        "kind":"app-binding-v1", "install_id":install,
-                        "context_id":context, "slot":slot, "config":config
-                    })) == binding_digest);
-                if workspace.install() != install || !workspace.declares_read_or_draft(slot) || !current {
+                    .is_some_and(|config| {
+                        app_runs::material_digest(&json!({
+                            "kind":"app-binding-v1", "install_id":claim.install,
+                            "context_id":context, "slot":claim.slot, "config":config
+                        })) == claim.binding_digest
+                    });
+                if workspace.install() != claim.install
+                    || !workspace.declares_read_or_draft(claim.slot)
+                    || !current
+                {
                     return Err(Error::rejected("tool workspace binding is no longer current"));
                 }
             }
-            tx.execute(
-                "INSERT OR IGNORE INTO app_tool_claims VALUES(?,?,?,?,?,?,?,?)",
-                params![
-                    request,
-                    install,
-                    alias,
-                    slot,
-                    binding_digest,
-                    input_digest,
-                    call_id,
-                    now()
-                ],
-            )?;
-            let existing: Option<(String, String, String, String, String, String)> = tx.query_opt(
-                "SELECT install_id,alias,slot,binding_digest,input_digest,call_id
-                     FROM app_tool_claims WHERE request_id=?",
-                [request],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
-            )?;
-            if let Some(existing) = existing {
-                if existing
-                    != (
-                        install.into(),
-                        alias.into(),
-                        slot.into(),
-                        binding_digest.into(),
-                        input_digest.into(),
-                        call_id.into(),
-                    )
-                {
-                    return Err(Error::rejected(
-                        "tool request id already claimed a different operation",
-                    ));
-                }
-            }
-            Ok(())
+            Self::insert_and_verify_claim(tx, claim)
+        })?;
+        if !Self::app_tool_claimed(&*self.conn(), &claim)? {
+            return Err(Error::rejected(
+                "tool call id already belongs to another claim",
+            ));
+        }
+        Ok(AppToolClaimReceipt {
+            request: claim.request,
+            install: claim.install,
+            alias: claim.alias,
+            slot: claim.slot,
+            binding_digest: claim.binding_digest,
+            input_digest: claim.input_digest,
+            call_id: claim.call_id,
         })
     }
 
+    /// Whether this exact claim identity is already reserved — used by the
+    /// record path to prove the durable claim precedes the result.
+    fn app_tool_claimed(conn: &impl StoreConn, claim: &AppToolClaim<'_>) -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_tool_claims WHERE request_id=? AND call_id=?
+             AND install_id=? AND alias=? AND slot=? AND binding_digest=? AND input_digest=?)",
+            params![
+                claim.request,
+                claim.call_id,
+                claim.install,
+                claim.alias,
+                claim.slot,
+                claim.binding_digest,
+                claim.input_digest
+            ],
+            |r| r.get(0),
+        )?)
+    }
 
     /// Installs that ever reserved a paid call: a restart looks for unfinished
     /// image jobs only in their record files.
@@ -213,11 +343,45 @@ impl Store {
         id.map(|id| self.app_tool_result(&id)).transpose()
     }
 
+    /// Replay only a receipt owned by the same persisted claim as the job.
+    pub(super) fn app_tool_result_for_claim(
+        &self,
+        claim: &AppToolClaim<'_>,
+    ) -> Result<Option<Value>> {
+        let conn = self.conn();
+        if !Self::app_tool_claimed(&*conn, claim)? {
+            return Err(Error::rejected("image job has no matching pre-call claim"));
+        }
+        let id = conn
+            .query_row(
+                "SELECT id FROM app_tool_results WHERE request_id=?",
+                [claim.request],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let receipt = Self::app_tool_result_in(&*conn, &id)?;
+        if id != claim.call_id
+            || receipt["install_id"] != claim.install
+            || receipt["alias"] != claim.alias
+            || receipt["slot"] != claim.slot
+            || receipt["binding_digest"] != claim.binding_digest
+            || receipt["input_digest"] != claim.input_digest
+        {
+            return Err(Error::rejected(
+                "image job receipt does not match its claim",
+            ));
+        }
+        Ok(Some(receipt))
+    }
+
     /// Persist the one result for a request id after the provider call.
     /// Requires the matching pre-call claim; a second result for the same
     /// request id returns the existing receipt (the unique request id is
     /// the dedup), and a mismatched repeat refuses.
-    pub(crate) fn app_tool_record(&self, record: AppToolRecord<'_>) -> Result<Value> {
+    pub(super) fn app_tool_record_in(&self, record: AppToolRecord<'_>) -> Result<Value> {
         let AppToolRecord {
             id,
             request,
@@ -317,6 +481,12 @@ impl Store {
             )?;
             Self::app_tool_result_in(&tx, id)
         })
+    }
+
+    // Existing custody fixtures exercise the low-level checked store path.
+    #[cfg(test)]
+    pub(crate) fn app_tool_record(&self, record: AppToolRecord<'_>) -> Result<Value> {
+        self.app_tool_record_in(record)
     }
 
     /// Retain one operator-provided image as a standalone receipt. Unlike a
