@@ -674,6 +674,17 @@ A replay without a recorded result is not a successful report. Hosted and
 local-device clients refuse to present a missing result as success and do not
 automatically dispatch another read.
 
+### Discovering connected-account tools and connections
+
+Agents and workspace members discover qualified connected-account tools (both
+reads and, for owners, stageable draft/send effects) alongside the
+`connection_id` values they are permitted to use via `platform connected-tools`
+(`cli.read` or `cli.write`):
+
+```sh
+cadence --org acme platform connected-tools [--query linkedin]
+```
+
 ### Staging a draft or send tool for owner approval
 
 A connected draft/send tool (for example a Gmail send) never runs when an agent

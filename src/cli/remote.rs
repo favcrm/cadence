@@ -1526,6 +1526,19 @@ fn verb_for(
                     }
                     args.insert("operation".into(), json!("tools"));
                 }
+                PlatformAction::ConnectedTools { query } => {
+                    args.insert("operation".into(), json!("connected_tools"));
+                    if let Some(raw) = query {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() || trimmed.len() > 100 {
+                            return Err(Error::invalid(
+                                "platform_call",
+                                "query must be 1-100 non-whitespace characters",
+                            ));
+                        }
+                        args.insert("q".into(), json!(trimmed));
+                    }
+                }
                 PlatformAction::Call {
                     tool,
                     input,
@@ -4325,6 +4338,46 @@ mod read_contract_tests {
             None
         );
         assert_eq!(connection_owner_verb(&Commands::MyWork), None);
+    }
+
+    #[test]
+    fn hosted_connected_tools_maps_to_platform_call_and_allows_agents() {
+        let bare = platform(PlatformAction::ConnectedTools { query: None });
+        assert_eq!(connection_owner_verb(&bare), None);
+        let (verb, args) = outcome(&bare).expect("bare connected-tools should be accepted");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(args, json!({ "operation": "connected_tools" }));
+
+        let filtered = platform(PlatformAction::ConnectedTools {
+            query: Some("  linkedin  ".into()),
+        });
+        assert_eq!(connection_owner_verb(&filtered), None);
+        let (verb, args) = outcome(&filtered).expect("filtered connected-tools should be accepted");
+        assert_eq!(verb, "platform_call");
+        assert_eq!(
+            args,
+            json!({ "operation": "connected_tools", "q": "linkedin" })
+        );
+
+        let too_long = platform(PlatformAction::ConnectedTools {
+            query: Some("x".repeat(101)),
+        });
+        let err = outcome(&too_long).unwrap_err();
+        assert!(err.contains("1-100"), "{err}");
+
+        let empty = platform(PlatformAction::ConnectedTools {
+            query: Some("   ".into()),
+        });
+        let err = outcome(&empty).unwrap_err();
+        assert!(err.contains("1-100"), "{err}");
+
+        let missing = std::path::Path::new("/nonexistent-cadence-state-dir");
+        let local_err = super::super::platform::run_platform(
+            missing,
+            &PlatformAction::ConnectedTools { query: None },
+        )
+        .unwrap_err();
+        assert!(local_err.to_string().contains("--org"), "{local_err}");
     }
 
     #[test]
