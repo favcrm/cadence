@@ -20,6 +20,10 @@ export interface IssuePageProps {
   onToast: (text: string) => void;
   /** True on hosted workspaces where local daemon `/lane` routes do not exist. */
   hosted?: boolean;
+  /** True when the viewer can see/dispatch to owner-connected local daemons (`settings_sections` includes `daemons`). */
+  canLocalDispatch?: boolean;
+  /** Link to Settings -> Daemons when `canLocalDispatch` is true. */
+  daemonsHref?: string;
   managedFiles?: boolean;
   /** Configured repositories for `project` (`[]` on non-repository projects). */
   projectRepos?: readonly unknown[] | null;

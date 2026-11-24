@@ -56,6 +56,7 @@ import EmailSending from "./features/settings/EmailSending";
 import SettingsLayout from "./features/settings/SettingsLayout";
 import General from "./features/settings/General";
 import HostedStatus from "./features/settings/HostedStatus";
+import Daemons from "./features/settings/Daemons";
 import AdvancedCustody from "./features/settings/AdvancedCustody";
 import { settingsLabel, settingsNavGroups, settingsRedirect } from "./features/settings/settingsNav";
 import Preferences from "./features/settings/Preferences";
@@ -1585,6 +1586,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             writeBlock={block}
             kickoffBlock={operatorKickoffBlock(meta)}
             hosted={meta?.hosted === true}
+            canLocalDispatch={meta?.settings_sections?.includes("daemons") === true}
+            daemonsHref={meta?.settings_sections?.includes("daemons") ? hrefFor({ screen: "settings", section: "daemons" }) : undefined}
             managedFiles={managedFiles}
             projectRepos={projects.find((p) => p.key === route.project)?.repos ?? null}
             stagedActions={decisions.rows}
@@ -1857,6 +1860,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 hosted={meta?.hosted === true}
                 onBillingSnapshot={setBillingSummary}
               />
+            )}
+            {route.section === "daemons" && meta?.settings_sections?.includes("daemons") && (
+              <Daemons onOpenIssue={openIssue} />
             )}
             {route.section === "update" && (meta?.settings_sections
               ? <HostedStatus meta={meta} canReadConnections={viewer.operator === true} partialUpdates={partialUpdates} />

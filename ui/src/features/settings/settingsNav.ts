@@ -2,7 +2,7 @@ import type { SettingsSection } from "../../lib/router";
 
 export type SettingsIcon =
   | "preferences" | "security" | "connections" | "email" | "templates" | "general"
-  | "status" | "agents" | "memory" | "permissions" | "custody" | "account" | "members" | "documents";
+  | "status" | "daemons" | "agents" | "memory" | "permissions" | "custody" | "account" | "members" | "documents";
 
 export type SettingsNavEntry = { section: SettingsSection; label: string; icon: SettingsIcon };
 export type SettingsNavGroupSpec = { label: string; items: SettingsNavEntry[] };
@@ -15,6 +15,7 @@ const ENTRIES = {
   email: { section: "email", label: "Email sending", icon: "email" },
   templates: { section: "templates", label: "Templates", icon: "templates" },
   general: { section: "general", label: "General", icon: "general" },
+  daemons: { section: "daemons", label: "Daemons", icon: "daemons" },
   status: { section: "update", label: "Status", icon: "status" },
   agents: { section: "models", label: "Agents", icon: "agents" },
   memory: { section: "memory", label: "Memory", icon: "memory" },
@@ -62,15 +63,16 @@ export function settingsNavGroups(meta: SettingsMeta): SettingsNavGroupSpec[] {
     // CAD-2286: Documents follows Members; Members stays first, where
     // `settingsRedirect` lands a request for a page this board does not serve.
     { label: "Workspace", items: pick("members", ...(meta?.wiki_managed_files ? [] : ["documents" as const]), "connections", "email", ...(!meta?.hosted ? ["templates" as const] : []), "general") },
-    { label: "System", items: [...pick("status"), ...account] },
+    { label: "System", items: [...pick("daemons", "status"), ...account] },
   ].filter((group) => group.items.length > 0);
 }
 
 /**
  * Sections only a hosted board can serve. A native board has no tenant member
- * list and no document lifecycle, so it neither offers nor mounts either.
+ * list, no document lifecycle, and no owner daemon directory, so it neither
+ * offers nor mounts them.
  */
-const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents", "security"];
+const HOSTED_ONLY: readonly SettingsSection[] = ["members", "documents", "security", "daemons"];
 
 /**
  * Where a request for `section` should land instead, or null when it is fine.

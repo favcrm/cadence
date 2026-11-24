@@ -1,6 +1,7 @@
 //! Daemon-owned outbound hosted events. HTTPS remains the assignment authority.
 use super::http::BoardHttp;
 use super::*;
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -12,11 +13,54 @@ const DIRECTORY_VERSION: &str = "hosted-cadence-agent-directory.v1";
 const INBOX_LIMIT: usize = 512;
 const FILE_LIMIT: u64 = 4 * 1024 * 1024;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnRepoBinding {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnPolicy {
+    pub spawn_allowed: bool,
+    pub repos: Vec<SpawnRepoBinding>,
+    pub harnesses: Vec<String>,
+    pub max_concurrent: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AgentActivitySnapshot {
+    pub status: String,
+    pub summary: Option<String>,
+    pub issue_id: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RunnerRuntimeSnapshot {
+    pub agents: BTreeMap<String, AgentActivitySnapshot>,
+    pub active_spawn_lanes: u32,
+}
+
+pub type SpawnWorkerFn =
+    Arc<dyn Fn(&SpawnSpec, &Path, &str) -> Result<(String, String)> + Send + Sync>;
+pub type KickoffFn = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
+pub struct EventRuntime {
+    pub send: Arc<dyn Fn(Value) -> Result<Value> + Send + Sync>,
+    pub snapshot: Arc<dyn Fn(&WorkspaceBinding) -> RunnerRuntimeSnapshot + Send + Sync>,
+    pub spawn_worker: SpawnWorkerFn,
+    pub on_kickoff: KickoffFn,
+    pub on_terminal: Arc<dyn Fn(&str) + Send + Sync>,
+    pub notify: Arc<dyn Fn() + Send + Sync>,
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentBinding {
     pub alias: String,
-    agent_id: String,
+    pub agent_id: String,
     adapter: String,
     delivery: String,
 }
@@ -37,6 +81,8 @@ pub struct WorkspaceBinding {
     default_alias: Option<String>,
     /// Explicit connect may resume blocked work once; background reconnect may not.
     resume_operation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spawn_policy: Option<SpawnPolicy>,
 }
 
 impl WorkspaceBinding {
@@ -45,6 +91,12 @@ impl WorkspaceBinding {
     }
     pub fn default_alias(&self) -> Option<&str> {
         self.default_alias.as_deref()
+    }
+    pub fn agents(&self) -> &[AgentBinding] {
+        &self.agents
+    }
+    pub fn spawn_policy(&self) -> Option<&SpawnPolicy> {
+        self.spawn_policy.as_ref()
     }
     pub(super) fn adapter_for(&self, alias: &str) -> Option<&str> {
         self.agents
@@ -190,6 +242,107 @@ fn inbox_lock(state: &Path) -> Result<impl Sized> {
     )
 }
 
+pub(crate) fn validate_spawn_policy(policy: &SpawnPolicy) -> Result<SpawnPolicy> {
+    if !policy.spawn_allowed {
+        return Ok(SpawnPolicy {
+            spawn_allowed: false,
+            repos: Vec::new(),
+            harnesses: Vec::new(),
+            max_concurrent: 0,
+        });
+    }
+    if policy.max_concurrent == 0 || policy.max_concurrent > 32 {
+        return Err(Error::rejected(
+            "spawn --max-concurrent must be between 1 and 32",
+        ));
+    }
+    let mut harnesses = Vec::new();
+    for raw in &policy.harnesses {
+        let trimmed = raw.trim();
+        if !super::contract::VALID_SPAWN_HARNESSES.contains(&trimmed) {
+            return Err(Error::rejected(format!(
+                "unsupported spawn harness '{trimmed}'"
+            )));
+        }
+        if !harnesses.iter().any(|h| h == trimmed) {
+            harnesses.push(trimmed.to_string());
+        }
+    }
+    if harnesses.is_empty() {
+        return Err(Error::rejected(
+            "--allow-spawn requires at least one allowed harness",
+        ));
+    }
+    let mut repos = Vec::new();
+    for binding in &policy.repos {
+        let name = binding.name.trim();
+        if !super::contract::logical_repo_name(name) {
+            return Err(Error::rejected(format!(
+                "invalid logical spawn repo name '{name}'"
+            )));
+        }
+        if repos.iter().any(|r: &SpawnRepoBinding| r.name == name) {
+            return Err(Error::rejected(format!(
+                "duplicate spawn repo logical name '{name}'"
+            )));
+        }
+        let root = worktree::main_root(Path::new(&binding.path))?;
+        repos.push(SpawnRepoBinding {
+            name: name.to_string(),
+            path: root.to_string_lossy().into_owned(),
+        });
+    }
+    if repos.is_empty() {
+        return Err(Error::rejected(
+            "--allow-spawn requires at least one allowlisted repository",
+        ));
+    }
+    Ok(SpawnPolicy {
+        spawn_allowed: true,
+        repos,
+        harnesses,
+        max_concurrent: policy.max_concurrent,
+    })
+}
+
+pub(crate) fn authorize_spawn_locally(
+    policy: Option<&SpawnPolicy>,
+    spec: &SpawnSpec,
+    active_spawn_lanes: u32,
+) -> Result<PathBuf> {
+    let Some(policy) = policy.filter(|p| p.spawn_allowed) else {
+        return Err(Error::invalid(
+            "spawn_not_allowed",
+            "host daemon has not enabled opt-in spawn (--allow-spawn)",
+        ));
+    };
+    if !policy.harnesses.iter().any(|h| h == &spec.provider) {
+        return Err(Error::invalid(
+            "spawn_target_not_allowed",
+            format!(
+                "harness '{}' is outside host daemon allowlist",
+                spec.provider
+            ),
+        ));
+    }
+    let Some(repo) = policy.repos.iter().find(|r| r.name == spec.repo) else {
+        return Err(Error::invalid(
+            "spawn_target_not_allowed",
+            format!("repo '{}' is outside host daemon allowlist", spec.repo),
+        ));
+    };
+    if active_spawn_lanes >= policy.max_concurrent {
+        return Err(Error::invalid(
+            "runner_at_capacity",
+            format!(
+                "host daemon is at {}/{} concurrent spawned lanes",
+                active_spawn_lanes, policy.max_concurrent
+            ),
+        ));
+    }
+    worktree::main_root(Path::new(&repo.path))
+}
+
 /// The daemon resolves real endpoint capabilities. Caller declarations do not
 /// grant push, an actor, or another member's identity.
 pub fn connect(
@@ -199,7 +352,12 @@ pub fn connect(
     fyi_only: bool,
     lane_name: Option<&str>,
     repo: Option<&Path>,
+    spawn_policy: Option<SpawnPolicy>,
 ) -> Result<Value> {
+    let validated_policy = spawn_policy
+        .as_ref()
+        .map(validate_spawn_policy)
+        .transpose()?;
     let alias = agent.alias.as_str();
     let provider = agent.provider.as_str();
     let endpoint_kind = agent.endpoint_kind.as_str();
@@ -244,8 +402,16 @@ pub fn connect(
             lane_name: None,
             default_alias: None,
             resume_operation: None,
+            spawn_policy: None,
         }
     };
+    if let Some(policy) = validated_policy {
+        binding.spawn_policy = if policy.spawn_allowed {
+            Some(policy)
+        } else {
+            None
+        };
+    }
     let capabilities = crate::adapter::registry::capabilities_json(provider, endpoint_kind);
     let delivery = if capabilities["has_actor"] == true {
         "turn"
@@ -515,19 +681,80 @@ fn recover_notices(
     }
 }
 
+fn hostname_label() -> Option<String> {
+    let raw = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())?;
+    let trimmed: String = raw.trim().chars().take(120).collect();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn spawn_manifest_json(policy: Option<&SpawnPolicy>, active_lanes: u32) -> Value {
+    match policy {
+        Some(policy) if policy.spawn_allowed => json!({
+            "spawn_allowed": true,
+            "repos": policy.repos.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+            "harnesses": policy.harnesses,
+            "max_concurrent": policy.max_concurrent,
+            "active_lanes": active_lanes.min(32),
+        }),
+        _ => json!({
+            "spawn_allowed": false,
+            "repos": [],
+            "harnesses": [],
+            "max_concurrent": 0,
+            "active_lanes": 0,
+        }),
+    }
+}
+
 fn register(
     http: &mut BoardHttp,
     binding: &WorkspaceBinding,
     sessions: &[String],
     select_default: bool,
     client_agent_id: &str,
+    snapshot: &RunnerRuntimeSnapshot,
 ) -> Result<()> {
-    let agents: Vec<Value> = binding.agents.iter().zip(sessions).map(|(agent, session)| json!({
-        "agent_id": agent.agent_id, "label": agent.alias, "adapter": agent.adapter, "delivery": agent.delivery,
-        "session_id": session, "client_agent_id": client_agent_id,
-    })).collect();
-    let mut body =
-        json!({"version": DIRECTORY_VERSION, "runner_id": binding.runner_id, "agents": agents});
+    let agents: Vec<Value> = binding
+        .agents
+        .iter()
+        .zip(sessions)
+        .map(|(agent, session)| {
+            let mut item = json!({
+                "agent_id": agent.agent_id,
+                "label": agent.alias,
+                "adapter": agent.adapter,
+                "delivery": agent.delivery,
+                "session_id": session,
+                "client_agent_id": client_agent_id,
+            });
+            if let Some(act) = snapshot.agents.get(&agent.alias) {
+                let mut activity = json!({ "status": act.status });
+                if let Some(summary) = act.summary.as_deref().filter(|s| !s.is_empty()) {
+                    activity["summary"] = json!(summary.chars().take(240).collect::<String>());
+                }
+                if let Some(issue_id) = act.issue_id.as_deref().filter(|s| !s.is_empty()) {
+                    activity["issue_id"] = json!(issue_id);
+                }
+                if let Some(updated_at) = act.updated_at.as_deref() {
+                    activity["updated_at"] = json!(updated_at);
+                }
+                item["activity"] = activity;
+            }
+            item
+        })
+        .collect();
+    let mut body = json!({
+        "version": DIRECTORY_VERSION,
+        "runner_id": binding.runner_id,
+        "platform": std::env::consts::OS,
+        "spawn_manifest": spawn_manifest_json(binding.spawn_policy(), snapshot.active_spawn_lanes),
+        "agents": agents,
+    });
+    if let Some(host_label) = hostname_label() {
+        body["host_label"] = json!(host_label);
+    }
     if select_default {
         body["default_agent_id"] = json!(binding
             .default_alias
@@ -683,14 +910,14 @@ pub fn run(
     state: PathBuf,
     binding: WorkspaceBinding,
     stop: Arc<AtomicBool>,
-    send: Arc<dyn Fn(Value) -> Result<Value> + Send + Sync>,
-    notify: Arc<dyn Fn() + Send + Sync>,
+    runtime: EventRuntime,
 ) {
     let sessions: Vec<String> = binding
         .agents
         .iter()
         .map(|_| format!("las_{}", Uuid::new_v4()))
         .collect();
+    let runtime = Arc::new(runtime);
     // A replacement configuration cannot overlap the old workspace socket.
     let name = format!("hosted-workspace-{}", binding.organization_id);
     let _owner = loop {
@@ -721,8 +948,7 @@ pub fn run(
         let state = state.clone();
         let binding = binding.clone();
         let stop = stop.clone();
-        let send = send.clone();
-        let notify = notify.clone();
+        let runtime = Arc::clone(&runtime);
         let lifetime = lifetime.clone();
         std::thread::spawn(move || {
             let mut retry = false;
@@ -743,10 +969,12 @@ pub fn run(
                     let mut http = guarded_http(&target, &lifetime)?;
                     let mut coord = guarded_http(&target, &lifetime)?.into_coordinator()?;
                     coord.delivery_guard = Some(lifetime.clone());
+                    let send = Arc::clone(&runtime.send);
+                    let on_kickoff = Arc::clone(&runtime.on_kickoff);
                     let mut deliver = |kickoff: &Kickoff| {
                         let adapter_for_alias =
                             binding.adapter_for(kickoff.alias).map(str::to_string);
-                        super::delivery::deliver_kickoff_with_adapter(
+                        let sent = super::delivery::deliver_kickoff_with_adapter(
                             &target,
                             &state,
                             kickoff,
@@ -761,11 +989,21 @@ pub fn run(
                                 }
                                 send(params)
                             },
-                        )
+                        )?;
+                        on_kickoff(kickoff.alias, kickoff.assignment_id, kickoff.issue_id);
+                        Ok(sent)
                     };
-                    process(&state, &binding, &mut coord, &mut http, &mut deliver, &stop)
+                    process(
+                        &state,
+                        &binding,
+                        &mut coord,
+                        &mut http,
+                        runtime.as_ref(),
+                        &mut deliver,
+                        &stop,
+                    )
                 })();
-                notify();
+                (runtime.notify)();
                 retry = result.is_err();
             }
         })
@@ -779,9 +1017,8 @@ pub fn run(
                 sessions: &sessions,
             },
             &stop,
-            send.as_ref(),
+            runtime.as_ref(),
             &pending,
-            notify.as_ref(),
             &lifetime,
         );
         if stop.load(Ordering::SeqCst) {
@@ -807,13 +1044,97 @@ struct SessionRegistration<'a> {
     sessions: &'a [String],
 }
 
+fn deliver_assignments<F: FnMut(&Kickoff) -> Result<Value>>(
+    binding: &WorkspaceBinding,
+    coord: &mut Coordinator<BoardHttp>,
+    http: &mut BoardHttp,
+    runtime: &EventRuntime,
+    rows: Vec<Assignment>,
+    resume_blocked: bool,
+    deliver: &mut F,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let needs_default = rows
+        .iter()
+        .any(|row| row.target_agent_id.is_none() && row.spawn.is_none());
+    let allow_default = if needs_default {
+        is_assignment_default(http, binding)?
+    } else {
+        false
+    };
+    let stored_repo = coord.with_ledger(|ledger| Ok(ledger.repo.clone()))?;
+    let seat_root = stored_repo
+        .as_deref()
+        .map(|raw| worktree::main_root(Path::new(raw)))
+        .transpose()?;
+    let mut resolve = |row: &Assignment| -> Result<Option<PickupTarget>> {
+        if let Some(spec) = row.spawn.as_ref() {
+            if spec.runner_id != binding.runner_id {
+                return Ok(None);
+            }
+            let active_lanes = (runtime.snapshot)(binding).active_spawn_lanes;
+            let repo_root = authorize_spawn_locally(binding.spawn_policy(), spec, active_lanes)?;
+            return Ok(Some(PickupTarget::Spawn {
+                spec: spec.clone(),
+                repo_root,
+            }));
+        }
+        if let Some(target_agent_id) = row.target_agent_id.as_deref() {
+            let Some(agent) = binding
+                .agents
+                .iter()
+                .find(|candidate| candidate.agent_id == target_agent_id)
+            else {
+                return Ok(None);
+            };
+            let Some(repo_root) = seat_root.clone() else {
+                return Err(Error::invalid(
+                    "repo_required",
+                    "connect this seat with --repo before claiming work",
+                ));
+            };
+            return Ok(Some(PickupTarget::Seat {
+                alias: agent.alias.clone(),
+                repo_root,
+            }));
+        }
+        if !allow_default {
+            return Ok(None);
+        }
+        let Some(default_alias) = binding.default_alias() else {
+            return Ok(None);
+        };
+        let Some(repo_root) = seat_root.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(PickupTarget::Seat {
+            alias: default_alias.to_string(),
+            repo_root,
+        }))
+    };
+    let mut spawn_actor = |spec: &SpawnSpec, worktree: &Path, assignment_id: &str| {
+        (runtime.spawn_worker)(spec, worktree, assignment_id)
+    };
+    let picked = coord.pickup_rows_routed(
+        rows,
+        binding.lane_name.as_deref(),
+        resume_blocked,
+        binding.default_alias.as_deref(),
+        &mut resolve,
+        &mut spawn_actor,
+        deliver,
+    )?;
+    pickup_reconciled(coord, &picked)
+}
+
 fn session(
     state: &Path,
     registration: SessionRegistration<'_>,
     stop: &AtomicBool,
-    send: &dyn Fn(Value) -> Result<Value>,
+    runtime: &EventRuntime,
     pending: &std::sync::mpsc::SyncSender<()>,
-    notify: &dyn Fn(),
     lifetime: &Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<()> {
     let SessionRegistration { binding, sessions } = registration;
@@ -826,14 +1147,16 @@ fn session(
     let mut coord = guarded_http(&target, lifetime)?.into_coordinator()?;
     coord.delivery_guard = Some(lifetime.clone());
     coord.ensure_active()?;
+    let snap = (runtime.snapshot)(binding);
     // A new credential for this same pinned member must refresh the directory
-    // credential fence while retaining stable IDs/session and selected default.
+    // credential fence while retaining stable IDs/session, spawn policy, and status.
     register(
         &mut http,
         binding,
         sessions,
         binding.resume_operation.is_some() && inbox.selected_operation != binding.resume_operation,
         &coord.client_agent_id()?,
+        &snap,
     )?;
     {
         let _lock = inbox_lock(state)?;
@@ -841,6 +1164,8 @@ fn session(
         inbox.selected_operation = binding.resume_operation.clone();
         atomic(&binding.inbox_path(state), &inbox)?;
     }
+    let send = Arc::clone(&runtime.send);
+    let on_kickoff = Arc::clone(&runtime.on_kickoff);
     let mut deliver = |kickoff: &Kickoff| {
         if !lifetime() {
             return Err(Error::busy_coded(
@@ -849,7 +1174,7 @@ fn session(
             ));
         }
         let adapter_for_alias = binding.adapter_for(kickoff.alias).map(str::to_string);
-        super::delivery::deliver_kickoff_with_adapter(
+        let sent = super::delivery::deliver_kickoff_with_adapter(
             &target,
             state,
             kickoff,
@@ -864,7 +1189,9 @@ fn session(
                 }
                 send(params)
             },
-        )
+        )?;
+        on_kickoff(kickoff.alias, kickoff.assignment_id, kickoff.issue_id);
+        Ok(sent)
     };
     if !inbox.initialized {
         if inbox.recovery_watermark.is_none() {
@@ -872,17 +1199,18 @@ fn session(
             if watermark < inbox.cursor {
                 return Err(Error::rejected("snapshot watermark regressed"));
             }
-            if is_assignment_default(&mut http, binding)? && !stop.load(Ordering::SeqCst) {
+            if !stop.load(Ordering::SeqCst) {
                 let resume = binding.resume_operation.is_some()
                     && inbox.resumed_operation != binding.resume_operation;
-                let picked = coord.pickup_rows(
+                deliver_assignments(
+                    binding,
+                    &mut coord,
+                    &mut http,
+                    runtime,
                     rows,
-                    binding.lane_name.as_deref(),
                     resume,
-                    binding.default_alias.as_deref(),
                     &mut deliver,
                 )?;
-                pickup_reconciled(&mut coord, &picked)?;
             }
             let _lock = inbox_lock(state)?;
             inbox = load_inbox(state, binding)?;
@@ -890,21 +1218,22 @@ fn session(
             inbox.recovery_notice_after = None;
             atomic(&binding.inbox_path(state), &inbox)?;
         }
-        inbox = recover_notices(state, binding, &mut http, stop, notify)?;
+        inbox = recover_notices(state, binding, &mut http, stop, runtime.notify.as_ref())?;
     } else {
         let resume = binding.resume_operation.is_some()
             && inbox.resumed_operation != binding.resume_operation;
         if resume || inbox.reread_assignments {
             let (_, rows) = coord.snapshot()?;
-            if is_assignment_default(&mut http, binding)? && !stop.load(Ordering::SeqCst) {
-                let picked = coord.pickup_rows(
+            if !stop.load(Ordering::SeqCst) {
+                deliver_assignments(
+                    binding,
+                    &mut coord,
+                    &mut http,
+                    runtime,
                     rows,
-                    binding.lane_name.as_deref(),
                     resume,
-                    binding.default_alias.as_deref(),
                     &mut deliver,
                 )?;
-                pickup_reconciled(&mut coord, &picked)?;
             }
             let _lock = inbox_lock(state)?;
             inbox = load_inbox(state, binding)?;
@@ -1023,7 +1352,7 @@ fn session(
             ))
             .map_err(|_| Error::rejected("hosted event ACK failed"))?;
         let _ = pending.try_send(());
-        notify();
+        (runtime.notify)();
     }
     let _ = socket.close(None);
     Ok(())
@@ -1056,6 +1385,7 @@ fn process<F: FnMut(&Kickoff) -> Result<Value>>(
     binding: &WorkspaceBinding,
     coord: &mut Coordinator<BoardHttp>,
     http: &mut BoardHttp,
+    runtime: &EventRuntime,
     deliver: &mut F,
     stop: &AtomicBool,
 ) -> Result<()> {
@@ -1075,6 +1405,12 @@ fn process<F: FnMut(&Kickoff) -> Result<Value>>(
             // A stale old-recipient invalidation still fences local custody,
             // even when its row is no longer visible over HTTPS.
             let generation = event["generation"].as_u64().unwrap_or(0);
+            if matches!(
+                event["state"].as_str(),
+                Some("result" | "failed" | "cancelled")
+            ) {
+                (runtime.on_terminal)(id);
+            }
             coord.with_ledger(|ledger| {
                 for attempt in ledger
                     .attempts
@@ -1107,16 +1443,7 @@ fn process<F: FnMut(&Kickoff) -> Result<Value>>(
                         return Err(Error::rejected("event read named another assignment"));
                     }
                     coord.remember_discovered(&row)?;
-                    if is_assignment_default(http, binding)? {
-                        let picked = coord.pickup_rows(
-                            vec![row],
-                            binding.lane_name.as_deref(),
-                            false,
-                            binding.default_alias.as_deref(),
-                            deliver,
-                        )?;
-                        pickup_reconciled(coord, &picked)?;
-                    }
+                    deliver_assignments(binding, coord, http, runtime, vec![row], false, deliver)?;
                 }
                 403 | 404 => {}
                 _ => return Err(Error::rejected("event assignment read was refused")),
@@ -1308,5 +1635,79 @@ mod record_event_tests {
         let mut inbox = inbox(9);
         assert!(!record_event(&mut inbox, json!({"type": "x"}), 9, true).unwrap());
         assert!(inbox.entries.is_empty());
+    }
+
+    #[test]
+    fn cad2746_legacy_workspace_binding_without_spawn_policy_deserializes() {
+        let raw = json!({
+            "version": 1,
+            "org": "fav-limited",
+            "organization_id": "ws_1",
+            "endpoint": "https://example.test",
+            "subject_id": "usr_1",
+            "issuer": "https://issuer.test",
+            "runner_id": "lri_00000000-0000-4000-8000-000000000001",
+            "agents": [],
+            "connected": true,
+            "lane_name": null,
+            "default_alias": null,
+            "resume_operation": null
+        });
+        let parsed: WorkspaceBinding = serde_json::from_value(raw).unwrap();
+        assert!(parsed.spawn_policy().is_none());
+    }
+
+    #[test]
+    fn cad2746_authorize_spawn_locally_enforces_allowlist_and_capacity() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo_dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+
+        let policy = validate_spawn_policy(&SpawnPolicy {
+            spawn_allowed: true,
+            repos: vec![SpawnRepoBinding {
+                name: "fav-limited/cadence".into(),
+                path: repo_dir.path().to_string_lossy().into_owned(),
+            }],
+            harnesses: vec!["omp".into()],
+            max_concurrent: 1,
+        })
+        .unwrap();
+
+        let spec = SpawnSpec {
+            runner_id: "lri_00000000-0000-4000-8000-000000000001".into(),
+            provider: "omp".into(),
+            model: None,
+            effort: None,
+            repo: "fav-limited/cadence".into(),
+            profile_id: None,
+        };
+
+        // Disabled host fails closed
+        let disabled = authorize_spawn_locally(None, &spec, 0).unwrap_err();
+        assert_eq!(disabled.code(), Some("spawn_not_allowed"));
+
+        // Bad harness fails closed
+        let mut bad_harness = spec.clone();
+        bad_harness.provider = "codex".into();
+        let refused_h = authorize_spawn_locally(Some(&policy), &bad_harness, 0).unwrap_err();
+        assert_eq!(refused_h.code(), Some("spawn_target_not_allowed"));
+
+        // Bad repo fails closed
+        let mut bad_repo = spec.clone();
+        bad_repo.repo = "other/repo".into();
+        let refused_r = authorize_spawn_locally(Some(&policy), &bad_repo, 0).unwrap_err();
+        assert_eq!(refused_r.code(), Some("spawn_target_not_allowed"));
+
+        // At capacity fails closed
+        let at_cap = authorize_spawn_locally(Some(&policy), &spec, 1).unwrap_err();
+        assert_eq!(at_cap.code(), Some("runner_at_capacity"));
+
+        // Within policy + capacity succeeds
+        assert!(authorize_spawn_locally(Some(&policy), &spec, 0).is_ok());
     }
 }

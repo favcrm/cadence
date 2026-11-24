@@ -69,6 +69,22 @@ pub(super) fn safe_code(body: &Value) -> String {
     }
 }
 
+pub(crate) const VALID_SPAWN_HARNESSES: &[&str] =
+    &["omp", "pi", "claude", "codex", "cursor", "devin"];
+pub(crate) const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+pub(crate) fn logical_repo_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && !value.contains('\0')
+        && !value.contains("..")
+        && !value.starts_with('/')
+        && !value.starts_with('~')
+        && !value.starts_with('\\')
+        && !value.contains('\\')
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
 fn forbidden_path_key(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(key, child)| {
@@ -89,6 +105,98 @@ fn forbidden_path_key(value: &Value) -> bool {
         Value::Array(items) => items.iter().any(forbidden_path_key),
         _ => false,
     }
+}
+
+fn forbidden_assignment_key(object: &serde_json::Map<String, Value>) -> bool {
+    object.iter().any(|(key, child)| {
+        if key == "spawn" {
+            // `spawn` is validated separately with an exact allowlist of scalar fields;
+            // every other key stays subject to recursive path/custody denial.
+            return false;
+        }
+        matches!(
+            key.as_str(),
+            "path"
+                | "repo"
+                | "cwd"
+                | "worktree"
+                | "filesystem"
+                | "bundle"
+                | "result_custody"
+                | "presence"
+                | "attempt"
+                | "target_user_id"
+        ) || forbidden_path_key(child)
+    })
+}
+
+fn parse_spawn_spec(value: Option<&Value>) -> Result<Option<super::SpawnSpec>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| Error::rejected("assignment spawn field is not the contract"))?;
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "runner_id" | "provider" | "model" | "effort" | "repo" | "profile_id"
+        ) {
+            return Err(Error::rejected(
+                "assignment spawn contains an unknown or disallowed field",
+            ));
+        }
+    }
+    let runner_id = obj
+        .get("runner_id")
+        .and_then(Value::as_str)
+        .filter(|id| prefixed_id(id, "lri_"))
+        .ok_or_else(|| Error::rejected("assignment spawn runner_id is invalid"))?
+        .to_string();
+    let provider = obj
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|p| VALID_SPAWN_HARNESSES.contains(p))
+        .ok_or_else(|| Error::rejected("assignment spawn provider is invalid"))?
+        .to_string();
+    let repo = obj
+        .get("repo")
+        .and_then(Value::as_str)
+        .filter(|r| logical_repo_name(r))
+        .ok_or_else(|| Error::rejected("assignment spawn repo identifier is invalid"))?
+        .to_string();
+    let model = match obj.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m))
+            if !m.trim().is_empty()
+                && m.len() <= 160
+                && !m.bytes().any(|byte| byte.is_ascii_control()) =>
+        {
+            Some(m.trim().to_string())
+        }
+        _ => return Err(Error::rejected("assignment spawn model is invalid")),
+    };
+    let effort = match obj.get("effort") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(e)) if VALID_EFFORTS.contains(&e.as_str()) => Some(e.clone()),
+        _ => return Err(Error::rejected("assignment spawn effort is invalid")),
+    };
+    let profile_id = match obj.get("profile_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if prefixed_id(id, "ap_") => Some(id.clone()),
+        _ => return Err(Error::rejected("assignment spawn profile_id is invalid")),
+    };
+    Ok(Some(super::SpawnSpec {
+        runner_id,
+        provider,
+        model,
+        effort,
+        repo,
+        profile_id,
+    }))
 }
 
 pub(super) fn attempt_key(issue: &str, action: &str, target: Option<&str>) -> String {
@@ -258,6 +366,26 @@ impl Assignment {
             "reported_head_sha": self.reported_head_sha,
             "text": self.text,
         });
+        if let Some(target_agent_id) = &self.target_agent_id {
+            row["target_agent_id"] = json!(target_agent_id);
+        }
+        if let Some(spawn) = &self.spawn {
+            let mut obj = json!({
+                "runner_id": spawn.runner_id,
+                "provider": spawn.provider,
+                "repo": spawn.repo,
+            });
+            if let Some(model) = &spawn.model {
+                obj["model"] = json!(model);
+            }
+            if let Some(effort) = &spawn.effort {
+                obj["effort"] = json!(effort);
+            }
+            if let Some(profile_id) = &spawn.profile_id {
+                obj["profile_id"] = json!(profile_id);
+            }
+            row["spawn"] = obj;
+        }
         if let Some(kind) = &self.unsupported_kind {
             row["kind"] = json!(kind);
         }
@@ -341,10 +469,16 @@ pub(super) const CLIENT_FEATURES_HEADER: &str = "X-Cadence-Client-Features";
 ///
 /// It does not announce work kinds, so a board must not send this client a
 /// non-dev row. `unsupported_kind` is the defence if one arrives anyway.
-pub(super) const CLIENT_FEATURES: &str = "assignment-unknown-keys,event-unknown-types";
+pub(super) const CLIENT_FEATURES: &str =
+    "assignment-unknown-keys,event-unknown-types,target-agent,daemon-spawn";
 
 pub(super) fn parse_assignment(value: &Value) -> Result<Assignment> {
-    if forbidden_path_key(value) {
+    let Some(object) = value.as_object() else {
+        return Err(Error::rejected(
+            "coordination response is not the assignment contract",
+        ));
+    };
+    if forbidden_assignment_key(object) {
         return Err(Error::rejected(
             "coordination response is not the assignment contract; nothing local was started",
         ));
@@ -368,10 +502,11 @@ pub(super) fn parse_assignment(value: &Value) -> Result<Assignment> {
     ];
     // An unknown key is ignored so a newer board can add one. Required keys,
     // their values and the forbidden path check above stay strict.
-    let object = value
-        .as_object()
-        .filter(|object| required.iter().all(|key| object.contains_key(*key)))
-        .ok_or_else(|| Error::rejected("coordination response is not the assignment contract"))?;
+    if !required.iter().all(|key| object.contains_key(*key)) {
+        return Err(Error::rejected(
+            "coordination response is not the assignment contract",
+        ));
+    }
     // Ignoring a work kind would run review or research as dev work. Refusing
     // the row here would stop every later event, snapshot and list, so it is
     // kept and refused where work would start.
@@ -482,6 +617,16 @@ pub(super) fn parse_assignment(value: &Value) -> Result<Assignment> {
             ))
         }
     };
+    let target_agent_id = match value.get("target_agent_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if prefixed_id(id, "lag_") => Some(id.clone()),
+        _ => {
+            return Err(Error::rejected(
+                "coordination response has an invalid target_agent_id",
+            ))
+        }
+    };
+    let spawn = parse_spawn_spec(value.get("spawn"))?;
     Ok(Assignment {
         unsupported_kind,
         assignment_id: assignment_id.to_string(),
@@ -496,8 +641,98 @@ pub(super) fn parse_assignment(value: &Value) -> Result<Assignment> {
         created_by_subject_id: created_by.to_string(),
         client_agent_id,
         profile_id,
+        target_agent_id,
+        spawn,
         guidance: parse_guidance(value)?,
         reported_head_sha,
         text: optional_text(value, "text")?,
     })
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    fn base_assignment() -> Value {
+        json!({
+            "version": VERSION,
+            "assignment_id": "hla_00000000-0000-4000-8000-000000000001",
+            "organization_id": "ws_1",
+            "issue_id": "CAD-2746",
+            "action": "dispatch",
+            "execution": "local",
+            "state": "queued",
+            "generation": 1,
+            "claim_id": null,
+            "target": "usr_1",
+            "created_by_subject_id": "usr_owner",
+            "client_agent_id": null,
+            "guidance": null,
+            "reported_head_sha": null,
+            "text": null,
+        })
+    }
+
+    #[test]
+    fn cad2746_parses_target_agent_and_validated_spawn_spec() {
+        let mut seat = base_assignment();
+        seat["target_agent_id"] = json!("lag_00000000-0000-4000-8000-000000000002");
+        let parsed_seat = parse_assignment(&seat).expect("seat assignment parses");
+        assert_eq!(
+            parsed_seat.target_agent_id.as_deref(),
+            Some("lag_00000000-0000-4000-8000-000000000002")
+        );
+        assert!(parsed_seat.spawn.is_none());
+
+        let mut spawn = base_assignment();
+        spawn["spawn"] = json!({
+            "runner_id": "lri_00000000-0000-4000-8000-000000000003",
+            "provider": "omp",
+            "model": "sonnet-4",
+            "effort": "high",
+            "repo": "fav-limited/cadence",
+            "profile_id": "ap_2ca20330f4db4195",
+        });
+        let parsed_spawn = parse_assignment(&spawn).expect("spawn assignment parses");
+        let spec = parsed_spawn.spawn.expect("spawn populated");
+        assert_eq!(spec.provider, "omp");
+        assert_eq!(spec.repo, "fav-limited/cadence");
+        assert_eq!(spec.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn cad2746_refuses_forbidden_paths_and_traversal_in_spawn_repo() {
+        for bad_repo in [
+            "/etc/passwd",
+            "../escape",
+            "foo/../../bar",
+            "~/repo",
+            "a\\b",
+        ] {
+            let mut row = base_assignment();
+            row["spawn"] = json!({
+                "runner_id": "lri_00000000-0000-4000-8000-000000000003",
+                "provider": "omp",
+                "repo": bad_repo,
+            });
+            assert!(
+                parse_assignment(&row).is_err(),
+                "must refuse repo '{bad_repo}'"
+            );
+        }
+
+        let mut bad_guidance = base_assignment();
+        bad_guidance["guidance"] = json!({"repo": "/host/path"});
+        assert!(
+            parse_assignment(&bad_guidance).is_err(),
+            "forbidden_path_key must remain active outside spawn"
+        );
+
+        let mut bad_top = base_assignment();
+        bad_top["repo"] = json!("any");
+        assert!(
+            parse_assignment(&bad_top).is_err(),
+            "top-level repo key remains forbidden"
+        );
+    }
 }

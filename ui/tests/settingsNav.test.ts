@@ -88,3 +88,18 @@ equal(settingsRedirect("security", OWNER), "members", "an unlisted security sect
 equal(settingsRedirect("security", {}), "models", "a native board does not expose hosted security");
 equal(settingsRedirect("security", { settings_sections: ["preferences"] }), "preferences", "a board without security refuses the direct link");
 equal(settingsLabel("security"), "Security", "the crumb names Security");
+
+// CAD-2746: Settings → System → Daemons is hosted owner-only, offered when listed.
+const OWNER_DAEMONS = { settings_sections: ["preferences", "general", "members", "connections", "email", "status", "daemons"] };
+equal(
+  settingsNavGroups(OWNER_DAEMONS).find((g) => g.label === "System")?.items.map((i) => i.label),
+  ["Daemons", "Status"],
+  "daemons sits under System above Status for owners",
+);
+equal(flat(OWNER).includes("Daemons"), false, "a board without daemons in settings_sections hides it");
+equal(flat(MEMBER).includes("Daemons"), false, "members do not see Daemons");
+equal(flat(null).includes("Daemons"), false, "a native board has no Daemons section");
+equal(settingsRedirect("daemons", OWNER_DAEMONS), null, "a listed daemons section stays");
+equal(settingsRedirect("daemons", MEMBER), "members", "a member link to daemons redirects away");
+equal(settingsRedirect("daemons", {}), "models", "a native board redirects away from daemons");
+equal(settingsLabel("daemons"), "Daemons", "the crumb names Daemons");

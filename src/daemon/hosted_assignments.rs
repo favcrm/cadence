@@ -1,9 +1,73 @@
 //! Explicit operator configuration and daemon-owned workspace event workers.
 use super::*;
-use crate::local_assignment::{events, reporting::ReportDriver};
+use crate::local_assignment::{events, reporting::ReportDriver, SpawnSpec};
 use crate::remote_cli::RemoteTarget;
 
 impl Shared {
+    fn spawn_hosted_worker(
+        self: &Arc<Self>,
+        spec: &SpawnSpec,
+        worktree: &Path,
+    ) -> Result<(String, String)> {
+        let provider = spec.provider.as_str();
+        let kind = crate::adapter::registry::default_kind(provider)?;
+        crate::adapter::registry::refuse_reviewer_pane(provider, kind, "worker")?;
+        self.kickoff_launch_policy(
+            provider,
+            kind,
+            spec.model.as_deref(),
+            spec.effort.as_deref(),
+        )?;
+
+        let mut alias = String::new();
+        for _ in 0..8 {
+            let suffix = &Uuid::new_v4().simple().to_string()[..6];
+            let cand = format!("{provider}-{suffix}");
+            if self.store.agent_opt(&cand)?.is_none()
+                && crate::master::refuse_reserved_alias(&cand).is_ok()
+                && crate::agent_settings::refuse_profile_alias(&self.store, &cand).is_ok()
+            {
+                alias = cand;
+                break;
+            }
+        }
+        if alias.is_empty() {
+            return Err(Error::rejected(
+                "hosted spawn: could not mint a free worker alias",
+            ));
+        }
+
+        let mut launch = serde_json::Map::new();
+        if let Some(model) = spec.model.as_deref() {
+            launch.insert("model".to_string(), json!(model));
+        }
+        if let Some(effort) = spec.effort.as_deref() {
+            launch.insert("effort".to_string(), json!(effort));
+        }
+        let launch_val = Value::Object(launch.clone());
+        if !launch.is_empty() {
+            crate::adapter::registry::validate_launch_params(provider, kind, &launch_val)?;
+        }
+        let params_str = (!launch.is_empty()).then(|| launch_val.to_string());
+        let profile_instructions = spawn_agent_instructions(spec.profile_id.as_deref());
+        let cwd = std::fs::canonicalize(worktree)
+            .map_err(|_| Error::rejected("Working directory must exist"))?;
+        self.store.register_agent(&crate::store::NewAgent {
+            alias: &alias,
+            provider,
+            endpoint_kind: kind,
+            role: "worker",
+            cwd: &cwd.to_string_lossy(),
+            sandbox: "read-only",
+            instructions: profile_instructions.as_deref(),
+            params: params_str.as_deref(),
+            team_role: None,
+            model_policy: None,
+        })?;
+        self.launch_actor(&alias)?;
+        Ok((alias, format!("{provider}/{kind}")))
+    }
+
     pub(super) fn rpc_hosted_local_agent(
         self: &Arc<Self>,
         method: &str,
@@ -26,6 +90,63 @@ impl Shared {
                     .get("fyi_only")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let spawn_policy = match params.get("allow_spawn").and_then(Value::as_bool) {
+                    Some(true) => {
+                        let repos = params
+                            .get("spawn_repos")
+                            .and_then(Value::as_array)
+                            .map(|rows| {
+                                rows.iter()
+                                    .filter_map(|row| {
+                                        let name = row.get("name").and_then(Value::as_str)?;
+                                        let path = row.get("path").and_then(Value::as_str)?;
+                                        Some(events::SpawnRepoBinding {
+                                            name: name.to_string(),
+                                            path: path.to_string(),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let harnesses = params
+                            .get("harnesses")
+                            .and_then(Value::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .filter(|h| !h.is_empty())
+                            .unwrap_or_else(|| {
+                                vec![
+                                    "omp".to_string(),
+                                    "pi".to_string(),
+                                    "claude".to_string(),
+                                    "codex".to_string(),
+                                ]
+                            });
+                        let max_concurrent = params
+                            .get("max_concurrent")
+                            .and_then(Value::as_u64)
+                            .and_then(|n| u32::try_from(n).ok())
+                            .unwrap_or(2);
+                        Some(events::SpawnPolicy {
+                            spawn_allowed: true,
+                            repos,
+                            harnesses,
+                            max_concurrent,
+                        })
+                    }
+                    Some(false) => Some(events::SpawnPolicy {
+                        spawn_allowed: false,
+                        repos: Vec::new(),
+                        harnesses: Vec::new(),
+                        max_concurrent: 0,
+                    }),
+                    None => None,
+                };
                 events::connect(
                     &self.state_dir,
                     &target,
@@ -33,6 +154,7 @@ impl Shared {
                     fyi_only,
                     optional_str(params, "name"),
                     optional_str(params, "repo").map(Path::new),
+                    spawn_policy,
                 )?
             }
             "hosted_local_agent_disconnect" => events::disconnect(&self.state_dir, org_id)?,
@@ -84,15 +206,32 @@ impl Shared {
                         let stop = Arc::new(AtomicBool::new(false));
                         workers.push((binding.clone(), stop.clone()));
                         let state = self.state_dir.clone();
-                        let shared = self.clone();
+                        let active_lanes =
+                            Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+                                String,
+                                ActiveHostedLane,
+                            >::new()));
+
+                        let shared_send = self.clone();
                         let send_stop = stop.clone();
                         let send_binding = binding.clone();
                         let default_alias = binding.default_alias().map(str::to_string);
+                        let active_for_send = Arc::clone(&active_lanes);
                         let send = Arc::new(move |params: Value| {
+                            let target_alias = params["alias"].as_str();
+                            let allowed_alias = target_alias.is_some_and(|alias| {
+                                default_alias.as_deref() == Some(alias)
+                                    || send_binding.agents().iter().any(|a| a.alias == alias)
+                                    || active_for_send
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .values()
+                                        .any(|lane| lane.alias == alias)
+                            });
                             if send_stop.load(Ordering::SeqCst)
-                                || shared.closing.load(Ordering::SeqCst)
-                                || shared.execution_mode.fenced()
-                                || params["alias"].as_str() != default_alias.as_deref()
+                                || shared_send.closing.load(Ordering::SeqCst)
+                                || shared_send.execution_mode.fenced()
+                                || !allowed_alias
                             {
                                 return Err(Error::busy_coded(
                                     "binding_cancelled",
@@ -100,7 +239,7 @@ impl Shared {
                                 ));
                             }
                             // Validate the persisted selection again immediately before send.
-                            if !events::bindings(&shared.state_dir)?
+                            if !events::bindings(&shared_send.state_dir)?
                                 .iter()
                                 .any(|current| current == &send_binding)
                             {
@@ -109,11 +248,99 @@ impl Shared {
                                     "hosted workspace was disconnected or rebound",
                                 ));
                             }
-                            shared.send_hosted_kickoff(&params)
+                            shared_send.send_hosted_kickoff(&params)
                         });
+
+                        let shared_snap = self.clone();
+                        let active_for_snap = Arc::clone(&active_lanes);
+                        let snapshot = Arc::new(move |b: &events::WorkspaceBinding| {
+                            let mut agents = std::collections::BTreeMap::new();
+                            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                            let lanes = active_for_snap.lock().unwrap_or_else(|e| e.into_inner());
+                            for item in b.agents() {
+                                let row_state = shared_snap
+                                    .store
+                                    .agent_opt(&item.alias)
+                                    .ok()
+                                    .flatten()
+                                    .map(|row| row.state);
+                                let issue_id = active_issue_for_alias(&lanes, &item.alias);
+                                agents.insert(
+                                    item.alias.clone(),
+                                    build_agent_activity_snapshot(
+                                        row_state.as_deref(),
+                                        issue_id,
+                                        &now,
+                                    ),
+                                );
+                            }
+                            let active_spawn_lanes =
+                                lanes.values().filter(|lane| lane.spawned).count() as u32;
+                            events::RunnerRuntimeSnapshot {
+                                agents,
+                                active_spawn_lanes,
+                            }
+                        });
+
+                        let shared_spawn = self.clone();
+                        let active_for_spawn = Arc::clone(&active_lanes);
+                        let max_spawn_lanes = binding
+                            .spawn_policy()
+                            .filter(|policy| policy.spawn_allowed)
+                            .map(|policy| policy.max_concurrent)
+                            .unwrap_or(0);
+                        let spawn_worker = Arc::new(
+                            move |spec: &SpawnSpec, worktree: &Path, assignment_id: &str| {
+                                {
+                                    let mut lanes =
+                                        active_for_spawn.lock().unwrap_or_else(|e| e.into_inner());
+                                    reserve_spawn_slot(&mut lanes, assignment_id, max_spawn_lanes)?;
+                                }
+                                let spawned = shared_spawn.spawn_hosted_worker(spec, worktree);
+                                let mut lanes =
+                                    active_for_spawn.lock().unwrap_or_else(|e| e.into_inner());
+                                match spawned {
+                                    Ok((alias, adapter)) => {
+                                        if let Some(entry) = lanes.get_mut(assignment_id) {
+                                            entry.alias = alias.clone();
+                                        }
+                                        Ok((alias, adapter))
+                                    }
+                                    Err(err) => {
+                                        lanes.remove(assignment_id);
+                                        Err(err)
+                                    }
+                                }
+                            },
+                        );
+
+                        let active_for_kickoff = Arc::clone(&active_lanes);
+                        let on_kickoff =
+                            Arc::new(move |alias: &str, assignment_id: &str, issue_id: &str| {
+                                let mut lanes =
+                                    active_for_kickoff.lock().unwrap_or_else(|e| e.into_inner());
+                                record_hosted_kickoff(&mut lanes, alias, assignment_id, issue_id);
+                            });
+
+                        let active_for_term = Arc::clone(&active_lanes);
+                        let on_terminal = Arc::new(move |assignment_id: &str| {
+                            active_for_term
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(assignment_id);
+                        });
+
                         let notifier = self.clone();
                         let notify = Arc::new(move || notifier.wake());
-                        thread::spawn(move || events::run(state, binding, stop, send, notify));
+                        let runtime = events::EventRuntime {
+                            send,
+                            snapshot,
+                            spawn_worker,
+                            on_kickoff,
+                            on_terminal,
+                            notify,
+                        };
+                        thread::spawn(move || events::run(state, binding, stop, runtime));
                     }
                 }
                 let _ = reporter.tick(&self.store, Instant::now() + Duration::from_secs(5));
@@ -169,9 +396,116 @@ fn refuse_fenced_default(alias: &str, state: &str, has_unknown: bool) -> Result<
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveHostedLane {
+    alias: String,
+    issue_id: String,
+    spawned: bool,
+}
+
+fn spawn_agent_instructions(profile_id: Option<&str>) -> Option<String> {
+    profile_id.map(|id| format!("Hosted agent profile: {id}"))
+}
+
+fn reserve_spawn_slot(
+    lanes: &mut std::collections::BTreeMap<String, ActiveHostedLane>,
+    assignment_id: &str,
+    max_concurrent: u32,
+) -> Result<()> {
+    let active = lanes
+        .values()
+        .enumerate()
+        .filter(|(_, lane)| lane.spawned)
+        .count() as u32;
+    let already_reserved = lanes.get(assignment_id).is_some_and(|lane| lane.spawned);
+    if !already_reserved && active >= max_concurrent {
+        return Err(Error::busy_coded(
+            "runner_at_capacity",
+            "local runner reached max concurrent spawned lanes",
+        ));
+    }
+    lanes
+        .entry(assignment_id.to_string())
+        .or_insert_with(|| ActiveHostedLane {
+            alias: String::new(),
+            issue_id: String::new(),
+            spawned: true,
+        })
+        .spawned = true;
+    Ok(())
+}
+
+fn record_hosted_kickoff(
+    lanes: &mut std::collections::BTreeMap<String, ActiveHostedLane>,
+    alias: &str,
+    assignment_id: &str,
+    issue_id: &str,
+) {
+    match lanes.get_mut(assignment_id) {
+        Some(existing) => {
+            existing.alias = alias.to_string();
+            existing.issue_id = issue_id.to_string();
+        }
+        None => {
+            lanes.insert(
+                assignment_id.to_string(),
+                ActiveHostedLane {
+                    alias: alias.to_string(),
+                    issue_id: issue_id.to_string(),
+                    spawned: false,
+                },
+            );
+        }
+    }
+}
+
+fn active_issue_for_alias(
+    lanes: &std::collections::BTreeMap<String, ActiveHostedLane>,
+    alias: &str,
+) -> Option<String> {
+    lanes
+        .values()
+        .rev()
+        .find(|lane| lane.alias == alias && !lane.issue_id.is_empty())
+        .map(|lane| lane.issue_id.clone())
+}
+
+fn build_agent_activity_snapshot(
+    row_state: Option<&str>,
+    issue_id: Option<String>,
+    now: &str,
+) -> events::AgentActivitySnapshot {
+    let status = match row_state {
+        Some("busy" | "starting") => "busy",
+        Some("attention") => "blocked",
+        Some("idle") => "idle",
+        _ => "offline",
+    };
+    let summary = match (status, issue_id.as_deref()) {
+        ("busy", Some(id)) => format!("Working on {id}"),
+        ("busy", None) => "Busy".to_string(),
+        ("blocked", Some(id)) => format!("Needs attention on {id}"),
+        ("blocked", None) => "Needs attention".to_string(),
+        ("idle", Some(id)) => format!("Assigned to {id}"),
+        ("idle", None) => "Idle".to_string(),
+        (_, Some(id)) => format!("Offline ({id})"),
+        (_, None) => "Offline".to_string(),
+    };
+    events::AgentActivitySnapshot {
+        status: status.to_string(),
+        summary: Some(summary),
+        issue_id,
+        updated_at: Some(now.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::refuse_fenced_default;
+    use super::{
+        active_issue_for_alias, build_agent_activity_snapshot, record_hosted_kickoff,
+        refuse_fenced_default, reserve_spawn_slot, spawn_agent_instructions, ActiveHostedLane,
+    };
+    use std::collections::BTreeMap;
 
     #[test]
     fn cad2259_a_fenced_default_refuses_the_kickoff_with_its_reason() {
@@ -195,5 +529,70 @@ mod tests {
                 "{state}"
             );
         }
+    }
+
+    #[test]
+    fn cad2746_spawn_agent_instructions_carries_profile_id_when_present() {
+        assert_eq!(
+            spawn_agent_instructions(Some("ap_123")).as_deref(),
+            Some("Hosted agent profile: ap_123")
+        );
+        assert_eq!(spawn_agent_instructions(None), None);
+    }
+
+    #[test]
+    fn cad2746_activity_snapshot_tracks_issue_and_clears_on_terminal() {
+        let mut lanes = BTreeMap::new();
+        record_hosted_kickoff(&mut lanes, "seat-a", "hla_seat", "CAD-2746");
+        lanes.insert(
+            "hla_spawn".to_string(),
+            ActiveHostedLane {
+                alias: "omp-123".to_string(),
+                issue_id: String::new(),
+                spawned: true,
+            },
+        );
+        record_hosted_kickoff(&mut lanes, "omp-123", "hla_spawn", "CAD-2747");
+
+        assert_eq!(
+            active_issue_for_alias(&lanes, "seat-a").as_deref(),
+            Some("CAD-2746")
+        );
+        assert_eq!(
+            active_issue_for_alias(&lanes, "omp-123").as_deref(),
+            Some("CAD-2747")
+        );
+        assert_eq!(lanes.values().filter(|l| l.spawned).count(), 1);
+
+        let busy = build_agent_activity_snapshot(
+            Some("busy"),
+            active_issue_for_alias(&lanes, "seat-a"),
+            "2026-11-24T08:00:00Z",
+        );
+        assert_eq!(busy.status, "busy");
+        assert_eq!(busy.issue_id.as_deref(), Some("CAD-2746"));
+        assert_eq!(busy.summary.as_deref(), Some("Working on CAD-2746"));
+
+        lanes.remove("hla_seat");
+        let idle = build_agent_activity_snapshot(
+            Some("idle"),
+            active_issue_for_alias(&lanes, "seat-a"),
+            "2026-11-24T08:05:00Z",
+        );
+        assert_eq!(idle.status, "idle");
+        assert_eq!(idle.issue_id, None);
+        assert_eq!(idle.summary.as_deref(), Some("Idle"));
+    }
+
+    #[test]
+    fn cad2746_reserve_spawn_slot_enforces_cap_and_releases() {
+        let mut lanes = BTreeMap::new();
+        assert!(reserve_spawn_slot(&mut lanes, "hla_1", 1).is_ok());
+        // Duplicate retry on same assignment stays idempotent; second distinct assignment is refused.
+        assert!(reserve_spawn_slot(&mut lanes, "hla_1", 1).is_ok());
+        let err = reserve_spawn_slot(&mut lanes, "hla_2", 1).unwrap_err();
+        assert_eq!(err.code(), Some("runner_at_capacity"));
+        lanes.remove("hla_1");
+        assert!(reserve_spawn_slot(&mut lanes, "hla_2", 1).is_ok());
     }
 }

@@ -60,6 +60,18 @@ pub(crate) enum LocalAgentAction {
         /// Register this explicit agent for FYI only; preserve the assignment default.
         #[arg(long)]
         fyi_only: bool,
+        /// Opt-in: allow workspace owners to spawn isolated worker lanes on this host from the hosted Issue Dispatch modal.
+        #[arg(long)]
+        allow_spawn: bool,
+        /// Allowlisted local repository binding (`<logical-name>=<path>` or `<path>`). Repeatable.
+        #[arg(long = "spawn-repo")]
+        spawn_repos: Vec<String>,
+        /// Allowlisted harnesses for spawned workers (comma-separated, e.g. `omp,pi,claude,codex`).
+        #[arg(long, value_delimiter = ',')]
+        harnesses: Vec<String>,
+        /// Concurrent spawned lane cap for this daemon (1..=32). Defaults to 2 when `--allow-spawn` is set.
+        #[arg(long)]
+        max_concurrent: Option<u32>,
     },
     /// Observe the daemon's durable workspace inbox; never claim work.
     Watch,
@@ -180,6 +192,10 @@ pub(super) fn run(
             name,
             alias,
             fyi_only,
+            allow_spawn,
+            spawn_repos,
+            harnesses,
+            max_concurrent,
         } => {
             let state = local_state
                 .clone()
@@ -190,13 +206,70 @@ pub(super) fn run(
                 .clone()
                 .or(coord.configured_alias()?)
                 .ok_or_else(|| Error::usage("connect requires --alias <explicit local agent>"))?;
+            let mut parsed_repos: Vec<Value> = Vec::new();
+            for raw in spawn_repos {
+                let (repo_name, repo_path) = match raw.split_once('=') {
+                    Some((k, v)) if !k.trim().is_empty() && !v.trim().is_empty() => {
+                        (k.trim().to_string(), PathBuf::from(v.trim()))
+                    }
+                    None => {
+                        let p = PathBuf::from(raw.trim());
+                        let derived = p
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                Error::usage(format!(
+                                    "could not derive a logical repo name from '{raw}'; pass --spawn-repo <name>=<path>"
+                                ))
+                            })?
+                            .to_string();
+                        (derived, p)
+                    }
+                    Some(_) => {
+                        return Err(Error::usage(format!(
+                            "invalid --spawn-repo '{raw}'; expected <name>=<path> or <path>"
+                        )))
+                    }
+                };
+                parsed_repos.push(json!({ "name": repo_name, "path": repo_path }));
+            }
+            if *allow_spawn && parsed_repos.is_empty() {
+                if let Some(repo_path) = repo.as_ref() {
+                    let derived = repo_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            Error::usage("could not derive a logical repo name from --repo; pass --spawn-repo <name>=<path>")
+                        })?;
+                    parsed_repos.push(json!({ "name": derived, "path": repo_path }));
+                } else {
+                    return Err(Error::usage(
+                        "--allow-spawn requires at least one --spawn-repo <name>=<path> (or --repo)",
+                    ));
+                }
+            }
+            let mut connect_params = json!({
+                "org": target.org, "organization_id": target.org_id, "endpoint": target.endpoint,
+                "alias": alias, "repo": repo, "name": name, "fyi_only": fyi_only,
+            });
+            if *allow_spawn {
+                connect_params["allow_spawn"] = json!(true);
+                connect_params["spawn_repos"] = json!(parsed_repos);
+                if !harnesses.is_empty() {
+                    connect_params["harnesses"] = json!(harnesses);
+                }
+                if let Some(cap) = max_concurrent {
+                    connect_params["max_concurrent"] = json!(cap);
+                }
+            }
             cadence_agent::client::rpc_timeout(
                 &state,
                 "hosted_local_agent_connect",
-                json!({
-                    "org": target.org, "organization_id": target.org_id, "endpoint": target.endpoint,
-                    "alias": alias, "repo": repo, "name": name, "fyi_only": fyi_only,
-                }),
+                connect_params,
                 std::time::Duration::from_secs(30),
             )?
         }
