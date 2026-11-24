@@ -803,6 +803,8 @@ fn classify_approved(
                 entry.kind = "agent".into();
                 entry.focus = Some(focus.clone());
                 entry.profile.clone_from(profile);
+                // A profile assigned by policy never replaces human approval.
+                operator |= profile.is_some();
                 match focus.as_str() {
                     "standards" => standards = true,
                     "spec-security" => spec = true,

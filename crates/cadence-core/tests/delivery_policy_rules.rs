@@ -239,6 +239,10 @@ fn assigned_review_profiles_appear_only_for_required_slots() {
     let src = classify(&assignment_policy, &[m("src/a.rs")], 10, &synth());
     assert_eq!(docs.review_kind, ReviewKind::Standards);
     assert_eq!(src.review_kind, ReviewKind::StandardsAndSpec);
+    assert!(
+        docs.operator_approval,
+        "a required assigned reviewer slot needs a human, even without an operator slot"
+    );
     let docs = serde_json::to_value(&docs).unwrap();
     let src = serde_json::to_value(&src).unwrap();
     assert_eq!(
