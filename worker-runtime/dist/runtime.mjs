@@ -56040,6 +56040,23 @@ function intentGuard(refusal) {
 
 // src/loop-guard.ts
 var DEFAULT_LOOP_GUARD_LIMIT = 4;
+var DEFAULT_ERROR_LOOP_LIMIT = 3;
+function normalizeErrorSignature(message) {
+  const firstLine = message.split(`
+`).map((line) => line.trim()).find((line) => line !== "") ?? "";
+  return firstLine.replace(/^\[error\]\s*/i, "").replace(/\/\d+(?=\/|$|:|\s)/g, "/#").replace(/\s+/g, " ").trim().toLowerCase().slice(0, 160);
+}
+function extractToolError(result) {
+  const errorDiag = result.diagnostics?.find((d) => d.severity === "error");
+  if (errorDiag) {
+    return { message: errorDiag.message, blocked: errorDiag.code === "blocked" };
+  }
+  if (!result.isError)
+    return null;
+  const textPart = result.output?.find((part) => part.type === "text");
+  const text = textPart && "text" in textPart ? String(textPart.text) : "";
+  return { message: text.trim() || "tool_error", blocked: false };
+}
 function stableJson(value, seen = new WeakSet) {
   if (value === null)
     return "null";
@@ -56084,12 +56101,23 @@ function stableJson(value, seen = new WeakSet) {
 
 class LoopGuard {
   states = new Map;
+  errorStates = new Map;
   limit;
-  constructor(limit = DEFAULT_LOOP_GUARD_LIMIT) {
+  errorLimit;
+  constructor(limit = DEFAULT_LOOP_GUARD_LIMIT, errorLimit = DEFAULT_ERROR_LOOP_LIMIT) {
     this.limit = Math.max(1, Math.floor(limit));
+    this.errorLimit = Math.max(1, Math.floor(errorLimit));
   }
   record(conversationKey, toolName, args) {
     const key = String(conversationKey ?? "default");
+    const prevErr = this.errorStates.get(key);
+    if (prevErr) {
+      if (prevErr.toolName !== toolName) {
+        this.errorStates.delete(key);
+      } else if (prevErr.count >= this.errorLimit) {
+        return `Loop guard stopped repeated failing '${toolName}' calls (${prevErr.count} consecutive identical errors: ${prevErr.sample}). Fix the failing parameter or root cause, switch to a different tool or skill, or explain the blocker to the user.`;
+      }
+    }
     const fingerprint = `${toolName}\x00${stableJson(args)}`;
     const prev = this.states.get(key);
     if (prev && prev.fingerprint === fingerprint) {
@@ -56102,12 +56130,45 @@ class LoopGuard {
     this.states.set(key, { fingerprint, count: 1 });
     return;
   }
+  recordResult(conversationKey, toolName, result) {
+    const key = String(conversationKey ?? "default");
+    const err = extractToolError(result);
+    if (!err) {
+      this.errorStates.delete(key);
+      return {};
+    }
+    if (err.blocked) {
+      return {};
+    }
+    const signature = `${toolName}\x00${normalizeErrorSignature(err.message)}`;
+    const prev = this.errorStates.get(key);
+    if (prev && prev.signature === signature) {
+      prev.count += 1;
+      prev.sample = err.message.trim().slice(0, 160);
+      if (prev.count >= this.errorLimit) {
+        return {
+          warn: `Repeated failure (${prev.count} consecutive identical errors) on '${toolName}'. Do not retry with minor rewording — fix the missing or invalid input, switch approach, or explain the issue to the user.`
+        };
+      }
+      return {};
+    }
+    this.errorStates.set(key, {
+      toolName,
+      signature,
+      count: 1,
+      sample: err.message.trim().slice(0, 160)
+    });
+    return {};
+  }
   reset(conversationKey) {
     if (conversationKey === undefined) {
       this.states.clear();
+      this.errorStates.clear();
       return;
     }
-    this.states.delete(String(conversationKey));
+    const key = String(conversationKey);
+    this.states.delete(key);
+    this.errorStates.delete(key);
   }
 }
 function loopGuardExtension(guard) {
@@ -56118,6 +56179,18 @@ function loopGuardExtension(guard) {
         beforeTool: (call, api) => {
           const block = guard.record(api.conversationId, call.name, call.arguments);
           return block ? { block } : undefined;
+        },
+        afterTool: (call, result, api) => {
+          const outcome = guard.recordResult(api.conversationId, call.name, result);
+          if (!outcome.warn)
+            return;
+          return {
+            ...result,
+            diagnostics: [
+              ...result.diagnostics ?? [],
+              { severity: "warn", code: "loop_guard_warning", message: outcome.warn }
+            ]
+          };
         }
       })
     ]
