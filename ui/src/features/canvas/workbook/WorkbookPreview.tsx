@@ -80,8 +80,10 @@ export default function WorkbookPreview({ href, title }: { href: string; title: 
         operation = pending;
         pending.signal.addEventListener("abort", () => worker?.terminate(), { once: true });
         const bytes = await readBytes(href, pending);
+        // This Vite-only module exists in the browser, not in the CommonJS test harness.
+        const { default: WorkbookWorker } = await import("./workbook.worker?worker");
         pending.assertCurrent();
-        worker = new Worker(new URL("./workbook.worker.ts", import.meta.url), { type: "module" });
+        worker = new WorkbookWorker();
         worker.onmessage = (event: MessageEvent<{ workbook?: WorkbookSheets }>) => {
           if (active && !pending.signal.aborted) setState(event.data.workbook ? { status: "ready", workbook: event.data.workbook } : { status: "error" });
           pending.dispose();
