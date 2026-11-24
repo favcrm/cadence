@@ -242,6 +242,41 @@ async function run(): Promise<void> {
   const observed = withReadObservations(projection, receipt.display_scope_key!, [ADS_CAMPAIGNS_VERB]);
   assert.equal(observed.read_observations?.length ?? 0, 0, "connections.ads.campaigns must not enter observeRead display cache");
   assert.equal(refused, 0, "the ads import mount is not retired");
+
+  // CAD-2769: allowlisted connections.* host errors pass through sanitized { code, text }
+  // without retiring the active mount; board_session_required (401) still retires it.
+  const stubRefusal = (status: number, code: string, message: string) => {
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ ok: false, error: { code, message } }), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )) as typeof fetch;
+  };
+  const nonFatalCases: Array<{ status: number; code: string; message: string }> = [
+    { status: 503, code: "upstream_unavailable", message: "The ad platform is temporarily unavailable." },
+    { status: 502, code: "upstream_rejected", message: "The ad platform rejected the campaign read request." },
+    { status: 429, code: "rate_limited", message: "The ad platform rate limit was reached. Retry shortly." },
+    { status: 401, code: "needs_reconnect", message: "Reconnect your ad platform to continue importing campaigns." },
+    { status: 403, code: "account_not_authorized", message: "The ad platform denied access to this ad account." },
+  ];
+  for (const c of nonFatalCases) {
+    stubRefusal(c.status, c.code, c.message);
+    const errReply = await adsServices.call(ADS_CAMPAIGNS_VERB, { toolkit: "metaads", connection_id: "conn_1", account_id: "act_123" });
+    assert.equal(errReply.ok, false, `${c.code} returns failure`);
+    if (errReply.ok) throw new Error("expected failure");
+    assert.equal(errReply.refusal.code, c.code, `${c.code} code passes through`);
+    assert.equal(errReply.refusal.text, c.message, `${c.code} message passes through`);
+    assert.equal(refused, 0, `${c.code} keeps mount alive`);
+  }
+
+  stubRefusal(401, "board_session_required", "A board session is required.");
+  const sessionLost = await adsServices.call(ADS_CAMPAIGNS_VERB, { toolkit: "metaads", connection_id: "conn_1", account_id: "act_123" });
+  assert.equal(sessionLost.ok, false, "board_session_required returns failure");
+  if (sessionLost.ok) throw new Error("expected failure");
+  assert.equal(sessionLost.refusal.code, "unauthorized", "board_session_required maps to unauthorized");
+  assert.equal(refused, 1, "board_session_required retires the mount");
 }
 
 run().catch(error => { throw error; });
