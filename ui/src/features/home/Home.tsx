@@ -921,8 +921,8 @@ function ConversationIdCopy({ id }: { id: string }) {
   }, [result]);
 
   return (
-    <div className="relative flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-      <span className="sr-only sm:not-sr-only text-micro text-ink-500">{t("Conversation ID")}:</span>
+    <div className="home-conversation-id relative flex shrink-0 items-center gap-1.5 whitespace-nowrap">
+      <span className="hidden sm:inline text-micro text-ink-500">{t("Conversation ID")}:</span>
       <code className="num text-micro text-ink-300" title={id}>{shortId(id)}</code>
       <Button size="sm" variant="ghost" onClick={async () => {
         try {
@@ -1750,7 +1750,7 @@ function MasterHome({
               <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
-              {homeConversation && <ConversationIdCopy key={homeConversation} id={homeConversation} />}
+              {!missing && homeConversation && <ConversationIdCopy key={homeConversation} id={homeConversation} />}
               {compactHome && latestLabel && (
                 <button
                   type="button"

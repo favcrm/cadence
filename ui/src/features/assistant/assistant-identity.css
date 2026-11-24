@@ -337,6 +337,17 @@
     min-width: 0;
     flex: 1;
   }
+  .master-heading.assistant-heading:has(.home-conversation-id) {
+    flex-wrap: wrap;
+  }
+  .master-heading.assistant-heading:has(.home-conversation-id) .assistant-heading-text {
+    flex-basis: auto;
+  }
+  .master-heading.assistant-heading:has(.home-conversation-id) .assistant-heading-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: 100%;
+  }
   .master-heading.assistant-heading:has(.assistant-menu) .assistant-heading-name { flex-wrap: nowrap; gap: 0.4rem; min-width: 0; }
   .master-heading.assistant-heading:has(.assistant-menu) .assistant-heading-name h1 { font-size: 1rem; }
   /* Only the header's own scope line: the About dialog keeps its descriptor. */
