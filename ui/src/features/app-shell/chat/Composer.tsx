@@ -147,6 +147,8 @@ export interface ComposerProps {
   actions?: ComposerAction[];
   prepareEdit?: {
     maxBytes: number;
+    scope: string;
+    sourceMediaTypes: string[];
     submit: (input: { asset_id: string; revision: number; sha256: string; instructions: string }, requestId: string) => Promise<void>;
   };
   /**
@@ -181,7 +183,7 @@ export interface ComposerAction {
 /** CAD-2422: a message longer than this (UTF-8) is sent as a text attachment.
  *  Large enough for any ordinary message; small next to the 256 KiB model request. */
 const LONG_TEXT_BYTES = 32 * 1024;
-const prepareAttempts = new Map<string, { input: string; requestId: string }>();
+const prepareAttempts = new Map<string, string>();
 onPrivateSessionReset(() => prepareAttempts.clear());
 /** CAD-2422: per composer key, the long text already copied into an
  *  attachment row and that row, so the next send carries the row in its
@@ -633,7 +635,7 @@ export default function Composer({
   };
   const prepare = () => {
     const instructions = draft.trim();
-    if (!prepareEdit || !libraryPin || block || !instructions) {
+    if (!prepareEdit || !libraryPin || !prepareEdit.sourceMediaTypes.includes(libraryPin.media_type) || block || !instructions) {
       onNotice?.("Preparing an edit is unavailable. Check the image and try again.");
       return;
     }
@@ -647,12 +649,11 @@ export default function Composer({
       return;
     }
     const input = { asset_id: libraryPin.asset_id, revision: libraryPin.revision, sha256: libraryPin.sha256, instructions };
-    const fingerprint = JSON.stringify(input);
-    const previous = prepareAttempts.get(key);
-    const attempt = previous?.input === fingerprint ? previous : { input: fingerprint, requestId: crypto.randomUUID() };
-    prepareAttempts.set(key, attempt);
-    void prepareEdit.submit(input, attempt.requestId).then(() => {
-      if (prepareAttempts.get(key) === attempt) prepareAttempts.delete(key);
+    const fingerprint = JSON.stringify([key, prepareEdit.scope, input]);
+    const requestId = prepareAttempts.get(fingerprint) ?? crypto.randomUUID();
+    prepareAttempts.set(fingerprint, requestId);
+    void prepareEdit.submit(input, requestId).then(() => {
+      if (prepareAttempts.get(fingerprint) === requestId) prepareAttempts.delete(fingerprint);
       settleDraft(reservation, "prepare");
     }, () => settleDraft(reservation, false));
   };
@@ -1028,7 +1029,7 @@ export default function Composer({
             {attachInput}
             {attachControl(true)}
             {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
-            {prepareEdit && libraryPin && <button type="button" className="lnk text-label" disabled={!!block || reserved || !draft.trim()} onClick={prepare}>{t("Prepare edit")}</button>}
+            {prepareEdit && libraryPin && prepareEdit.sourceMediaTypes.includes(libraryPin.media_type) && <button type="button" className="lnk text-label min-h-8 px-2" disabled={!!block || reserved || !draft.trim()} onClick={prepare}>{t("Prepare edit")}</button>}
             {stop ? <IconStop onStop={stop.onStop} /> : <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />}
           </div>
         </div>

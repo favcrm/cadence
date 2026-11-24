@@ -277,6 +277,22 @@ function parseOperation(value: unknown): Operation | null {
     error: text(v.error, 500),
   };
 }
+export function matchesPrepareReceipt(value: unknown, installId: string, contextId: string, input: { asset_id: string; revision: number; sha256: string; instructions: string }): boolean {
+  const operation = parseOperation(value);
+  if (!operation || operation.action_id !== "media.refine.prepare") return false;
+  if (operation.status !== "pending_permission") return true;
+  const request = operation.permission_request;
+  const preview = request?.mediaPreview;
+  return request?.scope.install_id === installId && request.scope.context_id === contextId &&
+    request.scope.action_id === "media.refine.prepare" && preview !== null && preview !== undefined &&
+    preview.asset_id === input.asset_id && preview.revision === input.revision &&
+    preview.sha256 === input.sha256 && preview.instructions === input.instructions;
+}
+
+export interface PrepareCapability {
+  maxBytes: number;
+  sourceMediaTypes: string[];
+}
 function parsePermission(value: unknown): Permission | null {
   const v = record(value);
   if (!v || !text(v.id, 128) || !text(v.action_id, 64) || !text(v.resource_id, 128) ||
@@ -472,7 +488,7 @@ interface AssistantData {
   actions: Action[];
   operations: Operation[];
   permissions: Permission[];
-  prepare: number | null;
+  prepare: PrepareCapability | null;
   error: string | null;
   /** The app's assistant descriptor is not consented yet: a calm, permanent-until-approved state. */
   consent: boolean;
@@ -511,7 +527,7 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   /** The transcript snapshot this scope must reconcile before actions become live. */
   connectionRevision: number;
   onPendingChange: (pending: boolean, reconciledRevision: number | null) => void;
-  onPrepareChange: (maxBytes: number | null, reconciledRevision: number | null) => void;
+  onPrepareChange: (capability: PrepareCapability | null, reconciledRevision: number | null) => void;
   writeRevision: number;
 }) {
   const t = useTranslate();
@@ -572,9 +588,12 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
         const operationResponse = operations.value;
         const permissionResponse = permissions.value;
         const prepare = record(actionResponse.prepare);
-        const maxBytes = prepare && Object.keys(prepare).length === 2 &&
-          prepare.action_id === "media.refine.prepare" && prepare.max_instruction_bytes === 2000
-          ? 2000 : null;
+        const mediaTypes = prepare?.source_media_types;
+        const capability: PrepareCapability | null = prepare && Object.keys(prepare).length === 3 &&
+          prepare.action_id === "media.refine.prepare" && prepare.max_instruction_bytes === 2000 &&
+          Array.isArray(mediaTypes) && mediaTypes.length === 2 &&
+          mediaTypes.includes("image/png") && mediaTypes.includes("image/jpeg")
+          ? { maxBytes: 2000, sourceMediaTypes: mediaTypes as string[] } : null;
         if (!Array.isArray(actionResponse.actions) || !Array.isArray(operationResponse.operations) || !Array.isArray(permissionResponse.permissions)) {
           throw new Error("The assistant service returned an invalid response.");
         }
@@ -584,7 +603,7 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
           actions: actionResponse.actions.map(parseAction).filter((v): v is Action => v !== null),
           operations: operationResponse.operations.map((row) => parseOperation(record(row)?.operation ?? row)).filter((v): v is Operation => v !== null),
           permissions: permissionResponse.permissions.map((row) => parsePermission(record(row)?.permission ?? row)).filter((v): v is Permission => v !== null),
-          prepare: maxBytes,
+          prepare: capability,
           error: null,
           consent: false,
         });

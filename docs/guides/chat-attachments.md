@@ -332,8 +332,9 @@ image, enter the edit instructions, then choose **Prepare edit**. Ordinary
 **Send** (including Enter) sends the pinned image to the assistant for
 discussion or inspection; it does not prepare a reference edit. Preparing an
 edit shows the pinned original, instructions and quote for **Allow once** or
-**Deny**. It does not run or charge for the edit. Older hosted boards without
-the advertised action do not show the control.
+**Deny**. It does not run or charge for the edit. The control only appears
+when the host advertises the action and supports the attached original's media
+type. Other supported chat images can still be sent for inspection.
 
 ### Native reference edits
 
