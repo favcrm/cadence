@@ -152,9 +152,10 @@ export default function AuthBoundary({ children }: {
       if (admitted) {
         settleRecovery();
         // SessionView.id is only a non-secret display prefix; stable creation
-        // and expiry plus verified subject/role distinguish its observations.
+        // time plus verified subject/role distinguish its observations. Sliding
+        // session expiry (`expires_at`) extends without tearing down UI state.
         const nextIdentity = meta.signed_in === true && session
-          ? JSON.stringify([hosted, session.id, session.origin, session.created, session.expires_at, session.user?.sub ?? null, session.user?.role ?? null])
+          ? JSON.stringify([hosted, session.id, session.origin, session.created, session.user?.sub ?? null, session.user?.role ?? null])
           : JSON.stringify([false, "anonymous"]);
         if (identity.current !== nextIdentity) discard();
         identity.current = nextIdentity;

@@ -573,29 +573,40 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // Bootstrap is owned by AuthBoundary. A private refresh first verifies
   // the current session; failed verification pauses this entire Activity.
   const healthRequest = useRef(0);
-  const refresh = useCallback(() => {
+  const runRefreshReads = useCallback((generation: number) => {
+    if (!privateReadsAllowed() || generation !== privateSessionGeneration()) return;
+    const healthProbe = ++healthRequest.current;
+    api.health()
+      .then((next) => {
+        if (healthProbe === healthRequest.current) setHealth(next);
+      })
+      .catch(() => {
+        if (healthProbe === healthRequest.current) setHealth("unavailable");
+      });
+    void resources.projects.refresh();
+    void resources.issues.refresh();
+    void resources.agents.refresh();
+    if (overviewWantedRef.current) void resources.overview.refresh();
+    if (personalWanted.current) void resources.myWork.refresh();
+    // CAD-2286: a probe that failed recovers on the routine recheck; a
+    // latched `unavailable` answers from the store without a request.
+    if (documentsHosted) void documentsProbe.revalidate();
+    loadDetail();
+  }, [loadDetail, documentsHosted]);
+  const runRefresh = useCallback((verifySession: boolean) => {
     const generation = privateSessionGeneration();
+    if (!verifySession) {
+      runRefreshReads(generation);
+      return;
+    }
     void recheck().then((verified) => {
-      if (!verified || !privateReadsAllowed() || generation !== privateSessionGeneration()) return;
-      const healthProbe = ++healthRequest.current;
-      api.health()
-        .then((next) => {
-          if (healthProbe === healthRequest.current) setHealth(next);
-        })
-        .catch(() => {
-          if (healthProbe === healthRequest.current) setHealth("unavailable");
-        });
-      void resources.projects.refresh();
-      void resources.issues.refresh();
-      void resources.agents.refresh();
-      if (overviewWantedRef.current) void resources.overview.refresh();
-      if (personalWanted.current) void resources.myWork.refresh();
-      // CAD-2286: a probe that failed recovers on the routine recheck; a
-      // latched `unavailable` answers from the store without a request.
-      if (documentsHosted) void documentsProbe.revalidate();
-      loadDetail();
+      if (!verified) return;
+      runRefreshReads(generation);
     });
-  }, [loadDetail, recheck, documentsHosted]);
+  }, [recheck, runRefreshReads]);
+  const refresh = useCallback(() => {
+    runRefresh(true);
+  }, [runRefresh]);
   const retryAccess = useCallback(() => { void recheck(); }, [recheck]);
   // An unsigned reader (admitted only by --allow-anonymous-reads) is a
   // resolved non-operator: the server omits `operator` for it. Only a
@@ -609,7 +620,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     const timer = window.setTimeout(() => setRecheckFinished(true), 60_000);
     return () => window.clearTimeout(timer);
   }, [metaUnavailable]);
-  useEffect(() => { refresh(); }, [refresh]);
+  const initialMountGenRef = useRef<number | null>(privateReadsAllowed() ? privateSessionGeneration() : null);
+  const initialReconcileGenRef = useRef<number | null>(privateReadsAllowed() ? privateSessionGeneration() : null);
+  useEffect(() => {
+    const generation = privateSessionGeneration();
+    if (initialMountGenRef.current !== null && initialMountGenRef.current === generation && privateReadsAllowed()) {
+      initialMountGenRef.current = null;
+      runRefresh(false);
+      return;
+    }
+    runRefresh(true);
+  }, [runRefresh]);
 
   const reconcile = useCallback(() => {
     // A GET begun before subscription can still be in flight. Invalidate
@@ -623,8 +644,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     invalidatePersonal();
     noteThreadsChanged();
     noteMasterChanged();
+    const generation = privateSessionGeneration();
+    if (initialReconcileGenRef.current !== null && initialReconcileGenRef.current === generation && privateReadsAllowed()) {
+      initialReconcileGenRef.current = null;
+      runRefresh(false);
+      return;
+    }
     refresh();
-  }, [refresh, invalidatePersonal]);
+  }, [refresh, runRefresh, invalidatePersonal]);
 
   const liveUpdates = useRef<LiveUpdates | null>(null);
   useEffect(() => {
@@ -1025,6 +1052,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
     : null;
+  const [unreadProbesFallback, setUnreadProbesFallback] = useState(false);
+  useEffect(() => {
+    setUnreadProbesFallback(false);
+    if (!onAppScreen) return;
+    const timer = window.setTimeout(() => setUnreadProbesFallback(true), 2500);
+    return () => window.clearTimeout(timer);
+  }, [onAppScreen, routeInstallId]);
+  const deferUnreadProbes = onAppScreen && activeApp === null && !unreadProbesFallback;
   // CAD-1193: one viewer for every consumer — `access` splits the
   // `operator: null` unknown into "checking" (a probe is still in
   // flight or has never run) and "unavailable" (a completed probe
@@ -1318,8 +1353,12 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           {onAppScreen && <div ref={setAppActionsTarget} className="app-header-actions-target" />}
         </header>
 
-        <AssistantUnreadProbes apps={installed} />
-        <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />
+        {!deferUnreadProbes && (
+          <>
+            <AssistantUnreadProbes apps={installed} />
+            <WhatsAppUnreadProbes apps={installed} resolveHref={resolveAppPath} />
+          </>
+        )}
 
         {updateBanner && (
           <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">
