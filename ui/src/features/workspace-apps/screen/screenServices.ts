@@ -328,7 +328,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
           data = { state: "uncertain" };
         }
         if (WRITES.has(operation)) invalidateDisplay(domain);
-        else if (operation !== "catalog.status" && operation !== "connections.connect" && receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
+        else if (operation !== "catalog.status" && operation !== "connections.connect" && operation !== "connections.ads.campaigns" && receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
         return { ok: true, data };
       } catch (error) {
         const refusal = failed(error, operation);

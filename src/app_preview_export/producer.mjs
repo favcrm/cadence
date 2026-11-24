@@ -1,8 +1,7 @@
-//#region src/lib/privateSession.ts
+// src/lib/privateSession.ts
 var generation = 0;
 var privateSessionGeneration = () => generation;
-//#endregion
-//#region src/lib/sessionKey.ts
+// src/lib/sessionKey.ts
 /**
 * The operator session's second credential (CAD-313, review round 2 of
 * PR #249). The board's HttpOnly cookie alone is no session: every
@@ -45,8 +44,7 @@ function sessionKey() {
 	} catch {}
 	return null;
 }
-//#endregion
-//#region src/lib/conditionalGet.ts
+// src/lib/conditionalGet.ts
 /** Bounded validators, scoped to this tab's current operator credential.
 * 304 is useful only with a matching in-memory representation; no disk cache.
 */
@@ -248,6 +246,7 @@ var RECORD_CALL_VERBS = [
 	"routines.list",
 	"connections.assets",
 	"connections.connect",
+	"connections.ads.campaigns",
 	"catalog.call",
 	"catalog.status"
 ];
@@ -415,8 +414,7 @@ function shapeFor(push, level) {
 	}
 	return pushBytes(v2) <= 131072 ? v2 : null;
 }
-//#endregion
-//#region src/features/workspace-apps/screen/screenProjection.ts
+// src/features/workspace-apps/screen/screenProjection.ts
 var ID_MAX = 128;
 var isId = (value) => value.length > 0 && value.length <= ID_MAX;
 function isZone(timezone) {
@@ -889,8 +887,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 	if (!shapeFor(projection, false)) throw new Error("The screen projection exceeds its message limit");
 	return projection;
 }
-//#endregion
-//#region scripts/app-fixtures/producer.ts
+// scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
 var CONTRACT = "app-screen-projection-fixtures/10";
@@ -1099,6 +1096,5 @@ main().catch((error) => {
 	process.stderr.write(`fixture producer refused: ${String(error?.message ?? "error").slice(0, 512)}\n`);
 	process.exitCode = 1;
 });
-//#endregion
 
 //# sourceMappingURL=producer.mjs.map
