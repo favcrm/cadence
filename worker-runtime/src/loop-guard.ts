@@ -2,6 +2,7 @@ import { hook, ToolTask, type Extension, type ToolExecutionResult } from "@earen
 
 export const DEFAULT_LOOP_GUARD_LIMIT = 4;
 export const DEFAULT_ERROR_LOOP_LIMIT = 3;
+export const LOOP_GUARD_WARNING_CODE = "loop_guard_warning";
 
 interface ToolLoopState {
   fingerprint: string;
@@ -196,7 +197,7 @@ export function loopGuardExtension(guard: LoopGuard): Extension {
             ...result,
             diagnostics: [
               ...(result.diagnostics ?? []),
-              { severity: "warn", code: "loop_guard_warning", message: outcome.warn },
+              { severity: "warn", code: LOOP_GUARD_WARNING_CODE, message: outcome.warn },
             ],
           };
         },

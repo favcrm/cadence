@@ -1,0 +1,91 @@
+diff --git a/dist/harness/compaction.js b/dist/harness/compaction.js
+--- a/dist/harness/compaction.js
++++ b/dist/harness/compaction.js
+@@ -111,12 +111,38 @@ export const CompactionTask = defineTask({
+             // The context at `tail` is immutable, so this is the range `select` chose.
+             const view = await runtime.context(runtime.conversationId, context, { at: tail });
+             const cut = view.entries.findIndex((entry) => entry.id === firstKept);
++            const source = {
++                entries: view.entries.slice(0, cut),
++                messages: summarizedMessages(view, cut),
++                serialize: serializeConversation,
++            };
++            let rendered;
++            let renderFailed = false;
++            await runtime.hooks.each("renderCompactionSource", async (hook) => {
++                if (rendered !== undefined || renderFailed)
++                    return;
++                try {
++                    rendered = await hook(source, runtime, context);
++                } catch {
++                    // The generic hook runner logs and swallows errors; never fall back to raw source here.
++                    runtime.signal.throwIfAborted();
++                    renderFailed = true;
++                }
++            });
++            if (renderFailed) {
++                const message = "Compaction source could not be safely rendered";
++                await runtime.commit(async (tx) => {
++                    failCompactionStatus(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId, message);
++                    return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "source_error" } } } };
++                }, context);
++                return;
++            }
+             const now = runtime.now();
+             const messages = [
+                 { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT, timestamp: now },
+                 {
+                     role: "user",
+-                    content: [{ type: "text", text: summaryPrompt(summarizedMessages(view, cut), task.input.instructions) }],
++                    content: [{ type: "text", text: summaryPrompt(rendered ?? serializeConversation(source.messages), task.input.instructions) }],
+                     timestamp: now,
+                 },
+             ];
+@@ -324,9 +350,9 @@ function summaryFailure(message) {
+     return "Summarization produced no text";
+ }
+ /** The summarizer's user message: the serialized conversation, the prompt, and any instructions. */
+-function summaryPrompt(messages, instructions) {
++function summaryPrompt(source, instructions) {
+     const focus = instructions === undefined ? "" : `\n\nAdditional focus: ${instructions}`;
+-    return `<conversation>\n${serializeConversation(messages)}\n</conversation>\n\n${SUMMARIZATION_PROMPT}${focus}`;
++    return `<conversation>\n${source}\n</conversation>\n\n${SUMMARIZATION_PROMPT}${focus}`;
+ }
+ /**
+  * Messages as plain text, so the summarizer reads a transcript instead of continuing it. System messages are omitted.
+@@ -334,7 +360,7 @@ function summaryPrompt(messages, instructions) {
+  * the live context (a block that does not match its request is dropped), so including it can make the request larger
+  * than the context it summarizes. Visible text, tool calls, and tool results record what happened.
+  */
+-export function serializeConversation(messages) {
++export function serializeConversation(messages, formatArgument = (json) => json) {
+     const parts = [];
+     for (const message of messages) {
+         if (message.role === "user") {
+@@ -347,7 +373,7 @@ export function serializeConversation(messages) {
+             const calls = message.content.flatMap((content) => content.type === "toolCall"
+                 ? [
+                     `${content.name}(${Object.entries(content.arguments)
+-                        .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
++                        .map(([key, value]) => `${key}=${formatArgument(JSON.stringify(value))}`)
+                         .join(", ")})`,
+                 ]
+                 : []);
+diff --git a/dist/harness/types.d.ts b/dist/harness/types.d.ts
+index 7f4a0ba59df6d5870248c60c055dd188fdab51c4..f9e0c0b31c4dde02fe1e9f6519c87378840f8b98 100644
+--- a/dist/harness/types.d.ts
++++ b/dist/harness/types.d.ts
+@@ -1006,6 +1006,12 @@ export interface CompactionHooks {
+     } | {
+         readonly summary: string;
+     }>;
++    /** Render only the summary source from the immutable range pinned for this attempt. First result wins. */
++    renderCompactionSource(source: {
++        readonly entries: readonly EntryRecord[];
++        readonly messages: readonly Message[];
++        readonly serialize: (messages: readonly Message[], formatArgument?: (json: string) => string) => string;
++    }, api: HookApi, context: Context): HookResult<string>;
+ }
+ export {};
+ //# sourceMappingURL=types.d.ts.map
+\ No newline at end of file

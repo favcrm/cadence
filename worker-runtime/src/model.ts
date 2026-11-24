@@ -7,7 +7,6 @@ import {
   MAX_IMAGE_BASE64_CHARS,
   MAX_IMAGE_PARTS,
 } from "./image-limits.ts";
-import { redactToolErrors } from "./summary-tool-errors.ts";
 
 /**
  * Model transport for one hosted conversation.
@@ -269,17 +268,16 @@ export interface MeteredBinding {
  * Pi supplies one user message containing the whole compaction source. The
  * hosted gateway limits each message to 64,000 characters, independently of
  * the overall byte budget. Preserve the source in consecutive messages, only
- * for the engine's attested summarization request. Tool error text is removed
- * first (CAD-2744, `redactToolErrors`), so the split never decides what stays.
+ * for the engine's attested summary. Pi's render hook already shaped the
+ * structured messages, so the split never decides what stays.
  */
 function splitSummaryMessages(input: Record<string, unknown>): Record<string, unknown> {
   const source = summarySource(input);
   if (source === null) return input;
   const { system, user } = source;
-  const text = redactToolErrors(shortenToolCallArguments(source.text));
+  const text = source.text;
   const limit = 64_000;
-  if (text === source.text && text.length <= limit) return input;
-  if (text.length <= limit) return { ...input, messages: [system, { ...user, content: text }] };
+  if (text.length <= limit) return input;
   const messages: unknown[] = [system];
   for (let start = 0; start < text.length;) {
     let end = Math.min(start + limit, text.length);
@@ -308,46 +306,6 @@ function summarySource(
     user.content[0]?.type === "text" && typeof user.content[0].text === "string"
   ) return { system, user, text: user.content[0].text };
   return null;
-}
-
-/**
- * CAD-2480: the engine's serializer shortens tool results to 2,000 characters
- * but writes every tool-call argument whole, as `name(key=<JSON>)` on one
- * line (JSON escapes newlines). A backlog of large HTML arguments then cannot
- * fit one summary request. Shorten each long string inside a tool-call line the
- * way a tool result is shortened: keep the head and the tail, name what was
- * left out. The summary needs what was done, not every byte of a page.
- */
-const TOOL_CALLS_PREFIX = "[Assistant tool calls]: ";
-const TOOL_CALL_STRING_KEPT = 1_000;
-const JSON_STRING = /"(?:[^"\\]|\\[\s\S])*"/g;
-
-function shortenToolCallArguments(text: string): string {
-  if (!text.includes(TOOL_CALLS_PREFIX)) return text;
-  return text
-    .split("\n\n")
-    .map((part) =>
-      !part.startsWith(TOOL_CALLS_PREFIX)
-        ? part
-        : part.replace(JSON_STRING, (literal) => shortenJsonString(literal)),
-    )
-    .join("\n\n");
-}
-
-/** One JSON string literal (quotes included) cut to its head and tail, never inside an escape or a surrogate pair. */
-function shortenJsonString(literal: string): string {
-  const body = literal.slice(1, -1);
-  if (body.length <= 2 * TOOL_CALL_STRING_KEPT + 200) return literal;
-  let head = TOOL_CALL_STRING_KEPT;
-  // An odd run of backslashes before the cut means it falls inside an escape.
-  const slashes = /\\*$/.exec(body.slice(0, head))![0].length;
-  if (slashes % 2 === 1) head--;
-  head = cutText(body, head).length;
-  let tail = body.length - TOOL_CALL_STRING_KEPT;
-  if (body[tail - 1] === "\\" && /\\*$/.exec(body.slice(0, tail))![0].length % 2 === 1) tail++;
-  const low = body.charCodeAt(tail);
-  if (low >= 0xdc00 && low <= 0xdfff) tail++;
-  return `"${body.slice(0, head)}[... ${tail - head} more characters omitted]${body.slice(tail)}"`;
 }
 
 /**

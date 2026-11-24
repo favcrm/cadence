@@ -3,6 +3,7 @@
 import { describe, expect, it } from "bun:test";
 import { SUMMARY_INSTRUCTION } from "../src/model.ts";
 import { TOOL_ERROR_REDACTED } from "../src/summary-tool-errors.ts";
+import { TRANSIENT_FAILURE_NOTE } from "../src/summary-tool-failures.ts";
 import {
   captureSummaryRequest, FACTS, LEAK_MARKERS, score, withoutInstruction,
 } from "../evals/compaction-retention/fixture.ts";
@@ -91,13 +92,13 @@ describe("compaction retention request", () => {
     expect(system(instruction)).toContain(JSON.stringify(SUMMARY_INSTRUCTION).slice(1, -1));
 
     // The source holds every fact, so a summary that drops one did so
-    // itself. CAD-2744: the tool's error code and text are removed before the
-    // model sees them; the calls' arguments and the assistant's own "keeps
-    // refusing" wording remain for the instruction to handle.
-    expect(score(userText(instruction))).toEqual({
-      kept: ALL_FACTS, dropped: [], leaks: ["argument value", "standing failure claim"],
-    });
+    // itself. CAD-2744 removes the tool's error code and text, and CAD-2745
+    // turns the assistant's "avoid canvas_open" wording into a retry and adds
+    // the runtime note; only the calls' arguments remain.
+    expect(score(userText(instruction))).toEqual({ kept: ALL_FACTS, dropped: [], leaks: ["argument value"] });
+    expect(userText(instruction)).toContain("An earlier canvas_open call failed; try it again normally.");
     expect(userText(instruction)).toContain(TOOL_ERROR_REDACTED);
+    expect(userText(instruction)).toContain(TRANSIENT_FAILURE_NOTE);
 
     const control = withoutInstruction(instruction);
     expect(system(control)).not.toContain(SUMMARY_INSTRUCTION.slice(0, 40));
