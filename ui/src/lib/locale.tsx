@@ -4538,3 +4538,14 @@ const CAD2755_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2755_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2764_ZHTW: Record<string, string> = {
+  "Waiting…": "等待中…",
+  "Reconnect needed": "需要重新連接",
+  "Finish signing in to {label} in the opened tab.": "請在新開啟的分頁完成登入 {label}。",
+  "Your {label} connection needs to be reconnected.": "您的 {label} 連線需要重新連接。",
+  "{label} connected · {account}": "已連接 {label} · {account}",
+};
+for (const [key, value] of Object.entries(CAD2764_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

@@ -1,6 +1,7 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { useLocaleTag, useTranslate } from "../../lib/locale";
 import { requestThreadReload } from "../../lib/masterChanged";
+import { useVisiblePoll } from "../../lib/useVisiblePoll";
 import { TurnCard, type CardDensity, type CardStatus } from "../../ui/TurnCard";
 import { WriteGate } from "../auth/WriteGate";
 import { optionsLine } from "../canvas/viewParams";
@@ -34,24 +35,26 @@ function useLiveRequest(model: ShareCardModel | null): [ShareCardModel | null, (
   const [live, setLive] = useState<ShareCardModel | null>(null);
   const id = model?.id ?? null;
   const pending = (live ?? model)?.status === "pending";
+  const activeIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (id === null || !pending) return;
-    let stopped = false;
-    const read = () => {
-      if (document.visibilityState === "hidden") return;
+    activeIdRef.current = id !== null && pending ? id : null;
+    return () => {
+      activeIdRef.current = null;
+    };
+  }, [id, pending]);
+  useVisiblePoll(
+    id !== null && pending,
+    POLL_MS,
+    () => {
+      if (id === null) return;
       void readShareRequest(id).then((next) => {
-        if (stopped || next === null || next.status === "pending") return;
+        if (activeIdRef.current !== id || next === null || next.status === "pending") return;
         setLive(next);
         requestThreadReload();
       });
-    };
-    read();
-    const timer = setInterval(read, POLL_MS);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [id, pending]);
+    },
+    { immediate: true, onFocus: true },
+  );
   // The thread caught up: its row is at least as new as ours.
   const current = live !== null && model !== null && live.id === model.id && model.status === "pending" ? live : model;
   return [current, setLive];
