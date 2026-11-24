@@ -373,8 +373,448 @@ impl Shared {
         Ok(adapter)
     }
 
+    fn fail_pre_write_message(&self, message: &Message, reason: &str) -> Result<()> {
+        let failed = json!({"status": "failed", "text": "", "error": reason});
+        self.store
+            .finish(message, "failed", &failed, Some(reason))?;
+        self.notify_routed_target(message, &failed);
+        self.wake();
+        Ok(())
+    }
+
+    fn clear_cloud_hold(
+        cloud_held: &mut Option<Box<store::Message>>,
+        ctl: &AgentCtl,
+        recover_started: &mut Option<Instant>,
+        recover_escalated: &mut bool,
+        recover_failures: &mut u32,
+    ) {
+        *cloud_held = None;
+        ctl.cloud_held.store(false, Ordering::SeqCst);
+        *recover_started = None;
+        *recover_escalated = false;
+        *recover_failures = 0;
+    }
+
+    fn poll_cloud_hold(
+        &self,
+        alias: &str,
+        ctl: &AgentCtl,
+        adapter: &Arc<dyn ProviderAdapter>,
+        state: &mut CloudHoldState,
+    ) -> Result<bool> {
+        let Some(pending) = state.held.clone() else {
+            return Ok(false);
+        };
+        if !self.store.agent(alias)?.enabled {
+            return Ok(true);
+        }
+        // An operator reconcile settled the held message: stop
+        // polling and take the next queued message.
+        if self
+            .store
+            .message(&pending.id)?
+            .is_none_or(|message| message.state != "unknown")
+        {
+            Self::clear_cloud_hold(
+                &mut state.held,
+                ctl,
+                &mut state.started,
+                &mut state.escalated,
+                &mut state.failures,
+            );
+            return Ok(false);
+        }
+        // After the budget, one escalation and no further polls.
+        // The agent stays enabled and the held message is not replayed.
+        if state.escalated {
+            ctl.wake.wait_if_unchanged(
+                ctl.wake.ticket(),
+                Instant::now() + Duration::from_secs(3600),
+            );
+            return Ok(false);
+        }
+        let transient = match adapter.poll_settled() {
+            // A stop or shutdown released the adapter, which then
+            // reports interrupted. That is not the session's
+            // outcome: leave the message for the reconcile.
+            Ok(SettledPoll::Ready(_))
+                if self.closing.load(Ordering::SeqCst) || !self.store.agent(alias)?.enabled =>
+            {
+                return Ok(true);
+            }
+            Ok(SettledPoll::Ready(turn)) => {
+                let status = match turn.status.as_str() {
+                    "failed" => "failed",
+                    "interrupted" => "interrupted",
+                    _ => "completed",
+                };
+                let note = if turn.text.is_empty() {
+                    None
+                } else {
+                    Some(turn.text.as_str())
+                };
+                if let Err(error) =
+                    self.store
+                        .reconcile(&pending.id, status, note, "cloud_poll", None)
+                {
+                    // The operator reconciled it first; theirs stands.
+                    let settled = self
+                        .store
+                        .message(&pending.id)?
+                        .is_none_or(|message| message.state != "unknown");
+                    if !settled {
+                        return Err(error);
+                    }
+                }
+                // CAD-2215: a polled kickoff completing here is the
+                // private ledger's trigger, exactly like the other
+                // completion paths. Never a shared effect.
+                if status == "completed" && pending.source == "job_dispatch" {
+                    let _ = self.settle_private_completion(&pending.id);
+                }
+                Self::clear_cloud_hold(
+                    &mut state.held,
+                    ctl,
+                    &mut state.started,
+                    &mut state.escalated,
+                    &mut state.failures,
+                );
+                self.wake();
+                return Ok(false);
+            }
+            Ok(SettledPoll::Pending { transient }) => transient,
+            Err(_) => true,
+        };
+        let interval = adapter.poll_interval().max(Duration::from_millis(1));
+        if transient {
+            state.failures = state.failures.saturating_add(1);
+            state.delay = state
+                .delay
+                .saturating_mul(2)
+                .clamp(interval, Duration::from_secs(60));
+        } else {
+            state.delay = interval;
+        }
+        let started = state.started.get_or_insert_with(Instant::now);
+        if state.failures >= 8 || started.elapsed() >= adapter.recover_budget() {
+            self.store.escalate_cloud_hold(
+                &pending,
+                "devin cloud recovery stopped after repeated poll failures",
+            )?;
+            state.escalated = true;
+            self.wake();
+            return Ok(false);
+        }
+        let ready_at = Instant::now() + state.delay;
+        while Instant::now() < ready_at {
+            if self.closing.load(Ordering::SeqCst) {
+                return Ok(true);
+            }
+            ctl.wake.wait_if_unchanged(ctl.wake.ticket(), ready_at);
+        }
+        Ok(false)
+    }
+
+    fn prepare_lane_for_message(
+        self: &Arc<Self>,
+        alias: &str,
+        ctl: &Arc<AgentCtl>,
+        lane: &mut LaneRuntime,
+        message: &Message,
+    ) -> Result<bool> {
+        // CAD-1752: a confined catalogue agent runs each ticket
+        // in that ticket's lane worktree, by relaunching between
+        // turns - never mid-turn, never unconfined. The message
+        // goes back to the queue while the endpoint is swapped.
+        match self.lane_workdir_needed(&lane.agent, message) {
+            Ok(None) => Ok(false),
+            Ok(Some(workdir)) => {
+                let _ = self.store.requeue(&message.id);
+                let _ = self.store.set_agent_state_if(alias, "idle", "busy");
+                if let Err(error) = self.relaunch_for_lane(
+                    ctl,
+                    &mut lane.agent,
+                    &mut lane.adapter,
+                    &workdir,
+                    message,
+                ) {
+                    // The endpoint could not be reopened in the
+                    // lane: settle this message once, with the
+                    // reason, and fence the agent on the error.
+                    // No second attempt, no fresh session, no
+                    // wider grant.
+                    let reason = format!(
+                        "relaunch for {} failed: {error}",
+                        message.issue.as_deref().unwrap_or("the task")
+                    );
+                    self.fail_pre_write_message(message, &reason)?;
+                    // The fence carries the stated reason, not
+                    // the closed-connection error underneath.
+                    return Err(Error::provider(reason));
+                }
+                Ok(true)
+            }
+            Err(Error::PreWrite(reason)) => {
+                self.fail_pre_write_message(message, &reason)?;
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn compose_context_prompt(
+        &self,
+        alias: &str,
+        agent: &Agent,
+        message: &Message,
+        input: PromptInput,
+    ) -> Result<(String, Option<ContextDelivery>)> {
+        let PromptInput {
+            base,
+            pack,
+            after_reset,
+            compacted,
+        } = input;
+        // The committed actor profile follows the request on every real
+        // turn, including after provider `/new`. Missing or unreadable
+        // profiles fail closed.
+        let base = self.prompt_with_profile(message, base)?;
+        // CAD-1822: mandatory task context is planned against
+        // the delivery body and actor profile first; optional
+        // continuity history is budgeted from what remains.
+        let mut pending_context = None;
+        let mut text = match self.context_delivery(agent, message, &base, after_reset, compacted)? {
+            Some(delivery) => {
+                let text = if delivery.plan.text.is_empty() {
+                    base
+                } else {
+                    format!("{base}\n\n{}", delivery.plan.text)
+                };
+                pending_context = Some(delivery);
+                text
+            }
+            None => base,
+        };
+        // CAD-1822: the optional continuity prefix yields
+        // first. Include it whole only when it still fits;
+        // otherwise omit it whole with a recorded reason and
+        // keep the mandatory task contract and sources.
+        if let Some(pack) = pack {
+            let reserved = pending_context
+                .as_ref()
+                .map(|delivery| delivery.reserved_bytes)
+                .unwrap_or(0);
+            let combined = text.len() + pack.text.len() + 2 + reserved;
+            if pending_context.is_some() && combined > crate::context_pack::MAX_COMBINED_BYTES {
+                self.omit_continuity(alias, message, &pack, combined);
+            } else {
+                self.record_continuity(alias, message, &pack);
+                text = pack.wrap(&text);
+            }
+        }
+        Ok((text, pending_context))
+    }
+
+    fn settle_turn_outcome(
+        &self,
+        alias: &str,
+        ctl: &Arc<AgentCtl>,
+        adapter: &Arc<dyn ProviderAdapter>,
+        turn: &mut TurnOutcomeCtx<'_>,
+        loop_state: &mut ActorLoopState,
+        outcome: Result<TurnResult>,
+    ) -> Result<()> {
+        let message = turn.message;
+        let mut pending_context = turn.pending_context.take();
+        match outcome {
+            Ok(result) => {
+                if let Err(error) = self.complete(message, result) {
+                    // The provider reported an outcome we could
+                    // not persist or classify — ambiguous
+                    // post-submission, fence rather than replay.
+                    return self.unknown(
+                        alias,
+                        message,
+                        &format!("reported outcome could not be applied: {error}"),
+                    );
+                }
+                // CAD-1822: only a definite provider result
+                // confirms supply. The receipt names the actual
+                // session/generation and newly appended bytes.
+                if let Some(delivery) = pending_context.take() {
+                    if let Err(error) = delivery.record(&self.store, message) {
+                        let _ = self.store.event_public(
+                            alias,
+                            "context_supply_failed",
+                            json!({"message": message.id, "error": error.to_string()}),
+                        );
+                    }
+                }
+                loop_state.gate_notice = None;
+                loop_state.gate_waits = 0;
+                loop_state.unrendered = 0;
+                loop_state.unrendered_message = None;
+                Ok(())
+            }
+            // The paste did not render within the deadline:
+            // evidence of a dropped or unsubmitted delivery.
+            // Routed notifications are informational — requeue
+            // for at-least-once delivery, bounded; on exhaustion
+            // the delivery is *parked*, not fenced: a
+            // notification must never kill the recipient's pane
+            // and in-flight work. The worker's result stays
+            // durable on the worker's own message, so nothing
+            // is lost. Task messages keep the uncertainty
+            // discipline: `unknown` + fence, never a blind
+            // replay.
+            Err(Error::NotRendered(miss)) => {
+                loop_state.unrendered += 1;
+                let routed = message.is_routed();
+                let retry = routed && loop_state.unrendered <= 3;
+                let crate::error::RenderMiss {
+                    reason,
+                    before_tail,
+                    after_tail,
+                    claim_probe,
+                    reprobe,
+                } = *miss;
+                let _ = self.store.event_public(
+                    alias,
+                    "paste_not_rendered",
+                    if message.source == "app_run_dispatch" {
+                        json!({"message":message.id,"app_owned":true,"reason":"app paste not rendered","attempt":loop_state.unrendered,"retry":retry})
+                    } else {
+                        json!({"message": message.id,
+                               "reason": reason,
+                               "attempt": loop_state.unrendered,
+                               "retry": retry,
+                               "before": before_tail,
+                               "after": after_tail,
+                               "claim_probe": claim_probe,
+                               "reprobe": reprobe})
+                    },
+                );
+                if retry {
+                    let retry_ticket = ctl.wake.ticket();
+                    let _ = self.store.requeue(&message.id);
+                    let _ = self.store.set_agent_state_if(alias, "idle", "busy");
+                    loop_state.gate_notice = None;
+                    ctl.wake
+                        .wait_if_unchanged(retry_ticket, Instant::now() + loop_state.retry_base);
+                } else if routed {
+                    let _ = self.store.event_public(
+                        alias,
+                        "delivery_parked",
+                        json!({"message": message.id,
+                               "reason": reason,
+                               "attempts": loop_state.unrendered}),
+                    );
+                    let parked = json!({"status": "failed",
+                                "via": "pty_render_miss",
+                                "error": reason});
+                    self.store
+                        .finish(message, "failed", &parked, Some(&reason))?;
+                    self.notify_routed_target(message, &parked);
+                    let _ = self.store.set_agent_state_if(alias, "idle", "busy");
+                    loop_state.unrendered = 0;
+                    loop_state.unrendered_message = None;
+                    self.wake();
+                } else {
+                    return self.unknown(
+                        alias,
+                        message,
+                        "submission accepted but never rendered on the endpoint",
+                    );
+                }
+                Ok(())
+            }
+            // The submission gate refused before any paste:
+            // safe to retry — back to the queue with a
+            // bounded backoff, never a silent drop.
+            Err(Error::GateRefused(reason)) => {
+                let retry_ticket = ctl.wake.ticket();
+                let _ = self.store.requeue(&message.id);
+                let _ = self.store.set_agent_state_if(alias, "idle", "busy");
+                if loop_state.gate_notice.as_deref() != Some(reason.as_str()) {
+                    let _ = self.store.event_public(
+                        alias,
+                        "gate_wait",
+                        json!({"message": message.id, "reason": reason}),
+                    );
+                    loop_state.gate_notice = Some(reason);
+                }
+                // 5s → 10 → 20 → 30s cap (`gate_backoff`):
+                // claims and inbox arrivals wake the wait
+                // early, so the poll is only the fallback for
+                // a busy pane.
+                let wait = gate_backoff(loop_state.retry_base, loop_state.gate_waits);
+                loop_state.gate_waits = loop_state.gate_waits.saturating_add(1);
+                ctl.wake
+                    .wait_if_unchanged(retry_ticket, Instant::now() + wait);
+                Ok(())
+            }
+            Err(Error::OutcomeUnknown(error)) => {
+                if loop_state.hold_cloud {
+                    let held = json!({
+                        "status": "unknown",
+                        "text": "",
+                        "error": error,
+                        "held": true,
+                    });
+                    ctl.cloud_held.store(true, Ordering::SeqCst);
+                    self.store.finish(message, "unknown", &held, Some(&error))?;
+                    let _ = self.store.event_public(
+                        alias,
+                        "cloud_hold",
+                        json!({"reason": error, "fenced": false}),
+                    );
+                    loop_state.hold.held = Some(Box::new(message.clone()));
+                    loop_state.hold.delay = adapter.poll_interval().max(Duration::from_millis(1));
+                    loop_state.hold.started = Some(Instant::now());
+                    loop_state.hold.escalated = false;
+                    loop_state.hold.failures = 0;
+                    self.wake();
+                    Ok(())
+                } else {
+                    self.unknown(alias, message, &error)
+                }
+            }
+            // Deterministic pre-submission rejection: zero
+            // bytes reached the provider, so nothing is
+            // unknown — fail the message, keep the endpoint
+            // live and keep draining the queue.
+            Err(Error::PreWrite(reason)) => {
+                self.fail_pre_write_message(message, &reason)?;
+                loop_state.gate_notice = None;
+                Ok(())
+            }
+            // A provider/adapter error is actor-fatal: record
+            // the failed attempt, then land in `attention`.
+            Err(error) => {
+                self.fail_pre_write_message(message, &error.to_string())?;
+                // Other submitted PTY messages are now
+                // orphaned by the dead endpoint.
+                let _ = self
+                    .store
+                    .orphan_running(alias, "endpoint lost after submission");
+                // CAD-1142: stamp the claimed turn's proven
+                // source onto the fatal error so `run_actor`
+                // can classify its public fence text without
+                // reading provider prose. The stamped text is
+                // unchanged — only the public writes differ.
+                let error = if message.source == "app_run_dispatch" {
+                    error.into_app_owned_fatal()
+                } else {
+                    error
+                };
+                Err(error)
+            }
+        }
+    }
+
     fn actor_inner(self: &Arc<Self>, alias: &str, ctl: &Arc<AgentCtl>) -> Result<()> {
-        let mut agent = self.store.agent(alias)?;
+        let agent = self.store.agent(alias)?;
         // CAD-1380: the exact snapshot about to open must be the principal's
         // canonical root before any adapter grant is built.
         if let Some(binding) = self.store.assistant_for_alias(alias)? {
@@ -384,19 +824,23 @@ impl Shared {
         // process. Finish the message unknown and keep the actor and
         // endpoint; do not fence.
         let hold_cloud = agent.provider == "devin" && agent.endpoint_kind == "cloud";
-        let mut adapter = self.open_actor_adapter(alias, ctl, &agent)?;
-        let retry_base = self.pty_retry_base();
-        let mut gate_notice: Option<String> = None;
-        let mut gate_waits: u32 = 0;
-        // Proven paste misses per message — a TUI that looks idle but
-        // keeps dropping pastes must not be re-fed forever.
-        let mut unrendered: u32 = 0;
-        let mut unrendered_message: Option<String> = None;
-        let mut cloud_held: Option<Box<store::Message>> = None;
-        let mut recover_delay = Duration::from_secs(1);
-        let mut recover_started: Option<Instant> = None;
-        let mut recover_escalated = false;
-        let mut recover_failures: u32 = 0;
+        let adapter = self.open_actor_adapter(alias, ctl, &agent)?;
+        let mut lane = LaneRuntime { agent, adapter };
+        let mut loop_state = ActorLoopState {
+            retry_base: self.pty_retry_base(),
+            gate_notice: None,
+            gate_waits: 0,
+            unrendered: 0,
+            unrendered_message: None,
+            hold_cloud,
+            hold: CloudHoldState {
+                held: None,
+                delay: Duration::from_secs(1),
+                started: None,
+                escalated: false,
+                failures: 0,
+            },
+        };
         // A hold lives only in this actor. A daemon restart or a stop
         // during a hold leaves the message `unknown`, and start, resume
         // and relaunch fence the agent on it: the operator inspects the
@@ -416,109 +860,9 @@ impl Shared {
                     return Err(Error::unknown(UNKNOWN_GENERIC_REASON));
                 }
             }
-            if let Some(pending) = cloud_held.clone() {
-                if !self.store.agent(alias)?.enabled {
+            if loop_state.hold.held.is_some() {
+                if self.poll_cloud_hold(alias, ctl, &lane.adapter, &mut loop_state.hold)? {
                     return Ok(());
-                }
-                // An operator reconcile settled the held message: stop
-                // polling and take the next queued message.
-                if self
-                    .store
-                    .message(&pending.id)?
-                    .is_none_or(|message| message.state != "unknown")
-                {
-                    cloud_held = None;
-                    ctl.cloud_held.store(false, Ordering::SeqCst);
-                    recover_started = None;
-                    recover_escalated = false;
-                    recover_failures = 0;
-                    continue;
-                }
-                // After the budget, one escalation and no further polls.
-                // The agent stays enabled and the held message is not replayed.
-                if recover_escalated {
-                    ctl.wake.wait_if_unchanged(
-                        ctl.wake.ticket(),
-                        Instant::now() + Duration::from_secs(3600),
-                    );
-                    continue;
-                }
-                let transient = match adapter.poll_settled() {
-                    // A stop or shutdown released the adapter, which then
-                    // reports interrupted. That is not the session's
-                    // outcome: leave the message for the reconcile.
-                    Ok(SettledPoll::Ready(_))
-                        if self.closing.load(Ordering::SeqCst)
-                            || !self.store.agent(alias)?.enabled =>
-                    {
-                        return Ok(());
-                    }
-                    Ok(SettledPoll::Ready(turn)) => {
-                        let status = match turn.status.as_str() {
-                            "failed" => "failed",
-                            "interrupted" => "interrupted",
-                            _ => "completed",
-                        };
-                        let note = if turn.text.is_empty() {
-                            None
-                        } else {
-                            Some(turn.text.as_str())
-                        };
-                        if let Err(error) =
-                            self.store
-                                .reconcile(&pending.id, status, note, "cloud_poll", None)
-                        {
-                            // The operator reconciled it first; theirs stands.
-                            let settled = self
-                                .store
-                                .message(&pending.id)?
-                                .is_none_or(|message| message.state != "unknown");
-                            if !settled {
-                                return Err(error);
-                            }
-                        }
-                        // CAD-2215: a polled kickoff completing here is the
-                        // private ledger's trigger, exactly like the other
-                        // completion paths. Never a shared effect.
-                        if status == "completed" && pending.source == "job_dispatch" {
-                            let _ = self.settle_private_completion(&pending.id);
-                        }
-                        cloud_held = None;
-                        ctl.cloud_held.store(false, Ordering::SeqCst);
-                        recover_started = None;
-                        recover_escalated = false;
-                        recover_failures = 0;
-                        self.wake();
-                        continue;
-                    }
-                    Ok(SettledPoll::Pending { transient }) => transient,
-                    Err(_) => true,
-                };
-                let interval = adapter.poll_interval().max(Duration::from_millis(1));
-                if transient {
-                    recover_failures = recover_failures.saturating_add(1);
-                    recover_delay = recover_delay
-                        .saturating_mul(2)
-                        .clamp(interval, Duration::from_secs(60));
-                } else {
-                    recover_delay = interval;
-                }
-                let started = recover_started.get_or_insert_with(Instant::now);
-                if recover_failures >= 8 || started.elapsed() >= adapter.recover_budget() {
-                    self.store.escalate_cloud_hold(
-                        &pending,
-                        "devin cloud recovery stopped after repeated poll failures",
-                    )?;
-                    recover_escalated = true;
-                    self.wake();
-                    continue;
-                }
-                let ready_at = Instant::now() + recover_delay;
-                while Instant::now() < ready_at {
-                    if self.closing.load(Ordering::SeqCst) {
-                        return Ok(());
-                    }
-                    ctl.wake.wait_if_unchanged(ctl.wake.ticket(), ready_at);
                 }
                 continue;
             }
@@ -542,7 +886,7 @@ impl Shared {
             match self.take_app_aware(alias)? {
                 (Take::Stop, _) => return Ok(()),
                 (Take::Empty, _) => {
-                    if adapter.disconnected() {
+                    if lane.adapter.disconnected() {
                         // Submitted PTY messages may have reached the
                         // provider; fence them rather than replay.
                         let _ = self
@@ -558,63 +902,14 @@ impl Shared {
                     // proven render-miss budget must survive the wait. If a
                     // queued row was cancelled while waiting, start the next
                     // row with a fresh budget instead of inheriting its count.
-                    if unrendered_message.as_deref() != Some(message.id.as_str()) {
-                        unrendered = 0;
-                        unrendered_message = Some(message.id.clone());
+                    if loop_state.unrendered_message.as_deref() != Some(message.id.as_str()) {
+                        loop_state.unrendered = 0;
+                        loop_state.unrendered_message = Some(message.id.clone());
                     }
-                    // CAD-1752: a confined catalogue agent runs each ticket
-                    // in that ticket's lane worktree, by relaunching between
-                    // turns - never mid-turn, never unconfined. The message
-                    // goes back to the queue while the endpoint is swapped.
-                    if !message.is_nudge() {
-                        match self.lane_workdir_needed(&agent, &message) {
-                            Ok(None) => {}
-                            Ok(Some(workdir)) => {
-                                let _ = self.store.requeue(&message.id);
-                                let _ = self.store.set_agent_state_if(alias, "idle", "busy");
-                                if let Err(error) = self.relaunch_for_lane(
-                                    ctl,
-                                    &mut agent,
-                                    &mut adapter,
-                                    &workdir,
-                                    &message,
-                                ) {
-                                    // The endpoint could not be reopened in the
-                                    // lane: settle this message once, with the
-                                    // reason, and fence the agent on the error.
-                                    // No second attempt, no fresh session, no
-                                    // wider grant.
-                                    let reason = format!(
-                                        "relaunch for {} failed: {error}",
-                                        message.issue.as_deref().unwrap_or("the task")
-                                    );
-                                    let failed = json!({"status": "failed", "text": "",
-                                                "error": reason});
-                                    self.store.finish(
-                                        &message,
-                                        "failed",
-                                        &failed,
-                                        Some(&reason),
-                                    )?;
-                                    self.notify_routed_target(&message, &failed);
-                                    self.wake();
-                                    // The fence carries the stated reason, not
-                                    // the closed-connection error underneath.
-                                    return Err(Error::provider(reason));
-                                }
-                                continue;
-                            }
-                            Err(Error::PreWrite(reason)) => {
-                                let failed = json!({"status": "failed", "text": "",
-                                            "error": reason});
-                                self.store
-                                    .finish(&message, "failed", &failed, Some(&reason))?;
-                                self.notify_routed_target(&message, &failed);
-                                self.wake();
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        }
+                    if !message.is_nudge()
+                        && self.prepare_lane_for_message(alias, ctl, &mut lane, &message)?
+                    {
+                        continue;
                     }
                     let started_id = message.id.clone();
                     let shared = Arc::clone(self);
@@ -631,12 +926,12 @@ impl Shared {
                     // (new provider session, profile and pack) before the
                     // prompt is built, so the pack is this conversation's.
                     if !nudge {
-                        self.switch_session_if_needed(alias, &adapter, &message)?;
+                        self.switch_session_if_needed(alias, &lane.adapter, &message)?;
                     }
                     let slot = if nudge {
                         None
                     } else {
-                        self.turn_slot(&agent, &message)
+                        self.turn_slot(&lane.agent, &message)
                     };
                     let mut pending_context: Option<ContextDelivery> = None;
                     let prompt = if nudge {
@@ -645,186 +940,126 @@ impl Shared {
                         let compacted = self.context_compacted(&message);
                         let (base, pack) = self.continuity_parts(
                             alias,
-                            &agent.endpoint_kind,
+                            &lane.agent.endpoint_kind,
                             &message,
                             slot.as_deref(),
                         );
-                        // The committed actor profile follows the request on
-                        // every real turn, including after provider `/new`.
-                        // Missing or unreadable profiles fail closed.
-                        let body = self.prompt_with_profile(&message, base)?;
-                        // CAD-1822: mandatory task context is planned against
-                        // the delivery body and actor profile first; optional
-                        // continuity history is budgeted from what remains.
-                        let context = match self
-                            .context_delivery(&agent, &message, &body, false, compacted)
-                        {
-                            Ok(context) => context,
+                        match self.compose_context_prompt(
+                            alias,
+                            &lane.agent,
+                            &message,
+                            PromptInput {
+                                base,
+                                pack,
+                                after_reset: false,
+                                compacted,
+                            },
+                        ) {
+                            Ok((text, context)) => {
+                                pending_context = context;
+                                text
+                            }
                             Err(Error::PreWrite(reason)) => {
-                                let failed = json!({"status": "failed", "text": "",
-                                                    "error": reason});
-                                self.store
-                                    .finish(&message, "failed", &failed, Some(&reason))?;
-                                self.notify_routed_target(&message, &failed);
-                                gate_notice = None;
-                                self.wake();
+                                self.fail_pre_write_message(&message, &reason)?;
+                                loop_state.gate_notice = None;
                                 continue;
                             }
                             Err(error) => return Err(error),
-                        };
-                        let mut text = match context {
-                            Some(delivery) => {
-                                let text = if delivery.plan.text.is_empty() {
-                                    body
-                                } else {
-                                    format!("{body}\n\n{}", delivery.plan.text)
-                                };
-                                pending_context = Some(delivery);
-                                text
-                            }
-                            None => body,
-                        };
-                        // CAD-1822: the optional continuity prefix yields
-                        // first. Include it whole only when it still fits;
-                        // otherwise omit it whole with a recorded reason and
-                        // keep the mandatory task contract and sources.
-                        if let Some(pack) = pack {
-                            let reserved = pending_context
-                                .as_ref()
-                                .map(|delivery| delivery.reserved_bytes)
-                                .unwrap_or(0);
-                            let combined = text.len() + pack.text.len() + 2 + reserved;
-                            if pending_context.is_some()
-                                && combined > crate::context_pack::MAX_COMBINED_BYTES
-                            {
-                                self.omit_continuity(alias, &message, &pack, combined);
-                            } else {
-                                self.record_continuity(alias, &message, &pack);
-                                text = pack.wrap(&text);
-                            }
                         }
-                        text
                     };
-                    adapter.set_unclaimed_ok(message.is_routed() || nudge);
+                    lane.adapter.set_unclaimed_ok(message.is_routed() || nudge);
                     // CAD-520: a nudge may also enter through a busy
                     // pane's steering input (Devin's guide box). Cleared
                     // with `unclaimed_ok` so a later message cannot
                     // inherit either flag.
-                    adapter.set_steer_ok(nudge);
+                    lane.adapter.set_steer_ok(nudge);
                     // CAD-565: the pane may receive only a bounded
                     // notice — the stored body still faces the
                     // endpoint's own screen (a pty profile's
                     // literal-only checks) before it may deliver.
-                    let outcome = self
-                        .admit_app_submission(&message)
-                        .and_then(|()| adapter.check_body(&message.body))
-                        .and_then(|()| {
-                            if !nudge {
-                                let images =
-                                    self.turn_images_for(&message).map_err(
+                    let outcome =
+                        self.admit_app_submission(&message)
+                            .and_then(|()| lane.adapter.check_body(&message.body))
+                            .and_then(|()| {
+                                if !nudge {
+                                    let images = self.turn_images_for(&message).map_err(
                                         |error| match error {
                                             Error::Rejected(reason) => Error::PreWrite(reason),
                                             error => error,
                                         },
                                     )?;
-                                adapter.bind_turn_images(&images)?;
-                            }
-                            let on_started = move |turn: &str| {
-                                // CAD-250: a nudge owns no turn — it never
-                                // becomes `running`, and its paste is not the
-                                // held turn's proof of life.
-                                if !nudge {
-                                    let _ = shared.store.mark_running(&started_id, turn);
-                                    watch.bump_activity();
+                                    lane.adapter.bind_turn_images(&images)?;
                                 }
-                                shared.wake();
-                            };
-                            let first = adapter.run_turn_slotted(
-                                &prompt,
-                                slot.as_deref(),
-                                adapter::TurnMessage::from_actor(&message.id, claim.as_ref()),
-                                &on_started,
-                            )?;
-                            let reset = if nudge {
-                                false
-                            } else {
-                                adapter.reset_rejected_session(&first)?
-                            };
-                            if !reset {
-                                return Ok(first);
-                            }
-                            // A reset retry replaces the visible outcome.
-                            // Record fixed metadata only: the adapter's error
-                            // text can carry raw provider JSON, so the event
-                            // never copies it. The refusal category is
-                            // observable through the adapter's own fixed events.
-                            let _ = self.store.event_public(
-                                alias,
-                                "turn_retry",
-                                json!({
-                                    "message": message.id,
-                                    "first_status": first.status,
-                                }),
-                            );
-                            // CAD-1076: one retry on a fresh session.
-                            // Offered only for a master history refusal
-                            // before any tool. A serialized-body refusal
-                            // after a tool is not offered — retrying
-                            // would replay work that already ran, and
-                            // that turn stays failed with its limitation.
-                            let (base, pack) = self.after_session_reset_parts(
-                                &agent,
-                                &message,
-                                slot.as_deref(),
-                                &first,
-                            );
-                            // Same priority as the first attempt: the actor
-                            // profile and mandatory task context are planned
-                            // against the base body; optional history yields.
-                            let base = self.prompt_with_profile(&message, base)?;
-                            pending_context = None;
-                            let prompt =
-                                match self.context_delivery(&agent, &message, &base, true, false) {
-                                    Ok(Some(delivery)) => {
-                                        let text = if delivery.plan.text.is_empty() {
-                                            base
-                                        } else {
-                                            format!("{base}\n\n{}", delivery.plan.text)
-                                        };
-                                        pending_context = Some(delivery);
-                                        text
+                                let on_started = move |turn: &str| {
+                                    // CAD-250: a nudge owns no turn — it never
+                                    // becomes `running`, and its paste is not the
+                                    // held turn's proof of life.
+                                    if !nudge {
+                                        let _ = shared.store.mark_running(&started_id, turn);
+                                        watch.bump_activity();
                                     }
-                                    Ok(None) => base,
-                                    Err(error) => return Err(error),
+                                    shared.wake();
                                 };
-                            let prompt = match pack {
-                                Some(pack) => {
-                                    let reserved = pending_context
-                                        .as_ref()
-                                        .map(|delivery| delivery.reserved_bytes)
-                                        .unwrap_or(0);
-                                    let combined = prompt.len() + pack.text.len() + 2 + reserved;
-                                    if pending_context.is_some()
-                                        && combined > crate::context_pack::MAX_COMBINED_BYTES
-                                    {
-                                        self.omit_continuity(alias, &message, &pack, combined);
-                                        prompt
-                                    } else {
-                                        self.record_continuity(alias, &message, &pack);
-                                        pack.wrap(&prompt)
-                                    }
+                                let first = lane.adapter.run_turn_slotted(
+                                    &prompt,
+                                    slot.as_deref(),
+                                    adapter::TurnMessage::from_actor(&message.id, claim.as_ref()),
+                                    &on_started,
+                                )?;
+                                let reset = if nudge {
+                                    false
+                                } else {
+                                    lane.adapter.reset_rejected_session(&first)?
+                                };
+                                if !reset {
+                                    return Ok(first);
                                 }
-                                None => prompt,
-                            };
-                            adapter.run_turn_slotted(
-                                &prompt,
-                                slot.as_deref(),
-                                adapter::TurnMessage::from_actor(&message.id, claim.as_ref()),
-                                &on_started,
-                            )
-                        });
-                    adapter.set_unclaimed_ok(false);
-                    adapter.set_steer_ok(false);
+                                // A reset retry replaces the visible outcome.
+                                // Record fixed metadata only: the adapter's error
+                                // text can carry raw provider JSON, so the event
+                                // never copies it. The refusal category is
+                                // observable through the adapter's own fixed events.
+                                let _ = self.store.event_public(
+                                    alias,
+                                    "turn_retry",
+                                    json!({
+                                        "message": message.id,
+                                        "first_status": first.status,
+                                    }),
+                                );
+                                // CAD-1076: one retry on a fresh session.
+                                // Offered only for a master history refusal
+                                // before any tool. A serialized-body refusal
+                                // after a tool is not offered — retrying
+                                // would replay work that already ran, and
+                                // that turn stays failed with its limitation.
+                                let (base, pack) = self.after_session_reset_parts(
+                                    &lane.agent,
+                                    &message,
+                                    slot.as_deref(),
+                                    &first,
+                                );
+                                let (prompt, context) = self.compose_context_prompt(
+                                    alias,
+                                    &lane.agent,
+                                    &message,
+                                    PromptInput {
+                                        base,
+                                        pack,
+                                        after_reset: true,
+                                        compacted: false,
+                                    },
+                                )?;
+                                pending_context = context;
+                                lane.adapter.run_turn_slotted(
+                                    &prompt,
+                                    slot.as_deref(),
+                                    adapter::TurnMessage::from_actor(&message.id, claim.as_ref()),
+                                    &on_started,
+                                )
+                            });
+                    lane.adapter.set_unclaimed_ok(false);
+                    lane.adapter.set_steer_ok(false);
                     // CAD-250: an unconfirmed nudge paste ends `unknown`,
                     // but a nudge belongs to no turn — it never fences the
                     // agent, never retries, never touches the held turn.
@@ -851,205 +1086,18 @@ impl Shared {
                         }
                         other => other,
                     };
-                    match outcome {
-                        Ok(result) => {
-                            if let Err(error) = self.complete(&message, result) {
-                                // The provider reported an outcome we could
-                                // not persist or classify — ambiguous
-                                // post-submission, fence rather than replay.
-                                return self.unknown(
-                                    alias,
-                                    &message,
-                                    &format!("reported outcome could not be applied: {error}"),
-                                );
-                            }
-                            // CAD-1822: only a definite provider result
-                            // confirms supply. The receipt names the actual
-                            // session/generation and newly appended bytes.
-                            if let Some(delivery) = pending_context.take() {
-                                if let Err(error) = delivery.record(&self.store, &message) {
-                                    let _ = self.store.event_public(
-                                        alias,
-                                        "context_supply_failed",
-                                        json!({"message": message.id,
-                                               "error": error.to_string()}),
-                                    );
-                                }
-                            }
-                            gate_notice = None;
-                            gate_waits = 0;
-                            unrendered = 0;
-                            unrendered_message = None;
-                        }
-                        // The paste did not render within the deadline:
-                        // evidence of a dropped or unsubmitted delivery.
-                        // Routed notifications are informational — requeue
-                        // for at-least-once delivery, bounded; on exhaustion
-                        // the delivery is *parked*, not fenced: a
-                        // notification must never kill the recipient's pane
-                        // and in-flight work. The worker's result stays
-                        // durable on the worker's own message, so nothing
-                        // is lost. Task messages keep the uncertainty
-                        // discipline: `unknown` + fence, never a blind
-                        // replay.
-                        Err(Error::NotRendered(miss)) => {
-                            unrendered += 1;
-                            let routed = message.is_routed();
-                            let retry = routed && unrendered <= 3;
-                            // The miss carries the pane's own evidence:
-                            // screen tails before the paste and after
-                            // the deadline plus the probe verdict that
-                            // admitted the send — what "idle" looked
-                            // like when delivery failed.
-                            let crate::error::RenderMiss {
-                                reason,
-                                before_tail,
-                                after_tail,
-                                claim_probe,
-                                reprobe,
-                            } = *miss;
-                            let _ = self.store.event_public(
-                                alias,
-                                "paste_not_rendered",
-                                if message.source == "app_run_dispatch" {
-                                    json!({"message":message.id,"app_owned":true,"reason":"app paste not rendered","attempt":unrendered,"retry":retry})
-                                } else { json!({"message": message.id,
-                                       "reason": reason,
-                                       "attempt": unrendered,
-                                       "retry": retry,
-                                       "before": before_tail,
-                                       "after": after_tail,
-                                       "claim_probe": claim_probe,
-                                       "reprobe": reprobe}) },
-                            );
-                            if retry {
-                                let retry_ticket = ctl.wake.ticket();
-                                let _ = self.store.requeue(&message.id);
-                                let _ = self.store.set_agent_state_if(alias, "idle", "busy");
-                                gate_notice = None;
-                                ctl.wake
-                                    .wait_if_unchanged(retry_ticket, Instant::now() + retry_base);
-                            } else if routed {
-                                let _ = self.store.event_public(
-                                    alias,
-                                    "delivery_parked",
-                                    json!({"message": message.id,
-                                           "reason": reason,
-                                           "attempts": unrendered}),
-                                );
-                                let parked = json!({"status": "failed",
-                                            "via": "pty_render_miss",
-                                            "error": reason});
-                                self.store
-                                    .finish(&message, "failed", &parked, Some(&reason))?;
-                                self.notify_routed_target(&message, &parked);
-                                let _ = self.store.set_agent_state_if(alias, "idle", "busy");
-                                unrendered = 0;
-                                unrendered_message = None;
-                                self.wake();
-                            } else {
-                                return self.unknown(
-                                    alias,
-                                    &message,
-                                    "submission accepted but never rendered on the endpoint",
-                                );
-                            }
-                        }
-                        // The submission gate refused before any paste:
-                        // safe to retry — back to the queue with a
-                        // bounded backoff, never a silent drop.
-                        Err(Error::GateRefused(reason)) => {
-                            let retry_ticket = ctl.wake.ticket();
-                            let _ = self.store.requeue(&message.id);
-                            let _ = self.store.set_agent_state_if(alias, "idle", "busy");
-                            if gate_notice.as_deref() != Some(reason.as_str()) {
-                                let _ = self.store.event_public(
-                                    alias,
-                                    "gate_wait",
-                                    json!({"message": message.id, "reason": reason}),
-                                );
-                                gate_notice = Some(reason);
-                            }
-                            // 5s → 10 → 20 → 30s cap (`gate_backoff`):
-                            // claims and inbox arrivals wake the wait
-                            // early, so the poll is only the fallback for
-                            // a busy pane.
-                            let wait = gate_backoff(retry_base, gate_waits);
-                            gate_waits = gate_waits.saturating_add(1);
-                            ctl.wake
-                                .wait_if_unchanged(retry_ticket, Instant::now() + wait);
-                        }
-                        Err(Error::OutcomeUnknown(error)) => {
-                            if hold_cloud {
-                                let held = json!({
-                                    "status": "unknown",
-                                    "text": "",
-                                    "error": error,
-                                    "held": true,
-                                });
-                                ctl.cloud_held.store(true, Ordering::SeqCst);
-                                self.store
-                                    .finish(&message, "unknown", &held, Some(&error))?;
-                                let _ = self.store.event_public(
-                                    alias,
-                                    "cloud_hold",
-                                    json!({"reason": error, "fenced": false}),
-                                );
-                                cloud_held = Some(message);
-                                recover_delay =
-                                    adapter.poll_interval().max(Duration::from_millis(1));
-                                recover_started = Some(Instant::now());
-                                recover_escalated = false;
-                                recover_failures = 0;
-                                self.wake();
-                            } else {
-                                return self.unknown(alias, &message, &error);
-                            }
-                        }
-                        // Deterministic pre-submission rejection: zero
-                        // bytes reached the provider, so nothing is
-                        // unknown — fail the message, keep the endpoint
-                        // live and keep draining the queue.
-                        Err(Error::PreWrite(reason)) => {
-                            let failed = json!({"status": "failed", "text": "",
-                                        "error": reason});
-                            self.store
-                                .finish(&message, "failed", &failed, Some(&reason))?;
-                            self.notify_routed_target(&message, &failed);
-                            gate_notice = None;
-                            self.wake();
-                        }
-                        // A provider/adapter error is actor-fatal: record
-                        // the failed attempt, then land in `attention`.
-                        Err(error) => {
-                            let failed =
-                                json!({"status": "failed", "text": "", "error": error.to_string()});
-                            self.store.finish(
-                                &message,
-                                "failed",
-                                &failed,
-                                Some(&error.to_string()),
-                            )?;
-                            self.notify_routed_target(&message, &failed);
-                            // Other submitted PTY messages are now
-                            // orphaned by the dead endpoint.
-                            let _ = self
-                                .store
-                                .orphan_running(alias, "endpoint lost after submission");
-                            self.wake();
-                            // CAD-1142: stamp the claimed turn's proven
-                            // source onto the fatal error so `run_actor`
-                            // can classify its public fence text without
-                            // reading provider prose. The stamped text is
-                            // unchanged — only the public writes differ.
-                            let error = if message.source == "app_run_dispatch" {
-                                error.into_app_owned_fatal()
-                            } else {
-                                error
-                            };
-                            return Err(error);
-                        }
-                    }
+                    let mut turn_ctx = TurnOutcomeCtx {
+                        message: &message,
+                        pending_context,
+                    };
+                    self.settle_turn_outcome(
+                        alias,
+                        ctl,
+                        &lane.adapter,
+                        &mut turn_ctx,
+                        &mut loop_state,
+                        outcome,
+                    )?;
                 }
             }
         }
@@ -1321,4 +1369,39 @@ impl Shared {
         self.wake();
         Err(Error::unknown(UNKNOWN_GENERIC_REASON))
     }
+}
+
+struct LaneRuntime {
+    agent: Agent,
+    adapter: Arc<dyn ProviderAdapter>,
+}
+
+struct CloudHoldState {
+    held: Option<Box<Message>>,
+    delay: Duration,
+    started: Option<Instant>,
+    escalated: bool,
+    failures: u32,
+}
+
+struct ActorLoopState {
+    retry_base: Duration,
+    gate_notice: Option<String>,
+    gate_waits: u32,
+    unrendered: u32,
+    unrendered_message: Option<String>,
+    hold_cloud: bool,
+    hold: CloudHoldState,
+}
+
+struct PromptInput {
+    base: String,
+    pack: Option<crate::continuity::Pack>,
+    after_reset: bool,
+    compacted: bool,
+}
+
+struct TurnOutcomeCtx<'a> {
+    message: &'a Message,
+    pending_context: Option<ContextDelivery>,
 }
