@@ -38,26 +38,28 @@ export function* proseClauses(text: string, semicolons: boolean): Generator<read
       continue;
     }
     const close = QUOTE_CLOSER[mark];
-    if (close !== undefined && !unclosedQuotes?.has(close) && !literalQuote(text, at, mark)) {
-      const end = quoteEnd(text, at + 1, close);
-      if (end !== undefined) {
-        quoted = true;
-        // In prose, sentence punctuation can precede a closing quote.
-        if (/[.!?]/.test(text[end - 2] ?? "") && /\s/.test(text[end] ?? "")) {
-          start = end;
-          quoted = false;
+    if (close !== undefined) {
+      let opener = at;
+      while (text[opener - 1] === "\\") opener--;
+      const escaped = (at - opener) % 2 === 1;
+      const kind = escaped ? `\\${close}` : close;
+      if (!unclosedQuotes?.has(kind) && !literalQuote(mark, text[opener - 1])) {
+        const end = quoteEnd(text, at + 1, close, escaped);
+        if (end !== undefined) {
+          quoted = true;
+          at = end;
+          continue;
         }
-        at = end;
-        continue;
+        // Each delimiter kind can scan to the end unsuccessfully at most once.
+        (unclosedQuotes ??= new Set()).add(kind);
       }
-      // No later opener of this kind can have a closer either. Each quote
-      // kind can scan to the end unsuccessfully at most once.
-      (unclosedQuotes ??= new Set()).add(close);
     }
     if (mark === "\\") {
-      // Escaped punctuation is not a clause boundary. Escaped quotes above
-      // still frame literal prose, so inspect them on the next iteration.
-      if (/[;.!?]/.test(text[at + 1] ?? "")) at++;
+      const after = runEnd(text, at, mark);
+      // An escaped quote still frames visible prose. Skip only escaped
+      // sentence punctuation and let the next iteration inspect any quote.
+      at = after + ((after - at) % 2 === 1 && /[;.!?]/.test(text[after] ?? "") ? 1 : 0);
+      continue;
     } else if (mark === ";" && semicolons) {
       if (!quoted && start < at) yield [start, at];
       start = at + 1;
@@ -154,8 +156,7 @@ function indexCodeClosers(text: string, start: number): Map<number, number> {
   return closers;
 }
 
-function literalQuote(text: string, at: number, mark: string): boolean {
-  const before = text[at - 1];
+function literalQuote(mark: string, before: string | undefined): boolean {
   if (mark === "'" || mark === "‘") return word(before);
   return mark === '"' && before !== undefined && /\d/.test(before);
 }
@@ -168,10 +169,13 @@ function word(char: string | undefined): boolean {
   return char !== undefined && /[\p{L}\p{N}_]/u.test(char);
 }
 
-function quoteEnd(text: string, start: number, close: string): number | undefined {
+function quoteEnd(text: string, start: number, close: string, escapedOpener: boolean): number | undefined {
   const apostrophe = close === "'" || close === "’";
   for (let at = start; at < text.length; at++) {
-    if (text[at] === "\\") at++;
-    else if (text[at] === close && !(apostrophe && word(text[at - 1]) && word(text[at + 1]))) return at + 1;
+    const escaped = text[at] === "\\";
+    const candidate = escaped ? at + 1 : at;
+    if ((!escaped || escapedOpener) && text[candidate] === close &&
+      !(apostrophe && word(text[at - 1]) && word(text[candidate + 1]))) return candidate + 1;
+    if (escaped) at++;
   }
 }

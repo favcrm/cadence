@@ -47,6 +47,7 @@ it("does not infer restrictions from quoted examples or Markdown code", () => {
   for (const text of [
     "Copy this example: `setup; do not retry canvas_open; wrap up`.",
     'Copy this example: "setup; do not retry canvas_open; wrap up".',
+    String.raw`Copy this example: \"setup; do not retry canvas_open; wrap up\".`,
     "Copy this example: ‘Setup; don’t retry; do not retry canvas_open; wrap up’.",
     "Copy this example: 「setup; do not retry canvas_open; wrap up」.",
     "Copy this example: ``setup `value`; do not retry canvas_open; wrap up``.",
@@ -76,11 +77,16 @@ it("recognizes a real instruction after a quoted block", () => {
 it("only rewrites the unquoted claim beside an assistant's example", () => {
   for (const quote of [
     'The guide says: "Run once. Do not retry canvas_open. Use the backup".',
-    'The guide says: "Run once. Do not retry canvas_open. Use the backup."',
+    'The guide says: "Run once. Do not retry canvas_open. Use the backup."\n\n',
   ]) {
     const text = `${quote} canvas_open does not work right now.`;
     expect(rewriteGiveUps(text, failed, new Map())).toBe(`${quote} An earlier canvas_open call failed; try it again normally.`);
   }
+});
+
+it("never makes the consequence after a quoted label a standalone claim", () => {
+  const text = 'If the board shows "Read only!" do not retry canvas_open.';
+  expect(rewriteGiveUps(text, failed, new Map())).toBe(text);
 });
 
 it("keeps scanning after inch marks and unmatched inline delimiters", () => {

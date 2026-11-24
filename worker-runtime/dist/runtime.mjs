@@ -57415,22 +57415,26 @@ function* proseClauses(text, semicolons) {
       continue;
     }
     const close = QUOTE_CLOSER[mark];
-    if (close !== undefined && !unclosedQuotes?.has(close) && !literalQuote(text, at, mark)) {
-      const end = quoteEnd(text, at + 1, close);
-      if (end !== undefined) {
-        quoted = true;
-        if (/[.!?]/.test(text[end - 2] ?? "") && /\s/.test(text[end] ?? "")) {
-          start = end;
-          quoted = false;
+    if (close !== undefined) {
+      let opener = at;
+      while (text[opener - 1] === "\\")
+        opener--;
+      const escaped = (at - opener) % 2 === 1;
+      const kind = escaped ? `\\${close}` : close;
+      if (!unclosedQuotes?.has(kind) && !literalQuote(mark, text[opener - 1])) {
+        const end = quoteEnd(text, at + 1, close, escaped);
+        if (end !== undefined) {
+          quoted = true;
+          at = end;
+          continue;
         }
-        at = end;
-        continue;
+        (unclosedQuotes ??= new Set).add(kind);
       }
-      (unclosedQuotes ??= new Set).add(close);
     }
     if (mark === "\\") {
-      if (/[;.!?]/.test(text[at + 1] ?? ""))
-        at++;
+      const after = runEnd(text, at, mark);
+      at = after + ((after - at) % 2 === 1 && /[;.!?]/.test(text[after] ?? "") ? 1 : 0);
+      continue;
     } else if (mark === ";" && semicolons) {
       if (!quoted && start < at)
         yield [start, at];
@@ -57537,8 +57541,7 @@ function indexCodeClosers(text, start) {
   }
   return closers;
 }
-function literalQuote(text, at, mark) {
-  const before = text[at - 1];
+function literalQuote(mark, before) {
   if (mark === "'" || mark === "‘")
     return word2(before);
   return mark === '"' && before !== undefined && /\d/.test(before);
@@ -57556,13 +57559,15 @@ var QUOTE_CLOSER = {
 function word2(char) {
   return char !== undefined && /[\p{L}\p{N}_]/u.test(char);
 }
-function quoteEnd(text, start, close) {
+function quoteEnd(text, start, close, escapedOpener) {
   const apostrophe = close === "'" || close === "’";
   for (let at = start;at < text.length; at++) {
-    if (text[at] === "\\")
+    const escaped = text[at] === "\\";
+    const candidate = escaped ? at + 1 : at;
+    if ((!escaped || escapedOpener) && text[candidate] === close && !(apostrophe && word2(text[at - 1]) && word2(text[candidate + 1])))
+      return candidate + 1;
+    if (escaped)
       at++;
-    else if (text[at] === close && !(apostrophe && word2(text[at - 1]) && word2(text[at + 1])))
-      return at + 1;
   }
 }
 
