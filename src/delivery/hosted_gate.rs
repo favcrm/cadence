@@ -454,19 +454,106 @@ pub fn set_delivery(
     project: &str,
     repos: &[String],
     delivery: Option<&str>,
+    fence: Option<(u64, &str)>,
 ) -> Result<Value> {
+    let repos = checked_delivery_inputs(repos, delivery)?;
+    let mut call_args = args(&[("project", json!(project)), ("repos", json!(repos))]);
+    if let Some(section) = delivery {
+        call_args.insert("delivery".into(), json!(section));
+    }
+    if let Some((revision, digest)) = fence {
+        if !policy_preview_digest(digest) {
+            return Err(refuse(
+                "--preview-digest must be sha256 followed by 64 lowercase hex digits",
+            ));
+        }
+        call_args.insert(
+            "expected_revision".into(),
+            json!((revision > 0).then_some(revision)),
+        );
+        call_args.insert("preview_digest".into(), json!(digest));
+    }
+    let body = call(target, wake_timeout, "delivery_policy_set", call_args)?;
+    set_delivery_answer(&body, project, &repos, delivery)
+}
+
+fn policy_preview_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+pub fn show_delivery(target: &RemoteTarget, wake_timeout: u64, project: &str) -> Result<Value> {
+    let body = call(
+        target,
+        wake_timeout,
+        "delivery_policy",
+        args(&[("project", json!(project))]),
+    )?;
+    if body["project"].as_str() != Some(project) || body.get("revision").is_none() {
+        return Err(refuse(
+            "`delivery_policy` returned no record for the requested project",
+        ));
+    }
+    Ok(body)
+}
+
+pub fn preview_delivery(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: &str,
+    repos: &[String],
+    delivery: Option<&str>,
+) -> Result<Value> {
+    let repos = checked_delivery_inputs(repos, delivery)?;
+    let repos: Vec<_> = repos.iter().map(|repo| repo.to_ascii_lowercase()).collect();
+    let mut proposal = json!({"repos": repos});
+    if let Some(section) = delivery {
+        proposal["delivery"] = json!(section);
+    }
+    let body = call(
+        target,
+        wake_timeout,
+        "delivery_policy",
+        args(&[("project", json!(project)), ("proposal", proposal)]),
+    )?;
+    preview_delivery_answer(body, project, &repos, delivery)
+}
+
+fn preview_delivery_answer(
+    body: Value,
+    project: &str,
+    repos: &[String],
+    delivery: Option<&str>,
+) -> Result<Value> {
+    if body["state"].as_str() != Some("preview")
+        || body["project"].as_str() != Some(project)
+        || !body
+            .get("expected_revision")
+            .is_some_and(|rev| rev.is_null() || rev.as_u64().is_some_and(|value| value > 0))
+        || body["proposal"] != json!({"repos": repos, "delivery": delivery})
+        || !body["preview_digest"]
+            .as_str()
+            .is_some_and(policy_preview_digest)
+    {
+        return Err(refuse(
+            "the board did not preview these exact delivery policy inputs",
+        ));
+    }
+    Ok(body)
+}
+
+fn checked_delivery_inputs(repos: &[String], delivery: Option<&str>) -> Result<Vec<String>> {
     let repos = set_delivery_repos(repos)?;
     if let Some(section) = delivery {
         if delivery_policy::parse(&delivery_policy::section_front(section))?.is_none() {
             return Err(refuse("the delivery file holds no delivery section"));
         }
     }
-    let mut call_args = args(&[("project", json!(project)), ("repos", json!(repos))]);
-    if let Some(section) = delivery {
-        call_args.insert("delivery".into(), json!(section));
-    }
-    let body = call(target, wake_timeout, "delivery_policy_set", call_args)?;
-    set_delivery_answer(&body, project, &repos, delivery)
+    Ok(repos)
 }
 
 fn set_delivery_repos(repos: &[String]) -> Result<Vec<String>> {
@@ -3329,6 +3416,27 @@ mod tests {
         let mut refused = ok.clone();
         refused["state"] = json!("refused");
         assert!(set_delivery_answer(&refused, "cadence", &repos, None).is_err());
+    }
+
+    #[test]
+    fn delivery_preview_refuses_drift_and_pre_preview_boards() {
+        let preview: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/hosted-cadence-delivery-preview.json"
+        ))
+        .unwrap();
+        let repos = [
+            "favcrm/cadence".to_string(),
+            "favcrm/social-content".to_string(),
+        ];
+        assert!(preview_delivery_answer(preview.clone(), "cadence", &repos, None).is_ok());
+        assert!(preview_delivery_answer(preview.clone(), "cadence", &repos[..1], None).is_err());
+        assert!(
+            preview_delivery_answer(preview, "cadence", &repos, Some("max_revise: 4")).is_err()
+        );
+
+        let old = json!({"project":"cadence","revision":null,"repos":{"state":"not_stored"},
+                         "delivery":{"state":"not_stored"},"delivery_approval":{"state":"not_stored"}});
+        assert!(preview_delivery_answer(old, "cadence", &repos, None).is_err());
     }
 
     /// The classifier refuses a PR outside the ticket project's declared

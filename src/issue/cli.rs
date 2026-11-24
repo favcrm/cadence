@@ -940,17 +940,13 @@ pub enum ProjectAction {
         #[arg(long)]
         json: bool,
     },
-    /// Record a hosted org's delivery inputs for a project (CAD-1946): its
-    /// GitHub repos and, optionally, its `delivery:` policy section. A
-    /// hosted org stores no project.yaml or PROJECT.md, and the merge gate
-    /// refuses a project with no recorded repos. Replaces what was
-    /// recorded. The workspace owner only; locally, `project add --repo`
-    /// and PROJECT.md hold the same inputs.
+    /// Inspect, preview, or record a hosted project's repositories and
+    /// delivery policy. Writing requires a live workspace owner.
     Delivery {
         /// Project key.
         key: String,
         /// A GitHub repo of the project, `owner/name` (repeatable).
-        #[arg(long = "repo", required = true)]
+        #[arg(long = "repo", required_unless_present = "show")]
         repos: Vec<String>,
         /// A file holding the project's `delivery:` section: its YAML
         /// value, the section under its own top-level `delivery:` key, or a
@@ -960,6 +956,18 @@ pub enum ProjectAction {
         /// sent. Omitted: no section, so the default policy applies.
         #[arg(long)]
         delivery_file: Option<std::path::PathBuf>,
+        /// Read the recorded policy without changing it.
+        #[arg(long, conflicts_with_all = ["repos", "delivery_file", "preview", "expect_rev", "preview_digest"])]
+        show: bool,
+        /// Validate a proposed replacement without saving it.
+        #[arg(long, conflicts_with_all = ["show", "expect_rev", "preview_digest"])]
+        preview: bool,
+        /// Apply against the revision returned by preview. Use 0 for no record.
+        #[arg(long, requires = "preview_digest")]
+        expect_rev: Option<u64>,
+        /// Apply only the exact proposal returned by preview.
+        #[arg(long, requires = "expect_rev")]
+        preview_digest: Option<String>,
     },
     /// A project's timeline on a hosted org (CAD-2240): ticket changes,
     /// comments, role messages and reviews, newest first. Hosted only; a

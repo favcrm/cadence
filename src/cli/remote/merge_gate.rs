@@ -563,10 +563,22 @@ pub(super) fn merge_gate(
                             key,
                             repos,
                             delivery_file,
+                            show,
+                            preview,
+                            expect_rev,
+                            preview_digest,
                         },
                 },
         } => {
-            refuse_managed(target, "issue project delivery")?;
+            if *show {
+                return Ok(printed((
+                    hosted_gate::show_delivery(target, wake_timeout, key)?,
+                    0,
+                )));
+            }
+            if !*preview {
+                refuse_managed(target, "issue project delivery")?;
+            }
             let delivery = delivery_file
                 .as_ref()
                 .map(|path| {
@@ -575,8 +587,24 @@ pub(super) fn merge_gate(
                     })
                 })
                 .transpose()?;
-            let receipt =
-                hosted_gate::set_delivery(target, wake_timeout, key, repos, delivery.as_deref())?;
+            let receipt = if *preview {
+                hosted_gate::preview_delivery(
+                    target,
+                    wake_timeout,
+                    key,
+                    repos,
+                    delivery.as_deref(),
+                )?
+            } else {
+                hosted_gate::set_delivery(
+                    target,
+                    wake_timeout,
+                    key,
+                    repos,
+                    delivery.as_deref(),
+                    expect_rev.zip(preview_digest.as_deref()),
+                )?
+            };
             printed((receipt, 0))
         }
         _ => None,
