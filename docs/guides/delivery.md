@@ -75,6 +75,14 @@ a hosted project's saved section is in force from the next gate read. On a
 native board the operator approves the section with
 `cadence issue project approve-work <project-key>`.
 
+Use `--show` to read the current policy without a repository argument. Add
+`--preview` to a proposed replacement to validate it without recording it.
+After reviewing the response, the owner can rerun the original replacement
+command without `--preview`, with `--expect-rev` (use `0` for a null
+revision) and `--preview-digest` from the preview. A changed revision or
+proposal refuses; re-read and preview again rather than applying without the
+fences. A board without preview support will not activate the proposal.
+
 The gate refuses a project with no recorded repository.
 
 ### Trusted lists
@@ -181,6 +189,14 @@ What each required review asks of the hosted gate:
 | `operator` | The owner's approval. |
 | `check`, `mode: required` | The latest run of each check that App posted on the exact head concluded `success`. The hosted gate matches the App by its slug, so name it by slug, not by id. |
 | `check`, `mode: advisory` | Nothing; it never blocks. |
+
+An `agent` slot may nominate a workspace profile with `profile: ap_…`.
+Use a distinct profile for each named slot; `check` and `operator` slots
+do not accept a profile. The profile is part of the policy approval digest
+and is returned only for matching slots in `required_reviews`. A matching
+profile-backed slot adds a human approval requirement, even without an
+explicit `operator` slot. A profile nomination does not change review counts,
+enroll a harness, grant verdict authority, or enable hosted claim on its own.
 
 A `revise` on an axis the policy does not require does not block. A change no
 rule asks a review of needs no code review, only its checks and evidence. A

@@ -1,0 +1,12 @@
+{
+  "state": "preview",
+  "project": "cadence",
+  "expected_revision": null,
+  "current": null,
+  "proposal": {
+    "repos": ["favcrm/cadence", "favcrm/social-content"],
+    "delivery": null
+  },
+  "policy_digest": null,
+  "preview_digest": "sha256:ecb9018e521bbe820b7c524a6247202fb2735a98447a207454dcf10edddf6341"
+}

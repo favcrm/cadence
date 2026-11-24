@@ -1262,6 +1262,57 @@ What the client does when the credential is not available:
 | the agent's own refusals: `403 forbidden` and the rest | final, never retried on the login |
 | a `401` to a **cached** agent credential | drop the cache and re-mint once; a `401` to one just minted is final |
 
+### Previewing hosted delivery settings
+
+Read the stored policy before preparing a replacement:
+
+```sh
+cadence --org acme issue project delivery storefront --show
+cadence --org acme issue project delivery storefront --preview \
+  --repo acme/storefront --delivery-file ./delivery.yaml
+```
+
+On a compatible hosted board, preview returns the current revision, exact
+proposal and `preview_digest` without writing. Workspace MCP can request the
+same preview through `cadence_cli` with verb `delivery_policy` and arguments
+`{project, proposal: {repos, delivery}}`. MCP cannot apply it.
+
+After checking the proposal, the owner applies it from the CLI with the same
+repositories and unchanged file. Use `0` for a preview whose
+`expected_revision` is `null`. Set `revision` and `digest` to the preview's
+`expected_revision` and `preview_digest`:
+
+```sh
+cadence --org acme issue project delivery storefront \
+  --repo acme/storefront --delivery-file ./delivery.yaml \
+  --expect-rev "$revision" --preview-digest "$digest"
+```
+
+If the stored revision or proposed inputs changed, preview again. A policy
+that names a reviewer `profile` requires both fences and a board that supports
+profile-backed policy; older boards cannot apply it. The unfenced legacy
+command remains available for policies without profile nominations. Applying
+settings does not approve a PR, dispatch a reviewer, or enqueue a merge.
+
+### Attesting who produced a PR head
+
+For the assigned-review bootstrap, the owner records who produced the exact
+head. This attests authorship only; it neither approves the PR nor enqueues it.
+Use `--human-only` only when no agent profile helped produce this head.
+Otherwise pass `--producer-profile` once for each contributing profile:
+
+```sh
+cadence --org acme audit producer --project storefront --issue STORE-1 \
+  --repo acme/storefront --pr 27 --head "$head" --producer-profile "$profile" \
+  --source "Owner verified the producer from the implementation assignment"
+```
+
+Omit the producer flags and `--source` to read the exact receipt. On a hosted
+board that supports producer attestation, Workspace MCP may use `cadence_cli`
+with verb `review_producer` and the same tuple to read it; MCP may not attest
+it. A changed head needs a new receipt. If an attestation response is lost,
+read the receipt before repeating the command.
+
 ### Workspace skills from the CLI (CAD-2396)
 
 A hosted workspace can keep its own skills: a `SKILL.md` package with optional

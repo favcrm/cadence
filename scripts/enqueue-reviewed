@@ -1329,7 +1329,7 @@ POLICY_REVIEW_KINDS = BASE_REVIEW_KINDS + ("standards", "spec_security")
 POLICY_REVIEW_COUNT = {"none": 0, "combined": 1, "standards": 1, "spec_security": 1,
                        "standards_and_spec": 2}
 AGENT_FOCI = ("standards", "spec-security", "browser-qa", "general")
-REVIEW_ENTRY_KEYS = frozenset(("name", "kind", "focus", "app", "mode"))
+REVIEW_ENTRY_KEYS = frozenset(("name", "kind", "focus", "app", "mode", "profile"))
 
 
 def review_join(a, b):
@@ -1358,7 +1358,7 @@ def policy_evidence(req):
         return isinstance(value, str) and value != "" and not any(
             unicodedata.category(char) == "Cc" for char in value)
 
-    names, required, axes = set(), [], {"standards": False, "spec-security": False, "general": False}
+    names, profiles, required, axes = set(), set(), [], {"standards": False, "spec-security": False, "general": False}
     qa = operator = False
     for r in reviews:
         if not isinstance(r, dict) or set(r) - REVIEW_ENTRY_KEYS or not text(r.get("name")):
@@ -1367,6 +1367,14 @@ def policy_evidence(req):
             raise ValueError(f"policy review '{r['name']}' is listed twice")
         names.add(r["name"])
         kind, focus, app, mode = (r.get("kind"), r.get("focus"), r.get("app"), r.get("mode"))
+        if "profile" in r:
+            profile = r["profile"]
+            if kind != "agent" or not isinstance(profile, str) or not re.fullmatch(r"ap_[A-Za-z0-9-]{8,64}", profile):
+                raise ValueError(f"policy review '{r['name']}' has an invalid profile")
+            if profile in profiles:
+                raise ValueError(f"policy profile '{profile}' is listed twice")
+            profiles.add(profile)
+            operator = True
         if kind == "agent" and focus in AGENT_FOCI and app is None and mode is None:
             if focus == "browser-qa":
                 qa = True

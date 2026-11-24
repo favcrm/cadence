@@ -634,6 +634,13 @@
         "name": {
           "description": "The review's name in the policy's `reviews` map.",
           "type": "string"
+        },
+        "profile": {
+          "description": "An owner-nominated profile for this slot; actual review authorization\nstill depends on the host's assignment and runtime checks.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -924,8 +931,16 @@
             "kind": {
               "type": "string",
               "const": "agent"
+            },
+            "profile": {
+              "description": "Workspace profile nominated for this slot, not a credential.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "focus"
@@ -946,6 +961,7 @@
               "$ref": "#/$defs/CheckMode"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "app",
@@ -961,6 +977,7 @@
               "const": "operator"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind"
           ]

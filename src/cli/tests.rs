@@ -877,6 +877,35 @@ fn audit_verdict_takes_its_repo() {
 }
 
 #[test]
+fn audit_producer_requires_a_distinct_attestation_mode_and_source() {
+    let base = [
+        "cadence",
+        "audit",
+        "producer",
+        "--project",
+        "cadence",
+        "--issue",
+        "CAD-1",
+        "--repo",
+        "favcrm/cadence",
+        "--pr",
+        "7",
+        "--head",
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    ];
+    assert!(Cli::try_parse_from(base).is_ok());
+    assert!(Cli::try_parse_from(base.into_iter().chain(["--human-only"])).is_err());
+    let args = ["--human-only", "--source", "owner verified actual producer"];
+    assert!(Cli::try_parse_from(base.into_iter().chain(args)).is_ok());
+    assert!(Cli::try_parse_from(
+        base.into_iter()
+            .chain(args)
+            .chain(["--producer-profile", "ap_profile-1"])
+    )
+    .is_err());
+}
+
+#[test]
 fn broker_approvals_flags_parse() {
     // `cadence claude` — broker parses; refused with --bypass/--tui;
     // the timeout requires the flag.

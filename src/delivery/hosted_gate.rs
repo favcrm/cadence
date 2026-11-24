@@ -454,19 +454,124 @@ pub fn set_delivery(
     project: &str,
     repos: &[String],
     delivery: Option<&str>,
+    fence: Option<(u64, &str)>,
 ) -> Result<Value> {
-    let repos = set_delivery_repos(repos)?;
-    if let Some(section) = delivery {
-        if delivery_policy::parse(&delivery_policy::section_front(section))?.is_none() {
-            return Err(refuse("the delivery file holds no delivery section"));
-        }
-    }
+    let repos = checked_delivery_inputs(repos, delivery, fence.is_some())?;
     let mut call_args = args(&[("project", json!(project)), ("repos", json!(repos))]);
     if let Some(section) = delivery {
         call_args.insert("delivery".into(), json!(section));
     }
+    if let Some((revision, digest)) = fence {
+        if !policy_preview_digest(digest) {
+            return Err(refuse(
+                "--preview-digest must be sha256 followed by 64 lowercase hex digits",
+            ));
+        }
+        call_args.insert(
+            "expected_revision".into(),
+            json!((revision > 0).then_some(revision)),
+        );
+        call_args.insert("preview_digest".into(), json!(digest));
+    }
     let body = call(target, wake_timeout, "delivery_policy_set", call_args)?;
     set_delivery_answer(&body, project, &repos, delivery)
+}
+
+fn policy_preview_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+pub fn show_delivery(target: &RemoteTarget, wake_timeout: u64, project: &str) -> Result<Value> {
+    let body = call(
+        target,
+        wake_timeout,
+        "delivery_policy",
+        args(&[("project", json!(project))]),
+    )?;
+    if body["project"].as_str() != Some(project) || body.get("revision").is_none() {
+        return Err(refuse(
+            "`delivery_policy` returned no record for the requested project",
+        ));
+    }
+    Ok(body)
+}
+
+pub fn preview_delivery(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    project: &str,
+    repos: &[String],
+    delivery: Option<&str>,
+) -> Result<Value> {
+    let repos = checked_delivery_inputs(repos, delivery, true)?;
+    let repos: Vec<_> = repos.iter().map(|repo| repo.to_ascii_lowercase()).collect();
+    let mut proposal = json!({"repos": repos});
+    if let Some(section) = delivery {
+        proposal["delivery"] = json!(section);
+    }
+    let body = call(
+        target,
+        wake_timeout,
+        "delivery_policy",
+        args(&[("project", json!(project)), ("proposal", proposal)]),
+    )?;
+    preview_delivery_answer(body, project, &repos, delivery)
+}
+
+fn preview_delivery_answer(
+    body: Value,
+    project: &str,
+    repos: &[String],
+    delivery: Option<&str>,
+) -> Result<Value> {
+    if body["state"].as_str() != Some("preview")
+        || body["project"].as_str() != Some(project)
+        || !body
+            .get("expected_revision")
+            .is_some_and(|rev| rev.is_null() || rev.as_u64().is_some_and(|value| value > 0))
+        || body["proposal"] != json!({"repos": repos, "delivery": delivery})
+        || !body["preview_digest"]
+            .as_str()
+            .is_some_and(policy_preview_digest)
+    {
+        return Err(refuse(
+            "the board did not preview these exact delivery policy inputs",
+        ));
+    }
+    Ok(body)
+}
+
+fn checked_delivery_inputs(
+    repos: &[String],
+    delivery: Option<&str>,
+    allow_profile: bool,
+) -> Result<Vec<String>> {
+    let repos = set_delivery_repos(repos)?;
+    if let Some(section) = delivery {
+        let policy = delivery_policy::parse(&delivery_policy::section_front(section))?
+            .ok_or_else(|| refuse("the delivery file holds no delivery section"))?;
+        if !allow_profile
+            && policy.reviews.values().any(|review| {
+                matches!(
+                    review,
+                    delivery_policy::Review::Agent {
+                        profile: Some(_),
+                        ..
+                    }
+                )
+            })
+        {
+            return Err(refuse(
+                "profile-backed delivery policy requires --expect-rev and --preview-digest from --preview",
+            ));
+        }
+    }
+    Ok(repos)
 }
 
 fn set_delivery_repos(repos: &[String]) -> Result<Vec<String>> {
@@ -643,6 +748,118 @@ impl GateBinding {
             None => Ok(()),
         }
     }
+}
+
+/// An exact-head author attestation is never an approval or a queue request.
+pub fn review_producer(
+    target: &RemoteTarget,
+    wake_timeout: u64,
+    binding: &GateBinding,
+    source: Option<&str>,
+    human_only: bool,
+    profiles: &[String],
+) -> Result<Value> {
+    let mut arguments = binding.arguments();
+    let mut profiles = profiles.to_vec();
+    profiles.sort_unstable();
+    let kind = if human_only {
+        "human-only"
+    } else {
+        "profile-assisted"
+    };
+    let verb = if let Some(source) = source {
+        let trimmed = source.trim();
+        if trimmed.is_empty()
+            || source.len() > 200
+            || source.chars().any(char::is_control)
+            || trimmed.eq_ignore_ascii_case("user")
+            || trimmed.eq_ignore_ascii_case("daemon")
+        {
+            return Err(refuse(
+                "--source must give the owner's producer evidence (1–200 UTF-8 bytes)",
+            ));
+        }
+        if !valid_producer_profiles(kind, profiles.iter().map(|id| Some(id.as_str()))) {
+            return Err(refuse(
+                "attest with --source and either --human-only or distinct --producer-profile ids",
+            ));
+        }
+        arguments.insert("source".into(), json!(source));
+        arguments.insert("kind".into(), json!(kind));
+        arguments.insert("profile_ids".into(), json!(profiles));
+        "review_producer_attest"
+    } else {
+        "review_producer"
+    };
+    let body = call(target, wake_timeout, verb, arguments)?;
+    if let Some(source) = source {
+        check_receipt(verb, || {
+            review_producer_answer(&body, binding, verb)?;
+            let producer = &body["producer"];
+            if producer["source"].as_str() != Some(source)
+                || producer["kind"].as_str() != Some(kind)
+                || producer["profile_ids"] != json!(profiles)
+                || body["duplicate"].as_bool().is_none()
+            {
+                return Err(refuse(
+                    "producer attestation did not echo the requested evidence",
+                ));
+            }
+            Ok(body)
+        })
+    } else {
+        review_producer_answer(&body, binding, verb)?;
+        Ok(body)
+    }
+}
+
+fn valid_producer_profiles<'a>(
+    kind: &str,
+    profiles: impl ExactSizeIterator<Item = Option<&'a str>>,
+) -> bool {
+    const MAX_PRODUCERS: usize = 16;
+    match kind {
+        "human-only" => return profiles.len() == 0,
+        "profile-assisted" if (1..=MAX_PRODUCERS).contains(&profiles.len()) => {}
+        _ => return false,
+    }
+    let mut seen = [""; MAX_PRODUCERS];
+    for (index, profile) in profiles.enumerate() {
+        let Some(id) = profile.filter(|id| delivery_policy::valid_workspace_profile_id(id)) else {
+            return false;
+        };
+        if seen[..index].contains(&id) {
+            return false;
+        }
+        seen[index] = id;
+    }
+    true
+}
+
+fn review_producer_answer(body: &Value, binding: &GateBinding, verb: &str) -> Result<()> {
+    let producer = &body["producer"];
+    let tuple = match body["state"].as_str() {
+        Some("recorded")
+            if producer["kind"]
+                .as_str()
+                .zip(producer["profile_ids"].as_array())
+                .is_some_and(|(kind, ids)| {
+                    valid_producer_profiles(kind, ids.iter().map(Value::as_str))
+                }) =>
+        {
+            producer
+        }
+        Some("not_recorded") if verb == "review_producer" => body,
+        _ => {
+            return Err(refuse(format!(
+                "`{verb}` returned no usable producer state"
+            )))
+        }
+    };
+    if tuple["pr"].as_u64() != Some(binding.pr) {
+        return Err(refuse(format!("`{verb}` answered for another PR")));
+    }
+    binding.echoes(tuple, verb, true)
 }
 
 /// `cadence audit approval` for a hosted org: `(document, exit code)` in the
@@ -2364,6 +2581,47 @@ mod tests {
     }
 
     #[test]
+    fn producer_readback_rejects_moved_heads_and_ambiguous_receipts() {
+        let binding = binding();
+        let mut reply = json!({
+            "state": "recorded",
+            "producer": {
+                "project": "cadence", "issue": "CAD-1", "repo": "favcrm/cadence", "pr": 7,
+                "head": HEAD, "kind": "human-only", "profile_ids": []
+            }
+        });
+        assert!(review_producer_answer(&reply, &binding, "review_producer").is_ok());
+        reply["producer"]["head"] = json!(OTHER);
+        assert!(review_producer_answer(&reply, &binding, "review_producer").is_err());
+        let mut absent = Value::Object(binding.arguments());
+        absent["state"] = json!("not_recorded");
+        assert!(review_producer_answer(&absent, &binding, "review_producer").is_ok());
+        assert!(review_producer_answer(&absent, &binding, "review_producer_attest").is_err());
+        reply["producer"]["head"] = json!(HEAD);
+        for (kind, profiles) in [
+            (json!(null), json!([])),
+            (json!("unrecognized"), json!([])),
+            (json!("human-only"), json!(["ap_standards-123"])),
+            (json!("profile-assisted"), json!([])),
+            (json!("profile-assisted"), json!([7])),
+            (json!("profile-assisted"), json!(["ap_short"])),
+            (
+                json!("profile-assisted"),
+                json!(["ap_standards-123", "ap_standards-123"]),
+            ),
+        ] {
+            reply["producer"]["kind"] = kind;
+            reply["producer"]["profile_ids"] = profiles;
+            assert!(
+                review_producer_answer(&reply, &binding, "review_producer").is_err(),
+                "{reply}"
+            );
+        }
+        reply["producer"]["profile_ids"] = json!(["ap_standards-123", "ap_spec-12345"]);
+        assert!(review_producer_answer(&reply, &binding, "review_producer").is_ok());
+    }
+
+    #[test]
     fn a_binding_requires_an_explicit_project_and_the_full_head() {
         // CAD-2001: a missing project is an error, never a repo inference.
         for (project, repo, issue, pr, head) in [
@@ -3329,6 +3587,27 @@ mod tests {
         let mut refused = ok.clone();
         refused["state"] = json!("refused");
         assert!(set_delivery_answer(&refused, "cadence", &repos, None).is_err());
+    }
+
+    #[test]
+    fn delivery_preview_refuses_drift_and_pre_preview_boards() {
+        let preview: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/hosted-cadence-delivery-preview.json"
+        ))
+        .unwrap();
+        let repos = [
+            "favcrm/cadence".to_string(),
+            "favcrm/social-content".to_string(),
+        ];
+        assert!(preview_delivery_answer(preview.clone(), "cadence", &repos, None).is_ok());
+        assert!(preview_delivery_answer(preview.clone(), "cadence", &repos[..1], None).is_err());
+        assert!(
+            preview_delivery_answer(preview, "cadence", &repos, Some("max_revise: 4")).is_err()
+        );
+
+        let old = json!({"project":"cadence","revision":null,"repos":{"state":"not_stored"},
+                         "delivery":{"state":"not_stored"},"delivery_approval":{"state":"not_stored"}});
+        assert!(preview_delivery_answer(old, "cadence", &repos, None).is_err());
     }
 
     /// The classifier refuses a PR outside the ticket project's declared

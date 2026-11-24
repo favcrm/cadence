@@ -141,6 +141,10 @@ pub struct RequiredReview {
     /// An `agent` review's focus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,
+    /// An owner-nominated profile for this slot; actual review authorization
+    /// still depends on the host's assignment and runtime checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// A `check` review's GitHub App.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
@@ -790,13 +794,17 @@ fn classify_approved(
             name: name.clone(),
             kind: String::new(),
             focus: None,
+            profile: None,
             app: None,
             mode: None,
         };
         match review {
-            Review::Agent { focus } => {
+            Review::Agent { focus, profile } => {
                 entry.kind = "agent".into();
                 entry.focus = Some(focus.clone());
+                entry.profile.clone_from(profile);
+                // A profile assigned by policy never replaces human approval.
+                operator |= profile.is_some();
                 match focus.as_str() {
                     "standards" => standards = true,
                     "spec-security" => spec = true,

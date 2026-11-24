@@ -33,6 +33,13 @@ pub const OVERSIZED_FILES: u64 = 40;
 
 pub const FOCI: &[&str] = &["general", "standards", "spec-security", "browser-qa"];
 
+/// The profile identifier accepted by delivery policy and producer evidence.
+pub fn valid_workspace_profile_id(profile: &str) -> bool {
+    profile.strip_prefix("ap_").is_some_and(|id| {
+        (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
 /// A project's delivery policy — `PROJECT.md` `delivery:` or the
 /// defaults. [`parse`] builds it through the strict raw types and
 /// [`DeliveryPolicy::validate`]; `serde` round-trips the validated
@@ -99,10 +106,15 @@ pub enum MergeMethod {
 
 /// One named review a rule may require. `kind` picks the variant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Review {
     /// An independent agent review; `focus` is one of [`FOCI`].
-    Agent { focus: String },
+    Agent {
+        focus: String,
+        /// Workspace profile nominated for this slot, not a credential.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+    },
     /// A GitHub App check (a bot). `mode: advisory` never blocks;
     /// `required` blocks like an agent review.
     Check { app: String, mode: CheckMode },
@@ -179,6 +191,7 @@ pub fn default_policy() -> DeliveryPolicy {
             "review".to_string(),
             Review::Agent {
                 focus: "general".to_string(),
+                profile: None,
             },
         )]),
         risk: vec![RiskRule {
@@ -459,9 +472,26 @@ impl DeliveryPolicy {
         if self.reviews.is_empty() {
             return Err(err("reviews must name at least one review"));
         }
-        for name in self.reviews.keys() {
+        let mut assigned_profiles = BTreeMap::new();
+        for (name, review) in &self.reviews {
             if !valid_tag(name) {
                 return Err(err(format!("reviews.{name:?}: not a valid name")));
+            }
+            if let Review::Agent {
+                profile: Some(profile),
+                ..
+            } = review
+            {
+                if !valid_workspace_profile_id(profile) {
+                    return Err(err(format!(
+                        "reviews.{name:?}.profile: expected a workspace profile ID"
+                    )));
+                }
+                if let Some(existing) = assigned_profiles.insert(profile, name) {
+                    return Err(err(format!(
+                        "reviews.{name:?}.profile: already assigned to {existing:?}"
+                    )));
+                }
             }
         }
         if self.risk.is_empty() {
@@ -609,6 +639,8 @@ struct RawReview {
     #[serde(default)]
     focus: Option<String>,
     #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
     app: Option<String>,
     #[serde(default)]
     mode: Option<String>,
@@ -659,10 +691,14 @@ impl RawReview {
                         FOCI.join(", ")
                     )));
                 }
-                Ok(Review::Agent { focus })
+                Ok(Review::Agent {
+                    focus,
+                    profile: self.profile,
+                })
             }
             "check" => {
                 refused("focus", &self.focus)?;
+                refused("profile", &self.profile)?;
                 let app = self.app.ok_or_else(|| {
                     err(format!("reviews.{name:?}: a 'check' review needs an 'app'"))
                 })?;
@@ -691,6 +727,7 @@ impl RawReview {
             }
             "operator" => {
                 refused("focus", &self.focus)?;
+                refused("profile", &self.profile)?;
                 refused("app", &self.app)?;
                 refused("mode", &self.mode)?;
                 Ok(Review::Operator)
@@ -871,6 +908,43 @@ mod tests {
     }
 
     #[test]
+    fn assigned_review_profiles_are_distinct_and_bound_to_policy_approval() {
+        let yaml = "delivery:
+  reviews:
+    standards: {kind: agent, focus: standards, profile: ap_standards-123}
+    spec: {kind: agent, focus: spec-security, profile: ap_spec-12345}
+  risk:
+    - require: [standards, spec]
+";
+        let assigned = parse_delivery(yaml).unwrap().unwrap();
+        let legacy = parse_delivery(
+            &yaml
+                .replace(", profile: ap_standards-123", "")
+                .replace(", profile: ap_spec-12345", ""),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&assigned).unwrap()["reviews"]["standards"]["profile"],
+            "ap_standards-123",
+        );
+        assert_ne!(digest(&assigned), digest(&legacy));
+        assert!(legacy
+            .reviews
+            .values()
+            .all(|review| serde_json::to_value(review)
+                .unwrap()
+                .get("profile")
+                .is_none()));
+        let duplicate = yaml.replace("ap_spec-12345", "ap_standards-123");
+        assert!(err_of(&duplicate).contains("already assigned"));
+        let bad_id = yaml.replace("ap_spec-12345", "spec");
+        assert!(err_of(&bad_id).contains("workspace profile ID"));
+        let operator = yaml.replace("kind: agent, focus: spec-security", "kind: operator");
+        assert!(err_of(&operator).contains("takes no 'profile'"));
+    }
+
+    #[test]
     fn default_policy_is_the_loop_constants() {
         let d = default_policy();
         assert_eq!(d.max_revise, crate::delivery::MAX_REVISE);
@@ -890,7 +964,8 @@ mod tests {
             BTreeMap::from([(
                 "review".to_string(),
                 Review::Agent {
-                    focus: "general".to_string()
+                    focus: "general".to_string(),
+                    profile: None,
                 }
             )])
         );
@@ -1275,6 +1350,7 @@ mod tests {
                 name.to_string(),
                 Review::Agent {
                     focus: "general".into(),
+                    profile: None,
                 },
             );
             let e = p.validate().unwrap_err().to_string();

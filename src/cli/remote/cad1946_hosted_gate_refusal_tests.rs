@@ -12,6 +12,7 @@ use cadence_agent::delivery::hosted_gate::{
     approve, approve_delegated_project, approve_scope_project, delivery_check, delivery_enqueue,
     revoke_project, GateBinding,
 };
+use cadence_agent::issue::cli::{IssueAction, ProjectAction};
 use cadence_agent::remote_cli::{CliIdentityPin, RemoteTarget};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -659,6 +660,177 @@ fn managed_caller_refuses_owner_gate_writes_before_http_and_permits_delegated_an
             "{label} must pass refuse_managed and reach transport: {err}"
         );
     }
+}
+
+#[test]
+fn managed_producer_source_is_refused_before_any_http_request() {
+    let mut env = ScopedEnv::new();
+    let server = StubRelayServer::start(None, Arc::new(|verb, _| valid_stub_reply(verb)));
+    let endpoint = server.endpoint();
+    env.write_credential(
+        &endpoint,
+        TEST_SUBJECT,
+        TEST_ISSUER,
+        &["cli.read", "cli.write", "audit.approve"],
+    );
+    env.set_var("CADENCE_ALIAS", "synthetic-worker");
+    env.set_var("CADENCE_MANAGED", "1");
+
+    let command = Commands::Audit {
+        action: Some(AuditAction::Producer {
+            project: TEST_PROJECT.into(),
+            repo: TEST_REPO.into(),
+            issue: TEST_ISSUE.into(),
+            pr: TEST_PR,
+            head: HEAD_A.into(),
+            source: Some("owner in chat".into()),
+            human_only: true,
+            profile: vec![],
+        }),
+        since: None,
+        class: None,
+        project: None,
+        json: false,
+        limit: None,
+        repo: None,
+        notes_dir: None,
+        merge_report: None,
+    };
+    let err = run_cmd(target_with(&endpoint, None), command).unwrap_err();
+    assert_managed_refused_pre_network(&err, "audit producer --source");
+    assert_eq!(server.request_count(), 0);
+    assert!(server.take_calls().is_empty());
+}
+
+#[test]
+fn stale_delivery_apply_sends_exact_fence_once_and_returns_conflict() {
+    let env = ScopedEnv::new();
+    // This relay models a board conflict; the actual board's no-write behavior
+    // must be established independently by the AOS-744 server fixture.
+    let server = StubRelayServer::start(
+        None,
+        Arc::new(|_, _| {
+            HttpReply::json(
+                409,
+                json!({
+                    "ok": false,
+                    "error": {"code": "revision_conflict", "message": "Tenant remote call refused."},
+                }),
+            )
+        }),
+    );
+    let endpoint = server.endpoint();
+    env.write_credential(
+        &endpoint,
+        TEST_SUBJECT,
+        TEST_ISSUER,
+        &["cli.read", "cli.write", "audit.approve"],
+    );
+    let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let command = Commands::Issue {
+        action: IssueAction::Project {
+            action: ProjectAction::Delivery {
+                key: TEST_PROJECT.into(),
+                repos: vec![TEST_REPO.into()],
+                delivery_file: None,
+                show: false,
+                preview: false,
+                expect_rev: Some(7),
+                preview_digest: Some(digest.into()),
+            },
+        },
+    };
+    let err = run_cmd(target_with(&endpoint, None), command).unwrap_err();
+    let message = err.to_string();
+    assert_eq!(err.kind(), "rejected", "{message}");
+    assert!(message.contains("revision_conflict"), "{message}");
+    let calls = server.take_calls();
+    assert_eq!(
+        calls,
+        vec![(
+            "delivery_policy_set".into(),
+            json!({
+                "project": TEST_PROJECT,
+                "repos": [TEST_REPO],
+                "expected_revision": 7,
+                "preview_digest": digest,
+            }),
+        )],
+        "the CLI must not retry the mutation without the fence"
+    );
+    assert_eq!(
+        server.request_count(),
+        2,
+        "one authorization and one mutation"
+    );
+}
+
+#[test]
+fn unfenced_profile_policy_is_refused_but_legacy_policy_still_dispatches() {
+    let env = ScopedEnv::new();
+    let server = StubRelayServer::start(
+        None,
+        Arc::new(|_, _| {
+            HttpReply::json(
+                409,
+                json!({
+                    "ok": false,
+                    "error": {"code": "revision_conflict", "message": "fixture refusal"},
+                }),
+            )
+        }),
+    );
+    let endpoint = server.endpoint();
+    env.write_credential(
+        &endpoint,
+        TEST_SUBJECT,
+        TEST_ISSUER,
+        &["cli.read", "cli.write", "audit.approve"],
+    );
+    let target = target_with(&endpoint, None);
+    let repos = vec![TEST_REPO.to_string()];
+    let profile_policy = "delivery:\n  reviews:\n    standards: {kind: agent, focus: standards, profile: ap_standards-123}\n  risk:\n    - require: [standards]\n";
+    let err = cadence_agent::delivery::hosted_gate::set_delivery(
+        &target,
+        5,
+        TEST_PROJECT,
+        &repos,
+        Some(profile_policy),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "profile-backed delivery policy requires --expect-rev and --preview-digest from --preview"
+        ),
+        "{err}"
+    );
+    assert_eq!(server.request_count(), 0);
+    assert!(server.take_calls().is_empty());
+
+    let legacy_policy = "delivery:\n  reviews:\n    standards: {kind: agent, focus: standards}\n  risk:\n    - require: [standards]\n";
+    let err = cadence_agent::delivery::hosted_gate::set_delivery(
+        &target,
+        5,
+        TEST_PROJECT,
+        &repos,
+        Some(legacy_policy),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("revision_conflict"), "{err}");
+    assert_eq!(
+        server.take_calls(),
+        vec![(
+            "delivery_policy_set".into(),
+            json!({
+                "project": TEST_PROJECT,
+                "repos": [TEST_REPO],
+                "delivery": legacy_policy,
+            }),
+        )]
+    );
+    assert_eq!(server.request_count(), 2);
 }
 
 // ---- Scenario 2: Foreign/forged HTTP 200 receipt rejection ----

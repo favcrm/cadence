@@ -224,6 +224,38 @@ fn docs_path_needs_one_combined_review_only() {
 }
 
 #[test]
+fn assigned_review_profiles_appear_only_for_required_slots() {
+    let assignment_policy = approved(policy(
+        "  reviews:
+    std: {kind: agent, focus: standards, profile: ap_standards-123}
+    spec: {kind: agent, focus: spec-security, profile: ap_spec-12345}
+    ops: {kind: operator}
+  risk:
+    - require: [std]
+    - when: {paths: ['src/**']}
+      require: [spec, ops]",
+    ));
+    let docs = classify(&assignment_policy, &[m("docs/a.md")], 10, &synth());
+    let src = classify(&assignment_policy, &[m("src/a.rs")], 10, &synth());
+    assert_eq!(docs.review_kind, ReviewKind::Standards);
+    assert_eq!(src.review_kind, ReviewKind::StandardsAndSpec);
+    assert!(
+        docs.operator_approval,
+        "a required assigned reviewer slot needs a human, even without an operator slot"
+    );
+    let docs = serde_json::to_value(&docs).unwrap();
+    let src = serde_json::to_value(&src).unwrap();
+    assert_eq!(
+        docs["required_reviews"],
+        serde_json::json!([{
+            "name": "std", "kind": "agent", "focus": "standards", "profile": "ap_standards-123"
+        }])
+    );
+    assert_eq!(src["required_reviews"][1]["profile"], "ap_spec-12345");
+    assert!(src["required_reviews"][2].get("profile").is_none());
+}
+
+#[test]
 fn web_path_adds_browser_qa_to_the_combined_review() {
     let r = classify(&approved(spec_policy()), &[m("web/x.ts")], 10, &synth());
     assert_eq!(r.class, DeliveryClass::Consequential, "{r:?}");

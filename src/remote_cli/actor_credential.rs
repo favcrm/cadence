@@ -282,6 +282,7 @@ pub(super) fn is_assistant_allowed_call(
             | "template_upload"
             | "delivery_policy"
             | "delivery_check"
+            | "review_producer"
             | "audit_approval"
             | "audit_verdicts"
             | "audit_verdict"
@@ -839,6 +840,16 @@ mod tests {
         assert!(!is_assistant_allowed_call(
             Surface::Cli,
             "delivery_enqueue",
+            None
+        ));
+        assert!(is_assistant_allowed_call(
+            Surface::Cli,
+            "review_producer",
+            None
+        ));
+        assert!(!is_assistant_allowed_call(
+            Surface::Cli,
+            "review_producer_attest",
             None
         ));
         assert!(!is_assistant_allowed_call(

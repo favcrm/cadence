@@ -19236,6 +19236,7 @@ mod cad2494_acceptance {
         rows: Vec<Value>,
         patch: Value,
         runs: Value,
+        approved: bool,
     }
 
     fn gate<'a>(repo: &'a Repo, head: &str, patch: Value, rows: Vec<Value>) -> Gate<'a> {
@@ -19251,6 +19252,7 @@ mod cad2494_acceptance {
             rows,
             patch,
             runs: json!({}),
+            approved: true,
         }
     }
 
@@ -19287,7 +19289,7 @@ mod cad2494_acceptance {
                 "repo": REPO, "pr": 7, "title": "CAD-1: add the thing", "head": self.head,
                 "base": "main", "base_oid": self.repo.base, "tip": self.repo.base,
                 "repo_dir": self.repo.work(), "changed_files": changed,
-                "verdicts": self.rows, "class": self.class, "approved": true,
+                "verdicts": self.rows, "class": self.class, "approved": self.approved,
                 "comment_out": comment, "req_patch": self.patch, "policy_check_runs": self.runs,
                 "identities": [{"github_login": "authorlogin", "subject_id": "usr_author"},
                                {"github_login": "alice", "subject_id": "usr_alice"},
@@ -19412,6 +19414,22 @@ mod cad2494_acceptance {
         gate(&repo, &head, p(), std_row()).passes();
         gate(&repo, &head, p(), vec![]).refused("Standards");
         gate(&repo, &head, p(), spec_row()).refused("Standards");
+    }
+
+    #[test]
+    fn assigned_policy_slot_requires_exact_head_operator_approval() {
+        let repo = Repo::new();
+        let head = repo.head("code", "src/area/new.rs");
+        let mut patch = kind(1, "standards", Some("standards"));
+        patch["required_reviews"][0]["profile"] = json!("ap_standards-123");
+        patch["operator_approval"] = json!(true);
+        let mut checked = gate(&repo, &head, patch, std_row());
+        checked.approved = false;
+        checked.refused("no operator approval recorded for exactly head");
+        checked.approved = true;
+        checked.passes();
+        checked.patch["operator_approval"] = json!(false);
+        checked.refused("policy answer does not match its named reviews or the trusted floor");
     }
 
     #[test]

@@ -7,6 +7,29 @@ use super::*;
 /// the records grant nothing — `cadence audit` binds them to merges.
 #[derive(Subcommand)]
 pub(crate) enum AuditAction {
+    /// Show who produced a hosted PR head, or attest it as the human owner.
+    /// This is not merge approval.
+    Producer {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        issue: String,
+        #[arg(long)]
+        pr: u64,
+        #[arg(long)]
+        head: String,
+        /// Evidence the owner used to identify the producer; omit to read.
+        #[arg(long)]
+        source: Option<String>,
+        /// Confirm that no agent profile produced the head.
+        #[arg(long, conflicts_with = "profile", requires = "source")]
+        human_only: bool,
+        /// Profile(s) that helped produce this exact head.
+        #[arg(long = "producer-profile", requires = "source")]
+        profile: Vec<String>,
+    },
     /// Record that the operator approved `--action` (default merge) on
     /// the exact full `--head` of PR `--pr`. `--delegated`: a designated
     /// agent records a delegated approval from its own pane (CAD-918).
@@ -359,6 +382,9 @@ pub(super) fn run(
         // the notes dir instead, which this verb never fabricates.
         Some(AuditAction::Verdict { .. }) => Err(Error::rejected(
             "audit verdict records a verdict in the hosted org; select it with `--org <org>`.              Nothing was written",
+        )),
+        Some(AuditAction::Producer { .. }) => Err(Error::rejected(
+            "audit producer requires a hosted org; select it with `--org <org>`. Nothing was sent",
         )),
         // Dispatched before the state dir resolved: `audit verdicts` routes
         // through the org resolver there (CAD-1981), so a hosted selection

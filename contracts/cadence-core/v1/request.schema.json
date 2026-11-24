@@ -603,8 +603,16 @@
             "kind": {
               "type": "string",
               "const": "agent"
+            },
+            "profile": {
+              "description": "Workspace profile nominated for this slot, not a credential.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "focus"
@@ -625,6 +633,7 @@
               "$ref": "#/$defs/CheckMode"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "app",
@@ -640,6 +649,7 @@
               "const": "operator"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind"
           ]
