@@ -4421,3 +4421,17 @@ const CAD2726_ZHTW: Record<string, string> = {
 for (const [key, value] of Object.entries(CAD2726_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }
+
+const CAD2743_ZHTW: Record<string, string> = {
+  "New WhatsApp message": "新 WhatsApp 訊息",
+  "Photo": "相片",
+  "Video": "影片",
+  "Voice message": "語音訊息",
+  "Audio": "音訊",
+  "Document": "文件",
+  "New message": "新訊息",
+  "Unread WhatsApp messages": "未讀 WhatsApp 訊息",
+};
+for (const [key, value] of Object.entries(CAD2743_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}

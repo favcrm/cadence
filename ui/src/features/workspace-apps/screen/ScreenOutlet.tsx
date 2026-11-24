@@ -26,7 +26,17 @@ import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, WHATSAPP_COMPOSE_HASH, type Recor
 import type { MountReceipt } from "./screenLifecycle";
 import Button from "../../../ui/Button";
 import AppLoadingSurface from "../AppLoadingSurface";
-import WhatsAppReplyComposer, { type WhatsAppReplySelection } from "./WhatsAppReplyComposer";
+import {
+  getActiveWhatsAppView,
+  markWhatsAppThreadUnread,
+  requestWhatsAppUnreadRefresh,
+  setActiveWhatsAppView,
+} from "../../app-shell/whatsappUnread";
+import WhatsAppReplyComposer, {
+  getWhatsAppDraftPreviews,
+  subscribeWhatsAppDrafts,
+  type WhatsAppReplySelection,
+} from "./WhatsAppReplyComposer";
 
 /** The pane renderer: the outlet's typed failure and a retry that re-mounts
  *  this same projection without a reload. */
@@ -403,6 +413,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           });
         }
         let selectedWhatsApp: { conversationId: string; provider: WhatsAppComposeProvider } | null = null;
+        const whatsappUxEnabled = primary && !readOnly && current.installation.name === "waba";
         const composeServices = primary && !readOnly && current.installation.name === "waba" && admitsWhatsAppComposer(receipt)
           ? services : null;
         const mediaDownloadServices = current.installation.name === "waba" && admitsWhatsAppMediaDownload(receipt)
@@ -414,6 +425,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           if (conversationId === null && selectedWhatsApp === null) return;
           if (selectedWhatsApp?.conversationId === conversationId && selectedWhatsApp?.provider === provider) return;
           selectedWhatsApp = composeCurrent() && conversationId !== null ? { conversationId, provider } : null;
+          setActiveWhatsAppView(
+            selectedWhatsApp
+              ? { installId: current.installation.install_id, conversationId: selectedWhatsApp.conversationId }
+              : null,
+          );
           const revision = ++whatsappRevision.current;
           composerUnsaved = false;
           updateLeaveGuard();
@@ -429,6 +445,14 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
               receiptScope: `${generation}:${scope}`,
               services: composeServices,
               current: currentSelection,
+              draftScope: current.installation.install_id,
+              preserveTextDrafts: owned.whatsappUx,
+              announceOutboundEcho: owned.whatsappUx ? echo => {
+                if (currentSelection()) owned?.whatsappOutboundEcho(echo);
+              } : undefined,
+              onSentRefreshUnread: () => {
+                requestWhatsAppUnreadRefresh(current.installation.install_id);
+              },
               announceAvailability: nomination === null ? undefined : state => {
                 if (currentSelection()) owned?.whatsappReplyAvailability(nomination, state);
               },
@@ -464,6 +488,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           mountQuery.set("wa_compose_inset_ack", "1");
         }
         if (mediaDownloadServices) mountQuery.set("wa_media_download", "1");
+        if (whatsappUxEnabled) mountQuery.set("wa_ux", "1");
         frame.src = `${receipt.mount}${mountQuery.size ? `?${mountQuery}` : ""}${composeServices ? WHATSAPP_COMPOSE_HASH : ""}`;
         // The URL carries the pick at mount time; a change during the load can
         // only be delivered once the document's listener runs, so repeat the
@@ -544,6 +569,12 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                 mediaDownloadServices.downloadWhatsAppMedia(conversationId, messageId, signal),
               onWhatsAppMediaSave: triggerWhatsAppMediaSave,
             } : {}),
+            ...(whatsappUxEnabled ? {
+              onWhatsAppThreadUnread: (conversationId: string, provider: WhatsAppComposeProvider, unread: boolean) => {
+                if (!isCurrent()) return;
+                void markWhatsAppThreadUnread(current.installation.install_id, provider, conversationId, unread);
+              },
+            } : {}),
             onScreenDrawer: onScreenDrawer
               ? (mode, surface, independent, size, context) => {
                   if (!isCurrent()) return;
@@ -617,6 +648,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     })();
     return () => {
       retired = true;
+      if (primary && latest.current.installation.name === "waba") {
+        const cur = getActiveWhatsAppView();
+        if (cur?.installId === latest.current.installation.install_id) setActiveWhatsAppView(null);
+      }
       unsubscribe();
       session.dispose();
       clearLeaveGuard();
@@ -658,6 +693,33 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
     frame?.contentWindow?.postMessage({ type: "cadence-theme", theme: frameTheme ?? "system" }, "*");
   }, [frameTheme]);
   useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale, route]);
+  useEffect(() => {
+    if (!primary || readOnly || projection.installation.name !== "waba" || state !== "ready") return;
+    const ch = channel.current;
+    if (!ch?.whatsappUx) return;
+    const installId = projection.installation.install_id;
+    const pushDrafts = () => {
+      ch.whatsappDrafts(getWhatsAppDraftPreviews(installId));
+    };
+    pushDrafts();
+    return subscribeWhatsAppDrafts(pushDrafts);
+  }, [primary, readOnly, projection.installation.install_id, projection.installation.name, state]);
+  useEffect(() => {
+    if (!primary || readOnly || projection.installation.name !== "waba" || state !== "ready") return;
+    const ch = channel.current;
+    if (!ch?.whatsappUx || typeof window === "undefined") return;
+    const currentUrl = new URL(window.location.href);
+    const target = currentUrl.searchParams.get("wa_thread");
+    if (!target || target.length > 256) return;
+    for (let i = 0; i < target.length; i++) {
+      const code = target.charCodeAt(i);
+      if (code < 32 || code === 127) return;
+    }
+    ch.whatsappOpenThread(target);
+    currentUrl.searchParams.delete("wa_thread");
+    const nextUrl = currentUrl.pathname + (currentUrl.searchParams.size ? `?${currentUrl.searchParams}` : "") + currentUrl.hash;
+    window.history.replaceState(window.history.state, "", nextUrl);
+  }, [primary, readOnly, projection.installation.name, state, href]);
   // The child portal exists only for a live primary with a real private
   // token; the token goes into the mount POST and nowhere else.
   const drawerToken = primary ? actionTokenRef.current : null;

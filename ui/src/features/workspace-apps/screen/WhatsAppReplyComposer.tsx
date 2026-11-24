@@ -8,6 +8,7 @@ import {
   LINKED_MEDIA_MAX_IMAGE_BYTES,
   WHATSAPP_REPLY_INSET_MAX,
   type WhatsAppComposeProvider,
+  type WhatsAppOutboundEchoMessage,
   type WhatsAppReplyAvailability,
   type WhatsAppReplyBounds,
 } from "./screenProtocol";
@@ -59,6 +60,10 @@ export interface WhatsAppReplySelection {
   announceAvailability?(state: WhatsAppReplyAvailability): void;
   announceInset?(px: number): number | undefined;
   announce(dirty: boolean, refresh?: boolean): void;
+  draftScope?: string;
+  preserveTextDrafts?: boolean;
+  announceOutboundEcho?(echo: Omit<WhatsAppOutboundEchoMessage, "v" | "op">): void;
+  onSentRefreshUnread?(): void;
 }
 
 type Recipient = {
@@ -85,7 +90,124 @@ type StatusTone = "uncertain" | "failed";
 // Retain only unresolved uncertain sends across navigation so an interrupted
 // confirmation cannot accidentally authorize a duplicate reply.
 const replyRecovery = new Map<string, string>();
-onPrivateSessionReset(() => replyRecovery.clear());
+const DRAFT_STORAGE_KEY = "cadence:wa-drafts:v1";
+const MAX_DRAFTS = 50;
+const DRAFT_KEY_SEP = "\u0000";
+const replyDrafts = new Map<string, string>();
+const draftListeners = new Set<() => void>();
+let draftsLoaded = false;
+
+function draftStorageKey(scope: string, provider: WhatsAppComposeProvider, conversationId: string): string {
+  return `${scope}${DRAFT_KEY_SEP}${provider}${DRAFT_KEY_SEP}${conversationId}`;
+}
+
+function loadReplyDrafts(): void {
+  if (draftsLoaded) return;
+  draftsLoaded = true;
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    const raw = sessionStorage.getItem(DRAFT_STORAGE_KEY);
+    if (!raw) return;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    for (const entry of parsed.slice(-MAX_DRAFTS)) {
+      if (
+        Array.isArray(entry) &&
+        entry.length === 2 &&
+        typeof entry[0] === "string" &&
+        typeof entry[1] === "string" &&
+        entry[1].length > 0
+      ) {
+        replyDrafts.set(entry[0], entry[1].slice(0, 4096));
+      }
+    }
+  } catch {
+    // Ignore storage unavailability or malformed entries.
+  }
+}
+
+function persistReplyDrafts(): void {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    if (replyDrafts.size === 0) {
+      sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+      return;
+    }
+    sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify([...replyDrafts.entries()]));
+  } catch {
+    // Ignore quota / storage restrictions.
+  }
+}
+
+function emitDraftListeners(): void {
+  for (const listener of draftListeners) listener();
+}
+
+function readWhatsAppDraft(scope: string, provider: WhatsAppComposeProvider, conversationId: string): string {
+  loadReplyDrafts();
+  return replyDrafts.get(draftStorageKey(scope, provider, conversationId)) ?? "";
+}
+
+function writeWhatsAppDraft(
+  scope: string,
+  provider: WhatsAppComposeProvider,
+  conversationId: string,
+  text: string,
+): void {
+  loadReplyDrafts();
+  const key = draftStorageKey(scope, provider, conversationId);
+  const prev = replyDrafts.get(key) ?? "";
+  if (prev === text) return;
+  if (text === "") {
+    replyDrafts.delete(key);
+  } else {
+    replyDrafts.delete(key);
+    replyDrafts.set(key, text.slice(0, 4096));
+    while (replyDrafts.size > MAX_DRAFTS) {
+      const oldest = replyDrafts.keys().next().value;
+      if (oldest === undefined) break;
+      replyDrafts.delete(oldest);
+    }
+  }
+  persistReplyDrafts();
+  emitDraftListeners();
+}
+
+export function getWhatsAppDraftPreviews(draftScope: string): Record<string, string> {
+  loadReplyDrafts();
+  const prefix = `${draftScope}${DRAFT_KEY_SEP}`;
+  const previews: Record<string, string> = {};
+  for (const [key, value] of replyDrafts.entries()) {
+    if (!key.startsWith(prefix)) continue;
+    const parts = key.split(DRAFT_KEY_SEP);
+    const conversationId = parts[2];
+    const trimmed = value.replace(/\s+/g, " ").trim();
+    if (!conversationId || !trimmed) continue;
+    previews[conversationId] = trimmed.length > 140 ? `${trimmed.slice(0, 139)}…` : trimmed;
+  }
+  return previews;
+}
+
+export function subscribeWhatsAppDrafts(listener: () => void): () => void {
+  draftListeners.add(listener);
+  return () => {
+    draftListeners.delete(listener);
+  };
+}
+
+onPrivateSessionReset(() => {
+  replyRecovery.clear();
+  replyDrafts.clear();
+  draftsLoaded = true;
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+    } catch {
+      // Ignore storage cleanup errors.
+    }
+  }
+  emitDraftListeners();
+});
 const receiptKey = (selection: WhatsAppReplySelection, recipient: Recipient) =>
   `${selection.receiptScope}:${selection.provider ?? "linked"}:${recipient.workRef}`;
 
@@ -148,10 +270,24 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
   const zh = locale === "zh-TW";
   const provider: WhatsAppComposeProvider = selection.provider ?? "linked";
   const isOfficial = provider === "official";
+  const draftKeyScope = selection.preserveTextDrafts && selection.draftScope ? selection.draftScope : null;
+  const draftIdentity = draftKeyScope ? `${draftKeyScope}\u0000${provider}\u0000${selection.conversationId}` : null;
   const [verification, setVerification] = useState<RecipientCheck>();
   const [showCheckingHint, setShowCheckingHint] = useState(false);
   const [retry, setRetry] = useState<{ bound?: Recipient }>();
-  const [text, setText] = useState("");
+  const [text, setTextState] = useState(() =>
+    draftKeyScope ? readWhatsAppDraft(draftKeyScope, provider, selection.conversationId) : "",
+  );
+  const prevDraftIdentity = useRef(draftIdentity);
+  useLayoutEffect(() => {
+    if (prevDraftIdentity.current === draftIdentity) return;
+    prevDraftIdentity.current = draftIdentity;
+    setTextState(draftKeyScope ? readWhatsAppDraft(draftKeyScope, provider, selection.conversationId) : "");
+  }, [draftIdentity, draftKeyScope, provider, selection.conversationId]);
+  function setText(next: string): void {
+    setTextState(next);
+    if (draftKeyScope) writeWhatsAppDraft(draftKeyScope, provider, selection.conversationId, next);
+  }
   const [pendingOp, setPendingOp] = useState<"send" | "check" | null>(null);
   const busy = pendingOp !== null;
   const sending = pendingOp === "send";
@@ -304,8 +440,10 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     box.style.height = "auto";
     box.style.height = `${box.scrollHeight}px`;
   }, [bounds, text, recipient, attachment]);
-  draftDirtyRef.current = !!text || !!attachment || busy || staging;
-  useLayoutEffect(() => { selection.announce(!!text || !!attachment || busy || staging); }, [selection, text, attachment, busy, staging]);
+  const draftDirty = draftKeyScope ? false : !!text;
+  const blockingDirty = draftDirty || !!attachment || busy || staging;
+  draftDirtyRef.current = blockingDirty;
+  useLayoutEffect(() => { selection.announce(blockingDirty); }, [selection, blockingDirty]);
   useEffect(() => { selection.announceAvailability?.(availability); }, [selection, availability]);
   useEffect(() => {
     if (availability !== "checking") {
@@ -458,6 +596,18 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
     setAttachError(null);
     const activeAttachment = isOfficial ? null : attachment;
     const draftText = activeAttachment?.kind === "audio" ? "" : text;
+    const tempId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const echoCreatedAt = new Date().toISOString();
+    selection.announceOutboundEcho?.({
+      phase: "pending",
+      temp_id: tempId,
+      conversation_id: selection.conversationId,
+      provider,
+      text: draftText,
+      media_kind: activeAttachment?.kind ?? null,
+      file_name: activeAttachment?.file_name ?? null,
+      created_at: echoCreatedAt,
+    });
     const args: Record<string, unknown> = {
       provider,
       conversation_id: selection.conversationId,
@@ -557,12 +707,34 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
         const mayHaveSent = submitted && (outcome === "sent" || outcome === "accepted" || outcome === "uncertain");
         if (!staleAttachmentHandled && !windowClosedHandled) setAttempt({ effectId, outcome });
         if (mayHaveSent) {
+          selection.announceOutboundEcho?.({
+            phase: "sent",
+            temp_id: tempId,
+            conversation_id: selection.conversationId,
+            provider,
+            text: draftText,
+            media_kind: activeAttachment?.kind ?? null,
+            file_name: activeAttachment?.file_name ?? null,
+            created_at: echoCreatedAt,
+          });
+          selection.onSentRefreshUnread?.();
           setText("");
           if (activeAttachment) {
             stagedIdRef.current = null;
             setAttachment(null);
             replacePreview(null);
           }
+        } else {
+          selection.announceOutboundEcho?.({
+            phase: submitted && outcome === "failed" ? "failed" : "cancelled",
+            temp_id: tempId,
+            conversation_id: selection.conversationId,
+            provider,
+            text: draftText,
+            media_kind: activeAttachment?.kind ?? null,
+            file_name: activeAttachment?.file_name ?? null,
+            created_at: echoCreatedAt,
+          });
         }
         if (submitted && effectId && outcome === "uncertain") {
           setConfirming(true);
@@ -571,7 +743,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
           scheduleAcceptedUpgradePoll(effectId, 0);
         }
         setPendingOp(null);
-        selection.announce(!mayHaveSent && (!!text || (!!attachment && !staleAttachmentHandled)), submitted);
+        selection.announce(!mayHaveSent && (draftDirty || (!!attachment && !staleAttachmentHandled)), submitted);
       }
     }
   }
@@ -593,7 +765,7 @@ export default function WhatsAppReplyComposer({ selection, bounds, inset }: { se
       settleReceipt(receiptKey(selection, recipient), effectId, outcome);
       setAttempt({ effectId, outcome });
       if (outcome === "accepted" && !group) scheduleAcceptedUpgradePoll(effectId, 0);
-      selection.announce(!!text || !!attachment, true);
+      selection.announce(draftDirty || !!attachment, true);
     } finally {
       running.current = false;
       if (selection.current()) setPendingOp(null);

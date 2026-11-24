@@ -21,7 +21,7 @@
     },
     {
       "path": "ui/src/features/workspace-apps/screen/screenProtocol.ts",
-      "sha256": "ee6a17b70384fd17073d69718359dd55a829f64f804b1d1b284f4bcf3ceb26a7"
+      "sha256": "4c56c4765a365d026919ab965bbbfd231e96688d9ba7c58b616eabe1c122f4a2"
     },
     {
       "path": "ui/src/lib/api.ts",

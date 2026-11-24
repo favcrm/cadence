@@ -99,6 +99,10 @@ body {
   font: 600 .65rem/1.1rem "IBM Plex Mono", monospace;
   text-align: center;
 }
+.navlink .navbadge.navbadge-accent {
+  background: var(--color-accent);
+  color: var(--color-on-accent, #fff);
+}
 .navlink[data-parent-current] {
   background: none;
   color: var(--color-ink-100);
