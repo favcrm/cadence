@@ -43,7 +43,7 @@ const TEXT_TOOL: &str = "generate_text";
 const IMAGE_MODEL: &str = "openai/gpt-image-2.5";
 /// The reviewed image model a native price card may name. It is the same
 /// constant the price read and every submit must echo.
-pub(crate) fn reviewed_image_model() -> &'static str {
+pub fn reviewed_image_model() -> &'static str {
     IMAGE_MODEL
 }
 const CALL_PATH: &str = "/v1/runtime/tools/call";
@@ -64,7 +64,7 @@ const ARTIFACT_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_UNCERTAIN_SUBMIT: &str = "AgenticOS image submit outcome is uncertain";
 
 /// The exact prompt an image job submits; frozen on the job at admission.
-pub(crate) fn frozen_image_prompt(
+pub fn frozen_image_prompt(
     authority: &Value,
     input: &Value,
 ) -> std::result::Result<String, String> {
@@ -77,7 +77,7 @@ pub(crate) fn frozen_image_prompt(
     }
 }
 
-pub(crate) fn image_plan_preflight(
+pub fn image_plan_preflight(
     inputs: &BTreeMap<String, String>,
     manual: bool,
 ) -> std::result::Result<(), String> {
@@ -113,6 +113,10 @@ pub struct AgenticosExternalAdapter {
     table: ToolTable,
     transport: Transport,
     account_identity: Option<crate::remote_cli::AccountImageIdentity>,
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub base: String,
+    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
     base: String,
     deployment_pin: Option<String>,
     http: ureq::Agent,
@@ -169,6 +173,19 @@ impl AgenticosExternalAdapter {
             .expect("descriptor")
             .validate(&adapter.table)?;
         Ok(adapter)
+    }
+
+    /// Resolve the currently enrolled account before freezing its image
+    /// transport and lineage together.
+    pub fn checked_account_image(
+        config: &Value,
+    ) -> Result<(Self, crate::remote_cli::AccountImageIdentity)> {
+        if config["provider"].as_str() != Some(super::account_media::PLATFORM) {
+            return Err(Error::rejected("account image provider is absent"));
+        }
+        let identity = super::account_media::current_identity(config).map_err(Error::rejected)?;
+        let adapter = Self::account_image(identity.clone())?;
+        Ok((adapter, identity))
     }
 
     /// The normal-login adapter reuses only the reviewed image protocol.
@@ -1631,11 +1648,11 @@ fn validate_source_authority<'a>(
 }
 
 pub fn register_with_deployment_pin(
-    opts: &mut crate::daemon::ServeOptions,
+    opts: &mut impl super::PlatformRegistry,
     base: &str,
     deployment_pin: Option<&str>,
 ) -> Result<()> {
-    opts.platforms.insert(
+    opts.platforms_mut().insert(
         PLATFORM.into(),
         std::sync::Arc::new(AgenticosExternalAdapter::with_deployment_pin(
             base,
@@ -1645,36 +1662,18 @@ pub fn register_with_deployment_pin(
     Ok(())
 }
 
-fn register_with_deployment(
-    opts: &mut crate::daemon::ServeOptions,
-    base: &str,
-    deployment_pin: Option<&str>,
-) -> Result<()> {
-    opts.platforms.insert(
-        PLATFORM.into(),
-        std::sync::Arc::new(AgenticosExternalAdapter::with_deployment_pin(
-            base,
-            deployment_pin,
-        )?),
-    );
-    Ok(())
-}
 
 /// Trusted hosted metadata alone admits the credentialless media door.
 /// Otherwise external access remains opt-in per daemon. Caller URL settings
 /// and conflicting pre-registration cannot replace a hosted transport.
-pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+pub fn attach(opts: &mut impl super::PlatformComposition) -> Result<()> {
+    let opts = &mut opts.attach_view();
     super::account_media::attach(opts)?;
-    let metadata = match &opts.provider_deployments {
-        Some(value) => Some(value.clone()),
-        None => super::deployments::load()?,
-    };
-    // CAD-1416: cache the already-validated owned metadata so `Shared` and the
-    // other readers see the same assertions without a second root read.
     if opts.provider_deployments.is_none() {
-        opts.provider_deployments = metadata.clone();
+        *opts.provider_deployments = super::deployments::load()?;
     }
-    if let Some(admission) = metadata.as_ref().and_then(|value| value.hosted_media()) {
+    // Cache the validated metadata so all composition readers share it.
+    if let Some(admission) = opts.provider_deployments.as_ref().and_then(|value| value.verified()).and_then(|value| value.hosted_media()) {
         if std::env::var_os("CADENCE_AGENTICOS_EXTERNAL_URL").is_some() {
             return Err(Error::rejected(
                 "hosted media conflicts with external URL composition",
@@ -1700,10 +1699,9 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
         return Ok(());
     };
     let base = valid_base(&base)?;
-    let pin = metadata
-        .as_ref()
+    let pin = opts.provider_deployments.as_ref()
         .and_then(|value| value.pin(PLATFORM, &base));
-    register_with_deployment(opts, &base, pin)
+    register_with_deployment_pin(opts.platforms, &base, pin)
 }
 
 impl PlatformAdapter for AgenticosExternalAdapter {
@@ -1974,9 +1972,107 @@ impl PlatformAdapter for AgenticosExternalAdapter {
     }
 }
 
+#[cfg(any(test, all(debug_assertions, feature = "test-seam")))]
+#[doc(hidden)]
+pub mod board_fixture {
+    use super::*;
+    pub const CALL_PATH: &str = super::CALL_PATH;
+    pub const MEDIA_PRICE_PATH: &str = super::MEDIA_PRICE_PATH;
+    pub const TEXT_MANIFEST_PIN: &str = super::TEXT_MANIFEST_PIN;
+    pub const IMAGE_TOOL: &str = super::IMAGE_TOOL;
+
+    #[derive(Clone, Debug)]
+    pub struct DoorRequest {
+        pub method: String,
+        pub url: String,
+        pub auth: Option<String>,
+        pub idem: Option<String>,
+        pub body: Value,
+    }
+
+    pub fn json_response(
+        status: u16,
+        payload: Value,
+    ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+        tiny_http::Response::from_string(payload.to_string()).with_status_code(status)
+    }
+
+    /// Loopback AgenticOS media door. It answers exactly `expected` requests
+    /// and the test joins the worker, so a call that issues one extra
+    /// request (a forbidden re-POST) fails instead of passing silently.
+    pub fn media_door(
+        answer: impl Fn(&DoorRequest) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> + Send + 'static,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<DoorRequest>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_worker = seen.clone();
+        let worker = std::thread::spawn(move || {
+            let mut first = true;
+            loop {
+                // The first request gets a generous window; afterwards the
+                // door closes shortly after the caller goes quiet, so a test
+                // finishes fast instead of idling for the full timeout.
+                let window = if first {
+                    Duration::from_secs(10)
+                } else {
+                    Duration::from_millis(500)
+                };
+                first = false;
+                let mut request = match server.recv_timeout(window).unwrap() {
+                    Some(request) => request,
+                    None => break,
+                };
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let record = DoorRequest {
+                    method: request.method().to_string(),
+                    url: request.url().to_string(),
+                    auth: request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("authorization"))
+                        .map(|header| header.value.as_str().to_owned()),
+                    idem: request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("idempotency-key"))
+                        .map(|header| header.value.as_str().to_owned()),
+                    body: serde_json::from_str(&text).unwrap_or(Value::Null),
+                };
+                let reply = answer(&record);
+                seen_worker.lock().unwrap().push(record);
+                request.respond(reply).unwrap();
+            }
+        });
+        (base, seen, worker)
+    }
+    pub fn price_view(charge_minor: u64, version: &str) -> Value {
+        json!({"ok":true,"data":{"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge_minor,"currency":"USD","version":version}}})
+    }
+    pub fn hosted_adapter() -> AgenticosExternalAdapter {
+        let metadata = super::super::deployments::DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#).unwrap();
+        AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap()).unwrap()
+    }
+
+    pub fn hosted_with_pin(pin: &str) -> Result<AgenticosExternalAdapter> {
+        let metadata = super::super::deployments::DeploymentMetadata::parse(
+            format!(r#"{{"schema":1,"providers":[{{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"{pin}","transport":"hosted-media-lease@1"}}]}}"#).as_bytes(),
+        )?;
+        AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::board_fixture::{
+        hosted_adapter, hosted_with_pin, json_response, media_door, price_view, DoorRequest,
+    };
 
     fn authority() -> Value {
         json!({"schema":1,"install_id":"install1","slot":"source","inputs":{"profile_handle":"juicysuite_crm"},"binding":{"config":{
@@ -2287,76 +2383,6 @@ mod tests {
         json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"media:sha256:test-quote"})
     }
 
-    #[derive(Clone, Debug)]
-    pub(super) struct DoorRequest {
-        pub(super) method: String,
-        pub(super) url: String,
-        pub(super) auth: Option<String>,
-        pub(super) idem: Option<String>,
-        pub(super) body: Value,
-    }
-
-    pub(super) fn json_response(
-        status: u16,
-        payload: Value,
-    ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-        tiny_http::Response::from_string(payload.to_string()).with_status_code(status)
-    }
-
-    /// Loopback AgenticOS media door. It answers exactly `expected` requests
-    /// and the test joins the worker, so a call that issues one extra
-    /// request (a forbidden re-POST) fails instead of passing silently.
-    pub(super) fn media_door(
-        answer: impl Fn(&DoorRequest) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> + Send + 'static,
-    ) -> (
-        String,
-        std::sync::Arc<std::sync::Mutex<Vec<DoorRequest>>>,
-        std::thread::JoinHandle<()>,
-    ) {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen_worker = seen.clone();
-        let worker = std::thread::spawn(move || {
-            let mut first = true;
-            loop {
-                // The first request gets a generous window; afterwards the
-                // door closes shortly after the caller goes quiet, so a test
-                // finishes fast instead of idling for the full timeout.
-                let window = if first {
-                    Duration::from_secs(10)
-                } else {
-                    Duration::from_millis(500)
-                };
-                first = false;
-                let mut request = match server.recv_timeout(window).unwrap() {
-                    Some(request) => request,
-                    None => break,
-                };
-                let mut text = String::new();
-                request.as_reader().read_to_string(&mut text).unwrap();
-                let record = DoorRequest {
-                    method: request.method().to_string(),
-                    url: request.url().to_string(),
-                    auth: request
-                        .headers()
-                        .iter()
-                        .find(|header| header.field.equiv("authorization"))
-                        .map(|header| header.value.as_str().to_owned()),
-                    idem: request
-                        .headers()
-                        .iter()
-                        .find(|header| header.field.equiv("idempotency-key"))
-                        .map(|header| header.value.as_str().to_owned()),
-                    body: serde_json::from_str(&text).unwrap_or(Value::Null),
-                };
-                let reply = answer(&record);
-                seen_worker.lock().unwrap().push(record);
-                request.respond(reply).unwrap();
-            }
-        });
-        (base, seen, worker)
-    }
 
     /// CAD-1392 acceptance (owned by the independent reviewer, not the
     /// batching implementer): under the deferred-join pattern — sequential
@@ -2479,9 +2505,6 @@ mod tests {
         assert_eq!(seen2[0].idem.as_deref(), Some("app-call-image-2"));
     }
 
-    fn price_view(charge_minor: u64, version: &str) -> Value {
-        json!({"ok":true,"data":{"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge_minor,"currency":"USD","version":version}}})
-    }
 
     pub(super) fn job_view(
         id: &str,
@@ -2571,17 +2594,6 @@ mod tests {
         }
     }
 
-    fn hosted_adapter() -> AgenticosExternalAdapter {
-        let metadata = super::super::deployments::DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#).unwrap();
-        AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap()).unwrap()
-    }
-
-    fn hosted_with_pin(pin: &str) -> Result<AgenticosExternalAdapter> {
-        let metadata = super::super::deployments::DeploymentMetadata::parse(
-            format!(r#"{{"schema":1,"providers":[{{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"{pin}","transport":"hosted-media-lease@1"}}]}}"#).as_bytes(),
-        )?;
-        AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap())
-    }
 
     fn hosted_text_proof() -> Value {
         let mut proof = text_authority("text");
@@ -3209,8 +3221,6 @@ mod tests {
     }
 
     mod hosted_source;
-    #[cfg(feature = "test-seam")]
-    mod hosted_source_board;
 
     /// Poll, deadline and drift paths need the short test-seam clock.
     #[cfg(feature = "test-seam")]

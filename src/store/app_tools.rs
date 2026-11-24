@@ -63,7 +63,9 @@ pub(crate) struct AppToolRecord<'a> {
     pub asset: Option<(&'a str, &'a [u8])>,
 }
 
-pub(crate) struct AppToolClaim<'a> {
+pub struct AppToolClaim<'a> {
+    pub workspace: &'a crate::issue::app_catalog::workspace::RuntimeSnapshot<'a>,
+    pub context: Option<&'a str>,
     pub request: &'a str,
     pub install: &'a str,
     pub alias: &'a str,
@@ -101,8 +103,10 @@ impl Store {
     /// byte-for-byte the same intent (same install, alias, slot, binding,
     /// input and call id) — an uncertain transport retry. Any difference
     /// refuses so a recycled id can never run a second/changed operation.
-    pub(crate) fn app_tool_claim(&self, claim: AppToolClaim<'_>) -> Result<()> {
+    pub fn app_tool_claim(&self, claim: AppToolClaim<'_>) -> Result<()> {
         let AppToolClaim {
+            workspace,
+            context,
             request,
             install,
             alias,
@@ -113,6 +117,27 @@ impl Store {
         } = claim;
         self.write_tx(|conn| {
             let tx = &mut *conn;
+            #[cfg(test)]
+            let fixture = workspace.is_store_fixture();
+            #[cfg(not(test))]
+            let fixture = false;
+            if !fixture {
+                let scope = context.map_or_else(|| "installation".to_owned(), |id| format!("context:{id}"));
+                let config: Option<String> = tx.query_row(
+                    "SELECT config FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=?
+                     AND digest=? AND state='configured' AND json_extract(config,'$.bundle_digest')=?",
+                    params![install, scope, slot, binding_digest, workspace.digest()], |r| r.get(0),
+                ).optional()?;
+                let current = config
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .is_some_and(|config| app_runs::material_digest(&json!({
+                        "kind":"app-binding-v1", "install_id":install,
+                        "context_id":context, "slot":slot, "config":config
+                    })) == binding_digest);
+                if workspace.install() != install || !workspace.declares_read_or_draft(slot) || !current {
+                    return Err(Error::rejected("tool workspace binding is no longer current"));
+                }
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO app_tool_claims VALUES(?,?,?,?,?,?,?,?)",
                 params![
@@ -161,28 +186,11 @@ impl Store {
         })
     }
 
-    /// Whether this exact claim identity is already reserved — used by the
-    /// record path to prove the durable claim precedes the result.
-    fn app_tool_claimed(conn: &impl StoreConn, claim: &AppToolClaim<'_>) -> Result<bool> {
-        Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM app_tool_claims WHERE request_id=? AND call_id=?
-             AND install_id=? AND alias=? AND slot=? AND binding_digest=? AND input_digest=?)",
-            params![
-                claim.request,
-                claim.call_id,
-                claim.install,
-                claim.alias,
-                claim.slot,
-                claim.binding_digest,
-                claim.input_digest
-            ],
-            |r| r.get(0),
-        )?)
-    }
 
     /// Installs that ever reserved a paid call: a restart looks for unfinished
     /// image jobs only in their record files.
-    pub(crate) fn app_tool_claim_installs(&self) -> Result<Vec<String>> {
+    #[doc(hidden)]
+    pub fn app_tool_claim_installs(&self) -> Result<Vec<String>> {
         let conn = self.conn();
         let installs = conn
             .prepare("SELECT DISTINCT install_id FROM app_tool_claims")?
@@ -192,7 +200,8 @@ impl Store {
     }
 
     /// The retained receipt for one request id, or `None`.
-    pub(crate) fn app_tool_result_for_request(&self, request: &str) -> Result<Option<Value>> {
+    #[doc(hidden)]
+    pub fn app_tool_result_for_request(&self, request: &str) -> Result<Option<Value>> {
         let id = self
             .conn()
             .query_row(
@@ -248,18 +257,13 @@ impl Store {
         let input_text = serde_json::to_string(input)?;
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            if !Self::app_tool_claimed(
-                &tx,
-                &AppToolClaim {
-                    request,
-                    install,
-                    alias,
-                    slot,
-                    binding_digest,
-                    input_digest,
-                    call_id: id,
-                },
-            )? {
+            let claimed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_tool_claims WHERE request_id=? AND call_id=?
+                 AND install_id=? AND alias=? AND slot=? AND binding_digest=? AND input_digest=?)",
+                params![request, id, install, alias, slot, binding_digest, input_digest],
+                |r| r.get(0),
+            )?;
+            if !claimed {
                 return Err(Error::rejected(
                     "app tool result has no matching pre-call claim",
                 ));
@@ -400,13 +404,15 @@ impl Store {
         })
     }
 
-    pub(crate) fn app_tool_result(&self, id: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_tool_result(&self, id: &str) -> Result<Value> {
         Self::app_tool_result_in(&self.conn(), id)
     }
 
     /// Read retained bytes only for an install-owned receipt. The caller
     /// rechecks draft attachment/context and image integrity before serving.
-    pub(crate) fn app_tool_asset_bytes(
+    #[doc(hidden)]
+    pub fn app_tool_asset_bytes(
         &self,
         install: &str,
         id: &str,
@@ -497,7 +503,8 @@ impl Store {
     /// The receipts for one installation (operator read), newest last.
     /// Verify a selected post against a retained read receipt owned by this install.
     /// The receipt remains install-scoped; this does not assert it was private to a context.
-    pub(crate) fn app_tool_source_post_exists(
+    #[doc(hidden)]
+    pub fn app_tool_source_post_exists(
         &self,
         install: &str,
         receipt_id: &str,
@@ -526,7 +533,8 @@ impl Store {
     /// would cost history. Probing the primary key per candidate and checking
     /// the installation here keeps the query at 500 point lookups — asserted by
     /// the plan test, at production cardinality.
-    pub(crate) fn app_tool_source_results_for(
+    #[doc(hidden)]
+    pub fn app_tool_source_results_for(
         &self,
         install: &str,
         ids: &[String],
@@ -564,7 +572,8 @@ impl Store {
         Ok(out)
     }
 
-    pub(crate) fn app_tool_results(&self, install: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_tool_results(&self, install: &str) -> Result<Value> {
         let conn = self.conn();
         let ids = conn
             .prepare(

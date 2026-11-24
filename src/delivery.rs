@@ -182,7 +182,7 @@ pub enum TicketDone {
     },
 }
 
-pub(crate) const MAX_DONE_ATTEMPTS: u8 = 3;
+pub const MAX_DONE_ATTEMPTS: u8 = 3;
 
 fn initial_done_attempts() -> u8 {
     1
@@ -1256,7 +1256,7 @@ pub fn sync_pr_counted(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -
 /// One bounded `gh pr view` — the read half every GitHub touch
 /// shares (the sync and the approve-and-land transaction). Returned
 /// parsed; the caller stamps `read_at` (CAD-564: the read starts now).
-pub(crate) fn pr_view(gh_bin: &str, slug: &str, number: u64) -> Result<Value> {
+pub fn pr_view(gh_bin: &str, slug: &str, number: u64) -> Result<Value> {
     pr_view_via(gh_bin, slug, number, false)
 }
 
@@ -1346,7 +1346,7 @@ pub fn resolve_gh(path: Option<std::ffi::OsString>) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent/gh-not-on-path-at-boot"))
 }
 
-pub(crate) fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
+pub fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
     gh_via(gh_bin, false, args)
 }
 

@@ -3,8 +3,7 @@
 //! The board backend acts like `cadence login`: it requests a device
 //! code from the issuer, shows the user code + verification link, polls
 //! for the credential, verifies it through `/v1/runtime/session`, and
-//! only then mints its own board session (via
-//! [`crate::operator_auth::Auth::open_device`]). The `agc_` credential
+//! only then mints its own board session. The `agc_` credential
 //! is verified, never stored as a board session and never returned to
 //! the browser.
 //!

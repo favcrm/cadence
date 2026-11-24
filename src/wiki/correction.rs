@@ -36,7 +36,7 @@ pub(crate) struct Human {
     pub display: String,
 }
 
-pub(crate) fn list(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
+pub fn list(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     super::admitted_for_export(pm, caller, path)?;
     let loaded = collection::root_and_project(pm, caller, path)?;
     let requests = match &loaded.review_project {

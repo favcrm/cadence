@@ -36,7 +36,7 @@ pub mod policy;
 mod quorum;
 mod rendering;
 pub mod supply;
-pub(crate) mod v2;
+pub mod v2;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

@@ -279,7 +279,7 @@ pub fn installations(ctx: Ctx) -> Result<Vec<Install>> {
     for (id, record) in workspace_records(ctx.pm_dir)? {
         let mut team: BTreeSet<String> = record.team.values().cloned().collect();
         if let Some(state) = ctx.state_dir {
-            if let Some(saved) = crate::daemon::app_teams_rpc::team_of(state, &id)? {
+            if let Some(saved) = crate::daemon::app_team_state::team_of(state, &id)? {
                 team.extend(saved.roles.values().cloned());
             }
         }

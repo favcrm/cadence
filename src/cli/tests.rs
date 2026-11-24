@@ -1976,7 +1976,7 @@ fn cad879_self_requests_no_history() {
 /// malformed fields, or fenced turns.
 #[test]
 fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
-    use cadence_agent::daemon::{INSTANCE_FILE, LAST_RECOVERY_FILE};
+    use cadence_daemon::{INSTANCE_FILE, LAST_RECOVERY_FILE};
     let dir = tempfile::tempdir().unwrap();
     let verdict =
         |dir: &std::path::Path| super::daemon::recovery_record_verdict(dir, Some("run-b"));

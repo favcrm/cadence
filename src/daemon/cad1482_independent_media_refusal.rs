@@ -110,7 +110,7 @@ fn square_png() -> Vec<u8> {
 }
 
 fn media_screen(app_dir: &std::path::Path) {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = crate::contract_fixture::workspace_root();
     let src = manifest_dir.join("tests/fixtures/apps/ig-tools-fixture/screens/feed");
     let dst = app_dir.join("screens/media");
     std::fs::create_dir_all(&dst).unwrap();

@@ -84,7 +84,7 @@ fn smtp_fixture_source(root: &Path) -> Result<PathBuf> {
     use sha2::{Digest, Sha256};
 
     let source = root.join("source");
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps/crm");
+    let fixture = crate::contract_fixture::workspace_root().join("tests/fixtures/apps/crm");
     for name in [
         "app.md",
         "app-chat.json",

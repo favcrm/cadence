@@ -5,7 +5,7 @@ const CONFIG: &str = r#"{"schema":1,"providers":[{"provider":"agenticos","origin
 
 #[test]
 fn nonhosted_registration_never_loads_image_metadata() {
-    let mut opts = crate::daemon::ServeOptions::default();
+    let mut opts = crate::platform::TestComposition::default();
     crate::platform::agenticos::register_with_loader(
         &mut opts,
         "http://localhost:3110",
@@ -325,7 +325,7 @@ fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_medi
         return;
     }
     assert!(std::env::var_os("CADENCE_AGENTICOS_EXTERNAL_URL").is_none());
-    let mut opts = crate::daemon::ServeOptions {
+    let mut opts = crate::platform::TestComposition {
         provider_deployments: Some(
             DeploymentMetadata::parse(HOSTED_MEDIA_CONFIG.as_bytes())
                 .expect("trusted hosted media composition must be admitted"),
@@ -340,7 +340,7 @@ fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_medi
     ] {
         let metadata = DeploymentMetadata::parse(config.as_bytes()).unwrap();
         assert!(metadata.hosted_media().is_none());
-        let mut absent = crate::daemon::ServeOptions {
+        let mut absent = crate::platform::TestComposition {
             provider_deployments: Some(metadata),
             ..Default::default()
         };
@@ -463,7 +463,7 @@ fn hosted_media_attach_refuses_every_external_url_composition() {
         }
         return;
     }
-    let mut opts = crate::daemon::ServeOptions {
+    let mut opts = crate::platform::TestComposition {
         provider_deployments: Some(
             DeploymentMetadata::parse(HOSTED_MEDIA_CONFIG.as_bytes()).unwrap(),
         ),

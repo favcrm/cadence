@@ -17,7 +17,8 @@ use crate::error::{Error, Result};
 use crate::proc::{self, BoundedError};
 
 /// CAD-1416: hosted intake and export, selected by the daemon's real lease.
-pub(crate) mod hosted;
+#[doc(hidden)]
+pub mod hosted;
 
 /// Wall-clock bound for one export, above the runner's own 105 s limit.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(120);

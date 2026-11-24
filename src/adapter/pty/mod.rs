@@ -252,7 +252,7 @@ fn split_pane_command(helper: &Path, vars: &[String], command: &str) -> String {
 
 /// Only a seam-armed test may replace the fixed installed helper.
 /// A process environment variable alone is never helper authority.
-pub(crate) fn agent_exec_path(state_dir: &Path, env: &ProviderEnv) -> PathBuf {
+pub fn agent_exec_path(state_dir: &Path, env: &ProviderEnv) -> PathBuf {
     if crate::test_seam::armed(state_dir) {
         env.own("CADENCE_AGENT_EXEC")
             .map(PathBuf::from)
@@ -266,7 +266,7 @@ pub(crate) fn agent_exec_path(state_dir: &Path, env: &ProviderEnv) -> PathBuf {
 /// read its lane copy. In split mode ask the fixed drop helper to test
 /// that copy as the agent UID; any refusal or missing file stays
 /// `briefing_missing` in `agent show`.
-pub(crate) fn briefing_available(source: &Path, exposed: &Path, helper: Option<&Path>) -> bool {
+pub fn briefing_available(source: &Path, exposed: &Path, helper: Option<&Path>) -> bool {
     if !source.is_file() {
         return false;
     }
@@ -560,34 +560,28 @@ pub(crate) fn kill_server(state_dir: &Path, env: &ProviderEnv) -> usize {
     sessions
 }
 
-/// Kill `alias`'s session on this state dir's private tmux socket —
-/// the explicit kill path for `agent stop`/`remove`/`gc` on a pty
-/// agent whose pane may have survived a fence (fences detach now).
-/// Best effort: only sessions we launched exist on this socket, and a
-/// missing session or server is already the goal state.
-pub(crate) fn kill_pane(state_dir: &Path, alias: &str, env: &ProviderEnv, agent_uid: Option<u32>) {
+/// Stop a pane only if its real and effective UIDs match `agent_uid`.
+pub fn kill_pane_checked(state_dir: &Path, alias: &str, env: &ProviderEnv, agent_uid: u32) {
     let tmux = env
         .var("CADENCE_TMUX_COMMAND")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "tmux".to_string());
     let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
-    if let Some(uid) = agent_uid {
-        let pid = crate::reaper::output(Command::new(&tmux).arg("-L").arg(&socket).args([
-            "display-message",
-            "-p",
-            "-t",
-            alias,
-            "#{pane_pid}",
-        ]))
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| text.trim().parse::<u32>().ok());
-        if !pid.is_some_and(|pid| pane_uids(pid) == Some((uid, uid))) {
-            // Do not destroy an old operator-uid pane after a mode
-            // switch or a forged/stale tmux row. No same-uid fallback.
-            return;
-        }
+    let pid = crate::reaper::output(Command::new(&tmux).arg("-L").arg(&socket).args([
+        "display-message",
+        "-p",
+        "-t",
+        alias,
+        "#{pane_pid}",
+    ]))
+    .ok()
+    .filter(|out| out.status.success())
+    .and_then(|out| String::from_utf8(out.stdout).ok())
+    .and_then(|text| text.trim().parse::<u32>().ok());
+    if !pid.is_some_and(|pid| pane_uids(pid) == Some((agent_uid, agent_uid))) {
+        // Do not destroy an old operator-uid pane after a mode
+        // switch or a forged/stale tmux row. No same-uid fallback.
+        return;
     }
     let _ = crate::reaper::output(Command::new(tmux).arg("-L").arg(&socket).args([
         "kill-session",
@@ -601,7 +595,7 @@ pub(crate) fn kill_pane(state_dir: &Path, alias: &str, env: &ProviderEnv, agent_
 /// kills — so it keeps any pty row whose pane survived a fence rather
 /// than orphan that pane. A `tmux` that cannot run counts as alive:
 /// fail closed, keep the row.
-pub(crate) fn pane_alive(state_dir: &Path, alias: &str, env: &ProviderEnv) -> bool {
+pub fn pane_alive(state_dir: &Path, alias: &str, env: &ProviderEnv) -> bool {
     let tmux = env
         .var("CADENCE_TMUX_COMMAND")
         .filter(|v| !v.is_empty())
@@ -619,7 +613,7 @@ pub(crate) fn pane_alive(state_dir: &Path, alias: &str, env: &ProviderEnv) -> bo
 /// on this state dir's private tmux socket (`cadence attach`, or a
 /// hand-run `tmux attach`). `None` when tmux cannot answer — the idle
 /// auto-stop timer then keeps the agent: fail closed.
-pub(crate) fn pane_clients(state_dir: &Path, alias: &str, env: &ProviderEnv) -> Option<usize> {
+pub fn pane_clients(state_dir: &Path, alias: &str, env: &ProviderEnv) -> Option<usize> {
     let tmux = env
         .var("CADENCE_TMUX_COMMAND")
         .filter(|v| !v.is_empty())
@@ -688,7 +682,7 @@ pub(crate) fn descends_from(mut pid: u32, pane_pid: u32) -> bool {
 /// (`setsid`) reparents to init — or, under `daemon run`, to the daemon,
 /// the child subreaper of everything it launched (CAD-308) — so no
 /// registered pane is left on its chain.
-pub(crate) fn caller_chain(mut pid: u32) -> Option<Vec<u32>> {
+pub fn caller_chain(mut pid: u32) -> Option<Vec<u32>> {
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
     while pid > 1 && seen.insert(pid) {
@@ -720,7 +714,7 @@ pub fn has_control_chars(text: &str) -> bool {
 /// outer one and resolution never depends on map order. The daemon's
 /// slot identity (CAD-113) resolves through here; pane-attention and
 /// board-write identity use the wider [`crate::peer::PeerTies`] rule.
-pub(crate) fn nearest_pane<'a>(
+pub fn nearest_pane<'a>(
     chain: &[u32],
     panes: &'a std::collections::HashMap<u32, String>,
 ) -> Option<&'a String> {
@@ -2132,7 +2126,7 @@ impl ProviderAdapter for PtyAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_exec_path, briefing_available, kill_pane, match_draft, normalize_screen,
+        agent_exec_path, briefing_available, kill_pane_checked, match_draft, normalize_screen,
         owned_lane_dir, pane_env, split_pane_command, split_profile_ready, tail_chars, DraftMatch,
     };
 
@@ -2403,10 +2397,8 @@ mod tests {
         let env = crate::adapter::ProviderEnv::default();
         env.set("CADENCE_TMUX_COMMAND", script.to_string_lossy());
         let other_uid = unsafe { libc::geteuid() }.saturating_add(1);
-        kill_pane(dir.path(), "worker", &env, Some(other_uid));
+        kill_pane_checked(dir.path(), "worker", &env, other_uid);
         assert!(!marker.exists(), "split mode killed an operator-uid pane");
-        kill_pane(dir.path(), "worker", &env, None);
-        assert!(marker.exists(), "legacy same-uid stop changed");
     }
 
     #[test]

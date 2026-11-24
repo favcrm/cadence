@@ -263,10 +263,17 @@ fn readable_room(conn: &impl StoreConn, actor: &VerifiedHuman, room: &str) -> Re
 /// The room incarnation and the member's current join boundary. Both are
 /// checked in the same transaction as a scoped history read or marker write.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HumanRoomCursorScope {
+#[doc(hidden)]
+pub struct HumanRoomCursorScope {
     pub(crate) topic: String,
     pub(crate) created: u64,
     pub(crate) cutoff: i64,
+}
+
+impl HumanRoomCursorScope {
+    pub fn topic(&self) -> &str { &self.topic }
+    pub fn created(&self) -> u64 { self.created }
+    pub fn cutoff(&self) -> i64 { self.cutoff }
 }
 
 fn human_room_cursor_scope_in(

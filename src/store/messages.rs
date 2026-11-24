@@ -3050,7 +3050,8 @@ impl Store {
     /// Current work and unresolved outcomes for overview probes. Terminal
     /// history stays available through `messages`; unknowns remain visible
     /// even after a clock step or alias re-registration, as there too.
-    pub(crate) fn active_messages(&self, alias: &str) -> Result<Vec<Message>> {
+    #[doc(hidden)]
+    pub fn active_messages(&self, alias: &str) -> Result<Vec<Message>> {
         let conn = self.conn();
         self.agent_in(&conn, alias)?;
         let mut stmt = conn.prepare(
@@ -3064,7 +3065,8 @@ impl Store {
 
     /// Running message IDs admitted to one scoped board reader, grouped in
     /// one query so cached fleet rows never inherit operator-only IDs.
-    pub(crate) fn scoped_running_message_ids(
+    #[doc(hidden)]
+    pub fn scoped_running_message_ids(
         &self,
         issues: &[&str],
         denied: &super::PrivateJobDenials,
@@ -3121,7 +3123,8 @@ impl Store {
 
     /// Running rows only, via the queue index: recurring summaries must
     /// not deserialize completed bodies and results on every board tick.
-    pub(crate) fn running_messages(&self, alias: &str) -> Result<Vec<Message>> {
+    #[doc(hidden)]
+    pub fn running_messages(&self, alias: &str) -> Result<Vec<Message>> {
         let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT * FROM messages WHERE alias=?1 AND state='running' ORDER BY seq")?;

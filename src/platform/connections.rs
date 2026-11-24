@@ -369,8 +369,8 @@ mod tests {
     #[test]
     fn local_registration_changes_with_actual_outbox_destination() {
         let dir = tempfile::tempdir().unwrap();
-        let mut first = crate::daemon::ServeOptions::default();
-        let mut second = crate::daemon::ServeOptions::default();
+        let mut first = crate::platform::TestComposition::default();
+        let mut second = crate::platform::TestComposition::default();
         crate::platform::local::register_at(
             dir.path(),
             &mut first,

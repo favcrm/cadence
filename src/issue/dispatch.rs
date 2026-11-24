@@ -29,14 +29,17 @@ mod kickoff;
 use self::context::{
     content_digest, lessons, redacted_fact, Lessons, LESSON_KIND, LESSON_OMITTED_ID, LESSON_PATH,
 };
-pub(crate) use self::context::{context_guard, ContextTarget, JobContext, PreparedContext};
+pub use self::context::{context_guard, ContextTarget, PreparedContext};
+pub(crate) use self::context::JobContext;
 use self::early_kickoff::{
     early_kickoff, message_refs, message_row, row_mode, same_path, spec_locator, DispatchMode,
     EarlyDispatch, EarlyKickoff,
 };
-pub(crate) use self::job_spec::{canonical_issue_spec_digest, job_context};
+pub use self::job_spec::{admitted_job_context, canonical_issue_spec_digest, dispatch_lane};
+pub(crate) use self::job_spec::job_context;
 pub use self::kickoff::parse_acceptance_listing;
-pub(crate) use self::kickoff::{acceptance_listing, inline_listing, outstanding_items};
+pub use self::kickoff::acceptance_listing;
+pub(crate) use self::kickoff::{inline_listing, outstanding_items};
 use self::kickoff::{
     acceptance_warning, check_body, check_job_kickoff, job_prototype, plain_body, plain_kickoff,
 };
@@ -267,15 +270,25 @@ struct Preflight {
 /// Authority, claim and target checks stay with the caller — this only
 /// removes the duplicated load/acceptance/plan sequence.
 #[derive(Clone)]
-pub(crate) struct GatedIssue {
-    pub project: crate::issue::project::Project,
-    pub dir: PathBuf,
-    pub front: Front,
-    pub items: Vec<AcceptanceItem>,
+pub struct GatedIssue {
+    pub(crate) project: crate::issue::project::Project,
+    pub(crate) dir: PathBuf,
+    pub(crate) front: Front,
+    pub(crate) items: Vec<AcceptanceItem>,
     /// Exact source from which `front` and `items` were parsed.
-    pub source: String,
+    pub(crate) source: String,
     /// Complete canonical prose from that same parse, without criteria copies.
-    pub request: String,
+    pub(crate) request: String,
+}
+
+impl GatedIssue {
+    pub fn project(&self) -> &crate::issue::project::Project {
+        &self.project
+    }
+
+    pub fn front(&self) -> &Front {
+        &self.front
+    }
 }
 
 /// One issue read: the project and folder that hold it, its frontmatter, its
@@ -360,7 +373,7 @@ impl IssueSnapshot {
 /// legacy kickoff instead of gaining a new refusal merely because context
 /// capture was attempted. A held issue that cannot be read, and a tracker
 /// that cannot be listed, still fail closed.
-pub(crate) fn capture_issue(pm: &Pm, id: &str) -> Result<Option<GatedIssue>> {
+pub fn capture_issue(pm: &Pm, id: &str) -> Result<Option<GatedIssue>> {
     let Some(snapshot) = IssueSnapshot::read(pm, id)? else {
         return Ok(None);
     };
@@ -371,7 +384,7 @@ pub(crate) fn capture_issue(pm: &Pm, id: &str) -> Result<Option<GatedIssue>> {
 /// read it, apply the plan gate and require acceptance when the caller does.
 /// Authority, claim and target checks stay with the caller — this only
 /// removes the duplicated load/acceptance/plan sequence.
-pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
+pub fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
     let Some(snapshot) = IssueSnapshot::read(pm, id)? else {
         return Err(Error::rejected(format!(
             "Unknown issue '{id}' — `cadence issue ls` lists what exists"
@@ -385,7 +398,7 @@ pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<
 /// and a confined pi worker is not on a Devin model. Split out so a
 /// caller that runs `issue start` itself (the board kickoff) can refuse
 /// before the first mutation.
-pub(crate) struct SeatCheck {
+pub struct SeatCheck {
     pub show: Value,
     pub agent: Value,
     pub cwd_override: Option<String>,
@@ -393,7 +406,7 @@ pub(crate) struct SeatCheck {
     pub endpoint_kind: String,
 }
 
-pub(crate) fn check_seat(
+pub fn check_seat(
     project: &crate::issue::project::Project,
     alias: &str,
     force: bool,

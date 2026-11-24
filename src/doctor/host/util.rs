@@ -408,7 +408,7 @@ pub(super) fn group_line(name: &str, g: &GroupAgg) -> String {
 /// One provider's sqlite watch root: `*-wal` files anywhere under it
 /// are checkpoint candidates. The daemon watches these; the provider
 /// name is what the "no live turn" gate checks.
-pub(crate) struct WalRoot {
+pub struct WalRoot {
     pub provider: &'static str,
     pub label: &'static str,
     pub root: PathBuf,
@@ -417,7 +417,7 @@ pub(crate) struct WalRoot {
 /// The roots the daemon's WAL watcher scans — the same provider
 /// stores `provider-state` reports on (devin `sessions.db`, the codex
 /// dir's `*.sqlite`, claude projects' nested dbs).
-pub(crate) fn wal_roots(home: &Path, data_home: &Path) -> Vec<WalRoot> {
+pub fn wal_roots(home: &Path, data_home: &Path) -> Vec<WalRoot> {
     vec![
         WalRoot {
             provider: "devin",
@@ -439,7 +439,7 @@ pub(crate) fn wal_roots(home: &Path, data_home: &Path) -> Vec<WalRoot> {
 
 /// The `<db>-wal` sibling cadence and sqlite both write next to the
 /// main file.
-pub(crate) fn wal_sibling(db: &Path) -> Option<PathBuf> {
+pub fn wal_sibling(db: &Path) -> Option<PathBuf> {
     Some(db.with_file_name(format!("{}-wal", db.file_name()?.to_string_lossy())))
 }
 
@@ -448,7 +448,7 @@ pub(crate) fn wal_sibling(db: &Path) -> Option<PathBuf> {
 /// `~/.claude/projects` on a busy host is exactly the store that can
 /// exceed them.
 #[derive(Default)]
-pub(crate) struct WalScan {
+pub struct WalScan {
     pub dbs: Vec<PathBuf>,
     pub truncated: bool,
 }
@@ -458,7 +458,7 @@ pub(crate) struct WalScan {
 /// mode already). Depth-capped; the *matched-db* count is capped so a
 /// dirent-heavy root can't starve the match set, and truncation is
 /// reported rather than silent.
-pub(crate) fn find_wals(root: &Path) -> WalScan {
+pub fn find_wals(root: &Path) -> WalScan {
     const MAX_DEPTH: u8 = 4;
     const MAX_DBS: usize = 1_024;
     // Dirent safety bound, far above any real store: a runaway walk

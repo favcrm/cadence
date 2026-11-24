@@ -274,8 +274,8 @@ pub(super) fn agent_read_principal(
         return Ok(Some(read_as_principal(&shared.store, actor, verb)?));
     }
     match shared.agent_caller(peer_pid, verb)? {
-        crate::peer::AgentCaller::Operator => Ok(None),
-        crate::peer::AgentCaller::Agent(alias) => {
+        super::caller_rule::AgentCaller::Operator => Ok(None),
+        super::caller_rule::AgentCaller::Agent(alias) => {
             let agent = shared.store.agent(&alias).map_err(|_| {
                 Error::rejected(format!(
                     "{verb} refused: the calling agent is not registered"
@@ -393,7 +393,7 @@ impl Shared {
             read_as_principal(&self.store, actor, verb)?
         } else {
             match self.agent_caller(peer_pid, verb)? {
-                crate::peer::AgentCaller::Agent(alias) => {
+                super::caller_rule::AgentCaller::Agent(alias) => {
                     let agent = self.store.agent(&alias).map_err(|_| {
                         Error::rejected(format!(
                             "{verb} refused: the caller's registration is unavailable"
@@ -401,7 +401,7 @@ impl Shared {
                     })?;
                     agent_principal(&agent.uid)
                 }
-                crate::peer::AgentCaller::Operator => {
+                super::caller_rule::AgentCaller::Operator => {
                     return Ok(VerifiedJobEventReader {
                         scope: None,
                         relayed,

@@ -104,10 +104,8 @@ fn boot_daemon_pinned(
 fn board_quote(answer: fn(&str, &str, &Value) -> Reply, slot: &str) -> (u16, Value, Value) {
     let (mut stop, root, state) = boot_daemon(answer);
     let pm = root.path().join("pm");
-    let source = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/apps/social-content"
-    );
+    let source = cadence_agent::contract_fixture::workspace_root()
+        .join("tests/fixtures/apps/social-content");
     let install = operator(&state, "app_workspace_install", json!({"source":source}));
     let approve = json!({"install_id":install["install_id"],"digest":install["digest"]});
     operator(&state, "app_local_install_approve", approve);
@@ -249,7 +247,7 @@ fn cad1294_screen_fetch_of_a_saved_handle_reaches_the_provider_door() {
     let (_stop, root, state) = boot_daemon(recording_door);
     // Social Content (declares `list_posts`) plus the tools screen fixture.
     let fixture = root.path().join("app");
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let manifest_dir = cadence_agent::contract_fixture::workspace_root();
     copy_dir(
         &std::path::Path::new(manifest_dir).join("tests/fixtures/apps/social-content"),
         &fixture,
@@ -365,7 +363,7 @@ fn text_door(method: &str, url: &str, body: &Value) -> Reply {
 #[test]
 fn cad1302_caption_through_a_slot_named_writer_reaches_the_lease_door() {
     let (_stop, root, state) = boot_daemon_pinned(text_door, TEXT_MANIFEST_PIN);
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = cadence_agent::contract_fixture::workspace_root();
     let fixture = root.path().join("app");
     // The host's Social Content workflows satisfy the local-workflow
     // check; the manifest is the real app's declarations, `writer` included.
@@ -540,10 +538,8 @@ fn all_posts_1302() -> usize {
 
 /// The real Social Content declaration with the `writer` slot.
 fn writer_manifest() -> String {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/apps/social-content-writer/app.md"
-    );
+    let path = cadence_agent::contract_fixture::workspace_root()
+        .join("tests/fixtures/apps/social-content-writer/app.md");
     std::fs::read_to_string(path).unwrap()
 }
 
@@ -566,7 +562,7 @@ fn invoke_1302(
         })
         .map_err(|e| format!("{method}: {e}"))
     };
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = cadence_agent::contract_fixture::workspace_root();
     let fixture = root.join(format!("app-{tag}"));
     copy_dir(
         &manifest_dir.join("tests/fixtures/apps/social-content"),
@@ -876,7 +872,7 @@ fn door_1303(method: &str, url: &str, body: &Value) -> Reply {
 /// draft-effect `image` slot) and the source read alias.
 fn social_fixture(root: &std::path::Path) -> PathBuf {
     let fixture = root.join("app");
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = cadence_agent::contract_fixture::workspace_root();
     copy_dir(
         &manifest_dir.join("tests/fixtures/apps/social-content"),
         &fixture,

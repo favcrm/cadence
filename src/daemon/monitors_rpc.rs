@@ -41,13 +41,9 @@ use serde_json::{json, Value};
 
 use super::identity::{scope_allows_issue, ProjectScope, PublicReadPrincipal};
 use super::job_events_opaque;
+pub(crate) use super::monitor_scope::MONITOR_READER_SCOPE_ACK;
 use super::scoped_cursor::{CursorBinding, CursorDirection, ScopedCursorCodec};
 use super::*;
-
-/// The exact value of [`READER_SCOPE_FIELD`] on a scoped monitor reply: the
-/// daemon understood the relayed reader proof and applied the reader boundary
-/// to this answer. Bump the suffix when this changes.
-pub(crate) const MONITOR_READER_SCOPE_ACK: &str = "cad2215.monitor-read.opaque.v1";
 
 const ALERTS_DOMAIN: &str = "monitor-alerts";
 const ACK_DOMAIN: &str = "monitor-alert-ack";

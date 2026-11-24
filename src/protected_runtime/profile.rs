@@ -25,10 +25,10 @@ const MAX_ENV_ENTRIES: usize = 24;
 const MAX_NODE_ARGS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SupervisorPin {
-    pub(crate) uid: u32,
-    pub(crate) gid: u32,
-    pub(crate) exe_digest: String,
+pub struct SupervisorPin {
+    pub uid: u32,
+    pub gid: u32,
+    pub exe_digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,16 +57,16 @@ pub(crate) struct IssuerKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ImagePin {
+pub struct ImagePin {
     /// `ref@sha256:<64 hex>` — the exact digest-pinned image reference.
-    pub(crate) reference: String,
+    pub reference: String,
     /// `sha256:<64 hex>` of the image's repo digest hex, for label binding.
-    pub(crate) digest: String,
-    pub(crate) source: String,
-    pub(crate) helper: String,
-    pub(crate) node: String,
-    pub(crate) pi_graph: String,
-    pub(crate) policy: String,
+    pub digest: String,
+    pub source: String,
+    pub helper: String,
+    pub node: String,
+    pub pi_graph: String,
+    pub policy: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,26 +95,26 @@ pub(crate) struct SeccompPin {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ApprovedTool {
-    pub(crate) name: String,
-    pub(crate) schema_digest: String,
-    pub(crate) implementation_digest: String,
+pub struct ApprovedTool {
+    pub name: String,
+    pub schema_digest: String,
+    pub implementation_digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RegistryPin {
-    pub(crate) manifest_id: String,
-    pub(crate) manifest_revision: u64,
-    pub(crate) policy_digest: String,
-    pub(crate) registry_digest: String,
-    pub(crate) approved: Vec<ApprovedTool>,
+pub struct RegistryPin {
+    pub manifest_id: String,
+    pub manifest_revision: u64,
+    pub policy_digest: String,
+    pub registry_digest: String,
+    pub approved: Vec<ApprovedTool>,
 }
 
 /// The validated root profile. Every field is private; construction is only
 /// through [`LocalProfile::load_production`] / [`LocalProfile::load_from`]
 /// after the file and parent ownership checks.
 #[derive(Clone, Debug)]
-pub(crate) struct LocalProfile {
+pub struct LocalProfile {
     profile_path: PathBuf,
     raw: Vec<u8>,
     digest: String,
@@ -145,14 +145,14 @@ pub(crate) struct LocalProfile {
 impl LocalProfile {
     /// Load the compiled-in production profile path. No environment variable
     /// or request field can redirect this path.
-    pub(crate) fn load_production() -> Result<Self> {
+    pub fn load_production() -> Result<Self> {
         Self::load_from(Path::new(super::PROFILE_PATH))
     }
 
     /// Load a root-owned profile from an operator-supplied absolute path (the
     /// root service's own argv, never agent input). The same ownership,
     /// no-symlink, strict-schema and digest rules apply.
-    pub(crate) fn load_from(path: &Path) -> Result<Self> {
+    pub fn load_from(path: &Path) -> Result<Self> {
         if !path.is_absolute() {
             return Err(Error::rejected("profile path must be absolute"));
         }
@@ -223,22 +223,22 @@ impl LocalProfile {
     pub(crate) fn raw(&self) -> &[u8] {
         &self.raw
     }
-    pub(crate) fn digest(&self) -> &str {
+    pub fn digest(&self) -> &str {
         &self.digest
     }
-    pub(crate) fn workspace_id(&self) -> &str {
+    pub fn workspace_id(&self) -> &str {
         &self.workspace_id
     }
-    pub(crate) fn core_id(&self) -> &str {
+    pub fn core_id(&self) -> &str {
         &self.core_id
     }
-    pub(crate) fn lineage_reference(&self) -> &str {
+    pub fn lineage_reference(&self) -> &str {
         &self.lineage_reference
     }
-    pub(crate) fn database_epoch(&self) -> u64 {
+    pub fn database_epoch(&self) -> u64 {
         self.database_epoch
     }
-    pub(crate) fn supervisor(&self) -> &SupervisorPin {
+    pub fn supervisor(&self) -> &SupervisorPin {
         &self.supervisor
     }
     /// The pinned digest of the root owner binary the broker fence listener
@@ -269,7 +269,7 @@ impl LocalProfile {
     pub(crate) fn issuer_keys(&self) -> &[IssuerKey] {
         &self.issuer_keys
     }
-    pub(crate) fn image(&self) -> &ImagePin {
+    pub fn image(&self) -> &ImagePin {
         &self.image
     }
     pub(crate) fn runtime(&self) -> &RuntimePin {
@@ -281,7 +281,7 @@ impl LocalProfile {
     pub(crate) fn uid_range(&self) -> (u32, u32) {
         (self.uid_start, self.uid_end)
     }
-    pub(crate) fn operator_origin(&self) -> &str {
+    pub fn operator_origin(&self) -> &str {
         &self.operator_origin
     }
     pub(crate) fn docker_socket(&self) -> &Path {
@@ -290,13 +290,13 @@ impl LocalProfile {
     pub(crate) fn max_runtimes(&self) -> u32 {
         self.max_runtimes
     }
-    pub(crate) fn registry(&self) -> &RegistryPin {
+    pub fn registry(&self) -> &RegistryPin {
         &self.registry
     }
-    pub(crate) fn state_dir(&self) -> &Path {
+    pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
-    pub(crate) fn run_dir(&self) -> &Path {
+    pub fn run_dir(&self) -> &Path {
         &self.run_dir
     }
     pub(crate) fn control_socket(&self) -> &Path {

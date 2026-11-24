@@ -746,7 +746,7 @@ impl Shared {
                 "tool native actor changed during price discovery",
             ));
         }
-        workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
+        workspace::with_runtime_snapshot_proof(&pm, &ctx.install_id, |bundle, files, workspace| {
             let _custody = self
                 .platform_custody_lock
                 .lock()
@@ -1181,6 +1181,8 @@ impl Shared {
             // same id admits only the byte-identical intent.
             self.store
                 .app_tool_claim(crate::store::app_tools::AppToolClaim {
+                    workspace,
+                    context: ctx.context_id.as_deref(),
                     request: request_id,
                     install: &ctx.install_id,
                     alias,

@@ -79,7 +79,7 @@ pub(super) fn kickoff_body(
 /// [`parse_acceptance_listing`] reads it back exactly. Quoting escapes
 /// every control character and U+2028/U+2029, so the result can ride a
 /// single-line pty kickoff without losing them.
-pub(crate) fn acceptance_listing(items: &[AcceptanceItem]) -> Option<String> {
+pub fn acceptance_listing(items: &[AcceptanceItem]) -> Option<String> {
     (!items.is_empty()).then(|| inline_listing(items))
 }
 

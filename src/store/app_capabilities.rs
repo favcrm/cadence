@@ -107,7 +107,8 @@ pub fn read_asset_material(path: &std::path::Path, id: &str) -> Result<(Value, V
     asset_material_in(&open_read_only(path)?, id)
 }
 
-pub(crate) struct AppCapabilityRecord<'a> {
+pub struct AppCapabilityRecord<'a> {
+    pub workspace: &'a crate::issue::app_catalog::workspace::RuntimeSnapshot<'a>,
     pub id: &'a str,
     pub run: &'a str,
     pub step: &'a str,
@@ -121,7 +122,8 @@ pub(crate) struct AppCapabilityRecord<'a> {
     pub asset: Option<(&'a str, &'a [u8])>,
 }
 
-pub(crate) struct AppCapabilityClaim<'a> {
+pub struct AppCapabilityClaim<'a> {
+    pub workspace: &'a crate::issue::app_catalog::workspace::RuntimeSnapshot<'a>,
     pub run: &'a str,
     pub step: &'a str,
     pub message: &'a str,
@@ -131,6 +133,35 @@ pub(crate) struct AppCapabilityClaim<'a> {
     pub binding_digest: &'a str,
     pub input_digest: &'a str,
     pub call_id: &'a str,
+}
+
+fn check_run_binding(
+    conn: &impl StoreConn,
+    workspace: &crate::issue::app_catalog::workspace::RuntimeSnapshot<'_>,
+    run: &str,
+    slot: &str,
+    binding_digest: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if workspace.is_store_fixture() {
+        return Ok(());
+    }
+    let (install, bundle, snapshot, digest, approved): (String, String, String, String, Option<String>) =
+        conn.query_row(
+            "SELECT install_id,bundle_digest,snapshot,snapshot_digest,approved_digest FROM app_runs WHERE id=?",
+            [run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).optional()?.ok_or_else(|| Error::rejected("app capability run is unavailable"))?;
+    let snapshot: Value = serde_json::from_str(&snapshot)?;
+    if install != workspace.install() || bundle != workspace.digest()
+        || approved.as_deref() != Some(digest.as_str())
+        || app_runs::material_digest(&snapshot) != digest
+        || snapshot["capabilities"][slot]["digest"].as_str() != Some(binding_digest)
+        || !snapshot["workflow"]["capability_slots"].as_array()
+            .is_some_and(|slots| slots.iter().any(|item| item.as_str() == Some(slot)))
+    {
+        return Err(Error::rejected("app capability snapshot binding changed"));
+    }
+    Ok(())
 }
 
 /// CAD-2042: the first page of run-bound source reads. The order matches the
@@ -164,8 +195,9 @@ const SOURCE_PAGE_FENCE_SLACK: usize = 1024;
 impl Store {
     /// Reserve the one paid operation for this run slot before provider I/O.
     /// A failed/uncertain result can only retry the same operation and key.
-    pub(crate) fn app_capability_claim(&self, claim: AppCapabilityClaim<'_>) -> Result<bool> {
+    pub fn app_capability_claim(&self, claim: AppCapabilityClaim<'_>) -> Result<bool> {
         let AppCapabilityClaim {
+            workspace,
             run,
             step,
             message,
@@ -179,6 +211,7 @@ impl Store {
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
+                    check_run_binding(tx, workspace, run, slot, binding_digest)?;
                     // CAD-1171: a host-execution run has no message or
                     // turn; its dispatched step is the proof.
                     let active: bool = if message.is_empty() && turn.is_empty() {
@@ -240,7 +273,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn app_selected_source_input(
+    #[doc(hidden)]
+    pub fn app_selected_source_input(
         &self,
         install: &str,
         context: Option<&str>,
@@ -279,7 +313,8 @@ impl Store {
         crate::issue::workflow::source_input_line(caption)
     }
 
-    pub(crate) fn app_capability_receipt_for_turn(
+    #[doc(hidden)]
+    pub fn app_capability_receipt_for_turn(
         &self,
         id: &str,
         alias: &str,
@@ -317,7 +352,8 @@ impl Store {
         Ok(receipt)
     }
 
-    pub(crate) fn app_capability_result_for_slot(
+    #[doc(hidden)]
+    pub fn app_capability_result_for_slot(
         &self,
         run: &str,
         slot: &str,
@@ -333,8 +369,9 @@ impl Store {
         id.map(|id| self.app_capability_result(&id)).transpose()
     }
 
-    pub(crate) fn app_capability_record(&self, record: AppCapabilityRecord<'_>) -> Result<Value> {
+    pub fn app_capability_record(&self, record: AppCapabilityRecord<'_>) -> Result<Value> {
         let AppCapabilityRecord {
+            workspace,
             id,
             run,
             step,
@@ -348,6 +385,7 @@ impl Store {
             asset,
         } = record;
         let record = AppCapabilityRecord {
+            workspace,
             id,
             run,
             step,
@@ -378,6 +416,7 @@ impl Store {
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
+                    check_run_binding(tx, workspace, run, slot, binding_digest)?;
                     // CAD-1171: a host-execution run records its receipt
                     // with no message or turn; the dispatched step is the
                     // proof, exactly as in the claim.
@@ -490,7 +529,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn app_capability_result(&self, id: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_capability_result(&self, id: &str) -> Result<Value> {
         Self::app_capability_result_in(&self.conn(), id)
     }
 
@@ -535,7 +575,8 @@ impl Store {
         Ok(receipt)
     }
 
-    pub(crate) fn app_capability_results(&self, run: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_capability_results(&self, run: &str) -> Result<Value> {
         let conn = self.conn();
         let ids = conn.prepare("SELECT id FROM app_capability_results WHERE run_id=? ORDER BY created,id LIMIT 100")?
             .query_map([run], |r| r.get::<_,String>(0))?
@@ -552,7 +593,8 @@ impl Store {
     /// an equal or backdated `created` and any id is excluded from a scan that
     /// began earlier. Receipts are immutable and never deleted, so the bound
     /// is a stable snapshot of the run-bound rows.
-    pub(crate) fn app_source_run_watermark(&self) -> Result<i64> {
+    #[doc(hidden)]
+    pub fn app_source_run_watermark(&self) -> Result<i64> {
         Ok(self.conn().query_row(
             "SELECT COALESCE(MAX(rowid),0) FROM app_capability_results",
             [],
@@ -569,7 +611,8 @@ impl Store {
     /// authenticated, so the skip budget is `SOURCE_PAGE_FENCE_SLACK`; past
     /// it the scan is refused as `stale_cursor` rather than walking the
     /// scoped history. This bounds this function only.
-    pub(crate) fn app_source_run_candidates(
+    #[doc(hidden)]
+    pub fn app_source_run_candidates(
         &self,
         install: &str,
         context: &str,
@@ -615,7 +658,8 @@ impl Store {
     /// use the existing draft proof; native host executions use their approved
     /// step and exact claim. This read does not widen draft authorization.
     /// `None` means the receipt is not provable; nothing is guessed.
-    pub(crate) fn app_source_run_receipt(
+    #[doc(hidden)]
+    pub fn app_source_run_receipt(
         &self,
         install: &str,
         context: &str,
@@ -645,7 +689,8 @@ impl Store {
         Some((receipt, run_id))
     }
 
-    pub(crate) fn app_capability_asset(&self, id: &str) -> Result<Value> {
+    #[doc(hidden)]
+    pub fn app_capability_asset(&self, id: &str) -> Result<Value> {
         let (receipt, bytes) = asset_material_in(&self.conn(), id)?;
         use base64::Engine;
         Ok(

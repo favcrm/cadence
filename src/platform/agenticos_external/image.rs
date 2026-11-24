@@ -260,7 +260,7 @@ fn decode_limits() -> image::Limits {
 
 /// A small, local display derivative of already-proven retained image material.
 /// Reuse custody decode limits; never fetch or expose an original locator.
-pub(crate) fn preview_jpeg(bytes: &[u8], media_type: &str) -> Result<Vec<u8>, Fault> {
+pub fn preview_jpeg(bytes: &[u8], media_type: &str) -> Result<Vec<u8>, Fault> {
     if bytes.len() > ASSET_LIMIT {
         return Err((
             ImageFault::TooLarge,
@@ -375,7 +375,7 @@ pub fn uploaded_image_mime(bytes: &[u8], media_type: &str) -> Result<&'static st
     Ok(mime)
 }
 
-pub(crate) fn normalize_uploaded_image(
+pub fn normalize_uploaded_image(
     bytes: &[u8],
 ) -> Result<(Vec<u8>, &'static str, u32, u32), Fault> {
     if bytes.is_empty() || bytes.len() > ASSET_LIMIT {

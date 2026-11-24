@@ -25,22 +25,22 @@ const ELIGIBILITY_WINDOW: Duration = Duration::from_secs(5);
 
 /// Public (secret-free) identity of one qualified runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RuntimeIdentity {
-    pub(crate) workspace_id: String,
-    pub(crate) runtime_id: String,
-    pub(crate) agent_uid: String,
-    pub(crate) session_binding: String,
-    pub(crate) server_generation: u64,
-    pub(crate) runtime_generation: u64,
-    pub(crate) owner_epoch: u64,
-    pub(crate) os_uid: u32,
-    pub(crate) container_id: String,
-    pub(crate) image_digest: String,
-    pub(crate) profile_digest: String,
-    pub(crate) loaded_registry_digest: String,
-    pub(crate) loaded_receipt_id: String,
-    pub(crate) node_pid: u32,
-    pub(crate) node_starttime: u64,
+pub struct RuntimeIdentity {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub agent_uid: String,
+    pub session_binding: String,
+    pub server_generation: u64,
+    pub runtime_generation: u64,
+    pub owner_epoch: u64,
+    pub os_uid: u32,
+    pub container_id: String,
+    pub image_digest: String,
+    pub profile_digest: String,
+    pub loaded_registry_digest: String,
+    pub loaded_receipt_id: String,
+    pub node_pid: u32,
+    pub node_starttime: u64,
 }
 
 impl RuntimeIdentity {
@@ -148,7 +148,7 @@ impl RuntimeIdentity {
 /// A live, freshly rechecked runtime. Not cloneable, not serializable, no
 /// caller-constructible literal. Holding one is evidence that the owner just
 /// re-verified the epoch, recipient, live container and loaded registry.
-pub(crate) struct QualifiedRuntime {
+pub struct QualifiedRuntime {
     identity: RuntimeIdentity,
     qualified_at: Instant,
     expires_at: Instant,
@@ -164,13 +164,13 @@ impl QualifiedRuntime {
         }
     }
 
-    pub(crate) fn identity(&self) -> &RuntimeIdentity {
+    pub fn identity(&self) -> &RuntimeIdentity {
         &self.identity
     }
 
     /// True only while the short witness has not expired. Expired is a refusal,
     /// never a silent extension.
-    pub(crate) fn is_current(&self) -> bool {
+    pub fn is_current(&self) -> bool {
         Instant::now() < self.expires_at
     }
 
@@ -191,21 +191,21 @@ impl std::fmt::Debug for QualifiedRuntime {
 
 /// Secret-free status for operator/HTTP surfaces.
 #[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct RuntimeStatus {
-    pub(crate) v: u32,
-    pub(crate) runtime_id: String,
-    pub(crate) generation: u64,
-    pub(crate) owner_epoch: u64,
+pub struct RuntimeStatus {
+    pub v: u32,
+    pub runtime_id: String,
+    pub generation: u64,
+    pub owner_epoch: u64,
     /// The owner authority's database/custody epoch.
-    pub(crate) database_epoch: u64,
-    pub(crate) phase: String,
-    pub(crate) agent_uid: String,
-    pub(crate) session_binding: String,
-    pub(crate) os_uid: u32,
-    pub(crate) qualified: bool,
-    pub(crate) node_pid: Option<u32>,
-    pub(crate) loaded_registry_digest: Option<String>,
-    pub(crate) fenced_reason: Option<String>,
+    pub database_epoch: u64,
+    pub phase: String,
+    pub agent_uid: String,
+    pub session_binding: String,
+    pub os_uid: u32,
+    pub qualified: bool,
+    pub node_pid: Option<u32>,
+    pub loaded_registry_digest: Option<String>,
+    pub fenced_reason: Option<String>,
 }
 
 impl RuntimeStatus {
@@ -274,13 +274,13 @@ impl RuntimeStatus {
 
 /// The exact broker-fence acknowledgement.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct FenceAck {
-    pub(crate) v: u32,
-    pub(crate) runtime_id: String,
-    pub(crate) owner_epoch: u64,
-    pub(crate) generation: u64,
-    pub(crate) nonce: String,
-    pub(crate) fenced_at_ms: u64,
+pub struct FenceAck {
+    pub v: u32,
+    pub runtime_id: String,
+    pub owner_epoch: u64,
+    pub generation: u64,
+    pub nonce: String,
+    pub fenced_at_ms: u64,
 }
 
 struct FenceWatermark {
@@ -296,12 +296,12 @@ struct EligibilityState {
 }
 
 /// The daemon's short current-eligibility guard.
-pub(crate) struct CurrentEligibility {
+pub struct CurrentEligibility {
     state: RwLock<EligibilityState>,
 }
 
 impl CurrentEligibility {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: RwLock::new(EligibilityState {
                 current: None,
@@ -313,7 +313,7 @@ impl CurrentEligibility {
     /// Writer: install a freshly rechecked runtime. Refuses a runtime whose
     /// generation/epoch is already fenced; refreshes are the only way a
     /// dispatch becomes eligible.
-    pub(crate) fn refresh(&self, runtime: QualifiedRuntime) -> Result<()> {
+    pub fn refresh(&self, runtime: QualifiedRuntime) -> Result<()> {
         if !runtime.is_current() {
             return Err(Error::rejected(
                 "owner recheck witness expired before it could be installed",
@@ -339,7 +339,7 @@ impl CurrentEligibility {
     }
 
     /// Writer: clear eligibility (lock/unlock, container exit, uncertainty).
-    pub(crate) fn invalidate(&self, reason: &str) {
+    pub fn invalidate(&self, reason: &str) {
         if let Ok(mut state) = self.state.write() {
             state.current = None;
             let _ = reason;
@@ -349,7 +349,7 @@ impl CurrentEligibility {
     /// Writer-FENCE: the owner took its runtime fence; the daemon stops
     /// admitting this generation before acknowledging. Idempotent for the same
     /// exact tuple; a lower generation for the same runtime still fences.
-    pub(crate) fn fence_generation(
+    pub fn fence_generation(
         &self,
         runtime_id: &str,
         owner_epoch: u64,
@@ -398,7 +398,7 @@ impl CurrentEligibility {
     }
 
     /// Shared reader held across the final admission transaction.
-    pub(crate) fn reader(&self) -> Result<CurrentReader<'_>> {
+    pub fn reader(&self) -> Result<CurrentReader<'_>> {
         let guard = self
             .state
             .read()
@@ -415,21 +415,21 @@ impl Default for CurrentEligibility {
 
 /// The short read guard. Holding it blocks the fence writer; the guarded
 /// runtime expires by itself.
-pub(crate) struct CurrentReader<'a> {
+pub struct CurrentReader<'a> {
     guard: RwLockReadGuard<'a, EligibilityState>,
 }
 
 impl CurrentReader<'_> {
-    pub(crate) fn qualified(&self) -> Option<&QualifiedRuntime> {
+    pub fn qualified(&self) -> Option<&QualifiedRuntime> {
         self.guard.current.as_ref().filter(|q| q.is_current())
     }
 
-    pub(crate) fn require(&self) -> Result<&QualifiedRuntime> {
+    pub fn require(&self) -> Result<&QualifiedRuntime> {
         self.qualified()
             .ok_or_else(|| Error::rejected("no current qualified runtime — admission refused"))
     }
 
-    pub(crate) fn runtime_id(&self) -> Option<&str> {
+    pub fn runtime_id(&self) -> Option<&str> {
         self.guard
             .current
             .as_ref()

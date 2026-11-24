@@ -472,7 +472,8 @@ impl Store {
     /// CAD-1123 HP4: the intent a host-minted request id already froze in
     /// this install, if any — so a retried or double-tapped publish start
     /// resumes the same intent instead of minting a second one.
-    pub(crate) fn social_publish_find_request(
+    #[doc(hidden)]
+    pub fn social_publish_find_request(
         &self,
         install_id: &str,
         request_id: &str,
@@ -596,7 +597,8 @@ impl Store {
     /// Peek the oldest due queued intent without claiming. The dispatch
     /// RPC uses it to compare operator-supplied current authority against
     /// frozen before claiming; the claim itself re-verifies in-transaction.
-    pub(crate) fn social_publish_peek_due(&self, now_epoch: i64) -> Result<Option<Value>> {
+    #[doc(hidden)]
+    pub fn social_publish_peek_due(&self, now_epoch: i64) -> Result<Option<Value>> {
         self.read_tx(|conn| {
 
                     let next: Option<String> = conn
@@ -612,7 +614,8 @@ impl Store {
     /// CAD-1020: one page of the driver's due rows — up to `limit` due
     /// queued intents, oldest first, after the `(due_epoch, intent_id)`
     /// keyset `after`. A read only; each row is still claimed by identity.
-    pub(crate) fn social_publish_due_batch(
+    #[doc(hidden)]
+    pub fn social_publish_due_batch(
         &self,
         now_epoch: i64,
         limit: usize,
@@ -743,7 +746,8 @@ impl Store {
     /// the row only when it belongs to exactly this install and context
     /// (null-preserving, the CAD-1027 cancel predicate). Send-now reads
     /// through it so an out-of-scope request refuses before staging.
-    pub(crate) fn social_publish_show_scoped(
+    #[doc(hidden)]
+    pub fn social_publish_show_scoped(
         &self,
         intent_id: &str,
         install_id: &str,

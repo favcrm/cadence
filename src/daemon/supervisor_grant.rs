@@ -60,7 +60,7 @@ use std::os::unix::fs::PermissionsExt;
 /// The supervisor account's fixed uid — the server that owns the private
 /// grant listener. Asserted as a constant bound (NSS resolution lives in the
 /// topology layer); a socket owned by anyone else is never a grant channel.
-pub(crate) const SUPERVISOR_UID: u32 = 21000;
+pub const SUPERVISOR_UID: u32 = 21000;
 
 /// The reviewed, image-pinned Ed25519 verifying keys for the supervisor grant
 /// — `"<kid>:<base64url-x>"` pairs. The production grant core now builds its
@@ -536,7 +536,7 @@ fn fresh_nonce() -> Result<String> {
 
 /// `launch.request.identity` — the executor admission identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExecutorIdentity {
+pub struct ExecutorIdentity {
     pub company: String,
     pub instance: String,
     /// Must be `"native"` for the protected lane.
@@ -550,7 +550,7 @@ pub(crate) struct ExecutorIdentity {
 
 /// `launch.request` — the launch obligation identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LaunchRequest {
+pub struct LaunchRequest {
     pub identity: ExecutorIdentity,
     /// `"fresh_start" | "reconstruct"`.
     pub purpose: String,
@@ -562,7 +562,7 @@ pub(crate) struct LaunchRequest {
 
 /// `launch` — the request plus the global epoch it binds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LaunchBinding {
+pub struct LaunchBinding {
     pub request: LaunchRequest,
     /// The current global epoch (JS-safe non-negative integer).
     pub epoch: u64,
@@ -570,7 +570,7 @@ pub(crate) struct LaunchBinding {
 
 /// `recipient` — the *live supervisor instance* the grant is bound to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Recipient {
+pub struct Recipient {
     /// pid 1..=4194304 (kernel pid_max bound).
     pub pid: u32,
     /// `/proc/<pid>` starttime as a decimal string, `^[1-9][0-9]{0,19}$`.
@@ -583,7 +583,7 @@ pub(crate) struct Recipient {
 
 /// `pins` — the pinned artifact digests.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Pins {
+pub struct Pins {
     /// Source commit — 40-hex SHA1.
     pub source: String,
     /// OCI image — must equal `launch.request.image`.
@@ -597,7 +597,7 @@ pub(crate) struct Pins {
 
 /// `lineage` — the restore-lineage the grant binds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Lineage {
+pub struct Lineage {
     /// `^[A-Za-z0-9_-]{1,128}$`.
     pub reference: String,
     /// JS-safe non-negative integer.
@@ -606,7 +606,7 @@ pub(crate) struct Lineage {
 
 /// The canonical `SupervisorChallenge` — the exact platform shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SupervisorChallenge {
+pub struct SupervisorChallenge {
     pub launch: LaunchBinding,
     pub recipient: Recipient,
     pub pins: Pins,
@@ -777,7 +777,7 @@ fn parse_identity(v: &serde_json::Value) -> Result<ExecutorIdentity> {
     })
 }
 
-pub(crate) fn parse_request(v: &serde_json::Value) -> Result<LaunchRequest> {
+pub fn parse_request(v: &serde_json::Value) -> Result<LaunchRequest> {
     let m = obj_exact(v, &["challenge", "identity", "image", "purpose"])?;
     let identity = parse_identity(m.get("identity").unwrap())?;
     let purpose = sget(m, "purpose")?;
@@ -1304,7 +1304,7 @@ pub(super) fn verify_enrolled_format(
 /// authority: the durable external consume and the protected spawn are still
 /// `Err`/unavailable this batch.
 #[derive(Debug)]
-pub(crate) struct VerifiedGrant {
+pub struct VerifiedGrant {
     claims: GrantClaims,
     peer: PeerIdentity,
 }
@@ -1316,7 +1316,7 @@ impl VerifiedGrant {
         &self.challenge().launch.request.challenge
     }
     /// The exact canonical challenge the grant bound.
-    pub(crate) fn challenge(&self) -> &SupervisorChallenge {
+    pub fn challenge(&self) -> &SupervisorChallenge {
         &self.claims.challenge
     }
 }
@@ -1340,7 +1340,7 @@ pub(crate) struct SupervisorRecipient {
 /// `SupervisorEnrollment`, never a caller literal. `GrantCore` has **no**
 /// caller-injectable trust — every trust input is a private constant resolved
 /// inside `install`/`challenge`.
-pub(crate) struct GrantCore {
+pub struct GrantCore {
     enrolled: SupervisorEnrollment,
     tomb: TombstoneSet,
     profile: LocalProfile,
@@ -1372,7 +1372,7 @@ impl GrantCore {
     /// root-owned profile and an authenticated `RootOwnerClient` (hello_v1 +
     /// kernel peer + pinned owner key). Missing profile/owner/keyring refuses;
     /// there is no caller-injectable trust.
-    pub(crate) fn production_local(profile: &LocalProfile) -> Result<Self> {
+    pub fn production_local(profile: &LocalProfile) -> Result<Self> {
         let enrolled = SupervisorEnrollment::from_facts(
             crate::protected_runtime::local_supervisor_facts(profile)?,
         );
@@ -1398,7 +1398,7 @@ impl GrantCore {
     /// owner-launched installer pid/starttime/generation and the measured
     /// supervisor recipient are bound here; the canonical challenge is still
     /// absent (the owner binds it only at `challenge` → `enroll_pending`).
-    pub(crate) fn register_prepared(&mut self, prepared: &PreparedRuntime) -> Result<()> {
+    pub fn register_prepared(&mut self, prepared: &PreparedRuntime) -> Result<()> {
         if prepared.profile_digest != self.profile.digest() {
             return Err(Error::rejected(
                 "prepare reply is for a different protected profile",
@@ -1492,20 +1492,20 @@ impl GrantCore {
     }
 
     /// Consume and remove the marker for exactly this operation.
-    pub(crate) fn take_installed(&mut self, operation: &str) -> Option<VerifiedGrant> {
+    pub fn take_installed(&mut self, operation: &str) -> Option<VerifiedGrant> {
         self.installed.remove(operation)
     }
 
     /// Remove only this operation's marker (idempotent). Used for one
     /// runtime's failure/timeout/stop/fence; never touches another operation.
-    pub(crate) fn remove_installed(&mut self, operation: &str) {
+    pub fn remove_installed(&mut self, operation: &str) {
         let _ = self.installed.remove(operation);
         let _ = self.prepared.remove(operation);
     }
 
     /// The authenticated owner fence names a runtime, not a caller-selected
     /// operation. Remove only that exact generation's marker and intent.
-    pub(crate) fn remove_runtime_installed(&mut self, runtime_id: &str, generation: u64) {
+    pub fn remove_runtime_installed(&mut self, runtime_id: &str, generation: u64) {
         self.installed.retain(|_, grant| {
             let identity = &grant.challenge().launch.request.identity;
             identity.instance != runtime_id || identity.generation != generation
@@ -1518,7 +1518,7 @@ impl GrantCore {
 
     /// Drop ALL markers. Reserved for global owner-epoch change/invalidate-all
     /// or supervisor shutdown; never for one runtime's failure.
-    pub(crate) fn clear_installed(&mut self) {
+    pub fn clear_installed(&mut self) {
         self.installed.clear();
         self.prepared.clear();
     }
@@ -1779,14 +1779,14 @@ impl GrantCore {
 /// through the signed challenge/installer proofs. The listener path is not
 /// itself authority.
 #[cfg(target_os = "linux")]
-pub(crate) struct GrantListener {
+pub struct GrantListener {
     listener: std::os::unix::net::UnixListener,
 }
 
 #[cfg(target_os = "linux")]
 impl GrantListener {
     /// Bind the production grant listener as the pinned supervisor account.
-    pub(crate) fn listen_production() -> Result<Self> {
+    pub fn listen_production() -> Result<Self> {
         let profile = LocalProfile::load_production()?;
         let euid = unsafe { libc::geteuid() };
         if euid != profile.supervisor().uid {
@@ -1932,7 +1932,7 @@ impl GrantListener {
     /// caller locks the grant core only for `serve_accepted`, so `prepare`
     /// can register an allocation while the listener waits.
     #[cfg(target_os = "linux")]
-    pub(crate) fn accept_production(&self) -> Result<std::os::unix::net::UnixStream> {
+    pub fn accept_production(&self) -> Result<std::os::unix::net::UnixStream> {
         let (stream, _addr) = self
             .listener
             .accept()
@@ -1942,7 +1942,7 @@ impl GrantListener {
 
     /// Serve one already-accepted connection with the caller's locked core.
     #[cfg(target_os = "linux")]
-    pub(crate) fn serve_accepted(
+    pub fn serve_accepted(
         &self,
         stream: &std::os::unix::net::UnixStream,
         core: &mut GrantCore,
@@ -2070,7 +2070,7 @@ impl GrantListener {
 /// serves it on a dedicated thread. The implementation must refuse an unknown
 /// runtime/generation and must not report success without taking the writer
 /// fence (short current-eligibility reader).
-pub(crate) trait BrokerFenceTarget: Send + Sync {
+pub trait BrokerFenceTarget: Send + Sync {
     #[cfg(target_os = "linux")]
     fn verify_owner_callback(
         &self,
@@ -2091,14 +2091,14 @@ pub(crate) trait BrokerFenceTarget: Send + Sync {
 /// It accepts only the authenticated live root owner PID/starttime/epoch and
 /// a request body signed with the profile-pinned owner key.
 #[cfg(target_os = "linux")]
-pub(crate) struct BrokerFenceListener {
+pub struct BrokerFenceListener {
     listener: std::os::unix::net::UnixListener,
     profile: LocalProfile,
 }
 
 #[cfg(target_os = "linux")]
 impl BrokerFenceListener {
-    pub(crate) fn listen_production(profile: &LocalProfile) -> Result<Self> {
+    pub fn listen_production(profile: &LocalProfile) -> Result<Self> {
         let euid = unsafe { libc::geteuid() };
         if euid != profile.supervisor().uid {
             return Err(Error::rejected(
@@ -2148,7 +2148,7 @@ impl BrokerFenceListener {
     /// Serve the fence listener forever, one bounded connection per thread.
     /// The target takes the real writer fence; its reply is only sent after
     /// that fence is held.
-    pub(crate) fn serve(self: std::sync::Arc<Self>, target: std::sync::Arc<dyn BrokerFenceTarget>) {
+    pub fn serve(self: std::sync::Arc<Self>, target: std::sync::Arc<dyn BrokerFenceTarget>) {
         for incoming in self.listener.incoming() {
             let Ok(stream) = incoming else { continue };
             let me = std::sync::Arc::clone(&self);
@@ -2243,14 +2243,14 @@ impl BrokerFenceListener {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) struct BrokerFenceListener;
+pub struct BrokerFenceListener;
 
 #[cfg(not(target_os = "linux"))]
 impl BrokerFenceListener {
-    pub(crate) fn listen_production(_profile: &LocalProfile) -> Result<Self> {
+    pub fn listen_production(_profile: &LocalProfile) -> Result<Self> {
         Err(Error::rejected("broker fence listener is Linux-only"))
     }
-    pub(crate) fn serve(
+    pub fn serve(
         self: std::sync::Arc<Self>,
         _target: std::sync::Arc<dyn BrokerFenceTarget>,
     ) {

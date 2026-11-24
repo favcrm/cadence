@@ -261,7 +261,7 @@ pub fn approved(
 /// because nothing on this path freezes a package. [`check_installed_text`]
 /// is the installed bundle's own verdict, where the tag is admissible and the
 /// caller proves it resolves.
-pub(crate) fn check_text(
+pub fn check_text(
     text: &str,
     agents: &HashSet<String>,
     agent_sources: &[String],

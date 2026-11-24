@@ -8,8 +8,14 @@ license = "MIT"
 description = "Local controller coordinating coding agents across terminals"
 
 [workspace]
-members = [".", "crates/cadence-core", "crates/cadence-ui", "crates/cadence-cli"]
-default-members = [".", "crates/cadence-ui", "crates/cadence-cli"]
+members = [
+    ".",
+    "crates/cadence-core",
+    "crates/cadence-daemon",
+    "crates/cadence-ui",
+    "crates/cadence-cli",
+]
+default-members = [".", "crates/cadence-daemon", "crates/cadence-ui", "crates/cadence-cli"]
 resolver = "2"
 
 [lib]
@@ -137,7 +143,6 @@ roxmltree = "=0.21.2"
 # safety-floor binary in tests/ is autodiscovered and needs no entry.
 
 [dev-dependencies]
-cadence-ui = { path = "crates/cadence-ui" }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 jsonschema = { version = "=0.56.0", default-features = false }
 shlex = "2.0.1"
@@ -191,6 +196,9 @@ lto = false
 # Dependencies keep opt-level 1; the one workspace crate is front-end bound,
 # so skipping its LLVM optimisation is the cheap win (CAD-1103 measurements).
 [profile.ci.package.cadence-agent]
+opt-level = 0
+
+[profile.ci.package.cadence-daemon]
 opt-level = 0
 
 [profile.ci.package.cadence-ui]

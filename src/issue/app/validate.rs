@@ -156,7 +156,7 @@ fn validate_snapshot(
 
 /// Storage members and their requirement are one package contract, including
 /// when already-installed bytes are explicitly approved again.
-pub(crate) fn validate_storage_members<'a>(
+pub fn validate_storage_members<'a>(
     manifest: &Manifest,
     paths: impl Iterator<Item = &'a str>,
 ) -> Result<()> {

@@ -279,7 +279,7 @@ pub fn acceptance_items(body: &str) -> Vec<AcceptanceItem> {
 /// Split a canonical task body into its prose and complete criteria without
 /// duplicating the criteria in the provider payload. Keep every other line,
 /// including Acceptance preambles, continuations and fenced examples.
-pub(crate) fn task_request(mut body: String) -> (String, Vec<AcceptanceItem>) {
+pub fn task_request(mut body: String) -> (String, Vec<AcceptanceItem>) {
     let mut removed = Vec::new();
     let mut items = Vec::new();
     for (line, item) in acceptance_lines(&body) {

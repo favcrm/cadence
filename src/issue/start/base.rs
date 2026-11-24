@@ -13,7 +13,7 @@ use crate::worktree;
 
 /// The project's declared repo roots, canonicalized and de-duplicated:
 /// two rows naming one checkout are one repo (CAD-2001).
-pub(crate) fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
+pub fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     for path in project.repos.iter().filter_map(|r| r.path.as_deref()) {
         let expanded = project::expand_home(path);

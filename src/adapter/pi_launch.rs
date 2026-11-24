@@ -165,7 +165,7 @@ pub(super) fn pi_command(env: &ProviderEnv) -> Vec<String> {
 /// `Err(reason)` is the
 /// clear "not found" line the daemon start log and `doctor --host`
 /// both surface (CAD-1247).
-pub(crate) fn resolve_pi_launch_command(
+pub fn resolve_pi_launch_command(
     env: &ProviderEnv,
     path: Option<&str>,
 ) -> std::result::Result<PathBuf, String> {

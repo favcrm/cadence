@@ -16,7 +16,8 @@ use super::quota::automatic_quota_error;
 use super::StoreConn;
 use super::{is_terminal, now, Sender, Store};
 
-pub(crate) const MAX_MONITOR_TASKS: usize = 256;
+#[doc(hidden)]
+pub const MAX_MONITOR_TASKS: usize = 256;
 
 /// A daemon-owned supervision registration. `state` is the monitor
 /// lifecycle (`degraded` until the first successful check, then `active`,
@@ -45,7 +46,8 @@ pub struct Monitor {
     pub updated: f64,
 }
 
-pub(crate) struct ProjectMonitorView {
+#[doc(hidden)]
+pub struct ProjectMonitorView {
     pub monitor: Monitor,
     pub coverage: Vec<(String, Option<String>)>,
     pub open_alerts: i64,
@@ -228,7 +230,8 @@ impl Store {
     }
 
     /// The monitor and its covered tasks' issue bindings from one read.
-    pub(crate) fn project_monitor_view(&self, id: &str) -> Result<ProjectMonitorView> {
+    #[doc(hidden)]
+    pub fn project_monitor_view(&self, id: &str) -> Result<ProjectMonitorView> {
         self.read_tx(|conn| self.project_monitor_view_in(&*conn, id))
     }
 

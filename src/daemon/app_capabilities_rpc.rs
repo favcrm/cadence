@@ -320,7 +320,7 @@ impl Shared {
             self.recheck_app_capability_quote(&proof, quote)?;
             Ok((step, proof))
         };
-        let prepared = workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+        let prepared = workspace::with_runtime_snapshot_proof(&pm, install, |bundle, files, workspace| {
             let _custody = self
                 .platform_custody_lock
                 .lock()
@@ -345,6 +345,7 @@ impl Shared {
             let prepared = self.prepare_app_capability_quote(&proof)?;
             if !self.store.app_capability_claim(
                 crate::store::app_capabilities::AppCapabilityClaim {
+                    workspace,
                     run: run_id,
                     step: &step,
                     message,
@@ -413,7 +414,7 @@ impl Shared {
             workspace::with_runtime_snapshot_pair(
                 &pm,
                 install,
-                &original.install_id,
+                original.install_id(),
                 |(bundle, files), producer| admit(bundle, files, Some(producer)),
             )?
         } else {
@@ -445,7 +446,8 @@ impl Shared {
             }
             let record = |bundle: &Value,
                           files: &BTreeMap<String, String>,
-                          producer: Option<(&Value, &BTreeMap<String, String>)>|
+                          producer: Option<(&Value, &BTreeMap<String, String>)>,
+                          workspace: &workspace::RuntimeSnapshot<'_>|
              -> Result<Value> {
                 let _custody = self
                     .platform_custody_lock
@@ -486,6 +488,7 @@ impl Shared {
                 }
                 self.store.app_capability_record(
                     crate::store::app_capabilities::AppCapabilityRecord {
+                        workspace,
                         id: &call_id,
                         run: run_id,
                         step: &step,
@@ -504,15 +507,15 @@ impl Shared {
                 )
             };
             if let Some(original) = &reference {
-                workspace::with_runtime_snapshot_pair(
+                workspace::with_runtime_snapshot_pair_proof(
                     &pm,
                     install,
-                    &original.install_id,
-                    |(bundle, files), producer| record(bundle, files, Some(producer)),
+                    original.install_id(),
+                    |(bundle, files, workspace), producer| record(bundle, files, Some(producer), workspace),
                 )
             } else {
-                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-                    record(bundle, files, None)
+                workspace::with_runtime_snapshot_proof(&pm, install, |bundle, files, workspace| {
+                    record(bundle, files, None, workspace)
                 })
             }
         };
@@ -822,7 +825,7 @@ impl Shared {
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 // Claim under the runtime/custody/release guards; provider I/O
                 // remains outside them, followed by a fresh result check.
-                let prepared = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
+                let prepared = workspace::with_runtime_snapshot_proof(&pm, &install, |bundle, files, workspace| {
                     let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
@@ -900,6 +903,7 @@ impl Shared {
                     // (the first call may still be in flight).
                     if !self.store.app_capability_claim(
                         crate::store::app_capabilities::AppCapabilityClaim {
+                            workspace,
                             run: &run_id,
                             step: &step,
                             message,
@@ -993,7 +997,7 @@ impl Shared {
                     })?;
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.
                 crate::issue::lockseam::outside_lock("app-capability-before-record");
-                let recorded = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
+                let recorded = workspace::with_runtime_snapshot_proof(&pm, &install, |bundle, files, workspace| {
                     let _custody = self
                         .platform_custody_lock
                         .lock()
@@ -1037,6 +1041,7 @@ impl Shared {
                     self.store
                         .app_capability_record(
                             crate::store::app_capabilities::AppCapabilityRecord {
+                                workspace,
                                 id: &call_id,
                                 run: &run_id,
                                 step: &step,

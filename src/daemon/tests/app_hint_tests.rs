@@ -103,7 +103,10 @@ fn scoped_app_turn_slots_a_token_only_where_it_can_redeem() {
     // installation's consented declarations, so the turn needs a real
     // approved install (the CRM fixture declares the segment verbs).
     let pid = std::process::id();
-    let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "{}/tests/fixtures/apps/crm",
+        crate::contract_fixture::workspace_root().display()
+    );
     let installed = scoped(Asserted::Operator, || {
         shared.dispatch("app_workspace_install", &json!({ "source": source }), pid)
     })

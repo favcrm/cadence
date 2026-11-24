@@ -12,10 +12,11 @@ mod runtime_guard;
 use runtime_guard::builtin_bundle;
 #[cfg(test)]
 use runtime_guard::read_seam;
-pub(crate) use runtime_guard::{
+pub use runtime_guard::{
     install_builtin_guarded, remove_guarded, remove_preview, restore_guarded, update_check,
     with_completed_bundle_snapshot, with_runtime_read, with_runtime_snapshot,
-    with_runtime_snapshot_pair,
+    with_runtime_snapshot_pair, with_runtime_snapshot_proof, with_runtime_snapshot_pair_proof,
+    RuntimeSnapshot,
 };
 
 /// Only this source-owned marker proves a request failed before its first
@@ -84,8 +85,13 @@ impl UpgradeJournal {
     /// The digest the upgrade published — the target every journaled
     /// carry receipt is re-pinned to. Accessor: the journal is opaque
     /// outside this module.
-    pub(crate) fn new_digest(&self) -> &str {
+    pub fn new_digest(&self) -> &str {
         &self.expected_new_digest
+    }
+
+    /// Carry receipts staged by this upgrade, rechecked by the delivery CAS.
+    pub fn bindings(&self) -> &BTreeMap<String, Value> {
+        &self.bindings
     }
 }
 
@@ -988,7 +994,7 @@ pub fn install(
     )
 }
 
-pub(crate) fn install_with_outcome(
+pub fn install_with_outcome(
     pm: &Pm,
     state: &Path,
     source: &str,
@@ -1263,7 +1269,7 @@ pub fn upgrade(
     upgrade_tracked(pm, request, preflight, deliver, &Cell::new(false))
 }
 
-pub(crate) fn upgrade_with_outcome(
+pub fn upgrade_with_outcome(
     pm: &Pm,
     request: &UpgradeRequest<'_>,
     preflight: impl FnOnce(
@@ -1675,7 +1681,7 @@ fn apply_upgrade<F: FnOnce(&UpgradeJournal) -> Result<Vec<String>>>(
 /// `deliver` is the same binding carry the original `upgrade` staged: a
 /// recovery replays the retained journal's checked receipts verbatim,
 /// still under the PM lock and still under each binding's CAS.
-pub(crate) fn upgrade_recover(
+pub fn upgrade_recover(
     pm: &Pm,
     id: &str,
     request_id: &str,
@@ -1860,7 +1866,7 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
         .collect())
 }
 
-pub(crate) fn recover(pm: &Pm, state: &Path, id: &str) -> Result<Value> {
+pub fn recover(pm: &Pm, state: &Path, id: &str) -> Result<Value> {
     let _ = state; // The daemon proves the calling connection before this backend.
     let id = InstallationId::parse(id)?;
     let _lock = pm.lock()?;
@@ -1881,7 +1887,7 @@ pub(crate) fn recover(pm: &Pm, state: &Path, id: &str) -> Result<Value> {
 /// one install's row under the catalog, the same shape `show` returns.
 /// The daemon opens its own PM descriptor — `Root` stays catalog-
 /// private.
-pub(crate) fn describe_id(pm: &Pm, catalog: &Catalog, id: &InstallationId) -> Result<Value> {
+pub fn describe_id(pm: &Pm, catalog: &Catalog, id: &InstallationId) -> Result<Value> {
     let root = Root::open(&pm.dir)?;
     describe(&root, catalog, id)
 }
@@ -2230,7 +2236,7 @@ fn commit_migration(pm: &Pm, journal: &Journal) -> Result<Vec<String>> {
     .filter(|path| path != PENDING)
     .collect())
 }
-pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
+pub fn migrate(pm: &Pm) -> Result<Value> {
     let _lock = pm.lock()?;
     let mut foreign = None;
     let catalog = migrate_delivering(pm, |journal| {
@@ -2251,7 +2257,7 @@ pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
         json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(&catalog)?),"journal_id":catalog.last_migration,"installations":catalog.installations.len(),"committed":true,"foreign_files":foreign,"executable":false}),
     )
 }
-pub(crate) fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Value> {
+pub fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Value> {
     let _lock = pm.lock()?;
     let mut foreign = Vec::new();
     recover_delivering(

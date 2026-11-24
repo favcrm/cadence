@@ -53,7 +53,8 @@ use check::daemon_aliases;
 pub use check::{
     approval_key, approved, check, fetch_approvals, gate_digest, gate_keys, known_agents,
 };
-pub(crate) use check::{check_installed_text, check_text};
+pub(crate) use check::check_installed_text;
+pub use check::check_text;
 use front::{parse_front, placeholders};
 pub use front::{refuse_skill_directive, skill_tags};
 pub(crate) use front::{ticket_meta, TicketMetas};

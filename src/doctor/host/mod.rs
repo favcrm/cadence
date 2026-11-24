@@ -457,16 +457,16 @@ impl Scan {
 
 /// The optional `[host]` table in `pm.yaml` — read as plain YAML so a
 /// missing or older `pm.yaml` is simply "no overrides", never an error.
-/// `pub(crate)` — the daemon's slot service and `issue start` reuse it
-/// for the CAD-113 `[host]` keys (`build_slots` &c.).
-pub(crate) fn host_overrides(pm_dir: &Path) -> Option<HostOverrides> {
+/// Shared by the daemon's slot service and `issue start` for the
+/// CAD-113 `[host]` keys (`build_slots` &c.).
+pub fn host_overrides(pm_dir: &Path) -> Option<HostOverrides> {
     read_host_overrides(pm_dir).ok().flatten()
 }
 
 /// `pm.yaml [host]`: `Ok(None)` when there is no file or no table,
 /// `Err` naming the problem when the table is present but unusable —
 /// a bad value or an unknown (misspelled) key.
-pub(crate) fn read_host_overrides(
+pub fn read_host_overrides(
     pm_dir: &Path,
 ) -> std::result::Result<Option<HostOverrides>, String> {
     let Ok(text) = std::fs::read_to_string(pm_dir.join("pm.yaml")) else {
@@ -498,7 +498,7 @@ pub(crate) fn read_host_overrides(
 
 /// Resolved `[host]` thresholds — shared by `Scan::host` and the
 /// daemon's WAL watcher so both read one config table.
-pub(crate) fn host_thresholds(pm_dir: Option<&Path>) -> Thresholds {
+pub fn host_thresholds(pm_dir: Option<&Path>) -> Thresholds {
     match pm_dir.map(read_host_overrides).transpose() {
         Ok(overrides) => Thresholds::resolve(overrides.flatten()),
         Err(e) => Thresholds {
@@ -674,21 +674,21 @@ use temp_dirs::check_temp_dirs;
 /// measurement — the same `du`-walk the read-only plan reports.
 pub(crate) use util::dir_size;
 #[allow(unused_imports)]
-pub(crate) use util::find_wals;
+pub use util::find_wals;
 #[allow(unused_imports)]
 pub(crate) use util::has_secret_prefix;
 #[allow(unused_imports)]
-pub(crate) use util::wal_roots;
+pub use util::wal_roots;
 #[allow(unused_imports)]
-pub(crate) use util::wal_sibling;
+pub use util::wal_sibling;
 #[allow(unused_imports)]
 pub(crate) use util::Census;
 #[allow(unused_imports)]
 pub(crate) use util::FsFree;
 #[allow(unused_imports)]
-pub(crate) use util::WalRoot;
+pub use util::WalRoot;
 #[allow(unused_imports)]
-pub(crate) use util::WalScan;
+pub use util::WalScan;
 #[allow(unused_imports)]
 pub(crate) use util::SECRET_PREFIXES;
 #[allow(unused_imports)]

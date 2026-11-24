@@ -147,7 +147,8 @@ fn row_entry(row: &rusqlite::Row) -> rusqlite::Result<ThreadEntry> {
 impl Store {
     /// The reader's own in-flight turn, admitted by project policy OR by one
     /// of `conversations`, after applying project and private-job denials.
-    pub(crate) fn running_message_scoped_with_conversations(
+    #[doc(hidden)]
+    pub fn running_message_scoped_with_conversations(
         &self,
         alias: &str,
         issues: &[&str],
@@ -173,7 +174,8 @@ impl Store {
     /// `conversations`, each with the conversation its enqueue note landed in.
     /// Waiting turns retain delivery ordering; `None` means no enqueue note.
     #[allow(clippy::type_complexity)] // the queue row is one query's shape
-    pub(crate) fn queued_metadata_scoped_with_conversations(
+    #[doc(hidden)]
+    pub fn queued_metadata_scoped_with_conversations(
         &self,
         alias: &str,
         issues: &[&str],
@@ -212,7 +214,8 @@ impl Store {
 
     /// The per-alias running-id map that feeds `visible_running_messages`,
     /// widened by the same granted conversations. Every denial stays in force.
-    pub(crate) fn scoped_running_message_ids_with_conversations(
+    #[doc(hidden)]
+    pub fn scoped_running_message_ids_with_conversations(
         &self,
         issues: &[&str],
         denied: &PrivateJobDenials,
@@ -245,7 +248,8 @@ impl Store {
     /// authority; every entry must carry a message that passes the reader's
     /// private-job, project and cloud denials. The operator-only kinds are
     /// dropped for a member reader, exactly like the scoped page.
-    pub(crate) fn thread_entries_after_granted(
+    #[doc(hidden)]
+    pub fn thread_entries_after_granted(
         &self,
         thread_id: &str,
         after: i64,
@@ -283,7 +287,8 @@ impl Store {
     /// A granted conversation's backward page. Same rules as
     /// [`Self::thread_entries_before_scoped`], including selecting before the
     /// cursor and limit so hidden entries neither consume a page nor move it.
-    pub(crate) fn thread_entries_before_granted(
+    #[doc(hidden)]
+    pub fn thread_entries_before_granted(
         &self,
         thread_id: &str,
         before: Option<i64>,
@@ -325,7 +330,8 @@ impl Store {
 
     /// The newest visible assistant reply in a granted conversation, under
     /// the same denial rules as [`Self::thread_reply_seq_scoped`].
-    pub(crate) fn thread_reply_seq_granted(
+    #[doc(hidden)]
+    pub fn thread_reply_seq_granted(
         &self,
         thread_id: &str,
         issues: &[&str],

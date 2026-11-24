@@ -179,7 +179,8 @@ impl IndexRefresh {
     /// captured into `last` (and therefore `status`), never panics the
     /// worker. A new commit kicks it again; a search retries inline and
     /// refuses stale results if repair still fails.
-    fn run(&self) {
+    #[doc(hidden)]
+    pub fn run(&self) {
         loop {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             while !s.needed && !s.closing {
@@ -361,20 +362,6 @@ impl IndexRefresh {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.closing = true;
         self.wake.notify_all();
-    }
-
-    /// Spawn the refresh worker thread; the returned handle is joined at
-    /// shutdown after `close`. Refusal is reported, never a panic.
-    pub(crate) fn spawn(self: &Arc<Self>) -> Option<crate::thread_budget::Budgeted<()>> {
-        let me = Arc::clone(self);
-        match crate::thread_budget::spawn_named("wiki-index-refresh".to_string(), move || me.run())
-        {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                eprintln!("cadence: wiki index refresh not started: {e}");
-                None
-            }
-        }
     }
 }
 

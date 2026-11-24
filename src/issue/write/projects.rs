@@ -72,7 +72,7 @@ pub fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
     }
 }
 
-pub(crate) fn load_front(dir: &Path) -> Result<(Front, String)> {
+pub fn load_front(dir: &Path) -> Result<(Front, String)> {
     let text = std::fs::read_to_string(dir.join("issue.md"))?;
     parse::parse_issue(&text)
 }

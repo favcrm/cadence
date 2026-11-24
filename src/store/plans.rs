@@ -103,7 +103,8 @@ pub struct Task {
 /// One durable dispatch/report event for a task. `None` means the field
 /// was missing or the payload was unreadable — never a value to guess at.
 #[derive(Clone, Debug)]
-pub(crate) struct TaskHistoryEvent {
+#[doc(hidden)]
+pub struct TaskHistoryEvent {
     pub kind: String,
     pub alias: String,
     pub task: Option<String>,
@@ -513,7 +514,8 @@ impl Store {
     }
 
     /// Resolve task ids to their jobs' issue bindings in bounded batches.
-    pub(crate) fn task_issue_bindings<S: AsRef<str>>(
+    #[doc(hidden)]
+    pub fn task_issue_bindings<S: AsRef<str>>(
         &self,
         ids: &[S],
     ) -> Result<std::collections::HashMap<String, Option<String>>> {
@@ -591,7 +593,8 @@ impl Store {
     /// `task_dispatched` and `task_reported` rows, oldest first. Scoped by
     /// the stored job/task columns. A payload field that is missing or
     /// unreadable stays `None` so the caller refuses rather than guesses.
-    pub(crate) fn task_history_events(
+    #[doc(hidden)]
+    pub fn task_history_events(
         &self,
         job: &str,
         task: &str,
@@ -646,7 +649,8 @@ impl Store {
 
     /// Every durable dispatch message the store wrote for this task,
     /// oldest first. Native rows only; nothing is parsed from prose.
-    pub(crate) fn task_dispatch_messages(&self, task: &str) -> Result<Vec<Message>> {
+    #[doc(hidden)]
+    pub fn task_dispatch_messages(&self, task: &str) -> Result<Vec<Message>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
                 "SELECT * FROM messages

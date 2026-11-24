@@ -795,7 +795,7 @@ fn runner_tree_refused(runner: &str) -> Error {
 }
 
 /// An exec-bound request claiming anything but the connection peer.
-pub(crate) fn exec_not_peer(pid: u32) -> Error {
+pub fn exec_not_peer(pid: u32) -> Error {
     Error::rejected(format!(
         "An exec-bound hold names the requesting process itself — pid {pid} is \
          not the connection peer (`build-slot run` binds its own pid, then execs)"

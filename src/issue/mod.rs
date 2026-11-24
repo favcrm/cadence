@@ -44,7 +44,8 @@ pub mod hooks;
 pub mod idea;
 pub mod line_times;
 pub mod lint;
-pub(crate) mod lockseam;
+#[doc(hidden)]
+pub mod lockseam;
 pub mod model;
 pub mod notes;
 pub mod parse;
@@ -504,6 +505,11 @@ impl Pm {
         Ok(rel)
     }
 
+    fn check_lock_paths(&self, lock: &PmLock, paths: &[PathBuf]) -> Result<()> {
+        lock.check_tracker(self)?;
+        lock.check_commit(&self.rel_paths(paths)?)
+    }
+
     /// [`Self::commit`] through a scoped [`PmLock`]: the commit's paths
     /// must stay inside the lock's admitted paths and clear of the
     /// crashed writer's leftovers, or the commit is refused and nothing
@@ -517,7 +523,7 @@ impl Pm {
         message: &str,
     ) -> Result<Vec<String>> {
         self.fence_check()?;
-        lock.check_commit(&self.rel_paths(paths)?)?;
+        self.check_lock_paths(lock, paths)?;
         self.commit(paths, message)
     }
 

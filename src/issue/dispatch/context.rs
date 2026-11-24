@@ -15,7 +15,7 @@ use crate::store;
 /// The runtime facts that pick a task's context role and delivery
 /// envelope. They come from the actual assigned worker row, never from a
 /// request field, a project default or a guessed model.
-pub(crate) struct ContextTarget<'a> {
+pub struct ContextTarget<'a> {
     pub team_role: Option<&'a str>,
     pub provider: &'a str,
     pub endpoint_kind: &'a str,
@@ -23,7 +23,7 @@ pub(crate) struct ContextTarget<'a> {
 
 /// A validated opted-in task context: the manifest the admission
 /// transaction must pin, and the exact body that turn delivers.
-pub(crate) struct PreparedContext<'a> {
+pub struct PreparedContext<'a> {
     pub manifest: crate::context_pack::Manifest,
     pub body: std::borrow::Cow<'a, str>,
 }
@@ -300,7 +300,7 @@ fn admit_context<'a>(
 /// combined mandatory payload over the local cap and a non-managed
 /// endpoint that cannot receive required prompt context all refuse with
 /// [`crate::context_pack::Refusal`] before anything is created.
-pub(crate) fn context_guard<'a>(
+pub fn context_guard<'a>(
     pm: &Pm,
     project: &crate::issue::project::Project,
     front: &Front,

@@ -933,7 +933,7 @@ impl Shared {
             return Ok(());
         };
         let app_paths =
-            crate::issue::app_guard::apps_in_paths(gated.front.paths.iter().map(String::as_str));
+            crate::issue::app_guard::apps_in_paths(gated.front().paths.iter().map(String::as_str));
         let mut authors: Vec<&str> = vec![plan.worker.alias.as_str(), plan.job.pm_alias.as_str()];
         authors.extend(caller.filter(|c| !c.is_empty()));
         let guard = crate::issue::app_guard::Ctx {
@@ -1004,7 +1004,7 @@ impl Shared {
         // unprovable checkout refuses instead of becoming an empty app
         // set.
         let remotes =
-            crate::issue::app_guard::checkout_remotes(&gated.project, &root).map_err(|e| {
+            crate::issue::app_guard::checkout_remotes(gated.project(), &root).map_err(|e| {
                 Error::rejected(format!(
                     "task dispatch refused: job '{}' / task '{}' — {}",
                     plan.job.id, plan.task.id, e
@@ -2267,102 +2267,10 @@ impl Shared {
                     .to_string(),
             );
         };
-        let target = crate::issue::dispatch::ContextTarget {
-            team_role: plan.worker.team_role.as_deref(),
-            provider: &plan.worker.provider,
-            endpoint_kind: &plan.worker.endpoint_kind,
-        };
-        // CAD-1846: the native scope proof, run only after the project is
-        // confirmed opted in and its endpoint can receive context, and before
-        // any spec byte is read. The job's declared repository must be exactly
-        // the checkout of this issue's single verified open lane, and the
-        // task's worktree must be that same lane — not merely another
-        // worktree in the same repository. Canonicalization failures fail
-        // closed rather than falling back to a textual comparison.
-        let scope = |project: &crate::issue::project::Project,
-                     front: &crate::issue::model::Front|
-         -> Result<()> {
-            let lane = self.dispatch_lane("job dispatch", project, front)?;
-            let lane_root = crate::worktree::main_root(&lane).map_err(|error| {
-                crate::context_pack::Refusal::ScopeConflict {
-                    detail: format!(
-                        "issue {}'s lane {} has no proven repository: {error}",
-                        front.id,
-                        lane.display()
-                    ),
-                }
-                .error()
-            })?;
-            let repo = plan.job.repo.as_deref().ok_or_else(|| {
-                crate::context_pack::Refusal::ScopeConflict {
-                    detail: format!("issue-linked job '{}' names no repository", plan.job.id),
-                }
-                .error()
-            })?;
-            let repo = std::path::Path::new(repo).canonicalize().map_err(|error| {
-                crate::context_pack::Refusal::ScopeConflict {
-                    detail: format!(
-                        "job '{}' repository {repo} cannot be resolved: {error}",
-                        plan.job.id
-                    ),
-                }
-                .error()
-            })?;
-            if repo != lane_root {
-                return Err(crate::context_pack::Refusal::ScopeConflict {
-                    detail: format!(
-                        "job '{}' names repository {}, but issue {}'s lane {} is in {}",
-                        plan.job.id,
-                        repo.display(),
-                        front.id,
-                        lane.display(),
-                        lane_root.display()
-                    ),
-                }
-                .error());
-            }
-            let worktree = plan.task.worktree.as_deref().ok_or_else(|| {
-                crate::context_pack::Refusal::ScopeConflict {
-                    detail: format!("issue-linked task '{}' binds no worktree", plan.task.id),
-                }
-                .error()
-            })?;
-            let task_lane = crate::worktree::layout::worktree_dir(&lane_root, worktree);
-            let task_lane = task_lane.canonicalize().map_err(|error| {
-                crate::context_pack::Refusal::ScopeConflict {
-                    detail: format!(
-                        "task '{}' worktree {} cannot be resolved: {error}",
-                        plan.task.id,
-                        task_lane.display()
-                    ),
-                }
-                .error()
-            })?;
-            if task_lane != lane {
-                return Err(crate::context_pack::Refusal::ScopeConflict {
-                    detail: format!(
-                        "task '{}' binds worktree {}, not issue {}'s verified lane {}",
-                        plan.task.id,
-                        task_lane.display(),
-                        front.id,
-                        lane.display()
-                    ),
-                }
-                .error());
-            }
-            Ok(())
-        };
-        let prepared = crate::issue::dispatch::job_context(
+        let prepared = crate::issue::dispatch::admitted_job_context(
             &pm,
             gated,
-            crate::issue::dispatch::JobContext {
-                job: &plan.job,
-                task: &plan.task,
-                revision: plan.revision,
-                message: &plan.message_id,
-                target,
-                admission_scope: Some(&scope),
-            },
+            plan,
             no_lessons,
         )?;
         let Some(prepared) = prepared else {

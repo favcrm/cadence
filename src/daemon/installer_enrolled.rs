@@ -599,4 +599,5 @@ pub(crate) fn release_host_frame_until(frame: &[u8], until: Instant) -> Result<(
 }
 
 #[cfg(test)]
+#[path = "installer_enrolled/tests.rs"]
 mod tests;

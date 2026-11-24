@@ -830,16 +830,23 @@ fn check_echo(
 /// anything malformed refuses startup loudly.
 pub fn attach_publish_sender(
     state_dir: &Path,
-    opts: &mut crate::daemon::ServeOptions,
+    opts: &mut impl crate::platform::PlatformComposition,
 ) -> Result<()> {
+    let opts = &mut opts.attach_view();
     if opts.social_publish_sender.is_some() {
         return Ok(());
     }
-    let metadata = match &opts.provider_deployments {
-        Some(value) => Some(value.clone()),
-        None => crate::platform::deployments::load()?,
+    let loaded = if opts.provider_deployments.is_none() {
+        crate::platform::deployments::load()?
+    } else {
+        None
     };
-    attach_publish_sender_with(state_dir, opts, metadata.as_ref())
+    let admission = opts.provider_deployments.as_ref().or(loaded.as_ref())
+        .and_then(|metadata| metadata.verified())
+        .and_then(|metadata| metadata.hosted_media());
+    attach_publish_sender_with(
+        state_dir, opts.social_publish_sender, opts.social_media_importer, opts.social_media_resolver, admission,
+    )
 }
 
 /// CAD-1267: image metadata carrying the hosted-media lease assertion (AOS-181
@@ -850,10 +857,12 @@ pub fn attach_publish_sender(
 /// is a conflict and refuses startup (the lease is never silently replaced).
 fn attach_publish_sender_with(
     state_dir: &Path,
-    opts: &mut crate::daemon::ServeOptions,
-    metadata: Option<&crate::platform::deployments::DeploymentMetadata>,
+    sender: &mut Option<Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
+    importer: &mut Option<Arc<crate::platform::agenticos_external::media_import::MediaImporter>>,
+    resolver: &mut Option<Arc<crate::platform::agenticos_external::media_import::MediaResolver>>,
+    admission: Option<crate::platform::deployments::HostedMediaAdmission>,
 ) -> Result<()> {
-    if let Some(admission) = metadata.and_then(|value| value.hosted_media()) {
+    if let Some(admission) = admission {
         let device_env = [
             PUBLISH_SEND_URL_ENV,
             PUBLISH_SEND_CREDENTIAL_FILE_ENV,
@@ -869,21 +878,21 @@ fn attach_publish_sender_with(
         }
         let base = HOSTED_ORIGIN;
         let credential = DeviceCredential::hosted_lease(&admission);
-        opts.social_publish_sender = Some(Arc::new(HttpPublishSender::new(
+        *sender = Some(Arc::new(HttpPublishSender::new(
             base,
             credential.clone(),
             production_resolver(state_dir),
         )?));
-        if opts.social_media_importer.is_none() {
-            opts.social_media_importer = Some(Arc::new(
+        if importer.is_none() {
+            *importer = Some(Arc::new(
                 crate::platform::agenticos_external::media_import::MediaImporter::new(
                     base,
                     credential.clone(),
                 )?,
             ));
         }
-        if opts.social_media_resolver.is_none() {
-            opts.social_media_resolver = Some(Arc::new(
+        if resolver.is_none() {
+            *resolver = Some(Arc::new(
                 crate::platform::agenticos_external::media_import::MediaResolver::new(
                     base, credential,
                 )?,
@@ -912,17 +921,17 @@ fn attach_publish_sender_with(
     } else {
         read_credential_file(Path::new(&credential_file))?
     };
-    let resolver = production_resolver(state_dir);
-    opts.social_publish_sender = Some(Arc::new(HttpPublishSender::new(
+    let production = production_resolver(state_dir);
+    *sender = Some(Arc::new(HttpPublishSender::new(
         url.trim_end_matches('/'),
         credential.clone(),
-        resolver,
+        production,
     )?));
     // CAD-979: the retained-media import seam reuses the same configured
     // `publish.send` credential and base URL — one importer held once on
     // `opts`, resolved here at attach (never per-call env, never serialized).
-    if opts.social_media_importer.is_none() {
-        opts.social_media_importer = Some(Arc::new(
+    if importer.is_none() {
+        *importer = Some(Arc::new(
             crate::platform::agenticos_external::media_import::MediaImporter::new(
                 url.trim_end_matches('/'),
                 credential,
@@ -933,12 +942,12 @@ fn attach_publish_sender_with(
     // credential — it maps local→AOS `connectionId` only and never asserts
     // workspace. Absent/unset → `capability_unavailable` at import (the
     // resolver is required to place any media on the AOS wire).
-    if opts.social_media_resolver.is_none() {
+    if resolver.is_none() {
         let read_url = std::env::var(PUBLISH_READ_URL_ENV).unwrap_or_default();
         let read_file = std::env::var(PUBLISH_READ_CREDENTIAL_FILE_ENV).unwrap_or_default();
         if !read_url.is_empty() && !read_file.is_empty() {
             let read_credential = read_credential_file(Path::new(&read_file))?;
-            opts.social_media_resolver = Some(Arc::new(
+            *resolver = Some(Arc::new(
                 crate::platform::agenticos_external::media_import::MediaResolver::new(
                     read_url.trim_end_matches('/'),
                     read_credential,
@@ -1002,7 +1011,7 @@ fn store_material(
     // main store; the install is encoded in the `sfx_` effect id.
     let db_path = match &binding.source {
         super::publish::PublicationSource::SocialDraft { .. } => {
-            crate::daemon::app_effects_rpc::social_effect_install(&binding.cadence_effect_id)
+            crate::daemon::social_effect_id::social_effect_install(&binding.cadence_effect_id)
                 .and_then(|install| {
                     crate::store::app_records::record_db_path(state_dir, &install).ok()
                 })
@@ -1282,11 +1291,14 @@ mod tests {
         clean_env();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var(PUBLISH_SEND_URL_ENV, "https://publish.example");
-        let mut opts = crate::daemon::ServeOptions::default();
+        let mut opts = crate::platform::TestComposition::default();
         let metadata =
             crate::platform::deployments::DeploymentMetadata::parse(HOSTED_PUBLISH.as_bytes())
                 .unwrap();
-        assert!(attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata)).is_err());
+        assert!(attach_publish_sender_with(
+            dir.path(), &mut opts.social_publish_sender, &mut opts.social_media_importer,
+            &mut opts.social_media_resolver, metadata.hosted_media(),
+        ).is_err());
         clean_env();
     }
 

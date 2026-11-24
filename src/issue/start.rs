@@ -23,7 +23,8 @@ use crate::worktree::{self, layout};
 mod base;
 
 use base::{branch_base, resolve_existing_base, worktree_branch};
-pub(crate) use base::{configured_integration, declared_repos, resolve_base, resolve_repo};
+pub use base::declared_repos;
+pub(crate) use base::{configured_integration, resolve_base, resolve_repo};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
 /// [--assignee <alias>]`.
@@ -146,7 +147,7 @@ fn refuse_terminal_lifecycle_record(
 }
 
 /// The issue's open worktree refs, in recorded order.
-pub(crate) fn open_worktrees(front: &Front) -> Vec<PathBuf> {
+pub fn open_worktrees(front: &Front) -> Vec<PathBuf> {
     front
         .refs
         .iter()

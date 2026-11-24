@@ -66,7 +66,7 @@ import sys
 
 DAEMON_ROOT = "src/daemon/tests/"
 SUITE = "tests/suite.rs"
-LIB = "binary_id(=cadence-agent)"
+LIB = "binary_id(=cadence-daemon)"
 SUITE_BIN = "binary_id(=cadence-cli::suite)"
 
 
@@ -362,12 +362,12 @@ def main():
         suite = ["test(/./)"]
     cargo, clauses = [], []
     if daemon:
-        cargo.append("--lib")
+        cargo += ["-p", "cadence-daemon", "--lib"]
         keep = {p for p in daemon if not any(p != o and p.startswith(o) for o in daemon)}
         alts = " or ".join(f"test(/^{p}/)" for p in sorted(keep))
         clauses.append(f"({LIB} and ({alts}))")
     if suite:
-        cargo += ["--test", "suite"]
+        cargo += ["-p", "cadence-cli", "--test", "suite"]
         clauses.append(f"({SUITE_BIN} and ({' or '.join(suite)}))")
     flt = " or ".join(clauses)
     print(flt)

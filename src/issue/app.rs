@@ -59,8 +59,9 @@ mod skill;
 mod validate;
 
 pub(crate) use validate::{
-    inspect_texts, validate, validate_storage_members, validate_texts, Validated,
+    inspect_texts, validate, validate_texts, Validated,
 };
+pub use validate::validate_storage_members;
 
 #[doc(hidden)]
 pub use grammar::{bundle_path_ok, file_cap, root_member, skill_subdir_ok, MAX_APP_BYTES};

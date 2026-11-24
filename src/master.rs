@@ -1031,7 +1031,7 @@ fn real_dir(pm_dir: &Path, slug: &str) -> Result<PathBuf> {
 /// The file `install_defaults` writes when `name` is missing —
 /// `master status` resolves would-be prefs against the same templates
 /// without installing anything.
-pub(crate) fn default_template(slug: &str, name: &str) -> Option<&'static str> {
+pub fn default_template(slug: &str, name: &str) -> Option<&'static str> {
     match (slug, name) {
         (ALIAS, "IDENTITY.md") => Some(IDENTITY_TEMPLATE),
         (ALIAS, "SOUL.md") => Some(SOUL_TEMPLATE),

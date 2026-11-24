@@ -18,7 +18,102 @@
 use serde_json::{json, Value};
 
 use super::IDENTITY_FIELDS;
-use crate::peer::{may_mutate_agent, AgentCaller, AgentMutation};
+
+/// Who is asking to change or delete an agent row — derived from the
+/// connection, never from a request field (CAD-149, CAD-304 S3). The
+/// daemon builds it from the peer's `/proc` ancestry (the nearest
+/// registered pane or enrolled managed endpoint IS that agent) and,
+/// deriving none, from [`crate::peer::operator_proof`]; anything else is refused
+/// before a caller exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentCaller {
+    /// Positive operator proof.
+    Operator,
+    /// A registered agent, by alias.
+    Agent(String),
+}
+
+impl AgentCaller {
+    /// `(by, by_kind)` for audit events.
+    pub(crate) fn audit(&self) -> (&str, &'static str) {
+        match self {
+            AgentCaller::Operator => ("operator", "operator"),
+            AgentCaller::Agent(alias) => (alias, "agent"),
+        }
+    }
+}
+
+/// What a mutation of an agent can do — the key class of the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentMutation {
+    /// Only self-service params (model, effort — see
+    /// `registry::ParamClass::SelfService`).
+    SelfService,
+    /// Anything else: trust-bearing or posture params, and removal
+    /// (which deletes the agent's history).
+    Controlled,
+    /// Steering the agent's queue (CAD-158): an `urgent` send, or one
+    /// that supersedes its queued messages. Never self-service — and a
+    /// worker is never its PM's PM, so worker output cannot jump its
+    /// PM's queue.
+    Steer,
+}
+
+/// The one rule for "may `caller` mutate agent `target`" (CAD-149,
+/// shared with `agent remove`/`agent gc`, CAD-304 S3). `target_pm` is
+/// the target's own PM — its `params.upstream`.
+///
+/// - the operator may do anything;
+/// - the target's own PM may do anything to it (a PM is never its own
+///   PM, even if an upstream names itself);
+/// - the agent itself may make a self-service change only (it may not
+///   steer its own queue);
+/// - everyone else — a peer worker, the PM of another group, a worker
+///   writing to its own PM — is refused.
+///
+/// `Err` is the refusal text, naming the rule.
+pub(crate) fn may_mutate_agent(
+    caller: &AgentCaller,
+    target: &str,
+    target_pm: Option<&str>,
+    mutation: AgentMutation,
+    verb: &str,
+) -> Result<(), String> {
+    let alias = match caller {
+        AgentCaller::Operator => return Ok(()),
+        AgentCaller::Agent(alias) => alias.as_str(),
+    };
+    if alias != target && target_pm == Some(alias) {
+        return Ok(());
+    }
+    let owner = match target_pm.filter(|pm| *pm != target) {
+        Some(pm) => format!("the operator or its PM '{pm}'"),
+        None => "the operator (it has no PM)".to_string(),
+    };
+    if mutation == AgentMutation::Steer {
+        return Err(format!(
+            "{verb} refused: agent '{alias}' may not send urgent or superseding \
+             messages to '{target}' — only {owner} may steer '{target}''s queue \
+             (steering rule: operator or the recipient's PM, CAD-158)"
+        ));
+    }
+    if alias == target {
+        return match mutation {
+            AgentMutation::SelfService => Ok(()),
+            AgentMutation::Controlled | AgentMutation::Steer => Err(format!(
+                "{verb} refused: agent '{alias}' cannot make this change to itself — \
+                 an agent may set only its own model/effort; trust-bearing and \
+                 posture params and removal of '{target}' belong to {owner} \
+                 (caller rule, CAD-149)"
+            )),
+        };
+    }
+    Err(format!(
+        "{verb} refused: agent '{alias}' cannot change another agent — only \
+         '{target}' itself (model/effort) and {owner} may change '{target}' \
+         (caller rule, CAD-149)"
+    ))
+}
 
 /// Who is on the other end of the connection, for [`admit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1900,7 +1995,7 @@ fn keep_or(params: &Value, field: &str, default: Option<&str>) -> Value {
 /// list, so a method missing from one is missing from all.
 #[cfg(test)]
 pub(crate) fn dispatch_methods() -> Vec<String> {
-    let src = include_str!("../daemon.rs");
+    let src = include_str!("crate_root.rs");
     let start = src.find("    fn dispatch_method(\n").expect("dispatch fn");
     let body = &src[start..];
     let body = &body[body.find("match method {").expect("match")..];
@@ -1944,6 +2039,80 @@ pub(crate) fn dispatch_methods() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// CAD-149: the policy per caller kind and mutation class.
+    #[test]
+    fn may_mutate_agent_per_caller_kind() {
+        use AgentMutation::{Controlled, SelfService};
+        let op = AgentCaller::Operator;
+        let pm = AgentCaller::Agent("pm".into());
+        let pm2 = AgentCaller::Agent("pm2".into());
+        let w1 = AgentCaller::Agent("w1".into());
+        let w2 = AgentCaller::Agent("w2".into());
+        let may = |c: &AgentCaller, target: &str, target_pm: Option<&str>, m| {
+            may_mutate_agent(c, target, target_pm, m, "agent set")
+        };
+        for m in [SelfService, Controlled] {
+            // Operator: everything, PM or not.
+            assert!(may(&op, "w2", Some("pm"), m).is_ok());
+            assert!(may(&op, "root", None, m).is_ok());
+            // The target's own PM: everything.
+            assert!(may(&pm, "w2", Some("pm"), m).is_ok());
+            // A peer worker and another group's PM: nothing.
+            let e = may(&w1, "w2", Some("pm"), m).unwrap_err();
+            assert!(e.contains("cannot change another agent"), "{e}");
+            assert!(e.contains("its PM 'pm'"), "{e}");
+            assert!(may(&pm2, "w2", Some("pm"), m).is_err());
+            // A worker that happens to be named as nothing: refused.
+            assert!(may(&w2, "w1", None, m).is_err());
+        }
+        // Self: self-service only — trust/posture/removal refused, and
+        // the refusal names the rule.
+        assert!(may(&w1, "w1", Some("pm"), SelfService).is_ok());
+        let e = may(&w1, "w1", Some("pm"), Controlled).unwrap_err();
+        assert!(e.contains("cannot make this change to itself"), "{e}");
+        assert!(e.contains("caller rule"), "{e}");
+        // A PM on itself is not its own PM.
+        assert!(may(&pm, "pm", None, Controlled).is_err());
+        assert!(may(&pm, "pm", None, SelfService).is_ok());
+        // An upstream naming the target itself grants it nothing.
+        assert!(may(&w1, "w1", Some("w1"), Controlled).is_err());
+    }
+
+    /// CAD-158: urgent/supersede sends — the operator or the recipient's
+    /// own PM only; the refusal names the steering rule on every route.
+    #[test]
+    fn steer_is_operator_or_recipients_pm_only() {
+        let steer = |c: &AgentCaller, target: &str, target_pm: Option<&str>| {
+            may_mutate_agent(
+                c,
+                target,
+                target_pm,
+                AgentMutation::Steer,
+                "send --priority",
+            )
+        };
+        let agent = |a: &str| AgentCaller::Agent(a.into());
+        assert!(steer(&AgentCaller::Operator, "w1", Some("pm")).is_ok());
+        assert!(steer(&AgentCaller::Operator, "pm", None).is_ok());
+        assert!(steer(&agent("pm"), "w1", Some("pm")).is_ok());
+        for (caller, target, target_pm) in [
+            // A worker to its own PM: never urgent.
+            ("w1", "pm", None),
+            // A worker on itself.
+            ("w1", "w1", Some("pm")),
+            // A peer worker in the same group.
+            ("w2", "w1", Some("pm")),
+            // Another group's PM.
+            ("pm2", "w1", Some("pm")),
+            // A PM on itself, and an upstream naming the target itself.
+            ("pm", "pm", None),
+            ("w1", "w1", Some("w1")),
+        ] {
+            let e = steer(&agent(caller), target, target_pm).unwrap_err();
+            assert!(e.contains("steering rule"), "{caller}->{target}: {e}");
+            assert!(e.contains(&format!("agent '{caller}'")), "{e}");
+        }
+    }
     use super::*;
 
     fn agent(a: &str) -> Who {

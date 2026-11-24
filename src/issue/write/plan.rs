@@ -158,7 +158,7 @@ pub fn create_plan(
 /// `refs`, tags, advisory `paths`) is deliberately absent: a ticket
 /// moving `ready` → `doing` is still the same work; a changed title,
 /// body, owner, size, dependency or plan membership is not.
-pub(crate) fn granted_semantics(front: &Front, body: &str) -> String {
+pub fn granted_semantics(front: &Front, body: &str) -> String {
     #[derive(serde::Serialize)]
     struct CanonicalPlan<'a> {
         state: &'a str,

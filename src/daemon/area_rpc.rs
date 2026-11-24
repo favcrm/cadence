@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use super::{optional_str, reject_identity_fields, required_str, Shared, DAEMON_ALIAS};
 use crate::error::{Error, Result};
 use crate::issue::{self, areas};
-use crate::peer::AgentCaller;
+use super::caller_rule::AgentCaller;
 
 /// Longest ack note.
 const NOTE_MAX: usize = 500;

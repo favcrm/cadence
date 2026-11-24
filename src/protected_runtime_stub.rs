@@ -11,7 +11,7 @@ pub(crate) const MAX_SAFE_INT: u64 = 9_007_199_254_740_991;
 /// A verified operations caller. Private fields; on this host the listener
 /// that alone produces one never binds, so no caller can be admitted.
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeCaller {
+pub struct RuntimeCaller {
     runtime_id: String,
     agent_uid: String,
     session_binding: String,
@@ -43,25 +43,25 @@ impl RuntimeCaller {
         }
     }
 
-    pub(crate) fn runtime_id(&self) -> &str {
+    pub fn runtime_id(&self) -> &str {
         &self.runtime_id
     }
-    pub(crate) fn agent_uid(&self) -> &str {
+    pub fn agent_uid(&self) -> &str {
         &self.agent_uid
     }
-    pub(crate) fn session_binding(&self) -> &str {
+    pub fn session_binding(&self) -> &str {
         &self.session_binding
     }
-    pub(crate) fn runtime_generation(&self) -> u64 {
+    pub fn runtime_generation(&self) -> u64 {
         self.runtime_generation
     }
-    pub(crate) fn os_uid(&self) -> u32 {
+    pub fn os_uid(&self) -> u32 {
         self.os_uid
     }
-    pub(crate) fn peer_pid(&self) -> u32 {
+    pub fn peer_pid(&self) -> u32 {
         self.peer_pid
     }
-    pub(crate) fn peer_starttime(&self) -> u64 {
+    pub fn peer_starttime(&self) -> u64 {
         self.peer_starttime
     }
 }
@@ -119,12 +119,12 @@ pub mod qualified {
 pub mod strict;
 
 pub mod ops {
-    pub(crate) use super::RuntimeCaller;
+    pub use super::RuntimeCaller;
 
     /// The fixed operations method set. On this host the router never
     /// dispatches them; the type exists so shared code compiles.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum OpsMethod {
+    pub enum OpsMethod {
         ConnectionSnapshotV1,
         ConnectionModelQuoteV1,
         ConnectionStageSendV1,
@@ -137,7 +137,7 @@ pub mod ops {
     }
 
     impl OpsMethod {
-        pub(crate) fn as_str(self) -> &'static str {
+        pub fn as_str(self) -> &'static str {
             match self {
                 Self::ConnectionSnapshotV1 => "connection_snapshot_v1",
                 Self::ConnectionModelQuoteV1 => "connection_model_quote_v1",

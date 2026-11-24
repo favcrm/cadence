@@ -60,16 +60,6 @@ pub use lifecycle::{
 #[doc(hidden)]
 pub use tailscale::{ensure_mapping, remove_mapping, tailscale_cli, ts, ts_self, ts_start_quiet};
 
-/// Test-only bridge preserving `crate::ui::serve` and `crate::ui::ServeOpts`
-/// for integration/acceptance fixtures still hosted in `cadence-agent`.
-#[cfg(test)]
-pub use cadence_ui::ServeOpts;
-
-#[cfg(test)]
-pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
-    cadence_ui::serve(state_dir, pm_dir, opts).map_err(|e| Error::internal(e.to_string()))
-}
-
 /// The options `ui run` and `ui start` share. Every field is optional:
 /// a given flag overrides the persisted `ui.json`, an absent one
 /// inherits it, and `--reset` on `start` forgets the file first.

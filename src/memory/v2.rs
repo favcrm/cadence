@@ -30,7 +30,7 @@ impl From<ScopeInput> for Scope {
     }
 }
 
-pub(crate) fn scope_input(value: &Value) -> Result<Scope> {
+pub fn scope_input(value: &Value) -> Result<Scope> {
     ScopeInput::deserialize(value)
         .map(Into::into)
         .map_err(|error| Error::rejected(format!("invalid proposal scope: {error}")))

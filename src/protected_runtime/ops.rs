@@ -39,7 +39,7 @@ pub(crate) struct AgentEnrollment {
 /// A verified operations caller. Private fields; produced only by the listener
 /// after the kernel peer check. There is no request/env qualified flag.
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeCaller {
+pub struct RuntimeCaller {
     runtime_id: String,
     agent_uid: String,
     session_binding: String,
@@ -74,25 +74,25 @@ impl RuntimeCaller {
         }
     }
 
-    pub(crate) fn runtime_id(&self) -> &str {
+    pub fn runtime_id(&self) -> &str {
         &self.runtime_id
     }
-    pub(crate) fn agent_uid(&self) -> &str {
+    pub fn agent_uid(&self) -> &str {
         &self.agent_uid
     }
-    pub(crate) fn session_binding(&self) -> &str {
+    pub fn session_binding(&self) -> &str {
         &self.session_binding
     }
-    pub(crate) fn runtime_generation(&self) -> u64 {
+    pub fn runtime_generation(&self) -> u64 {
         self.runtime_generation
     }
-    pub(crate) fn os_uid(&self) -> u32 {
+    pub fn os_uid(&self) -> u32 {
         self.os_uid
     }
-    pub(crate) fn peer_pid(&self) -> u32 {
+    pub fn peer_pid(&self) -> u32 {
         self.peer_pid
     }
-    pub(crate) fn peer_starttime(&self) -> u64 {
+    pub fn peer_starttime(&self) -> u64 {
         self.peer_starttime
     }
 }
@@ -102,7 +102,7 @@ impl RuntimeCaller {
 /// intent and the three bounded native-model-turn methods (r7). The split is
 /// fixed here so the router never guesses from the tag string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OpsFamily {
+pub enum OpsFamily {
     /// Custody/Connection backend (`Shared::handle_runtime`).
     Connection,
     /// Bounded keyless native model broker (`Shared::native_model`).
@@ -113,7 +113,7 @@ pub(crate) enum OpsFamily {
 /// metadata-only credential request intent, and the three native model-turn
 /// methods. There is no management or generic provider method here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OpsMethod {
+pub enum OpsMethod {
     ConnectionSnapshotV1,
     ConnectionModelQuoteV1,
     ConnectionStageSendV1,
@@ -141,7 +141,7 @@ impl OpsMethod {
         }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ConnectionSnapshotV1 => "connection_snapshot_v1",
             Self::ConnectionModelQuoteV1 => "connection_model_quote_v1",
@@ -155,7 +155,7 @@ impl OpsMethod {
         }
     }
 
-    pub(crate) fn family(self) -> OpsFamily {
+    pub fn family(self) -> OpsFamily {
         match self {
             Self::NativeModelTurnPrepareV1
             | Self::NativeModelTurnV1
@@ -167,7 +167,7 @@ impl OpsMethod {
     /// The measured Node process alone may use the native model-turn methods;
     /// the Connection methods keep their separately authorized tool/child
     /// behavior. The router applies this before dispatch.
-    pub(crate) fn model_turn_only(self) -> bool {
+    pub fn model_turn_only(self) -> bool {
         matches!(self.family(), OpsFamily::NativeModel)
     }
 }
@@ -175,7 +175,7 @@ impl OpsMethod {
 /// The daemon's dispatch implementation for the five operations. Arguments are
 /// passed through for the strict DTO parser owned by the caller; the caller
 /// identity is never taken from them.
-pub(crate) trait RuntimeOpsHandler: Send + Sync {
+pub trait RuntimeOpsHandler: Send + Sync {
     fn handle(
         &self,
         caller: &RuntimeCaller,
@@ -184,7 +184,7 @@ pub(crate) trait RuntimeOpsHandler: Send + Sync {
     ) -> Result<serde_json::Value>;
 }
 
-pub(crate) struct RuntimeOpsListener {
+pub struct RuntimeOpsListener {
     listener: std::os::unix::net::UnixListener,
     path: PathBuf,
     enrollment: AgentEnrollment,
@@ -237,7 +237,7 @@ impl RuntimeOpsListener {
     /// Serve connections until `stop` is set. The daemon uses this so a
     /// stopped runtime tears its listener down instead of leaking a blocked
     /// accept thread for the life of the process.
-    pub(crate) fn serve_managed(
+    pub fn serve_managed(
         self,
         handler: Arc<dyn RuntimeOpsHandler>,
         stop: Arc<std::sync::atomic::AtomicBool>,

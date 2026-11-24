@@ -40,7 +40,11 @@ pub trait ProtectedConsoleProvider: Send + Sync {
 
 static CONSOLE_PROVIDER: OnceLock<Weak<dyn ProtectedConsoleProvider>> = OnceLock::new();
 
-pub fn install_console_provider(provider: &Arc<dyn ProtectedConsoleProvider>) -> Result<()> {
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn install_console_provider(
+    _owner: &crate::protected_runtime::owner_link::OwnerLink,
+    provider: &Arc<dyn ProtectedConsoleProvider>,
+) -> Result<()> {
     CONSOLE_PROVIDER
         .set(Arc::downgrade(provider))
         .map_err(|_| Error::internal("the protected console provider is already installed"))
@@ -86,7 +90,7 @@ impl VerifiedConsoleSubject {
 /// subject; selector strings alone cannot mint a runtime caller.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn attach_console(
-    client: &crate::protected_runtime::client::RootOwnerClient,
+    client: &crate::protected_runtime::RootOwnerClient,
     subject: VerifiedConsoleSubject,
     recipient_nonce: &str,
     stderr_log: &Path,

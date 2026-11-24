@@ -247,3 +247,24 @@ pub(crate) fn load(state_dir: &Path, tracker_root: Option<&Path>) -> Result<Opti
         identity_key,
     }))
 }
+
+/// Load an admitted record into an opaque codec for cross-crate acceptance.
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+#[doc(hidden)]
+pub fn fixture_codec(
+    state_dir: &Path,
+    tracker_root: Option<&Path>,
+    workspace: &str,
+) -> Result<Option<crate::daemon::scoped_cursor::ScopedCursorCodec>> {
+    load(state_dir, tracker_root)?
+        .map(|material| {
+            crate::daemon::scoped_cursor::ScopedCursorCodec::new(
+                workspace,
+                material.keyring,
+                material.active_key_id,
+                &material.identity_key[..],
+            )
+            .map_err(|_| refused())
+        })
+        .transpose()
+}

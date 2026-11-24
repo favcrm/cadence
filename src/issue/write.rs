@@ -27,10 +27,12 @@ use done::check_done_evidence;
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use done::Staged;
 pub(crate) use done::{
-    apply_pairs, commit_staged, commit_staged_scoped, mark_done_on_merge_locked,
+    apply_pairs, commit_staged, commit_staged_scoped,
     mark_done_on_merge_waiting_with, stage, RealWait, WaitClock,
 };
-pub use done::{mark_done_on_merge, mark_done_on_merge_waiting, DoneWriteFailure};
+pub use done::{
+    mark_done_on_merge, mark_done_on_merge_locked, mark_done_on_merge_waiting, DoneWriteFailure,
+};
 #[cfg(all(test, feature = "test-seam"))]
 pub use edit::keyed_commit_seam::{arm_keyed_commit_after_success, KeyedCommitSeam};
 pub use edit::{
@@ -42,10 +44,12 @@ pub(crate) use edit::{
 };
 pub(crate) use new::next_id;
 pub use new::{master_issue_new_limits, new_issue};
-pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, GrantedPreview};
+pub(crate) use plan::{check_structure, create_granted_plan, GrantedPreview};
+pub use plan::granted_semantics;
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
-pub(crate) use projects::{check_tags, load_front, save_front, split_tags};
+pub(crate) use projects::{check_tags, save_front, split_tags};
+pub use projects::load_front;
 #[doc(hidden)]
 pub use projects::{checked_project_dirs, issue_dir};
 pub use projects::{
@@ -58,10 +62,11 @@ use rev::check_rev;
 pub use rev::issue_rev;
 pub(crate) use rev::{
     actor_who, atomic_write, attach_foreign, attach_post_warnings, blocked_warnings_best_effort,
-    commit, commit_scoped, commit_who, commit_who_scoped, create_exclusive, file_preimage,
+    commit, commit_who, commit_who_scoped, create_exclusive, file_preimage,
     post_commit_warning, restore_preimage, write_new,
 };
-pub(crate) use ticket::confirm_committed_selected_issue;
+pub use rev::commit_scoped;
+pub use ticket::confirm_committed_selected_issue;
 pub use ticket::materialize_app_run_ticket;
 // The bind acceptance test is the only caller, and it compiles only with
 // the test seam. A plain library build must not carry the re-export.

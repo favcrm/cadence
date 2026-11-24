@@ -7,10 +7,9 @@
 use super::*;
 use crate::store::NewAgent;
 use crate::test_seam::{scoped, Asserted};
-use std::path::PathBuf;
 
 fn golden(name: &str, actual: &Value) {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = crate::contract_fixture::workspace_root()
         .join("src/ui/board_api_golden")
         .join(name);
     let text = serde_json::to_string_pretty(actual).unwrap() + "\n";

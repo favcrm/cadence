@@ -1529,7 +1529,8 @@ impl Store {
 
     /// Page a member's own assistant history after excluding operator-only
     /// entries, so hidden rows neither consume the limit nor affect `more`.
-    pub(crate) fn member_thread_entries_after(
+    #[doc(hidden)]
+    pub fn member_thread_entries_after(
         &self,
         thread_id: &str,
         after: i64,
@@ -1558,7 +1559,8 @@ impl Store {
 
     /// The same visible history, newest first for selection and oldest first
     /// in the returned page.
-    pub(crate) fn member_thread_entries_before(
+    #[doc(hidden)]
+    pub fn member_thread_entries_before(
         &self,
         thread_id: &str,
         before: Option<i64>,
@@ -1588,7 +1590,8 @@ impl Store {
 
     /// Project-filtered pages are selected before their cursor and limit, so
     /// inaccessible entries neither consume a page nor advance its cursor.
-    pub(crate) fn thread_entries_after_scoped(
+    #[doc(hidden)]
+    pub fn thread_entries_after_scoped(
         &self,
         thread_id: &str,
         after: i64,
@@ -1627,7 +1630,8 @@ impl Store {
         )?)
     }
 
-    pub(crate) fn thread_entries_before_scoped(
+    #[doc(hidden)]
+    pub fn thread_entries_before_scoped(
         &self,
         thread_id: &str,
         before: Option<i64>,
@@ -1685,7 +1689,8 @@ impl Store {
     /// the rows below `anchor`, newest first; forward the rows above it,
     /// oldest first. The flag says more rows lie beyond the batch.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn thread_entries_reached_scoped(
+    #[doc(hidden)]
+    pub fn thread_entries_reached_scoped(
         &self,
         thread_id: &str,
         current: &str,
@@ -1729,7 +1734,8 @@ impl Store {
         Ok((rows, more))
     }
 
-    pub(crate) fn thread_reply_seq_scoped(
+    #[doc(hidden)]
+    pub fn thread_reply_seq_scoped(
         &self,
         thread_id: &str,
         issues: &[&str],

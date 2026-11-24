@@ -41,7 +41,7 @@ use crate::delivery::{
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report, Pm};
 use crate::master;
-use crate::peer::AgentCaller;
+use super::caller_rule::AgentCaller;
 use crate::store;
 
 /// Longest decline reason.

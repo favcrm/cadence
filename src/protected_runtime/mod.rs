@@ -55,7 +55,8 @@
 use crate::error::{Error, Result};
 
 pub(crate) mod attestation;
-pub(crate) mod client;
+#[doc(hidden)]
+pub mod client;
 pub(crate) mod console;
 pub(crate) mod docker;
 pub(crate) mod frame;
@@ -63,23 +64,38 @@ pub(crate) mod installer;
 pub(crate) mod keys;
 pub(crate) mod measure;
 pub(crate) mod measure_mounts;
-pub(crate) mod ops;
+#[doc(hidden)]
+pub mod ops;
+#[doc(hidden)]
+pub mod owner_link;
 pub(crate) mod peer;
 pub(crate) mod profile;
 pub(crate) mod proof;
-pub(crate) mod qualified;
+#[doc(hidden)]
+pub mod qualified;
 pub(crate) mod registry;
 pub(crate) mod service;
 pub(crate) mod spec;
 pub(crate) mod store;
-pub(crate) mod strict;
-pub(crate) mod types;
+#[doc(hidden)]
+pub mod strict;
+#[doc(hidden)]
+pub mod types;
+#[doc(hidden)]
+pub use attestation::{hex32, random32};
 
-pub(crate) use client::{OwnerEvidence, RootOwnerClient};
-pub(crate) use ops::RuntimeCaller;
-pub(crate) use profile::LocalProfile;
+#[doc(hidden)]
+pub use client::OwnerEvidence;
+#[doc(hidden)]
+pub use client::RootOwnerClient;
+#[doc(hidden)]
+pub use ops::RuntimeCaller;
+#[doc(hidden)]
+pub use qualified::QualifiedRuntime;
+#[doc(hidden)]
+pub use profile::LocalProfile;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use qualified::{CurrentEligibility, RuntimeStatus};
+pub use qualified::{CurrentEligibility, RuntimeStatus};
 pub(crate) use store::{CheckpointAck, CheckpointV1};
 
 /// The root-owned deployment class this module implements. Any other class
@@ -91,7 +107,7 @@ pub(crate) const PROFILE_CLASS: &str = "native-oci-agent/1";
 pub(crate) const OWNER_ROOT: &str = "/var/lib/cadence/runtime-owner";
 
 /// The root-owned trust profile path.
-pub(crate) const PROFILE_PATH: &str = "/var/lib/cadence/runtime-owner/profile.json";
+pub const PROFILE_PATH: &str = "/var/lib/cadence/runtime-owner/profile.json";
 
 /// The root-owned runtime state directory (authority SQLite + private key).
 pub(crate) const STATE_DIR: &str = "/var/lib/cadence/runtime-owner/state";
@@ -158,13 +174,19 @@ pub fn protected_profile_active() -> bool {
 /// its `/proc` starttime and a fresh per-process 32-hex generation. Produced
 /// only from actual kernel/profile facts — never from a caller literal or a
 /// JSON/serde value. A different euid or executable refuses.
-pub(crate) struct SupervisorFacts {
+pub struct SupervisorFacts {
     pub(crate) pid: u32,
     pub(crate) starttime: u64,
     pub(crate) generation: String,
 }
 
-pub(crate) fn local_supervisor_facts(profile: &LocalProfile) -> Result<SupervisorFacts> {
+impl SupervisorFacts {
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+}
+
+pub fn local_supervisor_facts(profile: &LocalProfile) -> Result<SupervisorFacts> {
     let euid = unsafe { libc::geteuid() };
     if euid != profile.supervisor().uid {
         return Err(rejected(

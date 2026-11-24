@@ -67,8 +67,10 @@ pub use isolation::{
 };
 use isolation::{refuse_symlinked_ancestry, refuse_symlinked_under};
 pub(crate) use isolation::{
-    validate_policy_for_env, validate_workspace_isolated, workspace_for_provider_env,
+    validate_policy_for_env, workspace_for_provider_env,
 };
+#[doc(hidden)]
+pub use isolation::validate_workspace_isolated;
 
 /// Marker file inside a home root declaring the new layout. The
 /// migration writes it; the content is the layout version.

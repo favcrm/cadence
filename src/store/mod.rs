@@ -30,7 +30,8 @@ pub(crate) mod credential_requests;
 /// the protected authority journal.
 pub(crate) mod native_model_turn;
 mod platform;
-pub(crate) use platform::{scope_list, scope_name};
+#[doc(hidden)]
+pub use platform::{scope_list, scope_name};
 pub use platform::{
     CredentialRecord, Grant, ProjectDefault, CREDENTIAL_REVOKED_EVENT, PLATFORM_CONNECTED_EVENT,
     PLATFORM_DEFAULT_EVENT, PLATFORM_DISCONNECTED_EVENT, PLATFORM_STREAM, SCOPE_GRANTED_EVENT,
@@ -63,13 +64,15 @@ pub use cloud_agent::{
 };
 #[cfg(test)]
 mod wait_probe;
-pub(crate) use agents::AGENT_GC_RECORDS_ONLY;
+#[doc(hidden)]
+pub use agents::AGENT_GC_RECORDS_ONLY;
 pub use agents::{Agent, ModelDefaultsSnapshot, NewAgent, AGENT_STATES};
 
 pub const MAX_INSTRUCTIONS_BYTES: usize = 32_000;
 pub mod activity;
 mod delivery;
-pub(crate) use delivery::UNKNOWN_GENERIC_REASON;
+#[doc(hidden)]
+pub use delivery::UNKNOWN_GENERIC_REASON;
 pub use delivery::{unknown_inspect_lead, unknown_recovery_note};
 mod events;
 pub use events::{
@@ -107,7 +110,8 @@ mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
 mod endpoint;
 pub use endpoint::AgentEndpoint;
-pub(crate) use monitors::{ProjectMonitorView, MAX_MONITOR_TASKS};
+#[doc(hidden)]
+pub use monitors::{ProjectMonitorView, MAX_MONITOR_TASKS};
 mod business_templates;
 pub(crate) use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
 pub use business_templates::{BusinessDocument, TemplateVersion};
@@ -127,7 +131,8 @@ pub use assistants::{
     assist_request_id, AssistDispatchExpect, AssistRecipient, AssistRequest, AssistRequestQueued,
     AssistantBinding, AssistantBootstrapUpdate,
 };
-pub(crate) use assistants::{PrivateJobDenials, PrivateJobReader};
+#[doc(hidden)]
+pub use assistants::{PrivateJobDenials, PrivateJobReader};
 pub mod app_audiences;
 pub use app_audiences::{AudienceBase, Predicate};
 pub mod app_content;
@@ -153,7 +158,10 @@ pub mod crm_smtp;
 mod plans;
 pub mod social_publish;
 pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
-pub(crate) use plans::{DispatchPlan, TaskHistoryEvent};
+#[doc(hidden)]
+pub use plans::DispatchPlan;
+#[doc(hidden)]
+pub use plans::TaskHistoryEvent;
 mod quota;
 mod schema;
 /// CAD-2215: the nullable `connection_metadata.cursor_keyring_fingerprint`

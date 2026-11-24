@@ -171,7 +171,7 @@ impl Shared {
             }
             Ok(json!({
                 "asset_id": asset_id, "revision": revision,
-                "sha256": image.original.sha256,
+                "sha256": image.original.sha256(),
                 "media_type": "image/jpeg", "base64": encoded,
             }))
         })
@@ -254,7 +254,7 @@ impl Shared {
         read: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(&pm, &original.install_id, |bundle, files| {
+        workspace::with_runtime_snapshot(&pm, original.install_id(), |bundle, files| {
             let _custody = self
                 .platform_custody_lock
                 .lock()
@@ -264,16 +264,16 @@ impl Shared {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             self.app_binding_receipt_current(
-                &original.install_id,
-                original.context_id.as_deref(),
-                &original.slot,
-                &original.proof,
+                original.install_id(),
+                original.context_id(),
+                original.slot(),
+                original.proof(),
                 bundle,
                 files,
             )?;
             if self
                 .store
-                .app_capability_status(&original.install_id, required_str(bundle, "digest")?)?
+                .app_capability_status(original.install_id(), required_str(bundle, "digest")?)?
                 ["state"]
                 != "approved"
             {
@@ -443,7 +443,7 @@ impl Shared {
         workspace::with_runtime_snapshot_pair(
             &pm,
             &receiver.0,
-            &original.install_id,
+            original.install_id(),
             |caller_snap, producer_snap| {
                 let _custody = self
                     .platform_custody_lock
@@ -455,15 +455,15 @@ impl Shared {
                     .unwrap_or_else(|e| e.into_inner());
                 self.receiver_install_admitted(caller, message_id, &receiver, caller_snap.0)?;
                 self.app_binding_receipt_current(
-                    &original.install_id,
-                    original.context_id.as_deref(),
-                    &original.slot,
-                    &original.proof,
+                    original.install_id(),
+                    original.context_id(),
+                    original.slot(),
+                    original.proof(),
                     producer_snap.0,
                     producer_snap.1,
                 )?;
                 if self.store.app_capability_status(
-                    &original.install_id,
+                    original.install_id(),
                     required_str(producer_snap.0, "digest")?,
                 )?["state"]
                     != "approved"
@@ -532,7 +532,7 @@ impl Shared {
         let declared = display
             .original
             .as_ref()
-            .map(|original| original.media_type.clone())
+            .map(|original| original.media_type().to_owned())
             .unwrap_or_else(|| display.media_type.to_string());
         if display.asset.revision != revision
             || !matches!(declared.as_str(), "image/png" | "image/jpeg")
@@ -670,7 +670,7 @@ impl Shared {
                     &asset_id,
                     expected_revision,
                     &request_id,
-                    crate::store::now(),
+                    crate::store::now_public(),
                 )
             },
         )
@@ -880,7 +880,7 @@ impl Shared {
         let prepared = workspace::with_runtime_snapshot_pair(
             &pm,
             &ctx.install_id,
-            &proven.install_id,
+            proven.install_id(),
             |(bundle, files), producer| {
                 let _custody = self
                     .platform_custody_lock
@@ -891,7 +891,7 @@ impl Shared {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 self.original_runtime_current(&ctx, &proven, (bundle, files), producer)?;
-                let config = &proven.proof.config;
+                let config = &proven.proof().config;
                 let provider = required_str(config, "provider")?;
                 let adapter = self
                     .platforms
@@ -899,17 +899,16 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("media origin adapter unavailable"))?;
                 let credential = self.app_capability_credential(config)?;
                 let descriptor = json!({
-                    "ref": proven.reference,
-                    "sha256": proven.sha256,
-                    "bytes": proven.bytes,
-                    "media_type": proven.media_type,
+                    "ref": proven.reference(),
+                    "sha256": proven.sha256(),
+                    "bytes": proven.bytes(),
+                    "media_type": proven.media_type(),
                 });
                 if provider == crate::platform::account_media::PLATFORM {
                     // Freeze the FULL source, not just the durable account handle.
                     // The broker checks this exact lineage before renewal/GET.
-                    let identity = crate::platform::account_media::current_identity(config)
-                        .map_err(Error::rejected)?;
-                    let frozen = crate::platform::agenticos_external::AgenticosExternalAdapter::account_image(identity.clone())?;
+                    let (frozen, identity) =
+                        crate::platform::agenticos_external::AgenticosExternalAdapter::checked_account_image(config)?;
                     account_source = Some(identity);
                     account_fetch = Some((frozen, credential, descriptor));
                     return Ok(None);
@@ -948,7 +947,7 @@ impl Shared {
             let (media_type, bytes) = crate::platform::PlatformAdapter::read_app_media_original(
                 &adapter,
                 &credential,
-                &proven.proof.config,
+                &proven.proof().config,
                 &descriptor,
             )
             .map_err(Error::rejected)?;
@@ -1104,10 +1103,10 @@ impl Shared {
         // rotation or revocation refuses before any provider access.
         let (pbundle, pfiles) = producer;
         self.app_binding_receipt_current(
-            &proven.install_id,
-            proven.context_id.as_deref(),
-            &proven.slot,
-            &proven.proof,
+            proven.install_id(),
+            proven.context_id(),
+            proven.slot(),
+            proven.proof(),
             pbundle,
             pfiles,
         )?;
@@ -1117,7 +1116,7 @@ impl Shared {
         // original read, exactly as a mount's own approval proof does.
         if self
             .store
-            .app_capability_status(&proven.install_id, required_str(pbundle, "digest")?)?["state"]
+            .app_capability_status(proven.install_id(), required_str(pbundle, "digest")?)?["state"]
             .as_str()
             != Some("approved")
         {
@@ -1417,7 +1416,7 @@ impl Shared {
         workspace::with_runtime_snapshot_pair(
             pm,
             &ctx.install_id,
-            &proven.install_id,
+            proven.install_id(),
             |caller, producer| {
                 let _custody = self
                     .platform_custody_lock
@@ -1438,7 +1437,7 @@ impl Shared {
                 )?;
                 if let Some(expected) = fetched.account_source {
                     let current =
-                        crate::platform::account_media::current_identity(&proven.proof.config)
+                        crate::platform::account_media::current_identity(&proven.proof().config)
                             .map_err(Error::rejected)?;
                     if expected != &current {
                         return Err(Error::rejected(
@@ -1906,7 +1905,7 @@ impl OriginalDelivery<'_> {
             OriginalAuthority::Provider(proven) => workspace::with_runtime_snapshot_pair(
                 self.pm,
                 &self.expected.install_id,
-                &proven.install_id,
+                proven.install_id(),
                 |caller, producer| {
                     let _custody = self
                         .shared
@@ -1975,7 +1974,7 @@ impl OriginalDelivery<'_> {
         )?;
         if let Some(expected) = &self.account_source {
             let proven = proven.ok_or_else(refused)?;
-            let current = crate::platform::account_media::current_identity(&proven.proof.config)
+            let current = crate::platform::account_media::current_identity(&proven.proof().config)
                 .map_err(Error::rejected)?;
             if &current != expected {
                 return Err(refused());

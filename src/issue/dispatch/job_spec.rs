@@ -241,7 +241,7 @@ fn read_job_spec(
 /// Canonical issue specs contain mutable tracker metadata that is not part
 /// of their effective spec. Pin every body byte, including all criteria;
 /// retain the separate raw source digest in the delivery manifest.
-pub(crate) fn canonical_issue_spec_digest(
+pub fn canonical_issue_spec_digest(
     pm: &Pm,
     issue: &str,
     spec: &Path,
@@ -269,6 +269,156 @@ pub(crate) fn canonical_issue_spec_digest(
     Ok(Some(content_digest(
         parse::split_front(&source)?.1.as_bytes(),
     )))
+}
+
+/// Resolve the issue's one live worktree in a declared project repository.
+pub fn dispatch_lane(
+    verb: &str,
+    project: &crate::issue::project::Project,
+    front: &crate::issue::model::Front,
+) -> Result<PathBuf> {
+    let repos = start::declared_repos(project);
+    let mut lanes: Vec<PathBuf> = Vec::new();
+    for cand in start::open_worktrees(front) {
+        let dir = cand.canonicalize().unwrap_or(cand.clone());
+        let Ok(root) = crate::worktree::main_root(&dir) else {
+            continue;
+        };
+        if !repos.contains(&root) {
+            continue;
+        }
+        let wt_root = crate::worktree::layout::worktrees_dir(&root)
+            .canonicalize()
+            .unwrap_or_else(|_| crate::worktree::layout::worktrees_dir(&root));
+        if dir.starts_with(&wt_root) {
+            lanes.push(dir);
+        }
+    }
+    lanes.sort();
+    lanes.dedup();
+    match lanes.len() {
+        1 => Ok(lanes.remove(0)),
+        0 => Err(Error::rejected(format!(
+            "{verb}: {} has no open lane the daemon can verify — a dispatch \
+             kickoff binds the worktree `issue start` recorded; none of its \
+             open worktree refs is a live worktree of the project's repos",
+            front.id
+        ))),
+        n => Err(Error::rejected(format!(
+            "{verb}: {} has {n} open lane refs the daemon can verify — \
+             which one a kickoff binds is ambiguous; close the stale \
+             lanes first",
+            front.id
+        ))),
+    }
+}
+
+/// Prepare a native job context only after resolving the captured issue's
+/// unique open lane and matching both the job repository and task worktree.
+/// The scope check runs lazily, after the project and endpoint opt-in gates.
+pub fn admitted_job_context(
+    pm: &Pm,
+    gated: GatedIssue,
+    plan: &store::DispatchPlan,
+    no_lessons: bool,
+) -> Result<Option<PreparedContext<'static>>> {
+    if gated.dir != pm.dir.join(&gated.project.key).join(&gated.front.id) {
+        return Err(Error::rejected(
+            "context refused: the captured issue belongs to a different tracker — nothing was queued",
+        ));
+    }
+    let job = &plan.job;
+    let task = &plan.task;
+    let scope = |project: &crate::issue::project::Project,
+                 front: &crate::issue::model::Front|
+     -> Result<()> {
+        let lane = dispatch_lane("job dispatch", project, front)?;
+        let lane_root = crate::worktree::main_root(&lane).map_err(|error| {
+            crate::context_pack::Refusal::ScopeConflict {
+                detail: format!(
+                    "issue {}'s lane {} has no proven repository: {error}",
+                    front.id,
+                    lane.display()
+                ),
+            }
+            .error()
+        })?;
+        let repo = job.repo.as_deref().ok_or_else(|| {
+            crate::context_pack::Refusal::ScopeConflict {
+                detail: format!("issue-linked job '{}' names no repository", job.id),
+            }
+            .error()
+        })?;
+        let repo = Path::new(repo).canonicalize().map_err(|error| {
+            crate::context_pack::Refusal::ScopeConflict {
+                detail: format!(
+                    "job '{}' repository {repo} cannot be resolved: {error}",
+                    job.id
+                ),
+            }
+            .error()
+        })?;
+        if repo != lane_root {
+            return Err(crate::context_pack::Refusal::ScopeConflict {
+                detail: format!(
+                    "job '{}' names repository {}, but issue {}'s lane {} is in {}",
+                    job.id,
+                    repo.display(),
+                    front.id,
+                    lane.display(),
+                    lane_root.display()
+                ),
+            }
+            .error());
+        }
+        let worktree = task.worktree.as_deref().ok_or_else(|| {
+            crate::context_pack::Refusal::ScopeConflict {
+                detail: format!("issue-linked task '{}' binds no worktree", task.id),
+            }
+            .error()
+        })?;
+        let task_lane = crate::worktree::layout::worktree_dir(&lane_root, worktree);
+        let task_lane = task_lane.canonicalize().map_err(|error| {
+            crate::context_pack::Refusal::ScopeConflict {
+                detail: format!(
+                    "task '{}' worktree {} cannot be resolved: {error}",
+                    task.id,
+                    task_lane.display()
+                ),
+            }
+            .error()
+        })?;
+        if task_lane != lane {
+            return Err(crate::context_pack::Refusal::ScopeConflict {
+                detail: format!(
+                    "task '{}' binds worktree {}, not issue {}'s verified lane {}",
+                    task.id,
+                    task_lane.display(),
+                    front.id,
+                    lane.display()
+                ),
+            }
+            .error());
+        }
+        Ok(())
+    };
+    job_context(
+        pm,
+        gated,
+        JobContext {
+            job,
+            task,
+            revision: plan.revision,
+            message: &plan.message_id,
+            target: super::ContextTarget {
+                team_role: plan.worker.team_role.as_deref(),
+                provider: &plan.worker.provider,
+                endpoint_kind: &plan.worker.endpoint_kind,
+            },
+            admission_scope: Some(&scope),
+        },
+        no_lessons,
+    )
 }
 
 /// CAD-1846: the same mandatory pipeline for an issue-linked job task.

@@ -793,7 +793,7 @@ impl Shared {
                             id,
                             journal.new_digest(),
                             &self.store.connection_workspace_id()?,
-                            &journal.bindings,
+                            journal.bindings(),
                         )
                     },
                     hosted_operation_id,
@@ -808,7 +808,7 @@ impl Shared {
                         required_str(params, "install_id")?,
                         journal.new_digest(),
                         &self.store.connection_workspace_id()?,
-                        &journal.bindings,
+                        journal.bindings(),
                     )
                 },
             ),

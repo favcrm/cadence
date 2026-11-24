@@ -1444,7 +1444,7 @@ pub(crate) fn verdict_state_pub(rollup: &[Value]) -> Option<String> {
     verdict_state(rollup)
 }
 
-pub(crate) fn checks_green_pub(rollup: &[Value]) -> bool {
+pub fn checks_green_pub(rollup: &[Value]) -> bool {
     checks_green(rollup)
 }
 

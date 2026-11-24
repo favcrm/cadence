@@ -137,7 +137,7 @@ pub fn default_outbox_dir() -> PathBuf {
 /// under the persisted `ui.json` port. The outbox root is also pinned
 /// on `opts.outbox_dir` so the `platform_outbox` read serves exactly
 /// what this adapter writes.
-pub fn register(state_dir: &Path, opts: &mut crate::daemon::ServeOptions) {
+pub fn register(state_dir: &Path, opts: &mut impl super::LocalRegistry) {
     let port = crate::ui::persisted_opts(state_dir).port.unwrap_or(3010);
     register_at(
         state_dir,
@@ -152,12 +152,12 @@ pub fn register(state_dir: &Path, opts: &mut crate::daemon::ServeOptions) {
 /// registers here so nothing lands under the real HOME.
 pub fn register_at(
     state_dir: &Path,
-    opts: &mut crate::daemon::ServeOptions,
+    opts: &mut impl super::LocalRegistry,
     outbox: PathBuf,
     board_url: String,
 ) {
-    opts.outbox_dir = Some(outbox.clone());
-    opts.platforms.insert(
+    *opts.outbox_dir_mut() = Some(outbox.clone());
+    opts.platforms_mut().insert(
         PLATFORM.to_string(),
         Arc::new(LocalAdapter {
             table: ToolTable::from_json(&serde_json::from_str(TABLE_JSON).expect("table parses"))
@@ -1324,7 +1324,7 @@ mod direct_call_tests {
     #[test]
     fn the_app_artifact_tool_is_not_directly_callable() {
         let dir = tempfile::tempdir().unwrap();
-        let mut opts = crate::daemon::ServeOptions::default();
+        let mut opts = crate::platform::TestComposition::default();
         crate::platform::local::register(dir.path(), &mut opts);
         let adapter = opts
             .platforms

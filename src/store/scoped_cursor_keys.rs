@@ -35,7 +35,8 @@ pub(crate) enum CursorKeyringInit {
 impl Store {
     /// The workspace this store's cursors are namespaced to and the admitted
     /// keyring fingerprint, if one was ever explicitly bound.
-    pub(crate) fn cursor_keyring_metadata(&self) -> Result<(String, Option<String>)> {
+    #[doc(hidden)]
+    pub fn cursor_keyring_metadata(&self) -> Result<(String, Option<String>)> {
         self.read_tx(|tx| {
             tx.query_opt(
                 "SELECT workspace_id, cursor_keyring_fingerprint \

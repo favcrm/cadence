@@ -12,7 +12,7 @@ use super::StoreConn;
 use super::{now, Store};
 
 /// Fallback detail when an unknown fence has no provider account.
-pub(crate) const UNKNOWN_GENERIC_REASON: &str = "Uncertain provider outcome requires review";
+pub const UNKNOWN_GENERIC_REASON: &str = "Uncertain provider outcome requires review";
 
 /// First sentence of an unknown-outcome hint: look before reconciling.
 pub fn unknown_inspect_lead() -> &'static str {

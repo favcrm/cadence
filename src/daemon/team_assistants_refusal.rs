@@ -7068,7 +7068,7 @@ mod master_home_acceptance {
     fn master_home_report_is_metadata_only_and_master_cannot_verdict() {
         let _flag = AssistantFlagOn::arm();
         let fx = Fx::new();
-        let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi-gateway.py");
+        let fake = crate::contract_fixture::workspace_root().join("tests/fixtures/pi-gateway.py");
         let token = format!("hcs_{}", "e".repeat(43));
         let sub = "sub-home";
         // Fixture platform member authority: the live membership and recorded

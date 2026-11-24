@@ -389,11 +389,11 @@ impl PlatformAdapter for AgenticosWebAdapter {
     }
 }
 
-pub fn attach(opts: &mut crate::daemon::ServeOptions, state_dir: &Path) -> Result<()> {
-    if opts.platforms.contains_key(PLATFORM) {
+pub fn attach(opts: &mut impl super::PlatformRegistry, state_dir: &Path) -> Result<()> {
+    if opts.platforms_mut().contains_key(PLATFORM) {
         return Ok(());
     }
-    opts.platforms.insert(
+    opts.platforms_mut().insert(
         PLATFORM.into(),
         std::sync::Arc::new(AgenticosWebAdapter::new(state_dir.to_path_buf())?),
     );

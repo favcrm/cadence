@@ -104,13 +104,6 @@ pub enum Sender {
 }
 
 impl Sender {
-    pub(crate) fn from_caller(caller: &crate::peer::AgentCaller) -> Sender {
-        match caller {
-            crate::peer::AgentCaller::Operator => Sender::Operator,
-            crate::peer::AgentCaller::Agent(alias) => Sender::Agent(alias.clone()),
-        }
-    }
-
     /// Resolve the durable source. The operator's stable ownership input is
     /// the saved login's verified issuer + subject for this exact target; a
     /// peer's is the verified parent recorded in its own enrolled credential

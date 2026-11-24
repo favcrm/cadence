@@ -1,5 +1,6 @@
 //! Explicit operator release of one actual accepted app artifact.
 use super::app_bindings_rpc::strict_fields;
+use super::social_effect_id::social_effect_install;
 use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::platform::agenticos_external::publish::bare_digest;
@@ -61,31 +62,6 @@ fn publication_smtp_envelope(
         envelope.secret(),
     )?;
     Ok(Some(envelope))
-}
-
-pub(crate) fn social_effect_install(id: &str) -> Option<String> {
-    let mut p = id.split('_');
-    if p.next() != Some("sfx") {
-        return None;
-    };
-    let hex = p.next()?;
-    let nonce = p.next()?;
-    if p.next().is_some()
-        || hex.is_empty()
-        || hex.len() % 2 != 0
-        || nonce.len() != 32
-        || !hex
-            .bytes()
-            .chain(nonce.bytes())
-            .all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    };
-    let bytes = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect::<Option<Vec<_>>>()?;
-    String::from_utf8(bytes).ok()
 }
 
 /// How long Publish now waits for AgenticOS to settle a `processing` send.

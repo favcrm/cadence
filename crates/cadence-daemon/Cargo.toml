@@ -1,0 +1,44 @@
+[package]
+name = "cadence-daemon"
+version = "0.2.5"
+edition = "2021"
+license = "MIT"
+publish = false
+autobins = false
+autotests = false
+
+[features]
+ui = ["cadence-agent/ui"]
+test-seam = ["cadence-agent/test-seam"]
+native-fixture-admission = ["cadence-agent/native-fixture-admission"]
+cli-runtime-test = ["test-seam", "cadence-agent/cli-runtime-test"]
+
+[dependencies]
+cadence-agent = { path = "../.." }
+cadence-core = { path = "../cadence-core", features = ["custody-crypto"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+getrandom = "0.3"
+libc = "0.2"
+regex = "1"
+ring = { version = "0.17", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "hooks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+signal-hook = "0.3"
+tempfile = "3"
+tracing = "0.1"
+ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+cadence-ui = { path = "../cadence-ui" }
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+jsonschema = { version = "=0.56.0", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pemfile = { version = "2" }
+tiny_http = "0.12"

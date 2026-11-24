@@ -156,7 +156,7 @@ fn boot() -> Fixture {
 
     // The app's own bundle plus the tools screen fixture, named for this app
     // and declaring the draft alias on the app's draft-effect slot.
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps");
+    let fixtures = crate::contract_fixture::workspace_root().join("tests/fixtures/apps");
     let app = root.path().join("app");
     copy_dir(&fixtures.join("social-content"), &app);
     copy_dir(

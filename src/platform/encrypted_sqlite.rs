@@ -330,7 +330,9 @@ impl EncryptedVault {
         Ok(())
     }
 
-    pub(crate) fn fence(&self) {
+    /// Discard the currently open handle; a subsequent read fails closed.
+    #[doc(hidden)]
+    pub fn fence(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let _ = Self::reset_locked(&mut inner);
     }

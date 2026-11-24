@@ -94,7 +94,7 @@ pub(super) fn local_execution_contract(
     crate::issue::app::validate_storage_members(&manifest, files.keys().map(String::as_str))?;
     manifest
         .requires
-        .check(&cadence_core::app_compat::host(env!("CARGO_PKG_VERSION"))?)?;
+        .check(&cadence_core::app_compat::host(cadence_agent::HOST_VERSION)?)?;
     if !manifest.connections.is_empty() {
         return Err(Error::rejected(
             "local text execution does not support connection capabilities",
@@ -156,7 +156,7 @@ impl Shared {
         // CAD-1171: a host-execution run has no owner, so it needs no
         // default team. `create_app_run` applies the floor only when the
         // installed workflow actually declares `execution: agent`.
-        let team = super::app_teams_rpc::team_of(&self.state_dir, install)?;
+        let team = super::app_team_state::team_of(&self.state_dir, install)?;
         let expected = params
             .get("expected_quotes")
             .filter(|value| value.is_object())
@@ -349,7 +349,7 @@ impl Shared {
     pub(super) fn create_app_run_as(
         &self,
         params: &Value,
-        team: Option<&super::app_teams_rpc::Team>,
+        team: Option<&super::app_team_state::Team>,
         expected: Option<&Value>,
         human: Option<&Value>,
         sealed_grant: bool,
@@ -1145,7 +1145,9 @@ impl Shared {
                 Ok((_, dir)) => Some(pm.lock_for_paths(&[dir.join("issue.md")])?),
                 Err(_) => None,
             };
-            crate::issue::write::confirm_committed_selected_issue(&pm, issue_id, &reserved)?;
+            crate::issue::write::confirm_committed_selected_issue(
+                &pm, _lock.as_ref(), issue_id, &reserved,
+            )?;
             let bound = self
                 .store
                 .app_run_ticket_bind(run_id, request_id, issue_id, human)?;
@@ -1432,9 +1434,9 @@ impl Shared {
             .reference
             .split_once('.')
             .is_some_and(|(job, digest)| {
-                digest == hex && job.starts_with("med_") && !original.reference.contains("://")
+                digest == hex && job.starts_with("med_") && !original.reference().contains("://")
             });
-        if original.sha256 != sha256 || !reference_ok {
+        if original.sha256() != sha256 || !reference_ok {
             return Err(Error::rejected(
                 "producer reference is not the retained original artifact",
             ));
@@ -1452,15 +1454,15 @@ impl Shared {
         producer_files: &BTreeMap<String, String>,
     ) -> Result<Value> {
         self.app_binding_receipt_library_source(
-            &expected.install_id,
-            expected.context_id.as_deref(),
-            &expected.slot,
-            &expected.proof,
+            expected.install_id(),
+            expected.context_id(),
+            expected.slot(),
+            expected.proof(),
             producer_bundle,
             producer_files,
         )?;
         if self.store.app_capability_status(
-            &expected.install_id,
+            expected.install_id(),
             required_str(producer_bundle, "digest")?,
         )?["state"]
             != "approved"
@@ -1470,10 +1472,10 @@ impl Shared {
             ));
         }
         let pinned = self.library_reference_pin(inputs)?;
-        if pinned.sha256 != expected.sha256
-            || pinned.reference != expected.reference
-            || pinned.install_id != expected.install_id
-            || pinned.slot != expected.slot
+        if pinned.sha256() != expected.sha256()
+            || pinned.reference() != expected.reference()
+            || pinned.install_id() != expected.install_id()
+            || pinned.slot() != expected.slot()
         {
             return Err(Error::rejected(
                 "producer reference changed before the reference edit",
@@ -1481,8 +1483,8 @@ impl Shared {
         }
         Ok(json!({
             "asset_id": inputs["library_asset_id"],
-            "sha256": pinned.sha256,
-            "ref": pinned.reference,
+            "sha256": pinned.sha256(),
+            "ref": pinned.reference(),
         }))
     }
 
@@ -1533,18 +1535,22 @@ impl Shared {
         let execute_legacy = |legacy_slots: &[String], finish: bool| -> Result<()> {
             type Files = std::collections::BTreeMap<String, String>;
             type Held<'a> = Option<(&'a Value, &'a Files)>;
-            let snap = |f: &mut dyn FnMut(&Value, &Files, Held) -> Result<()>| -> Result<()> {
+            let snap = |f: &mut dyn FnMut(
+                &Value, &Files, &workspace::RuntimeSnapshot<'_>, Held<'_>,
+            ) -> Result<()>| -> Result<()> {
                 if let Some(original) = &reference_original {
-                    workspace::with_runtime_snapshot_pair(
+                    workspace::with_runtime_snapshot_pair_proof(
                         &pm,
                         install,
-                        &original.install_id,
-                        |(bundle, files), producer| f(bundle, files, Some(producer)),
+                        original.install_id(),
+                        |(bundle, files, snapshot), producer| {
+                            f(bundle, files, snapshot, Some(producer))
+                        },
                     )
                 } else {
-                    workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-                        f(bundle, files, None)
-                    })
+                    workspace::with_runtime_snapshot_proof(
+                        &pm, install, |bundle, files, snapshot| f(bundle, files, snapshot, None),
+                    )
                 }
             };
             // Called with the custody and release guards held.
@@ -1555,15 +1561,15 @@ impl Shared {
                             Error::rejected("reference producer snapshot is unavailable")
                         })?;
                         self.app_binding_receipt_library_source(
-                            &original.install_id,
-                            original.context_id.as_deref(),
-                            &original.slot,
-                            &original.proof,
+                            original.install_id(),
+                            original.context_id(),
+                            original.slot(),
+                            original.proof(),
                             producer_bundle,
                             producer_files,
                         )?;
                         if self.store.app_capability_status(
-                            &original.install_id,
+                            original.install_id(),
                             required_str(producer_bundle, "digest")?,
                         )?["state"]
                             != "approved"
@@ -1588,7 +1594,7 @@ impl Shared {
                     .simple()
                 );
                 let mut prepared = None;
-                snap(&mut |bundle, files, producer| {
+                snap(&mut |bundle, files, snapshot, producer| {
                     let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
@@ -1655,10 +1661,10 @@ impl Shared {
                         // The paired snapshot and these held custody/release guards
                         // prove the producer as well as the consuming run.
                         let original = self.store.app_media_pin(asset_id, revision, sha256)?;
-                        if original.sha256 != sha256
+                        if original.sha256() != sha256
                             || reference_original
                                 .as_ref()
-                                .is_none_or(|expected| original.reference != expected.reference)
+                                .is_none_or(|expected| original.reference() != expected.reference())
                         {
                             return Err(Error::rejected(
                                 "producer reference changed before the reference edit",
@@ -1667,7 +1673,7 @@ impl Shared {
                         authority["reference_edit"] = json!({
                             "asset_id": asset_id,
                             "sha256": sha256,
-                            "ref": original.reference,
+                            "ref": original.reference(),
                         });
                         authority["frozen_prompt"] =
                             run["snapshot"]["inputs"]["instructions"].clone();
@@ -1682,6 +1688,7 @@ impl Shared {
                     let credential = self.app_capability_credential(config)?;
                     let newly_claimed = self.store.app_capability_claim(
                         crate::store::app_capabilities::AppCapabilityClaim {
+                            workspace: snapshot,
                             run: run_id,
                             step: &step_id,
                             message: "",
@@ -1778,7 +1785,7 @@ impl Shared {
                         )),
                     }
                 };
-                let recorded = snap(&mut |bundle, files, producer| {
+                let recorded = snap(&mut |bundle, files, snapshot, producer| {
                     let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
@@ -1831,6 +1838,7 @@ impl Shared {
                     }
                     if let Err(error) = self.store.app_capability_record(
                         crate::store::app_capabilities::AppCapabilityRecord {
+                            workspace: snapshot,
                             id: &call_id,
                             run: run_id,
                             step: &step_id,
@@ -1869,7 +1877,7 @@ impl Shared {
                 }
             }
             if finish {
-                snap(&mut |bundle, files, producer| {
+                snap(&mut |bundle, files, _, producer| {
                     let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock

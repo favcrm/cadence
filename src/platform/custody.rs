@@ -95,11 +95,6 @@ impl Custody {
                 "encrypted custody records are written by the enrollment path only",
             ));
         }
-        self.put_legacy(key, bytes)
-    }
-
-    /// Existing-legacy mutation only; new configured enrollments never call this.
-    pub(crate) fn put_legacy(&self, key: &Key, bytes: &[u8]) -> Result<&'static str> {
         match &self.legacy {
             LegacyBackend::File(dir) => {
                 file_put(dir, key, bytes)?;

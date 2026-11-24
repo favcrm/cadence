@@ -151,7 +151,7 @@ thread_local! {
 /// it they fail like any failed read. Bounds a periodic pass whose own
 /// size is not bounded (the daemon's reconcile). Nested, the smaller
 /// cap holds and the inner calls are spent from the outer one too.
-pub(crate) fn with_call_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
+pub fn with_call_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
     struct Reset {
         outer: Option<usize>,
         start: usize,

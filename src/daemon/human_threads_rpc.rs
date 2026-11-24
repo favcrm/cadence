@@ -141,15 +141,15 @@ impl HumanRoomCursors {
         room: &str,
         scope: &HumanRoomCursorScope,
     ) -> Result<Self> {
-        let created = format!("{:016x}", scope.created);
-        let cutoff = scope.cutoff.to_string();
+        let created = format!("{:016x}", scope.created());
+        let cutoff = scope.cutoff().to_string();
         Ok(Self {
             codec: shared.scoped_cursor_codec()?,
             principal: job_events_opaque::framed(&[&actor.org, &actor.id]),
             resource: job_events_opaque::framed(&[
                 "human-room",
                 room,
-                &scope.topic,
+                scope.topic(),
                 &created,
                 &cutoff,
             ]),

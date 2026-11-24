@@ -133,7 +133,8 @@ fn static_media_type(value: &str) -> Result<&'static str> {
 /// with the original proof when one exists. `media_type` describes
 /// `bytes`; the proof keeps the producer-declared type separately, as the
 /// provider path always has.
-pub(crate) struct DisplayImage {
+#[doc(hidden)]
+pub struct DisplayImage {
     pub asset: MediaAsset,
     pub media_type: &'static str,
     pub sha256: String,
@@ -694,7 +695,8 @@ impl Store {
     /// CAD-2051: display material for one catalog asset, imported or
     /// provider-produced. An absent id is `None`; a stored row that fails
     /// its own checks refuses rather than projecting.
-    pub(crate) fn app_media_display_image(&self, asset_id: &str) -> Result<Option<DisplayImage>> {
+    #[doc(hidden)]
+    pub fn app_media_display_image(&self, asset_id: &str) -> Result<Option<DisplayImage>> {
         if let Some(imported) = self.app_media_imported_image(asset_id)? {
             return Ok(Some(DisplayImage {
                 asset: imported.asset,
@@ -726,7 +728,8 @@ impl Store {
     /// present but cannot be read as a verified asset — unsupported stored
     /// type, custody digest mismatch — keeps its store error, because that
     /// is a broken catalog row rather than a stale pin.
-    pub(crate) fn app_media_pinned_display(
+    #[doc(hidden)]
+    pub fn app_media_pinned_display(
         &self,
         asset_id: &str,
         revision: i64,
@@ -745,7 +748,8 @@ impl Store {
     /// `None` for a provider-produced asset (its original lives behind
     /// the provider proof door), and a stored row that fails its digest,
     /// size or MIME check refuses rather than serving bytes.
-    pub(crate) fn app_media_imported_image(&self, asset_id: &str) -> Result<Option<ImportedImage>> {
+    #[doc(hidden)]
+    pub fn app_media_imported_image(&self, asset_id: &str) -> Result<Option<ImportedImage>> {
         if !valid_id(asset_id) {
             return Ok(None);
         }
@@ -988,7 +992,8 @@ impl Store {
     /// is not the retained original refuses. CAD-1508: a pin of the stored
     /// custody derivative names that digest and the original producer digest
     /// the pin must use.
-    pub(crate) fn app_media_pin(
+    #[doc(hidden)]
+    pub fn app_media_pin(
         &self,
         asset_id: &str,
         revision: i64,
@@ -1010,7 +1015,8 @@ impl Store {
         Ok(image.original)
     }
 
-    pub(crate) fn app_media_revision(&self, asset_id: &str) -> Result<i64> {
+    #[doc(hidden)]
+    pub fn app_media_revision(&self, asset_id: &str) -> Result<i64> {
         self.read_tx(|conn| {
             conn.query_row(
                 "SELECT revision FROM app_media_assets WHERE id=?1",
@@ -1024,7 +1030,8 @@ impl Store {
 
     /// The catalog child recorded for this run's receipt, not the newest
     /// child of the same source.
-    pub(crate) fn app_media_lineage_for_run(&self, run_id: &str) -> Result<Option<Value>> {
+    #[doc(hidden)]
+    pub fn app_media_lineage_for_run(&self, run_id: &str) -> Result<Option<Value>> {
         self.read_tx(|conn| {
             let row = conn
                 .query_row(
@@ -1058,7 +1065,8 @@ impl Store {
         })
     }
 
-    pub(crate) fn app_media_original(&self, asset_id: &str) -> Result<MediaOriginalProof> {
+    #[doc(hidden)]
+    pub fn app_media_original(&self, asset_id: &str) -> Result<MediaOriginalProof> {
         self.app_media_context_image(asset_id)
             .map(|image| image.original)
     }
@@ -1066,7 +1074,8 @@ impl Store {
     /// One verified receipt read supplies the original pin and its retained
     /// display material. A custody derivative need not hash to the original:
     /// `asset_material_in` proves both through the immutable receipt instead.
-    pub(crate) fn app_media_context_image(&self, asset_id: &str) -> Result<MediaContextImage> {
+    #[doc(hidden)]
+    pub fn app_media_context_image(&self, asset_id: &str) -> Result<MediaContextImage> {
         self.read_tx(|conn| {
             let row: Option<MediaAsset> = conn.query_opt(
                 "SELECT id,install_id,title,kind,lifecycle,revision,creator,created,updated
@@ -1305,28 +1314,64 @@ impl Store {
 /// never from a request field. The daemon layer re-proves the CURRENT
 /// binding/connection material against `proof` before any provider
 /// access; this value is the frozen record it is checked against.
-pub(crate) struct MediaOriginalProof {
+#[doc(hidden)]
+pub struct MediaOriginalProof {
     /// The install that produced the asset — bound to the receipt's run,
     /// never to the caller's mount install (the catalog is store-wide).
-    pub install_id: String,
+    pub(crate) install_id: String,
     /// The producing run's context, for binding re-proof.
-    pub context_id: Option<String>,
+    pub(crate) context_id: Option<String>,
     /// The capability slot the producing binding occupies.
-    pub slot: String,
+    pub(crate) slot: String,
     /// The run-frozen binding proof the CURRENT binding must still match.
-    pub proof: crate::store::app_bindings::BindingProof,
+    pub(crate) proof: crate::store::app_bindings::BindingProof,
     /// The closed stored `original_artifact` descriptor.
-    pub reference: String,
+    pub(crate) reference: String,
     /// Canonical `sha256:<64 lowercase hex>` of the original.
-    pub sha256: String,
+    pub(crate) sha256: String,
     /// The declared original byte count.
-    pub bytes: u64,
+    pub(crate) bytes: u64,
     /// The declared original MIME — validated bytes, allowlisted image.
-    pub media_type: String,
+    pub(crate) media_type: String,
+}
+
+impl MediaOriginalProof {
+    pub fn install_id(&self) -> &str {
+        &self.install_id
+    }
+
+    pub fn context_id(&self) -> Option<&str> {
+        self.context_id.as_deref()
+    }
+
+    pub fn slot(&self) -> &str {
+        &self.slot
+    }
+
+    pub fn proof(&self) -> &crate::store::app_bindings::BindingProof {
+        &self.proof
+    }
+
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
 }
 
 /// Authorized display material and its immutable original provenance.
-pub(crate) struct MediaContextImage {
+#[doc(hidden)]
+pub struct MediaContextImage {
     pub original: MediaOriginalProof,
     pub asset: MediaAsset,
     pub media_type: &'static str,

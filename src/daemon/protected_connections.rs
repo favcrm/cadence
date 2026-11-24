@@ -105,17 +105,17 @@ impl OwnerEligibility {
     ) -> Result<Self> {
         let unreadable = || Error::invalid("runtime_unqualified", "owner evidence is unusable");
         Ok(Self {
-            workspace_id: evidence.workspace_id.clone(),
+            workspace_id: evidence.workspace_id().to_owned(),
             custody_domain: "local".to_string(),
-            custody_epoch: Revision::new(evidence.custody_epoch).map_err(|_| unreadable())?,
-            owner_epoch: Revision::new(evidence.owner_epoch).map_err(|_| unreadable())?,
-            runtime_generation: Revision::new(evidence.runtime_generation)
+            custody_epoch: Revision::new(evidence.custody_epoch()).map_err(|_| unreadable())?,
+            owner_epoch: Revision::new(evidence.owner_epoch()).map_err(|_| unreadable())?,
+            runtime_generation: Revision::new(evidence.runtime_generation())
                 .map_err(|_| unreadable())?,
-            enrollment_id: UuidV1::try_from(evidence.enrollment_id.clone())
+            enrollment_id: UuidV1::try_from(evidence.enrollment_id().to_owned())
                 .map_err(|_| unreadable())?,
-            observed_registry_digest: Digest::try_from(evidence.observed_registry_digest.clone())
+            observed_registry_digest: Digest::try_from(evidence.observed_registry_digest().to_owned())
                 .map_err(|_| unreadable())?,
-            fence: if evidence.fenced {
+            fence: if evidence.fenced() {
                 FenceStateV1::Revoking
             } else {
                 FenceStateV1::Clear
@@ -2331,7 +2331,7 @@ impl ProtectedConnections {
             fingerprint: crate::secret::fingerprint(&screen),
             custody: reference,
             exchange,
-            enrolled_at: crate::store::now(),
+            enrolled_at: crate::store::now_public(),
             by: if rotated {
                 "human:rotate".to_string()
             } else {
@@ -2482,7 +2482,7 @@ fn synthetic_record(attempt: &VerifiedHumanAttemptV1) -> crate::store::Credentia
         fingerprint: String::new(),
         custody: String::new(),
         exchange: String::new(),
-        enrolled_at: crate::store::now(),
+        enrolled_at: crate::store::now_public(),
         by: String::new(),
     }
 }

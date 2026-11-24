@@ -281,7 +281,7 @@ pub(crate) fn workspace_for_provider_env(
 /// Refuse an operational workspace that overlaps any read or write root
 /// granted to either supported Master provider. The policies are built by
 /// the adapters themselves so this check follows their effective authority.
-pub(crate) fn validate_workspace_isolated(
+pub fn validate_workspace_isolated(
     workspace: &Path,
     state_dir: &Path,
     env: &crate::adapter::ProviderEnv,

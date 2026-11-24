@@ -711,8 +711,8 @@ impl PlatformAdapter for AgenticosProviderAdapter {
 /// Register the adapter when the daemon starts. Always available: a call with
 /// no enrolled `agenticos-provider` account refuses at the credential step,
 /// which is a clearer answer than "no adapter for this platform".
-pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
-    if opts.platforms.contains_key(PLATFORM) {
+pub fn attach(opts: &mut impl super::PlatformRegistry) -> Result<()> {
+    if opts.platforms_mut().contains_key(PLATFORM) {
         return Ok(());
     }
     let base = std::env::var("CADENCE_AGENTICOS_PROVIDER_URL")
@@ -722,7 +722,7 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
     // A malformed override is a startup refusal, never a silent fallback to a
     // different origin.
     let adapter = AgenticosProviderAdapter::new(&base)?;
-    opts.platforms
+    opts.platforms_mut()
         .insert(PLATFORM.into(), std::sync::Arc::new(adapter));
     Ok(())
 }

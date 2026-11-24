@@ -1575,7 +1575,8 @@ impl Store {
 
     /// Select authorized event bindings before applying either page boundary.
     /// A message, task and job named together must agree on the same work.
-    pub(crate) fn events_scoped(
+    #[doc(hidden)]
+    pub fn events_scoped(
         &self,
         alias: &str,
         after: i64,
@@ -1598,7 +1599,8 @@ impl Store {
     /// `i64::MAX` for the newest window, then the lowest `seq` of the previous
     /// window (exclusive) to continue past those rows. Without this bound a
     /// scan cannot look older than the newest `limit` rows it already saw.
-    pub(crate) fn events_scoped_before(
+    #[doc(hidden)]
+    pub fn events_scoped_before(
         &self,
         alias: &str,
         before: i64,
@@ -1617,7 +1619,8 @@ impl Store {
     /// CURRENT task/job/issue/denial bindings. Only `seq` is projected, so no
     /// event payload is copied, and there is no numeric-span bound and no
     /// per-row query.
-    pub(crate) fn events_scoped_admitted_seqs(
+    #[doc(hidden)]
+    pub fn events_scoped_admitted_seqs(
         &self,
         alias: &str,
         selected: &[i64],

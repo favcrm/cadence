@@ -12,7 +12,7 @@ use cadence_core::board_api::{MONITOR_CURSOR_FORMAT, READER_SCOPE_FIELD};
 use serde_json::{json, Value};
 
 use crate::client;
-use crate::daemon::monitors_rpc::MONITOR_READER_SCOPE_ACK;
+use crate::daemon::monitor_scope::MONITOR_READER_SCOPE_ACK;
 
 use super::{now_epoch, PROBE_TIMEOUT};
 

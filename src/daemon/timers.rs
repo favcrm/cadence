@@ -461,7 +461,7 @@ pub(super) fn delivery_view(agent: &Agent, queued: i64, oldest: Option<f64>) -> 
     if queued <= 0 {
         return json!({"queued": 0, "state": "clear"});
     }
-    let age = oldest.map(|at| (crate::store::now() - at).max(0.0).round() as u64);
+    let age = oldest.map(|at| (crate::store::now_public() - at).max(0.0).round() as u64);
     let (state, owner, reason) = if agent.state == "stopped" {
         (
             "stopped",

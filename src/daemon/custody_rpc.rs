@@ -4,6 +4,40 @@ use crate::platform::encrypted_sqlite::{EncryptedVault, ExpectedIdentity, TAG_PR
 use crate::store::{CredentialRecord, Store};
 use std::sync::MutexGuard;
 
+/// The legacy credential for this exact enrollment. This never decrypts a
+/// vault row; encrypted consumers need the separate scoped witness below.
+pub(crate) fn load_credential(
+    store: &Store,
+    custody: &crate::platform::Custody,
+    platform: &str,
+    account: &str,
+) -> Result<Vec<u8>> {
+    if crate::platform::is_builtin(platform, account) {
+        return Ok(Vec::new());
+    }
+    let record = store
+        .platform_credential(platform, account)?
+        .ok_or_else(|| {
+            Error::rejected(format!("no credential is enrolled for {platform}/{account}"))
+        })?;
+    let bytes = custody.load(&record.custody, &crate::platform::Key { platform, account })?;
+    if crate::secret::fingerprint(&bytes) != record.fingerprint {
+        return Err(Error::internal(format!(
+            "custody bytes for {platform}/{account} no longer match the recorded \
+             fingerprint — re-enroll or rotate"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// A lane credential may replace only missing enrollment, not a torn write.
+pub(crate) fn credential_enrollment_missing(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Rejected(message) if message.contains("no credential is enrolled")
+    )
+}
+
 // Only these statically audited daemon use sites may request a decrypt.
 #[derive(Clone, Copy)]
 pub(super) enum CustodyUse {
@@ -84,10 +118,6 @@ impl DaemonCustody {
         inner: crate::platform::Custody,
         vault: Option<std::sync::Arc<EncryptedVault>>,
     ) -> Self {
-        let inner = match &vault {
-            Some(vault) => inner.with_encrypted(std::sync::Arc::clone(vault)),
-            None => inner,
-        };
         Self { inner, vault }
     }
 

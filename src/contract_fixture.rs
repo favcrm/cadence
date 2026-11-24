@@ -21,6 +21,12 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
+/// Root for existing workspace fixtures shared by in-tree test targets.
+#[doc(hidden)]
+pub fn workspace_root() -> &'static std::path::Path {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
 #[cfg(test)]
 /// The fake adapter's declared tool table — the fixture file itself.
 pub const TOOL_TABLE_JSON: &str =

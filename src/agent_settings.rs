@@ -612,7 +612,8 @@ fn pi_canonical(policy: Option<&PiPolicy>) -> String {
 /// Deterministic JSON: sorted object keys, minimal separators, escapes
 /// only `"` and `\`. Shared by the settings grant digest (CAD-1586) so
 /// the CLI and daemon hash identical canonical bytes.
-pub(crate) fn canonical(value: &Value) -> String {
+#[doc(hidden)]
+pub fn canonical(value: &Value) -> String {
     fn write(out: &mut String, value: &Value) {
         match value {
             Value::Null => out.push_str("null"),

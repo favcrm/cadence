@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::{reject_identity_fields, required_str, Shared};
 use crate::error::{Error, Result};
 use crate::issue::{self, claim};
-use crate::peer::AgentCaller;
+use super::caller_rule::AgentCaller;
 
 const VERB: &str = "lane";
 

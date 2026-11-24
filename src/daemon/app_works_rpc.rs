@@ -289,7 +289,10 @@ mod tests {
                 model_policy: None,
             })
             .unwrap();
-        let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+        let source = format!(
+            "{}/tests/fixtures/apps/crm",
+            crate::contract_fixture::workspace_root().display()
+        );
         scoped(Asserted::Operator, || {
             shared.dispatch("app_workspace_install", &json!({"source": source}), pid())
         })

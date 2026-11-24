@@ -338,13 +338,13 @@ fn decode_b64(s: &str) -> Result<Vec<u8>> {
 }
 
 /// Fresh random 32 bytes from the kernel CSPRNG.
-pub(crate) fn random32() -> Result<[u8; 32]> {
+pub fn random32() -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     getrandom::fill(&mut out).map_err(|_| Error::unknown("entropy unavailable"))?;
     Ok(out)
 }
 
-pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
+pub fn hex32(bytes: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for b in bytes {
         out.push_str(&format!("{b:02x}"));
