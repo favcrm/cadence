@@ -31,7 +31,7 @@ export const TOOL_ERROR_TEXT_OMITTED = "(tool error text omitted)";
 export const TOOL_ERROR_CODE_OMITTED = "(tool error code omitted)";
 
 /** How the engine introduces an earlier summary in the summarized turns. */
-const SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:";
+export const SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:";
 
 /** A message shorter than this is common words ("timeout"), not worth chasing outside its harness line. */
 const MIN_ECHO_CHARS = 16;

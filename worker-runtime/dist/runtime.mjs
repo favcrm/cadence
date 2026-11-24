@@ -50794,51 +50794,106 @@ function redactToolErrors(text) {
 var TRANSIENT_FAILURE_NOTE = "[Runtime note]: Tool failures above are transient runtime events, not facts about the tools. " + "Record at most that an earlier call failed and that the next turn should try it again normally.";
 var CALLS_PREFIX = "[Assistant tool calls]: ";
 var ASSISTANT_PREFIX = "[Assistant]: ";
-var CALL_NAME = /(?:^|; )([A-Za-z_][\w.-]*)\(/g;
-var failedResult = (body) => body.includes(`<harness>
-`) && body.includes(`
-[error] `);
+var USER_PREFIX = "[User]: ";
+var FAILED_LINE = `
+[error] ${TOOL_ERROR_REDACTED}
+`;
+var IDENTIFIER = /^[A-Za-z_][\w.-]*$/;
 var SENTENCE = /[^.!?\n]+[.!?]?/g;
-var STANDING_CLAIM = new RegExp([
-  String.raw`\b(?:avoid|stop|skip|never|don'?t|do not)\b`,
-  String.raw`\b(?:does ?n[o']t|do ?n[o']t|can'?t|cannot|won'?t|isn'?t|is not)\s+(?:work|working|available|open)`,
-  String.raw`\b(?:broken|unavailable|not working|keeps? (?:failing|refusing)|refus(?:es|ing))\b`,
-  String.raw`\buntil\b[^.!?\n]{0,30}\b(?:fixed|resolved|works)\b`
-].join("|"), "i");
-function escape3(text) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var WORD = /[A-Za-z_][\w-]*/g;
+var AVOID_USE = /\b(?:avoid|stop|skip|never|don'?t|do not)\b(?:\W{1,10}\w{1,30}){0,2}?\W{1,10}(?:call(?:ing)?|us(?:e|ing)|run(?:ning)?|retr(?:y|ying)|try(?:ing)?|open(?:ing)?|re-?call(?:ing)?)\b/i;
+var BROKEN = /\b(?:does ?n[o']t|doesn'?t|can'?t|cannot|won'?t|isn'?t|is not)\s{1,3}(?:work|working|open)\b|\b(?:broken|not working|keeps? (?:failing|refusing)|refus(?:es|ing))\b|\buntil\b[^.!?\n]{0,30}\b(?:fixed|resolved|works|working)\b/i;
+var UNAVAILABLE = /\b(?:unavailable|not available)\b/i;
+var TIME_CUE = /\b(?:right now|currently|at the moment|for now|any ?more|still|today)\b/i;
+var USER_RULE = /\b(?:avoid|stop|skip|never|don'?t|do not|must not|should not)\b/i;
+var isFailed = (result) => result.includes(`<harness>
+`) && result.includes(FAILED_LINE);
+var isStandingClaim = (sentence) => AVOID_USE.test(sentence) || BROKEN.test(sentence) || UNAVAILABLE.test(sentence) && TIME_CUE.test(sentence);
+function callNames(list) {
+  const names = [];
+  let start = 0;
+  let depth = 0;
+  let inString = false;
+  for (let at = 0;at < list.length; at++) {
+    const char = list[at];
+    if (inString) {
+      if (char === "\\")
+        at++;
+      else if (char === '"')
+        inString = false;
+    } else if (char === '"')
+      inString = true;
+    else if (char === "(") {
+      if (depth === 0) {
+        const name = list.slice(start, at).trim();
+        if (IDENTIFIER.test(name))
+          names.push(name);
+      }
+      depth++;
+    } else if (char === ")")
+      depth = Math.max(0, depth - 1);
+    else if (char === ";" && depth === 0)
+      start = at + 1;
+  }
+  return names;
 }
-function rewrite(body, failed) {
-  const names = [...failed].map((name) => ({ name, pattern: new RegExp(String.raw`(?<![\w.-])${escape3(name)}(?![\w-])`) }));
+function userRuleWords(text, parts) {
+  const words = new Set;
+  for (const part of parts) {
+    if (part.role !== "User" || text.startsWith(SUMMARY_PREFIX2, part.start + USER_PREFIX.length))
+      continue;
+    for (const sentence of text.slice(part.start + USER_PREFIX.length, part.end).match(SENTENCE) ?? [])
+      if (USER_RULE.test(sentence))
+        for (const word of sentence.match(WORD) ?? [])
+          words.add(word);
+  }
+  return words;
+}
+function rewrite(body, failed, userRules) {
   return body.replace(SENTENCE, (sentence) => {
-    const tool = names.find(({ pattern }) => pattern.test(sentence));
-    if (!tool || !STANDING_CLAIM.test(sentence))
+    const tool = (sentence.match(WORD) ?? []).find((word) => failed.has(word));
+    if (tool === undefined || userRules.has(tool) || !isStandingClaim(sentence))
       return sentence;
     const leading = sentence.slice(0, sentence.length - sentence.trimStart().length);
-    return `${leading}An earlier ${tool.name} call failed; try it again normally.`;
+    return `${leading}An earlier ${tool} call failed; try it again normally.`;
   });
 }
 function settleToolFailures(text) {
-  if (!text.includes("<harness>"))
+  if (!text.includes(FAILED_LINE))
     return text;
   const parts = segments(text);
-  const pending = [];
+  if (parts.length === 0)
+    return text;
+  const userRules = userRuleWords(text, parts);
   const failed = new Set;
+  let anyFailed = false;
+  let group = null;
+  const settle = () => {
+    if (group && group.results.length === group.names.length)
+      group.names.forEach((name, index) => {
+        if (group.results[index]) {
+          failed.add(name);
+          anyFailed = true;
+        } else
+          failed.delete(name);
+      });
+    group = null;
+  };
   const bodies = parts.map((part) => {
     const body = text.slice(part.start, part.end);
-    if (part.role === "Assistant tool calls") {
-      for (const match of body.slice(CALLS_PREFIX.length).matchAll(CALL_NAME))
-        pending.push(match[1]);
-    } else if (part.role === "Tool result") {
-      const name = pending.shift();
-      if (name !== undefined && failedResult(body))
-        failed.add(name);
-    } else if (part.role === "Assistant" && failed.size > 0) {
-      return ASSISTANT_PREFIX + rewrite(body.slice(ASSISTANT_PREFIX.length), failed);
+    if (part.role === "Tool result") {
+      group?.results.push(isFailed(body));
+      return body;
     }
+    settle();
+    if (part.role === "Assistant tool calls")
+      group = { names: callNames(body.slice(CALLS_PREFIX.length)), results: [] };
+    else if (part.role === "Assistant" && failed.size > 0)
+      return ASSISTANT_PREFIX + rewrite(body.slice(ASSISTANT_PREFIX.length), failed, userRules);
     return body;
   });
-  if (failed.size === 0)
+  settle();
+  if (!anyFailed)
     return text;
   let out = text.slice(0, parts[0].start);
   parts.forEach((part, index) => {
