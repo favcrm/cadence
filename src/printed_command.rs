@@ -33,20 +33,20 @@ pub(crate) fn arg(value: &str) -> Option<String> {
 
 /// [`arg`] for a path. A path that is not valid UTF-8 has none: its lossy display
 /// would name a different path.
-pub(crate) fn path_arg(path: &Path) -> Option<String> {
+pub fn path_arg(path: &Path) -> Option<String> {
     arg(path.to_str()?)
 }
 
 /// A path in a sentence near a command. It reads as the path, quoted, so pasting the
 /// whole line cannot run it unless it is the first word, so do not start a sentence
 /// with it. A path that cannot be quoted safely shows as [`sanitized`].
-pub(crate) fn shown(path: &Path) -> String {
+pub fn shown(path: &Path) -> String {
     path_arg(path).unwrap_or_else(|| sanitized(&path.to_string_lossy()))
 }
 
 /// A value with each character that could mean something to a shell as `?`: close
 /// enough to recognise, and inert without quotes.
-pub(crate) fn sanitized(value: &str) -> String {
+pub fn sanitized(value: &str) -> String {
     value
         .chars()
         .map(|c| {
@@ -61,7 +61,7 @@ pub(crate) fn sanitized(value: &str) -> String {
 
 /// One piece of a printed command. Only `Fixed` is emitted as written, and it must
 /// be `'static`, so a runtime value cannot reach a command unquoted.
-pub(crate) enum Part<'a> {
+pub enum Part<'a> {
     Fixed(&'static str),
     Value(&'a str),
     Path(&'a Path),
@@ -96,7 +96,7 @@ fn render(parts: &[Part]) -> (String, usize) {
 /// A backticked command for a sentence. A value with no safe printed form becomes
 /// a placeholder with no shell meaning. Pasting it cannot act on the real value,
 /// though a command may still run against the placeholder, so the note says so.
-pub(crate) fn command(parts: &[Part]) -> String {
+pub fn command(parts: &[Part]) -> String {
     let (command, placeholders) = render(parts);
     if placeholders == 0 {
         format!("`{command}`")
@@ -125,14 +125,17 @@ pub(crate) fn with_path(before: &'static str, path: &Path, after: &'static str) 
     ])
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod tests {
     use super::*;
+    #[cfg(test)]
     use std::ffi::OsStr;
+    #[cfg(test)]
     use std::os::unix::ffi::OsStrExt;
 
     /// The rule itself: JSON encoding leaves a pasteable command unchanged.
-    pub(crate) fn survives_json(text: &str) -> bool {
+    pub fn survives_json(text: &str) -> bool {
         serde_json::to_string(text).unwrap() == format!("\"{text}\"")
     }
 
@@ -140,7 +143,7 @@ pub(crate) mod tests {
     /// the JSON a refusal prints as. Anything crafted to run would create `owned` in the
     /// working directory. `PATH` holds only `touch`: these messages name real commands,
     /// such as `cadence ui login --rotate`, which must never run from a test.
-    pub(crate) fn assert_inert_when_pasted(message: &str) {
+    pub fn assert_inert_when_pasted(message: &str) {
         let tools = tempfile::tempdir().unwrap();
         let touch = ["/usr/bin/touch", "/bin/touch"]
             .into_iter()
@@ -162,7 +165,7 @@ pub(crate) mod tests {
     }
 
     /// Names built to run `touch owned` when printed raw in a sentence.
-    pub(crate) const CRAFTED: [&str; 6] = [
+    pub const CRAFTED: [&str; 6] = [
         "x;touch owned;y",
         "x $(touch owned) y",
         "x`touch owned`y",
@@ -172,7 +175,7 @@ pub(crate) mod tests {
     ];
 
     /// Paths with no safe printed form.
-    pub(crate) const UNPRINTABLE: [&str; 11] = [
+    pub const UNPRINTABLE: [&str; 11] = [
         "/private/x$(touch owned)",
         "/private/x`touch owned`",
         "/private/it's",

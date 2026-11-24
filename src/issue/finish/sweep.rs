@@ -19,7 +19,8 @@ pub(crate) struct PathPreview {
 
 /// Collapse `.` and `..` without requiring the path to exist, so a
 /// missing recorded directory still compares with the path git prints.
-pub(crate) fn lexical_path(path: &Path) -> PathBuf {
+#[doc(hidden)]
+pub fn lexical_path(path: &Path) -> PathBuf {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -40,7 +41,8 @@ pub(crate) fn lexical_path(path: &Path) -> PathBuf {
     out
 }
 
-pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
+#[doc(hidden)]
+pub fn same_path(a: &Path, b: &Path) -> bool {
     if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) {
         return a == b;
     }

@@ -99,7 +99,8 @@ mod inbox;
 mod kickoff;
 #[doc(hidden)]
 pub use kickoff::captured_cloud_kickoff;
-pub(crate) use kickoff::last_sha_line;
+#[doc(hidden)]
+pub use kickoff::last_sha_line;
 pub mod routines;
 pub mod workspace_settings;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
@@ -120,7 +121,8 @@ pub use endpoint::AgentEndpoint;
 #[doc(hidden)]
 pub use monitors::{ProjectMonitorView, MAX_MONITOR_TASKS};
 mod business_templates;
-pub(crate) use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
+#[doc(hidden)]
+pub use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
 pub use business_templates::{BusinessDocument, TemplateVersion};
 mod artifacts;
 pub use artifacts::{
@@ -194,7 +196,8 @@ pub use seal::StoreConn;
 #[cfg(not(all(debug_assertions, feature = "test-seam")))]
 pub(crate) use seal::StoreConn;
 pub use seal::WriteTxn;
-pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx};
+#[doc(hidden)]
+pub use seal::{preflight_writer_guard, require_legacy_writer_tx};
 #[cfg(all(
     target_os = "linux",
     feature = "test-seam",

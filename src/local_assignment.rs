@@ -26,13 +26,21 @@ use crate::error::{Error, Result};
 use crate::remote_cli::{self, CliMaterial, RemoteTarget};
 use crate::worktree::{self, layout};
 
+#[path = "local_assignment/contract.rs"]
 mod contract;
+#[path = "local_assignment/delivery.rs"]
 pub mod delivery;
+#[path = "local_assignment/events.rs"]
 pub mod events;
+#[path = "local_assignment/finish_guidance.rs"]
 pub mod finish_guidance;
+#[path = "local_assignment/http.rs"]
 pub mod http;
+#[path = "local_assignment/notifications.rs"]
 pub mod notifications;
+#[path = "local_assignment/reporting.rs"]
 pub mod reporting;
+#[path = "local_assignment/wire.rs"]
 mod wire;
 
 use self::contract::{
@@ -43,14 +51,17 @@ use self::contract::{
 
 // Independently authored CAD-2290 acceptance; implementers must not weaken it.
 #[cfg(test)]
+#[path = "local_assignment/cad2290_hosted_finish_acceptance.rs"]
 mod cad2290_hosted_finish_acceptance;
 
 // Independently authored CAD-2337 refusal acceptance; implementers must not weaken it.
 #[cfg(test)]
+#[path = "local_assignment/cad2337_stale_socket_finish_refusal.rs"]
 mod cad2337_stale_socket_finish_refusal;
 
 // Independently authored CAD-2584 acceptance; implementers must not weaken it.
 #[cfg(test)]
+#[path = "local_assignment/cad2584_private_app_acceptance.rs"]
 mod cad2584_private_app_acceptance;
 
 pub const VERSION: &str = "hosted-cadence-local-assignment.v1";

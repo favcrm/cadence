@@ -8,14 +8,15 @@ autobins = false
 autotests = false
 
 [features]
-ui = ["cadence-agent/ui"]
-test-seam = ["cadence-agent/test-seam"]
-native-fixture-admission = ["cadence-agent/native-fixture-admission"]
-cli-runtime-test = ["test-seam", "cadence-agent/cli-runtime-test"]
+ui = ["cadence-agent/ui", "cadence-ops/ui"]
+test-seam = ["cadence-agent/test-seam", "cadence-ops/test-seam"]
+native-fixture-admission = ["cadence-agent/native-fixture-admission", "cadence-ops/native-fixture-admission"]
+cli-runtime-test = ["test-seam", "cadence-agent/cli-runtime-test", "cadence-ops/cli-runtime-test"]
 
 [dependencies]
 cadence-agent = { path = "../.." }
 cadence-core = { path = "../cadence-core", features = ["custody-crypto"] }
+cadence-ops = { path = "../cadence-ops" }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }

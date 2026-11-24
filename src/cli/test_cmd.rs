@@ -72,7 +72,7 @@ pub(super) fn run(state_dir: &Path, action: &TestAction) -> Result<i32> {
                     "full": full,
                     "no_cache": no_cache,
                     "rustflags": std::env::var("RUSTFLAGS").unwrap_or_default(),
-                    "env": cadence_agent::test_queue::allowlisted_env(std::env::vars()),
+                    "env": cadence_ops::test_queue::allowlisted_env(std::env::vars()),
                 }),
             )?;
             print_json(&view);

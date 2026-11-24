@@ -10,12 +10,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cadence_agent::local_assignment::delivery::deliver_kickoff;
-#[cfg(test)]
-use cadence_agent::local_assignment::delivery::{redact_secrets, write_note};
-use cadence_agent::local_assignment::http::BoardHttp;
-use cadence_agent::local_assignment::{Coordinator, Kickoff};
 use cadence_agent::remote_cli::RemoteTarget;
+use cadence_ops::local_assignment::delivery::deliver_kickoff;
+#[cfg(test)]
+use cadence_ops::local_assignment::delivery::{redact_secrets, write_note};
+use cadence_ops::local_assignment::http::BoardHttp;
+use cadence_ops::local_assignment::{Coordinator, Kickoff};
 use clap::Subcommand;
 use serde_json::{json, Value};
 
@@ -140,7 +140,7 @@ pub(super) fn hosted_finish(
         Some(dir) => dir.to_path_buf(),
         None => cadence_agent::client::state_dir()?,
     };
-    cadence_agent::local_assignment::finish_guidance::release(&coord, issue, worktree, &state)
+    cadence_ops::local_assignment::finish_guidance::release(&coord, issue, worktree, &state)
 }
 
 pub(super) fn run(
@@ -153,7 +153,7 @@ pub(super) fn run(
     // a running daemon. BoardHttp retains saved-login renewal and identity pins.
     match action {
         LocalAgentAction::Directory { after_id } => {
-            return finish(&cadence_agent::local_assignment::notifications::directory(
+            return finish(&cadence_ops::local_assignment::notifications::directory(
                 target,
                 after_id.as_deref(),
             )?);
@@ -165,7 +165,7 @@ pub(super) fn run(
             issues,
             wiki,
         } => {
-            let value = cadence_agent::local_assignment::notifications::notify(
+            let value = cadence_ops::local_assignment::notifications::notify(
                 target,
                 agent_id,
                 operation_id,
@@ -320,7 +320,7 @@ pub(super) fn run(
                 .map(Ok)
                 .unwrap_or_else(cadence_agent::client::state_dir)?;
             value["inbox"] =
-                cadence_agent::local_assignment::events::observe(&state, &target.org_id, false)?;
+                cadence_ops::local_assignment::events::observe(&state, &target.org_id, false)?;
             value
         }
         LocalAgentAction::Inbox { clear } => {
@@ -376,7 +376,7 @@ pub(super) fn run(
             };
             let cancelled = coord.reassign(assignment, to.as_deref(), *cancel)?;
             if let Some(state) = state {
-                let released = cadence_agent::local_assignment::finish_guidance::release_cancelled(
+                let released = cadence_ops::local_assignment::finish_guidance::release_cancelled(
                     &coord, assignment, &state,
                 )
                 .map_err(|error| Error::unknown(format!(
@@ -392,7 +392,7 @@ pub(super) fn run(
             }
         }
         LocalAgentAction::ReconcileRelease { assignment } => {
-            cadence_agent::local_assignment::finish_guidance::reconcile_absent_guard(
+            cadence_ops::local_assignment::finish_guidance::reconcile_absent_guard(
                 &coord, assignment,
             )?
         }

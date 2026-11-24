@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use super::github::{gh_text, git_text, is_plain_ref};
 use super::{item, parse_iso, Item};
 
+#[path = "main_ci/classify.rs"]
 mod classify;
 
 pub(crate) use classify::{classify_main_ci, main_ci_alerts, CiState, MainCiAlerts, ShaCi};

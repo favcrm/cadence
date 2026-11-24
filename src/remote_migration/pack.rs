@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
 
+#[path = "pack/plan.rs"]
 mod plan;
 
 use std::io::{self, Read};

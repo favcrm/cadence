@@ -20,7 +20,8 @@ use crate::business_templates::{
 use crate::error::{Error, Result};
 
 /// The schema (v40): template versions and the drafts pinned to them.
-pub(crate) const SCHEMA: &str = "
+#[doc(hidden)]
+pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS business_template_versions(
     company_id TEXT NOT NULL,
     name TEXT NOT NULL,

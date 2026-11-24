@@ -731,7 +731,8 @@ pub enum SealError {
 /// latch-absent legacy db and a non-existent path pass outside the fixed
 /// protected enclave. Inside it, even absent/partial/shadow paths refuse;
 /// only authentic owner startup can initialize the protected database.
-pub(crate) fn preflight_writer_guard(path: &std::path::Path) -> Result<()> {
+#[doc(hidden)]
+pub fn preflight_writer_guard(path: &std::path::Path) -> Result<()> {
     owner::refuse_legacy_path(path)?;
     if !path.exists() {
         return Ok(());
@@ -766,7 +767,8 @@ impl From<SealError> for Error {
 /// Recheck a legacy sibling writer after it has acquired BEGIN IMMEDIATE.
 /// Only latch-absent databases qualify; this grants no protected authority.
 /// Private callers must hold that transaction through their complete mutation.
-pub(crate) fn require_legacy_writer_tx(tx: &Transaction<'_>) -> Result<()> {
+#[doc(hidden)]
+pub fn require_legacy_writer_tx(tx: &Transaction<'_>) -> Result<()> {
     if tx.is_autocommit() {
         return Err(SealError::Unknown("sibling writer has no held transaction".into()).into());
     }

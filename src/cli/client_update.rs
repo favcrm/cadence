@@ -10,7 +10,7 @@
 
 use super::*;
 use cadence_agent::proc::BoundedError;
-use cadence_agent::upgrade::{is_full_sha, is_version_tag, sha256_file, DEFAULT_REPO, WORKFLOW};
+use cadence_ops::upgrade::{is_full_sha, is_version_tag, sha256_file, DEFAULT_REPO, WORKFLOW};
 use serde::Deserialize;
 use std::fs;
 use std::io::ErrorKind;
@@ -533,9 +533,9 @@ fn run_limited(cmd: &mut Command, timeout: Duration, limit: usize, what: &str) -
 /// remains the advanced https:// override and a source failure refuses,
 /// never silently falling back to GitHub).
 pub(super) fn latest_tag(release_source: Option<&str>) -> Result<String> {
-    let base = cadence_agent::releases::resolve_base(release_source)?;
+    let base = cadence_ops::releases::resolve_base(release_source)?;
     let source =
-        cadence_agent::releases::source_for(&base, cadence_agent::releases::PROFILE_PUBLIC_CLIENT)?;
+        cadence_ops::releases::source_for(&base, cadence_ops::releases::PROFILE_PUBLIC_CLIENT)?;
     let tag = match source.latest()? {
         Some(entry) => entry.version,
         None => {
@@ -604,9 +604,9 @@ fn fetch_verified(
     // The production constructor stays `https://`-only; the test-seam
     // loopback constructor exists only in `test-seam` debug builds and
     // supplies the identical `HttpGh` shape here.
-    let base = cadence_agent::releases::resolve_base(release_source)?;
+    let base = cadence_ops::releases::resolve_base(release_source)?;
     let source =
-        cadence_agent::releases::source_for(&base, cadence_agent::releases::PROFILE_PUBLIC_CLIENT)?;
+        cadence_ops::releases::source_for(&base, cadence_ops::releases::PROFILE_PUBLIC_CLIENT)?;
     fetch_verified_with(tag, target, runner, source)
 }
 
@@ -616,7 +616,7 @@ fn fetch_verified_with(
     tag: &str,
     target: &str,
     runner: &str,
-    source: cadence_agent::releases::HttpGh,
+    source: cadence_ops::releases::HttpGh,
 ) -> Result<Verified> {
     let scratch = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
@@ -638,7 +638,7 @@ fn fetch_verified_with(
         }
         let archive = source.release_artifact(&entry, &asset, target)?.clone();
         let checksum = source.release_artifact(&entry, &sha_name, target)?.clone();
-        let bundle_name = cadence_agent::releases::client_bundle_name(target);
+        let bundle_name = cadence_ops::releases::client_bundle_name(target);
         let bundle = source
             .release_artifact(&entry, &bundle_name, target)?
             .clone();
@@ -668,23 +668,23 @@ fn fetch_verified_with(
         let receipt = source
             .release_artifact(
                 &entry,
-                cadence_agent::upgrade::PUBLICATION_RECEIPT,
+                cadence_ops::upgrade::PUBLICATION_RECEIPT,
                 "publication",
             )?
             .clone();
         let pub_bundle = source
             .release_artifact(
                 &entry,
-                cadence_agent::upgrade::PUBLICATION_BUNDLE,
+                cadence_ops::upgrade::PUBLICATION_BUNDLE,
                 "publication",
             )?
             .clone();
         let receipt_file = scratch
             .path()
-            .join(cadence_agent::upgrade::PUBLICATION_RECEIPT);
+            .join(cadence_ops::upgrade::PUBLICATION_RECEIPT);
         let pub_bundle_file = scratch
             .path()
-            .join(cadence_agent::upgrade::PUBLICATION_BUNDLE);
+            .join(cadence_ops::upgrade::PUBLICATION_BUNDLE);
         source.download_artifact(&entry, &receipt, &receipt_file)?;
         source.download_artifact(&entry, &pub_bundle, &pub_bundle_file)?;
         publication = Some((receipt_file, pub_bundle_file));
@@ -838,9 +838,9 @@ pub(crate) fn fetch_verified_loopback(
     runner: &str,
     loopback_base: &str,
 ) -> Result<String> {
-    let source = cadence_agent::releases::HttpGh::for_profile_loopback(
+    let source = cadence_ops::releases::HttpGh::for_profile_loopback(
         loopback_base,
-        cadence_agent::releases::PROFILE_PUBLIC_CLIENT,
+        cadence_ops::releases::PROFILE_PUBLIC_CLIENT,
     )?;
     fetch_verified_with(tag, target, runner, source).map(|v| v.digest)
 }
@@ -875,9 +875,9 @@ fn attest(
     // named it) and re-binds the statement's recorded subject name
     // and digest to this exact tarball.
     let root = tempfile::NamedTempFile::new()?;
-    fs::write(root.path(), cadence_agent::upgrade::TRUSTED_ROOT_SNAPSHOT)?;
+    fs::write(root.path(), cadence_ops::upgrade::TRUSTED_ROOT_SNAPSHOT)?;
     let digest = sha256_file(tarball)?;
-    cadence_agent::upgrade::OfflineGh::new(DEFAULT_REPO)
+    cadence_ops::upgrade::OfflineGh::new(DEFAULT_REPO)
         .verify_bundle(
             tarball,
             bundle,
@@ -978,11 +978,11 @@ fn verify_publication_receipt(
              — refusing; the receipt does not cover the actual published assets",
         ));
     }
-    let digest = cadence_agent::upgrade::sha256_file(receipt_file)?;
+    let digest = cadence_ops::upgrade::sha256_file(receipt_file)?;
     let root = tempfile::NamedTempFile::new()?;
-    fs::write(root.path(), cadence_agent::upgrade::TRUSTED_ROOT_SNAPSHOT)?;
+    fs::write(root.path(), cadence_ops::upgrade::TRUSTED_ROOT_SNAPSHOT)?;
     let source_ref = format!("refs/tags/{tag}");
-    let facts = cadence_agent::upgrade::OfflineGh::new(DEFAULT_REPO)
+    let facts = cadence_ops::upgrade::OfflineGh::new(DEFAULT_REPO)
         .verify_bundle(
             receipt_file,
             bundle_file,
@@ -990,7 +990,7 @@ fn verify_publication_receipt(
             WORKFLOW,
             &source_ref,
             Some(source),
-            cadence_agent::upgrade::PUBLICATION_RECEIPT,
+            cadence_ops::upgrade::PUBLICATION_RECEIPT,
             &digest,
             "publication",
         )

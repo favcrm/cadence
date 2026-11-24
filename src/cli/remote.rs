@@ -19,8 +19,8 @@ use super::*;
 use blob_cat::collect_remote_blob;
 use blob_cat::remote_blob_cat;
 use cadence_agent::remote_cli::RemoteTarget;
-use cadence_agent::remote_migration::MigrationCommand;
 use cadence_agent::wiki::cli::WikiAction;
+use cadence_ops::remote_migration::MigrationCommand;
 use document_template::{remote_document, remote_template};
 use media_artifact::remote_platform_artifact;
 #[cfg(test)]
@@ -3795,7 +3795,7 @@ fn remote_restore(
                  import/--replace run",
             ));
         }
-        let receipt = cadence_agent::remote_migration::run(
+        let receipt = cadence_ops::remote_migration::run(
             &target,
             MigrationCommand::Status {
                 operation_id: id.to_string(),
@@ -3827,7 +3827,7 @@ fn remote_restore(
                  `restore --portable --status`, never a preflight pair",
             ));
         }
-        let receipt = cadence_agent::remote_migration::run(
+        let receipt = cadence_ops::remote_migration::run(
             &target,
             MigrationCommand::Rollback {
                 operation_id: id,
@@ -3853,7 +3853,7 @@ fn remote_restore(
                  --expected-* — it prints the values those flags need",
             ));
         }
-        let receipt = cadence_agent::remote_migration::run(
+        let receipt = cadence_ops::remote_migration::run(
             &target,
             MigrationCommand::Preflight { source },
             note,
@@ -3879,7 +3879,7 @@ fn remote_restore(
                  `restore --portable --preflight`",
             ));
         }
-        let receipt = cadence_agent::remote_migration::run(
+        let receipt = cadence_ops::remote_migration::run(
             &target,
             MigrationCommand::Replace {
                 source,
@@ -3901,7 +3901,7 @@ fn remote_restore(
     }
     // A plain remote `restore --portable --request-id …` imports INACTIVE —
     // it never replaces or activates a running workspace.
-    let receipt = cadence_agent::remote_migration::run(
+    let receipt = cadence_ops::remote_migration::run(
         &target,
         MigrationCommand::Import { source, request_id },
         note,
@@ -4090,7 +4090,7 @@ mod tests {
     #[test]
     fn hosted_finish_refuses_through_remote_dispatch_without_tracker_access() {
         use cadence_agent::issue::cli::IssueAction;
-        use cadence_agent::local_assignment::{CoordHttp, Coordinator, Reply};
+        use cadence_ops::local_assignment::{CoordHttp, Coordinator, Reply};
         use std::{cell::Cell, os::unix::fs::PermissionsExt, rc::Rc};
 
         struct FakeRemote(Rc<Cell<usize>>);
@@ -4136,7 +4136,7 @@ mod tests {
             Some(tracker.clone()),
             Some("issue finish".into()),
             |_, issue, worktree, state| {
-                cadence_agent::local_assignment::finish_guidance::release(
+                cadence_ops::local_assignment::finish_guidance::release(
                     &coordinator,
                     issue,
                     worktree,

@@ -750,7 +750,7 @@ fn hosted_assignment_target(
         return Err(managed_org_refused());
     };
     let bound =
-        cadence_agent::local_assignment::reporting::hosted_binding_target(state_dir, &message_id)?;
+        cadence_ops::local_assignment::reporting::hosted_binding_target(state_dir, &message_id)?;
     let Some(bound) = bound else {
         return Err(managed_org_refused());
     };
@@ -758,7 +758,7 @@ fn hosted_assignment_target(
         return Err(managed_org_refused());
     }
     let credential_path =
-        cadence_agent::local_assignment::reporting::agent_credential_path(state_dir, &message_id)?;
+        cadence_ops::local_assignment::reporting::agent_credential_path(state_dir, &message_id)?;
     let (assignment_id, claim_id, generation) =
         (bound.assignment_id, bound.claim_id, bound.generation);
     let target = cadence_agent::remote_cli::RemoteTarget {
@@ -2157,7 +2157,7 @@ pub(super) mod tests {
     }
 
     fn bind_hosted(dir: &Path, message: &str) {
-        let kickoff = cadence_agent::local_assignment::Kickoff {
+        let kickoff = cadence_ops::local_assignment::Kickoff {
             alias: "worker-1",
             issue_id: "CAD-1460",
             assignment_id: "hla_00000000000000000000000000000001",
@@ -2173,7 +2173,7 @@ pub(super) mod tests {
             action: "dispatch",
             note: None,
         };
-        cadence_agent::local_assignment::reporting::store_kickoff_binding(
+        cadence_ops::local_assignment::reporting::store_kickoff_binding(
             dir,
             "acme",
             EP_A,
@@ -2299,7 +2299,7 @@ pub(super) mod tests {
             .unwrap()
             .replace(EP_A, &endpoint);
         std::fs::write(&login, text).unwrap();
-        let kickoff = cadence_agent::local_assignment::Kickoff {
+        let kickoff = cadence_ops::local_assignment::Kickoff {
             alias: "worker-1",
             issue_id: "CAD-1460",
             assignment_id: "hla_00000000000000000000000000000001",
@@ -2315,7 +2315,7 @@ pub(super) mod tests {
             action: "dispatch",
             note: None,
         };
-        cadence_agent::local_assignment::reporting::store_kickoff_binding(
+        cadence_ops::local_assignment::reporting::store_kickoff_binding(
             &dir,
             "acme",
             &endpoint,

@@ -69,8 +69,11 @@ use serde_json::json;
 use crate::client;
 use crate::error::{Error, Result};
 
+#[path = "setup/handover.rs"]
 mod handover;
+#[path = "setup/plan_offer.rs"]
 mod plan_offer;
+#[path = "setup/provider.rs"]
 mod provider;
 
 #[cfg(test)]

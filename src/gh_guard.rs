@@ -37,7 +37,8 @@ fn pause_file(state_dir: &Path) -> PathBuf {
 /// The epoch second `gh` is paused until, if still in the future. A
 /// corrupt or far-future file never holds `gh` past the longest pause
 /// this module would write.
-pub(crate) fn paused_until(state_dir: &Path) -> Option<i64> {
+#[doc(hidden)]
+pub fn paused_until(state_dir: &Path) -> Option<i64> {
     let text = std::fs::read_to_string(pause_file(state_dir)).ok()?;
     let until = serde_json::from_str::<Value>(&text).ok()?["until"].as_i64()?;
     let at = now();
@@ -45,7 +46,8 @@ pub(crate) fn paused_until(state_dir: &Path) -> Option<i64> {
 }
 
 /// The note shown while `gh` is paused.
-pub(crate) fn paused_note(until: i64) -> String {
+#[doc(hidden)]
+pub fn paused_note(until: i64) -> String {
     format!(
         "github API rate limit exceeded — gh calls paused until {}",
         crate::issue::time::iso(until)
@@ -123,7 +125,8 @@ fn record_pause(state_dir: &Path, reset: Option<i64>) -> i64 {
 /// Run `gh` unless paused; a rate-limit failure starts the pause. The
 /// error is the refusal text; a `gh` failure is returned as `Ok` for
 /// the caller to read as it always did.
-pub(crate) fn run(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+#[doc(hidden)]
+pub fn run(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
     if !take_call() {
         return Err("gh call cap for this pass is spent".to_string());
     }

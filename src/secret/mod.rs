@@ -53,6 +53,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[doc(hidden)]
+pub fn shared_has_secret_prefix(tok: &str) -> bool {
+    has_secret_prefix(tok)
+}
 use crate::doctor::host::{has_secret_prefix, redact_argv};
 use crate::error::{Error, Result};
 

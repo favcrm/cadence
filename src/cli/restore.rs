@@ -38,16 +38,14 @@ pub(super) fn run(opts: Options) -> Result<i32> {
     // `check_flags` refused `None`; a local restore always has a source.
     let source = source.expect("source required by check_flags");
     if !portable {
-        let opts = cadence_agent::backup::RestoreOptions { force, repos };
-        print_json(&cadence_agent::backup::restore(&source, &state_dir, &opts)?);
+        let opts = cadence_ops::backup::RestoreOptions { force, repos };
+        print_json(&cadence_ops::backup::restore(&source, &state_dir, &opts)?);
         return Ok(0);
     }
     if activate_preflight {
         // Read-only plan: the package digest and the exact list of non-terminal
         // rows the caller must name. Nothing is written anywhere.
-        print_json(&cadence_agent::backup::portable::activate_preflight(
-            &source,
-        )?);
+        print_json(&cadence_ops::backup::portable::activate_preflight(&source)?);
         return Ok(0);
     }
     if activate_disabled {
@@ -59,14 +57,14 @@ pub(super) fn run(opts: Options) -> Result<i32> {
                 let text = std::fs::read_to_string(&path)?;
                 let value: serde_json::Value = serde_json::from_str(&text)
                     .map_err(|e| Error::usage(format!("reconciliation file: {e}")))?;
-                cadence_agent::backup::portable_activate::parse_reconciliation(
+                cadence_ops::backup::portable_activate::parse_reconciliation(
                     &value["reconciliation"],
                 )
                 .map_err(|e| Error::usage(format!("reconciliation file: {e}")))?
             }
             None => Vec::new(),
         };
-        print_json(&cadence_agent::backup::portable::restore_activate_disabled(
+        print_json(&cadence_ops::backup::portable::restore_activate_disabled(
             &source,
             &state_dir,
             &reconciliation,
@@ -79,7 +77,7 @@ pub(super) fn run(opts: Options) -> Result<i32> {
         // generation and required inventory but not the package digest.
         // Compute it locally from the same manifest bytes the activation
         // request will bind; nothing is written.
-        let package_digest = cadence_agent::backup::portable_replace::package_digest(&source)?;
+        let package_digest = cadence_ops::backup::portable_replace::package_digest(&source)?;
         let mut result = client::rpc(
             &controller,
             "portable_activate_preflight",
@@ -171,8 +169,8 @@ pub(super) fn run(opts: Options) -> Result<i32> {
         print_json(&result);
         return Ok(0);
     }
-    let opts = cadence_agent::backup::portable::PortableRestoreOptions { replace: false };
-    print_json(&cadence_agent::backup::portable::restore_inactive(
+    let opts = cadence_ops::backup::portable::PortableRestoreOptions { replace: false };
+    print_json(&cadence_ops::backup::portable::restore_inactive(
         &source, &state_dir, &opts,
     )?);
     Ok(0)

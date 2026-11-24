@@ -1505,7 +1505,8 @@ pub enum MigrationTimeout {
 }
 
 impl MigrationTimeout {
-    pub(crate) fn cap(self) -> Duration {
+    #[doc(hidden)]
+    pub fn cap(self) -> Duration {
         match self {
             Self::Json => Duration::from_secs(30),
             Self::Manifest => Duration::from_secs(60),
@@ -1543,7 +1544,8 @@ pub struct MigrationRequest<'a, 'b> {
 /// `None` when the answer is not JSON. Redirects, oversized answers and every
 /// path outside the namespace are refused; the raw failure body is never
 /// surfaced to the caller beyond this function's parsed envelope.
-pub(crate) fn migration_issuer_request(
+#[doc(hidden)]
+pub fn migration_issuer_request(
     dir: &Path,
     issuer: &str,
     request: MigrationRequest<'_, '_>,

@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -17,7 +16,7 @@ pub const RISK_PATHS_TOML: &str = include_str!("../docs/roles/risk-paths.toml");
 /// `merge`, so a reader that binds operator approvals never counts it.
 pub const DELEGATED_ACTION: &str = "delegated-merge";
 /// The approval action of a ticket-time scope pre-approval.
-pub const SCOPE_ACTION: &str = "scope";
+pub use cadence_agent::delegation::{sha256_hex, SCOPE_ACTION};
 
 #[derive(Deserialize)]
 struct List {
@@ -233,13 +232,6 @@ pub fn ci_green(
         }
     }
     Ok(())
-}
-
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// The digest a scope pre-approval binds: the ticket's body.

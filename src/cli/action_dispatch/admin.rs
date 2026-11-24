@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
         Commands::InspectPortable { source } => {
-            print_json(&cadence_agent::backup::portable::inspect_portable(&source)?);
+            print_json(&cadence_ops::backup::portable::inspect_portable(&source)?);
             Ok(0)
         }
         Commands::Doctor {

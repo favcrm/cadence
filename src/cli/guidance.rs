@@ -6,8 +6,8 @@
 //! rollback and not a daemon restart.
 
 use cadence_agent::skill::ActivatedGuidance;
-use cadence_agent::update::RunReport;
-use cadence_agent::upgrade::Layout;
+use cadence_ops::update::RunReport;
+use cadence_ops::upgrade::Layout;
 
 use super::*;
 
@@ -264,7 +264,7 @@ fn daemon_scope(state_dir: &Path, cli_home: &Path) -> Value {
         .get("build_commit")
         .and_then(Value::as_str)
         .filter(|value| known_build(value));
-    let cli_build = cadence_agent::overview::BUILD_COMMIT;
+    let cli_build = cadence_ops::overview::BUILD_COMMIT;
     let cli_build = known_build(cli_build).then_some(cli_build);
     let mut out = json!({
         "build": build,
@@ -351,7 +351,7 @@ fn same_scope_home(_pid: u64) -> ScopeHome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadence_agent::update::{CheckReport, RunReport};
+    use cadence_ops::update::{CheckReport, RunReport};
     use std::os::unix::fs::PermissionsExt;
 
     fn quiet_check(target: &str, up_to_date: bool) -> CheckReport {

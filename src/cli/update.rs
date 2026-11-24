@@ -138,14 +138,14 @@ fn native_update_platform_guard() -> Result<()> {
 /// `cadence update`: the everyday path (CAD-561). `status`, `--check`
 /// and `--rollback` are the other faces of the same pipeline.
 pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
-    use cadence_agent::update;
+    use cadence_ops::update;
     native_update_platform_guard()?;
     let caller = update_caller(state_dir, args.as_identity.as_deref())?;
     // An established image-managed runtime refuses the native updater
     // outright — no install, restart, drain or marker work.
     refuse_managed_runtime()?;
     let layout =
-        cadence_agent::upgrade::Layout::detect(args.link.clone(), args.releases_dir.clone())?;
+        cadence_ops::upgrade::Layout::detect(args.link.clone(), args.releases_dir.clone())?;
     // CAD-1479: the owned catalogue is the default release source;
     // `--release-source` is the advanced https:// override, and a
     // non-default `--repo` still selects the GitHub route — see
@@ -304,8 +304,8 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
 
 fn guidance_after(
     state_dir: &Path,
-    layout: &cadence_agent::upgrade::Layout,
-    report: &cadence_agent::update::RunReport,
+    layout: &cadence_ops::upgrade::Layout,
+    report: &cadence_ops::update::RunReport,
 ) -> Value {
     match home_dir() {
         Ok(home) => guidance::after_update(state_dir, layout, report, &home),

@@ -2,13 +2,13 @@
 
 use super::*;
 
-/// `cadence upgrade`: verify and install (see `cadence_agent::upgrade`),
+/// `cadence upgrade`: verify and install (see `cadence_ops::upgrade`),
 /// then either print the restart command or, with `--restart`, run the
 /// NEW binary's `daemon restart --when-idle --ui`. The restart must run
 /// from the installed binary: `daemon restart` respawns `current_exe()`,
 /// so restarting from this (old) process would bring the old build back.
 pub(super) fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
-    use cadence_agent::upgrade;
+    use cadence_ops::upgrade;
     // A restart without a rollout identity would fail after the install;
     // refuse before touching anything instead.
     if args.restart {

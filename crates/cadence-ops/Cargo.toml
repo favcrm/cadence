@@ -1,0 +1,36 @@
+[package]
+name = "cadence-ops"
+version = "0.5.2"
+edition = "2021"
+license = "MIT"
+publish = false
+autobins = false
+autotests = false
+
+[features]
+ui = ["cadence-agent/ui"]
+test-seam = ["cadence-agent/test-seam"]
+native-fixture-admission = ["cadence-agent/native-fixture-admission"]
+cli-runtime-test = ["test-seam", "cadence-agent/cli-runtime-test"]
+
+[dependencies]
+cadence-agent = { path = "../.." }
+cadence-core = { path = "../cadence-core", features = ["custody-crypto"] }
+aho-corasick = "1"
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
+libc = "0.2"
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+regex = "1"
+ring = { version = "0.17", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "hooks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
+tracing = "0.1"
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+unicode-normalization = "0.1"
+ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+uuid = { version = "1", features = ["v4", "v5"] }

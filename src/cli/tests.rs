@@ -1737,7 +1737,7 @@ fn durations_parse() {
 #[test]
 fn overview_commands_all_parse() {
     use cadence_agent::issue::{self, write};
-    use cadence_agent::overview as ov;
+    use cadence_ops::overview as ov;
 
     let assert_parses = |cmd: &str| {
         let argv = shlex::split(cmd).unwrap_or_else(|| panic!("'{cmd}' does not split"));
@@ -1763,8 +1763,8 @@ fn overview_commands_all_parse() {
         ov::CMD_ISSUE_SYNC.to_string(),
         ov::CMD_RESTART_WHEN_IDLE.to_string(),
         ov::CMD_UPGRADE_LATEST_MAIN.to_string(),
-        cadence_agent::upgrade::restart_command(None),
-        cadence_agent::upgrade::restart_command(Some("operator:name")),
+        cadence_ops::upgrade::restart_command(None),
+        cadence_ops::upgrade::restart_command(Some("operator:name")),
     ] {
         assert_parses(&cmd);
     }

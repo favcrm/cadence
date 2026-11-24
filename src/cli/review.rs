@@ -14,7 +14,7 @@ pub(super) fn run(
     keep: bool,
     json: bool,
 ) -> Result<i32> {
-    cadence_agent::review::run(&cadence_agent::review::Options {
+    cadence_ops::review::run(&cadence_ops::review::Options {
         pr,
         repo,
         full: full || !no_full,

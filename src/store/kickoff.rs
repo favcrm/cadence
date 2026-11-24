@@ -28,7 +28,8 @@ pub fn check_commit_sha(sha: &str) -> Result<String> {
 /// call `message result --sha`, so the kickoff asks the agent to end
 /// its answer with this line. The LAST line wins — a worker discussing
 /// SHAs mid-answer cannot shadow the trailer it ends with.
-pub(crate) fn last_sha_line(text: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn last_sha_line(text: &str) -> Option<String> {
     text.lines().rev().find_map(|line| {
         let hex = line
             .trim()

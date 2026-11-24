@@ -23,7 +23,7 @@ mod attach;
 mod attachment;
 mod audit;
 mod backup;
-use cadence_agent::briefing;
+use cadence_ops::briefing;
 mod build_slot;
 mod business_templates;
 mod channel;
@@ -192,7 +192,7 @@ use workflow::WorkflowAction;
     about = "Local controller for coding agents",
     // `0.1.0+<build commit>` — semver build metadata, `unknown` when
     // the build ran outside a git checkout.
-    version = cadence_agent::overview::BUILD_ID
+    version = cadence_ops::overview::BUILD_ID
 )]
 pub(crate) struct Cli {
     /// Runtime state directory (socket, database, logs).
@@ -615,13 +615,13 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             let head = head.unwrap_or_default().trim().to_ascii_lowercase();
             let repo = match repo {
                 Some(r) => r,
-                None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
-                    || {
+                None => {
+                    cadence_ops::audit::origin_slug(&std::env::current_dir()?).ok_or_else(|| {
                         Error::rejected(
                             "no github.com origin remote in the cwd — pass --repo owner/name",
                         )
-                    },
-                )?,
+                    })?
+                }
             };
             // No `--id`: the daemon picks the default, counting past a
             // revoked one so a re-approval is a fresh record.
@@ -700,7 +700,7 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
                      digest takes no --project. Nothing was read"
                 )));
             }
-            cadence_agent::audit::digest(state_dir, since.as_deref())?
+            cadence_ops::audit::digest(state_dir, since.as_deref())?
         }
         AuditAction::Revoke {
             id,

@@ -86,7 +86,8 @@ impl Directories {
     }
     /// Artifact directories allocate every missing component exclusively;
     /// existing components receive the same owner-controlled admission.
-    pub(crate) fn artifact(path: &Path, fresh: bool) -> Result<(Self, bool)> {
+    #[doc(hidden)]
+    pub fn artifact(path: &Path, fresh: bool) -> Result<(Self, bool)> {
         Self::open_mode(path, true, true, fresh, true)
     }
     /// Legacy metadata/artifact compatibility under owner-controlled paths,
@@ -191,7 +192,8 @@ impl Directories {
     }
     /// Remove only this still-pinned final directory and only if empty.
     /// Caller must prove it exclusively created that component.
-    pub(crate) fn remove_empty_last(&self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn remove_empty_last(&self) -> Result<()> {
         self.check()?;
         let parent = &self.handles[self.handles.len() - 2];
         let leaf = self.names.last().ok_or_else(store_refused)?;
@@ -200,17 +202,13 @@ impl Directories {
         }
         parent.sync_all().map_err(|_| store_refused())
     }
-    #[cfg(all(debug_assertions, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn last(&self) -> &File {
         self.handles.last().expect("root descriptor always present")
     }
-    #[cfg(not(all(debug_assertions, feature = "test-seam")))]
-    pub(crate) fn last(&self) -> &File {
-        self.handles.last().expect("root descriptor always present")
-    }
     /// Metadata-only inspection; never opens the configured key/vault leaf.
-    pub(crate) fn stat(&self, leaf: &std::ffi::OsStr) -> Result<Option<libc::stat>> {
+    #[doc(hidden)]
+    pub fn stat(&self, leaf: &std::ffi::OsStr) -> Result<Option<libc::stat>> {
         statat(self.last(), &name(leaf.as_bytes())?)
     }
     /// Only the fixed path-only record is opened here, never a key file.
@@ -228,7 +226,8 @@ impl Directories {
         Ok(Some(file))
     }
     #[allow(clippy::unnecessary_cast)] // stat field widths differ across Unix hosts
-    pub(crate) fn check(&self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn check(&self) -> Result<()> {
         let mut private_ancestor = false;
         for (i, part) in self.names.iter().enumerate() {
             let current = statat(&self.handles[i], part)?.ok_or_else(store_refused)?;

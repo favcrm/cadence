@@ -36,13 +36,21 @@ use crate::inbox;
 use crate::issue::line_times::LineTimes;
 use crate::issue::{board, project};
 
+#[path = "overview/assembly.rs"]
 mod assembly;
+#[path = "overview/commands.rs"]
 mod commands;
+#[path = "overview/github.rs"]
 mod github;
+#[path = "overview/github_cache.rs"]
 mod github_cache;
+#[path = "overview/main_ci.rs"]
 mod main_ci;
+#[path = "overview/monitoring.rs"]
 pub mod monitoring;
+#[path = "overview/needs_merge.rs"]
 mod needs_merge;
+#[path = "overview/sources.rs"]
 mod sources;
 
 pub use commands::{
@@ -74,16 +82,9 @@ use sources::{AgentProbe, DaemonView};
 /// Git identity baked in by build.rs — `unknown` when git or a repo
 /// was absent at build time, which every consumer reads as "cannot
 /// tell", never as zero.
-pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const BUILD_COMMIT: &str = env!("CADENCE_BUILD_COMMIT");
-/// The full build id `cadence --version` prints (`0.1.0+<sha>`, the
-/// same concat main.rs gives clap). The board announces it in the
-/// stream's `hello` frame and answers it on `/api/version` so an older
-/// tab bundle knows it is stale (CAD-573).
-pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CADENCE_BUILD_COMMIT"));
-pub const BUILD_TIME: &str = env!("CADENCE_BUILD_TIME");
-pub const BUILD_REMOTE: &str = env!("CADENCE_BUILD_REMOTE");
-pub const BUILD_ROOT: &str = env!("CADENCE_BUILD_ROOT");
+pub use cadence_agent::overview::{
+    checks_green_pub, BUILD_COMMIT, BUILD_ID, BUILD_REMOTE, BUILD_ROOT, BUILD_TIME, BUILD_VERSION,
+};
 
 /// `gh` results are cached this long in the state dir — the board and
 /// the CLI share one cache, and GitHub is the only source allowed to
@@ -1452,10 +1453,6 @@ pub(crate) fn build_repo_match_pub(projects: &[project::Project]) -> Option<(Str
 /// Verdict + checks on a PR rollup, for the session-end handoff.
 pub(crate) fn verdict_state_pub(rollup: &[Value]) -> Option<String> {
     verdict_state(rollup)
-}
-
-pub fn checks_green_pub(rollup: &[Value]) -> bool {
-    checks_green(rollup)
 }
 
 #[cfg(test)]

@@ -6,9 +6,10 @@
 
 use super::*;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 thread_local! {
-    pub(crate) static BEFORE_FINAL_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    #[doc(hidden)]
+    pub static BEFORE_FINAL_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
 }
 
@@ -17,7 +18,8 @@ thread_local! {
 /// origin's own GitHub repository (see [`hosted_evidence`]). Nothing is
 /// inferred from content, and "pushed" alone, which native finish accepts, is
 /// not enough: a hosted lane has no tracker ref to keep a branch findable.
-pub(crate) fn release_hosted_lane(
+#[doc(hidden)]
+pub fn release_hosted_lane(
     issue: &str,
     root: &Path,
     path: &Path,
@@ -134,7 +136,7 @@ pub(crate) fn release_hosted_lane(
             Ok(_) => Ok(()),
         }
     };
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     BEFORE_FINAL_LOCK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook();
@@ -267,7 +269,8 @@ pub(crate) fn github_slug(url: &str) -> Option<String> {
 
 /// The real lookup: `gh pr list -R <slug> --head <branch> --state merged`.
 /// `None` on any failure (no `gh`, not signed in, a timeout, bad JSON).
-pub(crate) fn gh_merged_prs(slug: &str, branch: &str) -> Option<Value> {
+#[doc(hidden)]
+pub fn gh_merged_prs(slug: &str, branch: &str) -> Option<Value> {
     let mut cmd = Command::new("gh");
     cmd.args([
         "-R",

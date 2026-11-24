@@ -50,6 +50,7 @@ use crate::remote_enrollment::{
     migration_issuer_request, MigrationBody, MigrationRequest, MigrationTimeout,
 };
 
+#[path = "remote_migration/pack.rs"]
 mod pack;
 
 use pack::{

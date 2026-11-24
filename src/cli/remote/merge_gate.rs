@@ -10,7 +10,8 @@ use std::io;
 use cadence_agent::delivery::hosted_gate::{self, GateBinding};
 use cadence_agent::issue::cli::{IssueAction, ProjectAction};
 use cadence_agent::remote_cli::{saved_capabilities, RemoteTarget};
-use cadence_agent::{audit as core_audit, Error, Result};
+use cadence_agent::{Error, Result};
+use cadence_ops::audit as core_audit;
 use serde_json::Value;
 
 use super::scope_hint;

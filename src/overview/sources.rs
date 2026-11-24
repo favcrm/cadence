@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::wildcard_imports, clippy::unwrap_used))]
 
+#[path = "sources/probe.rs"]
 mod probe;
 
 use super::github_cache::github_throttled;

@@ -8,8 +8,8 @@ pub(super) fn run(
     keep: u64,
     reason: String,
 ) -> Result<i32> {
-    let dir = dir.unwrap_or_else(|| cadence_agent::backup::default_dir(&state_dir));
-    print_json(&cadence_agent::backup::backup(
+    let dir = dir.unwrap_or_else(|| cadence_ops::backup::default_dir(&state_dir));
+    print_json(&cadence_ops::backup::backup(
         &state_dir,
         &dir,
         keep as usize,

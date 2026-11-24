@@ -84,8 +84,9 @@ pub const TEST_JOB: &str = "test";
 /// Ref prefix of the merge queue's temporary branches for `main`; a
 /// merge_group run on one of them is test evidence for its head sha.
 pub const QUEUE_REF_PREFIX: &str = "gh-readonly-queue/main/";
+use cadence_agent::upgrade::release_of;
 /// Files inside the artifact and inside `<releases>/<sha>/`.
-pub const BINARY: &str = "cadence";
+pub use cadence_agent::upgrade::{is_full_sha, is_version_tag, releases_dir_of, BINARY};
 pub const SHA_FILE: &str = "cadence.sha256";
 pub const MANIFEST: &str = "manifest.json";
 /// The restart `--restart` runs with the newly installed binary, and the
@@ -96,12 +97,6 @@ pub const RESTART_ARGS: [&str; 4] = ["daemon", "restart", "--when-idle", "--ui"]
 /// `cadence-<sha>-x86_64-linux`, the name CI uploads under.
 pub fn artifact_name(sha: &str) -> String {
     format!("cadence-{sha}-{TARGET}")
-}
-
-/// A full lowercase 40-hex commit id — never an abbreviation, a ref
-/// name, or anything a shell or `gh` could read as an option.
-pub fn is_full_sha(s: &str) -> bool {
-    s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A successful dispatch includes staging and production approval.
@@ -1546,45 +1541,6 @@ impl Layout {
     pub fn binary(&self, sha: &str) -> PathBuf {
         self.release_dir(sha).join(BINARY)
     }
-}
-
-/// `<dir>/<40-hex>/cadence` → `(<dir>, sha)`.
-fn release_of(target: &Path) -> Option<(PathBuf, String)> {
-    if target.file_name()? != BINARY {
-        return None;
-    }
-    let sha_dir = target.parent()?;
-    let sha = sha_dir.file_name()?.to_str()?;
-    if !is_full_sha(sha) {
-        return None;
-    }
-    Some((sha_dir.parent()?.to_path_buf(), sha.to_string()))
-}
-
-/// A release tag as `install.sh` names its directory: `v` and a version
-/// made of ASCII alphanumerics and `.+_-`, starting with a digit.
-pub fn is_version_tag(s: &str) -> bool {
-    s.strip_prefix('v').is_some_and(|v| {
-        v.starts_with(|c: char| c.is_ascii_digit())
-            && v.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'_' | b'-'))
-    })
-}
-
-/// The releases dir holding a link target: `<dir>/<40-hex>/cadence` (an
-/// upgrade) or `<dir>/v<version>/cadence` (an `install.sh` release).
-pub(crate) fn releases_dir_of(target: &Path) -> Option<PathBuf> {
-    if let Some((dir, _)) = release_of(target) {
-        return Some(dir);
-    }
-    if target.file_name()? != BINARY {
-        return None;
-    }
-    let tag_dir = target.parent()?;
-    if !is_version_tag(tag_dir.file_name()?.to_str()?) {
-        return None;
-    }
-    Some(tag_dir.parent()?.to_path_buf())
 }
 
 /// What the link points at now.

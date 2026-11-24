@@ -11,7 +11,8 @@ thread_local! {
 }
 
 /// Run `f` with every finish daemon probe on this thread bounded by `d`.
-pub(crate) fn with_probe_timeout<T>(d: std::time::Duration, f: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_probe_timeout<T>(d: std::time::Duration, f: impl FnOnce() -> T) -> T {
     let prev = PROBE_TIMEOUT.with(|t| t.replace(Some(d)));
     let out = f();
     PROBE_TIMEOUT.with(|t| t.set(prev));

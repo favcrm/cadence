@@ -11,11 +11,18 @@ description = "Local controller coordinating coding agents across terminals"
 members = [
     ".",
     "crates/cadence-core",
+    "crates/cadence-ops",
     "crates/cadence-daemon",
     "crates/cadence-ui",
     "crates/cadence-cli",
 ]
-default-members = [".", "crates/cadence-daemon", "crates/cadence-ui", "crates/cadence-cli"]
+default-members = [
+    ".",
+    "crates/cadence-ops",
+    "crates/cadence-daemon",
+    "crates/cadence-ui",
+    "crates/cadence-cli",
+]
 resolver = "2"
 
 [lib]
@@ -201,6 +208,9 @@ lto = false
 # Dependencies keep opt-level 1; the one workspace crate is front-end bound,
 # so skipping its LLVM optimisation is the cheap win (CAD-1103 measurements).
 [profile.ci.package.cadence-agent]
+opt-level = 0
+
+[profile.ci.package.cadence-ops]
 opt-level = 0
 
 [profile.ci.package.cadence-daemon]

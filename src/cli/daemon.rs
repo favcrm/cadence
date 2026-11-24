@@ -127,8 +127,8 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             // old store renamed aside; a daemon started now would create
             // an empty store next to it. `serve` refuses too; this says
             // so before anything is spawned.
-            cadence_agent::backup::refuse_interrupted_restore(&state_dir)?;
-            cadence_agent::backup::portable::refuse_if_inactive(&state_dir)?;
+            cadence_ops::backup::refuse_interrupted_restore(&state_dir)?;
+            cadence_ops::backup::portable::refuse_if_inactive(&state_dir)?;
             let mut result = client::daemon_start_as(&state_dir, as_identity.as_deref())?;
             // --resume: once the daemon answers, sweep every agent
             // with a stored thread and no live endpoint.
@@ -352,7 +352,7 @@ pub(crate) fn ui_run_args(pid: i32) -> (String, u16, Option<std::path::PathBuf>,
 /// would leave no daemon at all and the recovery only in daemon.log.
 /// Refuse with the same recovery message before anything stops.
 pub(crate) fn refuse_restart_over_leftovers(state_dir: &Path) -> Result<()> {
-    cadence_agent::backup::refuse_interrupted_restore(state_dir).map_err(|error| {
+    cadence_ops::backup::refuse_interrupted_restore(state_dir).map_err(|error| {
         Error::rejected(format!(
             "daemon restart refused before shutdown; the running daemon is untouched: {error}"
         ))

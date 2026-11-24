@@ -3268,12 +3268,14 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
     Ok(cred)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 thread_local! {
-    pub(crate) static CREDENTIAL_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    #[doc(hidden)]
+    pub static CREDENTIAL_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
+#[doc(hidden)]
+pub fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
     private_directory(dir)?;
     let file = OpenOptions::new()
         .read(true)
@@ -3292,7 +3294,7 @@ pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(file);
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         CREDENTIAL_WAITING.with(|observer| {
             if let Some(sender) = observer.borrow_mut().take() {
                 let _ = sender.send(());
@@ -4302,7 +4304,8 @@ pub fn upload_artifact(
     upload_artifact_in(&dir, target, upload, wake_timeout, agent.as_deref(), note)
 }
 
-pub(crate) fn upload_artifact_for_slot(
+#[doc(hidden)]
+pub fn upload_artifact_for_slot(
     dir: &Path,
     target: &RemoteTarget,
     upload: &ArtifactUpload,
@@ -6561,7 +6564,8 @@ pub fn call_verb(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn call_verb_for_slot(
+#[doc(hidden)]
+pub fn call_verb_for_slot(
     dir: &Path,
     target: &RemoteTarget,
     verb: &str,

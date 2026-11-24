@@ -8,7 +8,7 @@
 //! facts plus exactly one next command. That one grant also requests the
 //! optional owner-only `billing.read` (never `billing.cancel`); a declined
 //! or member-narrowed grant still signs in and reports billing unavailable.
-//! The checks themselves stay in `cadence_agent::setup`; `--json` keeps its
+//! The checks themselves stay in `cadence_ops::setup`; `--json` keeps its
 //! existing records and never prompts, signs in or calls the network — an
 //! explicit `--hosted`/`--register` with `--json` is refused before any of
 //! that. Without `--json` a pipe is asked the one scope question too (one
@@ -18,7 +18,7 @@
 use std::io::Write;
 
 use cadence_agent::remote_cli::RemoteTarget;
-use cadence_agent::setup::{Handover, PlanFact, SavedLogins, SignInFact, LIVE_INSTRUCTION};
+use cadence_ops::setup::{Handover, PlanFact, SavedLogins, SignInFact, LIVE_INSTRUCTION};
 
 use super::*;
 
@@ -83,7 +83,7 @@ fn run_with_hosted(
              login, or drop --hosted/--register to keep the machine records",
         ));
     }
-    let saved = cadence_agent::setup::saved_hosted_logins();
+    let saved = cadence_ops::setup::saved_hosted_logins();
     let mut sign_in = saved_fact(saved.as_ref());
     let mut target: Option<RemoteTarget> = None;
     let mut sign_in_failed = false;
@@ -110,16 +110,16 @@ fn run_with_hosted(
     // may hold. Only a verified sign-in selects hosted scope; an unconfirmed
     // sign-in keeps the local handover without claiming no session was issued.
     let scope = if sign_in.state == "verified" {
-        cadence_agent::setup::SCOPE_HOSTED
+        cadence_ops::setup::SCOPE_HOSTED
     } else {
-        cadence_agent::setup::SCOPE_LOCAL
+        cadence_ops::setup::SCOPE_LOCAL
     };
     // A hosted or unconfirmed sign-in reports the daemon and board without
     // starting either. An explicitly local run may start them.
     let start_services =
-        decision == Decision::LocalOnly && scope == cadence_agent::setup::SCOPE_LOCAL;
+        decision == Decision::LocalOnly && scope == cadence_ops::setup::SCOPE_LOCAL;
     let (code, outcomes) =
-        cadence_agent::setup::cli(&state_dir, port, json, cli_verbs(), start_services)
+        cadence_ops::setup::cli(&state_dir, port, json, cli_verbs(), start_services)
             .map_err(|error| preserve_sign_in_outcome(&sign_in, sign_in_failed, error))?;
     let tracker = cadence_agent::issue::default_dir()
         .map_err(|error| preserve_sign_in_outcome(&sign_in, sign_in_failed, error))?;
@@ -133,12 +133,12 @@ fn run_with_hosted(
             .is_some_and(|outcome| {
                 matches!(
                     outcome.status,
-                    cadence_agent::setup::Status::Ok
-                        | cadence_agent::setup::Status::Created
-                        | cadence_agent::setup::Status::Started
+                    cadence_ops::setup::Status::Ok
+                        | cadence_ops::setup::Status::Created
+                        | cadence_ops::setup::Status::Started
                 )
             }),
-        board_url: cadence_agent::setup::board_url(&state_dir, port),
+        board_url: cadence_ops::setup::board_url(&state_dir, port),
         plan: plan_fact(target.as_ref(), json, saved.as_ref(), sign_in_failed),
         sign_in,
         instruction: LIVE_INSTRUCTION.to_string(),
@@ -360,7 +360,7 @@ fn plan_fact(
     }
     match (target, json) {
         (Some(target), false) => {
-            cadence_agent::setup::plan_fact(&cadence_agent::setup::billing_offer(target))
+            cadence_ops::setup::plan_fact(&cadence_ops::setup::billing_offer(target))
         }
         (Some(_), true) => PlanFact::unknown(
             "not read: `setup --json` keeps its existing records and never calls the billing API",
@@ -401,7 +401,7 @@ fn next_command(scope: &str, sign_in: &SignInFact, state_dir: &Path, pm_dir: &Pa
     .iter()
     .any(|name| std::env::var_os(name).is_some());
     if !pinned {
-        if let (cadence_agent::setup::SCOPE_HOSTED, Some(slug)) = (scope, &sign_in.slug) {
+        if let (cadence_ops::setup::SCOPE_HOSTED, Some(slug)) = (scope, &sign_in.slug) {
             // A hosted read goes to the workspace through the saved login.
             return format!("cadence status --org {slug}");
         }
@@ -1300,8 +1300,7 @@ mod tests {
             std::env::set_var("CADENCE_STATE_DIR", &state);
             std::env::set_var("CADENCE_PM_DIR", &tracker);
             std::env::remove_var("HOME");
-            let original = match cadence_agent::setup::cli(&state, None, false, cli_verbs(), false)
-            {
+            let original = match cadence_ops::setup::cli(&state, None, false, cli_verbs(), false) {
                 Err(error) => error,
                 Ok(_) => panic!("the same-environment local setup prerequisite must fail"),
             };

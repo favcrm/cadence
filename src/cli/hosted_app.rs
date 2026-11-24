@@ -104,7 +104,7 @@ pub(super) fn run(target: &RemoteTarget, action: &AppAction) -> Result<i32> {
             "operation_id={id}; if uncertain, read/reconcile this ID, never redispatch blindly"
         ));
     }
-    let reply = cadence_agent::hosted_app_cli::request(target, method, &suffix, body.as_ref())?;
+    let reply = cadence_ops::hosted_app_cli::request(target, method, &suffix, body.as_ref())?;
     if let Some(id) = &reply.operation_id {
         cadence_agent::output::eprint_format_line(format_args!("operation_id={id}"));
     }

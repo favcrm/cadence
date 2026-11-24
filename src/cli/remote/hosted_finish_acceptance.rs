@@ -12,7 +12,7 @@
 
 use super::*;
 use cadence_agent::issue::cli::IssueAction;
-use cadence_agent::local_assignment::{finish_guidance, CoordHttp, Coordinator, Reply};
+use cadence_ops::local_assignment::{finish_guidance, CoordHttp, Coordinator, Reply};
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

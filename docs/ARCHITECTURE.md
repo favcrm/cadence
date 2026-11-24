@@ -80,7 +80,7 @@ The repository-root `src/daemon/` path is revision-independent: daemon sources
 and `src/daemon.rs` stay in place, mounted by `crates/cadence-daemon/src/lib.rs`
 through `#[path = "../../../src/daemon.rs"]` (with shared root-agent daemon
 primitives in `src/daemon/shared.rs`). Dependencies run one way:
-`cadence-agent` → `cadence-daemon` → `cadence-ui` → `cadence-cli` (downstream
+`cadence-agent` → `cadence-ops` → `cadence-daemon` → `cadence-ui` → `cadence-cli` (downstream
 crates may also use `cadence-agent` directly). The root agent retains shared
 daemon primitives needed by its own modules; it does not depend on the daemon
 crate in production.
