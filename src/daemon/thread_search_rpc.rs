@@ -27,8 +27,10 @@ use super::*;
 use crate::thread_search::{self as search, Query};
 
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "thread_search_rpc/cad2663_refusal_acceptance.rs"]
 mod cad2663_refusal_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "thread_search_rpc/cad2663_tests.rs"]
 mod cad2663_tests;
 
 /// Request fields `thread_search` accepts. Anything naming an agent, thread

@@ -71,6 +71,7 @@ fn b64(input: &str) -> Option<Vec<u8>> {
 }
 // One actual ephemeral CA/server pair for this test process. Sealed child
 // fixtures retain CA_PEM.to_vec() and smtp_config() without byte changes.
+#[path = "custody_acceptance_fixture/custody_fixture_tls_runtime.rs"]
 mod custody_fixture_tls_runtime;
 static CA_PEM: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
     custody_fixture_tls_runtime::ca_pem()
@@ -801,17 +802,24 @@ impl Rig {
     }
 }
 
+#[path = "custody_acceptance_fixture/authority5.rs"]
 mod authority5;
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+#[path = "custody_acceptance_fixture/custody6.rs"]
 mod custody6;
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+#[path = "custody_acceptance_fixture/omp_review_regressions.rs"]
 mod omp_review_regressions;
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+#[path = "custody_acceptance_fixture/omp_security_regressions.rs"]
 mod omp_security_regressions;
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+#[path = "custody_acceptance_fixture/r2_gap_regressions.rs"]
 mod r2_gap_regressions;
 
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+#[path = "custody_acceptance_fixture/smtp_scope7.rs"]
 pub(super) mod smtp_scope7;
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+#[path = "custody_acceptance_fixture/smtp_timeout4.rs"]
 pub(super) mod smtp_timeout4;

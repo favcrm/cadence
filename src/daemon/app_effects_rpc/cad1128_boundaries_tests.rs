@@ -70,6 +70,7 @@
 
 // PRIVATE execution-capable SMTP fixture (distinct from the merged,
 // stage-only `platform::smtp::test_artifact_adapter` helper).
+#[path = "cad1128_boundaries_tests/cad1128_exec_smtp_fixture.rs"]
 mod cad1128_exec_smtp_fixture;
 
 use crate::daemon::cad1128_canary_fx as fx;

@@ -1952,4 +1952,5 @@ mod cad1778_screen_tests {
 }
 
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "app_effects_rpc/cad1128_boundaries_tests.rs"]
 mod cad1128_boundaries_tests;

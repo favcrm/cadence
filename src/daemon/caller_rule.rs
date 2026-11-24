@@ -1999,7 +1999,7 @@ fn keep_or(params: &Value, field: &str, default: Option<&str>) -> Value {
 /// list, so a method missing from one is missing from all.
 #[cfg(test)]
 pub(crate) fn dispatch_methods() -> Vec<String> {
-    let src = include_str!("crate_root.rs");
+    let src = include_str!("../daemon.rs");
     let start = src.find("    fn dispatch_method(\n").expect("dispatch fn");
     let body = &src[start..];
     let body = &body[body.find("match method {").expect("match")..];

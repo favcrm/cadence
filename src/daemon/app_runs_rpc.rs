@@ -2096,19 +2096,26 @@ impl Shared {
 }
 
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "app_runs_rpc/cad1156_boundary_tests.rs"]
 mod cad1156_boundary_tests;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "app_runs_rpc/cad1156_downstream_tests.rs"]
 mod cad1156_downstream_tests;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "app_runs_rpc/cad1156_escaped_result_tests.rs"]
 mod cad1156_escaped_result_tests;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "app_runs_rpc/cad1156_summary_tests.rs"]
 mod cad1156_summary_tests;
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "app_runs_rpc/cad1156_tests.rs"]
 mod cad1156_tests;
 
 #[cfg(test)]
+#[path = "app_runs_rpc/cad1120_tests.rs"]
 mod cad1120_tests;
 #[cfg(test)]
+#[path = "app_runs_rpc/cad1123_tests.rs"]
 mod cad1123_tests;
 #[cfg(test)]
 mod cad742_tests {

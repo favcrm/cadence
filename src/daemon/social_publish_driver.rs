@@ -683,4 +683,5 @@ impl Shared {
 }
 
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "social_publish_driver/tests.rs"]
 mod tests;

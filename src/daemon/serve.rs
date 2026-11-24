@@ -1,5 +1,6 @@
 //! CAD-534: `cadence daemon` serve RPC handlers — moved verbatim from src/daemon.rs.
 
+#[path = "serve/accept_wait.rs"]
 pub(super) mod accept_wait;
 
 use super::*;

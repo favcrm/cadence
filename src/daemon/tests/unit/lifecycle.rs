@@ -102,7 +102,7 @@ fn cad561_a_pending_update_drains_only_while_the_lease_holds_it() {
 
 #[test]
 fn cad561_update_drain_is_operator_gated_in_the_dispatch() {
-    let src = include_str!("../../crate_root.rs");
+    let src = include_str!("../../../daemon.rs");
     let arm = src
         .find("\"update_drain\" => {")
         .expect("the update_drain arm");

@@ -97,9 +97,13 @@ fn write_private(path: &Path, bytes: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+#[path = "team_assistants_refusal/cad2215_delivery_provenance_acceptance.rs"]
 mod cad2215_delivery_provenance_acceptance;
+#[path = "team_assistants_refusal/cad2215_member_scope_acceptance.rs"]
 mod cad2215_member_scope_acceptance;
+#[path = "team_assistants_refusal/cad2215_private_completion_acceptance.rs"]
 mod cad2215_private_completion_acceptance;
+#[path = "team_assistants_refusal/cad2215_private_delivery_native_acceptance.rs"]
 mod cad2215_private_delivery_native_acceptance;
 
 pub use super::AssistantFlagOn;

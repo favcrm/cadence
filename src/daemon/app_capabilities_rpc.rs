@@ -65,6 +65,7 @@ pub fn operator_price_refusal(message: &str) -> Option<&str> {
 }
 
 #[cfg(all(test, feature = "test-seam"))]
+#[path = "app_capabilities_rpc/tests.rs"]
 mod tests;
 
 /// A run-bound capability failure as a daemon error: an explicit refusal
@@ -1183,4 +1184,5 @@ impl Shared {
 }
 
 #[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "app_capabilities_rpc/early_app_quote_tests.rs"]
 mod early_app_quote_tests;
