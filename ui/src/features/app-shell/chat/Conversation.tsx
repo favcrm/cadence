@@ -729,6 +729,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const onSnapshot = useCallback(() => setStreamRevision((revision) => revision + 1), []);
   const operationScope = `${installId}\u0000${mode.contextId}`;
   const [operationState, setOperationState] = useState<{ scope: string; revision: number | null; pending: boolean } | null>(null);
+  const [prepareState, setPrepareState] = useState<{ scope: string; revision: number | null; maxBytes: number | null } | null>(null);
+  const [operationWrite, setOperationWrite] = useState(0);
+  const onPrepareState = useCallback((maxBytes: number | null, revision: number | null) => {
+    setPrepareState({ scope: operationScope, revision, maxBytes });
+  }, [operationScope]);
   const [stagedState, setStagedState] = useState<{ conversation: string; pending: boolean } | null>(null);
   const onOperationState = useCallback((pending: boolean, revision: number | null) => {
     setOperationState({ scope: operationScope, revision, pending });
@@ -1657,6 +1662,25 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     return Promise.resolve();
   };
 
+  const prepareEdit = async (input: { asset_id: string; revision: number; sha256: string; instructions: string }, requestId: string) => {
+    const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
+    const current = () => composerKeyRef.current === origin.key && visitRef.current === origin.visit && frameRef.current === origin.frame;
+    try {
+      if (!hosted || !canSend || mode.contextId !== "default" || !operationsCurrent ||
+          prepareState?.scope !== operationScope || prepareState.revision !== streamRevision || !prepareState.maxBytes) {
+        throw new Error("Preparing an edit is unavailable");
+      }
+      await api.assistantPrepare(installId, { context_id: mode.contextId, action_id: "media.refine.prepare", request_id: requestId, input });
+      if (current()) {
+        setComposerNotice(null);
+        setOperationWrite((revision) => revision + 1);
+      }
+    } catch (error) {
+      if (current()) setComposerNotice("The edit could not be prepared. Retry the same instructions or change them and try again.");
+      throw error;
+    }
+  };
+
   const actor = useConversationActor(
     masterState,
     viewer.operator === true && !viewer.readOnly,
@@ -2243,7 +2267,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       </ViewScopeContext.Provider>
       </AttachmentNamesContext.Provider>
       </StagedSourceContext.Provider>
-      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} appLabel={mode.appLabel ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
+      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} screenTag={mode.screenTag ?? null} appLabel={mode.appLabel ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} onPrepareChange={onPrepareState} writeRevision={operationWrite} />
       {decisionsOn && convId !== null && decisionStore !== null && (
         <ConversationDecisions key={`${installId}\u0000${convId}`} canAlwaysAllow={viewer.operator === true && !viewer.readOnly} conversation={convId} store={decisionStore} revision={streamRevision} onPendingChange={onStagedState} onReview={() => onCollapsed(false)} />
       )}
@@ -2402,6 +2426,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         storeKey={composerKey}
         onReveal={revealComposer}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
+        prepareEdit={hosted && canSend && binding.error === null && mode.contextId === "default" && convId !== null && operationsCurrent && prepareState?.scope === operationScope && prepareState.revision === streamRevision && prepareState.maxBytes !== null ? { maxBytes: prepareState.maxBytes, submit: prepareEdit } : undefined}
         onSubmitted={engage}
         onCommand={(name, arg) => {
           if (name === "new" || name === "clear") {

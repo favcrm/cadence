@@ -472,12 +472,13 @@ interface AssistantData {
   actions: Action[];
   operations: Operation[];
   permissions: Permission[];
+  prepare: number | null;
   error: string | null;
   /** The app's assistant descriptor is not consented yet: a calm, permanent-until-approved state. */
   consent: boolean;
 }
 function emptyData(scopeKey: string): AssistantData {
-  return { scopeKey, connectionRevision: null, actions: [], operations: [], permissions: [], error: null, consent: false };
+  return { scopeKey, connectionRevision: null, actions: [], operations: [], permissions: [], prepare: null, error: null, consent: false };
 }
 
 /** How a failed read settles. `none`: the app declares no assistant actions
@@ -498,7 +499,7 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange }: {
+export default function AssistantOperations({ installId, contextId, canDecide, appPath, screenTag, appLabel, connectionRevision, onPendingChange, onPrepareChange, writeRevision }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
@@ -510,6 +511,8 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   /** The transcript snapshot this scope must reconcile before actions become live. */
   connectionRevision: number;
   onPendingChange: (pending: boolean, reconciledRevision: number | null) => void;
+  onPrepareChange: (maxBytes: number | null, reconciledRevision: number | null) => void;
+  writeRevision: number;
 }) {
   const t = useTranslate();
   const scopeKey = JSON.stringify([installId, contextId]);
@@ -531,6 +534,9 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   useEffect(() => {
     onPendingChange(pendingDecision, reconciledRevision);
   }, [pendingDecision, reconciledRevision, onPendingChange]);
+  useEffect(() => {
+    onPrepareChange(visible.error ? null : visible.prepare, reconciledRevision);
+  }, [visible.prepare, visible.error, reconciledRevision, onPrepareChange]);
 
   useEffect(() => {
     // An unresolved context owns no poller and sends no assistant requests.
@@ -565,6 +571,10 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
         const actionResponse = actions.value;
         const operationResponse = operations.value;
         const permissionResponse = permissions.value;
+        const prepare = record(actionResponse.prepare);
+        const maxBytes = prepare && Object.keys(prepare).length === 2 &&
+          prepare.action_id === "media.refine.prepare" && prepare.max_instruction_bytes === 2000
+          ? 2000 : null;
         if (!Array.isArray(actionResponse.actions) || !Array.isArray(operationResponse.operations) || !Array.isArray(permissionResponse.permissions)) {
           throw new Error("The assistant service returned an invalid response.");
         }
@@ -574,6 +584,7 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
           actions: actionResponse.actions.map(parseAction).filter((v): v is Action => v !== null),
           operations: operationResponse.operations.map((row) => parseOperation(record(row)?.operation ?? row)).filter((v): v is Operation => v !== null),
           permissions: permissionResponse.permissions.map((row) => parsePermission(record(row)?.permission ?? row)).filter((v): v is Permission => v !== null),
+          prepare: maxBytes,
           error: null,
           consent: false,
         });
@@ -642,6 +653,9 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     // Keep the scope's handle alive so in-flight decisions still settle.
     void poller.current?.written();
   }, [scopeKey, connectionRevision]);
+  useEffect(() => {
+    if (writeRevision > 0) void poller.current?.written();
+  }, [writeRevision]);
 
   const runWrite = async (busyId: string, write: () => Promise<unknown>, failure: string) => {
     const handle = poller.current;
