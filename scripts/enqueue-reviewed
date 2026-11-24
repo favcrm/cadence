@@ -85,11 +85,12 @@ LOCAL_AUTHOR_ROW_HINT = (" (a note under the author's identity still refuses und
 REVIEW_STANDARD_HINT = (" (the review standard is a fresh, read-only, non-author session's review, "
                         "and this gate cannot yet tell one from the author under one login. On hosted, "
                         "agents file no verdict: post findings as a PR comment, which is the advisory link "
-                        "(AGENTS.md \"Review\"). A source review is evidence, never a counted verdict: "
-                        "workflow-issued rows count (dispatch review-standards.yml and review-spec.yml; "
-                        "two rows satisfy a two-review ticket) and do not replace it, so pin the full PR "
-                        "head and the resolved model in the report. The native --exception --advisory "
-                        "evaluator is not a hosted route and ends at EXCEPTION_ENDS in scripts/delivery-gate)")
+                        "(AGENTS.md \"Review\"). A source review is evidence, never a counted verdict: on a "
+                        "hosted org, eligible workflow rows satisfy the hosted review count (dispatch "
+                        "review-standards.yml and review-spec.yml; two rows satisfy a two-review ticket) "
+                        "and do not replace the required source review, so pin the full PR head and the "
+                        "resolved model in the report. The native --exception --advisory evaluator is not "
+                        "a hosted route and ends at EXCEPTION_ENDS in scripts/delivery-gate)")
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
