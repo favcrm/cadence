@@ -3784,6 +3784,117 @@ fn cad2150_board_without_review_text_gets_a_typed_refusal_only_when_asked() {
     assert!(result.unwrap_err().to_string().contains("Release order"));
 }
 
+/// CAD-2740: a board that predates `include_agent_reviews` refuses it as an
+/// invalid request; only a request that carried it gets the typed code, and
+/// it wins over `include_body` (a board that knows the first knows the second).
+#[test]
+fn cad2740_board_without_agent_reviews_gets_a_typed_refusal_only_when_asked() {
+    let refused = json!({"ok": false, "error": {"code": "invalid_request"}});
+    let mut asked = json!({"project": "synthetic"}).as_object().unwrap().clone();
+    asked.insert("include_agent_reviews".to_string(), json!(true));
+    asked.insert("include_body".to_string(), json!(true));
+    let (result, _) = run(
+        vec![(400, "", refused.clone())],
+        "audit_verdicts_project",
+        asked,
+        10,
+    );
+    match result.unwrap_err() {
+        crate::error::Error::Structured(s) => {
+            assert_eq!(s.code, super::VERDICT_AGENT_REVIEWS_UNSUPPORTED);
+        }
+        other => panic!("expected the typed code, got {other}"),
+    }
+    let plain = json!({"project": "synthetic"}).as_object().unwrap().clone();
+    let (result, _) = run(
+        vec![(400, "", refused)],
+        "audit_verdicts_project",
+        plain,
+        10,
+    );
+    assert!(result.unwrap_err().to_string().contains("Release order"));
+}
+
+/// CAD-2740: a reviewer grant asks for `audit.approve`; any other profile
+/// write keeps `cli.write` alone, so a login without it is not newly refused.
+#[test]
+fn cad2740_only_a_reviewer_profile_write_requests_audit_approve() {
+    // The scopes the client asked the relay to mint, read from the request
+    // it sent (any answer will do: the refusal is not what is under test).
+    let scopes = |verb: &str, args: Value| {
+        let (_, requests) = run(
+            vec![(
+                403,
+                "",
+                json!({"ok": false, "error": {"code": "not_permitted"}}),
+            )],
+            verb,
+            args.as_object().unwrap().clone(),
+            10,
+        );
+        requests[0]["body"]["requested_scopes"].clone()
+    };
+    let both = json!(["cli.write", "audit.approve"]);
+    let write = json!(["cli.write"]);
+    for role in ["reviewer", " Reviewer ", "REVIEWER"] {
+        assert_eq!(
+            scopes(
+                "agent_profile_update",
+                json!({"id": "ap_1", "expectedRevision": 1, "role": role})
+            ),
+            both,
+            "{role:?}"
+        );
+    }
+    assert_eq!(
+        scopes(
+            "agent_profile_create",
+            json!({"alias": "rev", "catalogue": "reviewer"})
+        ),
+        both
+    );
+    for (verb, args) in [
+        (
+            "agent_profile_update",
+            json!({"id": "ap_1", "expectedRevision": 1, "role": "Planner"}),
+        ),
+        (
+            "agent_profile_update",
+            json!({"id": "ap_1", "expectedRevision": 1, "name": "reviewer"}),
+        ),
+        (
+            "agent_profile_update",
+            json!({"id": "ap_1", "expectedRevision": 1, "status": "archived"}),
+        ),
+        (
+            "agent_profile_create",
+            json!({"alias": "reviewer", "catalogue": "accountant"}),
+        ),
+    ] {
+        assert_eq!(scopes(verb, args.clone()), write, "{verb} {args}");
+    }
+}
+
+/// CAD-2740: the board's four agent-reviewer refusals print their names.
+#[test]
+fn cad2740_agent_reviewer_refusals_are_named() {
+    for (verb, code) in [
+        ("agent_profile_update", "reviewer_grant_required"),
+        ("agent_profile_create", "reviewer_grant_required"),
+        ("audit_verdict_project", "reviewer_profile_not_eligible"),
+        ("audit_verdict_project", "reviewer_is_author"),
+        ("audit_verdict_project", "agent_review_kind_not_allowed"),
+    ] {
+        let body = json!({"ok": false, "error": {"code": code, "message": "board text"}});
+        let (result, requests) = run(vec![(403, "", body)], verb, Map::new(), 10);
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), Some(code), "{verb}: {error}");
+        assert!(error.to_string().contains(code), "{verb}: {error}");
+        assert!(!error.to_string().contains("board text"), "{error}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1, "{verb}");
+    }
+}
+
 /// CAD-2277: a board that predates `limit` on `issue_ls` answers `400
 /// invalid_request`; only a call carrying `limit` gets the typed code so
 /// `src/cli/remote.rs` can retry once without `limit` and slice locally.
