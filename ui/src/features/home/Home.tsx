@@ -8,7 +8,6 @@ import { resources, threadReader } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
-import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
@@ -75,7 +74,7 @@ import { closeDrawer as closeCanvas } from "../canvas/canvasStore";
 import { useSendHandoff } from "./sendHandoff";
 import { memberScope } from "./memberThread";
 import { CloudContentNotice, StreamBanner, ThreadTurn, time } from "./ThreadView";
-import { formatElapsed, shortId } from "./turnText";
+import { formatElapsed } from "./turnText";
 import CredentialRequestList from "../connections/CredentialRequestCard";
 import {
   initialFollow,
@@ -913,6 +912,8 @@ export default function Home({
 
 function ConversationIdCopy({ id }: { id: string }) {
   const t = useTranslate();
+  const copyLabel = t("Copy ID");
+  const preview = id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;
   const [result, setResult] = useState<{ copied: boolean }>();
   useEffect(() => {
     if (!result) return;
@@ -923,17 +924,22 @@ function ConversationIdCopy({ id }: { id: string }) {
   return (
     <div className="home-conversation-id relative flex shrink-0 items-center gap-1.5 whitespace-nowrap">
       <span className="hidden sm:inline text-micro text-ink-500">{t("Conversation ID")}:</span>
-      <code className="num text-micro text-ink-300" title={id}>{shortId(id)}</code>
-      <Button size="sm" variant="ghost" onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(id);
-          setResult({ copied: true });
-        } catch {
-          setResult({ copied: false });
-        }
-      }}>
-        {t("Copy ID")}
-      </Button>
+      <button
+        type="button"
+        className="lnk num min-h-7 cursor-copy text-micro focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+        aria-label={`${copyLabel}: ${preview}`}
+        title={`${copyLabel}: ${id}`}
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(id);
+            setResult({ copied: true });
+          } catch {
+            setResult({ copied: false });
+          }
+        }}
+      >
+        {preview}
+      </button>
       <span
         role="status"
         className={result ? "pointer-events-none absolute right-0 top-full z-10 mt-1 rounded border border-ink-700 bg-ink-900 px-2 py-1 text-micro text-ink-200" : "sr-only"}
