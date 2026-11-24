@@ -1,5 +1,8 @@
 export {};
-import { selectDefaultHostedDispatch } from "../src/features/issues/hostedDispatchModel";
+import {
+  selectCloudSpecialists,
+  selectDefaultHostedDispatch,
+} from "../src/features/issues/hostedDispatchModel";
 import type { HostedLocalDaemonRunner } from "../src/lib/types";
 
 function assert(cond: boolean, why: string): void {
@@ -123,5 +126,51 @@ const runnerBase = (
       picked.reason === "seat_fallback" &&
       (picked.spawnDisabledReason ?? "").includes("--allow-spawn"),
     "disabled spawn must explain --allow-spawn requirement",
+  );
+}
+
+// 5. Cloud specialists filter out master, reviewer, and inbox system profiles.
+{
+  const specialists = selectCloudSpecialists([
+    {
+      id: "ap_master",
+      alias: "master",
+      catalogue: null,
+      job: null,
+      latest_claim: null,
+      look: null,
+      model: "inherit",
+      role: "master",
+      runtimes: [],
+      team_role: "master",
+    },
+    {
+      id: "ap_rev",
+      alias: "review-bot",
+      catalogue: null,
+      job: null,
+      latest_claim: null,
+      look: null,
+      model: "inherit",
+      role: "reviewer",
+      runtimes: [],
+      team_role: "reviewer",
+    },
+    {
+      id: "ap_builder",
+      alias: "Builder",
+      catalogue: "builder",
+      job: null,
+      latest_claim: null,
+      look: null,
+      model: "claude-sonnet-4",
+      role: "worker",
+      runtimes: [],
+      team_role: "builder",
+    },
+  ]);
+  assert(
+    specialists.length === 1 && specialists[0]!.id === "ap_builder",
+    `expected only ap_builder, got ${JSON.stringify(specialists)}`,
   );
 }

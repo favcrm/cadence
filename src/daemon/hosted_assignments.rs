@@ -49,6 +49,7 @@ impl Shared {
             crate::adapter::registry::validate_launch_params(provider, kind, &launch_val)?;
         }
         let params_str = (!launch.is_empty()).then(|| launch_val.to_string());
+        let profile_instructions = spawn_agent_instructions(spec.profile_id.as_deref());
         let cwd = std::fs::canonicalize(worktree)
             .map_err(|_| Error::rejected("Working directory must exist"))?;
         self.store.register_agent(&crate::store::NewAgent {
@@ -58,7 +59,7 @@ impl Shared {
             role: "worker",
             cwd: &cwd.to_string_lossy(),
             sandbox: "read-only",
-            instructions: None,
+            instructions: profile_instructions.as_deref(),
             params: params_str.as_deref(),
             team_role: None,
             model_policy: None,
@@ -205,17 +206,17 @@ impl Shared {
                         let stop = Arc::new(AtomicBool::new(false));
                         workers.push((binding.clone(), stop.clone()));
                         let state = self.state_dir.clone();
-                        let active_spawns =
+                        let active_lanes =
                             Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
                                 String,
-                                String,
+                                ActiveHostedLane,
                             >::new()));
 
                         let shared_send = self.clone();
                         let send_stop = stop.clone();
                         let send_binding = binding.clone();
                         let default_alias = binding.default_alias().map(str::to_string);
-                        let active_for_send = Arc::clone(&active_spawns);
+                        let active_for_send = Arc::clone(&active_lanes);
                         let send = Arc::new(move |params: Value| {
                             let target_alias = params["alias"].as_str();
                             let allowed_alias = target_alias.is_some_and(|alias| {
@@ -225,7 +226,7 @@ impl Shared {
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner())
                                         .values()
-                                        .any(|spawned| spawned == alias)
+                                        .any(|lane| lane.alias == alias)
                             });
                             if send_stop.load(Ordering::SeqCst)
                                 || shared_send.closing.load(Ordering::SeqCst)
@@ -251,34 +252,30 @@ impl Shared {
                         });
 
                         let shared_snap = self.clone();
-                        let active_for_snap = Arc::clone(&active_spawns);
+                        let active_for_snap = Arc::clone(&active_lanes);
                         let snapshot = Arc::new(move |b: &events::WorkspaceBinding| {
                             let mut agents = std::collections::BTreeMap::new();
                             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                            let lanes = active_for_snap.lock().unwrap_or_else(|e| e.into_inner());
                             for item in b.agents() {
-                                let status = match shared_snap.store.agent_opt(&item.alias) {
-                                    Ok(Some(row)) => match row.state.as_str() {
-                                        "busy" | "starting" => "busy",
-                                        "attention" => "blocked",
-                                        "idle" => "idle",
-                                        _ => "offline",
-                                    },
-                                    _ => "offline",
-                                };
+                                let row_state = shared_snap
+                                    .store
+                                    .agent_opt(&item.alias)
+                                    .ok()
+                                    .flatten()
+                                    .map(|row| row.state);
+                                let issue_id = active_issue_for_alias(&lanes, &item.alias);
                                 agents.insert(
                                     item.alias.clone(),
-                                    events::AgentActivitySnapshot {
-                                        status: status.to_string(),
-                                        summary: None,
-                                        issue_id: None,
-                                        updated_at: Some(now.clone()),
-                                    },
+                                    build_agent_activity_snapshot(
+                                        row_state.as_deref(),
+                                        issue_id,
+                                        &now,
+                                    ),
                                 );
                             }
-                            let active_spawn_lanes = active_for_snap
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .len() as u32;
+                            let active_spawn_lanes =
+                                lanes.values().filter(|lane| lane.spawned).count() as u32;
                             events::RunnerRuntimeSnapshot {
                                 agents,
                                 active_spawn_lanes,
@@ -286,7 +283,7 @@ impl Shared {
                         });
 
                         let shared_spawn = self.clone();
-                        let active_for_spawn = Arc::clone(&active_spawns);
+                        let active_for_spawn = Arc::clone(&active_lanes);
                         let spawn_worker = Arc::new(
                             move |spec: &SpawnSpec, worktree: &Path, assignment_id: &str| {
                                 let (alias, adapter) =
@@ -294,12 +291,27 @@ impl Shared {
                                 active_for_spawn
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
-                                    .insert(assignment_id.to_string(), alias.clone());
+                                    .insert(
+                                        assignment_id.to_string(),
+                                        ActiveHostedLane {
+                                            alias: alias.clone(),
+                                            issue_id: String::new(),
+                                            spawned: true,
+                                        },
+                                    );
                                 Ok((alias, adapter))
                             },
                         );
 
-                        let active_for_term = Arc::clone(&active_spawns);
+                        let active_for_kickoff = Arc::clone(&active_lanes);
+                        let on_kickoff =
+                            Arc::new(move |alias: &str, assignment_id: &str, issue_id: &str| {
+                                let mut lanes =
+                                    active_for_kickoff.lock().unwrap_or_else(|e| e.into_inner());
+                                record_hosted_kickoff(&mut lanes, alias, assignment_id, issue_id);
+                            });
+
+                        let active_for_term = Arc::clone(&active_lanes);
                         let on_terminal = Arc::new(move |assignment_id: &str| {
                             active_for_term
                                 .lock()
@@ -313,6 +325,7 @@ impl Shared {
                             send,
                             snapshot,
                             spawn_worker,
+                            on_kickoff,
                             on_terminal,
                             notify,
                         };
@@ -372,9 +385,88 @@ fn refuse_fenced_default(alias: &str, state: &str, has_unknown: bool) -> Result<
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveHostedLane {
+    alias: String,
+    issue_id: String,
+    spawned: bool,
+}
+
+fn spawn_agent_instructions(profile_id: Option<&str>) -> Option<String> {
+    profile_id.map(|id| format!("Hosted agent profile: {id}"))
+}
+
+fn record_hosted_kickoff(
+    lanes: &mut std::collections::BTreeMap<String, ActiveHostedLane>,
+    alias: &str,
+    assignment_id: &str,
+    issue_id: &str,
+) {
+    match lanes.get_mut(assignment_id) {
+        Some(existing) => {
+            existing.alias = alias.to_string();
+            existing.issue_id = issue_id.to_string();
+        }
+        None => {
+            lanes.insert(
+                assignment_id.to_string(),
+                ActiveHostedLane {
+                    alias: alias.to_string(),
+                    issue_id: issue_id.to_string(),
+                    spawned: false,
+                },
+            );
+        }
+    }
+}
+
+fn active_issue_for_alias(
+    lanes: &std::collections::BTreeMap<String, ActiveHostedLane>,
+    alias: &str,
+) -> Option<String> {
+    lanes
+        .values()
+        .rev()
+        .find(|lane| lane.alias == alias && !lane.issue_id.is_empty())
+        .map(|lane| lane.issue_id.clone())
+}
+
+fn build_agent_activity_snapshot(
+    row_state: Option<&str>,
+    issue_id: Option<String>,
+    now: &str,
+) -> events::AgentActivitySnapshot {
+    let status = match row_state {
+        Some("busy" | "starting") => "busy",
+        Some("attention") => "blocked",
+        Some("idle") => "idle",
+        _ => "offline",
+    };
+    let summary = match (status, issue_id.as_deref()) {
+        ("busy", Some(id)) => format!("Working on {id}"),
+        ("busy", None) => "Busy".to_string(),
+        ("blocked", Some(id)) => format!("Needs attention on {id}"),
+        ("blocked", None) => "Needs attention".to_string(),
+        ("idle", Some(id)) => format!("Assigned to {id}"),
+        ("idle", None) => "Idle".to_string(),
+        (_, Some(id)) => format!("Offline ({id})"),
+        (_, None) => "Offline".to_string(),
+    };
+    events::AgentActivitySnapshot {
+        status: status.to_string(),
+        summary: Some(summary),
+        issue_id,
+        updated_at: Some(now.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::refuse_fenced_default;
+    use super::{
+        active_issue_for_alias, build_agent_activity_snapshot, record_hosted_kickoff,
+        refuse_fenced_default, spawn_agent_instructions, ActiveHostedLane,
+    };
+    use std::collections::BTreeMap;
 
     #[test]
     fn cad2259_a_fenced_default_refuses_the_kickoff_with_its_reason() {
@@ -398,5 +490,58 @@ mod tests {
                 "{state}"
             );
         }
+    }
+
+    #[test]
+    fn cad2746_spawn_agent_instructions_carries_profile_id_when_present() {
+        assert_eq!(
+            spawn_agent_instructions(Some("ap_123")).as_deref(),
+            Some("Hosted agent profile: ap_123")
+        );
+        assert_eq!(spawn_agent_instructions(None), None);
+    }
+
+    #[test]
+    fn cad2746_activity_snapshot_tracks_issue_and_clears_on_terminal() {
+        let mut lanes = BTreeMap::new();
+        record_hosted_kickoff(&mut lanes, "seat-a", "hla_seat", "CAD-2746");
+        lanes.insert(
+            "hla_spawn".to_string(),
+            ActiveHostedLane {
+                alias: "omp-123".to_string(),
+                issue_id: String::new(),
+                spawned: true,
+            },
+        );
+        record_hosted_kickoff(&mut lanes, "omp-123", "hla_spawn", "CAD-2747");
+
+        assert_eq!(
+            active_issue_for_alias(&lanes, "seat-a").as_deref(),
+            Some("CAD-2746")
+        );
+        assert_eq!(
+            active_issue_for_alias(&lanes, "omp-123").as_deref(),
+            Some("CAD-2747")
+        );
+        assert_eq!(lanes.values().filter(|l| l.spawned).count(), 1);
+
+        let busy = build_agent_activity_snapshot(
+            Some("busy"),
+            active_issue_for_alias(&lanes, "seat-a"),
+            "2026-11-24T08:00:00Z",
+        );
+        assert_eq!(busy.status, "busy");
+        assert_eq!(busy.issue_id.as_deref(), Some("CAD-2746"));
+        assert_eq!(busy.summary.as_deref(), Some("Working on CAD-2746"));
+
+        lanes.remove("hla_seat");
+        let idle = build_agent_activity_snapshot(
+            Some("idle"),
+            active_issue_for_alias(&lanes, "seat-a"),
+            "2026-11-24T08:05:00Z",
+        );
+        assert_eq!(idle.status, "idle");
+        assert_eq!(idle.issue_id, None);
+        assert_eq!(idle.summary.as_deref(), Some("Idle"));
     }
 }

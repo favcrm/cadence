@@ -50,6 +50,7 @@ pub struct EventRuntime {
     pub send: Arc<dyn Fn(Value) -> Result<Value> + Send + Sync>,
     pub snapshot: Arc<dyn Fn(&WorkspaceBinding) -> RunnerRuntimeSnapshot + Send + Sync>,
     pub spawn_worker: SpawnWorkerFn,
+    pub on_kickoff: Arc<dyn Fn(&str, &str, &str) + Send + Sync>,
     pub on_terminal: Arc<dyn Fn(&str) + Send + Sync>,
     pub notify: Arc<dyn Fn() + Send + Sync>,
 }
@@ -1160,6 +1161,7 @@ fn session(
         atomic(&binding.inbox_path(state), &inbox)?;
     }
     let send = Arc::clone(&runtime.send);
+    let on_kickoff = Arc::clone(&runtime.on_kickoff);
     let mut deliver = |kickoff: &Kickoff| {
         if !lifetime() {
             return Err(Error::busy_coded(
@@ -1168,7 +1170,7 @@ fn session(
             ));
         }
         let adapter_for_alias = binding.adapter_for(kickoff.alias).map(str::to_string);
-        super::delivery::deliver_kickoff_with_adapter(
+        let sent = super::delivery::deliver_kickoff_with_adapter(
             &target,
             state,
             kickoff,
@@ -1183,7 +1185,9 @@ fn session(
                 }
                 send(params)
             },
-        )
+        )?;
+        on_kickoff(kickoff.alias, kickoff.assignment_id, kickoff.issue_id);
+        Ok(sent)
     };
     if !inbox.initialized {
         if inbox.recovery_watermark.is_none() {

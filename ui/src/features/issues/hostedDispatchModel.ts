@@ -1,8 +1,29 @@
+import type { AgentProfile } from "../../lib/generated/board-api";
 import type {
   HostedLocalDaemonAgent,
   HostedLocalDaemonRunner,
   HostedLocalHarness,
 } from "../../lib/types";
+
+/** Select dispatchable Cloud specialist profiles (excludes system roles like master/reviewer/inbox). */
+export function selectCloudSpecialists(
+  profiles: readonly AgentProfile[] | undefined,
+): AgentProfile[] {
+  return (profiles ?? []).filter((profile) => {
+    const id = profile.id.trim();
+    const alias = profile.alias.trim().toLowerCase();
+    const role = (profile.role ?? "").trim().toLowerCase();
+    return (
+      id.length > 0 &&
+      alias.length > 0 &&
+      alias !== "master" &&
+      alias !== "inbox" &&
+      role !== "master" &&
+      role !== "reviewer" &&
+      role !== "inbox"
+    );
+  });
+}
 
 export type DefaultHostedDispatch =
   | {
