@@ -284,22 +284,33 @@ impl Shared {
 
                         let shared_spawn = self.clone();
                         let active_for_spawn = Arc::clone(&active_lanes);
+                        let max_spawn_lanes = binding
+                            .spawn_policy()
+                            .filter(|policy| policy.spawn_allowed)
+                            .map(|policy| policy.max_concurrent)
+                            .unwrap_or(0);
                         let spawn_worker = Arc::new(
                             move |spec: &SpawnSpec, worktree: &Path, assignment_id: &str| {
-                                let (alias, adapter) =
-                                    shared_spawn.spawn_hosted_worker(spec, worktree)?;
-                                active_for_spawn
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .insert(
-                                        assignment_id.to_string(),
-                                        ActiveHostedLane {
-                                            alias: alias.clone(),
-                                            issue_id: String::new(),
-                                            spawned: true,
-                                        },
-                                    );
-                                Ok((alias, adapter))
+                                {
+                                    let mut lanes =
+                                        active_for_spawn.lock().unwrap_or_else(|e| e.into_inner());
+                                    reserve_spawn_slot(&mut lanes, assignment_id, max_spawn_lanes)?;
+                                }
+                                let spawned = shared_spawn.spawn_hosted_worker(spec, worktree);
+                                let mut lanes =
+                                    active_for_spawn.lock().unwrap_or_else(|e| e.into_inner());
+                                match spawned {
+                                    Ok((alias, adapter)) => {
+                                        if let Some(entry) = lanes.get_mut(assignment_id) {
+                                            entry.alias = alias.clone();
+                                        }
+                                        Ok((alias, adapter))
+                                    }
+                                    Err(err) => {
+                                        lanes.remove(assignment_id);
+                                        Err(err)
+                                    }
+                                }
                             },
                         );
 
@@ -396,6 +407,34 @@ fn spawn_agent_instructions(profile_id: Option<&str>) -> Option<String> {
     profile_id.map(|id| format!("Hosted agent profile: {id}"))
 }
 
+fn reserve_spawn_slot(
+    lanes: &mut std::collections::BTreeMap<String, ActiveHostedLane>,
+    assignment_id: &str,
+    max_concurrent: u32,
+) -> Result<()> {
+    let active = lanes
+        .values()
+        .enumerate()
+        .filter(|(_, lane)| lane.spawned)
+        .count() as u32;
+    let already_reserved = lanes.get(assignment_id).is_some_and(|lane| lane.spawned);
+    if !already_reserved && active >= max_concurrent {
+        return Err(Error::busy_coded(
+            "runner_at_capacity",
+            "local runner reached max concurrent spawned lanes",
+        ));
+    }
+    lanes
+        .entry(assignment_id.to_string())
+        .or_insert_with(|| ActiveHostedLane {
+            alias: String::new(),
+            issue_id: String::new(),
+            spawned: true,
+        })
+        .spawned = true;
+    Ok(())
+}
+
 fn record_hosted_kickoff(
     lanes: &mut std::collections::BTreeMap<String, ActiveHostedLane>,
     alias: &str,
@@ -464,7 +503,7 @@ fn build_agent_activity_snapshot(
 mod tests {
     use super::{
         active_issue_for_alias, build_agent_activity_snapshot, record_hosted_kickoff,
-        refuse_fenced_default, spawn_agent_instructions, ActiveHostedLane,
+        refuse_fenced_default, reserve_spawn_slot, spawn_agent_instructions, ActiveHostedLane,
     };
     use std::collections::BTreeMap;
 
@@ -543,5 +582,17 @@ mod tests {
         assert_eq!(idle.status, "idle");
         assert_eq!(idle.issue_id, None);
         assert_eq!(idle.summary.as_deref(), Some("Idle"));
+    }
+
+    #[test]
+    fn cad2746_reserve_spawn_slot_enforces_cap_and_releases() {
+        let mut lanes = BTreeMap::new();
+        assert!(reserve_spawn_slot(&mut lanes, "hla_1", 1).is_ok());
+        // Duplicate retry on same assignment stays idempotent; second distinct assignment is refused.
+        assert!(reserve_spawn_slot(&mut lanes, "hla_1", 1).is_ok());
+        let err = reserve_spawn_slot(&mut lanes, "hla_2", 1).unwrap_err();
+        assert_eq!(err.code(), Some("runner_at_capacity"));
+        lanes.remove("hla_1");
+        assert!(reserve_spawn_slot(&mut lanes, "hla_2", 1).is_ok());
     }
 }

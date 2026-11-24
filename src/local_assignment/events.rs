@@ -45,12 +45,13 @@ pub struct RunnerRuntimeSnapshot {
 
 pub type SpawnWorkerFn =
     Arc<dyn Fn(&SpawnSpec, &Path, &str) -> Result<(String, String)> + Send + Sync>;
+pub type KickoffFn = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 pub struct EventRuntime {
     pub send: Arc<dyn Fn(Value) -> Result<Value> + Send + Sync>,
     pub snapshot: Arc<dyn Fn(&WorkspaceBinding) -> RunnerRuntimeSnapshot + Send + Sync>,
     pub spawn_worker: SpawnWorkerFn,
-    pub on_kickoff: Arc<dyn Fn(&str, &str, &str) + Send + Sync>,
+    pub on_kickoff: KickoffFn,
     pub on_terminal: Arc<dyn Fn(&str) + Send + Sync>,
     pub notify: Arc<dyn Fn() + Send + Sync>,
 }
@@ -969,10 +970,11 @@ pub fn run(
                     let mut coord = guarded_http(&target, &lifetime)?.into_coordinator()?;
                     coord.delivery_guard = Some(lifetime.clone());
                     let send = Arc::clone(&runtime.send);
+                    let on_kickoff = Arc::clone(&runtime.on_kickoff);
                     let mut deliver = |kickoff: &Kickoff| {
                         let adapter_for_alias =
                             binding.adapter_for(kickoff.alias).map(str::to_string);
-                        super::delivery::deliver_kickoff_with_adapter(
+                        let sent = super::delivery::deliver_kickoff_with_adapter(
                             &target,
                             &state,
                             kickoff,
@@ -987,7 +989,9 @@ pub fn run(
                                 }
                                 send(params)
                             },
-                        )
+                        )?;
+                        on_kickoff(kickoff.alias, kickoff.assignment_id, kickoff.issue_id);
+                        Ok(sent)
                     };
                     process(
                         &state,
