@@ -698,6 +698,7 @@ function screenOperationLabel(operation: string, t: (english: string) => string)
     case "routines.list": return t("Read workspace routines");
     case "connections.assets": return t("Read connected account lists");
     case "connections.connect": return t("Start connecting a workspace account");
+    case "connections.ads.campaigns": return t("Import existing ad campaigns and 7-day reporting from connected ad accounts");
     case "catalog.call": return t("Run a granted platform tool with app data");
     case "smtp.test-send": return t("Send a test email through the configured account");
     default: return operation;

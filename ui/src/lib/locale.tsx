@@ -265,6 +265,7 @@ Object.assign(zhTW, {
   "Read workspace routines": "讀取工作區的例行工作",
   "Read connected account lists": "讀取已連結的帳號清單",
   "Start connecting a workspace account": "啟動連結工作區帳號",
+  "Import existing ad campaigns and 7-day reporting from connected ad accounts": "從已連結的廣告帳號匯入現有廣告活動與近 7 天成效報表",
   "Run a granted platform tool with app data": "使用應用程式資料執行已授權的平台工具",
   "Send a test email through the configured account": "透過已設定的帳戶傳送測試電郵",
   "Loads images from": "從以下來源載入圖片",
@@ -3857,6 +3858,20 @@ Object.assign(zhTW, {
   "Tools you enable can run without asking again.": "已啟用的工具可以直接執行，無需再次詢問。",
   "No read-only tools are available to enable here.": "目前沒有可在此啟用的唯讀工具。",
   "Tool access changed. Review the current tool before enabling it.": "工具存取權已變更。啟用前請檢查目前的工具。",
+  "Connect EMW for catalog reads": "連接 EMW 以讀取商品目錄",
+  "Allow Atlas to read the EMW catalog in your personal chats until you disconnect. Other agents and workspace members cannot use this access.": "允許 Atlas 在你的私人對話中讀取 EMW 商品目錄，直至你中斷連線。其他代理和工作區成員無法使用此存取權。",
+  "Connected · Catalog read access": "已連線 · 可讀取商品目錄",
+  "EMW catalog access": "EMW 商品目錄存取權",
+  "Allow Atlas catalog reads": "允許 Atlas 讀取商品目錄",
+  "Atlas can read the EMW catalog in your chats. Other people, agents and scheduled runs cannot use this access.": "Atlas 可在你的對話中讀取 EMW 商品目錄。其他人員、代理和排程任務無法使用此存取權。",
+  "Atlas can use catalog read access only in your chats.": "Atlas 只可在你的對話中讀取商品目錄。",
+  "Use your existing sign-in and make this connection personal. Atlas can read the catalog until you disconnect.": "使用目前的登入，並將此連線設為私人。Atlas 可讀取商品目錄，直至你中斷連線。",
+  "Disconnect EMW": "中斷 EMW 連線",
+  "Disconnecting stops Atlas from using this catalog connection.": "中斷後，Atlas 無法再使用此商品目錄連線。",
+  "Catalog access is no longer available. Please try again.": "商品目錄存取權已不可用。請重試。",
+  "Catalog access is not ready. Check this connection.": "商品目錄存取權尚未就緒。請檢查此連線。",
+  "Use your existing EMW sign-in in Connections.": "請在「連線」中使用你現有的 EMW 登入。",
+  "This server did not start OAuth sign-in.": "此伺服器未開始 OAuth 登入。",
   "Resuming…": "正在恢復…",
   "Custom MCP tool": "自訂 MCP 工具",
   "Run tool": "執行工具",
@@ -4419,5 +4434,19 @@ const CAD2726_ZHTW: Record<string, string> = {
   "What can you help me organize, automate, and track in this workspace?": "在這個工作區中，你可以協助我整理、自動化與追蹤哪些工作？",
 };
 for (const [key, value] of Object.entries(CAD2726_ZHTW)) {
+  if (!(key in zhTW)) zhTW[key] = value;
+}
+
+const CAD2743_ZHTW: Record<string, string> = {
+  "New WhatsApp message": "新 WhatsApp 訊息",
+  "Photo": "相片",
+  "Video": "影片",
+  "Voice message": "語音訊息",
+  "Audio": "音訊",
+  "Document": "文件",
+  "New message": "新訊息",
+  "Unread WhatsApp messages": "未讀 WhatsApp 訊息",
+};
+for (const [key, value] of Object.entries(CAD2743_ZHTW)) {
   if (!(key in zhTW)) zhTW[key] = value;
 }

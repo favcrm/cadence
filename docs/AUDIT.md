@@ -87,6 +87,15 @@ Workflow row shape: a hosted row with `identity_source: "workflow-oidc"` has no
 counts is in AGENTS.md "Review"; what a workflow row proves and does not is
 in AGENTS.md "What a workflow row proves".
 
+Agent-profile row and receipt shape (AOS-727): a hosted row with
+`identity_source: "agent-profile"` has no `github_login` (null or absent; a row
+or receipt that names one is refused) and its `reviewer` is the `agent_ap_<id>`
+subject of the filing agent profile. A receipt for such a verdict has the same
+shape as an owner-attested one with `github_login` null. The hosted read asks
+for these rows with `include_agent_reviews: true`; a board that refuses the
+field is read again without it and shows no agent rows. Any other
+`identity_source` is refused, never read as owner-attested.
+
 The document says where it came from: `origin` is `local` for the
 note parse and `hosted` for the org's record, and the merge gate applies the
 attested rule only to `hosted`. A hosted read takes `--project` and `--repo`

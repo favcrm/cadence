@@ -542,7 +542,7 @@ const DOCUMENTS_PARAMS = ["archived", "stage"] as const;
  *  `drawer_size` are the host's return hint for the drawer surface an app
  *  asked to open (a connect that leaves the board and comes back); they are
  *  the app page's alone and never follow the operator elsewhere. */
-const APP_ROUTE_PARAMS = ["crm", "record", "ctx", "appview", "segment", "conversation", "install", "drawer", "drawer_size"] as const;
+const APP_ROUTE_PARAMS = ["crm", "record", "ctx", "appview", "segment", "conversation", "install", "drawer", "drawer_size", "wa_thread"] as const;
 
 /** CAD-2555: the page's declared-view params (`p.<name>`) are app-owned too. */
 function deleteAppRouteParams(q: URLSearchParams): void {

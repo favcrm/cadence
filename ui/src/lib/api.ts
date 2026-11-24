@@ -1517,6 +1517,7 @@ export const api = {
     custom_headers?: Array<{ name: string; value: string }>;
     oauth_client?: { client_id: string; client_secret?: string; scopes?: string[] };
     required_scopes?: string[];
+    standing_read_profile?: "emw_catalog_v1";
     return_to?: string;
   }) => post<CustomMcpCreatePayload>("/api/connections/mcp", body),
   customMcpOAuthStart: (id: string, body?: { return_to?: string }) =>
@@ -1542,6 +1543,11 @@ export const api = {
     post<CustomMcpConnectionPayload>(
       `/api/connections/mcp/${encodeURIComponent(id)}/tools`,
       { tools: [{ tool_name: toolName, mode: "read" }], read_guard: readGuard },
+    ),
+  customMcpAllowCatalogReads: (id: string, snapshot_revision: number) =>
+    post<CustomMcpConnectionPayload>(
+      `/api/connections/mcp/${encodeURIComponent(id)}/allow-catalog-reads`,
+      { snapshot_revision },
     ),
   customMcpAcceptDrift: (
     id: string,

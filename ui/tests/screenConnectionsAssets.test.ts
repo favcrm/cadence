@@ -7,6 +7,7 @@ import {
 } from "../src/features/workspace-apps/screen/screenProtocol";
 import { parseMount, ScreenChannel, type MountReceipt } from "../src/features/workspace-apps/screen/screenLifecycle";
 import { READ_ONLY_OPERATIONS, readOnlyReceipt } from "../src/features/workspace-apps/screen/screenReadOnly";
+import { admitDisplaySession, withReadObservations } from "../src/features/workspace-apps/screen/screenDisplayCache";
 import {
   hostedConnectCommandUrl,
   recordServices,
@@ -196,6 +197,51 @@ async function run(): Promise<void> {
   const stripped = connectReply.data as Record<string, unknown>;
   assert.equal("host_command" in stripped, false, "host_command is stripped before reaching the iframe");
   assert.equal(refused, 0, "the connect mount is not retired");
+
+  // CAD-2751: `connections.ads.campaigns` is an owner-only CALL verb (never a SLOT,
+  // never a read-only mount verb, and excluded from observeRead display cache).
+  const ADS_CAMPAIGNS_VERB = "connections.ads.campaigns" as const;
+  assert.ok((RECORD_CALL_VERBS as readonly string[]).includes(ADS_CAMPAIGNS_VERB), `${ADS_CAMPAIGNS_VERB} is a CALL verb`);
+  assert.equal((RECORD_SLOT_VERBS as readonly string[]).includes(ADS_CAMPAIGNS_VERB), false, `${ADS_CAMPAIGNS_VERB} is never a SLOT`);
+  assert.equal(SCREEN_READ_VERBS.has(ADS_CAMPAIGNS_VERB), false, `${ADS_CAMPAIGNS_VERB} is not in SCREEN_READ_VERBS`);
+  assert.equal(READ_ONLY_OPERATIONS.includes(ADS_CAMPAIGNS_VERB), false, `${ADS_CAMPAIGNS_VERB} is not in READ_ONLY_OPERATIONS`);
+  assert.equal(recordArgsLimit(ADS_CAMPAIGNS_VERB), 16384, "connections.ads.campaigns keeps the default argument limit");
+
+  const adsReceipt: MountReceipt = { ...receipt, operations: ["records.list", ADS_CAMPAIGNS_VERB] };
+  assert.equal(
+    JSON.stringify(readOnlyReceipt(adsReceipt).operations),
+    JSON.stringify(["records.list"]),
+    "a read-only mount strips connections.ads.campaigns",
+  );
+  const parsedAdsCall = parseChild(
+    { v: 2, op: "call", id: "k3", verb: ADS_CAMPAIGNS_VERB, args: { toolkit: "metaads", connection_id: "conn_1", account_id: "act_123" } },
+    [ADS_CAMPAIGNS_VERB],
+  );
+  assert.ok(parsedAdsCall !== null && parsedAdsCall.op === "call" && parsedAdsCall.verb === ADS_CAMPAIGNS_VERB, "connections.ads.campaigns parses as a granted call");
+
+  admitDisplaySession(receipt.display_session_key!);
+  globalThis.fetch = ((url: string, init?: RequestInit) => {
+    assert.equal(url, "/api/app-screen-services/call", "connections.ads.campaigns uses service call route");
+    const body = JSON.parse(String(init?.body));
+    requests.push({ operation: body.operation, args: body.args });
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({ toolkit: "metaads", status: "ok", campaigns: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+  }) as typeof fetch;
+
+  const adsServices = recordServices(adsReceipt, "ads-import-domain", {
+    current: () => true,
+    refused: () => { refused += 1; },
+    command: () => {},
+  });
+  const adsReply = await adsServices.call(ADS_CAMPAIGNS_VERB, { toolkit: "metaads", connection_id: "conn_1", account_id: "act_123" });
+  assert.ok(adsReply.ok, "connections.ads.campaigns call resolves ok");
+  const observed = withReadObservations(projection, receipt.display_scope_key!, [ADS_CAMPAIGNS_VERB]);
+  assert.equal(observed.read_observations?.length ?? 0, 0, "connections.ads.campaigns must not enter observeRead display cache");
+  assert.equal(refused, 0, "the ads import mount is not retired");
 }
 
 run().catch(error => { throw error; });

@@ -1904,6 +1904,8 @@ export interface CustomMcpConnectionSummary {
   created_at: number;
   updated_at: number;
   connected_by_you?: boolean;
+  standing_read_profile?: "emw_catalog_v1";
+  standing_read_access?: "allowed" | "confirm";
   tools_summary: CustomMcpToolsSummary;
   tools?: CustomMcpToolPin[];
   server_instructions?: string | null;
@@ -1913,6 +1915,7 @@ export interface CustomMcpConnectionSummary {
 
 export interface CustomMcpListPayload {
   connections: CustomMcpConnectionSummary[];
+  standing_read_profile?: "emw_catalog_v1";
 }
 
 export interface CustomMcpOAuthDiscovery {

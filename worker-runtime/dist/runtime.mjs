@@ -63,561 +63,6 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
   throw Error('Dynamic require of "' + x + '" is not supported');
 });
 
-// node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js
-class FifoQueue {
-  incoming = [];
-  outgoing = [];
-  get length() {
-    return this.incoming.length + this.outgoing.length;
-  }
-  enqueue(value) {
-    this.incoming.push(value);
-  }
-  dequeue() {
-    if (this.outgoing.length === 0) {
-      while (this.incoming.length > 0) {
-        this.outgoing.push(this.incoming.pop());
-      }
-    }
-    return this.outgoing.pop();
-  }
-}
-function createAssistantMessageEventStream() {
-  return new AssistantMessageEventStream;
-}
-var EventStream, AssistantMessageEventStream;
-var init_event_stream = __esm(() => {
-  EventStream = class EventStream {
-    queue = new FifoQueue;
-    waiting = new FifoQueue;
-    done = false;
-    finalResultPromise;
-    resolveFinalResult;
-    isComplete;
-    extractResult;
-    constructor(isComplete, extractResult) {
-      this.isComplete = isComplete;
-      this.extractResult = extractResult;
-      this.finalResultPromise = new Promise((resolve) => {
-        this.resolveFinalResult = resolve;
-      });
-    }
-    push(event) {
-      if (this.done)
-        return;
-      if (this.isComplete(event)) {
-        this.done = true;
-        this.resolveFinalResult(this.extractResult(event));
-      }
-      const waiter = this.waiting.dequeue();
-      if (waiter) {
-        waiter({ value: event, done: false });
-      } else {
-        this.queue.enqueue(event);
-      }
-    }
-    end(result) {
-      this.done = true;
-      if (result !== undefined) {
-        this.resolveFinalResult(result);
-      }
-      while (this.waiting.length > 0) {
-        const waiter = this.waiting.dequeue();
-        waiter({ value: undefined, done: true });
-      }
-    }
-    async* [Symbol.asyncIterator]() {
-      while (true) {
-        if (this.queue.length > 0) {
-          yield this.queue.dequeue();
-        } else if (this.done) {
-          return;
-        } else {
-          const result = await new Promise((resolve) => this.waiting.enqueue(resolve));
-          if (result.done)
-            return;
-          yield result.value;
-        }
-      }
-    }
-    result() {
-      return this.finalResultPromise;
-    }
-  };
-  AssistantMessageEventStream = class AssistantMessageEventStream extends EventStream {
-    #startedAt = Date.now();
-    #startedAtMonotonic = performance.now();
-    constructor() {
-      super((event) => event.type === "done" || event.type === "error", (event) => {
-        if (event.type === "done") {
-          return event.message;
-        } else if (event.type === "error") {
-          return event.error;
-        }
-        throw new Error("Unexpected event type for final result");
-      });
-    }
-    push(event) {
-      if (event.type === "done")
-        this.#time(event.message);
-      else if (event.type === "error")
-        this.#time(event.error);
-      super.push(event);
-    }
-    end(result) {
-      if (result !== undefined)
-        this.#time(result);
-      super.end(result);
-    }
-    #time(message) {
-      if (this.done || message.durationMs !== undefined || message.timestamp < this.#startedAt)
-        return;
-      message.durationMs = Math.max(0, Math.round(performance.now() - this.#startedAtMonotonic));
-    }
-  };
-});
-
-// node_modules/@earendil-works/pi-ai/dist/api/lazy.js
-function createSetupErrorMessage(model, error, timestamp, stopReason) {
-  return {
-    role: "assistant",
-    content: [],
-    api: model.api,
-    provider: model.provider,
-    model: model.id,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
-    },
-    stopReason,
-    errorMessage: error instanceof Error ? error.message : String(error),
-    timestamp
-  };
-}
-function hasResult(source) {
-  return typeof source.result === "function";
-}
-async function forwardStream(target, source, observer, observeResult) {
-  let result;
-  for await (const event of source) {
-    target.push(event);
-    observer?.onEvent?.(event);
-    if (event.type === "done")
-      result = event.message;
-    else if (event.type === "error")
-      result = event.error;
-  }
-  if (hasResult(source))
-    result = await source.result();
-  target.end(result);
-  observeResult(result);
-}
-function lazyStream(model, setup, observer, signal) {
-  const startedAt = Date.now();
-  const outer = new AssistantMessageEventStream;
-  let observedResult = false;
-  const observeResult = (result) => {
-    if (observedResult)
-      return;
-    observedResult = true;
-    observer?.onResult?.(result);
-  };
-  setup().then((inner) => forwardStream(outer, inner, observer, observeResult)).catch((error) => {
-    const reason = signal?.aborted ? "aborted" : "error";
-    const message = createSetupErrorMessage(model, error, startedAt, reason);
-    const event = { type: "error", reason, error: message };
-    outer.push(event);
-    observer?.onEvent?.(event);
-    outer.end(message);
-    observeResult(message);
-  });
-  return outer;
-}
-function lazyApi(load, capabilities) {
-  const api = {
-    stream: (model, context, options) => lazyStream(model, async () => (await load()).stream(model, context, options), undefined, options?.signal),
-    streamSimple: (model, context, options) => lazyStream(model, async () => (await load()).streamSimple(model, context, options), undefined, options?.signal)
-  };
-  if (capabilities?.fetchDeferred) {
-    api.fetchDeferred = (model, handle, options) => lazyStream(model, async () => {
-      const implementation = await load();
-      if (!implementation.fetchDeferred)
-        throw new Error("API does not support deferred responses");
-      return implementation.fetchDeferred(model, handle, options);
-    }, undefined, options?.signal);
-  }
-  if (capabilities?.cancelDeferred) {
-    api.cancelDeferred = async (model, handle, options) => {
-      const implementation = await load();
-      if (!implementation.cancelDeferred)
-        throw new Error("API cannot cancel deferred responses");
-      await implementation.cancelDeferred(model, handle, options);
-    };
-  }
-  return api;
-}
-var init_lazy = __esm(() => {
-  init_event_stream();
-});
-
-// node_modules/@earendil-works/pi-ai/dist/auth/context.js
-function getProcessEnv() {
-  const proc = globalThis.process;
-  return proc?.env;
-}
-function defaultProviderAuthContext() {
-  return {
-    async env(name) {
-      const value = getProcessEnv()?.[name];
-      return typeof value === "string" && value.trim().length > 0 ? value : undefined;
-    },
-    async fileExists(path) {
-      try {
-        const fs = await importNodeModule("node:fs/promises");
-        let resolved = path;
-        if (resolved.startsWith("~")) {
-          const os = await importNodeModule("node:os");
-          resolved = os.homedir() + resolved.slice(1);
-        }
-        await fs.access(resolved);
-        return true;
-      } catch {
-        return false;
-      }
-    }
-  };
-}
-var __rewriteRelativeImportExtension = function(path, preserveJsx) {
-  if (typeof path === "string" && /^\.\.?\//.test(path)) {
-    return path.replace(/\.(tsx)$|((?:\.d)?)((?:\.[^./]+?)?)\.([cm]?)ts$/i, function(m, tsx, d, ext, cm) {
-      return tsx ? preserveJsx ? ".jsx" : ".js" : d && (!ext || !cm) ? m : d + ext + "." + cm.toLowerCase() + "js";
-    });
-  }
-  return path;
-}, importNodeModule = (specifier) => import(__rewriteRelativeImportExtension(specifier));
-
-// node_modules/@earendil-works/pi-ai/dist/utils/abort.js
-function abortReason(signal) {
-  if (signal.reason !== undefined)
-    return signal.reason;
-  const error = new Error("The operation was aborted");
-  error.name = "AbortError";
-  return error;
-}
-function operationSignal(signal) {
-  return signal ?? new AbortController().signal;
-}
-function raceWithAbortSignal(operation, signal) {
-  if (signal.aborted) {
-    operation.catch(() => {});
-    return Promise.reject(abortReason(signal));
-  }
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const cleanup = () => signal.removeEventListener("abort", onAbort);
-    const onAbort = () => {
-      if (settled)
-        return;
-      settled = true;
-      cleanup();
-      reject(abortReason(signal));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    operation.then((value) => {
-      if (settled)
-        return;
-      settled = true;
-      cleanup();
-      resolve(value);
-    }, (error) => {
-      if (settled)
-        return;
-      settled = true;
-      cleanup();
-      reject(error);
-    });
-    if (signal.aborted)
-      onAbort();
-  });
-}
-
-// node_modules/@earendil-works/pi-ai/dist/auth/credential-store.js
-class InMemoryCredentialStore {
-  credentials = new Map;
-  chains = new Map;
-  enqueue(providerId, task, options) {
-    const signal = operationSignal(options?.signal);
-    const previous = this.chains.get(providerId) ?? Promise.resolve();
-    const queued = (async () => {
-      await previous.catch(() => {});
-      signal.throwIfAborted();
-      return task();
-    })();
-    const tail = queued.catch(() => {});
-    this.chains.set(providerId, tail);
-    tail.then(() => {
-      if (this.chains.get(providerId) === tail)
-        this.chains.delete(providerId);
-    });
-    return raceWithAbortSignal(queued, signal);
-  }
-  async read(providerId, options) {
-    options?.signal?.throwIfAborted();
-    return this.credentials.get(providerId);
-  }
-  async list(options) {
-    options?.signal?.throwIfAborted();
-    return [...this.credentials].map(([providerId, credential]) => ({ providerId, type: credential.type }));
-  }
-  modify(providerId, fn, options) {
-    return this.enqueue(providerId, async () => {
-      const current = this.credentials.get(providerId);
-      const next = await fn(current);
-      options?.signal?.throwIfAborted();
-      if (next !== undefined)
-        this.credentials.set(providerId, next);
-      return next ?? current;
-    }, options);
-  }
-  delete(providerId, options) {
-    return this.enqueue(providerId, async () => {
-      this.credentials.delete(providerId);
-    }, options);
-  }
-}
-var init_credential_store = () => {};
-
-// node_modules/@earendil-works/pi-ai/dist/utils/diagnostics.js
-function formatThrownValue(value) {
-  if (value instanceof Error)
-    return value.message || value.name;
-  if (typeof value === "string")
-    return value;
-  return String(value);
-}
-function appendAssistantMessageDiagnostic(message, diagnostic) {
-  message.diagnostics = [...message.diagnostics ?? [], diagnostic];
-}
-
-// node_modules/@earendil-works/pi-ai/dist/utils/models-error.js
-function withCauseDetail(message, cause) {
-  if (cause === undefined || cause === null)
-    return message;
-  const detail = formatThrownValue(cause).trim();
-  if (!detail || message.includes(detail))
-    return message;
-  return `${message}: ${detail}`;
-}
-var ModelsError;
-var init_models_error = __esm(() => {
-  ModelsError = class ModelsError extends Error {
-    code;
-    constructor(code, message, options) {
-      super(withCauseDetail(message, options?.cause), options);
-      this.name = "ModelsError";
-      this.code = code;
-    }
-  };
-});
-
-// node_modules/@earendil-works/pi-ai/dist/auth/resolve.js
-function resolveProviderAuth(provider, credentials, authContext, overrides) {
-  const signal = operationSignal(overrides?.signal);
-  return raceWithAbortSignal(resolveProviderAuthWithSignal(provider, credentials, authContext, overrides, signal), signal);
-}
-async function resolveProviderAuthWithSignal(provider, credentials, authContext, overrides, signal) {
-  signal.throwIfAborted();
-  const requestAuthContext = overrides?.env ? overlayEnvAuthContext(authContext, overrides.env) : authContext;
-  if (overrides?.apiKey !== undefined && provider.auth.apiKey) {
-    return resolveApiKey(requestAuthContext, provider.auth.apiKey, provider.id, {
-      type: "api_key",
-      key: overrides.apiKey,
-      env: overrides.env
-    }, signal);
-  }
-  const stored = await readCredential(credentials, provider.id, signal);
-  if (stored) {
-    if (stored.type === "oauth" && provider.auth.oauth) {
-      return resolveStoredOAuth(credentials, provider.id, provider.auth.oauth, stored, signal, overrides?.minOAuthValidityMs);
-    }
-    if (stored.type === "api_key" && provider.auth.apiKey) {
-      const credential = overrides?.env ? { ...stored, env: { ...stored.env, ...overrides.env } } : stored;
-      return resolveApiKey(requestAuthContext, provider.auth.apiKey, provider.id, credential, signal);
-    }
-    return;
-  }
-  return provider.auth.apiKey ? resolveApiKey(requestAuthContext, provider.auth.apiKey, provider.id, undefined, signal) : undefined;
-}
-function overlayEnvAuthContext(base, env) {
-  return {
-    env: async (name) => env[name] || await base.env(name),
-    fileExists: (path) => base.fileExists(path)
-  };
-}
-async function refreshStoredOAuthCredential(credentials, providerId, oauth, needsRefresh, signal) {
-  let post;
-  const lockWait = new AbortController;
-  const cancelLockWait = () => lockWait.abort(signal.reason);
-  signal.addEventListener("abort", cancelLockWait, { once: true });
-  if (signal.aborted)
-    cancelLockWait();
-  try {
-    post = await credentials.modify(providerId, async (current) => {
-      signal.removeEventListener("abort", cancelLockWait);
-      signal.throwIfAborted();
-      if (current?.type !== "oauth")
-        return;
-      if (!needsRefresh(current))
-        return;
-      try {
-        return await oauth.refresh(current, AbortSignal.timeout(DEFAULT_OAUTH_REFRESH_TIMEOUT_MS));
-      } catch (error) {
-        throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, { cause: error });
-      }
-    }, { signal: lockWait.signal });
-  } catch (error) {
-    if (error instanceof ModelsError)
-      throw error;
-    signal.throwIfAborted();
-    throw new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause: error });
-  } finally {
-    signal.removeEventListener("abort", cancelLockWait);
-  }
-  return post?.type === "oauth" ? post : undefined;
-}
-async function resolveStoredOAuth(credentials, providerId, oauth, stored, signal, minOAuthValidityMs) {
-  const minimumValidityMs = Math.max(DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, minOAuthValidityMs ?? 0);
-  const expiresSoon = (credential) => Date.now() + minimumValidityMs >= credential.expires;
-  let credential = stored;
-  if (expiresSoon(credential)) {
-    const post = await refreshStoredOAuthCredential(credentials, providerId, oauth, expiresSoon, signal);
-    if (!post)
-      return;
-    credential = post;
-    if (minOAuthValidityMs !== undefined && expiresSoon(credential)) {
-      throw new ModelsError("oauth", `OAuth refresh returned a token that expires too soon for ${providerId}`);
-    }
-  }
-  try {
-    return { auth: await oauth.toAuth(credential), source: "OAuth" };
-  } catch (error) {
-    throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, { cause: error });
-  }
-}
-async function resolveApiKey(authContext, apiKey, providerId, credential, signal) {
-  try {
-    return await apiKey.resolve({ ctx: authContext, credential, signal });
-  } catch (error) {
-    throw new ModelsError("auth", `API key auth failed for provider ${providerId}`, { cause: error });
-  }
-}
-async function readCredential(credentials, providerId, signal) {
-  try {
-    return await credentials.read(providerId, { signal });
-  } catch (error) {
-    throw new ModelsError("auth", `Credential store read failed for ${providerId}`, { cause: error });
-  }
-}
-var DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 15000;
-var init_resolve = __esm(() => {
-  init_models_error();
-  init_models_error();
-  DEFAULT_OAUTH_MINIMUM_VALIDITY_MS = 5 * 60 * 1000;
-});
-
-// node_modules/@earendil-works/pi-ai/dist/models-store.js
-class InMemoryModelsStore {
-  entries = new Map;
-  async read(providerId, options) {
-    options?.signal?.throwIfAborted();
-    const entry = this.entries.get(providerId);
-    return entry ? structuredClone(entry) : undefined;
-  }
-  async write(providerId, entry, options) {
-    options?.signal?.throwIfAborted();
-    this.entries.set(providerId, structuredClone(entry));
-  }
-  async delete(providerId, options) {
-    options?.signal?.throwIfAborted();
-    this.entries.delete(providerId);
-  }
-}
-
-// node_modules/@earendil-works/pi-telemetry/dist/metrics.js
-function createTypedMetrics(metrics, schemas) {
-  const definitions = new Map;
-  for (const schema of schemas) {
-    for (const [name, definition] of Object.entries(schema.metrics ?? {}))
-      definitions.set(name, definition);
-  }
-  return {
-    counter: (name) => metrics.counter(name, definitions.get(name)),
-    upDownCounter: (name) => metrics.upDownCounter(name, definitions.get(name)),
-    histogram: (name) => metrics.histogram(name, definitions.get(name))
-  };
-}
-
-// node_modules/@earendil-works/pi-telemetry/dist/noop.js
-async function startNoopSpan(_options, callback) {
-  return callback(noopTelemetrySpan);
-}
-var noopCounter, noopUpDownCounter, noopHistogram, NOOP_TELEMETRY_METRICS, NOOP_TELEMETRY_PROPAGATION, noopTelemetrySpan, NOOP_TELEMETRY_CONTEXT;
-var init_noop = __esm(() => {
-  noopCounter = Object.freeze({ add: () => {} });
-  noopUpDownCounter = Object.freeze({ add: () => {} });
-  noopHistogram = Object.freeze({ record: () => {} });
-  NOOP_TELEMETRY_METRICS = Object.freeze({
-    counter: () => noopCounter,
-    upDownCounter: () => noopUpDownCounter,
-    histogram: () => noopHistogram
-  });
-  NOOP_TELEMETRY_PROPAGATION = Object.freeze({
-    inject: () => {
-      return;
-    },
-    extract: () => NOOP_TELEMETRY_CONTEXT
-  });
-  noopTelemetrySpan = {
-    metrics: NOOP_TELEMETRY_METRICS,
-    propagation: NOOP_TELEMETRY_PROPAGATION,
-    startSpan: startNoopSpan,
-    addLink: () => {},
-    addEvent: () => {},
-    setAttributes: () => {},
-    setStatus: () => {}
-  };
-  Object.freeze(noopTelemetrySpan);
-  NOOP_TELEMETRY_CONTEXT = noopTelemetrySpan;
-});
-
-// node_modules/@earendil-works/pi-telemetry/dist/memory.js
-var anchor, contextCarriers;
-var init_memory = __esm(() => {
-  init_noop();
-  anchor = performance.timeOrigin;
-  contextCarriers = new WeakMap;
-});
-
-// node_modules/@earendil-works/pi-telemetry/dist/index.js
-function defineTelemetrySchema(schema) {
-  return schema;
-}
-function bindTypedSpanStarter(telemetryContext) {
-  const startSpan = (name, attributes, callback) => telemetryContext.startSpan({ name, attributes }, (span) => callback(span, bindTypedSpanStarter(span)));
-  return startSpan;
-}
-function createTypedSpanStarter(telemetryContext, _schemas) {
-  return bindTypedSpanStarter(telemetryContext);
-}
-var init_dist = __esm(() => {
-  init_noop();
-  init_memory();
-});
-
 // node_modules/@earendil-works/pi-ai/dist/utils/text.js
 function contentText(content, separator = `
 `) {
@@ -653,378 +98,90 @@ function ownedSlice(text, start, end = text.length) {
   return `${text.slice(start, end)} `.slice(0, -1);
 }
 
-// node_modules/@earendil-works/pi-ai/dist/telemetry.js
-function createInstruments(adapter) {
-  const metrics = createTypedMetrics(adapter, [AI_TELEMETRY_SCHEMA]);
-  return {
-    requestDuration: metrics.histogram("pi.ai.request.duration"),
-    firstChunkDuration: metrics.histogram("pi.ai.first_chunk.duration"),
-    tokens: metrics.counter("pi.ai.tokens"),
-    cost: metrics.counter("pi.ai.cost")
-  };
+// node_modules/@earendil-works/pi-ai/dist/utils/estimate.js
+function calculateContextTokens(usage) {
+  return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
-function observeModelRequest(requestedModel, options, poll) {
-  const started = performance.now();
-  const attributes = { provider: requestedModel.provider, model: requestedModel.id };
-  const adapter = options?.telemetry?.metrics ?? NOOP_TELEMETRY_METRICS;
-  let instruments = instrumentCache.get(adapter);
-  if (!instruments) {
-    instruments = createInstruments(adapter);
-    instrumentCache.set(adapter, instruments);
-  }
-  const { requestDuration, firstChunkDuration, tokens, cost } = instruments;
-  let span;
-  let finish;
-  let first = true;
-  const toolChars = new Map;
-  const finished = new Promise((resolve) => {
-    finish = resolve;
-  });
-  const run = (activeSpan) => {
-    span = activeSpan;
-    return finished;
-  };
-  const startAttributes = {
-    ...attributes,
-    api: requestedModel.api,
-    ...typeof options?.reasoning === "string" ? { reasoning: options.reasoning } : {}
-  };
-  const start = createTypedSpanStarter(options?.telemetry ?? NOOP_TELEMETRY_CONTEXT, [AI_TELEMETRY_SCHEMA]);
-  if (poll)
-    start("pi.ai.poll", startAttributes, run);
-  else
-    start("pi.ai.request", startAttributes, run);
-  return {
-    onEvent(event) {
-      if (first) {
-        first = false;
-        span.addEvent("pi.ai.first_chunk");
-        firstChunkDuration.record(performance.now() - started, attributes, span);
-      }
-      if (event.type === "toolcall_delta") {
-        toolChars.set(event.contentIndex, (toolChars.get(event.contentIndex) ?? 0) + event.delta.length);
-      } else if (event.type === "text_end" || event.type === "thinking_end") {
-        span.addEvent("pi.ai.block", {
-          type: event.type === "text_end" ? "text" : "thinking",
-          index: event.contentIndex,
-          chars: event.content.length
-        });
-      } else if (event.type === "toolcall_end") {
-        const chars = toolChars.get(event.contentIndex) ?? 0;
-        toolChars.delete(event.contentIndex);
-        span.addEvent("pi.ai.block", {
-          type: "tool_call",
-          index: event.contentIndex,
-          chars,
-          tool: event.toolCall.name
-        });
-      }
-    },
-    onResult(message) {
-      if (message) {
-        span.setAttributes({
-          stop: message.stopReason,
-          "usage.input": message.usage.input,
-          "usage.output": message.usage.output,
-          "usage.cache_read": message.usage.cacheRead,
-          "usage.cache_write": message.usage.cacheWrite,
-          "cost.total": message.usage.cost.total,
-          "response.id": message.responseId
-        });
-        if (message.stopReason === "error") {
-          span.setStatus({
-            status: "error",
-            error: { name: "provider_error", message: ownedSlice(message.errorMessage ?? "", 0, 500) }
-          });
-        }
-        requestDuration.record(performance.now() - started, { ...attributes, stop: message.stopReason }, span);
-        if (!poll || message.stopReason !== "pending" && message.stopReason !== "deferred") {
-          tokens.add(message.usage.input, { ...attributes, kind: "input" });
-          tokens.add(message.usage.output, { ...attributes, kind: "output" });
-          tokens.add(message.usage.cacheRead, { ...attributes, kind: "cache_read" });
-          tokens.add(message.usage.cacheWrite, { ...attributes, kind: "cache_write" });
-          cost.add(message.usage.cost.total, attributes);
-        }
-      }
-      finish();
-    }
-  };
-}
-var provider, model, stop, request, AI_TELEMETRY_SCHEMA, instrumentCache;
-var init_telemetry = __esm(() => {
-  init_dist();
-  provider = { type: "string", description: "Provider identifier.", required: true };
-  model = { type: "string", description: "Requested model identifier.", required: true };
-  stop = {
-    type: "string",
-    description: "Normalized stop reason.",
-    values: ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"]
-  };
-  request = {
-    description: "One logical model request, including authentication and provider setup.",
-    parents: { kind: "any" },
-    startAttributes: {
-      provider,
-      api: { type: "string", description: "API identifier.", required: true },
-      model,
-      reasoning: { type: "string", description: "Scalar requested reasoning level.", required: false }
-    },
-    endAttributes: {
-      stop,
-      "usage.input": { type: "number", description: "Uncached input tokens." },
-      "usage.output": { type: "number", description: "Output tokens." },
-      "usage.cache_read": { type: "number", description: "Cache-read tokens." },
-      "usage.cache_write": { type: "number", description: "Cache-write tokens." },
-      "cost.total": { type: "number", description: "Total request cost in USD." },
-      "response.id": { type: "string", description: "Provider response identifier.", cardinality: "high" }
-    },
-    events: {
-      "pi.ai.first_chunk": { description: "First normalized stream event delivered.", attributes: {} },
-      "pi.ai.block": {
-        description: "A completed content block; content is never recorded.",
-        attributes: {
-          type: {
-            type: "string",
-            description: "Block kind.",
-            values: ["text", "thinking", "tool_call"],
-            required: true
-          },
-          index: { type: "number", description: "Content block index.", required: true },
-          chars: { type: "number", description: "UTF-16 character count.", required: true },
-          tool: { type: "string", description: "Tool name, for tool-call blocks only.", required: false }
-        }
-      }
-    },
-    status: {
-      default: "ok",
-      errorWhen: "Stop reason is error: provider_error with at most 500 error-message characters. Aborted stays ok."
-    }
-  };
-  AI_TELEMETRY_SCHEMA = defineTelemetrySchema({
-    version: 1,
-    spans: {
-      "pi.ai.request": request,
-      "pi.ai.poll": { ...request, description: "One deferred-response poll, not the deferred request's lifetime." }
-    },
-    metrics: {
-      "pi.ai.request.duration": {
-        kind: "histogram",
-        description: "Logical request or poll duration.",
-        unit: "ms",
-        attributes: { provider, model, stop: { ...stop, required: true } }
-      },
-      "pi.ai.first_chunk.duration": {
-        kind: "histogram",
-        description: "Time to the first normalized stream event.",
-        unit: "ms",
-        attributes: { provider, model }
-      },
-      "pi.ai.tokens": {
-        kind: "counter",
-        description: "Reported model token usage; pending and deferred polls are excluded.",
-        unit: "token",
-        attributes: {
-          provider,
-          model,
-          kind: {
-            type: "string",
-            description: "Token usage category.",
-            values: ["input", "output", "cache_read", "cache_write"],
-            required: true
-          }
-        }
-      },
-      "pi.ai.cost": {
-        kind: "counter",
-        description: "Reported model cost; pending and deferred polls are excluded.",
-        unit: "USD",
-        attributes: { provider, model }
-      }
-    }
-  });
-  instrumentCache = new WeakMap;
-});
-
-// node_modules/@earendil-works/pi-ai/dist/utils/version.js
-var PI_AI_VERSION = "1.5.2";
-
-// node_modules/@earendil-works/pi-ai/dist/utils/identity.js
-function mergeClientIdentity(...sources) {
-  let merged;
-  for (const source of sources) {
-    if (!source)
-      continue;
-    merged = { ...merged };
-    if (source.userAgent !== undefined)
-      merged.userAgent = source.userAgent;
-    if (source.attribution !== undefined)
-      merged.attribution = source.attribution;
-    if (source.version !== undefined)
-      merged.version = source.version;
-  }
-  return merged;
-}
-function getClientVersion(identity) {
-  return identity?.version ?? PI_AI_VERSION;
-}
-function runtimeDescription() {
-  if (typeof process === "undefined")
-    return;
-  const versions = process.versions;
-  if (versions?.bun)
-    return `bun/${versions.bun}`;
-  if (versions?.node)
-    return `node/${process.version}`;
-  return;
-}
-function formatUserAgent(identity) {
-  const mode = identity?.userAgent ?? "detailed";
-  if (typeof mode === "object")
-    return mode.custom;
-  if (mode === "short")
-    return "pi";
-  const product = `pi/${getClientVersion(identity)}`;
-  const runtime = runtimeDescription();
-  return runtime ? `${product} (${process.platform}; ${runtime}; ${process.arch})` : `${product} (browser)`;
-}
-function matchesHost(baseUrl, expectedHost) {
+function safeJsonStringify(value) {
   try {
-    return new URL(baseUrl).hostname === expectedHost;
+    return JSON.stringify(value) ?? "undefined";
   } catch {
-    return false;
+    return "[unserializable]";
   }
 }
-function isOpenRouter(target) {
-  return target.provider === "openrouter" || target.baseUrl.includes("openrouter.ai");
+function estimateTextAndImageContentChars(content) {
+  if (typeof content === "string")
+    return content.length;
+  let chars = 0;
+  for (const block of content)
+    chars += block.type === "text" ? block.text.length : ESTIMATED_IMAGE_CHARS;
+  return chars;
 }
-function isNvidiaNim(target) {
-  return target.provider === "nvidia" || matchesHost(target.baseUrl, NVIDIA_NIM_HOST);
+function estimateTextTokens(text) {
+  return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
-function isOpenCode(target) {
-  return target.provider === "opencode" || target.provider === "opencode-go" || matchesHost(target.baseUrl, OPENCODE_HOST);
+function estimateTextAndImageContentTokens(content) {
+  return Math.ceil(estimateTextAndImageContentChars(content) / CHARS_PER_TOKEN);
 }
-function getAttributionHeaders(target, identity) {
-  const attribution = identity?.attribution;
-  if (!attribution)
-    return {};
-  const { name, url, categories } = attribution;
-  if (isOpenRouter(target)) {
-    return {
-      "HTTP-Referer": url,
-      "X-OpenRouter-Title": name,
-      ...categories === undefined || categories.length === 0 ? {} : { "X-OpenRouter-Categories": categories.join(",") }
-    };
+function estimateMessageTokens(message) {
+  let chars = 0;
+  if (message.role === "system") {
+    return estimateTextTokens(getSystemMessageText(message)) + estimateToolsTokens(message.toolsAdded) + estimateToolsTokens(message.toolsRemoved);
   }
-  if (isNvidiaNim(target))
-    return { "X-BILLING-INVOKE-ORIGIN": name.charAt(0).toUpperCase() + name.slice(1) };
-  if (isOpenCode(target))
-    return { "x-opencode-client": name };
-  return {};
-}
-function getOpenCodeSessionHeaders(target, sessionId) {
-  return sessionId && isOpenCode(target) ? { "x-opencode-session": sessionId } : undefined;
-}
-function getIdentityHeaders(target, identity) {
-  return { "User-Agent": formatUserAgent(identity), ...getAttributionHeaders(target, identity) };
-}
-function isMutableModels(models) {
-  return "setProvider" in models && "deleteProvider" in models && "clearProviders" in models;
-}
-function withClientIdentity(models, identity) {
-  const withIdentity = (options) => ({ ...options, identity: mergeClientIdentity(identity, options?.identity) });
-  const wrapped = {
-    getProviders: () => models.getProviders(),
-    getProvider: (id) => models.getProvider(id),
-    getModels: (provider) => models.getModels(provider),
-    getModel: (provider, id) => models.getModel(provider, id),
-    getModelsOfType: (type, provider) => models.getModelsOfType(type, provider),
-    getModelOfType: (type, provider, id) => models.getModelOfType(type, provider, id),
-    getAllModels: (provider) => models.getAllModels(provider),
-    refresh: (options) => models.refresh(options),
-    checkAuth: (providerId, options) => models.checkAuth(providerId, options),
-    getAvailable: (providerId, options) => models.getAvailable(providerId, options),
-    getAvailableOfType: (type, providerId, options) => models.getAvailableOfType(type, providerId, options),
-    getAllAvailable: (providerId, options) => models.getAllAvailable(providerId, options),
-    getAuth: models.getAuth.bind(models),
-    login: (providerId, type, interaction, options) => models.login(providerId, type, interaction, options),
-    logout: (providerId, options) => models.logout(providerId, options),
-    stream: (model, context, options) => models.stream(model, context, withIdentity(options)),
-    complete: (model, context, options) => models.complete(model, context, withIdentity(options)),
-    streamSimple: (model, context, options) => models.streamSimple(model, context, withIdentity(options)),
-    completeSimple: (model, context, options) => models.completeSimple(model, context, withIdentity(options)),
-    streamDeferred: (model, handle, options) => models.streamDeferred(model, handle, withIdentity(options)),
-    fetchDeferred: (model, handle, options) => models.fetchDeferred(model, handle, withIdentity(options)),
-    cancelDeferred: (model, handle, options) => models.cancelDeferred(model, handle, withIdentity(options)),
-    generateImages: (model, context, options) => models.generateImages(model, context, withIdentity(options)),
-    classify: (model, context, options) => models.classify(model, context, withIdentity(options))
-  };
-  if (!isMutableModels(models))
-    return wrapped;
-  const mutable = {
-    ...wrapped,
-    setProvider: (provider) => models.setProvider(provider),
-    deleteProvider: (id) => models.deleteProvider(id),
-    clearProviders: () => models.clearProviders()
-  };
-  return mutable;
-}
-var PI_ATTRIBUTION, NVIDIA_NIM_HOST = "integrate.api.nvidia.com", OPENCODE_HOST = "opencode.ai";
-var init_identity = __esm(() => {
-  PI_ATTRIBUTION = { name: "pi", url: "https://pi.dev", categories: ["cli-agent"] };
-});
-
-// node_modules/@earendil-works/pi-ai/dist/utils/model-operations.js
-function getModelType(model) {
-  return model.type ?? "chat";
-}
-function isModelType(model, type) {
-  return getModelType(model) === type;
-}
-function assertChatModel(model) {
-  if (!isModelType(model, "chat")) {
-    throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not a chat model`);
+  if (message.role === "user")
+    return estimateTextAndImageContentTokens(message.content);
+  if (message.role === "toolResult")
+    return estimateTextAndImageContentTokens(message.content);
+  for (const block of message.content) {
+    if (block.type === "text") {
+      chars += block.text.length;
+    } else if (block.type === "thinking") {
+      chars += block.thinking.length;
+    } else {
+      chars += block.name.length + safeJsonStringify(block.arguments).length;
+    }
   }
+  return Math.ceil(chars / CHARS_PER_TOKEN);
 }
-function assertImageModel(model) {
-  if (!isModelType(model, "image")) {
-    throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not an image model`);
+function getLastAssistantUsageInfo(messages) {
+  let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;
+  let usageInfo;
+  for (let i = 0;i < messages.length; i++) {
+    const message = messages[i];
+    if (message.role === "assistant") {
+      const assistant = message;
+      const usageAppliesToPrefix = assistant.timestamp >= latestPrefixTimestamp;
+      if (usageAppliesToPrefix && assistant.stopReason !== "aborted" && assistant.stopReason !== "error" && calculateContextTokens(assistant.usage) > 0) {
+        usageInfo = { usage: assistant.usage, index: i };
+      }
+    }
+    latestPrefixTimestamp = Math.max(latestPrefixTimestamp, message.timestamp);
   }
+  return usageInfo;
 }
-function assertClassifierModel(model) {
-  if (!isModelType(model, "classifier")) {
-    throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not a classifier model`);
+function estimateContextTokens(context) {
+  const messages = "messages" in context ? context.messages : context;
+  const usageInfo = getLastAssistantUsageInfo(messages);
+  if (usageInfo) {
+    const usageTokens = calculateContextTokens(usageInfo.usage);
+    let trailingTokens = 0;
+    for (let i = usageInfo.index + 1;i < messages.length; i++) {
+      trailingTokens += estimateMessageTokens(messages[i]);
+    }
+    return { tokens: usageTokens + trailingTokens, usageTokens, trailingTokens, lastUsageIndex: usageInfo.index };
   }
+  let tokens = 0;
+  for (const message of messages)
+    tokens += estimateMessageTokens(message);
+  return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
 }
-function assertClassifierInputSupported(model, context) {
-  if (context.images?.length && !model.input.includes("image")) {
-    throw new ModelsError("provider", `Model ${model.provider}/${model.id} does not accept image input`);
-  }
+function estimateToolsTokens(tools) {
+  if (!tools || tools.length === 0)
+    return 0;
+  return estimateTextTokens(safeJsonStringify(tools));
 }
-function imageErrorResult(model, error, aborted = false) {
-  return {
-    api: model.api,
-    provider: model.provider,
-    model: model.id,
-    output: [],
-    stopReason: aborted ? "aborted" : "error",
-    errorMessage: error instanceof Error ? error.message : String(error),
-    timestamp: Date.now()
-  };
-}
-function classifierErrorResult(model, error, aborted = false) {
-  return {
-    api: model.api,
-    provider: model.provider,
-    model: model.id,
-    answers: {},
-    stopReason: aborted ? "aborted" : "error",
-    errorMessage: error instanceof Error ? error.message : String(error),
-    timestamp: Date.now()
-  };
-}
-var init_model_operations = __esm(() => {
-  init_models_error();
-});
+var CHARS_PER_TOKEN = 3.5, ESTIMATED_IMAGE_CHARS = 4800;
+var init_estimate = () => {};
 
 // node_modules/@earendil-works/pi-ai/dist/utils/transcript.js
 function createInitialSystemMessage(systemPrompt, tools) {
@@ -1140,762 +297,76 @@ function resolveTranscriptTools(messages, support) {
 }
 var init_transcript = () => {};
 
-// node_modules/@earendil-works/pi-ai/dist/models.js
-function hasKnownModelType(model) {
-  return Object.hasOwn(KNOWN_MODEL_TYPES, getModelType(model));
-}
-function withKnownModelTypes(entry) {
-  return { ...entry, models: entry.models.filter(hasKnownModelType) };
-}
-function mergeHeaders(base, override) {
-  if (!base && !override)
-    return;
-  const merged = { ...base };
-  for (const [name, value] of Object.entries(override ?? {})) {
-    const lowerName = name.toLowerCase();
-    for (const existingName of Object.keys(merged)) {
-      if (existingName.toLowerCase() === lowerName)
-        delete merged[existingName];
-    }
-    merged[name] = value;
+// node_modules/@earendil-works/pi-telemetry/dist/metrics.js
+function createTypedMetrics(metrics, schemas) {
+  const definitions = new Map;
+  for (const schema of schemas) {
+    for (const [name, definition] of Object.entries(schema.metrics ?? {}))
+      definitions.set(name, definition);
   }
-  return merged;
+  return {
+    counter: (name) => metrics.counter(name, definitions.get(name)),
+    upDownCounter: (name) => metrics.upDownCounter(name, definitions.get(name)),
+    histogram: (name) => metrics.histogram(name, definitions.get(name))
+  };
 }
 
-class ModelsImpl {
-  providers = new Map;
-  credentials;
-  modelsStore;
-  authContext;
-  identity;
-  refreshGenerations = new Map;
-  refreshControllers = new Map;
-  publicationChains = new Map;
-  constructor(options) {
-    this.credentials = options?.credentials ?? new InMemoryCredentialStore;
-    this.modelsStore = options?.modelsStore ?? new InMemoryModelsStore;
-    this.authContext = options?.authContext ?? defaultProviderAuthContext();
-    this.identity = options?.identity;
-  }
-  setProvider(provider) {
-    this.supersedeProviderRefresh(provider.id);
-    this.providers.set(provider.id, provider);
-  }
-  deleteProvider(id) {
-    this.supersedeProviderRefresh(id);
-    this.providers.delete(id);
-  }
-  clearProviders() {
-    for (const id of new Set([...this.providers.keys(), ...this.refreshControllers.keys()])) {
-      this.supersedeProviderRefresh(id);
-    }
-    this.providers.clear();
-  }
-  getProviders() {
-    return Array.from(this.providers.values());
-  }
-  getProvider(id) {
-    return this.providers.get(id);
-  }
-  getModels(provider) {
-    if (provider !== undefined) {
-      const entry = this.providers.get(provider);
-      if (!entry)
-        return [];
-      try {
-        return entry.getModels();
-      } catch {
-        return [];
-      }
-    }
-    const models = [];
-    for (const entry of this.providers.values()) {
-      try {
-        models.push(...entry.getModels());
-      } catch {}
-    }
-    return models;
-  }
-  getAllModels(provider) {
-    if (provider !== undefined) {
-      const entry = this.providers.get(provider);
-      if (!entry)
-        return [];
-      try {
-        return entry.getAllModels?.() ?? entry.getModels();
-      } catch {
-        return [];
-      }
-    }
-    const models = [];
-    for (const entry of this.providers.values()) {
-      try {
-        models.push(...entry.getAllModels?.() ?? entry.getModels());
-      } catch {}
-    }
-    return models;
-  }
-  getModelsOfType(type, provider) {
-    return this.getAllModels(provider).filter((model) => isModelType(model, type));
-  }
-  getModel(provider, id) {
-    return this.getModels(provider).find((model) => model.id === id);
-  }
-  getModelOfType(type, provider, id) {
-    return this.getModelsOfType(type, provider).find((model) => model.id === id);
-  }
-  supersedeProviderRefresh(providerId) {
-    const generation = (this.refreshGenerations.get(providerId) ?? 0) + 1;
-    this.refreshGenerations.set(providerId, generation);
-    const previous = this.refreshControllers.get(providerId);
-    if (previous) {
-      this.refreshControllers.delete(providerId);
-      previous.abort();
-    }
-    return generation;
-  }
-  beginProviderRefresh(providerId) {
-    const generation = this.supersedeProviderRefresh(providerId);
-    const controller = new AbortController;
-    this.refreshControllers.set(providerId, controller);
-    return { generation, controller };
-  }
-  publishProviderModels(providerId, generation, signal, publication) {
-    const previous = this.publicationChains.get(providerId) ?? Promise.resolve();
-    const queued = (async () => {
-      await previous.catch(() => {});
-      if (signal.aborted || this.refreshGenerations.get(providerId) !== generation)
-        return false;
-      if (publication.persist === null) {
-        await this.modelsStore.delete(providerId, { signal });
-      } else if (publication.persist !== undefined) {
-        await this.modelsStore.write(providerId, structuredClone(publication.persist), { signal });
-      }
-      if (signal.aborted || this.refreshGenerations.get(providerId) !== generation)
-        return false;
-      publication.update?.();
-      return true;
-    })();
-    const tail = queued.catch(() => {});
-    this.publicationChains.set(providerId, tail);
-    tail.then(() => {
-      if (this.publicationChains.get(providerId) === tail)
-        this.publicationChains.delete(providerId);
-    });
-    return raceWithAbortSignal(queued, signal);
-  }
-  async runProviderRefreshPhase(provider, credential, allowNetwork, force, generation, signal) {
-    const stored = await this.modelsStore.read(provider.id, { signal });
-    await provider.refreshModels({
-      credential,
-      stored: stored ? withKnownModelTypes(structuredClone(stored)) : undefined,
-      publish: (publication) => this.publishProviderModels(provider.id, generation, signal, publication),
-      allowNetwork,
-      force: allowNetwork ? force : undefined,
-      signal,
-      baseUrl: provider.baseUrl
-    });
-  }
-  async refresh(options = {}) {
-    const allowNetwork = options.allowNetwork ?? true;
-    const callerSignal = operationSignal(options.signal);
-    const errors = new Map;
-    if (callerSignal.aborted)
-      return { aborted: true, errors };
-    const selected = options.providers ? new Set(options.providers) : undefined;
-    const refreshable = Array.from(this.providers.values()).filter((provider) => provider.refreshModels !== undefined && (!selected || selected.has(provider.id)));
-    const refresh = Promise.all(refreshable.map(async (provider) => {
-      const { generation, controller } = this.beginProviderRefresh(provider.id);
-      const signal = AbortSignal.any([callerSignal, controller.signal]);
-      const operation = (async () => {
-        let storedCredential;
-        let credentialError;
-        try {
-          storedCredential = await this.readCredential(provider.id, signal);
-        } catch (error) {
-          credentialError = error;
-        }
-        await this.runProviderRefreshPhase(provider, storedCredential, false, undefined, generation, signal);
-        if (credentialError !== undefined)
-          throw credentialError;
-        if (!allowNetwork || signal.aborted)
-          return;
-        const network = await this.resolveNetworkRefresh(provider, storedCredential, signal);
-        if (!network)
-          return;
-        await this.runProviderRefreshPhase(provider, network.credential, true, options.force, generation, signal);
-      })();
-      try {
-        await raceWithAbortSignal(operation, signal);
-      } catch (error) {
-        if (!signal.aborted) {
-          errors.set(provider.id, error instanceof Error ? error : new ModelsError("model_source", `Model refresh failed for ${provider.id}`, { cause: error }));
-        }
-      } finally {
-        if (this.refreshControllers.get(provider.id) === controller) {
-          this.refreshControllers.delete(provider.id);
-        }
-      }
-    }));
-    try {
-      await raceWithAbortSignal(refresh, callerSignal);
-    } catch (error) {
-      if (!callerSignal.aborted)
-        throw error;
-    }
-    return { aborted: callerSignal.aborted, errors: new Map(errors) };
-  }
-  async resolveNetworkRefresh(provider, stored, signal) {
-    if (provider.refreshModelsAuth === "configured") {
-      return await this.checkProviderAuth(provider, stored, signal) ? {} : undefined;
-    }
-    const credential = await this.resolveRefreshCredential(provider, stored, signal);
-    return credential ? { credential } : undefined;
-  }
-  async resolveRefreshCredential(provider, stored, signal) {
-    if (stored?.type === "oauth") {
-      const oauth = provider.auth.oauth;
-      if (!oauth)
-        return;
-      if (Date.now() < stored.expires)
-        return stored;
-      if (signal.aborted)
-        return;
-      return refreshStoredOAuthCredential(this.credentials, provider.id, oauth, (current) => Date.now() >= current.expires, signal);
-    }
-    const apiKey = provider.auth.apiKey;
-    if (!apiKey)
-      return;
-    const credential = stored?.type === "api_key" ? stored : undefined;
-    const result = await apiKey.resolve({ ctx: this.authContext, credential, signal });
-    if (!result)
-      return;
-    return { type: "api_key", key: result.auth.apiKey, env: result.env };
-  }
-  async readCredential(providerId, signal) {
-    try {
-      return await this.credentials.read(providerId, { signal });
-    } catch (error) {
-      throw new ModelsError("auth", `Credential store read failed for ${providerId}`, { cause: error });
-    }
-  }
-  async checkProviderAuth(provider, credential, signal) {
-    if (credential?.type === "oauth") {
-      return provider.auth.oauth ? { source: "OAuth", type: "oauth" } : undefined;
-    }
-    const apiKey = provider.auth.apiKey;
-    if (!apiKey)
-      return;
-    if (apiKey.check) {
-      try {
-        return await apiKey.check({
-          ctx: this.authContext,
-          credential: credential?.type === "api_key" ? credential : undefined,
-          signal
-        });
-      } catch (error) {
-        throw new ModelsError("auth", `API key auth check failed for provider ${provider.id}`, { cause: error });
-      }
-    }
-    const resolution = await resolveProviderAuth(provider, this.credentials, this.authContext, { signal });
-    return resolution ? { source: resolution.source, type: "api_key" } : undefined;
-  }
-  checkAuth(providerId, options) {
-    const signal = operationSignal(options?.signal);
-    const check = (async () => {
-      signal.throwIfAborted();
-      const provider = this.providers.get(providerId);
-      if (!provider)
-        return;
-      return this.checkProviderAuth(provider, await this.readCredential(providerId, signal), signal);
-    })();
-    return raceWithAbortSignal(check, signal);
-  }
-  async getAuthenticatedProviders(providerId, signal) {
-    signal.throwIfAborted();
-    const providers = providerId ? [this.providers.get(providerId)].filter((entry) => entry !== undefined) : this.getProviders();
-    const checks = await Promise.all(providers.map(async (provider) => {
-      const credential = await this.readCredential(provider.id, signal);
-      return { provider, credential, auth: await this.checkProviderAuth(provider, credential, signal) };
-    }));
-    return checks.filter((entry) => entry.auth !== undefined);
-  }
-  getAvailable(providerId, options) {
-    const signal = operationSignal(options?.signal);
-    const available = (async () => {
-      const providers = await this.getAuthenticatedProviders(providerId, signal);
-      return providers.flatMap(({ provider, credential }) => {
-        const models = provider.getModels();
-        return provider.filterModels?.(models, credential) ?? models;
-      });
-    })();
-    return raceWithAbortSignal(available, signal);
-  }
-  async getAvailableOfType(type, providerId, options) {
-    return (await this.getAllAvailable(providerId, options)).filter((model) => isModelType(model, type));
-  }
-  getAllAvailable(providerId, options) {
-    const signal = operationSignal(options?.signal);
-    const available = (async () => {
-      const providers = await this.getAuthenticatedProviders(providerId, signal);
-      return providers.flatMap(({ provider, credential }) => {
-        const models = provider.getAllModels?.() ?? provider.getModels();
-        if (provider.filterAllModels)
-          return provider.filterAllModels(models, credential);
-        if (!provider.filterModels)
-          return models;
-        const availableChatIds = new Set(provider.filterModels(provider.getModels(), credential).map((model) => model.id));
-        return models.filter((model) => !isModelType(model, "chat") || availableChatIds.has(model.id));
-      });
-    })();
-    return raceWithAbortSignal(available, signal);
-  }
-  async getAuth(providerOrModel, overrides) {
-    const signal = operationSignal(overrides?.signal);
-    const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
-    const provider = this.providers.get(providerId);
-    if (!provider)
-      return;
-    const result = await resolveProviderAuth(provider, this.credentials, this.authContext, { ...overrides, signal });
-    if (!result || typeof providerOrModel === "string" || !providerOrModel.headers)
-      return result;
-    return {
-      ...result,
-      auth: {
-        ...result.auth,
-        headers: mergeHeaders(result.auth.headers, providerOrModel.headers)
-      }
-    };
-  }
-  async login(providerId, type, interaction, options) {
-    const signal = operationSignal(interaction.signal);
-    signal.throwIfAborted();
-    const provider = this.providers.get(providerId);
-    if (!provider)
-      throw new ModelsError("provider", `Unknown provider: ${providerId}`);
-    const method = type === "oauth" ? provider.auth.oauth : provider.auth.apiKey;
-    if (!method?.login) {
-      throw new ModelsError("auth", `${provider.name} does not support ${type} login`);
-    }
-    const loginOperation = method.login({ ...interaction, signal }, options);
-    const credential = await raceWithAbortSignal(loginOperation, signal);
-    let mutationStarted = false;
-    let markMutationStarted;
-    const started = new Promise((resolve) => {
-      markMutationStarted = resolve;
-    });
-    const mutation = this.credentials.modify(providerId, async () => {
-      mutationStarted = true;
-      markMutationStarted?.();
-      return credential;
-    }, { signal });
-    mutation.catch(() => {});
-    try {
-      await new Promise((resolve, reject) => {
-        const onAbort = () => {
-          if (!mutationStarted)
-            reject(signal.reason);
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-        Promise.race([started, mutation]).then(() => {
-          signal.removeEventListener("abort", onAbort);
-          resolve();
-        }, (error) => {
-          signal.removeEventListener("abort", onAbort);
-          reject(error);
-        });
-        if (signal.aborted)
-          onAbort();
-      });
-      await mutation;
-    } catch (error) {
-      signal.throwIfAborted();
-      throw new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause: error });
-    }
-    return credential;
-  }
-  async logout(providerId, options) {
-    const signal = operationSignal(options?.signal);
-    signal.throwIfAborted();
-    try {
-      await this.credentials.delete(providerId, { signal });
-    } catch (error) {
-      signal.throwIfAborted();
-      throw new ModelsError("auth", `Credential store delete failed for ${providerId}`, { cause: error });
-    }
-  }
-  requireProvider(model) {
-    const provider = this.providers.get(model.provider);
-    if (!provider) {
-      throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
-    }
-    return provider;
-  }
-  requireChatProvider(model) {
-    assertChatModel(model);
-    return this.requireProvider(model);
-  }
-  async applyAuth(model, options) {
-    this.requireProvider(model);
-    const resolution = await this.getAuth(model, {
-      apiKey: options?.apiKey,
-      env: options?.env,
-      signal: options?.signal
-    });
-    if (!resolution) {
-      throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
-    }
-    const auth = resolution.auth;
-    const apiKey = options?.apiKey ?? auth.apiKey;
-    const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
-    const sessionId = options && "sessionId" in options && typeof options.sessionId === "string" ? options.sessionId : undefined;
-    let headers = mergeHeaders(mergeHeaders(getOpenCodeSessionHeaders(requestModel, sessionId), auth.headers), options?.headers);
-    if (options?.transformHeaders)
-      headers = await options.transformHeaders(headers ?? {});
-    const env = resolution.env || options?.env ? { ...resolution.env ?? {}, ...options?.env ?? {} } : undefined;
-    const identity = mergeClientIdentity(this.identity, options?.identity);
-    const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
-    const requestOptions = {
-      ...providerOptions,
-      apiKey,
-      headers,
-      env,
-      ...identity === undefined ? {} : { identity }
-    };
-    return { requestModel, requestOptions };
-  }
-  stream(model, context, options) {
-    const transcript = normalizeContext(context);
-    return lazyStream(model, async () => {
-      const provider = this.requireChatProvider(model);
-      const { requestModel, requestOptions } = await this.applyAuth(model, options);
-      return provider.stream(requestModel, transcript, requestOptions);
-    }, observeModelRequest(model, options, false), options?.signal);
-  }
-  async complete(model, context, options) {
-    return this.stream(model, context, options).result();
-  }
-  streamSimple(model, context, options) {
-    const transcript = normalizeContext(context);
-    return lazyStream(model, async () => {
-      const provider = this.requireChatProvider(model);
-      const { requestModel, requestOptions } = await this.applyAuth(model, options);
-      return provider.streamSimple(requestModel, transcript, requestOptions);
-    }, observeModelRequest(model, options, false), options?.signal);
-  }
-  async completeSimple(model, context, options) {
-    return this.streamSimple(model, context, options).result();
-  }
-  streamDeferred(model, handle, options) {
-    return lazyStream(model, async () => {
-      const provider = this.requireChatProvider(model);
-      if (!provider.fetchDeferred) {
-        throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
-      }
-      const { requestModel, requestOptions } = await this.applyAuth(model, options);
-      return provider.fetchDeferred(requestModel, handle, requestOptions);
-    }, observeModelRequest(model, options, true), options?.signal);
-  }
-  async fetchDeferred(model, handle, options) {
-    return this.streamDeferred(model, handle, options).result();
-  }
-  async cancelDeferred(model, handle, options) {
-    const provider = this.requireChatProvider(model);
-    if (!provider.cancelDeferred) {
-      throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
-    }
-    const { requestModel, requestOptions } = await this.applyAuth(model, options);
-    await provider.cancelDeferred(requestModel, handle, requestOptions);
-  }
-  async generateImages(model, context, options) {
-    try {
-      assertImageModel(model);
-      const provider = this.requireProvider(model);
-      if (!provider.generateImages) {
-        throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
-      }
-      const { requestModel, requestOptions } = await this.applyAuth(model, options);
-      return await provider.generateImages(requestModel, context, requestOptions);
-    } catch (error) {
-      return imageErrorResult(model, error, options?.signal?.aborted);
-    }
-  }
-  async classify(model, context, options) {
-    try {
-      assertClassifierModel(model);
-      assertClassifierInputSupported(model, context);
-      const provider = this.requireProvider(model);
-      if (!provider.classify) {
-        throw new ModelsError("provider", `Provider ${model.provider} does not support classification`);
-      }
-      const { requestModel, requestOptions } = await this.applyAuth(model, options);
-      return await provider.classify(requestModel, context, requestOptions);
-    } catch (error) {
-      return classifierErrorResult(model, error, options?.signal?.aborted);
-    }
-  }
+// node_modules/@earendil-works/pi-telemetry/dist/noop.js
+async function startNoopSpan(_options, callback) {
+  return callback(noopTelemetrySpan);
 }
-function createModels(options) {
-  return new ModelsImpl(options);
-}
-function createProvider(input) {
-  const single = input.api && typeof input.api.stream === "function" ? input.api : undefined;
-  const byApi = single || !input.api ? undefined : input.api;
-  const images = input.images;
-  const classifiers = input.classifiers;
-  const streams = single ? [single] : Object.values(byApi ?? {}).filter((entry) => entry !== undefined);
-  const imageImplementations = Object.values(images ?? {}).filter((entry) => entry !== undefined);
-  const classifierImplementations = Object.values(classifiers ?? {}).filter((entry) => entry !== undefined);
-  if (streams.length === 0 && imageImplementations.length === 0 && classifierImplementations.length === 0) {
-    throw new Error(`Provider ${input.id}: at least one of "api", "images", or "classifiers" is required.`);
-  }
-  const baselineModels = input.models;
-  let dynamicModels = [];
-  const fetchModels = input.fetchModels;
-  const currentModels = () => {
-    const merged = [...baselineModels];
-    for (const model of dynamicModels) {
-      const index = merged.findIndex((entry) => getModelType(entry) === getModelType(model) && entry.id === model.id);
-      if (index >= 0)
-        merged[index] = model;
-      else
-        merged.push(model);
-    }
-    return merged;
-  };
-  const apiFor = (model) => single ?? byApi?.[model.api];
-  const dispatch = (model, run, signal) => {
-    const streams = apiFor(model);
-    if (!streams) {
-      return lazyStream(model, async () => {
-        throw new ModelsError("stream", `Provider ${input.id} has no API implementation for "${model.api}"`);
-      }, undefined, signal);
-    }
-    return run(streams);
-  };
-  const provider = {
-    id: input.id,
-    name: input.name ?? input.id,
-    baseUrl: input.baseUrl,
-    headers: input.headers,
-    auth: input.auth,
-    getModels: () => currentModels().filter((model) => isModelType(model, "chat")),
-    getAllModels: currentModels,
-    refreshModels: fetchModels ? async (context) => {
-      if (context.stored) {
-        const restored = context.stored.models.filter((model) => model.provider === input.id).map((model) => model);
-        if (!await context.publish({
-          update: () => {
-            dynamicModels = restored;
-          }
-        })) {
-          return;
-        }
-      }
-      if (!context.allowNetwork || context.signal.aborted)
-        return;
-      const fetched = await fetchModels(context);
-      if (context.signal.aborted)
-        return;
-      const refreshed = fetched.filter(hasKnownModelType);
-      await context.publish({
-        persist: { models: refreshed, checkedAt: Date.now() },
-        update: () => {
-          dynamicModels = refreshed;
-        }
-      });
-    } : undefined,
-    filterModels: input.filterModels,
-    filterAllModels: input.filterAllModels,
-    stream: (model, context, options) => dispatch(model, (streams) => streams.stream(model, context, options), options?.signal),
-    streamSimple: (model, context, options) => dispatch(model, (streams) => streams.streamSimple(model, context, options), options?.signal)
-  };
-  if (streams.some((entry) => entry.fetchDeferred !== undefined)) {
-    provider.fetchDeferred = (model, handle, options) => lazyStream(model, async () => {
-      const implementation = apiFor(model);
-      if (!implementation?.fetchDeferred) {
-        throw new ModelsError("provider", `Provider ${input.id} does not support deferred responses for "${model.api}"`);
-      }
-      return implementation.fetchDeferred(model, handle, options);
-    }, undefined, options?.signal);
-  }
-  if (streams.some((entry) => entry.cancelDeferred !== undefined)) {
-    provider.cancelDeferred = async (model, handle, options) => {
-      const implementation = apiFor(model);
-      if (!implementation?.cancelDeferred) {
-        throw new ModelsError("provider", `Provider ${input.id} cannot cancel deferred responses for "${model.api}"`);
-      }
-      await implementation.cancelDeferred(model, handle, options);
-    };
-  }
-  if (images && imageImplementations.length > 0) {
-    provider.generateImages = async (model, context, options) => {
-      const implementation = images[model.api];
-      if (!implementation) {
-        return imageErrorResult(model, new ModelsError("provider", `Provider ${input.id} has no image generation implementation for "${model.api}"`));
-      }
-      return implementation.generateImages(model, context, options);
-    };
-  }
-  if (classifiers && classifierImplementations.length > 0) {
-    provider.classify = async (model, context, options) => {
-      const implementation = classifiers[model.api];
-      if (!implementation) {
-        return classifierErrorResult(model, new ModelsError("provider", `Provider ${input.id} has no classifier implementation for "${model.api}"`));
-      }
-      return implementation.classify(model, context, options);
-    };
-  }
-  return provider;
-}
-function calculateCost(model, usage) {
-  const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-  let rates = model.cost;
-  let matchedThreshold = -1;
-  for (const tier of model.cost.tiers ?? []) {
-    if (inputTokens > tier.inputTokensAbove && tier.inputTokensAbove > matchedThreshold) {
-      rates = tier;
-      matchedThreshold = tier.inputTokensAbove;
-    }
-  }
-  const longWrite = usage.cacheWrite1h ?? 0;
-  const shortWrite = usage.cacheWrite - longWrite;
-  usage.cost.input = rates.input / 1e6 * usage.input;
-  usage.cost.output = rates.output / 1e6 * usage.output;
-  usage.cost.cacheRead = rates.cacheRead / 1e6 * usage.cacheRead;
-  usage.cost.cacheWrite = (rates.cacheWrite * shortWrite + rates.input * 2 * longWrite) / 1e6;
-  usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
-  usage.cost.totalFromProvider = false;
-  return usage.cost;
-}
-function getSupportedThinkingLevels(model) {
-  if (!model.reasoning)
-    return ["off"];
-  return EXTENDED_THINKING_LEVELS.filter((level) => {
-    const mapped = model.thinkingLevelMap?.[level];
-    if (mapped === null)
-      return false;
-    if (level === "xhigh" || level === "max")
-      return mapped !== undefined;
-    return true;
+var noopCounter, noopUpDownCounter, noopHistogram, NOOP_TELEMETRY_METRICS, NOOP_TELEMETRY_PROPAGATION, noopTelemetrySpan, NOOP_TELEMETRY_CONTEXT;
+var init_noop = __esm(() => {
+  noopCounter = Object.freeze({ add: () => {} });
+  noopUpDownCounter = Object.freeze({ add: () => {} });
+  noopHistogram = Object.freeze({ record: () => {} });
+  NOOP_TELEMETRY_METRICS = Object.freeze({
+    counter: () => noopCounter,
+    upDownCounter: () => noopUpDownCounter,
+    histogram: () => noopHistogram
   });
-}
-function clampThinkingLevel(model, level) {
-  const availableLevels = getSupportedThinkingLevels(model);
-  if (availableLevels.includes(level))
-    return level;
-  const requestedIndex = EXTENDED_THINKING_LEVELS.indexOf(level);
-  if (requestedIndex === -1)
-    return availableLevels[0] ?? "off";
-  for (let i = requestedIndex;i < EXTENDED_THINKING_LEVELS.length; i++) {
-    const candidate = EXTENDED_THINKING_LEVELS[i];
-    if (availableLevels.includes(candidate))
-      return candidate;
-  }
-  for (let i = requestedIndex - 1;i >= 0; i--) {
-    const candidate = EXTENDED_THINKING_LEVELS[i];
-    if (availableLevels.includes(candidate))
-      return candidate;
-  }
-  return availableLevels[0] ?? "off";
-}
-var KNOWN_MODEL_TYPES, EXTENDED_THINKING_LEVELS;
-var init_models = __esm(() => {
-  init_lazy();
-  init_credential_store();
-  init_resolve();
-  init_telemetry();
-  init_identity();
-  init_model_operations();
-  init_transcript();
-  KNOWN_MODEL_TYPES = { chat: true, image: true, classifier: true };
-  EXTENDED_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+  NOOP_TELEMETRY_PROPAGATION = Object.freeze({
+    inject: () => {
+      return;
+    },
+    extract: () => NOOP_TELEMETRY_CONTEXT
+  });
+  noopTelemetrySpan = {
+    metrics: NOOP_TELEMETRY_METRICS,
+    propagation: NOOP_TELEMETRY_PROPAGATION,
+    startSpan: startNoopSpan,
+    addLink: () => {},
+    addEvent: () => {},
+    setAttributes: () => {},
+    setStatus: () => {}
+  };
+  Object.freeze(noopTelemetrySpan);
+  NOOP_TELEMETRY_CONTEXT = noopTelemetrySpan;
 });
 
-// node_modules/@earendil-works/pi-ai/dist/utils/estimate.js
-function calculateContextTokens(usage) {
-  return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+// node_modules/@earendil-works/pi-telemetry/dist/memory.js
+var anchor, contextCarriers;
+var init_memory = __esm(() => {
+  init_noop();
+  anchor = performance.timeOrigin;
+  contextCarriers = new WeakMap;
+});
+
+// node_modules/@earendil-works/pi-telemetry/dist/index.js
+function defineTelemetrySchema(schema) {
+  return schema;
 }
-function safeJsonStringify(value) {
-  try {
-    return JSON.stringify(value) ?? "undefined";
-  } catch {
-    return "[unserializable]";
-  }
+function bindTypedSpanStarter(telemetryContext) {
+  const startSpan = (name, attributes, callback) => telemetryContext.startSpan({ name, attributes }, (span) => callback(span, bindTypedSpanStarter(span)));
+  return startSpan;
 }
-function estimateTextAndImageContentChars(content) {
-  if (typeof content === "string")
-    return content.length;
-  let chars = 0;
-  for (const block of content)
-    chars += block.type === "text" ? block.text.length : ESTIMATED_IMAGE_CHARS;
-  return chars;
+function createTypedSpanStarter(telemetryContext, _schemas) {
+  return bindTypedSpanStarter(telemetryContext);
 }
-function estimateTextTokens(text) {
-  return Math.ceil(text.length / CHARS_PER_TOKEN);
-}
-function estimateTextAndImageContentTokens(content) {
-  return Math.ceil(estimateTextAndImageContentChars(content) / CHARS_PER_TOKEN);
-}
-function estimateMessageTokens(message) {
-  let chars = 0;
-  if (message.role === "system") {
-    return estimateTextTokens(getSystemMessageText(message)) + estimateToolsTokens(message.toolsAdded) + estimateToolsTokens(message.toolsRemoved);
-  }
-  if (message.role === "user")
-    return estimateTextAndImageContentTokens(message.content);
-  if (message.role === "toolResult")
-    return estimateTextAndImageContentTokens(message.content);
-  for (const block of message.content) {
-    if (block.type === "text") {
-      chars += block.text.length;
-    } else if (block.type === "thinking") {
-      chars += block.thinking.length;
-    } else {
-      chars += block.name.length + safeJsonStringify(block.arguments).length;
-    }
-  }
-  return Math.ceil(chars / CHARS_PER_TOKEN);
-}
-function getLastAssistantUsageInfo(messages) {
-  let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;
-  let usageInfo;
-  for (let i = 0;i < messages.length; i++) {
-    const message = messages[i];
-    if (message.role === "assistant") {
-      const assistant = message;
-      const usageAppliesToPrefix = assistant.timestamp >= latestPrefixTimestamp;
-      if (usageAppliesToPrefix && assistant.stopReason !== "aborted" && assistant.stopReason !== "error" && calculateContextTokens(assistant.usage) > 0) {
-        usageInfo = { usage: assistant.usage, index: i };
-      }
-    }
-    latestPrefixTimestamp = Math.max(latestPrefixTimestamp, message.timestamp);
-  }
-  return usageInfo;
-}
-function estimateContextTokens(context) {
-  const messages = "messages" in context ? context.messages : context;
-  const usageInfo = getLastAssistantUsageInfo(messages);
-  if (usageInfo) {
-    const usageTokens = calculateContextTokens(usageInfo.usage);
-    let trailingTokens = 0;
-    for (let i = usageInfo.index + 1;i < messages.length; i++) {
-      trailingTokens += estimateMessageTokens(messages[i]);
-    }
-    return { tokens: usageTokens + trailingTokens, usageTokens, trailingTokens, lastUsageIndex: usageInfo.index };
-  }
-  let tokens = 0;
-  for (const message of messages)
-    tokens += estimateMessageTokens(message);
-  return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
-}
-function estimateToolsTokens(tools) {
-  if (!tools || tools.length === 0)
-    return 0;
-  return estimateTextTokens(safeJsonStringify(tools));
-}
-var CHARS_PER_TOKEN = 3.5, ESTIMATED_IMAGE_CHARS = 4800;
-var init_estimate = () => {};
+var init_dist = __esm(() => {
+  init_noop();
+  init_memory();
+});
 
 // node_modules/partial-json/dist/options.js
 var require_options = __commonJS(function(exports) {
@@ -2646,6 +1117,1535 @@ var init_streaming_json = __esm(() => {
     r: "\r",
     t: "\t"
   };
+});
+
+// node_modules/@earendil-works/pi-ai/dist/utils/version.js
+var PI_AI_VERSION = "1.5.2";
+
+// node_modules/@earendil-works/pi-ai/dist/utils/identity.js
+function mergeClientIdentity(...sources) {
+  let merged;
+  for (const source of sources) {
+    if (!source)
+      continue;
+    merged = { ...merged };
+    if (source.userAgent !== undefined)
+      merged.userAgent = source.userAgent;
+    if (source.attribution !== undefined)
+      merged.attribution = source.attribution;
+    if (source.version !== undefined)
+      merged.version = source.version;
+  }
+  return merged;
+}
+function getClientVersion(identity) {
+  return identity?.version ?? PI_AI_VERSION;
+}
+function runtimeDescription() {
+  if (typeof process === "undefined")
+    return;
+  const versions = process.versions;
+  if (versions?.bun)
+    return `bun/${versions.bun}`;
+  if (versions?.node)
+    return `node/${process.version}`;
+  return;
+}
+function formatUserAgent(identity) {
+  const mode = identity?.userAgent ?? "detailed";
+  if (typeof mode === "object")
+    return mode.custom;
+  if (mode === "short")
+    return "pi";
+  const product = `pi/${getClientVersion(identity)}`;
+  const runtime = runtimeDescription();
+  return runtime ? `${product} (${process.platform}; ${runtime}; ${process.arch})` : `${product} (browser)`;
+}
+function matchesHost(baseUrl, expectedHost) {
+  try {
+    return new URL(baseUrl).hostname === expectedHost;
+  } catch {
+    return false;
+  }
+}
+function isOpenRouter(target) {
+  return target.provider === "openrouter" || target.baseUrl.includes("openrouter.ai");
+}
+function isNvidiaNim(target) {
+  return target.provider === "nvidia" || matchesHost(target.baseUrl, NVIDIA_NIM_HOST);
+}
+function isOpenCode(target) {
+  return target.provider === "opencode" || target.provider === "opencode-go" || matchesHost(target.baseUrl, OPENCODE_HOST);
+}
+function getAttributionHeaders(target, identity) {
+  const attribution = identity?.attribution;
+  if (!attribution)
+    return {};
+  const { name, url, categories } = attribution;
+  if (isOpenRouter(target)) {
+    return {
+      "HTTP-Referer": url,
+      "X-OpenRouter-Title": name,
+      ...categories === undefined || categories.length === 0 ? {} : { "X-OpenRouter-Categories": categories.join(",") }
+    };
+  }
+  if (isNvidiaNim(target))
+    return { "X-BILLING-INVOKE-ORIGIN": name.charAt(0).toUpperCase() + name.slice(1) };
+  if (isOpenCode(target))
+    return { "x-opencode-client": name };
+  return {};
+}
+function getOpenCodeSessionHeaders(target, sessionId) {
+  return sessionId && isOpenCode(target) ? { "x-opencode-session": sessionId } : undefined;
+}
+function getIdentityHeaders(target, identity) {
+  return { "User-Agent": formatUserAgent(identity), ...getAttributionHeaders(target, identity) };
+}
+function isMutableModels(models) {
+  return "setProvider" in models && "deleteProvider" in models && "clearProviders" in models;
+}
+function withClientIdentity(models, identity) {
+  const withIdentity = (options) => ({ ...options, identity: mergeClientIdentity(identity, options?.identity) });
+  const wrapped = {
+    getProviders: () => models.getProviders(),
+    getProvider: (id) => models.getProvider(id),
+    getModels: (provider) => models.getModels(provider),
+    getModel: (provider, id) => models.getModel(provider, id),
+    getModelsOfType: (type, provider) => models.getModelsOfType(type, provider),
+    getModelOfType: (type, provider, id) => models.getModelOfType(type, provider, id),
+    getAllModels: (provider) => models.getAllModels(provider),
+    refresh: (options) => models.refresh(options),
+    checkAuth: (providerId, options) => models.checkAuth(providerId, options),
+    getAvailable: (providerId, options) => models.getAvailable(providerId, options),
+    getAvailableOfType: (type, providerId, options) => models.getAvailableOfType(type, providerId, options),
+    getAllAvailable: (providerId, options) => models.getAllAvailable(providerId, options),
+    getAuth: models.getAuth.bind(models),
+    login: (providerId, type, interaction, options) => models.login(providerId, type, interaction, options),
+    logout: (providerId, options) => models.logout(providerId, options),
+    stream: (model, context, options) => models.stream(model, context, withIdentity(options)),
+    complete: (model, context, options) => models.complete(model, context, withIdentity(options)),
+    streamSimple: (model, context, options) => models.streamSimple(model, context, withIdentity(options)),
+    completeSimple: (model, context, options) => models.completeSimple(model, context, withIdentity(options)),
+    streamDeferred: (model, handle, options) => models.streamDeferred(model, handle, withIdentity(options)),
+    fetchDeferred: (model, handle, options) => models.fetchDeferred(model, handle, withIdentity(options)),
+    cancelDeferred: (model, handle, options) => models.cancelDeferred(model, handle, withIdentity(options)),
+    generateImages: (model, context, options) => models.generateImages(model, context, withIdentity(options)),
+    classify: (model, context, options) => models.classify(model, context, withIdentity(options))
+  };
+  if (!isMutableModels(models))
+    return wrapped;
+  const mutable = {
+    ...wrapped,
+    setProvider: (provider) => models.setProvider(provider),
+    deleteProvider: (id) => models.deleteProvider(id),
+    clearProviders: () => models.clearProviders()
+  };
+  return mutable;
+}
+var PI_ATTRIBUTION, NVIDIA_NIM_HOST = "integrate.api.nvidia.com", OPENCODE_HOST = "opencode.ai";
+var init_identity = __esm(() => {
+  PI_ATTRIBUTION = { name: "pi", url: "https://pi.dev", categories: ["cli-agent"] };
+});
+
+// node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js
+class FifoQueue {
+  incoming = [];
+  outgoing = [];
+  get length() {
+    return this.incoming.length + this.outgoing.length;
+  }
+  enqueue(value) {
+    this.incoming.push(value);
+  }
+  dequeue() {
+    if (this.outgoing.length === 0) {
+      while (this.incoming.length > 0) {
+        this.outgoing.push(this.incoming.pop());
+      }
+    }
+    return this.outgoing.pop();
+  }
+}
+function createAssistantMessageEventStream() {
+  return new AssistantMessageEventStream;
+}
+var EventStream, AssistantMessageEventStream;
+var init_event_stream = __esm(() => {
+  EventStream = class EventStream {
+    queue = new FifoQueue;
+    waiting = new FifoQueue;
+    done = false;
+    finalResultPromise;
+    resolveFinalResult;
+    isComplete;
+    extractResult;
+    constructor(isComplete, extractResult) {
+      this.isComplete = isComplete;
+      this.extractResult = extractResult;
+      this.finalResultPromise = new Promise((resolve) => {
+        this.resolveFinalResult = resolve;
+      });
+    }
+    push(event) {
+      if (this.done)
+        return;
+      if (this.isComplete(event)) {
+        this.done = true;
+        this.resolveFinalResult(this.extractResult(event));
+      }
+      const waiter = this.waiting.dequeue();
+      if (waiter) {
+        waiter({ value: event, done: false });
+      } else {
+        this.queue.enqueue(event);
+      }
+    }
+    end(result) {
+      this.done = true;
+      if (result !== undefined) {
+        this.resolveFinalResult(result);
+      }
+      while (this.waiting.length > 0) {
+        const waiter = this.waiting.dequeue();
+        waiter({ value: undefined, done: true });
+      }
+    }
+    async* [Symbol.asyncIterator]() {
+      while (true) {
+        if (this.queue.length > 0) {
+          yield this.queue.dequeue();
+        } else if (this.done) {
+          return;
+        } else {
+          const result = await new Promise((resolve) => this.waiting.enqueue(resolve));
+          if (result.done)
+            return;
+          yield result.value;
+        }
+      }
+    }
+    result() {
+      return this.finalResultPromise;
+    }
+  };
+  AssistantMessageEventStream = class AssistantMessageEventStream extends EventStream {
+    #startedAt = Date.now();
+    #startedAtMonotonic = performance.now();
+    constructor() {
+      super((event) => event.type === "done" || event.type === "error", (event) => {
+        if (event.type === "done") {
+          return event.message;
+        } else if (event.type === "error") {
+          return event.error;
+        }
+        throw new Error("Unexpected event type for final result");
+      });
+    }
+    push(event) {
+      if (event.type === "done")
+        this.#time(event.message);
+      else if (event.type === "error")
+        this.#time(event.error);
+      super.push(event);
+    }
+    end(result) {
+      if (result !== undefined)
+        this.#time(result);
+      super.end(result);
+    }
+    #time(message) {
+      if (this.done || message.durationMs !== undefined || message.timestamp < this.#startedAt)
+        return;
+      message.durationMs = Math.max(0, Math.round(performance.now() - this.#startedAtMonotonic));
+    }
+  };
+});
+
+// node_modules/@earendil-works/pi-ai/dist/api/lazy.js
+function createSetupErrorMessage(model, error, timestamp, stopReason) {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+    },
+    stopReason,
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp
+  };
+}
+function hasResult(source) {
+  return typeof source.result === "function";
+}
+async function forwardStream(target, source, observer, observeResult) {
+  let result;
+  for await (const event of source) {
+    target.push(event);
+    observer?.onEvent?.(event);
+    if (event.type === "done")
+      result = event.message;
+    else if (event.type === "error")
+      result = event.error;
+  }
+  if (hasResult(source))
+    result = await source.result();
+  target.end(result);
+  observeResult(result);
+}
+function lazyStream(model, setup, observer, signal) {
+  const startedAt = Date.now();
+  const outer = new AssistantMessageEventStream;
+  let observedResult = false;
+  const observeResult = (result) => {
+    if (observedResult)
+      return;
+    observedResult = true;
+    observer?.onResult?.(result);
+  };
+  setup().then((inner) => forwardStream(outer, inner, observer, observeResult)).catch((error) => {
+    const reason = signal?.aborted ? "aborted" : "error";
+    const message = createSetupErrorMessage(model, error, startedAt, reason);
+    const event = { type: "error", reason, error: message };
+    outer.push(event);
+    observer?.onEvent?.(event);
+    outer.end(message);
+    observeResult(message);
+  });
+  return outer;
+}
+function lazyApi(load, capabilities) {
+  const api = {
+    stream: (model, context, options) => lazyStream(model, async () => (await load()).stream(model, context, options), undefined, options?.signal),
+    streamSimple: (model, context, options) => lazyStream(model, async () => (await load()).streamSimple(model, context, options), undefined, options?.signal)
+  };
+  if (capabilities?.fetchDeferred) {
+    api.fetchDeferred = (model, handle, options) => lazyStream(model, async () => {
+      const implementation = await load();
+      if (!implementation.fetchDeferred)
+        throw new Error("API does not support deferred responses");
+      return implementation.fetchDeferred(model, handle, options);
+    }, undefined, options?.signal);
+  }
+  if (capabilities?.cancelDeferred) {
+    api.cancelDeferred = async (model, handle, options) => {
+      const implementation = await load();
+      if (!implementation.cancelDeferred)
+        throw new Error("API cannot cancel deferred responses");
+      await implementation.cancelDeferred(model, handle, options);
+    };
+  }
+  return api;
+}
+var init_lazy = __esm(() => {
+  init_event_stream();
+});
+
+// node_modules/@earendil-works/pi-ai/dist/auth/context.js
+function getProcessEnv() {
+  const proc = globalThis.process;
+  return proc?.env;
+}
+function defaultProviderAuthContext() {
+  return {
+    async env(name) {
+      const value = getProcessEnv()?.[name];
+      return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+    },
+    async fileExists(path) {
+      try {
+        const fs = await importNodeModule("node:fs/promises");
+        let resolved = path;
+        if (resolved.startsWith("~")) {
+          const os = await importNodeModule("node:os");
+          resolved = os.homedir() + resolved.slice(1);
+        }
+        await fs.access(resolved);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  };
+}
+var __rewriteRelativeImportExtension = function(path, preserveJsx) {
+  if (typeof path === "string" && /^\.\.?\//.test(path)) {
+    return path.replace(/\.(tsx)$|((?:\.d)?)((?:\.[^./]+?)?)\.([cm]?)ts$/i, function(m, tsx, d, ext, cm) {
+      return tsx ? preserveJsx ? ".jsx" : ".js" : d && (!ext || !cm) ? m : d + ext + "." + cm.toLowerCase() + "js";
+    });
+  }
+  return path;
+}, importNodeModule = (specifier) => import(__rewriteRelativeImportExtension(specifier));
+
+// node_modules/@earendil-works/pi-ai/dist/utils/abort.js
+function abortReason(signal) {
+  if (signal.reason !== undefined)
+    return signal.reason;
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+function operationSignal(signal) {
+  return signal ?? new AbortController().signal;
+}
+function raceWithAbortSignal(operation, signal) {
+  if (signal.aborted) {
+    operation.catch(() => {});
+    return Promise.reject(abortReason(signal));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled)
+        return;
+      settled = true;
+      cleanup();
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then((value) => {
+      if (settled)
+        return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    }, (error) => {
+      if (settled)
+        return;
+      settled = true;
+      cleanup();
+      reject(error);
+    });
+    if (signal.aborted)
+      onAbort();
+  });
+}
+
+// node_modules/@earendil-works/pi-ai/dist/auth/credential-store.js
+class InMemoryCredentialStore {
+  credentials = new Map;
+  chains = new Map;
+  enqueue(providerId, task, options) {
+    const signal = operationSignal(options?.signal);
+    const previous = this.chains.get(providerId) ?? Promise.resolve();
+    const queued = (async () => {
+      await previous.catch(() => {});
+      signal.throwIfAborted();
+      return task();
+    })();
+    const tail = queued.catch(() => {});
+    this.chains.set(providerId, tail);
+    tail.then(() => {
+      if (this.chains.get(providerId) === tail)
+        this.chains.delete(providerId);
+    });
+    return raceWithAbortSignal(queued, signal);
+  }
+  async read(providerId, options) {
+    options?.signal?.throwIfAborted();
+    return this.credentials.get(providerId);
+  }
+  async list(options) {
+    options?.signal?.throwIfAborted();
+    return [...this.credentials].map(([providerId, credential]) => ({ providerId, type: credential.type }));
+  }
+  modify(providerId, fn, options) {
+    return this.enqueue(providerId, async () => {
+      const current = this.credentials.get(providerId);
+      const next = await fn(current);
+      options?.signal?.throwIfAborted();
+      if (next !== undefined)
+        this.credentials.set(providerId, next);
+      return next ?? current;
+    }, options);
+  }
+  delete(providerId, options) {
+    return this.enqueue(providerId, async () => {
+      this.credentials.delete(providerId);
+    }, options);
+  }
+}
+var init_credential_store = () => {};
+
+// node_modules/@earendil-works/pi-ai/dist/utils/diagnostics.js
+function formatThrownValue(value) {
+  if (value instanceof Error)
+    return value.message || value.name;
+  if (typeof value === "string")
+    return value;
+  return String(value);
+}
+function appendAssistantMessageDiagnostic(message, diagnostic) {
+  message.diagnostics = [...message.diagnostics ?? [], diagnostic];
+}
+
+// node_modules/@earendil-works/pi-ai/dist/utils/models-error.js
+function withCauseDetail(message, cause) {
+  if (cause === undefined || cause === null)
+    return message;
+  const detail = formatThrownValue(cause).trim();
+  if (!detail || message.includes(detail))
+    return message;
+  return `${message}: ${detail}`;
+}
+var ModelsError;
+var init_models_error = __esm(() => {
+  ModelsError = class ModelsError extends Error {
+    code;
+    constructor(code, message, options) {
+      super(withCauseDetail(message, options?.cause), options);
+      this.name = "ModelsError";
+      this.code = code;
+    }
+  };
+});
+
+// node_modules/@earendil-works/pi-ai/dist/auth/resolve.js
+function resolveProviderAuth(provider, credentials, authContext, overrides) {
+  const signal = operationSignal(overrides?.signal);
+  return raceWithAbortSignal(resolveProviderAuthWithSignal(provider, credentials, authContext, overrides, signal), signal);
+}
+async function resolveProviderAuthWithSignal(provider, credentials, authContext, overrides, signal) {
+  signal.throwIfAborted();
+  const requestAuthContext = overrides?.env ? overlayEnvAuthContext(authContext, overrides.env) : authContext;
+  if (overrides?.apiKey !== undefined && provider.auth.apiKey) {
+    return resolveApiKey(requestAuthContext, provider.auth.apiKey, provider.id, {
+      type: "api_key",
+      key: overrides.apiKey,
+      env: overrides.env
+    }, signal);
+  }
+  const stored = await readCredential(credentials, provider.id, signal);
+  if (stored) {
+    if (stored.type === "oauth" && provider.auth.oauth) {
+      return resolveStoredOAuth(credentials, provider.id, provider.auth.oauth, stored, signal, overrides?.minOAuthValidityMs);
+    }
+    if (stored.type === "api_key" && provider.auth.apiKey) {
+      const credential = overrides?.env ? { ...stored, env: { ...stored.env, ...overrides.env } } : stored;
+      return resolveApiKey(requestAuthContext, provider.auth.apiKey, provider.id, credential, signal);
+    }
+    return;
+  }
+  return provider.auth.apiKey ? resolveApiKey(requestAuthContext, provider.auth.apiKey, provider.id, undefined, signal) : undefined;
+}
+function overlayEnvAuthContext(base, env) {
+  return {
+    env: async (name) => env[name] || await base.env(name),
+    fileExists: (path) => base.fileExists(path)
+  };
+}
+async function refreshStoredOAuthCredential(credentials, providerId, oauth, needsRefresh, signal) {
+  let post;
+  const lockWait = new AbortController;
+  const cancelLockWait = () => lockWait.abort(signal.reason);
+  signal.addEventListener("abort", cancelLockWait, { once: true });
+  if (signal.aborted)
+    cancelLockWait();
+  try {
+    post = await credentials.modify(providerId, async (current) => {
+      signal.removeEventListener("abort", cancelLockWait);
+      signal.throwIfAborted();
+      if (current?.type !== "oauth")
+        return;
+      if (!needsRefresh(current))
+        return;
+      try {
+        return await oauth.refresh(current, AbortSignal.timeout(DEFAULT_OAUTH_REFRESH_TIMEOUT_MS));
+      } catch (error) {
+        throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, { cause: error });
+      }
+    }, { signal: lockWait.signal });
+  } catch (error) {
+    if (error instanceof ModelsError)
+      throw error;
+    signal.throwIfAborted();
+    throw new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause: error });
+  } finally {
+    signal.removeEventListener("abort", cancelLockWait);
+  }
+  return post?.type === "oauth" ? post : undefined;
+}
+async function resolveStoredOAuth(credentials, providerId, oauth, stored, signal, minOAuthValidityMs) {
+  const minimumValidityMs = Math.max(DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, minOAuthValidityMs ?? 0);
+  const expiresSoon = (credential) => Date.now() + minimumValidityMs >= credential.expires;
+  let credential = stored;
+  if (expiresSoon(credential)) {
+    const post = await refreshStoredOAuthCredential(credentials, providerId, oauth, expiresSoon, signal);
+    if (!post)
+      return;
+    credential = post;
+    if (minOAuthValidityMs !== undefined && expiresSoon(credential)) {
+      throw new ModelsError("oauth", `OAuth refresh returned a token that expires too soon for ${providerId}`);
+    }
+  }
+  try {
+    return { auth: await oauth.toAuth(credential), source: "OAuth" };
+  } catch (error) {
+    throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, { cause: error });
+  }
+}
+async function resolveApiKey(authContext, apiKey, providerId, credential, signal) {
+  try {
+    return await apiKey.resolve({ ctx: authContext, credential, signal });
+  } catch (error) {
+    throw new ModelsError("auth", `API key auth failed for provider ${providerId}`, { cause: error });
+  }
+}
+async function readCredential(credentials, providerId, signal) {
+  try {
+    return await credentials.read(providerId, { signal });
+  } catch (error) {
+    throw new ModelsError("auth", `Credential store read failed for ${providerId}`, { cause: error });
+  }
+}
+var DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 15000;
+var init_resolve = __esm(() => {
+  init_models_error();
+  init_models_error();
+  DEFAULT_OAUTH_MINIMUM_VALIDITY_MS = 5 * 60 * 1000;
+});
+
+// node_modules/@earendil-works/pi-ai/dist/models-store.js
+class InMemoryModelsStore {
+  entries = new Map;
+  async read(providerId, options) {
+    options?.signal?.throwIfAborted();
+    const entry = this.entries.get(providerId);
+    return entry ? structuredClone(entry) : undefined;
+  }
+  async write(providerId, entry, options) {
+    options?.signal?.throwIfAborted();
+    this.entries.set(providerId, structuredClone(entry));
+  }
+  async delete(providerId, options) {
+    options?.signal?.throwIfAborted();
+    this.entries.delete(providerId);
+  }
+}
+
+// node_modules/@earendil-works/pi-ai/dist/telemetry.js
+function createInstruments(adapter) {
+  const metrics = createTypedMetrics(adapter, [AI_TELEMETRY_SCHEMA]);
+  return {
+    requestDuration: metrics.histogram("pi.ai.request.duration"),
+    firstChunkDuration: metrics.histogram("pi.ai.first_chunk.duration"),
+    tokens: metrics.counter("pi.ai.tokens"),
+    cost: metrics.counter("pi.ai.cost")
+  };
+}
+function observeModelRequest(requestedModel, options, poll) {
+  const started = performance.now();
+  const attributes = { provider: requestedModel.provider, model: requestedModel.id };
+  const adapter = options?.telemetry?.metrics ?? NOOP_TELEMETRY_METRICS;
+  let instruments = instrumentCache.get(adapter);
+  if (!instruments) {
+    instruments = createInstruments(adapter);
+    instrumentCache.set(adapter, instruments);
+  }
+  const { requestDuration, firstChunkDuration, tokens, cost } = instruments;
+  let span;
+  let finish;
+  let first = true;
+  const toolChars = new Map;
+  const finished = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const run = (activeSpan) => {
+    span = activeSpan;
+    return finished;
+  };
+  const startAttributes = {
+    ...attributes,
+    api: requestedModel.api,
+    ...typeof options?.reasoning === "string" ? { reasoning: options.reasoning } : {}
+  };
+  const start = createTypedSpanStarter(options?.telemetry ?? NOOP_TELEMETRY_CONTEXT, [AI_TELEMETRY_SCHEMA]);
+  if (poll)
+    start("pi.ai.poll", startAttributes, run);
+  else
+    start("pi.ai.request", startAttributes, run);
+  return {
+    onEvent(event) {
+      if (first) {
+        first = false;
+        span.addEvent("pi.ai.first_chunk");
+        firstChunkDuration.record(performance.now() - started, attributes, span);
+      }
+      if (event.type === "toolcall_delta") {
+        toolChars.set(event.contentIndex, (toolChars.get(event.contentIndex) ?? 0) + event.delta.length);
+      } else if (event.type === "text_end" || event.type === "thinking_end") {
+        span.addEvent("pi.ai.block", {
+          type: event.type === "text_end" ? "text" : "thinking",
+          index: event.contentIndex,
+          chars: event.content.length
+        });
+      } else if (event.type === "toolcall_end") {
+        const chars = toolChars.get(event.contentIndex) ?? 0;
+        toolChars.delete(event.contentIndex);
+        span.addEvent("pi.ai.block", {
+          type: "tool_call",
+          index: event.contentIndex,
+          chars,
+          tool: event.toolCall.name
+        });
+      }
+    },
+    onResult(message) {
+      if (message) {
+        span.setAttributes({
+          stop: message.stopReason,
+          "usage.input": message.usage.input,
+          "usage.output": message.usage.output,
+          "usage.cache_read": message.usage.cacheRead,
+          "usage.cache_write": message.usage.cacheWrite,
+          "cost.total": message.usage.cost.total,
+          "response.id": message.responseId
+        });
+        if (message.stopReason === "error") {
+          span.setStatus({
+            status: "error",
+            error: { name: "provider_error", message: ownedSlice(message.errorMessage ?? "", 0, 500) }
+          });
+        }
+        requestDuration.record(performance.now() - started, { ...attributes, stop: message.stopReason }, span);
+        if (!poll || message.stopReason !== "pending" && message.stopReason !== "deferred") {
+          tokens.add(message.usage.input, { ...attributes, kind: "input" });
+          tokens.add(message.usage.output, { ...attributes, kind: "output" });
+          tokens.add(message.usage.cacheRead, { ...attributes, kind: "cache_read" });
+          tokens.add(message.usage.cacheWrite, { ...attributes, kind: "cache_write" });
+          cost.add(message.usage.cost.total, attributes);
+        }
+      }
+      finish();
+    }
+  };
+}
+var provider, model, stop, request, AI_TELEMETRY_SCHEMA, instrumentCache;
+var init_telemetry = __esm(() => {
+  init_dist();
+  provider = { type: "string", description: "Provider identifier.", required: true };
+  model = { type: "string", description: "Requested model identifier.", required: true };
+  stop = {
+    type: "string",
+    description: "Normalized stop reason.",
+    values: ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"]
+  };
+  request = {
+    description: "One logical model request, including authentication and provider setup.",
+    parents: { kind: "any" },
+    startAttributes: {
+      provider,
+      api: { type: "string", description: "API identifier.", required: true },
+      model,
+      reasoning: { type: "string", description: "Scalar requested reasoning level.", required: false }
+    },
+    endAttributes: {
+      stop,
+      "usage.input": { type: "number", description: "Uncached input tokens." },
+      "usage.output": { type: "number", description: "Output tokens." },
+      "usage.cache_read": { type: "number", description: "Cache-read tokens." },
+      "usage.cache_write": { type: "number", description: "Cache-write tokens." },
+      "cost.total": { type: "number", description: "Total request cost in USD." },
+      "response.id": { type: "string", description: "Provider response identifier.", cardinality: "high" }
+    },
+    events: {
+      "pi.ai.first_chunk": { description: "First normalized stream event delivered.", attributes: {} },
+      "pi.ai.block": {
+        description: "A completed content block; content is never recorded.",
+        attributes: {
+          type: {
+            type: "string",
+            description: "Block kind.",
+            values: ["text", "thinking", "tool_call"],
+            required: true
+          },
+          index: { type: "number", description: "Content block index.", required: true },
+          chars: { type: "number", description: "UTF-16 character count.", required: true },
+          tool: { type: "string", description: "Tool name, for tool-call blocks only.", required: false }
+        }
+      }
+    },
+    status: {
+      default: "ok",
+      errorWhen: "Stop reason is error: provider_error with at most 500 error-message characters. Aborted stays ok."
+    }
+  };
+  AI_TELEMETRY_SCHEMA = defineTelemetrySchema({
+    version: 1,
+    spans: {
+      "pi.ai.request": request,
+      "pi.ai.poll": { ...request, description: "One deferred-response poll, not the deferred request's lifetime." }
+    },
+    metrics: {
+      "pi.ai.request.duration": {
+        kind: "histogram",
+        description: "Logical request or poll duration.",
+        unit: "ms",
+        attributes: { provider, model, stop: { ...stop, required: true } }
+      },
+      "pi.ai.first_chunk.duration": {
+        kind: "histogram",
+        description: "Time to the first normalized stream event.",
+        unit: "ms",
+        attributes: { provider, model }
+      },
+      "pi.ai.tokens": {
+        kind: "counter",
+        description: "Reported model token usage; pending and deferred polls are excluded.",
+        unit: "token",
+        attributes: {
+          provider,
+          model,
+          kind: {
+            type: "string",
+            description: "Token usage category.",
+            values: ["input", "output", "cache_read", "cache_write"],
+            required: true
+          }
+        }
+      },
+      "pi.ai.cost": {
+        kind: "counter",
+        description: "Reported model cost; pending and deferred polls are excluded.",
+        unit: "USD",
+        attributes: { provider, model }
+      }
+    }
+  });
+  instrumentCache = new WeakMap;
+});
+
+// node_modules/@earendil-works/pi-ai/dist/utils/model-operations.js
+function getModelType(model) {
+  return model.type ?? "chat";
+}
+function isModelType(model, type) {
+  return getModelType(model) === type;
+}
+function assertChatModel(model) {
+  if (!isModelType(model, "chat")) {
+    throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not a chat model`);
+  }
+}
+function assertImageModel(model) {
+  if (!isModelType(model, "image")) {
+    throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not an image model`);
+  }
+}
+function assertClassifierModel(model) {
+  if (!isModelType(model, "classifier")) {
+    throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not a classifier model`);
+  }
+}
+function assertClassifierInputSupported(model, context) {
+  if (context.images?.length && !model.input.includes("image")) {
+    throw new ModelsError("provider", `Model ${model.provider}/${model.id} does not accept image input`);
+  }
+}
+function imageErrorResult(model, error, aborted = false) {
+  return {
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    output: [],
+    stopReason: aborted ? "aborted" : "error",
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp: Date.now()
+  };
+}
+function classifierErrorResult(model, error, aborted = false) {
+  return {
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    answers: {},
+    stopReason: aborted ? "aborted" : "error",
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp: Date.now()
+  };
+}
+var init_model_operations = __esm(() => {
+  init_models_error();
+});
+
+// node_modules/@earendil-works/pi-ai/dist/models.js
+function hasKnownModelType(model) {
+  return Object.hasOwn(KNOWN_MODEL_TYPES, getModelType(model));
+}
+function withKnownModelTypes(entry) {
+  return { ...entry, models: entry.models.filter(hasKnownModelType) };
+}
+function mergeHeaders(base, override) {
+  if (!base && !override)
+    return;
+  const merged = { ...base };
+  for (const [name, value] of Object.entries(override ?? {})) {
+    const lowerName = name.toLowerCase();
+    for (const existingName of Object.keys(merged)) {
+      if (existingName.toLowerCase() === lowerName)
+        delete merged[existingName];
+    }
+    merged[name] = value;
+  }
+  return merged;
+}
+
+class ModelsImpl {
+  providers = new Map;
+  credentials;
+  modelsStore;
+  authContext;
+  identity;
+  refreshGenerations = new Map;
+  refreshControllers = new Map;
+  publicationChains = new Map;
+  constructor(options) {
+    this.credentials = options?.credentials ?? new InMemoryCredentialStore;
+    this.modelsStore = options?.modelsStore ?? new InMemoryModelsStore;
+    this.authContext = options?.authContext ?? defaultProviderAuthContext();
+    this.identity = options?.identity;
+  }
+  setProvider(provider) {
+    this.supersedeProviderRefresh(provider.id);
+    this.providers.set(provider.id, provider);
+  }
+  deleteProvider(id) {
+    this.supersedeProviderRefresh(id);
+    this.providers.delete(id);
+  }
+  clearProviders() {
+    for (const id of new Set([...this.providers.keys(), ...this.refreshControllers.keys()])) {
+      this.supersedeProviderRefresh(id);
+    }
+    this.providers.clear();
+  }
+  getProviders() {
+    return Array.from(this.providers.values());
+  }
+  getProvider(id) {
+    return this.providers.get(id);
+  }
+  getModels(provider) {
+    if (provider !== undefined) {
+      const entry = this.providers.get(provider);
+      if (!entry)
+        return [];
+      try {
+        return entry.getModels();
+      } catch {
+        return [];
+      }
+    }
+    const models = [];
+    for (const entry of this.providers.values()) {
+      try {
+        models.push(...entry.getModels());
+      } catch {}
+    }
+    return models;
+  }
+  getAllModels(provider) {
+    if (provider !== undefined) {
+      const entry = this.providers.get(provider);
+      if (!entry)
+        return [];
+      try {
+        return entry.getAllModels?.() ?? entry.getModels();
+      } catch {
+        return [];
+      }
+    }
+    const models = [];
+    for (const entry of this.providers.values()) {
+      try {
+        models.push(...entry.getAllModels?.() ?? entry.getModels());
+      } catch {}
+    }
+    return models;
+  }
+  getModelsOfType(type, provider) {
+    return this.getAllModels(provider).filter((model) => isModelType(model, type));
+  }
+  getModel(provider, id) {
+    return this.getModels(provider).find((model) => model.id === id);
+  }
+  getModelOfType(type, provider, id) {
+    return this.getModelsOfType(type, provider).find((model) => model.id === id);
+  }
+  supersedeProviderRefresh(providerId) {
+    const generation = (this.refreshGenerations.get(providerId) ?? 0) + 1;
+    this.refreshGenerations.set(providerId, generation);
+    const previous = this.refreshControllers.get(providerId);
+    if (previous) {
+      this.refreshControllers.delete(providerId);
+      previous.abort();
+    }
+    return generation;
+  }
+  beginProviderRefresh(providerId) {
+    const generation = this.supersedeProviderRefresh(providerId);
+    const controller = new AbortController;
+    this.refreshControllers.set(providerId, controller);
+    return { generation, controller };
+  }
+  publishProviderModels(providerId, generation, signal, publication) {
+    const previous = this.publicationChains.get(providerId) ?? Promise.resolve();
+    const queued = (async () => {
+      await previous.catch(() => {});
+      if (signal.aborted || this.refreshGenerations.get(providerId) !== generation)
+        return false;
+      if (publication.persist === null) {
+        await this.modelsStore.delete(providerId, { signal });
+      } else if (publication.persist !== undefined) {
+        await this.modelsStore.write(providerId, structuredClone(publication.persist), { signal });
+      }
+      if (signal.aborted || this.refreshGenerations.get(providerId) !== generation)
+        return false;
+      publication.update?.();
+      return true;
+    })();
+    const tail = queued.catch(() => {});
+    this.publicationChains.set(providerId, tail);
+    tail.then(() => {
+      if (this.publicationChains.get(providerId) === tail)
+        this.publicationChains.delete(providerId);
+    });
+    return raceWithAbortSignal(queued, signal);
+  }
+  async runProviderRefreshPhase(provider, credential, allowNetwork, force, generation, signal) {
+    const stored = await this.modelsStore.read(provider.id, { signal });
+    await provider.refreshModels({
+      credential,
+      stored: stored ? withKnownModelTypes(structuredClone(stored)) : undefined,
+      publish: (publication) => this.publishProviderModels(provider.id, generation, signal, publication),
+      allowNetwork,
+      force: allowNetwork ? force : undefined,
+      signal,
+      baseUrl: provider.baseUrl
+    });
+  }
+  async refresh(options = {}) {
+    const allowNetwork = options.allowNetwork ?? true;
+    const callerSignal = operationSignal(options.signal);
+    const errors = new Map;
+    if (callerSignal.aborted)
+      return { aborted: true, errors };
+    const selected = options.providers ? new Set(options.providers) : undefined;
+    const refreshable = Array.from(this.providers.values()).filter((provider) => provider.refreshModels !== undefined && (!selected || selected.has(provider.id)));
+    const refresh = Promise.all(refreshable.map(async (provider) => {
+      const { generation, controller } = this.beginProviderRefresh(provider.id);
+      const signal = AbortSignal.any([callerSignal, controller.signal]);
+      const operation = (async () => {
+        let storedCredential;
+        let credentialError;
+        try {
+          storedCredential = await this.readCredential(provider.id, signal);
+        } catch (error) {
+          credentialError = error;
+        }
+        await this.runProviderRefreshPhase(provider, storedCredential, false, undefined, generation, signal);
+        if (credentialError !== undefined)
+          throw credentialError;
+        if (!allowNetwork || signal.aborted)
+          return;
+        const network = await this.resolveNetworkRefresh(provider, storedCredential, signal);
+        if (!network)
+          return;
+        await this.runProviderRefreshPhase(provider, network.credential, true, options.force, generation, signal);
+      })();
+      try {
+        await raceWithAbortSignal(operation, signal);
+      } catch (error) {
+        if (!signal.aborted) {
+          errors.set(provider.id, error instanceof Error ? error : new ModelsError("model_source", `Model refresh failed for ${provider.id}`, { cause: error }));
+        }
+      } finally {
+        if (this.refreshControllers.get(provider.id) === controller) {
+          this.refreshControllers.delete(provider.id);
+        }
+      }
+    }));
+    try {
+      await raceWithAbortSignal(refresh, callerSignal);
+    } catch (error) {
+      if (!callerSignal.aborted)
+        throw error;
+    }
+    return { aborted: callerSignal.aborted, errors: new Map(errors) };
+  }
+  async resolveNetworkRefresh(provider, stored, signal) {
+    if (provider.refreshModelsAuth === "configured") {
+      return await this.checkProviderAuth(provider, stored, signal) ? {} : undefined;
+    }
+    const credential = await this.resolveRefreshCredential(provider, stored, signal);
+    return credential ? { credential } : undefined;
+  }
+  async resolveRefreshCredential(provider, stored, signal) {
+    if (stored?.type === "oauth") {
+      const oauth = provider.auth.oauth;
+      if (!oauth)
+        return;
+      if (Date.now() < stored.expires)
+        return stored;
+      if (signal.aborted)
+        return;
+      return refreshStoredOAuthCredential(this.credentials, provider.id, oauth, (current) => Date.now() >= current.expires, signal);
+    }
+    const apiKey = provider.auth.apiKey;
+    if (!apiKey)
+      return;
+    const credential = stored?.type === "api_key" ? stored : undefined;
+    const result = await apiKey.resolve({ ctx: this.authContext, credential, signal });
+    if (!result)
+      return;
+    return { type: "api_key", key: result.auth.apiKey, env: result.env };
+  }
+  async readCredential(providerId, signal) {
+    try {
+      return await this.credentials.read(providerId, { signal });
+    } catch (error) {
+      throw new ModelsError("auth", `Credential store read failed for ${providerId}`, { cause: error });
+    }
+  }
+  async checkProviderAuth(provider, credential, signal) {
+    if (credential?.type === "oauth") {
+      return provider.auth.oauth ? { source: "OAuth", type: "oauth" } : undefined;
+    }
+    const apiKey = provider.auth.apiKey;
+    if (!apiKey)
+      return;
+    if (apiKey.check) {
+      try {
+        return await apiKey.check({
+          ctx: this.authContext,
+          credential: credential?.type === "api_key" ? credential : undefined,
+          signal
+        });
+      } catch (error) {
+        throw new ModelsError("auth", `API key auth check failed for provider ${provider.id}`, { cause: error });
+      }
+    }
+    const resolution = await resolveProviderAuth(provider, this.credentials, this.authContext, { signal });
+    return resolution ? { source: resolution.source, type: "api_key" } : undefined;
+  }
+  checkAuth(providerId, options) {
+    const signal = operationSignal(options?.signal);
+    const check = (async () => {
+      signal.throwIfAborted();
+      const provider = this.providers.get(providerId);
+      if (!provider)
+        return;
+      return this.checkProviderAuth(provider, await this.readCredential(providerId, signal), signal);
+    })();
+    return raceWithAbortSignal(check, signal);
+  }
+  async getAuthenticatedProviders(providerId, signal) {
+    signal.throwIfAborted();
+    const providers = providerId ? [this.providers.get(providerId)].filter((entry) => entry !== undefined) : this.getProviders();
+    const checks = await Promise.all(providers.map(async (provider) => {
+      const credential = await this.readCredential(provider.id, signal);
+      return { provider, credential, auth: await this.checkProviderAuth(provider, credential, signal) };
+    }));
+    return checks.filter((entry) => entry.auth !== undefined);
+  }
+  getAvailable(providerId, options) {
+    const signal = operationSignal(options?.signal);
+    const available = (async () => {
+      const providers = await this.getAuthenticatedProviders(providerId, signal);
+      return providers.flatMap(({ provider, credential }) => {
+        const models = provider.getModels();
+        return provider.filterModels?.(models, credential) ?? models;
+      });
+    })();
+    return raceWithAbortSignal(available, signal);
+  }
+  async getAvailableOfType(type, providerId, options) {
+    return (await this.getAllAvailable(providerId, options)).filter((model) => isModelType(model, type));
+  }
+  getAllAvailable(providerId, options) {
+    const signal = operationSignal(options?.signal);
+    const available = (async () => {
+      const providers = await this.getAuthenticatedProviders(providerId, signal);
+      return providers.flatMap(({ provider, credential }) => {
+        const models = provider.getAllModels?.() ?? provider.getModels();
+        if (provider.filterAllModels)
+          return provider.filterAllModels(models, credential);
+        if (!provider.filterModels)
+          return models;
+        const availableChatIds = new Set(provider.filterModels(provider.getModels(), credential).map((model) => model.id));
+        return models.filter((model) => !isModelType(model, "chat") || availableChatIds.has(model.id));
+      });
+    })();
+    return raceWithAbortSignal(available, signal);
+  }
+  async getAuth(providerOrModel, overrides) {
+    const signal = operationSignal(overrides?.signal);
+    const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
+    const provider = this.providers.get(providerId);
+    if (!provider)
+      return;
+    const result = await resolveProviderAuth(provider, this.credentials, this.authContext, { ...overrides, signal });
+    if (!result || typeof providerOrModel === "string" || !providerOrModel.headers)
+      return result;
+    return {
+      ...result,
+      auth: {
+        ...result.auth,
+        headers: mergeHeaders(result.auth.headers, providerOrModel.headers)
+      }
+    };
+  }
+  async login(providerId, type, interaction, options) {
+    const signal = operationSignal(interaction.signal);
+    signal.throwIfAborted();
+    const provider = this.providers.get(providerId);
+    if (!provider)
+      throw new ModelsError("provider", `Unknown provider: ${providerId}`);
+    const method = type === "oauth" ? provider.auth.oauth : provider.auth.apiKey;
+    if (!method?.login) {
+      throw new ModelsError("auth", `${provider.name} does not support ${type} login`);
+    }
+    const loginOperation = method.login({ ...interaction, signal }, options);
+    const credential = await raceWithAbortSignal(loginOperation, signal);
+    let mutationStarted = false;
+    let markMutationStarted;
+    const started = new Promise((resolve) => {
+      markMutationStarted = resolve;
+    });
+    const mutation = this.credentials.modify(providerId, async () => {
+      mutationStarted = true;
+      markMutationStarted?.();
+      return credential;
+    }, { signal });
+    mutation.catch(() => {});
+    try {
+      await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          if (!mutationStarted)
+            reject(signal.reason);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        Promise.race([started, mutation]).then(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, (error) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        });
+        if (signal.aborted)
+          onAbort();
+      });
+      await mutation;
+    } catch (error) {
+      signal.throwIfAborted();
+      throw new ModelsError("auth", `Credential store modify failed for ${providerId}`, { cause: error });
+    }
+    return credential;
+  }
+  async logout(providerId, options) {
+    const signal = operationSignal(options?.signal);
+    signal.throwIfAborted();
+    try {
+      await this.credentials.delete(providerId, { signal });
+    } catch (error) {
+      signal.throwIfAborted();
+      throw new ModelsError("auth", `Credential store delete failed for ${providerId}`, { cause: error });
+    }
+  }
+  requireProvider(model) {
+    const provider = this.providers.get(model.provider);
+    if (!provider) {
+      throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
+    }
+    return provider;
+  }
+  requireChatProvider(model) {
+    assertChatModel(model);
+    return this.requireProvider(model);
+  }
+  async applyAuth(model, options) {
+    this.requireProvider(model);
+    const resolution = await this.getAuth(model, {
+      apiKey: options?.apiKey,
+      env: options?.env,
+      signal: options?.signal
+    });
+    if (!resolution) {
+      throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
+    }
+    const auth = resolution.auth;
+    const apiKey = options?.apiKey ?? auth.apiKey;
+    const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+    const sessionId = options && "sessionId" in options && typeof options.sessionId === "string" ? options.sessionId : undefined;
+    let headers = mergeHeaders(mergeHeaders(getOpenCodeSessionHeaders(requestModel, sessionId), auth.headers), options?.headers);
+    if (options?.transformHeaders)
+      headers = await options.transformHeaders(headers ?? {});
+    const env = resolution.env || options?.env ? { ...resolution.env ?? {}, ...options?.env ?? {} } : undefined;
+    const identity = mergeClientIdentity(this.identity, options?.identity);
+    const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
+    const requestOptions = {
+      ...providerOptions,
+      apiKey,
+      headers,
+      env,
+      ...identity === undefined ? {} : { identity }
+    };
+    return { requestModel, requestOptions };
+  }
+  stream(model, context, options) {
+    const transcript = normalizeContext(context);
+    return lazyStream(model, async () => {
+      const provider = this.requireChatProvider(model);
+      const { requestModel, requestOptions } = await this.applyAuth(model, options);
+      return provider.stream(requestModel, transcript, requestOptions);
+    }, observeModelRequest(model, options, false), options?.signal);
+  }
+  async complete(model, context, options) {
+    return this.stream(model, context, options).result();
+  }
+  streamSimple(model, context, options) {
+    const transcript = normalizeContext(context);
+    return lazyStream(model, async () => {
+      const provider = this.requireChatProvider(model);
+      const { requestModel, requestOptions } = await this.applyAuth(model, options);
+      return provider.streamSimple(requestModel, transcript, requestOptions);
+    }, observeModelRequest(model, options, false), options?.signal);
+  }
+  async completeSimple(model, context, options) {
+    return this.streamSimple(model, context, options).result();
+  }
+  streamDeferred(model, handle, options) {
+    return lazyStream(model, async () => {
+      const provider = this.requireChatProvider(model);
+      if (!provider.fetchDeferred) {
+        throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+      }
+      const { requestModel, requestOptions } = await this.applyAuth(model, options);
+      return provider.fetchDeferred(requestModel, handle, requestOptions);
+    }, observeModelRequest(model, options, true), options?.signal);
+  }
+  async fetchDeferred(model, handle, options) {
+    return this.streamDeferred(model, handle, options).result();
+  }
+  async cancelDeferred(model, handle, options) {
+    const provider = this.requireChatProvider(model);
+    if (!provider.cancelDeferred) {
+      throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+    }
+    const { requestModel, requestOptions } = await this.applyAuth(model, options);
+    await provider.cancelDeferred(requestModel, handle, requestOptions);
+  }
+  async generateImages(model, context, options) {
+    try {
+      assertImageModel(model);
+      const provider = this.requireProvider(model);
+      if (!provider.generateImages) {
+        throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
+      }
+      const { requestModel, requestOptions } = await this.applyAuth(model, options);
+      return await provider.generateImages(requestModel, context, requestOptions);
+    } catch (error) {
+      return imageErrorResult(model, error, options?.signal?.aborted);
+    }
+  }
+  async classify(model, context, options) {
+    try {
+      assertClassifierModel(model);
+      assertClassifierInputSupported(model, context);
+      const provider = this.requireProvider(model);
+      if (!provider.classify) {
+        throw new ModelsError("provider", `Provider ${model.provider} does not support classification`);
+      }
+      const { requestModel, requestOptions } = await this.applyAuth(model, options);
+      return await provider.classify(requestModel, context, requestOptions);
+    } catch (error) {
+      return classifierErrorResult(model, error, options?.signal?.aborted);
+    }
+  }
+}
+function createModels(options) {
+  return new ModelsImpl(options);
+}
+function createProvider(input) {
+  const single = input.api && typeof input.api.stream === "function" ? input.api : undefined;
+  const byApi = single || !input.api ? undefined : input.api;
+  const images = input.images;
+  const classifiers = input.classifiers;
+  const streams = single ? [single] : Object.values(byApi ?? {}).filter((entry) => entry !== undefined);
+  const imageImplementations = Object.values(images ?? {}).filter((entry) => entry !== undefined);
+  const classifierImplementations = Object.values(classifiers ?? {}).filter((entry) => entry !== undefined);
+  if (streams.length === 0 && imageImplementations.length === 0 && classifierImplementations.length === 0) {
+    throw new Error(`Provider ${input.id}: at least one of "api", "images", or "classifiers" is required.`);
+  }
+  const baselineModels = input.models;
+  let dynamicModels = [];
+  const fetchModels = input.fetchModels;
+  const currentModels = () => {
+    const merged = [...baselineModels];
+    for (const model of dynamicModels) {
+      const index = merged.findIndex((entry) => getModelType(entry) === getModelType(model) && entry.id === model.id);
+      if (index >= 0)
+        merged[index] = model;
+      else
+        merged.push(model);
+    }
+    return merged;
+  };
+  const apiFor = (model) => single ?? byApi?.[model.api];
+  const dispatch = (model, run, signal) => {
+    const streams = apiFor(model);
+    if (!streams) {
+      return lazyStream(model, async () => {
+        throw new ModelsError("stream", `Provider ${input.id} has no API implementation for "${model.api}"`);
+      }, undefined, signal);
+    }
+    return run(streams);
+  };
+  const provider = {
+    id: input.id,
+    name: input.name ?? input.id,
+    baseUrl: input.baseUrl,
+    headers: input.headers,
+    auth: input.auth,
+    getModels: () => currentModels().filter((model) => isModelType(model, "chat")),
+    getAllModels: currentModels,
+    refreshModels: fetchModels ? async (context) => {
+      if (context.stored) {
+        const restored = context.stored.models.filter((model) => model.provider === input.id).map((model) => model);
+        if (!await context.publish({
+          update: () => {
+            dynamicModels = restored;
+          }
+        })) {
+          return;
+        }
+      }
+      if (!context.allowNetwork || context.signal.aborted)
+        return;
+      const fetched = await fetchModels(context);
+      if (context.signal.aborted)
+        return;
+      const refreshed = fetched.filter(hasKnownModelType);
+      await context.publish({
+        persist: { models: refreshed, checkedAt: Date.now() },
+        update: () => {
+          dynamicModels = refreshed;
+        }
+      });
+    } : undefined,
+    filterModels: input.filterModels,
+    filterAllModels: input.filterAllModels,
+    stream: (model, context, options) => dispatch(model, (streams) => streams.stream(model, context, options), options?.signal),
+    streamSimple: (model, context, options) => dispatch(model, (streams) => streams.streamSimple(model, context, options), options?.signal)
+  };
+  if (streams.some((entry) => entry.fetchDeferred !== undefined)) {
+    provider.fetchDeferred = (model, handle, options) => lazyStream(model, async () => {
+      const implementation = apiFor(model);
+      if (!implementation?.fetchDeferred) {
+        throw new ModelsError("provider", `Provider ${input.id} does not support deferred responses for "${model.api}"`);
+      }
+      return implementation.fetchDeferred(model, handle, options);
+    }, undefined, options?.signal);
+  }
+  if (streams.some((entry) => entry.cancelDeferred !== undefined)) {
+    provider.cancelDeferred = async (model, handle, options) => {
+      const implementation = apiFor(model);
+      if (!implementation?.cancelDeferred) {
+        throw new ModelsError("provider", `Provider ${input.id} cannot cancel deferred responses for "${model.api}"`);
+      }
+      await implementation.cancelDeferred(model, handle, options);
+    };
+  }
+  if (images && imageImplementations.length > 0) {
+    provider.generateImages = async (model, context, options) => {
+      const implementation = images[model.api];
+      if (!implementation) {
+        return imageErrorResult(model, new ModelsError("provider", `Provider ${input.id} has no image generation implementation for "${model.api}"`));
+      }
+      return implementation.generateImages(model, context, options);
+    };
+  }
+  if (classifiers && classifierImplementations.length > 0) {
+    provider.classify = async (model, context, options) => {
+      const implementation = classifiers[model.api];
+      if (!implementation) {
+        return classifierErrorResult(model, new ModelsError("provider", `Provider ${input.id} has no classifier implementation for "${model.api}"`));
+      }
+      return implementation.classify(model, context, options);
+    };
+  }
+  return provider;
+}
+function calculateCost(model, usage) {
+  const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+  let rates = model.cost;
+  let matchedThreshold = -1;
+  for (const tier of model.cost.tiers ?? []) {
+    if (inputTokens > tier.inputTokensAbove && tier.inputTokensAbove > matchedThreshold) {
+      rates = tier;
+      matchedThreshold = tier.inputTokensAbove;
+    }
+  }
+  const longWrite = usage.cacheWrite1h ?? 0;
+  const shortWrite = usage.cacheWrite - longWrite;
+  usage.cost.input = rates.input / 1e6 * usage.input;
+  usage.cost.output = rates.output / 1e6 * usage.output;
+  usage.cost.cacheRead = rates.cacheRead / 1e6 * usage.cacheRead;
+  usage.cost.cacheWrite = (rates.cacheWrite * shortWrite + rates.input * 2 * longWrite) / 1e6;
+  usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+  usage.cost.totalFromProvider = false;
+  return usage.cost;
+}
+function getSupportedThinkingLevels(model) {
+  if (!model.reasoning)
+    return ["off"];
+  return EXTENDED_THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null)
+      return false;
+    if (level === "xhigh" || level === "max")
+      return mapped !== undefined;
+    return true;
+  });
+}
+function clampThinkingLevel(model, level) {
+  const availableLevels = getSupportedThinkingLevels(model);
+  if (availableLevels.includes(level))
+    return level;
+  const requestedIndex = EXTENDED_THINKING_LEVELS.indexOf(level);
+  if (requestedIndex === -1)
+    return availableLevels[0] ?? "off";
+  for (let i = requestedIndex;i < EXTENDED_THINKING_LEVELS.length; i++) {
+    const candidate = EXTENDED_THINKING_LEVELS[i];
+    if (availableLevels.includes(candidate))
+      return candidate;
+  }
+  for (let i = requestedIndex - 1;i >= 0; i--) {
+    const candidate = EXTENDED_THINKING_LEVELS[i];
+    if (availableLevels.includes(candidate))
+      return candidate;
+  }
+  return availableLevels[0] ?? "off";
+}
+var KNOWN_MODEL_TYPES, EXTENDED_THINKING_LEVELS;
+var init_models = __esm(() => {
+  init_lazy();
+  init_credential_store();
+  init_resolve();
+  init_telemetry();
+  init_identity();
+  init_model_operations();
+  init_transcript();
+  KNOWN_MODEL_TYPES = { chat: true, image: true, classifier: true };
+  EXTENDED_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 });
 
 // node_modules/@earendil-works/pi-ai/dist/utils/provider-env.js
@@ -15537,100 +15537,6 @@ __export(exports_x509_transport_state_browser, {
   rememberX509Credential: () => rememberX509Credential,
   rememberX509OAuthError: () => rememberX509OAuthError
 });
-
-// src/hosted-session.ts
-init_models();
-import { DurableObject } from "cloudflare:workers";
-
-// node_modules/@earendil-works/chord/dist/context/index.js
-init_dist();
-var ABORT_SIGNAL_CONTEXT_KEY = Object.freeze({
-  token: Symbol("chord.abortSignal")
-});
-var TELEMETRY_CONTEXT_KEY = Object.freeze({
-  token: Symbol("chord.telemetry")
-});
-
-class BaseContext {
-  get abortSignal() {
-    return this.value(ABORT_SIGNAL_CONTEXT_KEY);
-  }
-  get telemetry() {
-    return this.value(TELEMETRY_CONTEXT_KEY) ?? NOOP_TELEMETRY_CONTEXT;
-  }
-}
-
-class EmptyContext extends BaseContext {
-  #name;
-  constructor(name) {
-    super();
-    this.#name = name;
-  }
-  value(_key) {
-    return;
-  }
-  toString() {
-    return this.#name;
-  }
-}
-
-class ContextValue extends BaseContext {
-  #parent;
-  #key;
-  #value;
-  constructor(parent, key, value) {
-    super();
-    this.#parent = parent;
-    this.#key = key;
-    this.#value = value;
-  }
-  value(key) {
-    if (key.token === this.#key.token)
-      return this.#value;
-    return this.#parent.value(key);
-  }
-  toString() {
-    return `${this.#parent}.WithValue(${this.#key.token.description ?? "anonymous"})`;
-  }
-}
-var BACKGROUND_CONTEXT = new EmptyContext("[Context BACKGROUND_CONTEXT]");
-var TODO_CONTEXT = new EmptyContext("[Context TODO_CONTEXT]");
-function withContextValue(key, value, parent) {
-  return new ContextValue(parent, key, value);
-}
-function withTelemetry(telemetry, context) {
-  return withContextValue(TELEMETRY_CONTEXT_KEY, telemetry, context);
-}
-function withAbortSignal(signal, context) {
-  const parentSignal = context.abortSignal;
-  const combined = parentSignal === undefined ? signal : AbortSignal.any([parentSignal, signal]);
-  return withContextValue(ABORT_SIGNAL_CONTEXT_KEY, combined, context);
-}
-function withoutAbortSignal(context) {
-  return withContextValue(ABORT_SIGNAL_CONTEXT_KEY, undefined, context);
-}
-function awaitWithContext(promise, context) {
-  const signal = context.abortSignal;
-  if (signal === undefined)
-    return promise;
-  if (signal.aborted)
-    return Promise.reject(abortError(signal));
-  return new Promise((resolve, reject) => {
-    const onAbort = () => reject(abortError(signal));
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then((value) => {
-      signal.removeEventListener("abort", onAbort);
-      resolve(value);
-    }, (error) => {
-      signal.removeEventListener("abort", onAbort);
-      reject(error);
-    });
-  });
-}
-function abortError(signal) {
-  const reason = signal.reason;
-  return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
-}
 // node_modules/@earendil-works/pi-durable/dist/harness/compaction.js
 init_estimate();
 
@@ -16191,6 +16097,96 @@ function isContextOverflow(message, contextWindow) {
 
 // node_modules/@earendil-works/pi-durable/dist/harness/generation.js
 init_transcript();
+
+// node_modules/@earendil-works/chord/dist/context/index.js
+init_dist();
+var ABORT_SIGNAL_CONTEXT_KEY = Object.freeze({
+  token: Symbol("chord.abortSignal")
+});
+var TELEMETRY_CONTEXT_KEY = Object.freeze({
+  token: Symbol("chord.telemetry")
+});
+
+class BaseContext {
+  get abortSignal() {
+    return this.value(ABORT_SIGNAL_CONTEXT_KEY);
+  }
+  get telemetry() {
+    return this.value(TELEMETRY_CONTEXT_KEY) ?? NOOP_TELEMETRY_CONTEXT;
+  }
+}
+
+class EmptyContext extends BaseContext {
+  #name;
+  constructor(name) {
+    super();
+    this.#name = name;
+  }
+  value(_key) {
+    return;
+  }
+  toString() {
+    return this.#name;
+  }
+}
+
+class ContextValue extends BaseContext {
+  #parent;
+  #key;
+  #value;
+  constructor(parent, key, value) {
+    super();
+    this.#parent = parent;
+    this.#key = key;
+    this.#value = value;
+  }
+  value(key) {
+    if (key.token === this.#key.token)
+      return this.#value;
+    return this.#parent.value(key);
+  }
+  toString() {
+    return `${this.#parent}.WithValue(${this.#key.token.description ?? "anonymous"})`;
+  }
+}
+var BACKGROUND_CONTEXT = new EmptyContext("[Context BACKGROUND_CONTEXT]");
+var TODO_CONTEXT = new EmptyContext("[Context TODO_CONTEXT]");
+function withContextValue(key, value, parent) {
+  return new ContextValue(parent, key, value);
+}
+function withTelemetry(telemetry, context) {
+  return withContextValue(TELEMETRY_CONTEXT_KEY, telemetry, context);
+}
+function withAbortSignal(signal, context) {
+  const parentSignal = context.abortSignal;
+  const combined = parentSignal === undefined ? signal : AbortSignal.any([parentSignal, signal]);
+  return withContextValue(ABORT_SIGNAL_CONTEXT_KEY, combined, context);
+}
+function withoutAbortSignal(context) {
+  return withContextValue(ABORT_SIGNAL_CONTEXT_KEY, undefined, context);
+}
+function awaitWithContext(promise, context) {
+  const signal = context.abortSignal;
+  if (signal === undefined)
+    return promise;
+  if (signal.aborted)
+    return Promise.reject(abortError(signal));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then((value) => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    }, (error) => {
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+  });
+}
+function abortError(signal) {
+  const reason = signal.reason;
+  return reason instanceof Error ? reason : new DOMException("The operation was aborted", "AbortError");
+}
 
 // node_modules/@earendil-works/chord/dist/delta/apply-immutable-trusted.js
 var DATA_DESCRIPTOR2 = {
@@ -31472,3621 +31468,24 @@ var Harness = {
     return harness;
   }
 };
-// node_modules/agents/dist/classPrivateFieldGet2-DZBYAB34.js
-function _checkPrivateRedeclaration(e, t) {
-  if (t.has(e))
-    throw new TypeError("Cannot initialize the same private elements twice on an object");
-}
-function _classPrivateFieldInitSpec(e, t, a) {
-  _checkPrivateRedeclaration(e, t), t.set(e, a);
-}
-function _assertClassBrand(e, t, n) {
-  if (typeof e == "function" ? e === t : e.has(t))
-    return arguments.length < 3 ? t : n;
-  throw new TypeError("Private element is not present on this object");
-}
-function _classPrivateFieldSet2(s, a, r) {
-  return s.set(_assertClassBrand(s, a), r), r;
-}
-function _classPrivateFieldGet2(s, a) {
-  return s.get(_assertClassBrand(s, a));
-}
-
-// node_modules/agents/dist/classPrivateMethodInitSpec-qMjJ6sHQ.js
-function _classPrivateMethodInitSpec(e, a) {
-  _checkPrivateRedeclaration(e, a), a.add(e);
-}
-
-// node_modules/agents/dist/capability-DBAKc6UZ.js
-var installedServices = /* @__PURE__ */ new WeakMap;
-var LifecycleCapability = class {
-  constructor(capabilityId) {
-    this.claims = "selective";
-    if (capabilityId.trim() === "")
-      throw new Error("Lifecycle capability IDs must be non-empty");
-    this.capabilityId = capabilityId;
-  }
-  onStart(_context) {}
-  get lifecycleServices() {
-    return installedServices.get(this);
-  }
-  get lifecycle() {
-    const services = this.lifecycleServices;
-    if (!services)
-      throw new Error(`${this.constructor.name} must be installed with Lifecycle.use() before use`);
-    return services;
-  }
+// src/contract.ts
+var COMPACTION_FAILURE_TEXT = "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
+var COMPACTION_FAILURE_BY_REASON = {
+  output_limit: "The conversation could not be compacted: its summary ran past the length limit. Send your message again to continue, or start a fresh conversation.",
+  interrupted: "The conversation could not be compacted: summarizing it was interrupted. Send your message again to continue, or start a fresh conversation.",
+  no_model: "The conversation could not be compacted: no model is available to summarize it. Send your message again to continue, or start a fresh conversation.",
+  model_error: "The conversation could not be compacted: the model could not write its summary. Send your message again to continue, or start a fresh conversation."
 };
-function bindLifecycleCapability(capability, services) {
-  installedServices.set(capability, services);
+function compactionFailureText(reason) {
+  return COMPACTION_FAILURE_BY_REASON[reason] ?? COMPACTION_FAILURE_TEXT;
 }
-function lifecycleCapabilityId(capability) {
-  return capability instanceof LifecycleCapability ? capability.capabilityId : undefined;
-}
+var BOARD_MESSAGE_KIND = "tenant.board.message";
+var OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
 
-// node_modules/agents/dist/retries.js
-function jitterBackoff(attempt, baseDelayMs, maxDelayMs) {
-  const upperBoundMs = Math.min(2 ** attempt * baseDelayMs, maxDelayMs);
-  return Math.floor(Math.random() * upperBoundMs);
-}
-async function tryN(n, fn, options) {
-  if (!Number.isFinite(n) || n < 1)
-    throw new Error("retry.maxAttempts must be >= 1");
-  n = Math.floor(n);
-  const rawBase = options?.baseDelayMs ?? 100;
-  const rawMax = options?.maxDelayMs ?? 3000;
-  if (!Number.isFinite(rawBase) || rawBase <= 0)
-    throw new Error("retry.baseDelayMs must be > 0");
-  if (!Number.isFinite(rawMax) || rawMax <= 0)
-    throw new Error("retry.maxDelayMs must be > 0");
-  const baseDelayMs = Math.floor(rawBase);
-  const maxDelayMs = Math.floor(rawMax);
-  if (baseDelayMs > maxDelayMs)
-    throw new Error("retry.baseDelayMs must be <= retry.maxDelayMs");
-  let attempt = 1;
-  while (true)
-    try {
-      return await fn(attempt);
-    } catch (err) {
-      const nextAttempt = attempt + 1;
-      if (nextAttempt > n || options?.shouldRetry && !options.shouldRetry(err, nextAttempt))
-        throw err;
-      const delay = jitterBackoff(attempt, baseDelayMs, maxDelayMs);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      attempt = nextAttempt;
-    }
-}
-function isErrorRetryable(err) {
-  if (typeof err !== "object" || err === null)
-    return false;
-  const msg = String(err);
-  const typed = err;
-  return Boolean(typed.retryable) && !typed.overloaded && !msg.includes("Durable Object is overloaded");
-}
-var SUPERSEDED_ISOLATE_PATTERN = /reset because its code was updated|this script has been upgraded/i;
-var CONNECTION_LOST_PATTERN = /network connection lost/i;
-var STORAGE_RESET_PATTERN = /Internal error in Durable Object storage caused object to be reset/i;
-var MEMORY_LIMIT_RESET_PATTERN = /exceeded its memory limit/i;
-function errorMessageOf(error) {
-  return error instanceof Error ? error.message : typeof error === "string" ? error : "";
-}
-function* selfAndCauses(error) {
-  let current = error;
-  for (let depth = 0;depth < 8 && current != null; depth++) {
-    yield current;
-    current = typeof current === "object" ? current.cause : undefined;
-  }
-}
-function isDurableObjectCodeUpdateReset(error) {
-  for (const e of selfAndCauses(error))
-    if (SUPERSEDED_ISOLATE_PATTERN.test(errorMessageOf(e)))
-      return true;
-  return false;
-}
-function isDurableObjectMemoryLimitReset(error) {
-  for (const e of selfAndCauses(error))
-    if (MEMORY_LIMIT_RESET_PATTERN.test(errorMessageOf(e)))
-      return true;
-  return false;
-}
-function isPlatformFailure(error) {
-  return isPlatformTransientError(error) || isDurableObjectMemoryLimitReset(error);
-}
-function isPlatformTransientError(error) {
-  for (const e of selfAndCauses(error)) {
-    const message = errorMessageOf(e);
-    if (SUPERSEDED_ISOLATE_PATTERN.test(message))
-      return true;
-    if (CONNECTION_LOST_PATTERN.test(message))
-      return true;
-    if (STORAGE_RESET_PATTERN.test(message))
-      return true;
-    if (isErrorRetryable(e))
-      return true;
-  }
-  return false;
-}
-
-// node_modules/agents/dist/resource-B59OV2a2.js
-function ok(value) {
-  return {
-    ok: true,
-    value
-  };
-}
-function err(error) {
-  return {
-    ok: false,
-    error
-  };
-}
-var SkillParseError = class extends Error {
-  constructor(code, message, options) {
-    super(message, options);
-    this.code = code;
-    this._tag = "SkillParseError";
-    this.name = "SkillParseError";
-  }
-};
-var NAME_MAX_LENGTH = 64;
-var DESCRIPTION_MAX_LENGTH = 1024;
-var COMPATIBILITY_MAX_LENGTH = 500;
-var NAME_CHARACTERS = /^[\p{L}\p{N}-]+$/u;
-var UNSAFE_NAME_CHARACTERS = /[/\\\u0000-\u001f\u007f]/;
-var SPEC_FIELDS = /* @__PURE__ */ new Set([
-  "name",
-  "description",
-  "license",
-  "compatibility",
-  "metadata",
-  "allowed-tools"
-]);
-function parseSkillFrontmatter(data, body, options = {}) {
-  if (!isRecord3(data))
-    return err(new SkillParseError("invalid-frontmatter", "SKILL.md frontmatter must be a YAML mapping."));
-  const warnings = [];
-  let failure;
-  function take(field) {
-    if ("fatal" in field) {
-      failure ??= field.fatal;
-      return;
-    }
-    for (const problem of field.problems ?? [])
-      warnings.push(problem);
-    return field.value;
-  }
-  const name = take(parseName(data.name, options.directory));
-  const description = take(parseDescription(data.description));
-  const license = take(parseLicense(data.license));
-  const compatibility = take(parseCompatibility(data.compatibility));
-  const metadata = take(parseMetadata(data.metadata));
-  const allowedTools = take(parseAllowedTools(data["allowed-tools"]));
-  if (failure || name === undefined || description === undefined || metadata === undefined || allowedTools === undefined)
-    return err(failure ?? new SkillParseError("invalid-frontmatter", "Invalid frontmatter."));
-  const extraFields = {};
-  for (const [key, value] of Object.entries(data))
-    if (!SPEC_FIELDS.has(key))
-      extraFields[key] = value;
-  return {
-    ok: true,
-    value: {
-      name,
-      description,
-      ...license === undefined ? {} : { license },
-      ...compatibility === undefined ? {} : { compatibility },
-      metadata,
-      allowedTools,
-      extraFields,
-      body
-    },
-    warnings
-  };
-}
-function isModelInvocable(skill) {
-  return skill.extraFields["disable-model-invocation"] !== true && skill.metadata["disable-model-invocation"] !== "true";
-}
-function specNameProblem(name) {
-  if (name.length === 0)
-    return "it must not be empty";
-  if ([...name].length > NAME_MAX_LENGTH)
-    return `it must be at most ${NAME_MAX_LENGTH} characters`;
-  if (name !== name.toLowerCase())
-    return "it must be lowercase";
-  if (!NAME_CHARACTERS.test(name))
-    return "it may only contain letters, digits, and hyphens";
-  if (name.startsWith("-") || name.endsWith("-"))
-    return "it must not start or end with a hyphen";
-  if (name.includes("--"))
-    return "it must not contain consecutive hyphens";
-  return null;
-}
-function isSafeName(name) {
-  return name.length > 0 && name === name.trim() && name !== "." && name !== ".." && !UNSAFE_NAME_CHARACTERS.test(name);
-}
-function parseName(value, directory) {
-  const fallback = (value === undefined || value === null) && directory ? directory : undefined;
-  const declared = typeof value === "string" ? value : fallback;
-  if (declared === undefined)
-    return { fatal: new SkillParseError("invalid-name", "SKILL.md frontmatter must set `name` to a string.") };
-  const name = declared.trim().normalize("NFKC");
-  if (!isSafeName(name))
-    return { fatal: new SkillParseError("invalid-name", `Invalid skill name "${declared}": it must be a single path segment without slashes or control characters.`) };
-  const accepted = name;
-  const problems = [];
-  if (fallback)
-    problems.push(new SkillParseError("invalid-name", `SKILL.md frontmatter has no \`name\`; using its directory "${fallback}".`));
-  else {
-    const formatProblem = declared !== declared.trim() ? "it must not start or end with whitespace" : specNameProblem(name);
-    if (formatProblem !== null)
-      problems.push(new SkillParseError("invalid-name", `Invalid skill name "${declared}": ${formatProblem}.`));
-    if (directory !== undefined && directory.normalize("NFKC") !== name)
-      problems.push(new SkillParseError("name-mismatch", `Skill name "${name}" must match its directory "${directory}".`));
-  }
-  return problems.length === 0 ? { value: accepted } : {
-    value: accepted,
-    problems
-  };
-}
-function parseDescription(value) {
-  const description = typeof value === "string" ? value.trim() : "";
-  if (description.length === 0)
-    return { fatal: new SkillParseError("invalid-description", "SKILL.md frontmatter must set `description` to a non-empty string.") };
-  if ([...description].length > DESCRIPTION_MAX_LENGTH)
-    return {
-      value: description,
-      problems: [new SkillParseError("invalid-description", `Skill description must be at most ${DESCRIPTION_MAX_LENGTH} characters.`)]
-    };
-  return { value: description };
-}
-function parseLicense(value) {
-  if (value === undefined || value === null)
-    return { value: undefined };
-  if (typeof value !== "string" || value.trim().length === 0)
-    return {
-      value: undefined,
-      problems: [new SkillParseError("invalid-license", "Skill `license` must be a non-empty string.")]
-    };
-  return { value: value.trim() };
-}
-function parseCompatibility(value) {
-  if (value === undefined || value === null)
-    return { value: undefined };
-  const compatibility = typeof value === "string" ? value.trim() : "";
-  if (compatibility.length === 0 || [...compatibility].length > COMPATIBILITY_MAX_LENGTH)
-    return {
-      value: compatibility.length === 0 ? undefined : compatibility,
-      problems: [new SkillParseError("invalid-compatibility", `Skill \`compatibility\` must be 1-${COMPATIBILITY_MAX_LENGTH} characters.`)]
-    };
-  return { value: compatibility };
-}
-function parseMetadata(value) {
-  if (value === undefined || value === null)
-    return { value: {} };
-  if (!isRecord3(value))
-    return {
-      value: {},
-      problems: [new SkillParseError("invalid-metadata", "Skill `metadata` must be a mapping of string keys to string values.")]
-    };
-  const metadata = {};
-  let problem;
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry !== "string" && typeof entry !== "number" && typeof entry !== "boolean") {
-      problem ??= new SkillParseError("invalid-metadata", `Skill \`metadata.${key}\` must be a string.`);
-      continue;
-    }
-    metadata[key] = String(entry);
-  }
-  return problem ? {
-    value: metadata,
-    problems: [problem]
-  } : { value: metadata };
-}
-function parseAllowedTools(value) {
-  if (value === undefined || value === null)
-    return { value: [] };
-  if (typeof value === "string")
-    return { value: value.split(/\s+/).filter((tool) => tool.length > 0) };
-  if (Array.isArray(value) && value.every((tool) => typeof tool === "string"))
-    return { value: value.map((tool) => tool.trim()).filter(Boolean) };
-  return {
-    value: [],
-    problems: [new SkillParseError("invalid-allowed-tools", "Skill `allowed-tools` must be a space-separated string.")]
-  };
-}
-function isRecord3(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-var InvalidSkillResourcePathError = class extends Error {
-  constructor(path) {
-    super(`Skill resource path must be a normalized relative path inside the skill: ${path}`);
-    this.path = path;
-    this._tag = "InvalidSkillResourcePathError";
-    this.name = "InvalidSkillResourcePathError";
-  }
-};
-function parseSkillResourcePath(path) {
-  if (path.length === 0 || path.startsWith("/") || path.includes("\x00") || path.includes("\\") || path === "SKILL.md" || path.split("/").some((part) => part === "" || part === "." || part === ".."))
-    return err(new InvalidSkillResourcePathError(path));
-  return ok(path);
-}
-var TEXT_EXTENSIONS = /* @__PURE__ */ new Set([
-  "",
-  ".bash",
-  ".css",
-  ".csv",
-  ".html",
-  ".js",
-  ".json",
-  ".jsx",
-  ".md",
-  ".mdx",
-  ".mjs",
-  ".py",
-  ".sh",
-  ".svg",
-  ".toml",
-  ".ts",
-  ".tsx",
-  ".txt",
-  ".xml",
-  ".yaml",
-  ".yml"
-]);
-var MIME_TYPES = /* @__PURE__ */ new Map([
-  [".css", "text/css"],
-  [".csv", "text/csv"],
-  [".gif", "image/gif"],
-  [".html", "text/html"],
-  [".jpeg", "image/jpeg"],
-  [".jpg", "image/jpeg"],
-  [".js", "text/javascript"],
-  [".json", "application/json"],
-  [".md", "text/markdown"],
-  [".mjs", "text/javascript"],
-  [".pdf", "application/pdf"],
-  [".png", "image/png"],
-  [".py", "text/x-python"],
-  [".sh", "text/x-shellscript"],
-  [".svg", "image/svg+xml"],
-  [".txt", "text/plain"],
-  [".webp", "image/webp"],
-  [".xml", "application/xml"],
-  [".yaml", "application/yaml"],
-  [".yml", "application/yaml"]
-]);
-function extensionOf(path) {
-  const file = path.split("/").at(-1) ?? path;
-  const index = file.lastIndexOf(".");
-  return index <= 0 ? "" : file.slice(index).toLowerCase();
-}
-function describeSkillResource(path, size) {
-  const root = path.split("/", 1)[0];
-  const kind = root === "scripts" ? "script" : root === "references" ? "reference" : root === "assets" ? "asset" : "file";
-  const extension = extensionOf(path);
-  const mimeType = MIME_TYPES.get(extension);
-  return {
-    path,
-    kind,
-    encoding: TEXT_EXTENSIONS.has(extension) ? "text" : "base64",
-    ...mimeType === undefined ? {} : { mimeType },
-    ...size === undefined ? {} : { size }
-  };
-}
-
-// node_modules/agents/dist/catalog-BpOejOsE.js
-var SkillSourceError = class extends Error {
-  constructor(sourceId, operation, cause) {
-    super(`Skill source "${sourceId}" failed to ${operation === "list" ? "list skills" : "read a resource"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
-    this.sourceId = sourceId;
-    this.operation = operation;
-    this._tag = "SkillSourceError";
-    this.name = "SkillSourceError";
-  }
-};
-var SkillResourceNotFoundError = class extends Error {
-  constructor(skill, path) {
-    super(`Resource not found: ${skill}/${path}`);
-    this.skill = skill;
-    this.path = path;
-    this._tag = "SkillResourceNotFoundError";
-    this.name = "SkillResourceNotFoundError";
-  }
-};
-var UnknownSkillError = class extends Error {
-  constructor(skill) {
-    super(`Skill not found: ${skill}`);
-    this.skill = skill;
-    this._tag = "UnknownSkillError";
-    this.name = "UnknownSkillError";
-  }
-};
-var catalogListings = /* @__PURE__ */ new WeakMap;
-async function loadSkillCatalog(sources, options = {}) {
-  const previousListings = options.previous ? catalogListings.get(options.previous) : undefined;
-  const listings = await Promise.all(sources.map(async (source) => ({
-    source,
-    listed: await source.list().catch((cause) => err(new SkillSourceError(source.id, "list", cause)))
-  })));
-  const diagnostics = [];
-  const entries = /* @__PURE__ */ new Map;
-  const sourceBySkill = /* @__PURE__ */ new Map;
-  const goodListings = /* @__PURE__ */ new Map;
-  for (const { source, listed } of listings) {
-    let listing;
-    if (listed.ok)
-      listing = listed.value;
-    else {
-      const fallback = previousListings?.get(source);
-      diagnostics.push({
-        _tag: "SourceFailed",
-        sourceId: source.id,
-        error: listed.error,
-        keptPrevious: fallback !== undefined
-      });
-      if (!fallback)
-        continue;
-      listing = fallback;
-    }
-    goodListings.set(source, listing);
-    for (const invalid of listing.invalid)
-      diagnostics.push({
-        _tag: "InvalidSkill",
-        sourceId: source.id,
-        location: invalid.location,
-        error: invalid.error
-      });
-    for (const { skill, resources, location, warnings } of listing.skills) {
-      const existing = entries.get(skill.name);
-      if (existing) {
-        diagnostics.push({
-          _tag: "DuplicateSkill",
-          name: skill.name,
-          sourceId: source.id,
-          keptSourceId: existing.sourceId
-        });
-        continue;
-      }
-      entries.set(skill.name, {
-        skill,
-        sourceId: source.id,
-        resources,
-        ...location === undefined ? {} : { location }
-      });
-      sourceBySkill.set(skill.name, source);
-      for (const warning of warnings ?? [])
-        diagnostics.push({
-          _tag: "SkillWarning",
-          sourceId: source.id,
-          name: skill.name,
-          error: warning
-        });
-    }
-  }
-  const skills = [...entries.values()].filter((entry) => isModelInvocable(entry.skill));
-  const visible = new Map(skills.map((entry) => [entry.skill.name, entry]));
-  const prompt = renderCatalogPrompt(skills);
-  const catalog = {
-    fingerprint: fingerprintOf(prompt ?? ""),
-    skills,
-    diagnostics,
-    prompt: () => prompt,
-    find: (name) => visible.get(name),
-    activate(name) {
-      const entry = visible.get(name);
-      return entry ? ok(renderSkillActivation(entry)) : err(new UnknownSkillError(name));
-    },
-    async readResource(request) {
-      const target = resolveResourceTarget(visible, request);
-      if (!target.ok)
-        return target;
-      const { entry, path } = target.value;
-      const source = sourceBySkill.get(entry.skill.name);
-      if (!source)
-        return err(new UnknownSkillError(entry.skill.name));
-      const read = await source.readResource(entry.skill.name, path).catch((cause) => err(new SkillSourceError(source.id, "read-resource", cause)));
-      if (!read.ok)
-        return read;
-      return ok({
-        entry,
-        resource: read.value
-      });
-    }
-  };
-  catalogListings.set(catalog, goodListings);
-  return catalog;
-}
-function formatSkillDiagnostic(diagnostic) {
-  switch (diagnostic._tag) {
-    case "InvalidSkill":
-      return `Skipped invalid skill ${diagnostic.location} from source "${diagnostic.sourceId}": ${diagnostic.error.message}`;
-    case "SkillWarning":
-      return `Skill "${diagnostic.name}" from source "${diagnostic.sourceId}" breaks the Agent Skills spec but was loaded: ${diagnostic.error.message}`;
-    case "SourceFailed":
-      return `${diagnostic.error.message}. ${diagnostic.keptPrevious ? "Its last listed skills were kept." : "Its skills were skipped."}`;
-    case "DuplicateSkill":
-      return `Duplicate skill "${diagnostic.name}" from source "${diagnostic.sourceId}" ignored; already provided by "${diagnostic.keptSourceId}".`;
-  }
-}
-function renderSkillResource(read) {
-  const { entry, resource } = read;
-  return [
-    `<skill_resource${attributes([
-      ["name", entry.skill.name],
-      ["path", resource.path],
-      ["kind", resource.kind],
-      ["encoding", resource.encoding],
-      ["mimeType", resource.mimeType]
-    ])}>`,
-    resource.content,
-    "</skill_resource>"
-  ].join(`
-`);
-}
-function renderCatalogPrompt(skills) {
-  if (skills.length === 0)
-    return null;
-  return [
-    "Available skills. When a task matches a skill, use activate_skill with its name before proceeding.",
-    "",
-    ...skills.map(({ skill }) => `- ${skill.name}: ${skill.description.replace(/\s+/g, " ")}`)
-  ].join(`
-`);
-}
-function renderSkillActivation(entry) {
-  const lines = [`<skill_content${attributes([["name", entry.skill.name], ["location", entry.location]])}>`, entry.skill.body.trim()];
-  if (entry.resources.length > 0) {
-    lines.push("", "<skill_resources>");
-    for (const resource of entry.resources)
-      lines.push(`  <file${attributes([
-        ["kind", resource.kind],
-        ["encoding", resource.encoding],
-        ["size", resource.size === undefined ? undefined : String(resource.size)]
-      ])}>${resource.path}</file>`);
-    lines.push("</skill_resources>");
-  }
-  lines.push("</skill_content>");
-  return lines.join(`
-`);
-}
-function resolveResourceTarget(skills, request) {
-  let name = request.name;
-  let relative = request.path;
-  if (name === undefined) {
-    const slash = relative.indexOf("/");
-    if (slash <= 0)
-      return err(new InvalidSkillResourcePathError(relative));
-    name = relative.slice(0, slash);
-    relative = relative.slice(slash + 1);
-  }
-  const entry = skills.get(name);
-  if (!entry)
-    return err(new UnknownSkillError(name));
-  const path = parseSkillResourcePath(relative);
-  if (!path.ok)
-    return path;
-  if (!entry.resources.some((resource) => resource.path === path.value))
-    return err(new SkillResourceNotFoundError(entry.skill.name, path.value));
-  return ok({
-    entry,
-    path: path.value
-  });
-}
-function attributes(pairs) {
-  return pairs.filter((pair) => pair[1] !== undefined).map(([key, value]) => ` ${key}="${value.replace(/"/g, "&quot;")}"`).join("");
-}
-function fingerprintOf(text) {
-  let a = 2166136261;
-  let b = 16777619;
-  for (let index = 0;index < text.length; index++) {
-    const code = text.charCodeAt(index);
-    a = Math.imul(a ^ code, 16777619);
-    b = Math.imul(b ^ code, 2166136261);
-  }
-  return `${(a >>> 0).toString(16).padStart(8, "0")}${(b >>> 0).toString(16).padStart(8, "0")}`;
-}
-
-// node_modules/@earendil-works/chord/dist/sqlite/cloudflare.js
-class SerialQueue {
-  tail = Promise.resolve();
-  pending = 0;
-  run(operation) {
-    if (this.pending > 0)
-      return this.enqueue(operation);
-    try {
-      return Promise.resolve(operation());
-    } catch (error) {
-      return Promise.reject(error);
-    }
-  }
-  hold(operation) {
-    return this.enqueue(operation);
-  }
-  enqueue(operation) {
-    this.pending++;
-    const result = this.tail.then(operation).finally(() => {
-      this.pending--;
-    });
-    this.tail = result.then(() => {}, () => {});
-    return result;
-  }
-}
-var storageQueues = new WeakMap;
-function queueFor(storage) {
-  let queue = storageQueues.get(storage);
-  if (queue === undefined) {
-    queue = new SerialQueue;
-    storageQueues.set(storage, queue);
-  }
-  return queue;
-}
-function bindValue(value) {
-  if (value instanceof Uint8Array)
-    return value.slice().buffer;
-  if (typeof value !== "bigint")
-    return value;
-  if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new RangeError(`Durable Object SQL cannot bind ${value} without losing precision`);
-  }
-  return Number(value);
-}
-var bind = (params) => params.map(bindValue);
-function row(row) {
-  for (const key in row) {
-    const value = row[key];
-    if (value instanceof ArrayBuffer)
-      row[key] = new Uint8Array(value);
-  }
-  return row;
-}
-
-class DurableObjectSqliteExecutor {
-  storage;
-  constructor(storage) {
-    this.storage = storage;
-  }
-  async exec(sql) {
-    this.check();
-    this.storage.sql.exec(sql);
-  }
-  async run(sql, ...params) {
-    this.check();
-    this.storage.sql.exec(sql, ...bind(params));
-  }
-  async runCounted(sql, ...params) {
-    this.check();
-    this.storage.sql.exec(sql, ...bind(params));
-    const counted = this.storage.sql.exec("SELECT changes() AS changes").next();
-    return counted.done ? 0 : Number(counted.value.changes);
-  }
-  async get(sql, ...params) {
-    this.check();
-    const result = this.storage.sql.exec(sql, ...bind(params)).next();
-    return result.done ? undefined : row(result.value);
-  }
-  async all(sql, ...params) {
-    this.check();
-    return this.storage.sql.exec(sql, ...bind(params)).toArray().map((value) => row(value));
-  }
-  check() {}
-}
-
-class DurableObjectSqliteTransaction extends DurableObjectSqliteExecutor {
-  active = true;
-  check() {
-    if (!this.active)
-      throw new Error("SQLite transaction handle is no longer active");
-  }
-}
-
-class DurableObjectSqliteDatabase extends DurableObjectSqliteExecutor {
-  queue;
-  constructor(storage) {
-    super(storage);
-    this.queue = queueFor(storage);
-  }
-  exec(sql) {
-    return this.queue.run(() => super.exec(sql));
-  }
-  run(sql, ...params) {
-    return this.queue.run(() => super.run(sql, ...params));
-  }
-  runCounted(sql, ...params) {
-    return this.queue.run(() => super.runCounted(sql, ...params));
-  }
-  get(sql, ...params) {
-    return this.queue.run(() => super.get(sql, ...params));
-  }
-  all(sql, ...params) {
-    return this.queue.run(() => super.all(sql, ...params));
-  }
-  transaction(callback) {
-    return this.queue.hold(() => this.storage.transaction(async () => {
-      const transaction = new DurableObjectSqliteTransaction(this.storage);
-      try {
-        return await callback(transaction);
-      } finally {
-        transaction.active = false;
-      }
-    }));
-  }
-  close() {
-    return this.queue.run(() => {});
-  }
-}
-
-// node_modules/@earendil-works/pi-durable/dist/storage/scan.js
-function scanStart(requested, cursor, fallback) {
-  if (requested !== undefined && requested !== "ascending" && requested !== "descending") {
-    throw new StorageRequestError(`Invalid scan order: ${String(requested)}`);
-  }
-  if (cursor === undefined)
-    return { order: requested ?? fallback, after: undefined };
-  const { after, order: stored } = cursor;
-  if (typeof after !== "number" || !Number.isSafeInteger(after))
-    throw new StorageRequestError("Invalid storage cursor");
-  if (stored !== undefined && stored !== "ascending" && stored !== "descending") {
-    throw new StorageRequestError("Invalid storage cursor");
-  }
-  const order = stored ?? fallback;
-  if (requested !== undefined && requested !== order) {
-    throw new StorageRequestError(`The cursor continues a ${order} scan; the query asks for ${requested}`);
-  }
-  return { order, after };
-}
-function nextCursor(id, order) {
-  return { after: id, order };
-}
-
-// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/rows.js
-var parseJson = (value) => JSON.parse(value);
-var encodeJson = (value) => JSON.stringify(value);
-var encodeIndexedString = (value) => JSON.stringify(value);
-var scopeColumns = (scope) => {
-  switch (scope.kind) {
-    case "session":
-      return { scopeKind: "session", ownerId: 0 };
-    case "conversation":
-      return { scopeKind: "conversation", ownerId: scope.conversationId };
-    case "task":
-      return { scopeKind: "task", ownerId: scope.taskId };
-  }
-};
-var addressParts = (address) => {
-  const scope = scopeColumns(address.scope);
-  return {
-    kind: encodeIndexedString(address.kind),
-    ...scope,
-    family: address.key === undefined ? 0 : 1,
-    keyValue: encodeIndexedString(address.key ?? "")
-  };
-};
-var addressColumnsKey = (kind, scopeKind, ownerId, family, keyValue) => JSON.stringify([kind, scopeKind, ownerId, family, keyValue]);
-var addressKey = (address) => {
-  const parts = addressParts(address);
-  return addressColumnsKey(parts.kind, parts.scopeKind, parts.ownerId, parts.family, parts.keyValue);
-};
-var isCurrentOnly = (record) => record.scope.kind !== "conversation" || record.history === "latest";
-function documentRow(record) {
-  const parts = addressParts(record);
-  return [
-    record.id,
-    parts.kind,
-    parts.family,
-    parts.keyValue,
-    parts.scopeKind,
-    parts.ownerId,
-    record.createdAt,
-    record.retiredAt ?? null,
-    encodeJson(record)
-  ];
-}
-
-// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/statements.js
-async function readRows(executor, sql, values) {
-  const rows = [];
-  for (const array of jsonArrays(values.map((value) => JSON.stringify(value)))) {
-    rows.push(...await executor.all(sql, array));
-  }
-  return rows;
-}
-async function runForEach(executor, sql, values) {
-  for (const array of jsonArrays(values.map((value) => JSON.stringify(value))))
-    await executor.run(sql, array);
-}
-var LARGE_ROW_CHARACTERS = 8 * 1024;
-async function insertRows(executor, table, columns, rows, conflict = "") {
-  const small = [];
-  const large = [];
-  for (const row of rows) {
-    let text = 0;
-    for (const cell of row)
-      if (typeof cell === "string")
-        text += cell.length;
-    if (text > LARGE_ROW_CHARACTERS)
-      large.push(row);
-    else
-      small.push(JSON.stringify(row));
-  }
-  const names = columns.join(", ");
-  if (small.length > 0) {
-    const cells = columns.map((_, index) => `json_extract(item.value, '$[${index}]')`).join(", ");
-    const sql = `INSERT INTO ${table} (${names}) SELECT ${cells} FROM json_each(?) AS item WHERE true ${conflict}`;
-    for (const array of jsonArrays(small))
-      await executor.run(sql, array);
-  }
-  await insertBound(executor, `INSERT INTO ${table} (${names}) VALUES`, columns.length, large, conflict);
-}
-var MAX_PARAMETERS = 100;
-async function insertBound(executor, head, width, rows, conflict) {
-  const row = `(${new Array(width).fill("?").join(", ")})`;
-  let size = 1;
-  while (size * 2 * width <= MAX_PARAMETERS)
-    size *= 2;
-  for (let start = 0;start < rows.length; start += size) {
-    while (size > rows.length - start)
-      size /= 2;
-    const chunk = rows.slice(start, start + size);
-    await executor.run(`${head} ${new Array(size).fill(row).join(", ")} ${conflict}`, ...chunk.flat());
-  }
-}
-var MAX_ARRAY_CHARACTERS = 512 * 1024;
-function jsonArrays(parts) {
-  const arrays = [];
-  let chunk = [];
-  let length = 2;
-  for (const part of parts) {
-    if (chunk.length > 0 && length + 1 + part.length > MAX_ARRAY_CHARACTERS) {
-      arrays.push(`[${chunk.join(",")}]`);
-      chunk = [];
-      length = 2;
-    }
-    length += (chunk.length > 0 ? 1 : 0) + part.length;
-    chunk.push(part);
-  }
-  if (chunk.length > 0)
-    arrays.push(`[${chunk.join(",")}]`);
-  return arrays;
-}
-
-// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/commit.js
-var claimOf = (write) => {
-  switch (write.type) {
-    case "conversation":
-    case "entry":
-    case "task":
-    case "submission":
-      return { id: write.value.id, table: write.type };
-    case "document.create":
-    case "document.copy":
-      return { id: write.record.id, table: "document" };
-    case "document.change":
-    case "document.retire":
-      return;
-  }
-};
-function prepareDocumentActions(writes) {
-  const actions = new Map;
-  for (const write of writes) {
-    if (write.type !== "document.create" && write.type !== "document.copy" && write.type !== "document.change" && write.type !== "document.retire") {
-      continue;
-    }
-    const id = write.type === "document.create" || write.type === "document.copy" ? write.record.id : write.id;
-    let action = actions.get(id);
-    if (action === undefined) {
-      action = { retire: false };
-      actions.set(id, action);
-    }
-    switch (write.type) {
-      case "document.create":
-        if (action.create !== undefined || action.content !== undefined || action.copy !== undefined) {
-          throw new Error(`Document ${id} has more than one content command`);
-        }
-        action.create = write.record;
-        action.content = write.content;
-        break;
-      case "document.copy":
-        if (action.create !== undefined || action.content !== undefined || action.copy !== undefined) {
-          throw new Error(`Document ${id} has more than one content command`);
-        }
-        action.create = write.record;
-        action.copy = write.source;
-        break;
-      case "document.change":
-        if (action.content !== undefined || action.copy !== undefined) {
-          throw new Error(`Document ${id} has more than one content command`);
-        }
-        action.content = write.content;
-        break;
-      case "document.retire":
-        if (action.retire)
-          throw new Error(`Document ${id} is retired more than once`);
-        action.retire = true;
-        break;
-    }
-  }
-  return actions;
-}
-
-class CommitState {
-  #recordIds;
-  #documents;
-  #versions;
-  #current;
-  constructor(recordIds, documents, versions, current) {
-    this.#recordIds = recordIds;
-    this.#documents = documents;
-    this.#versions = versions;
-    this.#current = current;
-  }
-  static async read(executor, tables, batches) {
-    const ids = new Set;
-    const documentIds = new Set;
-    const deltaIds = new Set;
-    const addresses = new Map;
-    for (const writes of batches) {
-      for (const write of writes) {
-        const claim = claimOf(write);
-        if (claim !== undefined)
-          ids.add(claim.id);
-        switch (write.type) {
-          case "document.create":
-          case "document.copy":
-            documentIds.add(write.record.id);
-            addresses.set(addressKey(write.record), addressParts(write.record));
-            break;
-          case "document.change":
-            documentIds.add(write.id);
-            if (write.content.kind === "delta")
-              deltaIds.add(write.id);
-            break;
-          case "document.retire":
-            documentIds.add(write.id);
-            break;
-          default:
-            break;
-        }
-      }
-    }
-    const recordIds = new Map;
-    for (const row of await readRows(executor, `SELECT id, record_type FROM ${tables.recordIds} WHERE id IN (SELECT value FROM json_each(?))`, [...ids])) {
-      recordIds.set(row.id, row.record_type);
-    }
-    const documents = new Map;
-    for (const row of await readRows(executor, `SELECT record FROM ${tables.documents} WHERE id IN (SELECT value FROM json_each(?))`, [...documentIds])) {
-      const record = parseJson(row.record);
-      documents.set(record.id, record);
-    }
-    const versions = new Map;
-    for (const row of await readRows(executor, `SELECT requested.value AS document_id, (
-				SELECT version FROM ${tables.documentRevisions} WHERE document_id = requested.value ORDER BY seq DESC LIMIT 1
-			) AS version FROM json_each(?) AS requested`, [...deltaIds])) {
-      if (row.version !== null)
-        versions.set(row.document_id, row.version);
-    }
-    return new CommitState(recordIds, documents, versions, await readCurrent(executor, tables, addresses));
-  }
-  check(writes, actions) {
-    this.#checkIds(writes);
-    this.#checkDocuments(actions);
-  }
-  apply(writes, actions, seq) {
-    for (const write of writes) {
-      const claim = claimOf(write);
-      if (claim !== undefined)
-        this.#recordIds.set(claim.id, claim.table);
-    }
-    for (const [id, action] of actions) {
-      if (action.create !== undefined) {
-        const record = { ...action.create, createdAt: seq, ...action.retire ? { retiredAt: seq } : {} };
-        this.#documents.set(id, record);
-        if (!action.retire)
-          this.#current.set(addressKey(record), id);
-      } else if (action.retire) {
-        const record = { ...this.#documents.get(id), retiredAt: seq };
-        this.#documents.set(id, record);
-        const key = addressKey(record);
-        if (this.#current.get(key) === id)
-          this.#current.set(key, undefined);
-      }
-      if (action.content !== undefined)
-        this.#versions.set(id, action.content.version);
-    }
-  }
-  document(id) {
-    return this.#documents.get(id);
-  }
-  #checkIds(writes) {
-    const claimed = new Map;
-    for (const write of writes) {
-      const claim = claimOf(write);
-      if (claim === undefined)
-        continue;
-      const { id, table } = claim;
-      const existing = this.#recordIds.get(id);
-      const earlier = claimed.get(id);
-      if (table === "conversation" || table === "entry" || table === "document") {
-        if (existing !== undefined)
-          throw new Error(`ID ${id} already belongs to ${existing}`);
-        if (earlier !== undefined)
-          throw new Error(`ID ${id} is written more than once`);
-      } else {
-        if (existing !== undefined && existing !== table)
-          throw new Error(`ID ${id} already belongs to ${existing}`);
-        if (earlier !== undefined && earlier !== table)
-          throw new Error(`ID ${id} is written as two record types`);
-      }
-      claimed.set(id, table);
-    }
-  }
-  #checkDocuments(actions) {
-    const liveCounts = new Map;
-    for (const [id, action] of actions) {
-      if (action.copy !== undefined && actions.has(action.copy.id)) {
-        throw new Error(`Document copy ${id} source is changed in the copy batch`);
-      }
-      const existing = this.#documents.get(id);
-      if (action.create === undefined && existing === undefined)
-        throw new Error(`Unknown document: ${id}`);
-      if (action.create !== undefined && existing !== undefined)
-        throw new Error(`Document ${id} already exists`);
-      if (existing?.retiredAt !== undefined)
-        throw new Error(`Document ${id} is retired`);
-      if (action.content?.kind === "delta") {
-        const previous = this.#versions.get(id);
-        if (previous === undefined)
-          throw new Error(`Document ${id} delta has no base`);
-        if (previous !== action.content.version)
-          throw new Error(`Document ${id} version transition requires a base`);
-      }
-      if (action.create === undefined && !action.retire)
-        continue;
-      const key = addressKey(action.create ?? existing);
-      let live = liveCounts.get(key);
-      if (live === undefined)
-        live = this.#current.get(key) === undefined ? 0 : 1;
-      if (action.retire && existing !== undefined)
-        live--;
-      if (action.create !== undefined && !action.retire)
-        live++;
-      liveCounts.set(key, live);
-    }
-    for (const live of liveCounts.values()) {
-      if (live > 1)
-        throw new Error("Document address already has a current incarnation");
-    }
-  }
-}
-async function readCurrent(executor, tables, addresses) {
-  const current = new Map;
-  for (const key of addresses.keys())
-    current.set(key, undefined);
-  const rows = await readRows(executor, `SELECT document.id, document.kind, document.scope_kind, document.owner_id, document.family, document.key_value
-			FROM json_each(?) AS address JOIN ${tables.documents} AS document
-			ON document.kind = json_extract(address.value, '$[0]') AND document.scope_kind = json_extract(address.value, '$[1]')
-			AND document.owner_id = json_extract(address.value, '$[2]') AND document.family = json_extract(address.value, '$[3]')
-			AND document.key_value = json_extract(address.value, '$[4]')
-			WHERE document.retired_at IS NULL`, [...addresses.values()].map((part) => [part.kind, part.scopeKind, part.ownerId, part.family, part.keyValue]));
-  for (const row of rows) {
-    current.set(addressColumnsKey(row.kind, row.scope_kind, row.owner_id, row.family, row.key_value), row.id);
-  }
-  return current;
-}
-
-class PendingWrites {
-  #recordIds = new Map;
-  #conversations = [];
-  #entries = [];
-  #tasks = new Map;
-  #submissions = new Map;
-  #documents = new Map;
-  #cleared = new Set;
-  #revisions = new Map;
-  add(writes, actions, seq, state) {
-    for (const write of writes)
-      this.#addWrite(write, seq);
-    for (const [id, action] of actions)
-      this.#addDocument(id, action, seq, state.document(id));
-  }
-  #addWrite(write, seq) {
-    const claim = claimOf(write);
-    if (claim !== undefined)
-      this.#recordIds.set(claim.id, claim.table);
-    switch (write.type) {
-      case "conversation":
-        this.#conversations.push([
-          write.value.id,
-          write.value.owner?.conversationId ?? null,
-          write.value.owner?.taskId ?? null,
-          encodeJson(write.value)
-        ]);
-        break;
-      case "entry":
-        this.#entries.push([
-          write.value.id,
-          write.value.conversationId,
-          write.value.head ?? null,
-          seq,
-          encodeJson(write.value)
-        ]);
-        break;
-      case "task":
-        this.#tasks.set(write.value.id, [
-          write.value.id,
-          write.value.conversationId,
-          encodeIndexedString(write.value.kind),
-          write.value.state.status,
-          write.value.abortRequested ? 1 : 0,
-          write.value.background ? 1 : 0,
-          encodeJson(write.value)
-        ]);
-        break;
-      case "submission":
-        this.#submissions.set(write.value.id, [
-          write.value.id,
-          write.value.conversationId,
-          write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
-          write.value.status,
-          encodeJson(write.value)
-        ]);
-        break;
-      default:
-        break;
-    }
-  }
-  #addDocument(id, action, seq, record) {
-    if (action.create !== undefined || action.retire)
-      this.#documents.set(id, record);
-    const content = action.content;
-    if (content !== undefined) {
-      if (content.kind === "base" && isCurrentOnly(record))
-        this.#clear(id);
-      const encoded = content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops);
-      let revisions = this.#revisions.get(id);
-      if (revisions === undefined) {
-        revisions = [];
-        this.#revisions.set(id, revisions);
-      }
-      revisions.push([id, seq, content.kind, content.version, encoded]);
-    }
-    if (action.retire && isCurrentOnly(record))
-      this.#clear(id);
-  }
-  #clear(id) {
-    this.#cleared.add(id);
-    this.#revisions.delete(id);
-  }
-  async flush(executor, tables) {
-    await insertRows(executor, tables.recordIds, ["id", "record_type"], [...this.#recordIds].map(([id, table]) => [id, table]), "ON CONFLICT(id) DO NOTHING");
-    await insertRows(executor, tables.conversations, ["id", "owner_conversation_id", "owner_task_id", "record"], this.#conversations);
-    await insertRows(executor, tables.entries, ["id", "conversation_id", "head", "commit_seq", "record"], this.#entries);
-    await insertRows(executor, tables.tasks, ["id", "conversation_id", "kind", "status", "abort_requested", "background", "record"], [...this.#tasks.values()], `ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
-				status = excluded.status, abort_requested = excluded.abort_requested,
-				background = excluded.background, record = excluded.record`);
-    await insertRows(executor, tables.submissions, ["id", "conversation_id", "request_id", "status", "record"], [...this.#submissions.values()], `ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
-				request_id = excluded.request_id, status = excluded.status, record = excluded.record`);
-    await insertRows(executor, tables.documents, ["id", "kind", "family", "key_value", "scope_kind", "owner_id", "created_at", "retired_at", "record"], [...this.#documents.values()].map(documentRow), "ON CONFLICT(id) DO UPDATE SET retired_at = excluded.retired_at, record = excluded.record");
-    await runForEach(executor, `DELETE FROM ${tables.documentRevisions} WHERE document_id IN (SELECT value FROM json_each(?))`, [...this.#cleared]);
-    await insertRows(executor, tables.documentRevisions, ["document_id", "seq", "kind", "version", "content"], [...this.#revisions.values()].flat());
-    this.#recordIds.clear();
-    this.#conversations.length = 0;
-    this.#entries.length = 0;
-    this.#tasks.clear();
-    this.#submissions.clear();
-    this.#documents.clear();
-    this.#cleared.clear();
-    this.#revisions.clear();
-  }
-}
-
-// node_modules/@earendil-works/chord/dist/sqlite/schema.js
-function validateSqliteSchemaPrefix(prefix) {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(prefix)) {
-    throw new Error(`Invalid SQLite schema prefix ${JSON.stringify(prefix)}`);
-  }
-  if (prefix.toLowerCase().startsWith("sqlite_")) {
-    throw new Error(`SQLite schema prefix ${JSON.stringify(prefix)} is reserved`);
-  }
-}
-
-// node_modules/@earendil-works/chord/dist/sqlite/migrations.js
-async function applySqliteMigrations(database, migrations, options) {
-  const { table } = options;
-  validateSqliteSchemaPrefix(table);
-  for (let index = 0;index < migrations.length; index++) {
-    if (migrations[index]?.version !== index + 1) {
-      throw new Error("SQLite migrations must have contiguous versions starting at 1");
-    }
-  }
-  await database.transaction(async (transaction) => {
-    await transaction.exec(`CREATE TABLE IF NOT EXISTS ${table} (
-			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-			version INTEGER NOT NULL CHECK (version >= 0)
-		) STRICT`);
-    await transaction.run(`INSERT OR IGNORE INTO ${table} (singleton, version) VALUES (1, 0)`);
-    const row = await transaction.get(`SELECT version FROM ${table} WHERE singleton = 1`);
-    if (row === undefined)
-      throw new Error("SQLite schema metadata is missing");
-    const currentVersion = migrations.at(-1)?.version ?? 0;
-    if (row.version > currentVersion) {
-      throw new Error(`SQLite schema version ${row.version} is newer than supported version ${currentVersion}`);
-    }
-    for (const migration of migrations) {
-      if (migration.version <= row.version)
-        continue;
-      for (const statement of migration.statements)
-        await transaction.exec(statement);
-      await transaction.run(`UPDATE ${table} SET version = ? WHERE singleton = 1`, migration.version);
-    }
-  });
-}
-// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/schema.js
-var TABLE_NAMES = {
-  durableSchema: "durable_schema",
-  durableMetadata: "durable_metadata",
-  recordIds: "record_ids",
-  conversations: "conversations",
-  entries: "entries",
-  tasks: "tasks",
-  submissions: "submissions",
-  documents: "documents",
-  documentRevisions: "document_revisions"
-};
-var INDEX_NAMES = {
-  conversationsByOwnerConversation: "conversations_by_owner_conversation",
-  conversationsByOwnerTask: "conversations_by_owner_task",
-  entriesByConversation: "entries_by_conversation",
-  entryHeadsByConversation: "entry_heads_by_conversation",
-  tasksByStatus: "tasks_by_status",
-  tasksByConversation: "tasks_by_conversation",
-  tasksByKind: "tasks_by_kind",
-  tasksByAbortRequested: "tasks_by_abort_requested",
-  tasksByBackground: "tasks_by_background",
-  submissionsByRequest: "submissions_by_request",
-  submissionsByConversation: "submissions_by_conversation",
-  submissionsByStatus: "submissions_by_status",
-  documentsByAddress: "documents_by_address",
-  documentsByScope: "documents_by_scope",
-  documentsByScopeKind: "documents_by_scope_kind",
-  documentRevisionsByKind: "document_revisions_by_kind"
-};
-function prefixIdentifiers(names, prefix) {
-  return Object.fromEntries(Object.entries(names).map(([key, name]) => [key, `${prefix}${name}`]));
-}
-function createSqliteSchema(prefix) {
-  if (prefix !== undefined)
-    validateSqliteSchemaPrefix(prefix);
-  const actualPrefix = prefix ?? "";
-  return {
-    tables: prefixIdentifiers(TABLE_NAMES, actualPrefix),
-    indexes: prefixIdentifiers(INDEX_NAMES, actualPrefix)
-  };
-}
-var DEFAULT_SQLITE_SCHEMA = createSqliteSchema();
-
-// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/migrations.js
-function createSqliteMigrations(schema) {
-  const { tables, indexes } = schema;
-  const initialSchema = [
-    `CREATE TABLE ${tables.durableMetadata} (
-			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-			next_id TEXT NOT NULL,
-			next_seq INTEGER NOT NULL
-		) STRICT`,
-    `INSERT INTO ${tables.durableMetadata} (singleton, next_id, next_seq) VALUES (1, '2', 1)`,
-    `CREATE TABLE ${tables.recordIds} (
-			id INTEGER PRIMARY KEY,
-			record_type TEXT NOT NULL CHECK (record_type IN ('conversation', 'entry', 'task', 'submission', 'document'))
-		) STRICT`,
-    `CREATE TABLE ${tables.conversations} (
-			id INTEGER PRIMARY KEY,
-			owner_conversation_id INTEGER,
-			owner_task_id INTEGER,
-			record TEXT NOT NULL CHECK (json_valid(record))
-		) STRICT`,
-    `CREATE INDEX ${indexes.conversationsByOwnerConversation} ON ${tables.conversations} (owner_conversation_id, id)`,
-    `CREATE INDEX ${indexes.conversationsByOwnerTask} ON ${tables.conversations} (owner_task_id, id)`,
-    `CREATE TABLE ${tables.entries} (
-			id INTEGER PRIMARY KEY,
-			conversation_id INTEGER NOT NULL,
-			head INTEGER,
-			commit_seq INTEGER NOT NULL,
-			record TEXT NOT NULL CHECK (json_valid(record))
-		) STRICT`,
-    `CREATE INDEX ${indexes.entriesByConversation} ON ${tables.entries} (conversation_id, id DESC)`,
-    `CREATE INDEX ${indexes.entryHeadsByConversation} ON ${tables.entries} (conversation_id, id DESC) WHERE head IS NOT NULL`,
-    `CREATE TABLE ${tables.tasks} (
-			id INTEGER PRIMARY KEY,
-			conversation_id INTEGER NOT NULL,
-			kind TEXT NOT NULL,
-			status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'waiting', 'completing', 'terminal')),
-			abort_requested INTEGER NOT NULL CHECK (abort_requested IN (0, 1)),
-			background INTEGER NOT NULL CHECK (background IN (0, 1)),
-			record TEXT NOT NULL CHECK (json_valid(record))
-		) STRICT`,
-    `CREATE INDEX ${indexes.tasksByStatus} ON ${tables.tasks} (status, id)`,
-    `CREATE INDEX ${indexes.tasksByConversation} ON ${tables.tasks} (conversation_id, id)`,
-    `CREATE INDEX ${indexes.tasksByKind} ON ${tables.tasks} (kind, id)`,
-    `CREATE INDEX ${indexes.tasksByAbortRequested} ON ${tables.tasks} (abort_requested, id)`,
-    `CREATE INDEX ${indexes.tasksByBackground} ON ${tables.tasks} (background, id)`,
-    `CREATE TABLE ${tables.submissions} (
-			id INTEGER PRIMARY KEY,
-			conversation_id INTEGER NOT NULL,
-			request_id TEXT,
-			status TEXT NOT NULL CHECK (status IN ('queued', 'placed', 'done', 'unanswered')),
-			record TEXT NOT NULL CHECK (json_valid(record))
-		) STRICT`,
-    `CREATE INDEX ${indexes.submissionsByRequest} ON ${tables.submissions} (conversation_id, request_id)`,
-    `CREATE INDEX ${indexes.submissionsByConversation} ON ${tables.submissions} (conversation_id, id)`,
-    `CREATE INDEX ${indexes.submissionsByStatus} ON ${tables.submissions} (status, id)`,
-    `CREATE TABLE ${tables.documents} (
-			id INTEGER PRIMARY KEY,
-			kind TEXT NOT NULL,
-			family INTEGER NOT NULL CHECK (family IN (0, 1)),
-			key_value TEXT NOT NULL,
-			scope_kind TEXT NOT NULL CHECK (scope_kind IN ('session', 'conversation', 'task')),
-			owner_id INTEGER NOT NULL,
-			created_at INTEGER NOT NULL,
-			retired_at INTEGER,
-			record TEXT NOT NULL CHECK (json_valid(record))
-		) STRICT`,
-    `CREATE INDEX ${indexes.documentsByAddress}
-			ON ${tables.documents} (kind, scope_kind, owner_id, family, key_value, created_at DESC, retired_at)`,
-    `CREATE INDEX ${indexes.documentsByScope} ON ${tables.documents} (scope_kind, owner_id, id)`,
-    `CREATE INDEX ${indexes.documentsByScopeKind} ON ${tables.documents} (scope_kind, owner_id, kind, id)`,
-    `CREATE TABLE ${tables.documentRevisions} (
-			document_id INTEGER NOT NULL,
-			seq INTEGER NOT NULL,
-			kind TEXT NOT NULL CHECK (kind IN ('base', 'delta')),
-			version INTEGER NOT NULL,
-			content TEXT NOT NULL CHECK (json_valid(content)),
-			PRIMARY KEY (document_id, seq)
-		) STRICT`,
-    `CREATE INDEX ${indexes.documentRevisionsByKind} ON ${tables.documentRevisions} (document_id, kind, seq DESC)`
-  ];
-  const rebuiltTasks = `${tables.tasks}_v2`;
-  const sleepingStatus = [
-    `CREATE TABLE ${rebuiltTasks} (
-			id INTEGER PRIMARY KEY,
-			conversation_id INTEGER NOT NULL,
-			kind TEXT NOT NULL,
-			status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'waiting', 'sleeping', 'completing', 'terminal')),
-			abort_requested INTEGER NOT NULL CHECK (abort_requested IN (0, 1)),
-			background INTEGER NOT NULL CHECK (background IN (0, 1)),
-			record TEXT NOT NULL CHECK (json_valid(record))
-		) STRICT`,
-    `INSERT INTO ${rebuiltTasks} (id, conversation_id, kind, status, abort_requested, background, record)
-			SELECT id, conversation_id, kind, status, abort_requested, background, record FROM ${tables.tasks}`,
-    `DROP TABLE ${tables.tasks}`,
-    `ALTER TABLE ${rebuiltTasks} RENAME TO ${tables.tasks}`,
-    `CREATE INDEX ${indexes.tasksByStatus} ON ${tables.tasks} (status, id)`,
-    `CREATE INDEX ${indexes.tasksByConversation} ON ${tables.tasks} (conversation_id, id)`,
-    `CREATE INDEX ${indexes.tasksByKind} ON ${tables.tasks} (kind, id)`,
-    `CREATE INDEX ${indexes.tasksByAbortRequested} ON ${tables.tasks} (abort_requested, id)`,
-    `CREATE INDEX ${indexes.tasksByBackground} ON ${tables.tasks} (background, id)`
-  ];
-  return [
-    { version: 1, statements: initialSchema },
-    { version: 2, statements: sleepingStatus }
-  ];
-}
-var SQLITE_MIGRATIONS = createSqliteMigrations(DEFAULT_SQLITE_SCHEMA);
-var CURRENT_SQLITE_SCHEMA_VERSION = SQLITE_MIGRATIONS.at(-1)?.version ?? 0;
-async function applySqliteMigrationsForSchema(database, schema, migrations = createSqliteMigrations(schema)) {
-  await applySqliteMigrations(database, migrations, { table: schema.tables.durableSchema });
-}
-
-// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/storage.js
-var cursorId = (cursor) => {
-  const after = cursor?.after;
-  if (after === undefined)
-    return;
-  if (typeof after !== "number" || !Number.isSafeInteger(after))
-    throw new StorageRequestError("Invalid storage cursor");
-  return idFromNumber(after);
-};
-var page = (values, limit, order = "ascending") => {
-  const items = values.slice(0, limit);
-  if (values.length <= limit)
-    return { items };
-  return { items, next: nextCursor(items.at(-1).id, order) };
-};
-var scanSql = (start) => start.order === "ascending" ? { clause: "id > ?", param: start.after ?? -1, direction: "ASC" } : { clause: "id < ?", param: start.after ?? Number.MAX_SAFE_INTEGER, direction: "DESC" };
-var isAliveAt = (record, at) => {
-  if (at === "current")
-    return record.retiredAt === undefined;
-  return record.createdAt <= at && (record.retiredAt === undefined || at < record.retiredAt);
-};
-function watchCalls(executor, calls) {
-  const watched = async (call) => {
-    try {
-      return await call();
-    } catch (error) {
-      calls.failed = true;
-      throw error;
-    }
-  };
-  return {
-    exec: (sql) => watched(() => executor.exec(sql)),
-    run: (sql, ...params) => watched(() => executor.run(sql, ...params)),
-    runCounted: (sql, ...params) => watched(() => executor.runCounted(sql, ...params)),
-    get: (sql, ...params) => watched(() => executor.get(sql, ...params)),
-    all: (sql, ...params) => watched(() => executor.all(sql, ...params))
-  };
-}
-
-class SqliteStorage {
-  db;
-  schema;
-  nextId;
-  closed = false;
-  closing;
-  admittedReads = 0;
-  readsDrained;
-  constructor(db, schema, nextId) {
-    this.db = db;
-    this.schema = schema;
-    this.nextId = nextId;
-  }
-  static async open(db, options = {}) {
-    try {
-      const schema = createSqliteSchema(options.prefix);
-      await applySqliteMigrationsForSchema(db, schema);
-      const metadata = await db.get(`SELECT next_id, next_seq FROM ${schema.tables.durableMetadata} WHERE singleton = 1`);
-      if (metadata === undefined)
-        throw new Error("Durable SQLite metadata is missing");
-      return new SqliteStorage(db, schema, Number(metadata.next_id));
-    } catch (error) {
-      try {
-        await db.close();
-      } catch {}
-      throw error;
-    }
-  }
-  async commit(batches, receive, _context) {
-    this.assertOpen();
-    const seqs = [];
-    let refused;
-    let candidateNextId = this.nextId;
-    await this.db.transaction(async (transaction) => {
-      const metadata = await this.readMetadata(transaction);
-      let next = metadata.next_seq;
-      const state = await CommitState.read(transaction, this.schema.tables, batches);
-      const pending = new PendingWrites;
-      for (const writes of batches) {
-        const checked = await this.checkBatch(transaction, state, pending, writes);
-        if ("refused" in checked) {
-          refused = { error: checked.refused };
-          break;
-        }
-        const seq = seqFromNumber(next++);
-        state.apply(writes, checked.actions, seq);
-        pending.add(writes, checked.actions, seq, state);
-        seqs.push(seq);
-        candidateNextId = Math.max(candidateNextId, this.candidateNextId(writes));
-      }
-      await pending.flush(transaction, this.schema.tables);
-      if (seqs.length > 0) {
-        await this.writeMetadata(transaction, Math.max(Number(metadata.next_id), candidateNextId), next);
-      }
-    });
-    this.nextId = Math.max(this.nextId, candidateNextId);
-    for (const [index, seq] of seqs.entries())
-      receive(index, seq);
-    return refused === undefined ? { stored: seqs.length } : { stored: seqs.length, refused: refused.error };
-  }
-  async readMetadata(executor) {
-    const metadata = await executor.get(`SELECT next_id, next_seq FROM ${this.schema.tables.durableMetadata} WHERE singleton = 1`);
-    if (metadata === undefined)
-      throw new Error("Durable SQLite metadata is missing");
-    return metadata;
-  }
-  async writeMetadata(executor, nextId, nextSeq) {
-    await executor.run(`UPDATE ${this.schema.tables.durableMetadata} SET next_id = ?, next_seq = ? WHERE singleton = 1`, String(nextId), nextSeq);
-  }
-  async checkBatch(transaction, state, pending, writes) {
-    let actions;
-    try {
-      actions = prepareDocumentActions(writes);
-      state.check(writes, actions);
-    } catch (error) {
-      return { refused: error };
-    }
-    if (![...actions.values()].some((action) => action.copy !== undefined))
-      return { actions };
-    await pending.flush(transaction, this.schema.tables);
-    const calls = { failed: false };
-    try {
-      await this.resolveCopies(watchCalls(transaction, calls), actions);
-    } catch (error) {
-      if (calls.failed)
-        throw error;
-      return { refused: error };
-    }
-    return { actions };
-  }
-  async mintId() {
-    this.assertOpen();
-    if (!Number.isSafeInteger(this.nextId))
-      throw new Error("ID space is exhausted");
-    return idFromNumber(this.nextId++);
-  }
-  async conversation(id, _context) {
-    this.assertOpen();
-    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.conversations} WHERE id = ?`, id);
-    return row === undefined ? undefined : parseJson(row.record);
-  }
-  async scanConversations(query, limit, cursor, _context) {
-    this.assertOpen();
-    const start = scanStart(query.order, cursor, "ascending");
-    const scan = scanSql(start);
-    const clauses = [scan.clause];
-    const params = [scan.param];
-    if (query.ownerConversationId !== undefined) {
-      clauses.push("owner_conversation_id = ?");
-      params.push(query.ownerConversationId);
-    }
-    if (query.ownerTaskId !== undefined) {
-      clauses.push("owner_task_id = ?");
-      params.push(query.ownerTaskId);
-    }
-    params.push(limit + 1);
-    const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.conversations} WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`, ...params);
-    return page(rows.map((row) => parseJson(row.record)), limit, start.order);
-  }
-  entry(idOrConversationId, idOrContext, context) {
-    return this.admitRead(() => this.readEntry(idOrConversationId, idOrContext, context));
-  }
-  findLatestHeadMarker(conversationId, atOrBeforeEntryId, _context) {
-    return this.admitRead(() => this.readLatestHeadMarker(conversationId, atOrBeforeEntryId));
-  }
-  scanEntries(query, limit, cursor, _context) {
-    return this.admitRead(() => this.readEntries(query, limit, cursor));
-  }
-  async readEntry(idOrConversationId, idOrContext, context) {
-    const id = context === undefined ? idFromNumber(idOrConversationId) : typeof idOrContext === "number" ? idFromNumber(idOrContext) : undefined;
-    if (id === undefined)
-      throw new StorageRequestError("Storage.entry() requires an entry ID");
-    let conversation;
-    if (context !== undefined) {
-      const conversationId = idFromNumber(idOrConversationId);
-      conversation = await this.readConversation(conversationId);
-      if (conversation === undefined)
-        throw new StorageRequestError(`Unknown conversation: ${conversationId}`);
-    }
-    const row = await this.db.get(`SELECT record, commit_seq FROM ${this.schema.tables.entries} WHERE id = ?`, id);
-    if (row === undefined)
-      return;
-    const entry = parseJson(row.record);
-    if (conversation !== undefined) {
-      let upperEntryId = Number.POSITIVE_INFINITY;
-      while (conversation.id !== entry.conversationId) {
-        if (conversation.parent === undefined)
-          return;
-        upperEntryId = Math.min(upperEntryId, conversation.parent.at);
-        conversation = await this.readConversation(conversation.parent.conversationId);
-      }
-      if (entry.id > upperEntryId)
-        return;
-    }
-    return { entry, commitSeq: seqFromNumber(row.commit_seq) };
-  }
-  async readLatestHeadMarker(conversationId, atOrBeforeEntryId) {
-    let conversation = await this.readConversation(conversationId);
-    if (conversation === undefined)
-      throw new StorageRequestError(`Unknown conversation: ${conversationId}`);
-    let upper = atOrBeforeEntryId;
-    while (true) {
-      const row = upper === undefined ? await this.db.get(`SELECT record FROM ${this.schema.tables.entries} WHERE conversation_id = ? AND head IS NOT NULL ORDER BY id DESC LIMIT 1`, conversation.id) : await this.db.get(`SELECT record FROM ${this.schema.tables.entries} WHERE conversation_id = ? AND head IS NOT NULL AND id <= ? ORDER BY id DESC LIMIT 1`, conversation.id, upper);
-      if (row !== undefined)
-        return parseJson(row.record);
-      if (conversation.parent === undefined)
-        return;
-      upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
-      conversation = await this.readConversation(conversation.parent.conversationId);
-    }
-  }
-  async readEntries(query, limit, cursor) {
-    const { order, after } = scanStart(query.order, cursor, "descending");
-    if (order === "ascending")
-      return this.readEntriesAscending(query, limit, after);
-    let conversation = await this.readConversation(query.conversationId);
-    if (conversation === undefined)
-      throw new StorageRequestError(`Unknown conversation: ${query.conversationId}`);
-    let upper = query.maxEntryId;
-    if (after !== undefined)
-      upper = Math.min(upper ?? Number.MAX_SAFE_INTEGER, after - 1);
-    const values = [];
-    while (true) {
-      const clauses = ["conversation_id = ?"];
-      const params = [conversation.id];
-      if (query.minEntryId !== undefined) {
-        clauses.push("id >= ?");
-        params.push(query.minEntryId);
-      }
-      if (upper !== undefined) {
-        clauses.push("id <= ?");
-        params.push(upper);
-      }
-      params.push(limit + 1 - values.length);
-      const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.entries} WHERE ${clauses.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...params);
-      values.push(...rows.map((row) => parseJson(row.record)));
-      if (values.length > limit || conversation.parent === undefined)
-        break;
-      upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
-      if (query.minEntryId !== undefined && upper < query.minEntryId)
-        break;
-      conversation = await this.readConversation(conversation.parent.conversationId);
-    }
-    return page(values, limit, "descending");
-  }
-  async readEntriesAscending(query, limit, after) {
-    const segments = [];
-    let conversation = await this.readConversation(query.conversationId);
-    if (conversation === undefined)
-      throw new StorageRequestError(`Unknown conversation: ${query.conversationId}`);
-    let upper = query.maxEntryId;
-    while (true) {
-      segments.push({ conversationId: conversation.id, upper });
-      if (conversation.parent === undefined)
-        break;
-      upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
-      if (query.minEntryId !== undefined && upper < query.minEntryId)
-        break;
-      conversation = await this.readConversation(conversation.parent.conversationId);
-    }
-    let lower = query.minEntryId;
-    if (after !== undefined)
-      lower = Math.max(lower ?? after + 1, after + 1);
-    const values = [];
-    for (const segment of segments.reverse()) {
-      const clauses = ["conversation_id = ?"];
-      const params = [segment.conversationId];
-      if (lower !== undefined) {
-        clauses.push("id >= ?");
-        params.push(lower);
-      }
-      if (segment.upper !== undefined) {
-        clauses.push("id <= ?");
-        params.push(segment.upper);
-      }
-      params.push(limit + 1 - values.length);
-      const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.entries} WHERE ${clauses.join(" AND ")} ORDER BY id ASC LIMIT ?`, ...params);
-      values.push(...rows.map((row) => parseJson(row.record)));
-      if (values.length > limit)
-        break;
-    }
-    return page(values, limit, "ascending");
-  }
-  async task(id, _context) {
-    this.assertOpen();
-    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.tasks} WHERE id = ?`, id);
-    return row === undefined ? undefined : parseJson(row.record);
-  }
-  async scanTasks(query, limit, cursor, _context) {
-    this.assertOpen();
-    const start = scanStart(query.order, cursor, "ascending");
-    const scan = scanSql(start);
-    const clauses = [scan.clause];
-    const params = [scan.param];
-    if (query.conversationId !== undefined) {
-      clauses.push("conversation_id = ?");
-      params.push(query.conversationId);
-    }
-    if (query.kind !== undefined) {
-      clauses.push("kind = ?");
-      params.push(encodeIndexedString(query.kind));
-    }
-    if (query.status !== undefined) {
-      clauses.push("status = ?");
-      params.push(query.status);
-    }
-    if (query.abortRequested !== undefined) {
-      clauses.push("abort_requested = ?");
-      params.push(query.abortRequested ? 1 : 0);
-    }
-    if (query.background !== undefined) {
-      clauses.push("background = ?");
-      params.push(query.background ? 1 : 0);
-    }
-    params.push(limit + 1);
-    const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.tasks} WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`, ...params);
-    return page(rows.map((row) => parseJson(row.record)), limit, start.order);
-  }
-  async submission(id, _context) {
-    this.assertOpen();
-    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.submissions} WHERE id = ?`, id);
-    return row === undefined ? undefined : parseJson(row.record);
-  }
-  async scanSubmissions(query, limit, cursor, _context) {
-    this.assertOpen();
-    const start = scanStart(query.order, cursor, "ascending");
-    const scan = scanSql(start);
-    const clauses = [scan.clause];
-    const params = [scan.param];
-    if (query.conversationId !== undefined) {
-      clauses.push("conversation_id = ?");
-      params.push(query.conversationId);
-    }
-    if (query.status !== undefined) {
-      clauses.push("status = ?");
-      params.push(query.status);
-    }
-    params.push(limit + 1);
-    const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.submissions} WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`, ...params);
-    return page(rows.map((row) => parseJson(row.record)), limit, start.order);
-  }
-  async submissionByRequest(conversationId, requestId, _context) {
-    this.assertOpen();
-    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.submissions} WHERE conversation_id = ? AND request_id = ?`, conversationId, encodeIndexedString(requestId));
-    return row === undefined ? undefined : parseJson(row.record);
-  }
-  async findDocument(address, at, _context) {
-    this.assertOpen();
-    const parts = addressParts(address);
-    const sql = at === "current" ? `SELECT record FROM ${this.schema.tables.documents}
-					WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
-					AND retired_at IS NULL ORDER BY created_at DESC LIMIT 1` : `SELECT record FROM ${this.schema.tables.documents}
-					WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
-					AND created_at <= ? AND (retired_at IS NULL OR retired_at > ?)
-					ORDER BY created_at DESC LIMIT 1`;
-    const params = [parts.kind, parts.scopeKind, parts.ownerId, parts.family, parts.keyValue];
-    if (at !== "current")
-      params.push(at, at);
-    const row = await this.db.get(sql, ...params);
-    return row === undefined ? undefined : parseJson(row.record);
-  }
-  async document(id, at, _context) {
-    this.assertOpen();
-    return this.db.transaction((transaction) => this.materializeDocument(transaction, id, at));
-  }
-  async scanDocuments(query, limit, cursor, _context) {
-    this.assertOpen();
-    const scope = scopeColumns(query.scope);
-    const clauses = ["scope_kind = ?", "owner_id = ?", "id > ?"];
-    const params = [scope.scopeKind, scope.ownerId, cursorId(cursor) ?? -1];
-    if (query.kind !== undefined) {
-      clauses.push("kind = ?");
-      params.push(encodeIndexedString(query.kind));
-    }
-    if (query.at === "current") {
-      clauses.push("retired_at IS NULL");
-    } else {
-      clauses.push("created_at <= ?", "(retired_at IS NULL OR retired_at > ?)");
-      params.push(query.at, query.at);
-    }
-    params.push(limit + 1);
-    const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.documents} WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`, ...params);
-    return page(rows.map((row) => parseJson(row.record)), limit);
-  }
-  close(_context) {
-    if (this.closing === undefined) {
-      this.closed = true;
-      this.closing = this.closeDatabase();
-    }
-    return this.closing;
-  }
-  async closeDatabase() {
-    if (this.admittedReads > 0) {
-      await new Promise((resolve) => {
-        this.readsDrained = resolve;
-      });
-    }
-    await this.db.close();
-  }
-  async admitRead(read) {
-    this.assertOpen();
-    this.admittedReads++;
-    try {
-      return await read();
-    } finally {
-      if (--this.admittedReads === 0)
-        this.readsDrained?.();
-    }
-  }
-  async readConversation(id) {
-    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.conversations} WHERE id = ?`, id);
-    return row === undefined ? undefined : parseJson(row.record);
-  }
-  async materializeDocument(executor, id, at) {
-    const row = await executor.get(`SELECT record FROM ${this.schema.tables.documents} WHERE id = ?`, id);
-    if (row === undefined)
-      return;
-    const record = parseJson(row.record);
-    if (at !== "current" && isCurrentOnly(record)) {
-      throw new StorageRequestError(`Document ${id} does not retain historical content`);
-    }
-    if (!isAliveAt(record, at))
-      return;
-    const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
-    const base = await executor.get(`SELECT seq, kind, version, content FROM ${this.schema.tables.documentRevisions}
-				WHERE document_id = ? AND kind = 'base' AND seq <= ? ORDER BY seq DESC LIMIT 1`, id, upper);
-    if (base === undefined)
-      throw new Error(`Document ${id} is missing a required base`);
-    let value = parseJson(base.content);
-    const tail = await executor.all(`SELECT seq, kind, version, content FROM ${this.schema.tables.documentRevisions}
-				WHERE document_id = ? AND seq > ? AND seq <= ? ORDER BY seq`, id, base.seq, upper);
-    for (const revision of tail) {
-      if (revision.kind !== "delta" || revision.version !== base.version) {
-        throw new Error(`Document ${id} crosses a stored version boundary without a base`);
-      }
-      value = apply(value, parseJson(revision.content));
-    }
-    return { record, version: base.version, value, deltasSinceBase: tail.length };
-  }
-  candidateNextId(writes) {
-    let nextId = this.nextId;
-    for (const write of writes) {
-      const id = claimOf(write)?.id;
-      if (id !== undefined)
-        nextId = Math.max(nextId, id + 1);
-    }
-    return nextId;
-  }
-  async resolveCopies(executor, actions) {
-    for (const [id, action] of actions) {
-      if (action.copy === undefined)
-        continue;
-      try {
-        const stored = await this.materializeDocument(executor, action.copy.id, action.copy.at);
-        if (stored === undefined)
-          throw new Error(`Fork source document ${action.copy.id} cannot be read`);
-        const create = action.create;
-        if (stored.record.scope.kind !== "conversation" || create.scope.kind !== "conversation" || stored.record.kind !== create.kind || stored.record.key !== create.key || stored.record.history !== create.history || stored.record.fork !== create.fork) {
-          throw new Error(`Fork source document ${action.copy.id} does not match the copied record`);
-        }
-        action.content = { kind: "base", version: stored.version, value: stored.value };
-      } catch (error) {
-        throw new Error(`Document copy ${id} was rejected`, { cause: error });
-      }
-    }
-  }
-  assertOpen() {
-    if (this.closed)
-      throw new Error("SqliteStorage is closed");
-  }
-}
-
-// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/cloudflare.js
-function openDurableObjectSqliteStorage(storage, options = {}) {
-  return SqliteStorage.open(new DurableObjectSqliteDatabase(storage), options);
-}
-
-// node_modules/@earendil-works/pi-ai/dist/utils/string-enum.js
-function StringEnum(values, options) {
-  return {
-    type: "string",
-    enum: values,
-    ...options?.description && { description: options.description },
-    ...options?.default && { default: options.default }
-  };
-}
-
-// node_modules/agents/dist/harness/pi/index.js
-var DEFAULT_PREFIX = "pi_";
-function openPiSessionStore(storage, options = {}) {
-  const prefix = options.prefix ?? DEFAULT_PREFIX;
-  if (prefix.toLowerCase().startsWith("_cf_"))
-    return Promise.reject(/* @__PURE__ */ new Error("The pi session store prefix must not start with _cf_"));
-  return openDurableObjectSqliteStorage(storage, { prefix });
-}
-var BG = BACKGROUND_CONTEXT;
-var ROOT_SESSION = String(ROOT_CONVERSATION_ID);
-var WAIT_BUDGET_MS = 10 * 60000;
-var HEARTBEAT_MS = 30000;
-var POLL_MS = 1000;
-var MAX_WAKE_BACKOFF_MS = 10 * 60000;
-var WAKE_ERRORS_KEY = "pi-harness:wake-errors";
-var WAKE_FN = "wake";
-var WAKE_JOB_ID = "pi-wake";
-function modelRef(model) {
-  return {
-    provider: model.provider,
-    modelId: model.id
-  };
-}
-function conversationId(session) {
-  const id = Number(session);
-  if (!Number.isSafeInteger(id) || id < 1)
-    throw new Error(`Invalid pi session ${JSON.stringify(session)}`);
-  return id;
-}
-function assistantText(entry) {
-  const message = entry?.model?.[0];
-  if (message?.role !== "assistant")
-    return "";
-  return message.content.map((part) => part.type === "text" ? part.text : "").join("");
-}
-function signalContext(signal) {
-  return signal ? withAbortSignal(signal, BG) : BG;
-}
-var _options = /* @__PURE__ */ new WeakMap;
-var _waiting = /* @__PURE__ */ new WeakMap;
-var _changed = /* @__PURE__ */ new WeakMap;
-var _admitting = /* @__PURE__ */ new WeakMap;
-var _onWakeWired = /* @__PURE__ */ new WeakMap;
-var _waitBudgetMs = /* @__PURE__ */ new WeakMap;
-var _heartbeatMs = /* @__PURE__ */ new WeakMap;
-var _pollMs = /* @__PURE__ */ new WeakMap;
-var _opening = /* @__PURE__ */ new WeakMap;
-var _lastClose = /* @__PURE__ */ new WeakMap;
-var _closing = /* @__PURE__ */ new WeakMap;
-var _PiHarness_brand = /* @__PURE__ */ new WeakSet;
-var _onWake = /* @__PURE__ */ new WeakMap;
-var PiHarness = class extends LifecycleCapability {
-  constructor(options) {
-    super("pi-harness");
-    _classPrivateMethodInitSpec(this, _PiHarness_brand);
-    _classPrivateFieldInitSpec(this, _options, undefined);
-    _classPrivateFieldInitSpec(this, _waiting, undefined);
-    _classPrivateFieldInitSpec(this, _changed, undefined);
-    _classPrivateFieldInitSpec(this, _admitting, 0);
-    _classPrivateFieldInitSpec(this, _onWakeWired, false);
-    _classPrivateFieldInitSpec(this, _waitBudgetMs, WAIT_BUDGET_MS);
-    _classPrivateFieldInitSpec(this, _heartbeatMs, HEARTBEAT_MS);
-    _classPrivateFieldInitSpec(this, _pollMs, POLL_MS);
-    _classPrivateFieldInitSpec(this, _opening, undefined);
-    _classPrivateFieldInitSpec(this, _lastClose, Promise.resolve());
-    _classPrivateFieldInitSpec(this, _closing, /* @__PURE__ */ new WeakSet);
-    _classPrivateFieldInitSpec(this, _onWake, (wake) => {
-      _classPrivateFieldSet2(_onWakeWired, this, true);
-      _classPrivateFieldGet2(_changed, this)?.call(this);
-      if (_classPrivateFieldGet2(_waiting, this))
-        return;
-      _assertClassBrand(_PiHarness_brand, this, _wakeFor).call(this, wake).catch((error) => _assertClassBrand(_PiHarness_brand, this, _wakeError).call(this, error));
-    });
-    _classPrivateFieldSet2(_options, this, options);
-    this.sessions = new PiSessions(this);
-  }
-  async onStart(_context) {
-    await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
-  }
-  async onJob(context) {
-    if (context.job.fn !== WAKE_FN)
-      return;
-    let outcome;
-    if (context.job.id !== WAKE_JOB_ID) {
-      await _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
-      outcome = undefined;
-    } else
-      outcome = await _assertClassBrand(_PiHarness_brand, this, _wakeStep).call(this);
-    const kv = this.lifecycle.storage.kv;
-    if (kv.get(WAKE_ERRORS_KEY) !== undefined)
-      kv.delete(WAKE_ERRORS_KEY);
-    return outcome;
-  }
-  onJobError(context, error) {
-    if (context.job.fn !== WAKE_FN)
-      return;
-    console.error(`pi wake job "${context.job.id}" failed after ${context.attempt} attempts; retrying with backoff`, error);
-    _assertClassBrand(_PiHarness_brand, this, _wakeError).call(this, error);
-    const kv = this.lifecycle.storage.kv;
-    const errors = (kv.get(WAKE_ERRORS_KEY) ?? 0) + 1;
-    kv.put(WAKE_ERRORS_KEY, errors);
-    const delay = Math.min(_classPrivateFieldGet2(_heartbeatMs, this) * 2 ** (errors - 1), MAX_WAKE_BACKOFF_MS);
-    return { rescheduleAt: Date.now() + delay };
-  }
-  async dispose() {
-    const opening = _classPrivateFieldGet2(_opening, this);
-    _classPrivateFieldSet2(_opening, this, undefined);
-    await (await opening?.catch(() => {
-      return;
-    }))?.pi.close(BG);
-  }
-  session(id = ROOT_SESSION) {
-    return new PiSession(this, id);
-  }
-  prompt(input, options = {}) {
-    return this.session(options.session).prompt(input, options);
-  }
-  submit(input, options = {}) {
-    return this.session(options.session).submit(input, options);
-  }
-  continue(options = {}) {
-    return this.session(options.session).continue(options);
-  }
-  abort(options = {}) {
-    return this.session(options.session).abort(options.operationId);
-  }
-  wait(operationId, options = {}) {
-    return this.session(options.session).wait(operationId, options.signal);
-  }
-  messages(options = {}) {
-    return this.session(options.session).messages();
-  }
-  async pending(options = {}) {
-    const { pi } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
-    const id = options.session === undefined ? undefined : conversationId(options.session);
-    return (await pi.inspect(BG)).submissions.flatMap((record) => {
-      if (record.requestId === undefined)
-        return [];
-      if (id !== undefined && record.conversationId !== id)
-        return [];
-      let status;
-      switch (record.status) {
-        case "queued":
-          status = "queued";
-          break;
-        case "placed":
-          status = "running";
-          break;
-        case "done":
-        case "unanswered":
-          return [];
-        default:
-          return record;
-      }
-      return [{
-        operationId: record.requestId,
-        session: String(record.conversationId),
-        status
-      }];
-    });
-  }
-  async pi() {
-    return (await _assertClassBrand(_PiHarness_brand, this, _open).call(this)).pi;
-  }
-  async conversation(session) {
-    const { pi } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
-    const conversation = await pi.conversation(conversationId(session), BG);
-    if (!conversation)
-      throw new Error(`Unknown pi session ${session}`);
-    return conversation;
-  }
-  async storage() {
-    return (await _assertClassBrand(_PiHarness_brand, this, _open).call(this)).storage;
-  }
-  async enqueue(session, input, options) {
-    return _assertClassBrand(_PiHarness_brand, this, _admitDraft).call(this, session, options.operationId, {
-      type: "input",
-      content: input,
-      whenBusy: options.whenBusy ?? "followUp",
-      ...options.whenIdle ? { whenIdle: options.whenIdle } : {},
-      ...options.entry ? { entry: options.entry } : {}
-    });
-  }
-  enqueueContinue(session, options) {
-    return _assertClassBrand(_PiHarness_brand, this, _admitDraft).call(this, session, options.operationId, { type: "continue" });
-  }
-  async withdraw(session, operationId) {
-    const { pi, storage } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
-    const id = conversationId(session);
-    const record = await storage.submissionByRequest(id, operationId, BG);
-    if (!record || record.status === "done" || record.status === "unanswered")
-      return false;
-    const outcome = await pi.abortSubmission(record.id, BG, id);
-    switch (outcome) {
-      case "aborted":
-        return true;
-      case "already_placed":
-        await (await pi.conversation(id, BG))?.abort(BG);
-        return true;
-      case "settled":
-      case "not_found":
-        return false;
-      default:
-        return outcome;
-    }
-  }
-  async settled(session, operationId, signal) {
-    const conversation = await this.conversation(session);
-    const context = signalContext(signal);
-    const submission = await _assertClassBrand(_PiHarness_brand, this, _findSubmission).call(this, conversation.id, operationId, context);
-    if (!submission)
-      return {
-        operationId,
-        session,
-        status: "unanswered",
-        reason: "not_found"
-      };
-    return _assertClassBrand(_PiHarness_brand, this, _result).call(this, session, operationId, await submission.wait(context), context);
-  }
-  agentDefaults() {
-    const defaults = _classPrivateFieldGet2(_options, this).defaults;
-    return {
-      ...defaults?.model === undefined ? {} : { model: modelRef(defaults.model) },
-      ...defaults?.thinkingLevel === undefined ? {} : { thinkingLevel: defaults.thinkingLevel },
-      ...defaults?.maxTurns === undefined ? {} : { maxTurns: defaults.maxTurns }
-    };
-  }
-};
-async function _admitDraft(session, requested, draft) {
-  const operationId = requested ?? crypto.randomUUID();
-  const { storage } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
-  const conversation = await this.conversation(session);
-  return {
-    operationId,
-    session,
-    accepted: await _assertClassBrand(_PiHarness_brand, this, _admit).call(this, async () => {
-      const accepted = await storage.submissionByRequest(conversation.id, operationId, BG) === undefined;
-      await conversation.submit({
-        ...draft,
-        requestId: operationId
-      }, BG);
-      return accepted;
-    })
-  };
-}
-async function _admit(hand) {
-  var _this$admitting;
-  _classPrivateFieldSet2(_admitting, this, (_this$admitting = _classPrivateFieldGet2(_admitting, this), _this$admitting++, _this$admitting));
-  let result;
-  try {
-    await _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
-    result = await hand();
-  } finally {
-    var _this$admitting3;
-    _classPrivateFieldSet2(_admitting, this, (_this$admitting3 = _classPrivateFieldGet2(_admitting, this), _this$admitting3--, _this$admitting3));
-  }
-  await _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
-  return result;
-}
-function _wake(time = Date.now()) {
-  return this.lifecycle.jobs.push({
-    id: WAKE_JOB_ID,
-    fn: WAKE_FN,
-    time,
-    singleflight: true,
-    recoveryLoop: true
-  });
-}
-async function _wakeFor(wake) {
-  if (wake.active)
-    await _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
-  else if (wake.at !== undefined)
-    await _assertClassBrand(_PiHarness_brand, this, _wake).call(this, wake.at);
-}
-async function _wakeStep() {
-  const heartbeat = { rescheduleAt: Date.now() + _classPrivateFieldGet2(_heartbeatMs, this) };
-  if (_classPrivateFieldGet2(_waiting, this))
-    return heartbeat;
-  const { pi } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
-  pi.resume();
-  const wake = pi.wake();
-  if (wake.active) {
-    const wait = _assertClassBrand(_PiHarness_brand, this, _waitWhileActive).call(this, pi).then((ended) => {
-      _classPrivateFieldSet2(_waiting, this, undefined);
-      if (ended)
-        _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
-    }, (error) => {
-      _classPrivateFieldSet2(_waiting, this, undefined);
-      throw error;
-    });
-    _classPrivateFieldSet2(_waiting, this, wait);
-    if (!this.lifecycle.trackAlarmWork(wait))
-      wait.catch(() => {});
-    return heartbeat;
-  }
-  if (_classPrivateFieldGet2(_admitting, this) > 0)
-    return heartbeat;
-  if (wake.at !== undefined)
-    return { rescheduleAt: wake.at };
-}
-async function _waitWhileActive(pi) {
-  const deadline = Date.now() + _classPrivateFieldGet2(_waitBudgetMs, this);
-  try {
-    let wake = pi.wake();
-    while (wake.active) {
-      const now = Date.now();
-      const left = deadline - now;
-      if (left <= 0)
-        return true;
-      let sleep = _classPrivateFieldGet2(_onWakeWired, this) ? left : Math.min(left, _classPrivateFieldGet2(_pollMs, this));
-      if (wake.at !== undefined)
-        sleep = Math.min(sleep, wake.at - now);
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, sleep);
-        _classPrivateFieldSet2(_changed, this, () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-      _classPrivateFieldSet2(_changed, this, undefined);
-      if (wake.at !== undefined && Date.now() >= wake.at)
-        pi.resume();
-      wake = pi.wake();
-    }
-    return true;
-  } catch (error) {
-    if (!_classPrivateFieldGet2(_closing, this).has(pi))
-      _assertClassBrand(_PiHarness_brand, this, _wakeError).call(this, error);
-    if (isDurableObjectMemoryLimitReset(error))
-      throw error;
-    return false;
-  }
-}
-function _wakeError(error) {
-  this.lifecycle.events.emit("pi:wake_error", { error: error instanceof Error ? error.message : String(error) });
-}
-async function _open() {
-  await this.lifecycle.ready();
-  if (_classPrivateFieldGet2(_opening, this) === undefined) {
-    const opening = _assertClassBrand(_PiHarness_brand, this, _doOpen).call(this, (pi, closed) => _assertClassBrand(_PiHarness_brand, this, _piClosing).call(this, opening, pi, closed)).catch((error) => {
-      if (_classPrivateFieldGet2(_opening, this) === opening)
-        _classPrivateFieldSet2(_opening, this, undefined);
-      throw error;
-    });
-    _classPrivateFieldSet2(_opening, this, opening);
-  }
-  return _classPrivateFieldGet2(_opening, this);
-}
-async function _doOpen(onClose) {
-  await _classPrivateFieldGet2(_lastClose, this);
-  const storage = await openPiSessionStore(this.lifecycle.storage);
-  const pi = await _classPrivateFieldGet2(_options, this).harness({
-    storage,
-    context: BG,
-    onWake: _classPrivateFieldGet2(_onWake, this)
-  });
-  try {
-    const closed = pi.closed;
-    pi.subscribeClose(() => onClose(pi, closed));
-    await pi.root(BG, { agent: this.agentDefaults() });
-    pi.resume();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    if (!_classPrivateFieldGet2(_onWakeWired, this))
-      console.warn("PiHarness: the harness factory did not pass onWake to Harness.open, so pi's timers keep this Durable Object in memory while a task sleeps. Pass it: harness: ({ storage, context, onWake }) => Harness.open(storage, { ...options, onWake }, context)");
-    await _assertClassBrand(_PiHarness_brand, this, _wakeFor).call(this, pi.wake());
-  } catch (error) {
-    pi.close(BG).catch(() => {});
-    throw error;
-  }
-  return {
-    pi,
-    storage
-  };
-}
-function _piClosing(opening, pi, closed) {
-  _classPrivateFieldGet2(_closing, this).add(pi);
-  _classPrivateFieldGet2(_changed, this)?.call(this);
-  if (_classPrivateFieldGet2(_opening, this) !== opening)
-    return;
-  _classPrivateFieldSet2(_opening, this, undefined);
-  _classPrivateFieldSet2(_lastClose, this, closed);
-}
-async function _findSubmission(id, operationId, context) {
-  const { pi, storage } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
-  const record = await storage.submissionByRequest(id, operationId, context);
-  return record ? pi.submission(record.id, context) : undefined;
-}
-async function _result(session, operationId, settled, context) {
-  if (settled.status === "unanswered")
-    return {
-      operationId,
-      session,
-      status: "unanswered",
-      reason: settled.reason
-    };
-  if (settled.type === "write")
-    return {
-      operationId,
-      session,
-      status: "done"
-    };
-  return {
-    operationId,
-    session,
-    status: "done",
-    text: assistantText((await (await this.conversation(session)).entries({
-      minEntryId: settled.answer,
-      maxEntryId: settled.answer
-    }, 1, undefined, context)).items[0])
-  };
-}
-var _harness = /* @__PURE__ */ new WeakMap;
-var PiSession = class {
-  constructor(harness, id) {
-    _classPrivateFieldInitSpec(this, _harness, undefined);
-    _classPrivateFieldSet2(_harness, this, harness);
-    this.id = id;
-  }
-  submit(input, options = {}) {
-    return _classPrivateFieldGet2(_harness, this).enqueue(this.id, input, options);
-  }
-  async prompt(input, options = {}) {
-    const receipt = await this.submit(input, options);
-    return {
-      ...await this.wait(receipt.operationId),
-      messages: await this.messages()
-    };
-  }
-  continue(options = {}) {
-    return _classPrivateFieldGet2(_harness, this).enqueueContinue(this.id, options);
-  }
-  steer(input, options = {}) {
-    return this.submit(input, {
-      ...options,
-      whenBusy: "steer"
-    });
-  }
-  wait(operationId, signal) {
-    return _classPrivateFieldGet2(_harness, this).settled(this.id, operationId, signal);
-  }
-  async abort(operationId) {
-    if (operationId !== undefined)
-      return _classPrivateFieldGet2(_harness, this).withdraw(this.id, operationId);
-    await (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).abort(BG);
-    return true;
-  }
-  async reset(handoff) {
-    await (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).reset(handoff, BG);
-  }
-  async setModel(model) {
-    await (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).configure({ model: modelRef(model) }, BG);
-  }
-  async messages() {
-    return [...(await (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).context(BG)).entries];
-  }
-  async watch(window2, context = BG) {
-    return (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).watch(context, window2);
-  }
-  async entries(query, limit, context = BG) {
-    return (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).entries(query, limit, undefined, context);
-  }
-  async busy() {
-    return (await (await _classPrivateFieldGet2(_harness, this).pi()).snapshot(LiveDoc, conversationId(this.id), BG))?.run !== undefined;
-  }
-};
-var _harness2 = /* @__PURE__ */ new WeakMap;
-var PiSessions = class {
-  constructor(harness) {
-    _classPrivateFieldInitSpec(this, _harness2, undefined);
-    _classPrivateFieldSet2(_harness2, this, harness);
-  }
-  get(id) {
-    return _classPrivateFieldGet2(_harness2, this).session(id);
-  }
-  async create() {
-    const conversation = await (await _classPrivateFieldGet2(_harness2, this).pi()).createConversation({
-      ownership: { kind: "ownerless" },
-      agent: _classPrivateFieldGet2(_harness2, this).agentDefaults()
-    }, BG);
-    return _classPrivateFieldGet2(_harness2, this).session(String(conversation.id));
-  }
-  async fork(from) {
-    const conversation = await _classPrivateFieldGet2(_harness2, this).conversation(from);
-    const at = (await conversation.entries({}, 1, undefined, BG)).items[0];
-    if (!at)
-      throw new Error(`Session ${from} has no entries to fork from`);
-    const fork = await conversation.fork(at.id, { ownership: { kind: "ownerless" } }, BG);
-    return _classPrivateFieldGet2(_harness2, this).session(String(fork.id));
-  }
-  async list() {
-    const storage = await _classPrivateFieldGet2(_harness2, this).storage();
-    const pi = await _classPrivateFieldGet2(_harness2, this).pi();
-    const sessions = [];
-    let cursor;
-    for (;; ) {
-      const page = await storage.scanConversations({}, 100, cursor, BG);
-      for (const record of page.items) {
-        const live = await pi.snapshot(LiveDoc, record.id, BG);
-        sessions.push({
-          id: String(record.id),
-          ...record.parent ? { parent: String(record.parent.conversationId) } : {},
-          busy: live?.run !== undefined
-        });
-      }
-      if (page.next === undefined)
-        return sessions;
-      cursor = page.next;
-    }
-  }
-};
-function textResult(text) {
-  return { output: [{
-    type: "text",
-    text
-  }] };
-}
-function errorResult(error) {
-  return {
-    output: [{
-      type: "text",
-      text: error.message
-    }],
-    isError: true
-  };
-}
-function skillTools(catalog) {
-  const names = catalog.skills.map((entry) => entry.skill.name);
-  if (names.length === 0)
-    return [];
-  const nameSchema = StringEnum(names);
-  return [{
-    name: "activate_skill",
-    description: "Activate a skill by name. Use this when the user's task matches one of the available skills; the response contains the skill's full instructions.",
-    parameters: obj({ name: nameSchema }, { open: true }),
-    replay: "safe",
-    async execute(input) {
-      const activated = catalog.activate(input.name);
-      return activated.ok ? textResult(activated.value) : errorResult(activated.error);
-    }
-  }, {
-    name: "read_skill_resource",
-    description: "Read a file bundled with a skill, such as a reference document or template. Provide the skill name and the file's path from the skill's resource list, or a qualified path like skill-name/references/file.md.",
-    parameters: obj({
-      name: opt(nameSchema),
-      path: str({ minLength: 1 })
-    }, { open: true }),
-    replay: "safe",
-    async execute(input) {
-      const read = await catalog.readResource(input.name === undefined ? { path: input.path } : {
-        name: input.name,
-        path: input.path
-      });
-      return read.ok ? textResult(renderSkillResource(read.value)) : errorResult(read.error);
-    }
-  }];
-}
-async function skills(sources) {
-  const catalog = await loadSkillCatalog(sources);
-  for (const diagnostic of catalog.diagnostics)
-    console.warn(`pi skills: ${formatSkillDiagnostic(diagnostic)}`);
-  const prompt = catalog.prompt();
-  return {
-    name: "agents.skills",
-    tools: skillTools(catalog),
-    sections: prompt === null ? [] : [{
-      key: "skills",
-      render: () => prompt
-    }]
-  };
-}
-
-// node_modules/agents/dist/current-agent-DhoDkSnH.js
-import { AsyncLocalStorage } from "node:async_hooks";
-var __DO_NOT_USE_WILL_BREAK__agentContext = new AsyncLocalStorage;
-function runInLifecycleHostContext(context, operation) {
-  return __DO_NOT_USE_WILL_BREAK__agentContext.run({
-    agent: context.host,
-    connection: context.connection,
-    request: context.request,
-    email: undefined
-  }, operation);
-}
-function runWithoutCurrentAgent(operation) {
-  return __DO_NOT_USE_WILL_BREAK__agentContext.exit(operation);
-}
-
-// node_modules/agents/dist/diagnostics-BzvaX2UT.js
-import { channel } from "node:diagnostics_channel";
-var channels = {
-  state: channel("agents:state"),
-  rpc: channel("agents:rpc"),
-  message: channel("agents:message"),
-  chat: channel("agents:chat"),
-  transcript: channel("agents:transcript"),
-  fiber: channel("agents:fiber"),
-  task: channel("agents:task"),
-  stream: channel("agents:stream"),
-  agentTool: channel("agents:agent_tool"),
-  schedule: channel("agents:schedule"),
-  lifecycle: channel("agents:lifecycle"),
-  workflow: channel("agents:workflow"),
-  mcp: channel("agents:mcp"),
-  email: channel("agents:email"),
-  channel: channel("agents:channel")
-};
-function getChannel(type) {
-  if (type.startsWith("mcp:"))
-    return channels.mcp;
-  if (type.startsWith("workflow:"))
-    return channels.workflow;
-  if (type.startsWith("fiber:"))
-    return channels.fiber;
-  if (type.startsWith("task:"))
-    return channels.task;
-  if (type.startsWith("stream:"))
-    return channels.stream;
-  if (type.startsWith("transcript:") || type.startsWith("chat:transcript:"))
-    return channels.transcript;
-  if (type.startsWith("chat:"))
-    return channels.chat;
-  if (type.startsWith("agent_tool:"))
-    return channels.agentTool;
-  if (type.startsWith("schedule:") || type.startsWith("queue:"))
-    return channels.schedule;
-  if (type.startsWith("message:") || type.startsWith("tool:") || type.startsWith("submission:") || type.startsWith("action:"))
-    return channels.message;
-  if (type === "rpc" || type.startsWith("rpc:"))
-    return channels.rpc;
-  if (type.startsWith("state:"))
-    return channels.state;
-  if (type.startsWith("email:"))
-    return channels.email;
-  if (type.startsWith("channel:") || type.startsWith("notice:"))
-    return channels.channel;
-  return channels.lifecycle;
-}
-function publishDiagnosticsEvent(event) {
-  getChannel(event.type).publish(event);
-}
-
-// node_modules/agents/dist/sql-error.js
-var SqlError = class extends Error {
-  constructor(query, cause) {
-    const message = cause instanceof Error ? cause.message : String(cause);
-    super(`SQL query failed: ${message}`, { cause });
-    this.name = "SqlError";
-    this.query = query;
-  }
-};
-
-// node_modules/agents/dist/lifecycle-v1rKHV2C.js
-import { AsyncLocalStorage as AsyncLocalStorage2 } from "node:async_hooks";
-import"cloudflare:workers";
-
-// node_modules/nanoid/url-alphabet/index.js
-var urlAlphabet = "useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict";
-
-// node_modules/nanoid/index.browser.js
-var nanoid = (size = 21) => {
-  let id = "";
-  let bytes = crypto.getRandomValues(new Uint8Array(size |= 0));
-  while (size--) {
-    id += urlAlphabet[bytes[size] & 63];
-  }
-  return id;
-};
-
-// node_modules/agents/dist/lifecycle-v1rKHV2C.js
-var _resolveCapabilities = /* @__PURE__ */ new WeakMap;
-var _capabilities$1 = /* @__PURE__ */ new WeakMap;
-var _startPromise = /* @__PURE__ */ new WeakMap;
-var _started = /* @__PURE__ */ new WeakMap;
-var _CapabilityRunner_brand = /* @__PURE__ */ new WeakSet;
-var CapabilityRunner = class {
-  constructor(resolveCapabilities) {
-    _classPrivateMethodInitSpec(this, _CapabilityRunner_brand);
-    _classPrivateFieldInitSpec(this, _resolveCapabilities, undefined);
-    _classPrivateFieldInitSpec(this, _capabilities$1, undefined);
-    _classPrivateFieldInitSpec(this, _startPromise, undefined);
-    _classPrivateFieldInitSpec(this, _started, false);
-    _classPrivateFieldSet2(_resolveCapabilities, this, resolveCapabilities);
-  }
-  async start(context) {
-    if (_classPrivateFieldGet2(_started, this))
-      return;
-    const pending = _classPrivateFieldGet2(_startPromise, this);
-    if (pending) {
-      await pending;
-      return;
-    }
-    const attempt = _assertClassBrand(_CapabilityRunner_brand, this, _runStart).call(this, context);
-    _classPrivateFieldSet2(_startPromise, this, attempt);
-    try {
-      await attempt;
-    } catch (error) {
-      if (_classPrivateFieldGet2(_startPromise, this) === attempt)
-        _classPrivateFieldSet2(_startPromise, this, undefined);
-      throw error;
-    }
-  }
-  async request(context) {
-    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a request");
-    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this)) {
-      const response = await capability.onRequest?.(context);
-      if (response !== undefined)
-        return response;
-    }
-  }
-  async webSocketUpgrade(context) {
-    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a WebSocket upgrade");
-    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this)) {
-      const response = await capability.onWebSocketUpgrade?.(context);
-      if (response !== undefined)
-        return response;
-    }
-  }
-  async webSocketMessage(ws, message) {
-    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a WebSocket message");
-    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
-      if (await capability.onWebSocketMessage?.(ws, message) === true)
-        return true;
-    return false;
-  }
-  async webSocketClose(ws, code, reason, wasClean) {
-    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a WebSocket close");
-    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
-      if (await capability.onWebSocketClose?.(ws, code, reason, wasClean) === true)
-        return true;
-    return false;
-  }
-  async webSocketError(ws, error) {
-    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a WebSocket error");
-    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
-      if (await capability.onWebSocketError?.(ws, error) === true)
-        return true;
-    return false;
-  }
-  async findById(capabilityId) {
-    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "dispatch capability work");
-    return _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this).find((candidate) => lifecycleCapabilityId(candidate) === capabilityId);
-  }
-  async route(capabilityId, context) {
-    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "route a capability message");
-    const capability = _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this).find((candidate) => lifecycleCapabilityId(candidate) === capabilityId);
-    if (!capability?.onRoute)
-      throw new Error(`Lifecycle capability ${JSON.stringify(capabilityId)} cannot receive routed messages`);
-    return capability.onRoute(context);
-  }
-  async memoryLimit(context) {
-    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
-      try {
-        await capability.onMemoryLimit?.(context);
-      } catch (error) {
-        console.error("Lifecycle capability memory-limit policy failed", error);
-      }
-  }
-  async dispose() {
-    for (const capability of [..._assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this)].reverse())
-      try {
-        await capability.dispose?.();
-      } catch (error) {
-        console.error("Lifecycle capability disposal failed", error);
-      }
-  }
-};
-async function _runStart(context) {
-  for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
-    await capability.onStart?.(context);
-  _classPrivateFieldSet2(_started, this, true);
-}
-async function _ensureReady(operation) {
-  const pending = _classPrivateFieldGet2(_startPromise, this);
-  if (pending)
-    await pending;
-  if (!_classPrivateFieldGet2(_started, this))
-    throw new Error(`Cannot ${operation} before the Durable Object lifecycle has started`);
-}
-function _getCapabilities() {
-  if (!_classPrivateFieldGet2(_capabilities$1, this))
-    _classPrivateFieldSet2(_capabilities$1, this, Object.freeze([..._classPrivateFieldGet2(_resolveCapabilities, this).call(this)]));
-  return _classPrivateFieldGet2(_capabilities$1, this);
-}
-function abortWithoutAlarmRetry(ctx, reason) {
-  ctx.abort(reason, { retryAlarm: false });
-}
-var HOST_JOB_CAPABILITY = "host";
-var DEFAULT_HUNG_TIMEOUT_SECONDS = 30;
-function jobFromRow(row) {
-  return {
-    id: row.id,
-    capability: row.capability,
-    fn: row.fn,
-    time: row.time,
-    payload: typeof row.payload === "string" ? JSON.parse(row.payload) : undefined,
-    retry: typeof row.retry_options === "string" ? JSON.parse(row.retry_options) : undefined,
-    singleflight: row.singleflight === 1,
-    exclusive: row.exclusive === 1,
-    recoveryLoop: row.recovery_loop === 1,
-    createdAt: row.created_at
-  };
-}
-function hungTimeoutMs(row) {
-  return (row.hung_timeout_seconds ?? DEFAULT_HUNG_TIMEOUT_SECONDS) * 1000;
-}
-function isHungRow(row, nowMs) {
-  return nowMs - (row.execution_started_at ?? 0) >= hungTimeoutMs(row);
-}
-var _storage = /* @__PURE__ */ new WeakMap;
-var _tableEnsured = /* @__PURE__ */ new WeakMap;
-var _JobQueue_brand = /* @__PURE__ */ new WeakSet;
-var JobQueue = class {
-  constructor(storage) {
-    _classPrivateMethodInitSpec(this, _JobQueue_brand);
-    _classPrivateFieldInitSpec(this, _storage, undefined);
-    _classPrivateFieldInitSpec(this, _tableEnsured, false);
-    _classPrivateFieldSet2(_storage, this, storage);
-  }
-  push(capability, options) {
-    if (!Number.isFinite(options.time) || options.time < 0)
-      throw new Error(`Invalid job time: ${String(options.time)}`);
-    if (typeof options.fn !== "string" || options.fn.trim() === "")
-      throw new Error("Jobs require a non-empty fn");
-    const id = options.id ?? nanoid(9);
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `INSERT INTO cf_agents_jobs
-        (id, capability, fn, time, payload, retry_options, singleflight,
-         hung_timeout_seconds, exclusive, recovery_loop, running,
-         execution_started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
-       ON CONFLICT(id) DO UPDATE SET
-         fn = excluded.fn,
-         time = excluded.time,
-         payload = excluded.payload,
-         retry_options = excluded.retry_options,
-         singleflight = excluded.singleflight,
-         hung_timeout_seconds = excluded.hung_timeout_seconds,
-         exclusive = excluded.exclusive,
-         recovery_loop = excluded.recovery_loop,
-         running = 0,
-         execution_started_at = NULL
-       WHERE cf_agents_jobs.capability = excluded.capability`, id, capability, options.fn, Math.floor(options.time), options.payload === undefined ? null : JSON.stringify(options.payload), options.retry ? JSON.stringify(options.retry) : null, options.singleflight ? 1 : 0, options.hungTimeoutSeconds ?? null, options.exclusive ? 1 : 0, options.recoveryLoop ? 1 : 0);
-    const job = this.get(capability, id);
-    if (!job) {
-      const owner = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT capability FROM cf_agents_jobs WHERE id = ?", id)[0]?.capability;
-      throw new Error(owner !== undefined ? `Job id ${JSON.stringify(id)} already belongs to ${JSON.stringify(owner)}; job ids are scoped to their owner` : `Failed to persist job ${id}`);
-    }
-    return job;
-  }
-  cancel(capability, id) {
-    if (_assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT id FROM cf_agents_jobs WHERE id = ? AND capability = ?", id, capability).length === 0)
-      return false;
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "DELETE FROM cf_agents_jobs WHERE id = ? AND capability = ?", id, capability);
-    return true;
-  }
-  reschedule(capability, id, time) {
-    if (!Number.isFinite(time) || time < 0)
-      throw new Error(`Invalid job time: ${String(time)}`);
-    if (_assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT id FROM cf_agents_jobs WHERE id = ? AND capability = ?", id, capability).length === 0)
-      return false;
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
-       SET time = ?, running = 0, execution_started_at = NULL
-       WHERE id = ? AND capability = ?`, Math.floor(time), id, capability);
-    return true;
-  }
-  get(capability, id) {
-    const rows = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE id = ? AND capability = ?", id, capability);
-    return rows[0] ? jobFromRow(rows[0]) : undefined;
-  }
-  list(capability) {
-    return _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE capability = ? ORDER BY time ASC", capability).map(jobFromRow);
-  }
-  due(nowMs) {
-    return _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE time <= ? ORDER BY time ASC", Math.floor(nowMs));
-  }
-  dueRow(id, nowMs) {
-    return _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE id = ? AND time <= ?", id, Math.floor(nowMs))[0];
-  }
-  markRunning(id, nowMs) {
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
-       SET running = 1, execution_started_at = ?
-       WHERE id = ?`, Math.floor(nowMs), id);
-  }
-  clearRunning(id) {
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
-       SET running = 0, execution_started_at = NULL
-       WHERE id = ?`, id);
-  }
-  delete(id) {
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "DELETE FROM cf_agents_jobs WHERE id = ?", id);
-  }
-  retime(id, time) {
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
-       SET time = ?, running = 0, execution_started_at = NULL
-       WHERE id = ?`, Math.floor(time), id);
-  }
-  delayRecoveryLoopJobs(time) {
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
-       SET time = ?, running = 0, execution_started_at = NULL
-       WHERE recovery_loop = 1 AND time <= ?`, Math.floor(time), Math.floor(time));
-  }
-  recoveryLoopJobs() {
-    return _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE recovery_loop = 1 ORDER BY time ASC").map(jobFromRow);
-  }
-  purgeRecoveryLoopJobs() {
-    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "DELETE FROM cf_agents_jobs WHERE recovery_loop = 1");
-  }
-  applyOutcome(id, outcome) {
-    if (outcome === undefined) {
-      _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "DELETE FROM cf_agents_jobs WHERE id = ? AND running = 1", id);
-      return;
-    }
-    if (outcome === "yield") {
-      this.clearRunning(id);
-      return;
-    }
-    if (typeof outcome === "object" && Number.isFinite(outcome.rescheduleAt) && outcome.rescheduleAt >= 0) {
-      _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
-         SET time = ?, running = 0, execution_started_at = NULL
-         WHERE id = ? AND running = 1`, Math.floor(outcome.rescheduleAt), id);
-      return;
-    }
-    throw new Error(`Invalid job outcome for ${id}`);
-  }
-  nextAlarmTime(nowMs) {
-    const exclusive = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT MIN(time) AS time FROM cf_agents_jobs WHERE exclusive = 1");
-    if (exclusive[0]?.time !== null && exclusive[0]?.time !== undefined)
-      return exclusive[0].time;
-    const now = Math.floor(nowMs);
-    let candidate = null;
-    const ready = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `SELECT MIN(time) AS time FROM cf_agents_jobs
-       WHERE singleflight = 0
-          OR running = 0
-          OR coalesce(execution_started_at, 0) + coalesce(hung_timeout_seconds, ?) * 1000 <= ?`, DEFAULT_HUNG_TIMEOUT_SECONDS, now);
-    if (ready[0]?.time !== null && ready[0]?.time !== undefined)
-      candidate = Math.max(ready[0].time, now + 1);
-    const recheck = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `SELECT MIN(coalesce(execution_started_at, 0) + coalesce(hung_timeout_seconds, ?) * 1000) AS recheck
-       FROM cf_agents_jobs
-       WHERE singleflight = 1
-         AND running = 1
-         AND coalesce(execution_started_at, 0) + coalesce(hung_timeout_seconds, ?) * 1000 > ?`, DEFAULT_HUNG_TIMEOUT_SECONDS, DEFAULT_HUNG_TIMEOUT_SECONDS, now)[0]?.recheck;
-    if (recheck !== null && recheck !== undefined)
-      candidate = candidate === null ? recheck : Math.min(candidate, recheck);
-    return candidate;
-  }
-};
-function _sql(query, ...params) {
-  _assertClassBrand(_JobQueue_brand, this, _ensureTable).call(this);
-  try {
-    return [..._classPrivateFieldGet2(_storage, this).sql.exec(query, ...params)];
-  } catch (cause) {
-    throw new SqlError(query, cause);
-  }
-}
-function _ensureTable() {
-  if (_classPrivateFieldGet2(_tableEnsured, this))
-    return;
-  _classPrivateFieldGet2(_storage, this).sql.exec(`
-      CREATE TABLE IF NOT EXISTS cf_agents_jobs (
-        id TEXT PRIMARY KEY NOT NULL,
-        capability TEXT NOT NULL,
-        fn TEXT NOT NULL,
-        time INTEGER NOT NULL,
-        payload TEXT,
-        retry_options TEXT,
-        singleflight INTEGER NOT NULL DEFAULT 0,
-        hung_timeout_seconds INTEGER,
-        exclusive INTEGER NOT NULL DEFAULT 0,
-        recovery_loop INTEGER NOT NULL DEFAULT 0,
-        running INTEGER NOT NULL DEFAULT 0,
-        execution_started_at INTEGER,
-        created_at INTEGER NOT NULL DEFAULT (unixepoch())
-      ) WITHOUT ROWID`);
-  _classPrivateFieldSet2(_tableEnsured, this, true);
-}
-var DEFAULT_MAX_ALARM_MEMORY_LIMIT_STRIKES = 3;
-var OOM_ALARM_STRIKES_KEY = "cf_agents:oom_alarm_strikes";
-var DEFAULT_JOB_RETRY = {
-  maxAttempts: 3,
-  baseDelayMs: 100,
-  maxDelayMs: 3000
-};
-var JOB_BACKLOG_WARNING_THRESHOLD = 10;
-var DEADMAN_ALARM_DELAY_MS = 30000;
-var AttributedPlatformFailure = class {
-  constructor(row, cause) {
-    this.row = row;
-    this.cause = cause;
-  }
-};
-var _options2 = /* @__PURE__ */ new WeakMap;
-var _alarmScope = /* @__PURE__ */ new WeakMap;
-var _alarmsInFlight = /* @__PURE__ */ new WeakMap;
-var _outstandingAlarmWork = /* @__PURE__ */ new WeakMap;
-var _strike = /* @__PURE__ */ new WeakMap;
-var _strikeRecordedThisIsolate = /* @__PURE__ */ new WeakMap;
-var _JobDriver_brand = /* @__PURE__ */ new WeakSet;
-var JobDriver = class {
-  constructor(options) {
-    _classPrivateMethodInitSpec(this, _JobDriver_brand);
-    _classPrivateFieldInitSpec(this, _options2, undefined);
-    _classPrivateFieldInitSpec(this, _alarmScope, new AsyncLocalStorage2);
-    _classPrivateFieldInitSpec(this, _alarmsInFlight, 0);
-    _classPrivateFieldInitSpec(this, _outstandingAlarmWork, /* @__PURE__ */ new Set);
-    _classPrivateFieldInitSpec(this, _strike, undefined);
-    _classPrivateFieldInitSpec(this, _strikeRecordedThisIsolate, false);
-    _classPrivateFieldSet2(_options2, this, options);
-  }
-  async runAlarm(initialize, runHostAlarm) {
-    var _this$alarmsInFlight;
-    _classPrivateFieldSet2(_alarmsInFlight, this, (_this$alarmsInFlight = _classPrivateFieldGet2(_alarmsInFlight, this), _this$alarmsInFlight++, _this$alarmsInFlight));
-    let clean = false;
-    try {
-      try {
-        await this.armStartupFallback();
-        await initialize();
-        await _assertClassBrand(_JobDriver_brand, this, _driveDueJobs).call(this);
-        await _classPrivateFieldGet2(_alarmScope, this).run({ executing: undefined }, runHostAlarm);
-        clean = true;
-      } catch (error) {
-        const attributed = error instanceof AttributedPlatformFailure;
-        const cause = attributed ? error.cause : error;
-        if (!isDurableObjectMemoryLimitReset(cause))
-          throw attributed ? cause : error;
-        await _assertClassBrand(_JobDriver_brand, this, _handleMemoryLimitReset).call(this, cause, attributed ? error.row : undefined);
-        return;
-      }
-    } finally {
-      var _this$alarmsInFlight3;
-      _classPrivateFieldSet2(_alarmsInFlight, this, (_this$alarmsInFlight3 = _classPrivateFieldGet2(_alarmsInFlight, this), _this$alarmsInFlight3--, _this$alarmsInFlight3));
-      if (clean)
-        await _assertClassBrand(_JobDriver_brand, this, _clearMemoryLimitStrikesWhenQuiescent).call(this);
-    }
-    await _classPrivateFieldGet2(_options2, this).rearm();
-  }
-  trackAlarmWork(work) {
-    const scope = _classPrivateFieldGet2(_alarmScope, this).getStore();
-    if (!scope)
-      return false;
-    if (_classPrivateFieldGet2(_outstandingAlarmWork, this).has(work))
-      return true;
-    _classPrivateFieldGet2(_outstandingAlarmWork, this).add(work);
-    work.then(() => _assertClassBrand(_JobDriver_brand, this, _settleAlarmWork).call(this, work, undefined, scope.executing), (error) => _assertClassBrand(_JobDriver_brand, this, _settleAlarmWork).call(this, work, error, scope.executing));
-    return true;
-  }
-  async armStartupFallback() {
-    if (_classPrivateFieldGet2(_options2, this).disabled())
-      return;
-    const nowMs = Date.now();
-    const next = _classPrivateFieldGet2(_options2, this).queue.nextAlarmTime(nowMs);
-    if (next === null)
-      return;
-    await _classPrivateFieldGet2(_options2, this).storage.setAlarm(Math.max(next, nowMs + DEADMAN_ALARM_DELAY_MS));
-  }
-};
-async function _settleAlarmWork(work, error, executing) {
-  try {
-    if (_classPrivateFieldGet2(_options2, this).disabled())
-      return;
-    if (isDurableObjectMemoryLimitReset(error)) {
-      await _assertClassBrand(_JobDriver_brand, this, _handleMemoryLimitReset).call(this, error, executing);
-      return;
-    }
-  } finally {
-    _classPrivateFieldGet2(_outstandingAlarmWork, this).delete(work);
-  }
-  await _assertClassBrand(_JobDriver_brand, this, _clearMemoryLimitStrikesWhenQuiescent).call(this);
-}
-async function _clearMemoryLimitStrikesWhenQuiescent() {
-  if (_classPrivateFieldGet2(_alarmsInFlight, this) > 0)
-    return;
-  if (_classPrivateFieldGet2(_outstandingAlarmWork, this).size > 0)
-    return;
-  if (_classPrivateFieldGet2(_strikeRecordedThisIsolate, this))
-    return;
-  _classPrivateFieldSet2(_strike, this, undefined);
-  await _assertClassBrand(_JobDriver_brand, this, _clearMemoryLimitStrikes).call(this);
-}
-async function _driveDueJobs() {
-  const nowMs = Date.now();
-  const due = _classPrivateFieldGet2(_options2, this).queue.due(nowMs);
-  if (due.length === 0)
-    return;
-  _assertClassBrand(_JobDriver_brand, this, _warnBacklog).call(this, due);
-  if (!_classPrivateFieldGet2(_options2, this).disabled())
-    await _classPrivateFieldGet2(_options2, this).storage.setAlarm(nowMs + DEADMAN_ALARM_DELAY_MS);
-  for (const stale of due) {
-    if (_classPrivateFieldGet2(_options2, this).disabled())
-      return;
-    const row = _classPrivateFieldGet2(_options2, this).queue.dueRow(stale.id, nowMs);
-    if (!row)
-      continue;
-    if (row.singleflight === 1 && row.running === 1) {
-      if (!isHungRow(row, nowMs)) {
-        console.warn(`Skipping job ${row.id}: previous execution still running`);
-        continue;
-      }
-      console.warn(`Forcing reset of hung job ${row.id} (started ${Math.round((nowMs - (row.execution_started_at ?? 0)) / 1000)}s ago)`);
-    }
-    _classPrivateFieldGet2(_options2, this).queue.markRunning(row.id, nowMs);
-    await _assertClassBrand(_JobDriver_brand, this, _driveJob).call(this, row);
-  }
-}
-async function _driveJob(row) {
-  const { queue, resolveDispatch, disabled } = _classPrivateFieldGet2(_options2, this);
-  const job = jobFromRow(row);
-  const dispatch = await resolveDispatch(row.capability);
-  if (!dispatch) {
-    console.error(`No installed capability or host handler for job ${row.id} (owner ${JSON.stringify(row.capability)}); dropping it`);
-    queue.delete(row.id);
-    return;
-  }
-  const maxAttempts = job.retry?.maxAttempts ?? DEFAULT_JOB_RETRY.maxAttempts;
-  const slowWatchdog = setTimeout(() => {
-    const seconds = Math.round(hungTimeoutMs(row) / 1000);
-    console.warn(`Job ${row.id} (${row.capability}/${row.fn}) has been dispatching for over ${seconds}s. Long dispatches starve every other job on this object; onJob must detach unbounded work and return.`);
-    try {
-      _classPrivateFieldGet2(_options2, this).emit("job:slow_dispatch", {
-        capability: row.capability,
-        fn: row.fn,
-        id: row.id,
-        thresholdMs: hungTimeoutMs(row)
-      });
-    } catch {}
-  }, hungTimeoutMs(row));
-  let outcome;
-  try {
-    outcome = await _classPrivateFieldGet2(_alarmScope, this).run({ executing: row }, () => tryN(maxAttempts, (attempt) => dispatch.onJob({
-      job,
-      attempt
-    }), {
-      baseDelayMs: job.retry?.baseDelayMs ?? DEFAULT_JOB_RETRY.baseDelayMs,
-      maxDelayMs: job.retry?.maxDelayMs ?? DEFAULT_JOB_RETRY.maxDelayMs,
-      shouldRetry: (error) => !isDurableObjectCodeUpdateReset(error) && !isDurableObjectMemoryLimitReset(error)
-    }));
-  } catch (error) {
-    if (disabled())
-      return;
-    if (isPlatformFailure(error)) {
-      try {
-        queue.clearRunning(row.id);
-      } catch {}
-      console.warn(`Deferring job ${row.id} to a fresh invocation after a platform failure; the job is preserved.`);
-      throw new AttributedPlatformFailure(row, error);
-    }
-    try {
-      outcome = await dispatch.onJobError?.({
-        job,
-        attempt: maxAttempts
-      }, error);
-    } catch (hookError) {
-      console.error(`Job failure hook threw for ${row.id}`, hookError);
-    }
-  } finally {
-    clearTimeout(slowWatchdog);
-  }
-  if (disabled())
-    return;
-  queue.applyOutcome(row.id, outcome ?? undefined);
-}
-function _warnBacklog(due) {
-  const counts = /* @__PURE__ */ new Map;
-  for (const row of due)
-    counts.set(row.capability, (counts.get(row.capability) ?? 0) + 1);
-  for (const [owner, count] of counts) {
-    if (count < JOB_BACKLOG_WARNING_THRESHOLD)
-      continue;
-    try {
-      console.warn(`Processing ${count} due jobs for ${JSON.stringify(owner)} in a single alarm cycle. This usually means one-shot jobs are pushed repeatedly without a stable id.`);
-      _classPrivateFieldGet2(_options2, this).emit("job:backlog_warning", {
-        capability: owner,
-        count
-      });
-    } catch {}
-  }
-}
-async function _clearMemoryLimitStrikes() {
-  const { storage } = _classPrivateFieldGet2(_options2, this);
-  try {
-    const prior = await storage.get(OOM_ALARM_STRIKES_KEY);
-    if (typeof prior === "number" && prior > 0)
-      await storage.delete(OOM_ALARM_STRIKES_KEY);
-  } catch {}
-}
-async function _handleMemoryLimitReset(error, executing) {
-  const { queue } = _classPrivateFieldGet2(_options2, this);
-  const first = _classPrivateFieldGet2(_strike, this) === undefined;
-  _classPrivateFieldSet2(_strikeRecordedThisIsolate, this, true);
-  _classPrivateFieldGet2(_strike, this) ?? _classPrivateFieldSet2(_strike, this, _assertClassBrand(_JobDriver_brand, this, _recordMemoryLimitStrike).call(this, error));
-  const strike = await _classPrivateFieldGet2(_strike, this);
-  try {
-    if (executing) {
-      if (strike.sealed)
-        queue.delete(executing.id);
-      else if (strike.nextTime !== undefined)
-        queue.retime(executing.id, strike.nextTime);
-    }
-  } catch {}
-  try {
-    await _classPrivateFieldGet2(_options2, this).onMemoryLimit({
-      sealed: strike.sealed,
-      nextTime: strike.nextTime,
-      executing: executing ? jobFromRow(executing) : undefined,
-      purgedRecoveryLoopJobs: first ? strike.purgedRecoveryLoopJobs : undefined
-    });
-  } catch {}
-  if (!first)
-    return;
-  try {
-    await _classPrivateFieldGet2(_options2, this).rearm();
-  } catch {}
-  try {
-    await _classPrivateFieldGet2(_options2, this).storage.sync();
-    _classPrivateFieldGet2(_options2, this).reset(`Alarm memory-limit strike ${strike.strikes}/${strike.limit}${strike.sealed ? " (sealed)" : ""}; resetting isolate (#1825)`);
-  } catch {}
-}
-async function _recordMemoryLimitStrike(error) {
-  const { queue, storage } = _classPrivateFieldGet2(_options2, this);
-  let strikes = 1;
-  let counted = true;
-  try {
-    const prior = await storage.get(OOM_ALARM_STRIKES_KEY);
-    strikes = (typeof prior === "number" ? prior : 0) + 1;
-    await storage.put(OOM_ALARM_STRIKES_KEY, strikes);
-  } catch {
-    counted = false;
-  }
-  const limit = _classPrivateFieldGet2(_options2, this).maxMemoryLimitStrikes() ?? DEFAULT_MAX_ALARM_MEMORY_LIMIT_STRIKES;
-  const sealed = strikes >= limit;
-  const strikeLabel = counted ? `strike ${strikes}/${limit}` : "strike not counted: storage rejected it after the reset";
-  console.error(`Alarm hit a Durable Object memory-limit reset (${strikeLabel}${sealed ? ", sealing recovery" : ", will retry with backoff"}). Breaking the platform alarm-retry loop (#1825).`, error instanceof Error ? error.message : String(error));
-  const nextTime = sealed ? undefined : Date.now() + Math.min(300, 30 * strikes) * 1000;
-  let purgedRecoveryLoopJobs;
-  try {
-    if (sealed)
-      purgedRecoveryLoopJobs = queue.recoveryLoopJobs();
-  } catch {}
-  try {
-    if (sealed)
-      queue.purgeRecoveryLoopJobs();
-    else if (nextTime !== undefined)
-      queue.delayRecoveryLoopJobs(nextTime);
-  } catch {}
-  if (sealed)
-    try {
-      await storage.delete(OOM_ALARM_STRIKES_KEY);
-    } catch {}
-  try {
-    _classPrivateFieldGet2(_options2, this).emit("alarm:memory_limit_reset", {
-      strikes,
-      limit,
-      sealed,
-      error: error instanceof Error ? error.message : String(error)
-    });
-  } catch {}
-  return {
-    strikes,
-    limit,
-    sealed,
-    nextTime,
-    purgedRecoveryLoopJobs
-  };
-}
-var CLOSING = 2;
-var CLOSED = 3;
-function isBenignTeardownError(ws, error) {
-  const state = ws.readyState;
-  if (state !== CLOSING && state !== CLOSED)
-    return false;
-  if (typeof error !== "object" || error === null)
-    return false;
-  const typed = error;
-  if (typed.retryable === true)
-    return true;
-  const message = typeof typed.message === "string" ? typed.message : "";
-  return /Network connection lost|WebSocket peer disconnected/i.test(message);
-}
-var LEGACY_NAME_STORAGE_KEY = "__ps_name";
-function mutableRequest(request) {
-  return new Request(request);
-}
-function decodeProps(header) {
-  const trimmed = header.trim();
-  if (trimmed.startsWith("{") || trimmed.startsWith("["))
-    return JSON.parse(trimmed);
-  const binary = atob(header);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0;i < binary.length; i++)
-    bytes[i] = binary.charCodeAt(i);
-  return JSON.parse(new TextDecoder().decode(bytes));
-}
-var lifecycleEventSinks = /* @__PURE__ */ new WeakMap;
-var lifecycleRouteTransports = /* @__PURE__ */ new WeakMap;
-var lifecycleHostInvokers = /* @__PURE__ */ new WeakMap;
-var lifecycleStartupScope = new AsyncLocalStorage2;
-var CATCH_ALL_HOOKS = ["onRequest", "onWebSocketUpgrade"];
-var _host = /* @__PURE__ */ new WeakMap;
-var _ctx = /* @__PURE__ */ new WeakMap;
-var _parentClassName = /* @__PURE__ */ new WeakMap;
-var _capabilities = /* @__PURE__ */ new WeakMap;
-var _capabilityRunner = /* @__PURE__ */ new WeakMap;
-var _jobQueue = /* @__PURE__ */ new WeakMap;
-var _jobDriver = /* @__PURE__ */ new WeakMap;
-var _status = /* @__PURE__ */ new WeakMap;
-var _alarmRearmQueue = /* @__PURE__ */ new WeakMap;
-var _rearmRequestedDuringStart = /* @__PURE__ */ new WeakMap;
-var _pendingEvents = /* @__PURE__ */ new WeakMap;
-var _alarmsDisabled = /* @__PURE__ */ new WeakMap;
-var _capabilitiesLocked = /* @__PURE__ */ new WeakMap;
-var _handlersInstalled = /* @__PURE__ */ new WeakMap;
-var _Lifecycle_brand = /* @__PURE__ */ new WeakSet;
-var _startup = /* @__PURE__ */ new WeakMap;
-var _startupToken = /* @__PURE__ */ new WeakMap;
-var _legacyName = /* @__PURE__ */ new WeakMap;
-var _props = /* @__PURE__ */ new WeakMap;
-var Lifecycle = class Lifecycle {
-  static install(host, options) {
-    const lifecycle = new Lifecycle(host, options);
-    lifecycle.installHandlers();
-    return lifecycle;
-  }
-  constructor(host, options) {
-    _classPrivateMethodInitSpec(this, _Lifecycle_brand);
-    _classPrivateFieldInitSpec(this, _host, undefined);
-    _classPrivateFieldInitSpec(this, _ctx, undefined);
-    _classPrivateFieldInitSpec(this, _parentClassName, undefined);
-    _classPrivateFieldInitSpec(this, _capabilities, []);
-    _classPrivateFieldInitSpec(this, _capabilityRunner, new CapabilityRunner(() => _classPrivateFieldGet2(_capabilities, this)));
-    _classPrivateFieldInitSpec(this, _jobQueue, undefined);
-    _classPrivateFieldInitSpec(this, _jobDriver, undefined);
-    _classPrivateFieldInitSpec(this, _status, "zero");
-    _classPrivateFieldInitSpec(this, _alarmRearmQueue, Promise.resolve());
-    _classPrivateFieldInitSpec(this, _rearmRequestedDuringStart, false);
-    _classPrivateFieldInitSpec(this, _pendingEvents, []);
-    _classPrivateFieldInitSpec(this, _alarmsDisabled, false);
-    _classPrivateFieldInitSpec(this, _capabilitiesLocked, false);
-    _classPrivateFieldInitSpec(this, _handlersInstalled, false);
-    _classPrivateFieldInitSpec(this, _startup, undefined);
-    _classPrivateFieldInitSpec(this, _startupToken, {});
-    _classPrivateFieldInitSpec(this, _legacyName, undefined);
-    _classPrivateFieldInitSpec(this, _props, undefined);
-    _classPrivateFieldSet2(_host, this, host);
-    _classPrivateFieldSet2(_ctx, this, _classPrivateFieldGet2(_host, this).ctx);
-    _classPrivateFieldSet2(_parentClassName, this, _classPrivateFieldGet2(_host, this).constructor.name);
-    _classPrivateFieldSet2(_jobQueue, this, new JobQueue(_classPrivateFieldGet2(_ctx, this).storage));
-    _classPrivateFieldSet2(_jobDriver, this, new JobDriver({
-      queue: _classPrivateFieldGet2(_jobQueue, this),
-      storage: _classPrivateFieldGet2(_ctx, this).storage,
-      disabled: () => _classPrivateFieldGet2(_alarmsDisabled, this),
-      resolveDispatch: (owner) => _assertClassBrand(_Lifecycle_brand, this, _resolveJobDispatch).call(this, owner),
-      maxMemoryLimitStrikes: () => options?.maxAlarmMemoryLimitStrikes,
-      onMemoryLimit: async (context) => {
-        await _classPrivateFieldGet2(_capabilityRunner, this).memoryLimit(context);
-        await runInLifecycleHostContext({ host: _classPrivateFieldGet2(_host, this) }, () => _classPrivateFieldGet2(_host, this).onAlarmMemoryLimit?.(context));
-      },
-      emit: (type, payload) => _assertClassBrand(_Lifecycle_brand, this, _emitCapabilityEvent).call(this, {
-        source: "lifecycle",
-        type,
-        payload
-      }),
-      rearm: () => this.rearmAlarm(),
-      reset: (reason) => {
-        setTimeout(() => abortWithoutAlarmRetry(_classPrivateFieldGet2(_ctx, this), reason), 0);
-      }
-    }));
-  }
-  installHandlers() {
-    if (_classPrivateFieldGet2(_handlersInstalled, this))
-      throw new Error("Durable Object lifecycle handlers are already installed");
-    _classPrivateFieldSet2(_handlersInstalled, this, true);
-    const handlers = {
-      fetch: this.fetch.bind(this),
-      alarm: this.alarm.bind(this),
-      webSocketMessage: this.webSocketMessage.bind(this),
-      webSocketClose: this.webSocketClose.bind(this),
-      webSocketError: this.webSocketError.bind(this)
-    };
-    for (const [name, handler] of Object.entries(handlers)) {
-      if (name in _classPrivateFieldGet2(_host, this))
-        continue;
-      Object.defineProperty(_classPrivateFieldGet2(_host, this), name, {
-        value: handler,
-        configurable: true
-      });
-    }
-  }
-  use(capability) {
-    if (_classPrivateFieldGet2(_capabilitiesLocked, this))
-      throw new Error("Lifecycle capabilities must be added before startup");
-    const capabilityId = lifecycleCapabilityId(capability);
-    if (capabilityId && _classPrivateFieldGet2(_capabilities, this).some((candidate) => lifecycleCapabilityId(candidate) === capabilityId))
-      throw new Error(`Lifecycle capability ${JSON.stringify(capabilityId)} is already installed`);
-    const catchAllIndex = _classPrivateFieldGet2(_capabilities, this).findIndex((candidate) => candidate.claims === "catch-all");
-    if (capability.claims === "catch-all") {
-      for (const hook of CATCH_ALL_HOOKS) {
-        if (!capability[hook])
-          continue;
-        const rival = _classPrivateFieldGet2(_capabilities, this).find((candidate) => candidate.claims === "catch-all" && candidate[hook]);
-        if (!rival)
-          continue;
-        const installed = lifecycleCapabilityId(rival);
-        throw new Error(`Lifecycle already has a catch-all for ${hook}${installed ? ` (${JSON.stringify(installed)})` : ""}; a second one could never be reached`);
-      }
-      _classPrivateFieldGet2(_capabilities, this).push(capability);
-    } else
-      _classPrivateFieldGet2(_capabilities, this).splice(catchAllIndex === -1 ? _classPrivateFieldGet2(_capabilities, this).length : catchAllIndex, 0, capability);
-    if (capability instanceof LifecycleCapability)
-      bindLifecycleCapability(capability, _assertClassBrand(_Lifecycle_brand, this, _servicesForCapability).call(this, capability.capabilityId));
-    return this;
-  }
-  route(envelope) {
-    return _assertClassBrand(_Lifecycle_brand, this, _dispatchRoute).call(this, envelope);
-  }
-  sql(strings, ...values) {
-    let query = "";
-    try {
-      query = strings.reduce((acc, str, i) => acc + str + (i < values.length ? "?" : ""), "");
-      return [..._classPrivateFieldGet2(_ctx, this).storage.sql.exec(query, ...values)];
-    } catch (error) {
-      console.error(`failed to execute sql query: ${query}`, error);
-      throw error;
-    }
-  }
-  async fetch(request) {
-    try {
-      const encodedProps = request.headers.get("x-agents-lifecycle-props");
-      if (encodedProps) {
-        _classPrivateFieldSet2(_props, this, decodeProps(encodedProps));
-        request = mutableRequest(request);
-        request.headers.delete("x-agents-lifecycle-props");
-      }
-      await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
-      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-        const capabilityResponse = await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).request({ request }));
-        if (capabilityResponse !== undefined)
-          return capabilityResponse;
-        if (_classPrivateFieldGet2(_host, this).onRequest)
-          return await runInLifecycleHostContext({
-            host: _classPrivateFieldGet2(_host, this),
-            request
-          }, () => _classPrivateFieldGet2(_host, this).onRequest(request));
-        return new Response("Not implemented", { status: 404 });
-      } else {
-        const upgradeResponse = await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).webSocketUpgrade({ request }));
-        if (upgradeResponse !== undefined)
-          return upgradeResponse;
-        return new Response("WebSocket upgrades are not enabled on this Durable Object. Install a capability that claims them (e.g. WebSockets).", { status: 404 });
-      }
-    } catch (err) {
-      console.error(`Error in ${_classPrivateFieldGet2(_parentClassName, this)}:${_classPrivateFieldGet2(_ctx, this).id.name ?? "<unnamed>"} fetch:`, err);
-      if (!(err instanceof Error))
-        throw err;
-      if (request.headers.get("Upgrade") === "websocket") {
-        const pair = new WebSocketPair;
-        pair[1].accept();
-        pair[1].send(JSON.stringify({ error: err.stack }));
-        pair[1].close(1011, "Uncaught exception during session setup");
-        return new Response(null, {
-          status: 101,
-          webSocket: pair[0]
-        });
-      } else
-        return new Response(err.stack, { status: 500 });
-    }
-  }
-  async webSocketMessage(ws, message) {
-    try {
-      await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
-      await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).webSocketMessage(ws, message));
-    } catch (e) {
-      console.error(`Error in ${_classPrivateFieldGet2(_parentClassName, this)}:${_classPrivateFieldGet2(_ctx, this).id.name ?? "<unnamed>"} webSocketMessage:`, e);
-    }
-  }
-  async webSocketClose(ws, code, reason, wasClean) {
-    try {
-      await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
-      await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).webSocketClose(ws, code, reason, wasClean));
-    } catch (e) {
-      console.error(`Error in ${_classPrivateFieldGet2(_parentClassName, this)}:${_classPrivateFieldGet2(_ctx, this).id.name ?? "<unnamed>"} webSocketClose:`, e);
-    }
-  }
-  async webSocketError(ws, error) {
-    if (isBenignTeardownError(ws, error))
-      return;
-    try {
-      await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
-      await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).webSocketError(ws, error));
-    } catch (e) {
-      console.error(`Error in ${_classPrivateFieldGet2(_parentClassName, this)}:${_classPrivateFieldGet2(_ctx, this).id.name ?? "<unnamed>"} webSocketError:`, e);
-    }
-  }
-  async start(props) {
-    if (props !== undefined && _classPrivateFieldGet2(_startup, this) === undefined)
-      _classPrivateFieldSet2(_props, this, props);
-    await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
-  }
-  isStarted() {
-    return _classPrivateFieldGet2(_status, this) === "started";
-  }
-  get name() {
-    const name = _classPrivateFieldGet2(_ctx, this).id.name ?? _classPrivateFieldGet2(_legacyName, this);
-    if (name !== undefined)
-      return name;
-    throw new Error(`${_classPrivateFieldGet2(_parentClassName, this)} could not determine its Durable Object name. Address it with idFromName() or getByName(). In local development, update Wrangler/workerd and use a current compatibility_date. newUniqueId(), idFromString(), and names over 1,024 bytes do not expose ctx.id.name. Alarms created before 2026-03-15 must be rescheduled from a named fetch or RPC handler.`);
-  }
-  get jobs() {
-    return _assertClassBrand(_Lifecycle_brand, this, _jobsForOwner).call(this, HOST_JOB_CAPABILITY);
-  }
-  async rearmAlarm() {
-    if (_classPrivateFieldGet2(_alarmsDisabled, this))
-      return;
-    if (_classPrivateFieldGet2(_status, this) === "starting") {
-      _classPrivateFieldSet2(_rearmRequestedDuringStart, this, true);
-      return;
-    }
-    await _assertClassBrand(_Lifecycle_brand, this, _serializeAlarmWrite).call(this, async () => {
-      if (_classPrivateFieldGet2(_alarmsDisabled, this))
-        return;
-      const alarm = _classPrivateFieldGet2(_jobQueue, this).nextAlarmTime(Date.now());
-      if (alarm === null)
-        await _classPrivateFieldGet2(_ctx, this).storage.deleteAlarm();
-      else
-        await _classPrivateFieldGet2(_ctx, this).storage.setAlarm(alarm);
-    });
-  }
-  trackAlarmWork(work) {
-    return _classPrivateFieldGet2(_jobDriver, this).trackAlarmWork(work);
-  }
-  async dispose() {
-    await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).dispose());
-  }
-  async disableAlarms() {
-    _classPrivateFieldSet2(_alarmsDisabled, this, true);
-    await _classPrivateFieldGet2(_alarmRearmQueue, this).catch(() => {});
-    await _classPrivateFieldGet2(_ctx, this).storage.deleteAlarm();
-  }
-  async alarm() {
-    await _classPrivateFieldGet2(_jobDriver, this).runAlarm(() => _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this), () => runInLifecycleHostContext({ host: _classPrivateFieldGet2(_host, this) }, async () => {
-      await _classPrivateFieldGet2(_host, this).onAlarm?.();
-    }));
-  }
-};
-function _servicesForCapability(capabilityId) {
-  const lifecycle = this;
-  const envelope = (payload) => ({
-    capability: capabilityId,
-    source: lifecycleRouteTransports.get(lifecycle)?.source,
-    payload
-  });
-  return Object.freeze({
-    get name() {
-      return lifecycle.name;
-    },
-    className: _classPrivateFieldGet2(_parentClassName, this),
-    storage: _classPrivateFieldGet2(_ctx, this).storage,
-    sockets: Object.freeze({
-      accept: (ws, tags) => _classPrivateFieldGet2(_ctx, this).acceptWebSocket(ws, tags),
-      get: (tag) => _classPrivateFieldGet2(_ctx, this).getWebSockets(tag)
-    }),
-    ready: () => _assertClassBrand(_Lifecycle_brand, this, _readyForCapabilityOperation).call(this),
-    status: () => _classPrivateFieldGet2(_status, this),
-    jobs: _assertClassBrand(_Lifecycle_brand, this, _jobsForOwner).call(this, capabilityId),
-    trackAlarmWork: (work) => _classPrivateFieldGet2(_jobDriver, this).trackAlarmWork(work),
-    runInHostContext: async (fn, scope) => _assertClassBrand(_Lifecycle_brand, this, _runInHostBoundary).call(this, fn, scope),
-    events: Object.freeze({ emit: (type, payload) => _assertClassBrand(_Lifecycle_brand, this, _emitCapabilityEvent).call(this, {
-      source: capabilityId,
-      type,
-      payload
-    }) }),
-    routes: Object.freeze({
-      get source() {
-        return lifecycleRouteTransports.get(lifecycle)?.source;
-      },
-      toRoot: (payload) => {
-        const transport = lifecycleRouteTransports.get(lifecycle);
-        return transport ? transport.toRoot(envelope(payload)) : _assertClassBrand(_Lifecycle_brand, this, _dispatchRoute).call(this, envelope(payload));
-      },
-      to: (target, payload) => {
-        const transport = lifecycleRouteTransports.get(lifecycle);
-        if (!transport)
-          throw new Error("Lifecycle has no transport for routed capabilities");
-        return transport.to(target, envelope(payload));
-      }
-    })
-  });
-}
-function _runInHostBoundary(fn, scope) {
-  const boundary = lifecycleHostInvokers.get(this);
-  return Promise.resolve(boundary ? boundary(fn, scope) : runInLifecycleHostContext({
-    host: _classPrivateFieldGet2(_host, this),
-    connection: scope?.connection,
-    request: scope?.request
-  }, fn));
-}
-function _readyForCapabilityOperation() {
-  return _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
-}
-async function _dispatchRoute(envelope) {
-  await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
-  return runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).route(envelope.capability, {
-    source: envelope.source,
-    payload: envelope.payload
-  }));
-}
-function _emitCapabilityEvent(event) {
-  if (event.source.trim() === "" || event.type.trim() === "")
-    throw new Error("Lifecycle events require non-empty source and type");
-  if (_classPrivateFieldGet2(_status, this) !== "started") {
-    _classPrivateFieldGet2(_pendingEvents, this).push(event);
-    return;
-  }
-  _assertClassBrand(_Lifecycle_brand, this, _publishCapabilityEvent).call(this, event);
-}
-function _publishCapabilityEvent(event) {
-  runWithoutCurrentAgent(() => {
-    const sink = lifecycleEventSinks.get(this);
-    try {
-      if (!sink) {
-        publishDiagnosticsEvent({
-          source: event.source,
-          type: event.type,
-          agent: _classPrivateFieldGet2(_parentClassName, this),
-          name: this.name,
-          payload: event.payload,
-          timestamp: Date.now()
-        });
-        return;
-      }
-      const pending = sink(event);
-      if (pending !== undefined)
-        _classPrivateFieldGet2(_ctx, this).waitUntil(Promise.resolve(pending).catch((error) => {
-          _assertClassBrand(_Lifecycle_brand, this, _reportEventSinkFailure).call(this, event, error);
-        }));
-    } catch (error) {
-      _assertClassBrand(_Lifecycle_brand, this, _reportEventSinkFailure).call(this, event, error);
-    }
-  });
-}
-function _reportEventSinkFailure(event, error) {
-  console.error(`Lifecycle event sink failed for ${event.source}:${event.type}`, error);
-}
-function _deliverPendingEvents() {
-  for (const event of _classPrivateFieldGet2(_pendingEvents, this).splice(0))
-    _assertClassBrand(_Lifecycle_brand, this, _publishCapabilityEvent).call(this, event);
-}
-function _ensureInitialized() {
-  if (_classPrivateFieldGet2(_status, this) === "started")
-    return Promise.resolve();
-  if (_classPrivateFieldGet2(_startup, this) === undefined) {
-    const startup = Promise.resolve().then(() => _assertClassBrand(_Lifecycle_brand, this, _runStartup).call(this)).finally(() => {
-      if (_classPrivateFieldGet2(_startup, this) === startup)
-        _classPrivateFieldSet2(_startup, this, undefined);
-    });
-    _classPrivateFieldSet2(_startup, this, startup);
-    return startup;
-  }
-  if (lifecycleStartupScope.getStore()?.has(_classPrivateFieldGet2(_startupToken, this)))
-    return Promise.resolve();
-  return _classPrivateFieldGet2(_startup, this);
-}
-async function _runStartup() {
-  if (_classPrivateFieldGet2(_ctx, this).id.name === undefined && _classPrivateFieldGet2(_legacyName, this) === undefined)
-    _classPrivateFieldSet2(_legacyName, this, await _classPrivateFieldGet2(_ctx, this).storage.get(LEGACY_NAME_STORAGE_KEY));
-  this.name;
-  _classPrivateFieldSet2(_capabilitiesLocked, this, true);
-  const scope = new Set(lifecycleStartupScope.getStore());
-  scope.add(_classPrivateFieldGet2(_startupToken, this));
-  let error;
-  await _classPrivateFieldGet2(_ctx, this).blockConcurrencyWhile(() => lifecycleStartupScope.run(scope, async () => {
-    _classPrivateFieldSet2(_status, this, "starting");
-    try {
-      await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).start({ props: _classPrivateFieldGet2(_props, this) }));
-      await runInLifecycleHostContext({ host: _classPrivateFieldGet2(_host, this) }, () => _classPrivateFieldGet2(_host, this).onStart?.(_classPrivateFieldGet2(_props, this)));
-      _classPrivateFieldSet2(_status, this, "started");
-    } catch (cause) {
-      _classPrivateFieldSet2(_status, this, "zero");
-      error = cause;
-    }
-  }));
-  if (error) {
-    const rearmRequested = _classPrivateFieldGet2(_rearmRequestedDuringStart, this);
-    _classPrivateFieldSet2(_rearmRequestedDuringStart, this, false);
-    _classPrivateFieldGet2(_pendingEvents, this).length = 0;
-    if (rearmRequested)
-      await _assertClassBrand(_Lifecycle_brand, this, _serializeAlarmWrite).call(this, () => _classPrivateFieldGet2(_jobDriver, this).armStartupFallback()).catch(() => {});
-    throw error;
-  }
-  _assertClassBrand(_Lifecycle_brand, this, _deliverPendingEvents).call(this);
-  if (_classPrivateFieldGet2(_rearmRequestedDuringStart, this)) {
-    _classPrivateFieldSet2(_rearmRequestedDuringStart, this, false);
-    await this.rearmAlarm();
-  }
-}
-function _jobsForOwner(owner) {
-  const rearmAfter = async (mutate) => {
-    const result = mutate();
-    await this.rearmAlarm();
-    return result;
-  };
-  return Object.freeze({
-    push: (options) => rearmAfter(() => _classPrivateFieldGet2(_jobQueue, this).push(owner, options)),
-    cancel: (id) => rearmAfter(() => _classPrivateFieldGet2(_jobQueue, this).cancel(owner, id)),
-    reschedule: (id, time) => rearmAfter(() => _classPrivateFieldGet2(_jobQueue, this).reschedule(owner, id, time)),
-    get: (id) => _classPrivateFieldGet2(_jobQueue, this).get(owner, id),
-    list: () => _classPrivateFieldGet2(_jobQueue, this).list(owner),
-    rearm: () => this.rearmAlarm()
-  });
-}
-function _serializeAlarmWrite(write) {
-  const next = _classPrivateFieldGet2(_alarmRearmQueue, this).catch(() => {}).then(write);
-  _classPrivateFieldSet2(_alarmRearmQueue, this, next);
-  return next;
-}
-async function _resolveJobDispatch(owner) {
-  if (owner === "host") {
-    const host = _classPrivateFieldGet2(_host, this);
-    if (!host.onJob)
-      return;
-    return { onJob: async (context) => runInLifecycleHostContext({ host }, () => host.onJob(context)) };
-  }
-  const capability = await _classPrivateFieldGet2(_capabilityRunner, this).findById(owner);
-  if (!capability?.onJob)
-    return;
-  return {
-    onJob: async (context) => runWithoutCurrentAgent(() => capability.onJob(context)),
-    onJobError: capability.onJobError ? async (context, error) => runWithoutCurrentAgent(() => capability.onJobError(context, error)) : undefined
-  };
-}
+// src/image-limits.ts
+var MAX_IMAGE_BASE64_CHARS = 192 * 1024;
+var MAX_IMAGE_PARTS = 4;
+var IMAGE_INPUT_UNAVAILABLE = "image_input_unavailable";
 
 // node_modules/agents/dist/images-CfuRCjwq.js
 function isDynamicRouteId(modelId) {
@@ -36367,7 +32766,7 @@ function createAnthropicStreamTranslator() {
     }
   };
 }
-function isRecord4(value) {
+function isRecord3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 var NOISE_FIELDS = [
@@ -36403,11 +32802,11 @@ function normalizeDelta(delta, relabelReasoning) {
       out.reasoning_content = reasoning;
   if (Array.isArray(out.tool_calls))
     out.tool_calls = out.tool_calls.map((call, index) => {
-      if (!isRecord4(call))
+      if (!isRecord3(call))
         return call;
-      const fn = isRecord4(call.function) ? call.function : undefined;
+      const fn = isRecord3(call.function) ? call.function : undefined;
       const args = fn !== undefined ? fn.arguments : call.arguments;
-      return fn === undefined && typeof call.name === "string" || isRecord4(args) ? normalizeToolCall(call, index) ?? call : call;
+      return fn === undefined && typeof call.name === "string" || isRecord3(args) ? normalizeToolCall(call, index) ?? call : call;
     });
   return out;
 }
@@ -36463,14 +32862,14 @@ function normalizeChatCompletionsStream(modelId, options = {}) {
       model ??= chunk.model;
     if (typeof chunk.created === "number")
       created ??= chunk.created;
-    if (isRecord4(chunk.error)) {
+    if (isRecord3(chunk.error)) {
       sawFinishReason = true;
       controller.enqueue(JSON.stringify(chunk));
       return;
     }
     if (Array.isArray(chunk.choices)) {
       if (chunk.choices.length === 0) {
-        if (isRecord4(chunk.usage)) {
+        if (isRecord3(chunk.usage)) {
           finalUsage = chunk.usage;
           finalUsageTemplate = {
             ...chunk,
@@ -36481,12 +32880,12 @@ function normalizeChatCompletionsStream(modelId, options = {}) {
         return;
       }
       const choices = chunk.choices.map((choice) => {
-        if (!isRecord4(choice))
+        if (!isRecord3(choice))
           return choice;
         if (typeof choice.finish_reason === "string")
           sawFinishReason = true;
-        const delta = isRecord4(choice.delta) ? normalizeDelta(choice.delta, relabelReasoning) : choice.delta;
-        if (isRecord4(delta)) {
+        const delta = isRecord3(choice.delta) ? normalizeDelta(choice.delta, relabelReasoning) : choice.delta;
+        if (isRecord3(delta)) {
           if (typeof delta.content === "string" && delta.content !== "")
             sawContent = true;
           if (typeof delta.reasoning_content === "string")
@@ -36536,7 +32935,7 @@ function normalizeChatCompletionsStream(modelId, options = {}) {
           index: 0
         }] }));
       }
-      if (isRecord4(chunk.usage)) {
+      if (isRecord3(chunk.usage)) {
         finalUsage = chunk.usage;
         finalUsageTemplate = undefined;
       }
@@ -36567,7 +32966,7 @@ function normalizeChatCompletionsStream(modelId, options = {}) {
       } catch {
         return;
       }
-      if (!isRecord4(parsed))
+      if (!isRecord3(parsed))
         return;
       for (const event of translateAnthropic(parsed) ?? [parsed])
         handle(event, controller);
@@ -36809,6 +33208,16 @@ function resolveOptions(provider, model, call) {
     },
     reasoningEffort: call?.reasoningEffort !== undefined ? call.reasoningEffort : model?.reasoningEffort,
     sessionAffinity: call?.sessionAffinity ?? model?.sessionAffinity
+  };
+}
+
+// node_modules/@earendil-works/pi-ai/dist/utils/string-enum.js
+function StringEnum(values, options) {
+  return {
+    type: "string",
+    enum: values,
+    ...options?.description && { description: options.description },
+    ...options?.default && { default: options.default }
   };
 }
 
@@ -54193,1048 +50602,6 @@ function createAI(settings) {
   });
 }
 
-// src/contract.ts
-var COMPACTION_FAILURE_TEXT = "The conversation could not be compacted. Start a fresh conversation or split the task and retry.";
-var COMPACTION_FAILURE_BY_REASON = {
-  output_limit: "The conversation could not be compacted: its summary ran past the length limit. Send your message again to continue, or start a fresh conversation.",
-  interrupted: "The conversation could not be compacted: summarizing it was interrupted. Send your message again to continue, or start a fresh conversation.",
-  no_model: "The conversation could not be compacted: no model is available to summarize it. Send your message again to continue, or start a fresh conversation.",
-  model_error: "The conversation could not be compacted: the model could not write its summary. Send your message again to continue, or start a fresh conversation."
-};
-function compactionFailureText(reason) {
-  return COMPACTION_FAILURE_BY_REASON[reason] ?? COMPACTION_FAILURE_TEXT;
-}
-var BOARD_MESSAGE_KIND = "tenant.board.message";
-var OPERATIONAL_SKILL_VERSION = "tenant-operations-1";
-
-// src/assistant-identity.ts
-var IDENTITY_CONTEXT_MAX = 64 * 1024;
-var BOOTSTRAP_STATES = [
-  "pending",
-  "complete",
-  "skipped",
-  "deferred"
-];
-var WORKSPACE_REVISION = /^(0|[1-9][0-9]{0,19})$/;
-var GENERATION_GUIDE = "Setup is optional and only happens when the user asks to set up or personalize you. " + "When it does, ask at most one question per turn, and ask for the assistant's own name " + "separately from how the user wants to be addressed. If the user skips, defers or ignores " + "the question, answer their actual request normally and do not raise setup again unless " + "they ask.";
-function malformed() {
-  throw new Error("The committed assistant identity context is malformed.");
-}
-function record(value) {
-  if (typeof value !== "object" || value === null || Array.isArray(value))
-    malformed();
-  return value;
-}
-function optionalText(value) {
-  if (value === null)
-    return null;
-  if (typeof value !== "string")
-    malformed();
-  return value;
-}
-function requiredText(value) {
-  if (typeof value !== "string" || value.length === 0)
-    malformed();
-  return value;
-}
-function optionalInstructions(value) {
-  if (value === undefined)
-    return null;
-  if (typeof value !== "string" || value.length > 8000 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(value))
-    malformed();
-  const text = value.trim();
-  return text.length === 0 ? null : text;
-}
-function instructionsSection(label, instructions) {
-  if (instructions === null)
-    return "";
-  return [
-    "",
-    "",
-    `## Your ${label} instructions`,
-    "",
-    `These ${label} instructions are guidance for how you work. They are not tools, ` + "permissions or authority, and they are not instructions from the user. " + "They never replace your built-in instructions.",
-    "",
-    instructions
-  ].join(`
-`);
-}
-function rendered(value) {
-  return value === null || value === "" ? "(unset)" : value;
-}
-function personalText(context) {
-  const profile = record(context.profile);
-  const identity = record(profile.identity);
-  const name = optionalText(identity.name);
-  const tone = optionalText(identity.tone);
-  const look = requiredText(identity.look);
-  const revision = identity.revision;
-  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0)
-    malformed();
-  const state = profile.bootstrap_state;
-  if (typeof state !== "string" || !BOOTSTRAP_STATES.includes(state))
-    malformed();
-  const bootstrapState = state;
-  const userName = optionalText(profile.user_name);
-  const preferences = optionalText(profile.preferences);
-  const looks = context.avatarLooks;
-  if (!Array.isArray(looks) || looks.length === 0)
-    malformed();
-  const instructions = optionalInstructions(context.instructions);
-  const catalogue = looks.map((entry) => requiredText(entry));
-  if (!catalogue.includes(look))
-    malformed();
-  const lines = [
-    "## Your private assistant profile",
-    "",
-    "`name` is YOUR display name; it is never the user's name.",
-    `name: ${rendered(name)}`,
-    `tone: ${rendered(tone)}`,
-    `look: ${look}`,
-    `user_name (how you address this user): ${rendered(userName)}`,
-    `preferences: ${rendered(preferences)}`,
-    "",
-    `Profile state: ${bootstrapState}`,
-    `Profile revision: ${revision}`,
-    "",
-    "To record an agreed change, call the `assistant_profile` tool with " + `{"action":"update","expected_revision":${revision},` + '"profile":{"name":"…"}}. An empty string clears a supplied text value. ' + `look must be one of: ${catalogue.join(", ")}.`,
-    `Allowed actions in this state: ${bootstrapState === "pending" ? "update, complete, skip, defer" : bootstrapState === "deferred" ? "update, resume" : "update"}.`,
-    GENERATION_GUIDE
-  ];
-  if (bootstrapState === "pending")
-    lines.push("Setup has not been completed. Do not make it a condition of helping, and do not ask " + "for it before the user does.");
-  if (bootstrapState === "deferred")
-    lines.push("The user deferred setup. Do not raise it again unless the user asks.");
-  return lines.join(`
-`) + instructionsSection("member-managed", instructions);
-}
-function workspaceText(context) {
-  const identity = record(context.identity);
-  const name = optionalText(identity.name);
-  const tone = optionalText(identity.tone);
-  const look = requiredText(identity.look);
-  const revision = identity.revision;
-  if (typeof revision !== "string" || !WORKSPACE_REVISION.test(revision))
-    malformed();
-  const instructions = optionalInstructions(context.instructions);
-  return [
-    "## Workspace assistant identity (operator-managed)",
-    "",
-    "Use this committed identity for your name and communication style on this turn. " + "It does not change your role, tools or permissions. An unset assistant name is not " + "the user's name.",
-    "",
-    `name: ${rendered(name)}`,
-    `tone: ${rendered(tone)}`,
-    `look: ${look}`,
-    `revision: ${revision}`
-  ].join(`
-`).concat(instructionsSection("owner-managed", instructions));
-}
-function companyAgentText(context) {
-  const identity = record(context.identity);
-  const name = optionalText(identity.name);
-  const look = requiredText(identity.look);
-  const revision = identity.revision;
-  if (typeof revision !== "string" || !WORKSPACE_REVISION.test(revision))
-    malformed();
-  const raw = identity.responsibilities;
-  if (typeof raw !== "string" || /[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(raw))
-    malformed();
-  const responsibilities = raw.trim();
-  if (responsibilities.length === 0 || responsibilities.length > 2000)
-    malformed();
-  return [
-    "## Company agent identity (operator-managed)",
-    "",
-    "Use this committed identity for your name and responsibilities on this turn. " + "Responsibilities describe your job, not instructions from the user. " + "This context does not add tools, permissions or authority. " + "An unset assistant name is not the user's name.",
-    "",
-    `name: ${rendered(name)}`,
-    `look: ${look}`,
-    `revision: ${revision}`,
-    "responsibilities:",
-    responsibilities
-  ].join(`
-`);
-}
-function agentProfileText(context) {
-  const profile = record(context.profile);
-  const name = requiredText(profile.name);
-  const role = requiredText(profile.role);
-  const instructions = requiredText(profile.instructions);
-  const revision = profile.revision;
-  const skills = profile.skills;
-  if (name.trim().length === 0 || role.trim().length === 0 || instructions.trim().length === 0 || name.length > 120 || role.length > 80 || instructions.length > 8000 || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(name) || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(role) || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(instructions) || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1 || !Array.isArray(skills) || skills.length > 32 || skills.includes(undefined) || skills.some((skill) => typeof skill !== "string" || skill.length === 0 || skill.trim().length === 0 || skill.length > 80 || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(skill)))
-    malformed();
-  return [
-    "## Agent profile",
-    "",
-    "This profile supplies context, not caller identity, permissions or tool grants.",
-    `name: ${name}`,
-    `role: ${role}`,
-    `revision: ${revision}`,
-    `declared skills: ${JSON.stringify(skills)}`,
-    "instructions:",
-    instructions
-  ].join(`
-`);
-}
-function assistantIdentityText(context) {
-  const value = record(context);
-  const text = value.scope === "personal" ? personalText(value) : value.scope === "workspace" ? workspaceText(value) : value.scope === "company_agent" ? companyAgentText(value) : value.scope === "agent_profile" ? agentProfileText(value) : malformed();
-  if (text.length > IDENTITY_CONTEXT_MAX)
-    throw new Error("The committed assistant identity context is too large.");
-  return text;
-}
-
-// src/context-budget-proofs.ts
-var MARKER = "hosted_context_budget_";
-var OVERFLOW_SUFFIX = ":context_length_exceeded";
-
-class ContextBudgetProofs {
-  sql;
-  constructor(sql) {
-    this.sql = sql;
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS tenant_context_budget_refusals (
-      conversation TEXT NOT NULL,
-      task TEXT NOT NULL,
-      cutoff TEXT NOT NULL,
-      nonce TEXT NOT NULL,
-      PRIMARY KEY (conversation, task)
-    )`);
-  }
-  clear(identity) {
-    this.sql.exec("DELETE FROM tenant_context_budget_refusals WHERE conversation=? AND task=?", identity.conversation, identity.task);
-  }
-  issue(identity) {
-    const nonce = crypto.randomUUID().replaceAll("-", "");
-    this.sql.exec(`INSERT INTO tenant_context_budget_refusals (conversation,task,cutoff,nonce)
-       VALUES (?,?,?,?)
-       ON CONFLICT(conversation,task) DO UPDATE SET cutoff=excluded.cutoff, nonce=excluded.nonce`, identity.conversation, identity.task, identity.cutoff, nonce);
-    return `${MARKER}${nonce}${OVERFLOW_SUFFIX}`;
-  }
-  matches(entry, message) {
-    if (typeof message !== "string" || !message.startsWith(MARKER) || typeof entry.conversationId !== "string" && typeof entry.conversationId !== "number" || typeof entry.byTaskId !== "string" && typeof entry.byTaskId !== "number")
-      return false;
-    const rows = this.sql.exec("SELECT nonce FROM tenant_context_budget_refusals WHERE conversation=? AND task=?", String(entry.conversationId), String(entry.byTaskId)).toArray();
-    if (rows.length !== 1 || typeof rows[0]?.nonce !== "string")
-      return false;
-    const issued = `${MARKER}${rows[0].nonce}`;
-    return message === issued || message === `${issued}${OVERFLOW_SUFFIX}`;
-  }
-  settled(entry, message) {
-    if (!this.matches(entry, message))
-      return false;
-    const conversation = Number(entry.conversationId);
-    const task = Number(entry.byTaskId);
-    if (!Number.isSafeInteger(conversation) || !Number.isSafeInteger(task))
-      return false;
-    const rows = this.sql.exec("SELECT status FROM pi_tasks WHERE id=? AND conversation_id=?", task, conversation).toArray();
-    return rows.length === 1 && rows[0]?.status === "terminal";
-  }
-}
-
-// src/tool-policy.ts
-async function withToolAuthority(name, authority, context, execute) {
-  const refusal = authority.toolRefusal(name);
-  if (refusal)
-    throw new Error(refusal);
-  context.abortSignal?.throwIfAborted();
-  await authority.authorizeTool(name);
-  context.abortSignal?.throwIfAborted();
-  return execute();
-}
-
-// src/image-limits.ts
-var MAX_IMAGE_BASE64_CHARS = 192 * 1024;
-var MAX_IMAGE_PARTS = 4;
-var IMAGE_INPUT_UNAVAILABLE = "image_input_unavailable";
-
-// src/engine.ts
-var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
-function outputError(output, acceptsImages) {
-  let count = 0;
-  let bytes = 0;
-  for (const part of output) {
-    if (part.type === "text" && typeof part.text === "string")
-      continue;
-    if (part.type !== "image")
-      return "Tool output is invalid.";
-    if (!acceptsImages)
-      return "Image input is unavailable for this session.";
-    count += 1;
-    bytes += typeof part.data === "string" ? part.data.length : 0;
-    if (count > MAX_IMAGE_PARTS || bytes > MAX_IMAGE_BASE64_CHARS || part.mimeType !== "image/png" && part.mimeType !== "image/jpeg" && part.mimeType !== "image/webp" || typeof part.data !== "string" || part.data.length === 0 || part.data.length % 4 !== 0 || !BASE64.test(part.data))
-      return "Image output is invalid or too large.";
-  }
-  return;
-}
-function invocation(api, app) {
-  return {
-    conversationId: api.conversationId,
-    taskId: api.taskId,
-    now: () => api.now(),
-    ...app === null ? {} : { app }
-  };
-}
-function registration(tool, authority, resolveApp, acceptsImages) {
-  let validator;
-  return {
-    name: tool.name,
-    description: tool.description,
-    parameters: tool.parameters,
-    ...tool.replay === undefined ? {} : { replay: tool.replay },
-    prepareArguments(input) {
-      validator ??= compile(tool.parameters, { formats, unresolvedRefs: "reject" });
-      if (!validator.check(input))
-        throw new Error("Tool arguments do not match the declared schema.");
-      return input;
-    },
-    execute(input, api, context) {
-      const run = async () => {
-        const app = resolveApp === undefined ? null : await resolveApp(api, context);
-        const result = await tool.execute(input, invocation(api, app), { abortSignal: context.abortSignal });
-        const error = result.output && outputError(result.output, acceptsImages);
-        if (error)
-          return {
-            output: [{ type: "text", text: error }],
-            isError: true
-          };
-        return {
-          ...result.output ? {
-            output: result.output.map((part) => part.type === "text" ? { type: "text", text: part.text } : {
-              type: "image",
-              data: part.data,
-              mimeType: part.mimeType
-            })
-          } : {},
-          ...result.isError ? { isError: true } : {}
-        };
-      };
-      if (authority === undefined)
-        return run();
-      return withToolAuthority(tool.name, authority, { abortSignal: context.abortSignal }, run);
-    }
-  };
-}
-function runtimeExtension(group, authority, resolveApp, acceptsImages = false) {
-  return {
-    name: group.name,
-    ...group.tools ? {
-      tools: group.tools.map((tool) => registration(tool, authority, resolveApp, acceptsImages))
-    } : {}
-  };
-}
-function authorizeRegistration(tool, authority) {
-  return {
-    ...tool,
-    execute(input, api, context) {
-      return withToolAuthority(tool.name, authority, { abortSignal: context.abortSignal }, () => tool.execute(input, api, context));
-    }
-  };
-}
-function authorizeExtension(extension, authority) {
-  if (!extension.tools)
-    return extension;
-  return {
-    ...extension,
-    tools: extension.tools.map((tool) => authorizeRegistration(tool, authority))
-  };
-}
-function intentGuard(refusal) {
-  return {
-    name: "hosted-tool-policy",
-    hooks: [
-      hook(ToolTask, {
-        beforeTool: (call) => {
-          const block = refusal(call.name);
-          return block ? { block } : undefined;
-        }
-      })
-    ]
-  };
-}
-
-// src/loop-guard.ts
-var DEFAULT_LOOP_GUARD_LIMIT = 4;
-function stableJson(value, seen = new WeakSet) {
-  if (value === null)
-    return "null";
-  if (value === undefined)
-    return "undefined";
-  const kind = typeof value;
-  if (kind === "boolean" || kind === "string")
-    return JSON.stringify(value);
-  if (kind === "number")
-    return Number.isFinite(value) ? JSON.stringify(value) : "null";
-  if (kind === "bigint")
-    return JSON.stringify(value.toString());
-  if (kind !== "object")
-    return "null";
-  const obj = value;
-  if (seen.has(obj))
-    return '"[Circular]"';
-  seen.add(obj);
-  try {
-    const maybeToJson = value.toJSON;
-    if (typeof maybeToJson === "function") {
-      return stableJson(maybeToJson.call(value), seen);
-    }
-    if (Array.isArray(value)) {
-      const items = value.map((item) => item === undefined || typeof item === "function" || typeof item === "symbol" ? "null" : stableJson(item, seen));
-      return `[${items.join(",")}]`;
-    }
-    const record = value;
-    const keys = Object.keys(record).sort();
-    const entries = [];
-    for (const key of keys) {
-      const prop = record[key];
-      if (prop === undefined || typeof prop === "function" || typeof prop === "symbol")
-        continue;
-      entries.push(`${JSON.stringify(key)}:${stableJson(prop, seen)}`);
-    }
-    return `{${entries.join(",")}}`;
-  } finally {
-    seen.delete(obj);
-  }
-}
-
-class LoopGuard {
-  states = new Map;
-  limit;
-  constructor(limit = DEFAULT_LOOP_GUARD_LIMIT) {
-    this.limit = Math.max(1, Math.floor(limit));
-  }
-  record(conversationKey, toolName, args) {
-    const key = String(conversationKey ?? "default");
-    const fingerprint = `${toolName}\x00${stableJson(args)}`;
-    const prev = this.states.get(key);
-    if (prev && prev.fingerprint === fingerprint) {
-      prev.count += 1;
-      if (prev.count > this.limit) {
-        return `Loop guard stopped repeated '${toolName}' call (${prev.count} consecutive identical attempts). Change parameters, switch to a different tool or skill, or explain the blocker to the user.`;
-      }
-      return;
-    }
-    this.states.set(key, { fingerprint, count: 1 });
-    return;
-  }
-  reset(conversationKey) {
-    if (conversationKey === undefined) {
-      this.states.clear();
-      return;
-    }
-    this.states.delete(String(conversationKey));
-  }
-}
-function loopGuardExtension(guard) {
-  return {
-    name: "hosted-loop-guard",
-    hooks: [
-      hook(ToolTask, {
-        beforeTool: (call, api) => {
-          const block = guard.record(api.conversationId, call.name, call.arguments);
-          return block ? { block } : undefined;
-        }
-      })
-    ]
-  };
-}
-
-// src/identity.ts
-var IDENTITY_PART = /^[A-Za-z0-9_-]{1,40}$/;
-function readGenerationIdentity(sql) {
-  let rows;
-  try {
-    rows = sql.exec(`SELECT id, record FROM pi_tasks
-          WHERE kind = '"pi.generation"' AND status = 'running'
-          ORDER BY id DESC LIMIT 2`).toArray().map((row) => ({ id: Number(row.id), record: String(row.record) }));
-  } catch {
-    return null;
-  }
-  if (rows.length !== 1)
-    return null;
-  const row = rows[0];
-  let record;
-  try {
-    record = JSON.parse(row.record);
-  } catch {
-    return null;
-  }
-  const checkpoint = record.state?.checkpoint;
-  if (record.kind !== "pi.generation" || record.state?.status !== "running" || !checkpoint || checkpoint.phase !== "request") {
-    return null;
-  }
-  const conversationId = record.conversationId;
-  const cutoff = checkpoint.cutoff;
-  const cutoffValue = typeof cutoff === "number" && Number.isSafeInteger(cutoff) && cutoff >= 0 ? String(cutoff) : typeof cutoff === "string" ? cutoff : null;
-  const conversation = typeof conversationId === "number" && Number.isSafeInteger(conversationId) ? String(conversationId) : typeof conversationId === "string" ? conversationId : null;
-  const task = String(row.id);
-  if (conversation === null || cutoffValue === null || !IDENTITY_PART.test(conversation) || !IDENTITY_PART.test(task) || !IDENTITY_PART.test(cutoffValue)) {
-    return null;
-  }
-  return { conversation, task, cutoff: cutoffValue };
-}
-function readCompactionIdentity(sql, taskId) {
-  if (!Number.isSafeInteger(taskId) || taskId <= 0)
-    return null;
-  try {
-    const rows = sql.exec(`SELECT id, conversation_id, record FROM pi_tasks
-          WHERE id = ? AND kind = '"pi.compaction"' AND status = 'running'`, taskId).toArray();
-    const row = rows[0];
-    if (rows.length !== 1 || row?.id !== taskId)
-      return null;
-    const record = parseRecord(row.record);
-    const state = record?.state;
-    if (typeof state !== "object" || state === null || Array.isArray(state))
-      return null;
-    const checkpoint = state.checkpoint;
-    if (record?.id !== taskId || record.conversationId !== row.conversation_id || record.kind !== "pi.compaction" || state.status !== "running" || typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
-      return null;
-    const request = checkpoint;
-    if (request.phase !== "summarize")
-      return null;
-    const part = (value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? String(value) : null;
-    const conversation = part(record.conversationId);
-    const cutoff = part(request.tail);
-    if (conversation === null || cutoff === null)
-      return null;
-    return { conversation, task: String(taskId), cutoff };
-  } catch {
-    return null;
-  }
-}
-function readSubmissionEntry(sql, submissionId) {
-  const unavailable = () => new Error(`Submission "${submissionId}" has no readable placed entry.`);
-  const id = Number(submissionId);
-  if (!Number.isSafeInteger(id) || id <= 0)
-    throw unavailable();
-  const submission = record2(sql, "pi_submissions", id);
-  if (submission === null || submission.type !== "input")
-    throw unavailable();
-  const entryId = submission.entry;
-  if (typeof entryId !== "number" || !Number.isSafeInteger(entryId) || entryId <= 0)
-    throw unavailable();
-  const entry = entryData(sql, entryId);
-  if (entry === null)
-    throw unavailable();
-  return entry;
-}
-function readSubmissionRequestId(sql, submissionId) {
-  const unavailable = () => new Error(`Submission "${submissionId}" has no readable request identity.`);
-  const id = Number(submissionId);
-  if (!Number.isSafeInteger(id) || id <= 0)
-    throw unavailable();
-  const submission = record2(sql, "pi_submissions", id);
-  if (submission === null || submission.type !== "input" || typeof submission.requestId !== "string")
-    throw unavailable();
-  return submission.requestId;
-}
-function submissionHeld(sql, operationId) {
-  if (!hasSubmissions(sql))
-    return false;
-  const held = sql.exec("SELECT 1 AS held FROM pi_submissions WHERE json_extract(record,'$.requestId')=? LIMIT 1", operationId).toArray()[0];
-  return held !== undefined;
-}
-function readHeldSubmission(sql, conversationId, operationId) {
-  if (!hasSubmissions(sql))
-    return null;
-  const rows = sql.exec(`SELECT id, record FROM pi_submissions
-        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
-  if (rows.length === 0)
-    return null;
-  if (rows.length > 1)
-    throw new Error(`Operation "${operationId}" names more than one engine submission.`);
-  const row = rows[0];
-  if (row === undefined)
-    return null;
-  const id = Number(row.id);
-  if (!Number.isSafeInteger(id) || id <= 0)
-    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
-  const submission = parseRecord(row.record);
-  if (submission === null)
-    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
-  const { type, status } = submission;
-  if (type !== "input" && type !== "write")
-    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
-  if (status !== "queued" && status !== "placed" && status !== "done" && status !== "unanswered")
-    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
-  const entryId = submission.entry;
-  if (entryId === undefined || entryId === null)
-    return { id, type, status, text: null, entry: null };
-  if (typeof entryId !== "number" || !Number.isSafeInteger(entryId) || entryId <= 0)
-    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
-  const entry = entryData(sql, entryId);
-  if (entry === null)
-    throw new Error(`Operation "${operationId}" has an engine submission whose entry is unavailable.`);
-  return { id, type, status, text: entryText(entry.model), entry };
-}
-function isEntryId(value) {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-function terminalOutcome(value) {
-  if (typeof value !== "object" || value === null || Array.isArray(value))
-    return false;
-  const outcome = value;
-  switch (outcome.status) {
-    case "completed":
-      return Object.hasOwn(outcome, "result") && outcome.error === undefined && outcome.reason === undefined;
-    case "failed":
-    case "faulted": {
-      const error = outcome.error;
-      return typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.message === "string" && outcome.reason === undefined && (outcome.status === "failed" || outcome.result === undefined);
-    }
-    case "aborted":
-      return outcome.error === undefined && (outcome.reason === undefined || typeof outcome.reason === "string");
-    case "orphaned":
-      return typeof outcome.reason === "string" && outcome.result === undefined && outcome.error === undefined;
-    default:
-      return false;
-  }
-}
-function passiveSummary(task, state) {
-  if (task.kind !== "pi.compaction" || task.version !== 1 || task.owner !== undefined || task.background !== true || task.abortRequested !== false || state.outcome !== undefined)
-    return false;
-  const input = task.input;
-  if (typeof input !== "object" || input === null || Array.isArray(input) || !("reason" in input) || input.reason !== "threshold" || "instructions" in input)
-    return false;
-  const checkpoint = state.checkpoint;
-  if (typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
-    return false;
-  const request = checkpoint;
-  const active = state.status === "pending" || state.status === "running";
-  if (request.phase === "select")
-    return active;
-  const model = request.model;
-  if (!isEntryId(request.attempt) || !isEntryId(request.tail) || !isEntryId(request.firstKept) || request.firstKept > request.tail || typeof request.maxTokens !== "number" || !Number.isSafeInteger(request.maxTokens) || request.maxTokens < 0 || typeof request.thinkingLevel !== "string" || typeof request.streamOptions !== "object" || request.streamOptions === null || Array.isArray(request.streamOptions) || typeof model !== "object" || model === null || Array.isArray(model) || !("provider" in model) || typeof model.provider !== "string" || !model.provider || !("modelId" in model) || typeof model.modelId !== "string" || !model.modelId)
-    return false;
-  if (request.phase === "summarize")
-    return active;
-  return request.phase === "retry" && typeof request.until === "number" && Number.isFinite(request.until) && (active || state.status === "sleeping" && state.until === request.until);
-}
-function entryHasRole(sql, id, conversationId, role) {
-  const rows = sql.exec("SELECT id, conversation_id, record FROM pi_entries WHERE id=?", id).toArray();
-  if (rows.length !== 1)
-    return false;
-  const row = rows[0];
-  const entry = parseRecord(row.record);
-  return Number(row.id) === id && Number(row.conversation_id) === conversationId && entry !== null && entry.id === id && entry.conversationId === conversationId && Array.isArray(entry.model) && entry.model.some((message) => typeof message === "object" && message !== null && !Array.isArray(message) && message.role === role);
-}
-function readSubmissionSettlement(sql, conversationId, operationId, allowPassiveSummary = false) {
-  const schema = sql.exec(`SELECT name, type FROM sqlite_master
-      WHERE name IN ('pi_submissions','pi_tasks','pi_entries','pi_submissions_by_request')
-         OR (type='table' AND name GLOB 'pi_*')`).toArray();
-  const submissions = schema.find((row) => row.name === "pi_submissions");
-  const tasks = schema.find((row) => row.name === "pi_tasks");
-  const entries = schema.find((row) => row.name === "pi_entries");
-  const requestIndex = schema.find((row) => row.name === "pi_submissions_by_request");
-  if (submissions === undefined && tasks === undefined)
-    return { state: schema.length === 0 ? "absent" : "unknown" };
-  if (submissions?.type !== "table" || tasks?.type !== "table" || entries?.type !== "table" || requestIndex?.type !== "index")
-    return { state: "unknown" };
-  const taskColumns = "SELECT id, conversation_id, kind, status, background, abort_requested, record FROM pi_tasks";
-  let taskAfter;
-  for (;; ) {
-    const rows = taskAfter === undefined ? sql.exec(`${taskColumns} ORDER BY id LIMIT 500`).toArray() : sql.exec(`${taskColumns} WHERE id>? ORDER BY id LIMIT 500`, taskAfter).toArray();
-    for (const row of rows) {
-      const id = Number(row.id);
-      const conversation = Number(row.conversation_id);
-      const record = parseRecord(row.record);
-      if (!isEntryId(id) || !isEntryId(conversation) || record === null || record.id !== id || record.conversationId !== conversation || typeof record.kind !== "string" || JSON.stringify(record.kind) !== row.kind || typeof record.version !== "number" || !Object.hasOwn(record, "input") || typeof record.background !== "boolean" || Number(record.background) !== row.background || typeof record.abortRequested !== "boolean" || Number(record.abortRequested) !== row.abort_requested)
-        return { state: "unknown" };
-      const state = record.state;
-      if (typeof state !== "object" || state === null || Array.isArray(state))
-        return { state: "unknown" };
-      const taskState = state;
-      if (taskState.status !== row.status)
-        return { state: "unknown" };
-      if (taskState.status === "terminal") {
-        if (taskState.checkpoint !== undefined || !terminalOutcome(taskState.outcome))
-          return { state: "unknown" };
-      } else if (!allowPassiveSummary || conversation !== conversationId || !passiveSummary(record, taskState))
-        return { state: "unknown" };
-      taskAfter = id;
-    }
-    if (rows.length < 500)
-      break;
-  }
-  const columns = "SELECT id, conversation_id, request_id, status, record FROM pi_submissions";
-  let after;
-  let settled;
-  for (;; ) {
-    const rows = after === undefined ? sql.exec(`${columns} ORDER BY id LIMIT 500`).toArray() : sql.exec(`${columns} WHERE id>? ORDER BY id LIMIT 500`, after).toArray();
-    for (const row of rows) {
-      const id = Number(row.id);
-      const conversation = Number(row.conversation_id);
-      const record = parseRecord(row.record);
-      if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(conversation) || conversation <= 0 || record === null || record.id !== id || record.conversationId !== conversation || record.status !== row.status || record.status !== "done" && record.status !== "unanswered" || (record.requestId === undefined ? row.request_id !== null : typeof record.requestId !== "string" || row.request_id !== JSON.stringify(record.requestId)))
-        return { state: "unknown" };
-      if (conversation === conversationId && record.requestId === operationId) {
-        if (settled !== undefined || record.type !== "input")
-          return { state: "unknown" };
-        if (record.status === "done") {
-          if (!isEntryId(record.entry) || !isEntryId(record.answer) || record.reason !== undefined || record.detail !== undefined)
-            return { state: "unknown" };
-        } else if (record.entry !== undefined && !isEntryId(record.entry) || record.answer !== undefined || typeof record.reason !== "string")
-          return { state: "unknown" };
-        if (record.entry !== undefined && !entryHasRole(sql, record.entry, conversationId, "user") || record.status === "done" && !entryHasRole(sql, record.answer, conversationId, "assistant"))
-          return { state: "unknown" };
-        settled = { state: "settled", submission: id, status: record.status };
-      }
-      after = id;
-    }
-    if (rows.length < 500)
-      break;
-  }
-  const indexed = sql.exec(`SELECT id FROM pi_submissions INDEXED BY pi_submissions_by_request
-      WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
-  if (settled === undefined)
-    return { state: indexed.length === 0 ? "absent" : "unknown" };
-  if (indexed.length !== 1 || Number(indexed[0]?.id) !== settled.submission)
-    return { state: "unknown" };
-  return settled;
-}
-function configureOperationReplyCapture(sql, enabled) {
-  if (!enabled) {
-    if (sql.exec(`SELECT 1 FROM sqlite_master
-      WHERE type='table' AND name='tenant_operation_replies'`).toArray().length === 0)
-      return;
-    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_insert");
-    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_update");
-    sql.exec("DROP INDEX IF EXISTS tenant_operation_replies_body_request");
-    return;
-  }
-  sql.exec(`CREATE TABLE IF NOT EXISTS tenant_operation_replies (
-    submission_id INTEGER PRIMARY KEY,
-    conversation_id INTEGER NOT NULL,
-    request_id TEXT,
-    status TEXT NOT NULL,
-    input_id INTEGER,
-    answer_id INTEGER
-  ) STRICT`);
-  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_answer
-    ON tenant_operation_replies (answer_id) WHERE answer_id IS NOT NULL`);
-  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_body_request
-    ON pi_submissions (conversation_id, json_extract(record, '$.requestId'))`);
-  for (const event of ["INSERT", "UPDATE"]) {
-    const transition = event === "UPDATE" ? "AND OLD.status IN ('queued', 'placed')" : "";
-    sql.exec(`CREATE TRIGGER IF NOT EXISTS tenant_operation_replies_${event.toLowerCase()}
-      AFTER ${event} ON pi_submissions
-      WHEN NEW.status IN ('done', 'unanswered') AND json_extract(NEW.record, '$.type')='input' ${transition}
-      BEGIN
-        INSERT OR IGNORE INTO tenant_operation_replies
-          (submission_id, conversation_id, request_id, status, input_id, answer_id)
-        VALUES (NEW.id, NEW.conversation_id, NEW.request_id, NEW.status,
-          json_extract(NEW.record, '$.entry'), json_extract(NEW.record, '$.answer'));
-      END`);
-  }
-}
-function readOperationReply(sql, conversationId, operationId) {
-  const unconfirmed = { state: "unconfirmed", operationId };
-  try {
-    const rows = sql.exec(`SELECT id, status, record FROM pi_submissions INDEXED BY pi_submissions_by_request
-        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
-    const row = rows[0];
-    if (rows.length !== 1 || !row || !isEntryId(row.id))
-      return unconfirmed;
-    const bodies = sql.exec(`SELECT id FROM pi_submissions INDEXED BY tenant_operation_replies_body_request
-      WHERE conversation_id=? AND json_extract(record, '$.requestId')=json_extract(?, '$') LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
-    if (bodies.length !== 1 || bodies[0]?.id !== row.id)
-      return unconfirmed;
-    const submission = parseRecord(row.record);
-    if (submission === null || submission.type !== "input" || submission.id !== row.id || submission.conversationId !== conversationId || submission.requestId !== operationId || submission.status !== row.status)
-      return unconfirmed;
-    if (submission.entry !== undefined && (!isEntryId(submission.entry) || !entryHasRole(sql, submission.entry, conversationId, "user")))
-      return unconfirmed;
-    if (submission.status === "queued" || submission.status === "placed") {
-      if (submission.status === "placed" !== (submission.entry !== undefined) || submission.answer !== undefined || submission.reason !== undefined || submission.detail !== undefined)
-        return unconfirmed;
-      return { state: "pending", operationId };
-    }
-    const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
-      FROM tenant_operation_replies WHERE submission_id=?`, row.id).toArray()[0];
-    if (!receipt || receipt.conversation_id !== conversationId || receipt.request_id !== JSON.stringify(operationId) || receipt.status !== submission.status || receipt.input_id !== (submission.entry ?? null) || receipt.answer_id !== (submission.answer ?? null))
-      return unconfirmed;
-    if (submission.status === "unanswered" && submission.answer === undefined && typeof submission.reason === "string")
-      return { state: "unanswered", operationId };
-    const answerId = submission.answer;
-    if (submission.status !== "done" || !isEntryId(submission.entry) || !isEntryId(answerId) || submission.reason !== undefined || submission.detail !== undefined)
-      return unconfirmed;
-    const owners = sql.exec(`SELECT submission_id FROM tenant_operation_replies
-      WHERE answer_id=? LIMIT 2`, answerId).toArray();
-    if (owners.length !== 1 || owners[0]?.submission_id !== row.id)
-      return unconfirmed;
-    const answer = sql.exec("SELECT conversation_id, record FROM pi_entries WHERE id=?", answerId).toArray()[0];
-    if (answer?.conversation_id !== conversationId)
-      return unconfirmed;
-    const entry = parseRecord(answer.record);
-    if (entry === null || entry.id !== answerId || entry.conversationId !== conversationId || !Array.isArray(entry.model))
-      return unconfirmed;
-    const message = entry.model[0];
-    if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
-      return unconfirmed;
-    if (!("stopReason" in message) || message.stopReason !== "stop")
-      return unconfirmed;
-    let text = "";
-    for (const part of message.content) {
-      if (typeof part !== "object" || part === null || !("type" in part))
-        return unconfirmed;
-      if (part.type === "text") {
-        if (!("text" in part) || typeof part.text !== "string")
-          return unconfirmed;
-        text += part.text;
-      } else if (part.type !== "thinking" && part.type !== "toolCall")
-        return unconfirmed;
-    }
-    return text === "" ? unconfirmed : { state: "answered", operationId, text };
-  } catch {
-    return unconfirmed;
-  }
-}
-function hasSubmissions(sql) {
-  const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'").toArray()[0];
-  return table !== undefined;
-}
-function entryData(sql, entryId) {
-  const entry = record2(sql, "pi_entries", entryId);
-  if (entry === null || !("kind" in entry))
-    return null;
-  return {
-    kind: entry.kind,
-    data: "data" in entry ? entry.data : undefined,
-    model: "model" in entry ? entry.model : undefined
-  };
-}
-function entryText(model) {
-  if (!Array.isArray(model) || model.length !== 1)
-    return null;
-  const message = model[0];
-  if (typeof message !== "object" || message === null || Array.isArray(message))
-    return null;
-  if (!("role" in message) || !("content" in message))
-    return null;
-  if (message.role !== "user" || typeof message.content !== "string")
-    return null;
-  return message.content;
-}
-function failureReason(outcome) {
-  if (outcome.status !== "failed")
-    return "unknown";
-  const error = outcome.error;
-  if (typeof error !== "object" || error === null || Array.isArray(error))
-    return "unknown";
-  const { message, detail } = error;
-  const reason = typeof detail === "object" && detail !== null && !Array.isArray(detail) ? detail.reason : undefined;
-  if (reason === "restart_limit")
-    return "interrupted";
-  if (reason === "no_model")
-    return "no_model";
-  if (reason !== "model_error")
-    return "unknown";
-  if (typeof message === "string" && message.startsWith("Summarization hit the token limit"))
-    return "output_limit";
-  return "model_error";
-}
-function readCompactionFailure(sql, conversationId) {
-  if (!Number.isSafeInteger(conversationId) || conversationId <= 0)
-    return null;
-  try {
-    const rows = sql.exec(`SELECT id, record FROM pi_tasks
-          WHERE conversation_id = ? AND kind = '"pi.compaction"' AND status = 'terminal'
-          ORDER BY id DESC LIMIT 1`, conversationId).toArray();
-    const row = rows[0];
-    if (row === undefined || !Number.isSafeInteger(row.id))
-      return null;
-    const id = Number(row.id);
-    const latest = sql.exec(`SELECT MAX(id) AS latest FROM pi_entries WHERE conversation_id = ?`, conversationId).toArray()[0]?.latest;
-    if (typeof latest === "number" && id <= latest)
-      return null;
-    const record = parseRecord(row.record);
-    const owner = record?.owner;
-    if (!Number.isSafeInteger(owner))
-      return null;
-    const state = record?.state;
-    if (typeof state !== "object" || state === null || Array.isArray(state))
-      return null;
-    const terminal = state;
-    if (terminal.status !== "terminal")
-      return null;
-    const outcome = terminal.outcome;
-    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome))
-      return null;
-    const status = outcome.status;
-    if (status !== "failed" && status !== "faulted" && status !== "orphaned")
-      return null;
-    const parent = sql.exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner).toArray()[0];
-    return parent === undefined || parent.status === "terminal" ? failureReason(outcome) : null;
-  } catch {
-    return null;
-  }
-}
-function parseRecord(stored) {
-  if (typeof stored !== "string")
-    return null;
-  try {
-    const parsed = JSON.parse(stored);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
-      return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-function record2(sql, table, id) {
-  const row = sql.exec(`SELECT record FROM ${table} WHERE id=?`, id).toArray()[0];
-  if (row === undefined)
-    return null;
-  return parseRecord(row.record);
-}
-
-// src/model-guard.ts
-var boundaries = new WeakMap;
-function guardModelStream(models, check) {
-  const existing = boundaries.get(models);
-  if (existing !== undefined) {
-    existing.checks.push(check);
-    return;
-  }
-  const original = models.streamSimple.bind(models);
-  const checks = [check];
-  boundaries.set(models, { checks, original });
-  models.streamSimple = (model, context, options) => {
-    for (const guard of checks)
-      guard(context.messages);
-    return original(model, context, options);
-  };
-  models.completeSimple = (model, context, options) => original(model, context, options).result();
-}
-
-// src/identity-context.ts
-function withSystemContext(messages, text, authored) {
-  const system = {
-    role: "system",
-    content: text,
-    timestamp: Date.now()
-  };
-  authored?.add(system);
-  let index = 0;
-  while (index < messages.length && messages[index].role === "system")
-    index += 1;
-  return [...messages.slice(0, index), system, ...messages.slice(index)];
-}
-function requireAuthoredIdentity(messages, authored) {
-  if (!messages.some((message) => authored.has(message)))
-    throw new Error("The model request did not receive the canonical assistant identity context.");
-}
-function guardModelRequests(models, authored) {
-  guardModelStream(models, (messages) => requireAuthoredIdentity(messages, authored));
-}
-function identityContextExtension(load, authored, snapshots) {
-  return {
-    name: "hosted-identity-context",
-    hooks: [
-      hook(GenerationTask, {
-        async beforeRequest(request, api, context) {
-          const live = await api.snapshot(LiveDoc, api.conversationId, context);
-          const run = live?.run;
-          if (run === undefined || run.taskId !== api.taskId || run.inputs.length === 0)
-            throw new Error("The active run's identity snapshot is unavailable.");
-          const root = run.inputs[0];
-          if (root === undefined || !Number.isSafeInteger(root) || root < 0)
-            throw new Error("The active run's identity root is unavailable.");
-          const text = await snapshots.readOrInsert(String(root), load, Date.now());
-          return {
-            messages: withSystemContext(request.messages, text, authored)
-          };
-        }
-      })
-    ]
-  };
-}
-
-// src/identity-snapshots.ts
-var CREATE_TABLE = `CREATE TABLE IF NOT EXISTS tenant_identity_snapshots (
-    run_id TEXT PRIMARY KEY,
-    context TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  )`;
-
-class IdentitySnapshots {
-  sql;
-  constructor(sql) {
-    this.sql = sql;
-    this.sql.exec(CREATE_TABLE);
-  }
-  async readOrInsert(runId, load, nowMs) {
-    if (typeof runId !== "string" || runId.length === 0)
-      throw new Error("The operation's identity root is unavailable.");
-    const existing = this.row(runId);
-    if (existing !== null)
-      return existing;
-    const text = await load();
-    if (typeof text !== "string" || text.length === 0 || text.length > IDENTITY_CONTEXT_MAX)
-      throw new Error("The operation's identity context is unavailable.");
-    this.sql.exec(`INSERT OR IGNORE INTO tenant_identity_snapshots (run_id,context,created_at)
-       VALUES (?,?,?)`, runId, text, nowMs);
-    const stored = this.row(runId);
-    if (stored === null)
-      throw new Error("The operation's identity snapshot is unavailable.");
-    return stored;
-  }
-  row(runId) {
-    const row = this.sql.exec("SELECT context FROM tenant_identity_snapshots WHERE run_id=?", runId).toArray()[0];
-    if (!row)
-      return null;
-    if (typeof row.context !== "string" || row.context.length === 0 || row.context.length > IDENTITY_CONTEXT_MAX)
-      throw new Error("The operation's identity snapshot is malformed.");
-    return row.context;
-  }
-}
-
-// src/master.ts
-function operationStatus(pending) {
-  const running = pending.find((operation) => operation.status === "running");
-  const queued = pending.filter((operation) => operation.status === "queued");
-  return {
-    running: running !== undefined,
-    message: running?.operationId ?? null,
-    queued: queued.length,
-    queuedMessages: queued.map((operation) => operation.operationId)
-  };
-}
-function masterState(model, status, conversationId, metadata) {
-  const state = {
-    ...metadata,
-    alias: "master",
-    provider: "cadence",
-    endpoint_kind: "durable_object",
-    live: true,
-    model,
-    model_label: model,
-    effort: null,
-    context: null,
-    session: conversationId === null ? null : {
-      id: conversationId,
-      messages: null,
-      streaming: status.running,
-      compacting: false
-    },
-    commands: ["new", "stop"],
-    turn: status.running ? {
-      state: "working",
-      message: status.message ?? null,
-      conversation: conversationId,
-      app_origin: null,
-      summary: null,
-      since: null
-    } : null,
-    queue: [],
-    queued: status.queued,
-    compaction_failure: status.compactionFailure ?? null
-  };
-  if (typeof state.toJSON === "function")
-    throw new TypeError("Master metadata cannot replace root serialization.");
-  return state;
-}
-
 // src/summary-tool-errors.ts
 var TOOL_ERROR_REDACTED = "the call failed; its error text is left out of this summary";
 var TOOL_ERROR_TEXT_OMITTED = "(tool error text omitted)";
@@ -55853,68 +51220,460 @@ function meteredBinding(transport, identity, onModelResolved, maxImagesPerReques
   };
 }
 
-// src/model-task-context.ts
-class ModelTaskContext {
-  phases = new WeakMap;
-  calls = new WeakMap;
-  startSpan = async (options, callback) => {
-    const span = {
-      startSpan: this.startSpan,
-      addLink() {},
-      addEvent() {},
-      setAttributes() {},
-      setStatus() {}
-    };
-    const attributes = options.attributes;
-    const task = attributes?.["task.id"];
-    const name = attributes?.["task.name"];
-    const phase = attributes?.phase;
-    if (options.name === "pi.durable.phase" && attributes?.kind === "run" && typeof task === "number" && Number.isSafeInteger(task) && task > 0) {
-      if (name === "pi.generation" && phase === "request")
-        this.phases.set(span, { kind: "generation", task });
-      else if (name === "pi.compaction" && phase === "summarize")
-        this.phases.set(span, { kind: "compaction", task });
-    }
-    return callback(span);
-  };
-  telemetry = { startSpan: this.startSpan };
-  install(models) {
-    const stream = models.streamSimple.bind(models);
-    const complete = models.completeSimple.bind(models);
-    models.streamSimple = (model, context, options) => {
-      this.bind(options, "generation");
-      return stream(model, context, options);
-    };
-    models.completeSimple = (model, context, options) => {
-      this.bind(options, "compaction");
-      return complete(model, context, options);
-    };
+// src/operation-scope.ts
+import { createHash } from "node:crypto";
+
+// src/identity.ts
+var IDENTITY_PART = /^[A-Za-z0-9_-]{1,40}$/;
+function readGenerationIdentity(sql) {
+  let rows;
+  try {
+    rows = sql.exec(`SELECT id, record FROM pi_tasks
+          WHERE kind = '"pi.generation"' AND status = 'running'
+          ORDER BY id DESC LIMIT 2`).toArray().map((row) => ({ id: Number(row.id), record: String(row.record) }));
+  } catch {
+    return null;
   }
-  bind(options, kind) {
-    const signal = options?.signal;
-    if (!signal)
-      return;
-    const phase = options.telemetry && this.phases.get(options.telemetry);
-    const call = phase?.kind === kind ? phase : kind === "generation" && phase === undefined ? { kind } : null;
-    if (this.calls.has(signal)) {
-      const previous = this.calls.get(signal);
-      if (!previous || !call || previous.kind !== call.kind || previous.task !== call.task) {
-        this.calls.set(signal, null);
-        return;
-      }
-    }
-    this.calls.set(signal, call);
+  if (rows.length !== 1)
+    return null;
+  const row = rows[0];
+  let record;
+  try {
+    record = JSON.parse(row.record);
+  } catch {
+    return null;
   }
-  read(signal) {
-    if (!signal || signal.aborted)
+  const checkpoint = record.state?.checkpoint;
+  if (record.kind !== "pi.generation" || record.state?.status !== "running" || !checkpoint || checkpoint.phase !== "request") {
+    return null;
+  }
+  const conversationId = record.conversationId;
+  const cutoff = checkpoint.cutoff;
+  const cutoffValue = typeof cutoff === "number" && Number.isSafeInteger(cutoff) && cutoff >= 0 ? String(cutoff) : typeof cutoff === "string" ? cutoff : null;
+  const conversation = typeof conversationId === "number" && Number.isSafeInteger(conversationId) ? String(conversationId) : typeof conversationId === "string" ? conversationId : null;
+  const task = String(row.id);
+  if (conversation === null || cutoffValue === null || !IDENTITY_PART.test(conversation) || !IDENTITY_PART.test(task) || !IDENTITY_PART.test(cutoffValue)) {
+    return null;
+  }
+  return { conversation, task, cutoff: cutoffValue };
+}
+function readCompactionIdentity(sql, taskId) {
+  if (!Number.isSafeInteger(taskId) || taskId <= 0)
+    return null;
+  try {
+    const rows = sql.exec(`SELECT id, conversation_id, record FROM pi_tasks
+          WHERE id = ? AND kind = '"pi.compaction"' AND status = 'running'`, taskId).toArray();
+    const row = rows[0];
+    if (rows.length !== 1 || row?.id !== taskId)
       return null;
-    return this.calls.get(signal) ?? null;
+    const record = parseRecord(row.record);
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state))
+      return null;
+    const checkpoint = state.checkpoint;
+    if (record?.id !== taskId || record.conversationId !== row.conversation_id || record.kind !== "pi.compaction" || state.status !== "running" || typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
+      return null;
+    const request = checkpoint;
+    if (request.phase !== "summarize")
+      return null;
+    const part = (value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+    const conversation = part(record.conversationId);
+    const cutoff = part(request.tail);
+    if (conversation === null || cutoff === null)
+      return null;
+    return { conversation, task: String(taskId), cutoff };
+  } catch {
+    return null;
   }
+}
+function readSubmissionEntry(sql, submissionId) {
+  const unavailable = () => new Error(`Submission "${submissionId}" has no readable placed entry.`);
+  const id = Number(submissionId);
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw unavailable();
+  const submission = record(sql, "pi_submissions", id);
+  if (submission === null || submission.type !== "input")
+    throw unavailable();
+  const entryId = submission.entry;
+  if (typeof entryId !== "number" || !Number.isSafeInteger(entryId) || entryId <= 0)
+    throw unavailable();
+  const entry = entryData(sql, entryId);
+  if (entry === null)
+    throw unavailable();
+  return entry;
+}
+function readSubmissionRequestId(sql, submissionId) {
+  const unavailable = () => new Error(`Submission "${submissionId}" has no readable request identity.`);
+  const id = Number(submissionId);
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw unavailable();
+  const submission = record(sql, "pi_submissions", id);
+  if (submission === null || submission.type !== "input" || typeof submission.requestId !== "string")
+    throw unavailable();
+  return submission.requestId;
+}
+function submissionHeld(sql, operationId) {
+  if (!hasSubmissions(sql))
+    return false;
+  const held = sql.exec("SELECT 1 AS held FROM pi_submissions WHERE json_extract(record,'$.requestId')=? LIMIT 1", operationId).toArray()[0];
+  return held !== undefined;
+}
+function readHeldSubmission(sql, conversationId, operationId) {
+  if (!hasSubmissions(sql))
+    return null;
+  const rows = sql.exec(`SELECT id, record FROM pi_submissions
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
+  if (rows.length === 0)
+    return null;
+  if (rows.length > 1)
+    throw new Error(`Operation "${operationId}" names more than one engine submission.`);
+  const row = rows[0];
+  if (row === undefined)
+    return null;
+  const id = Number(row.id);
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  const submission = parseRecord(row.record);
+  if (submission === null)
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  const { type, status } = submission;
+  if (type !== "input" && type !== "write")
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  if (status !== "queued" && status !== "placed" && status !== "done" && status !== "unanswered")
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  const entryId = submission.entry;
+  if (entryId === undefined || entryId === null)
+    return { id, type, status, text: null, entry: null };
+  if (typeof entryId !== "number" || !Number.isSafeInteger(entryId) || entryId <= 0)
+    throw new Error(`Operation "${operationId}" has an unreadable engine submission.`);
+  const entry = entryData(sql, entryId);
+  if (entry === null)
+    throw new Error(`Operation "${operationId}" has an engine submission whose entry is unavailable.`);
+  return { id, type, status, text: entryText(entry.model), entry };
+}
+function isEntryId(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+function terminalOutcome(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return false;
+  const outcome = value;
+  switch (outcome.status) {
+    case "completed":
+      return Object.hasOwn(outcome, "result") && outcome.error === undefined && outcome.reason === undefined;
+    case "failed":
+    case "faulted": {
+      const error = outcome.error;
+      return typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.message === "string" && outcome.reason === undefined && (outcome.status === "failed" || outcome.result === undefined);
+    }
+    case "aborted":
+      return outcome.error === undefined && (outcome.reason === undefined || typeof outcome.reason === "string");
+    case "orphaned":
+      return typeof outcome.reason === "string" && outcome.result === undefined && outcome.error === undefined;
+    default:
+      return false;
+  }
+}
+function passiveSummary(task, state) {
+  if (task.kind !== "pi.compaction" || task.version !== 1 || task.owner !== undefined || task.background !== true || task.abortRequested !== false || state.outcome !== undefined)
+    return false;
+  const input = task.input;
+  if (typeof input !== "object" || input === null || Array.isArray(input) || !("reason" in input) || input.reason !== "threshold" || "instructions" in input)
+    return false;
+  const checkpoint = state.checkpoint;
+  if (typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint))
+    return false;
+  const request = checkpoint;
+  const active = state.status === "pending" || state.status === "running";
+  if (request.phase === "select")
+    return active;
+  const model = request.model;
+  if (!isEntryId(request.attempt) || !isEntryId(request.tail) || !isEntryId(request.firstKept) || request.firstKept > request.tail || typeof request.maxTokens !== "number" || !Number.isSafeInteger(request.maxTokens) || request.maxTokens < 0 || typeof request.thinkingLevel !== "string" || typeof request.streamOptions !== "object" || request.streamOptions === null || Array.isArray(request.streamOptions) || typeof model !== "object" || model === null || Array.isArray(model) || !("provider" in model) || typeof model.provider !== "string" || !model.provider || !("modelId" in model) || typeof model.modelId !== "string" || !model.modelId)
+    return false;
+  if (request.phase === "summarize")
+    return active;
+  return request.phase === "retry" && typeof request.until === "number" && Number.isFinite(request.until) && (active || state.status === "sleeping" && state.until === request.until);
+}
+function entryHasRole(sql, id, conversationId, role) {
+  const rows = sql.exec("SELECT id, conversation_id, record FROM pi_entries WHERE id=?", id).toArray();
+  if (rows.length !== 1)
+    return false;
+  const row = rows[0];
+  const entry = parseRecord(row.record);
+  return Number(row.id) === id && Number(row.conversation_id) === conversationId && entry !== null && entry.id === id && entry.conversationId === conversationId && Array.isArray(entry.model) && entry.model.some((message) => typeof message === "object" && message !== null && !Array.isArray(message) && message.role === role);
+}
+function readSubmissionSettlement(sql, conversationId, operationId, allowPassiveSummary = false) {
+  const schema = sql.exec(`SELECT name, type FROM sqlite_master
+      WHERE name IN ('pi_submissions','pi_tasks','pi_entries','pi_submissions_by_request')
+         OR (type='table' AND name GLOB 'pi_*')`).toArray();
+  const submissions = schema.find((row) => row.name === "pi_submissions");
+  const tasks = schema.find((row) => row.name === "pi_tasks");
+  const entries = schema.find((row) => row.name === "pi_entries");
+  const requestIndex = schema.find((row) => row.name === "pi_submissions_by_request");
+  if (submissions === undefined && tasks === undefined)
+    return { state: schema.length === 0 ? "absent" : "unknown" };
+  if (submissions?.type !== "table" || tasks?.type !== "table" || entries?.type !== "table" || requestIndex?.type !== "index")
+    return { state: "unknown" };
+  const taskColumns = "SELECT id, conversation_id, kind, status, background, abort_requested, record FROM pi_tasks";
+  let taskAfter;
+  for (;; ) {
+    const rows = taskAfter === undefined ? sql.exec(`${taskColumns} ORDER BY id LIMIT 500`).toArray() : sql.exec(`${taskColumns} WHERE id>? ORDER BY id LIMIT 500`, taskAfter).toArray();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const conversation = Number(row.conversation_id);
+      const record = parseRecord(row.record);
+      if (!isEntryId(id) || !isEntryId(conversation) || record === null || record.id !== id || record.conversationId !== conversation || typeof record.kind !== "string" || JSON.stringify(record.kind) !== row.kind || typeof record.version !== "number" || !Object.hasOwn(record, "input") || typeof record.background !== "boolean" || Number(record.background) !== row.background || typeof record.abortRequested !== "boolean" || Number(record.abortRequested) !== row.abort_requested)
+        return { state: "unknown" };
+      const state = record.state;
+      if (typeof state !== "object" || state === null || Array.isArray(state))
+        return { state: "unknown" };
+      const taskState = state;
+      if (taskState.status !== row.status)
+        return { state: "unknown" };
+      if (taskState.status === "terminal") {
+        if (taskState.checkpoint !== undefined || !terminalOutcome(taskState.outcome))
+          return { state: "unknown" };
+      } else if (!allowPassiveSummary || conversation !== conversationId || !passiveSummary(record, taskState))
+        return { state: "unknown" };
+      taskAfter = id;
+    }
+    if (rows.length < 500)
+      break;
+  }
+  const columns = "SELECT id, conversation_id, request_id, status, record FROM pi_submissions";
+  let after;
+  let settled;
+  for (;; ) {
+    const rows = after === undefined ? sql.exec(`${columns} ORDER BY id LIMIT 500`).toArray() : sql.exec(`${columns} WHERE id>? ORDER BY id LIMIT 500`, after).toArray();
+    for (const row of rows) {
+      const id = Number(row.id);
+      const conversation = Number(row.conversation_id);
+      const record = parseRecord(row.record);
+      if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(conversation) || conversation <= 0 || record === null || record.id !== id || record.conversationId !== conversation || record.status !== row.status || record.status !== "done" && record.status !== "unanswered" || (record.requestId === undefined ? row.request_id !== null : typeof record.requestId !== "string" || row.request_id !== JSON.stringify(record.requestId)))
+        return { state: "unknown" };
+      if (conversation === conversationId && record.requestId === operationId) {
+        if (settled !== undefined || record.type !== "input")
+          return { state: "unknown" };
+        if (record.status === "done") {
+          if (!isEntryId(record.entry) || !isEntryId(record.answer) || record.reason !== undefined || record.detail !== undefined)
+            return { state: "unknown" };
+        } else if (record.entry !== undefined && !isEntryId(record.entry) || record.answer !== undefined || typeof record.reason !== "string")
+          return { state: "unknown" };
+        if (record.entry !== undefined && !entryHasRole(sql, record.entry, conversationId, "user") || record.status === "done" && !entryHasRole(sql, record.answer, conversationId, "assistant"))
+          return { state: "unknown" };
+        settled = { state: "settled", submission: id, status: record.status };
+      }
+      after = id;
+    }
+    if (rows.length < 500)
+      break;
+  }
+  const indexed = sql.exec(`SELECT id FROM pi_submissions INDEXED BY pi_submissions_by_request
+      WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
+  if (settled === undefined)
+    return { state: indexed.length === 0 ? "absent" : "unknown" };
+  if (indexed.length !== 1 || Number(indexed[0]?.id) !== settled.submission)
+    return { state: "unknown" };
+  return settled;
+}
+function configureOperationReplyCapture(sql, enabled) {
+  if (!enabled) {
+    if (sql.exec(`SELECT 1 FROM sqlite_master
+      WHERE type='table' AND name='tenant_operation_replies'`).toArray().length === 0)
+      return;
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_insert");
+    sql.exec("DROP TRIGGER IF EXISTS tenant_operation_replies_update");
+    sql.exec("DROP INDEX IF EXISTS tenant_operation_replies_body_request");
+    return;
+  }
+  sql.exec(`CREATE TABLE IF NOT EXISTS tenant_operation_replies (
+    submission_id INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    request_id TEXT,
+    status TEXT NOT NULL,
+    input_id INTEGER,
+    answer_id INTEGER
+  ) STRICT`);
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_answer
+    ON tenant_operation_replies (answer_id) WHERE answer_id IS NOT NULL`);
+  sql.exec(`CREATE INDEX IF NOT EXISTS tenant_operation_replies_body_request
+    ON pi_submissions (conversation_id, json_extract(record, '$.requestId'))`);
+  for (const event of ["INSERT", "UPDATE"]) {
+    const transition = event === "UPDATE" ? "AND OLD.status IN ('queued', 'placed')" : "";
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS tenant_operation_replies_${event.toLowerCase()}
+      AFTER ${event} ON pi_submissions
+      WHEN NEW.status IN ('done', 'unanswered') AND json_extract(NEW.record, '$.type')='input' ${transition}
+      BEGIN
+        INSERT OR IGNORE INTO tenant_operation_replies
+          (submission_id, conversation_id, request_id, status, input_id, answer_id)
+        VALUES (NEW.id, NEW.conversation_id, NEW.request_id, NEW.status,
+          json_extract(NEW.record, '$.entry'), json_extract(NEW.record, '$.answer'));
+      END`);
+  }
+}
+function readOperationReply(sql, conversationId, operationId) {
+  const unconfirmed = { state: "unconfirmed", operationId };
+  try {
+    const rows = sql.exec(`SELECT id, status, record FROM pi_submissions INDEXED BY pi_submissions_by_request
+        WHERE conversation_id=? AND request_id=? ORDER BY id LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
+    const row = rows[0];
+    if (rows.length !== 1 || !row || !isEntryId(row.id))
+      return unconfirmed;
+    const bodies = sql.exec(`SELECT id FROM pi_submissions INDEXED BY tenant_operation_replies_body_request
+      WHERE conversation_id=? AND json_extract(record, '$.requestId')=json_extract(?, '$') LIMIT 2`, conversationId, JSON.stringify(operationId)).toArray();
+    if (bodies.length !== 1 || bodies[0]?.id !== row.id)
+      return unconfirmed;
+    const submission = parseRecord(row.record);
+    if (submission === null || submission.type !== "input" || submission.id !== row.id || submission.conversationId !== conversationId || submission.requestId !== operationId || submission.status !== row.status)
+      return unconfirmed;
+    if (submission.entry !== undefined && (!isEntryId(submission.entry) || !entryHasRole(sql, submission.entry, conversationId, "user")))
+      return unconfirmed;
+    if (submission.status === "queued" || submission.status === "placed") {
+      if (submission.status === "placed" !== (submission.entry !== undefined) || submission.answer !== undefined || submission.reason !== undefined || submission.detail !== undefined)
+        return unconfirmed;
+      return { state: "pending", operationId };
+    }
+    const receipt = sql.exec(`SELECT conversation_id, request_id, status, input_id, answer_id
+      FROM tenant_operation_replies WHERE submission_id=?`, row.id).toArray()[0];
+    if (!receipt || receipt.conversation_id !== conversationId || receipt.request_id !== JSON.stringify(operationId) || receipt.status !== submission.status || receipt.input_id !== (submission.entry ?? null) || receipt.answer_id !== (submission.answer ?? null))
+      return unconfirmed;
+    if (submission.status === "unanswered" && submission.answer === undefined && typeof submission.reason === "string")
+      return { state: "unanswered", operationId };
+    const answerId = submission.answer;
+    if (submission.status !== "done" || !isEntryId(submission.entry) || !isEntryId(answerId) || submission.reason !== undefined || submission.detail !== undefined)
+      return unconfirmed;
+    const owners = sql.exec(`SELECT submission_id FROM tenant_operation_replies
+      WHERE answer_id=? LIMIT 2`, answerId).toArray();
+    if (owners.length !== 1 || owners[0]?.submission_id !== row.id)
+      return unconfirmed;
+    const answer = sql.exec("SELECT conversation_id, record FROM pi_entries WHERE id=?", answerId).toArray()[0];
+    if (answer?.conversation_id !== conversationId)
+      return unconfirmed;
+    const entry = parseRecord(answer.record);
+    if (entry === null || entry.id !== answerId || entry.conversationId !== conversationId || !Array.isArray(entry.model))
+      return unconfirmed;
+    const message = entry.model[0];
+    if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "assistant" || !("content" in message) || !Array.isArray(message.content))
+      return unconfirmed;
+    if (!("stopReason" in message) || message.stopReason !== "stop")
+      return unconfirmed;
+    let text = "";
+    for (const part of message.content) {
+      if (typeof part !== "object" || part === null || !("type" in part))
+        return unconfirmed;
+      if (part.type === "text") {
+        if (!("text" in part) || typeof part.text !== "string")
+          return unconfirmed;
+        text += part.text;
+      } else if (part.type !== "thinking" && part.type !== "toolCall")
+        return unconfirmed;
+    }
+    return text === "" ? unconfirmed : { state: "answered", operationId, text };
+  } catch {
+    return unconfirmed;
+  }
+}
+function hasSubmissions(sql) {
+  const table = sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='pi_submissions'").toArray()[0];
+  return table !== undefined;
+}
+function entryData(sql, entryId) {
+  const entry = record(sql, "pi_entries", entryId);
+  if (entry === null || !("kind" in entry))
+    return null;
+  return {
+    kind: entry.kind,
+    data: "data" in entry ? entry.data : undefined,
+    model: "model" in entry ? entry.model : undefined
+  };
+}
+function entryText(model) {
+  if (!Array.isArray(model) || model.length !== 1)
+    return null;
+  const message = model[0];
+  if (typeof message !== "object" || message === null || Array.isArray(message))
+    return null;
+  if (!("role" in message) || !("content" in message))
+    return null;
+  if (message.role !== "user" || typeof message.content !== "string")
+    return null;
+  return message.content;
+}
+function failureReason(outcome) {
+  if (outcome.status !== "failed")
+    return "unknown";
+  const error = outcome.error;
+  if (typeof error !== "object" || error === null || Array.isArray(error))
+    return "unknown";
+  const { message, detail } = error;
+  const reason = typeof detail === "object" && detail !== null && !Array.isArray(detail) ? detail.reason : undefined;
+  if (reason === "restart_limit")
+    return "interrupted";
+  if (reason === "no_model")
+    return "no_model";
+  if (reason !== "model_error")
+    return "unknown";
+  if (typeof message === "string" && message.startsWith("Summarization hit the token limit"))
+    return "output_limit";
+  return "model_error";
+}
+function readCompactionFailure(sql, conversationId) {
+  if (!Number.isSafeInteger(conversationId) || conversationId <= 0)
+    return null;
+  try {
+    const rows = sql.exec(`SELECT id, record FROM pi_tasks
+          WHERE conversation_id = ? AND kind = '"pi.compaction"' AND status = 'terminal'
+          ORDER BY id DESC LIMIT 1`, conversationId).toArray();
+    const row = rows[0];
+    if (row === undefined || !Number.isSafeInteger(row.id))
+      return null;
+    const id = Number(row.id);
+    const latest = sql.exec(`SELECT MAX(id) AS latest FROM pi_entries WHERE conversation_id = ?`, conversationId).toArray()[0]?.latest;
+    if (typeof latest === "number" && id <= latest)
+      return null;
+    const record = parseRecord(row.record);
+    const owner = record?.owner;
+    if (!Number.isSafeInteger(owner))
+      return null;
+    const state = record?.state;
+    if (typeof state !== "object" || state === null || Array.isArray(state))
+      return null;
+    const terminal = state;
+    if (terminal.status !== "terminal")
+      return null;
+    const outcome = terminal.outcome;
+    if (typeof outcome !== "object" || outcome === null || Array.isArray(outcome))
+      return null;
+    const status = outcome.status;
+    if (status !== "failed" && status !== "faulted" && status !== "orphaned")
+      return null;
+    const parent = sql.exec(`SELECT status FROM pi_tasks WHERE id = ?`, owner).toArray()[0];
+    return parent === undefined || parent.status === "terminal" ? failureReason(outcome) : null;
+  } catch {
+    return null;
+  }
+}
+function parseRecord(stored) {
+  if (typeof stored !== "string")
+    return null;
+  try {
+    const parsed = JSON.parse(stored);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+      return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function record(sql, table, id) {
+  const row = sql.exec(`SELECT record FROM ${table} WHERE id=?`, id).toArray()[0];
+  if (row === undefined)
+    return null;
+  return parseRecord(row.record);
 }
 
 // src/operation-scope.ts
-import { createHash } from "node:crypto";
-var CREATE_TABLE2 = `CREATE TABLE IF NOT EXISTS tenant_operation_scopes (
+var CREATE_TABLE = `CREATE TABLE IF NOT EXISTS tenant_operation_scopes (
     operation_id TEXT PRIMARY KEY,
     install_id TEXT,
     context_id TEXT,
@@ -56000,7 +51759,7 @@ class OperationScopes {
   sql;
   constructor(sql) {
     this.sql = sql;
-    this.sql.exec(CREATE_TABLE2);
+    this.sql.exec(CREATE_TABLE);
   }
   admit(envelope, evidence) {
     if (typeof envelope !== "object" || envelope === null)
@@ -56065,6 +51824,4509 @@ class OperationScopes {
       throw new Error("The operation's stored envelope is malformed.");
     const app = contextId === null ? parseAppScope({ installId }) : parseAppScope({ installId, contextId });
     return { digest, app };
+  }
+}
+
+// src/transcript.ts
+var PI_MAX_RETRIES = 3;
+var word = (alternatives) => new RegExp(`(?<![a-z0-9])(?:${alternatives})(?![a-z0-9])`, "i");
+var TIMEOUT = /timed?.?out|timeout|deadline.?exceeded/i;
+var UNREACHABLE = /connection.?(?:refused|reset|lost|error)|network.?error|(?:temporarily.?)?unavailable|upstream.?(?:connect|request.?failed)/i;
+var UNREACHABLE_STATUS = word("502|503|504");
+var BUSY = /rate.?limit|too many requests|overloaded|server.?busy/i;
+var BUSY_STATUS = word("429");
+var REFUSED = /refused|forbidden|unauthori[sz]ed|denied/i;
+var REFUSED_STATUS = word("401|402|403");
+var TOOL_CALL = /tool.?call/i;
+var TOOL_CALL_OUTPUT_LIMIT = /output.?(?:limit|space|token)/i;
+var TOOL_CALL_TOO_LARGE = /larger|too.?(?:large|big)|supported.?limit/i;
+function failedTurnReason(errorMessage) {
+  const raw = errorMessage ?? "";
+  if (raw.includes("billing_unavailable"))
+    return "billing_unavailable";
+  if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
+    return "The selected model cannot read images.";
+  if (TIMEOUT.test(raw))
+    return "The model request timed out.";
+  if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
+    return "The model service could not be reached.";
+  if (BUSY.test(raw) || BUSY_STATUS.test(raw))
+    return "The model is busy right now.";
+  if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
+    return "The model request was refused.";
+  if (TOOL_CALL.test(raw)) {
+    if (TOOL_CALL_OUTPUT_LIMIT.test(raw))
+      return "The model ran out of output space while writing a tool call. Ask for the content in smaller parts.";
+    if (TOOL_CALL_TOO_LARGE.test(raw))
+      return "The model wrote a tool call that was too large. Ask for the content in smaller parts.";
+  }
+  return "The model request failed.";
+}
+function terminalError(messages, index) {
+  const message = messages[index];
+  if (message?.role !== "assistant" || message.stopReason !== "error")
+    return false;
+  const next = messages[index + 1];
+  if (next !== undefined)
+    return next.role === "user";
+  if (isRetryableAssistantError(message)) {
+    let failures = 0;
+    for (let i = index;i >= 0; i--) {
+      const earlier = messages[i];
+      if (earlier?.role !== "assistant" || earlier.stopReason !== "error")
+        break;
+      failures += 1;
+    }
+    return failures > PI_MAX_RETRIES;
+  }
+  return !isContextOverflow(message);
+}
+function toolCallText(name, args) {
+  for (const key of ["command", "cmd", "path", "query", "url"]) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim() !== "")
+      return `${name}: ${value}`;
+  }
+  const json = JSON.stringify(args);
+  return json === undefined || json === "{}" ? name : `${name} ${json}`;
+}
+function createdAt(timestamp) {
+  return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
+}
+function projectedThreadEntries(records, includeThinking, project, budgetProof, settledBudgetProof) {
+  const entries = threadEntries(records, includeThinking, budgetProof, settledBudgetProof);
+  return project ? [...project(entries)] : entries;
+}
+var RESET_KIND = "pi.reset";
+var COMPACTION_KIND = "pi.compaction";
+var RESET_BOUNDARY = { role: "user", content: "", timestamp: 0 };
+var FRESH_START_TEXT = "Started fresh. The assistant no longer uses the messages above.";
+var HISTORY_PAGE = 500;
+async function readAllRecords(scan) {
+  const records = [];
+  let cursor;
+  do {
+    const page = await scan(cursor, HISTORY_PAGE);
+    records.push(...page.items);
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return records;
+}
+function threadEntries(records, includeThinking, budgetProof, settledBudgetProof) {
+  const entries = [];
+  const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
+  const all = visible.flatMap((record) => record.kind === RESET_KIND ? [RESET_BOUNDARY, ...record.model ?? []] : record.model ?? []);
+  let position = -1;
+  for (const record of visible) {
+    if (record.kind === RESET_KIND) {
+      position += 1;
+      const previous = entries.at(-1);
+      if (previous !== undefined && !(previous.role === "system" && previous.text === FRESH_START_TEXT)) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "system",
+          kind: "message",
+          text: FRESH_START_TEXT
+        });
+      }
+    }
+    const data = record.data;
+    const messageId = record.kind === BOARD_MESSAGE_KIND && data !== null && typeof data === "object" && !Array.isArray(data) && typeof data.messageId === "string" ? data.messageId : undefined;
+    const app = data !== null && typeof data === "object" && !Array.isArray(data) ? parseEntryAppScope(record.kind, data) : null;
+    const payload = app === null ? undefined : { app: appPayload(app) };
+    for (const message of record.model ?? []) {
+      position += 1;
+      if (message.role === "toolResult") {
+        const text = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join(`
+`).trim();
+        entries.push({
+          seq: entries.length + 1,
+          role: "agent",
+          kind: "tool_result",
+          text,
+          ...createdAt(message.timestamp),
+          payload: {
+            tool_use_id: message.toolCallId,
+            ...message.isError ? { is_error: true } : {}
+          }
+        });
+        continue;
+      }
+      const parts = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
+      const operator = message.role === "user";
+      const agent = message.role === "assistant";
+      const terminal = agent && (message.stopReason === "stop" || message.stopReason === "length");
+      const textCount = parts.filter((part) => part.type === "text" && part.text.trim().length > 0).length;
+      let textSeen = 0;
+      for (const part of parts) {
+        if (part.type === "thinking") {
+          if (!includeThinking || part.thinking.trim().length === 0)
+            continue;
+          entries.push({
+            seq: entries.length + 1,
+            role: "agent",
+            kind: "thinking",
+            text: part.thinking.trim(),
+            ...createdAt(message.timestamp),
+            ...part.redacted === true ? { payload: { redacted: true } } : {}
+          });
+          continue;
+        }
+        if (part.type === "toolCall") {
+          entries.push({
+            seq: entries.length + 1,
+            role: "agent",
+            kind: "tool_call",
+            text: toolCallText(part.name, part.arguments),
+            ...createdAt(message.timestamp),
+            payload: { tool_use_id: part.id }
+          });
+          continue;
+        }
+        if (part.type !== "text" || part.text.trim().length === 0)
+          continue;
+        textSeen += 1;
+        const final = agent && terminal && textSeen === textCount;
+        entries.push({
+          seq: entries.length + 1,
+          role: operator ? "operator" : agent ? "agent" : "system",
+          kind: agent ? final ? "turn_result" : "assistant_text" : "message",
+          text: part.text,
+          ...createdAt(message.timestamp),
+          ...operator && messageId !== undefined ? { message: messageId } : {},
+          ...operator && payload !== undefined ? { payload } : {}
+        });
+      }
+      if (!agent)
+        continue;
+      const outputLimitWithoutAnswer = message.stopReason === "length" && textCount === 0;
+      if (outputLimitWithoutAnswer || terminalError(all, position) || message.stopReason === "error" && all[position + 1] === undefined && settledBudgetProof?.(record, message.errorMessage) === true) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "agent",
+          kind: "turn_result",
+          text: "",
+          ...createdAt(message.timestamp),
+          payload: {
+            status: "failed",
+            error: outputLimitWithoutAnswer ? "The model reached its output limit before answering. Split the task and try again." : budgetProof?.(record, message.errorMessage) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(message.errorMessage)
+          }
+        });
+      }
+    }
+  }
+  return entries;
+}
+
+// src/failed-turn-context.ts
+var PARTIAL_TEXT_CAP = 400;
+function failed(message) {
+  return message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted");
+}
+function partialText(message) {
+  const text = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join(`
+`).trim();
+  return text.length <= PARTIAL_TEXT_CAP ? text : `${text.slice(0, PARTIAL_TEXT_CAP)}...`;
+}
+function readable(reason) {
+  return reason === "billing_unavailable" ? "Billing is unavailable for this workspace." : reason;
+}
+function failureNote(message, ran) {
+  const reason = message.stopReason === "aborted" ? "The turn was stopped." : readable(failedTurnReason(message.errorMessage));
+  const partial = partialText(message);
+  const names = [...new Set(ran.map((result) => result.toolName))];
+  return [
+    `[Your previous turn did not finish: ${reason}`,
+    partial === "" ? "" : ` Text you had written before the failure: ${JSON.stringify(partial)}.`,
+    names.length === 0 ? " No tool call from that turn completed.]" : ` These tool calls from that turn ran and may have taken effect: ${names.join(", ")}.]`
+  ].join("");
+}
+function withFailedTurnNotes(messages) {
+  let out;
+  let copied = 0;
+  for (let index = 0;index < messages.length; index++) {
+    const message = messages[index];
+    if (!failed(message))
+      continue;
+    const ids = new Set(message.content.flatMap((part) => part.type === "toolCall" ? [part.id] : []));
+    const ran = [];
+    let after = index + 1;
+    for (let next = messages[after];next?.role === "toolResult" && ids.has(next.toolCallId); next = messages[++after])
+      ran.push(next);
+    const next = messages[after];
+    const terminal = next === undefined ? message.stopReason === "error" && ran.length === 0 && terminalError(messages, index) : next.role === "user";
+    if (!terminal)
+      continue;
+    out ??= [];
+    out.push(...messages.slice(copied, index));
+    out.push({
+      ...message,
+      content: [{ type: "text", text: failureNote(message, ran) }],
+      stopReason: "stop",
+      errorMessage: undefined
+    });
+    copied = after;
+    index = after - 1;
+  }
+  if (out === undefined)
+    return messages;
+  out.push(...messages.slice(copied));
+  return out;
+}
+function failedTurnContextExtension() {
+  return {
+    name: "hosted-failed-turn-context",
+    hooks: [
+      hook(GenerationTask, {
+        beforeRequest(request) {
+          const messages = withFailedTurnNotes(request.messages);
+          return messages === request.messages ? undefined : { messages };
+        }
+      })
+    ]
+  };
+}
+
+// src/hosted-session.ts
+init_models();
+import { DurableObject } from "cloudflare:workers";
+
+// node_modules/agents/dist/classPrivateFieldGet2-DZBYAB34.js
+function _checkPrivateRedeclaration(e, t) {
+  if (t.has(e))
+    throw new TypeError("Cannot initialize the same private elements twice on an object");
+}
+function _classPrivateFieldInitSpec(e, t, a) {
+  _checkPrivateRedeclaration(e, t), t.set(e, a);
+}
+function _assertClassBrand(e, t, n) {
+  if (typeof e == "function" ? e === t : e.has(t))
+    return arguments.length < 3 ? t : n;
+  throw new TypeError("Private element is not present on this object");
+}
+function _classPrivateFieldSet2(s, a, r) {
+  return s.set(_assertClassBrand(s, a), r), r;
+}
+function _classPrivateFieldGet2(s, a) {
+  return s.get(_assertClassBrand(s, a));
+}
+
+// node_modules/agents/dist/classPrivateMethodInitSpec-qMjJ6sHQ.js
+function _classPrivateMethodInitSpec(e, a) {
+  _checkPrivateRedeclaration(e, a), a.add(e);
+}
+
+// node_modules/agents/dist/capability-DBAKc6UZ.js
+var installedServices = /* @__PURE__ */ new WeakMap;
+var LifecycleCapability = class {
+  constructor(capabilityId) {
+    this.claims = "selective";
+    if (capabilityId.trim() === "")
+      throw new Error("Lifecycle capability IDs must be non-empty");
+    this.capabilityId = capabilityId;
+  }
+  onStart(_context) {}
+  get lifecycleServices() {
+    return installedServices.get(this);
+  }
+  get lifecycle() {
+    const services = this.lifecycleServices;
+    if (!services)
+      throw new Error(`${this.constructor.name} must be installed with Lifecycle.use() before use`);
+    return services;
+  }
+};
+function bindLifecycleCapability(capability, services) {
+  installedServices.set(capability, services);
+}
+function lifecycleCapabilityId(capability) {
+  return capability instanceof LifecycleCapability ? capability.capabilityId : undefined;
+}
+
+// node_modules/agents/dist/retries.js
+function jitterBackoff(attempt, baseDelayMs, maxDelayMs) {
+  const upperBoundMs = Math.min(2 ** attempt * baseDelayMs, maxDelayMs);
+  return Math.floor(Math.random() * upperBoundMs);
+}
+async function tryN(n, fn, options) {
+  if (!Number.isFinite(n) || n < 1)
+    throw new Error("retry.maxAttempts must be >= 1");
+  n = Math.floor(n);
+  const rawBase = options?.baseDelayMs ?? 100;
+  const rawMax = options?.maxDelayMs ?? 3000;
+  if (!Number.isFinite(rawBase) || rawBase <= 0)
+    throw new Error("retry.baseDelayMs must be > 0");
+  if (!Number.isFinite(rawMax) || rawMax <= 0)
+    throw new Error("retry.maxDelayMs must be > 0");
+  const baseDelayMs = Math.floor(rawBase);
+  const maxDelayMs = Math.floor(rawMax);
+  if (baseDelayMs > maxDelayMs)
+    throw new Error("retry.baseDelayMs must be <= retry.maxDelayMs");
+  let attempt = 1;
+  while (true)
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      const nextAttempt = attempt + 1;
+      if (nextAttempt > n || options?.shouldRetry && !options.shouldRetry(err, nextAttempt))
+        throw err;
+      const delay = jitterBackoff(attempt, baseDelayMs, maxDelayMs);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      attempt = nextAttempt;
+    }
+}
+function isErrorRetryable(err) {
+  if (typeof err !== "object" || err === null)
+    return false;
+  const msg = String(err);
+  const typed = err;
+  return Boolean(typed.retryable) && !typed.overloaded && !msg.includes("Durable Object is overloaded");
+}
+var SUPERSEDED_ISOLATE_PATTERN = /reset because its code was updated|this script has been upgraded/i;
+var CONNECTION_LOST_PATTERN = /network connection lost/i;
+var STORAGE_RESET_PATTERN = /Internal error in Durable Object storage caused object to be reset/i;
+var MEMORY_LIMIT_RESET_PATTERN = /exceeded its memory limit/i;
+function errorMessageOf(error) {
+  return error instanceof Error ? error.message : typeof error === "string" ? error : "";
+}
+function* selfAndCauses(error) {
+  let current = error;
+  for (let depth = 0;depth < 8 && current != null; depth++) {
+    yield current;
+    current = typeof current === "object" ? current.cause : undefined;
+  }
+}
+function isDurableObjectCodeUpdateReset(error) {
+  for (const e of selfAndCauses(error))
+    if (SUPERSEDED_ISOLATE_PATTERN.test(errorMessageOf(e)))
+      return true;
+  return false;
+}
+function isDurableObjectMemoryLimitReset(error) {
+  for (const e of selfAndCauses(error))
+    if (MEMORY_LIMIT_RESET_PATTERN.test(errorMessageOf(e)))
+      return true;
+  return false;
+}
+function isPlatformFailure(error) {
+  return isPlatformTransientError(error) || isDurableObjectMemoryLimitReset(error);
+}
+function isPlatformTransientError(error) {
+  for (const e of selfAndCauses(error)) {
+    const message = errorMessageOf(e);
+    if (SUPERSEDED_ISOLATE_PATTERN.test(message))
+      return true;
+    if (CONNECTION_LOST_PATTERN.test(message))
+      return true;
+    if (STORAGE_RESET_PATTERN.test(message))
+      return true;
+    if (isErrorRetryable(e))
+      return true;
+  }
+  return false;
+}
+
+// node_modules/agents/dist/resource-B59OV2a2.js
+function ok(value) {
+  return {
+    ok: true,
+    value
+  };
+}
+function err(error) {
+  return {
+    ok: false,
+    error
+  };
+}
+var SkillParseError = class extends Error {
+  constructor(code, message, options) {
+    super(message, options);
+    this.code = code;
+    this._tag = "SkillParseError";
+    this.name = "SkillParseError";
+  }
+};
+var NAME_MAX_LENGTH = 64;
+var DESCRIPTION_MAX_LENGTH = 1024;
+var COMPATIBILITY_MAX_LENGTH = 500;
+var NAME_CHARACTERS = /^[\p{L}\p{N}-]+$/u;
+var UNSAFE_NAME_CHARACTERS = /[/\\\u0000-\u001f\u007f]/;
+var SPEC_FIELDS = /* @__PURE__ */ new Set([
+  "name",
+  "description",
+  "license",
+  "compatibility",
+  "metadata",
+  "allowed-tools"
+]);
+function parseSkillFrontmatter(data, body, options = {}) {
+  if (!isRecord4(data))
+    return err(new SkillParseError("invalid-frontmatter", "SKILL.md frontmatter must be a YAML mapping."));
+  const warnings = [];
+  let failure;
+  function take(field) {
+    if ("fatal" in field) {
+      failure ??= field.fatal;
+      return;
+    }
+    for (const problem of field.problems ?? [])
+      warnings.push(problem);
+    return field.value;
+  }
+  const name = take(parseName(data.name, options.directory));
+  const description = take(parseDescription(data.description));
+  const license = take(parseLicense(data.license));
+  const compatibility = take(parseCompatibility(data.compatibility));
+  const metadata = take(parseMetadata(data.metadata));
+  const allowedTools = take(parseAllowedTools(data["allowed-tools"]));
+  if (failure || name === undefined || description === undefined || metadata === undefined || allowedTools === undefined)
+    return err(failure ?? new SkillParseError("invalid-frontmatter", "Invalid frontmatter."));
+  const extraFields = {};
+  for (const [key, value] of Object.entries(data))
+    if (!SPEC_FIELDS.has(key))
+      extraFields[key] = value;
+  return {
+    ok: true,
+    value: {
+      name,
+      description,
+      ...license === undefined ? {} : { license },
+      ...compatibility === undefined ? {} : { compatibility },
+      metadata,
+      allowedTools,
+      extraFields,
+      body
+    },
+    warnings
+  };
+}
+function isModelInvocable(skill) {
+  return skill.extraFields["disable-model-invocation"] !== true && skill.metadata["disable-model-invocation"] !== "true";
+}
+function specNameProblem(name) {
+  if (name.length === 0)
+    return "it must not be empty";
+  if ([...name].length > NAME_MAX_LENGTH)
+    return `it must be at most ${NAME_MAX_LENGTH} characters`;
+  if (name !== name.toLowerCase())
+    return "it must be lowercase";
+  if (!NAME_CHARACTERS.test(name))
+    return "it may only contain letters, digits, and hyphens";
+  if (name.startsWith("-") || name.endsWith("-"))
+    return "it must not start or end with a hyphen";
+  if (name.includes("--"))
+    return "it must not contain consecutive hyphens";
+  return null;
+}
+function isSafeName(name) {
+  return name.length > 0 && name === name.trim() && name !== "." && name !== ".." && !UNSAFE_NAME_CHARACTERS.test(name);
+}
+function parseName(value, directory) {
+  const fallback = (value === undefined || value === null) && directory ? directory : undefined;
+  const declared = typeof value === "string" ? value : fallback;
+  if (declared === undefined)
+    return { fatal: new SkillParseError("invalid-name", "SKILL.md frontmatter must set `name` to a string.") };
+  const name = declared.trim().normalize("NFKC");
+  if (!isSafeName(name))
+    return { fatal: new SkillParseError("invalid-name", `Invalid skill name "${declared}": it must be a single path segment without slashes or control characters.`) };
+  const accepted = name;
+  const problems = [];
+  if (fallback)
+    problems.push(new SkillParseError("invalid-name", `SKILL.md frontmatter has no \`name\`; using its directory "${fallback}".`));
+  else {
+    const formatProblem = declared !== declared.trim() ? "it must not start or end with whitespace" : specNameProblem(name);
+    if (formatProblem !== null)
+      problems.push(new SkillParseError("invalid-name", `Invalid skill name "${declared}": ${formatProblem}.`));
+    if (directory !== undefined && directory.normalize("NFKC") !== name)
+      problems.push(new SkillParseError("name-mismatch", `Skill name "${name}" must match its directory "${directory}".`));
+  }
+  return problems.length === 0 ? { value: accepted } : {
+    value: accepted,
+    problems
+  };
+}
+function parseDescription(value) {
+  const description = typeof value === "string" ? value.trim() : "";
+  if (description.length === 0)
+    return { fatal: new SkillParseError("invalid-description", "SKILL.md frontmatter must set `description` to a non-empty string.") };
+  if ([...description].length > DESCRIPTION_MAX_LENGTH)
+    return {
+      value: description,
+      problems: [new SkillParseError("invalid-description", `Skill description must be at most ${DESCRIPTION_MAX_LENGTH} characters.`)]
+    };
+  return { value: description };
+}
+function parseLicense(value) {
+  if (value === undefined || value === null)
+    return { value: undefined };
+  if (typeof value !== "string" || value.trim().length === 0)
+    return {
+      value: undefined,
+      problems: [new SkillParseError("invalid-license", "Skill `license` must be a non-empty string.")]
+    };
+  return { value: value.trim() };
+}
+function parseCompatibility(value) {
+  if (value === undefined || value === null)
+    return { value: undefined };
+  const compatibility = typeof value === "string" ? value.trim() : "";
+  if (compatibility.length === 0 || [...compatibility].length > COMPATIBILITY_MAX_LENGTH)
+    return {
+      value: compatibility.length === 0 ? undefined : compatibility,
+      problems: [new SkillParseError("invalid-compatibility", `Skill \`compatibility\` must be 1-${COMPATIBILITY_MAX_LENGTH} characters.`)]
+    };
+  return { value: compatibility };
+}
+function parseMetadata(value) {
+  if (value === undefined || value === null)
+    return { value: {} };
+  if (!isRecord4(value))
+    return {
+      value: {},
+      problems: [new SkillParseError("invalid-metadata", "Skill `metadata` must be a mapping of string keys to string values.")]
+    };
+  const metadata = {};
+  let problem;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry !== "string" && typeof entry !== "number" && typeof entry !== "boolean") {
+      problem ??= new SkillParseError("invalid-metadata", `Skill \`metadata.${key}\` must be a string.`);
+      continue;
+    }
+    metadata[key] = String(entry);
+  }
+  return problem ? {
+    value: metadata,
+    problems: [problem]
+  } : { value: metadata };
+}
+function parseAllowedTools(value) {
+  if (value === undefined || value === null)
+    return { value: [] };
+  if (typeof value === "string")
+    return { value: value.split(/\s+/).filter((tool) => tool.length > 0) };
+  if (Array.isArray(value) && value.every((tool) => typeof tool === "string"))
+    return { value: value.map((tool) => tool.trim()).filter(Boolean) };
+  return {
+    value: [],
+    problems: [new SkillParseError("invalid-allowed-tools", "Skill `allowed-tools` must be a space-separated string.")]
+  };
+}
+function isRecord4(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+var InvalidSkillResourcePathError = class extends Error {
+  constructor(path) {
+    super(`Skill resource path must be a normalized relative path inside the skill: ${path}`);
+    this.path = path;
+    this._tag = "InvalidSkillResourcePathError";
+    this.name = "InvalidSkillResourcePathError";
+  }
+};
+function parseSkillResourcePath(path) {
+  if (path.length === 0 || path.startsWith("/") || path.includes("\x00") || path.includes("\\") || path === "SKILL.md" || path.split("/").some((part) => part === "" || part === "." || part === ".."))
+    return err(new InvalidSkillResourcePathError(path));
+  return ok(path);
+}
+var TEXT_EXTENSIONS = /* @__PURE__ */ new Set([
+  "",
+  ".bash",
+  ".css",
+  ".csv",
+  ".html",
+  ".js",
+  ".json",
+  ".jsx",
+  ".md",
+  ".mdx",
+  ".mjs",
+  ".py",
+  ".sh",
+  ".svg",
+  ".toml",
+  ".ts",
+  ".tsx",
+  ".txt",
+  ".xml",
+  ".yaml",
+  ".yml"
+]);
+var MIME_TYPES = /* @__PURE__ */ new Map([
+  [".css", "text/css"],
+  [".csv", "text/csv"],
+  [".gif", "image/gif"],
+  [".html", "text/html"],
+  [".jpeg", "image/jpeg"],
+  [".jpg", "image/jpeg"],
+  [".js", "text/javascript"],
+  [".json", "application/json"],
+  [".md", "text/markdown"],
+  [".mjs", "text/javascript"],
+  [".pdf", "application/pdf"],
+  [".png", "image/png"],
+  [".py", "text/x-python"],
+  [".sh", "text/x-shellscript"],
+  [".svg", "image/svg+xml"],
+  [".txt", "text/plain"],
+  [".webp", "image/webp"],
+  [".xml", "application/xml"],
+  [".yaml", "application/yaml"],
+  [".yml", "application/yaml"]
+]);
+function extensionOf(path) {
+  const file = path.split("/").at(-1) ?? path;
+  const index = file.lastIndexOf(".");
+  return index <= 0 ? "" : file.slice(index).toLowerCase();
+}
+function describeSkillResource(path, size) {
+  const root = path.split("/", 1)[0];
+  const kind = root === "scripts" ? "script" : root === "references" ? "reference" : root === "assets" ? "asset" : "file";
+  const extension = extensionOf(path);
+  const mimeType = MIME_TYPES.get(extension);
+  return {
+    path,
+    kind,
+    encoding: TEXT_EXTENSIONS.has(extension) ? "text" : "base64",
+    ...mimeType === undefined ? {} : { mimeType },
+    ...size === undefined ? {} : { size }
+  };
+}
+
+// node_modules/agents/dist/catalog-BpOejOsE.js
+var SkillSourceError = class extends Error {
+  constructor(sourceId, operation, cause) {
+    super(`Skill source "${sourceId}" failed to ${operation === "list" ? "list skills" : "read a resource"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.sourceId = sourceId;
+    this.operation = operation;
+    this._tag = "SkillSourceError";
+    this.name = "SkillSourceError";
+  }
+};
+var SkillResourceNotFoundError = class extends Error {
+  constructor(skill, path) {
+    super(`Resource not found: ${skill}/${path}`);
+    this.skill = skill;
+    this.path = path;
+    this._tag = "SkillResourceNotFoundError";
+    this.name = "SkillResourceNotFoundError";
+  }
+};
+var UnknownSkillError = class extends Error {
+  constructor(skill) {
+    super(`Skill not found: ${skill}`);
+    this.skill = skill;
+    this._tag = "UnknownSkillError";
+    this.name = "UnknownSkillError";
+  }
+};
+var catalogListings = /* @__PURE__ */ new WeakMap;
+async function loadSkillCatalog(sources, options = {}) {
+  const previousListings = options.previous ? catalogListings.get(options.previous) : undefined;
+  const listings = await Promise.all(sources.map(async (source) => ({
+    source,
+    listed: await source.list().catch((cause) => err(new SkillSourceError(source.id, "list", cause)))
+  })));
+  const diagnostics = [];
+  const entries = /* @__PURE__ */ new Map;
+  const sourceBySkill = /* @__PURE__ */ new Map;
+  const goodListings = /* @__PURE__ */ new Map;
+  for (const { source, listed } of listings) {
+    let listing;
+    if (listed.ok)
+      listing = listed.value;
+    else {
+      const fallback = previousListings?.get(source);
+      diagnostics.push({
+        _tag: "SourceFailed",
+        sourceId: source.id,
+        error: listed.error,
+        keptPrevious: fallback !== undefined
+      });
+      if (!fallback)
+        continue;
+      listing = fallback;
+    }
+    goodListings.set(source, listing);
+    for (const invalid of listing.invalid)
+      diagnostics.push({
+        _tag: "InvalidSkill",
+        sourceId: source.id,
+        location: invalid.location,
+        error: invalid.error
+      });
+    for (const { skill, resources, location, warnings } of listing.skills) {
+      const existing = entries.get(skill.name);
+      if (existing) {
+        diagnostics.push({
+          _tag: "DuplicateSkill",
+          name: skill.name,
+          sourceId: source.id,
+          keptSourceId: existing.sourceId
+        });
+        continue;
+      }
+      entries.set(skill.name, {
+        skill,
+        sourceId: source.id,
+        resources,
+        ...location === undefined ? {} : { location }
+      });
+      sourceBySkill.set(skill.name, source);
+      for (const warning of warnings ?? [])
+        diagnostics.push({
+          _tag: "SkillWarning",
+          sourceId: source.id,
+          name: skill.name,
+          error: warning
+        });
+    }
+  }
+  const skills = [...entries.values()].filter((entry) => isModelInvocable(entry.skill));
+  const visible = new Map(skills.map((entry) => [entry.skill.name, entry]));
+  const prompt = renderCatalogPrompt(skills);
+  const catalog = {
+    fingerprint: fingerprintOf(prompt ?? ""),
+    skills,
+    diagnostics,
+    prompt: () => prompt,
+    find: (name) => visible.get(name),
+    activate(name) {
+      const entry = visible.get(name);
+      return entry ? ok(renderSkillActivation(entry)) : err(new UnknownSkillError(name));
+    },
+    async readResource(request) {
+      const target = resolveResourceTarget(visible, request);
+      if (!target.ok)
+        return target;
+      const { entry, path } = target.value;
+      const source = sourceBySkill.get(entry.skill.name);
+      if (!source)
+        return err(new UnknownSkillError(entry.skill.name));
+      const read = await source.readResource(entry.skill.name, path).catch((cause) => err(new SkillSourceError(source.id, "read-resource", cause)));
+      if (!read.ok)
+        return read;
+      return ok({
+        entry,
+        resource: read.value
+      });
+    }
+  };
+  catalogListings.set(catalog, goodListings);
+  return catalog;
+}
+function formatSkillDiagnostic(diagnostic) {
+  switch (diagnostic._tag) {
+    case "InvalidSkill":
+      return `Skipped invalid skill ${diagnostic.location} from source "${diagnostic.sourceId}": ${diagnostic.error.message}`;
+    case "SkillWarning":
+      return `Skill "${diagnostic.name}" from source "${diagnostic.sourceId}" breaks the Agent Skills spec but was loaded: ${diagnostic.error.message}`;
+    case "SourceFailed":
+      return `${diagnostic.error.message}. ${diagnostic.keptPrevious ? "Its last listed skills were kept." : "Its skills were skipped."}`;
+    case "DuplicateSkill":
+      return `Duplicate skill "${diagnostic.name}" from source "${diagnostic.sourceId}" ignored; already provided by "${diagnostic.keptSourceId}".`;
+  }
+}
+function renderSkillResource(read) {
+  const { entry, resource } = read;
+  return [
+    `<skill_resource${attributes([
+      ["name", entry.skill.name],
+      ["path", resource.path],
+      ["kind", resource.kind],
+      ["encoding", resource.encoding],
+      ["mimeType", resource.mimeType]
+    ])}>`,
+    resource.content,
+    "</skill_resource>"
+  ].join(`
+`);
+}
+function renderCatalogPrompt(skills) {
+  if (skills.length === 0)
+    return null;
+  return [
+    "Available skills. When a task matches a skill, use activate_skill with its name before proceeding.",
+    "",
+    ...skills.map(({ skill }) => `- ${skill.name}: ${skill.description.replace(/\s+/g, " ")}`)
+  ].join(`
+`);
+}
+function renderSkillActivation(entry) {
+  const lines = [`<skill_content${attributes([["name", entry.skill.name], ["location", entry.location]])}>`, entry.skill.body.trim()];
+  if (entry.resources.length > 0) {
+    lines.push("", "<skill_resources>");
+    for (const resource of entry.resources)
+      lines.push(`  <file${attributes([
+        ["kind", resource.kind],
+        ["encoding", resource.encoding],
+        ["size", resource.size === undefined ? undefined : String(resource.size)]
+      ])}>${resource.path}</file>`);
+    lines.push("</skill_resources>");
+  }
+  lines.push("</skill_content>");
+  return lines.join(`
+`);
+}
+function resolveResourceTarget(skills, request) {
+  let name = request.name;
+  let relative = request.path;
+  if (name === undefined) {
+    const slash = relative.indexOf("/");
+    if (slash <= 0)
+      return err(new InvalidSkillResourcePathError(relative));
+    name = relative.slice(0, slash);
+    relative = relative.slice(slash + 1);
+  }
+  const entry = skills.get(name);
+  if (!entry)
+    return err(new UnknownSkillError(name));
+  const path = parseSkillResourcePath(relative);
+  if (!path.ok)
+    return path;
+  if (!entry.resources.some((resource) => resource.path === path.value))
+    return err(new SkillResourceNotFoundError(entry.skill.name, path.value));
+  return ok({
+    entry,
+    path: path.value
+  });
+}
+function attributes(pairs) {
+  return pairs.filter((pair) => pair[1] !== undefined).map(([key, value]) => ` ${key}="${value.replace(/"/g, "&quot;")}"`).join("");
+}
+function fingerprintOf(text) {
+  let a = 2166136261;
+  let b = 16777619;
+  for (let index = 0;index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    a = Math.imul(a ^ code, 16777619);
+    b = Math.imul(b ^ code, 2166136261);
+  }
+  return `${(a >>> 0).toString(16).padStart(8, "0")}${(b >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+// node_modules/@earendil-works/chord/dist/sqlite/cloudflare.js
+class SerialQueue {
+  tail = Promise.resolve();
+  pending = 0;
+  run(operation) {
+    if (this.pending > 0)
+      return this.enqueue(operation);
+    try {
+      return Promise.resolve(operation());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+  hold(operation) {
+    return this.enqueue(operation);
+  }
+  enqueue(operation) {
+    this.pending++;
+    const result = this.tail.then(operation).finally(() => {
+      this.pending--;
+    });
+    this.tail = result.then(() => {}, () => {});
+    return result;
+  }
+}
+var storageQueues = new WeakMap;
+function queueFor(storage) {
+  let queue = storageQueues.get(storage);
+  if (queue === undefined) {
+    queue = new SerialQueue;
+    storageQueues.set(storage, queue);
+  }
+  return queue;
+}
+function bindValue(value) {
+  if (value instanceof Uint8Array)
+    return value.slice().buffer;
+  if (typeof value !== "bigint")
+    return value;
+  if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(`Durable Object SQL cannot bind ${value} without losing precision`);
+  }
+  return Number(value);
+}
+var bind = (params) => params.map(bindValue);
+function row(row) {
+  for (const key in row) {
+    const value = row[key];
+    if (value instanceof ArrayBuffer)
+      row[key] = new Uint8Array(value);
+  }
+  return row;
+}
+
+class DurableObjectSqliteExecutor {
+  storage;
+  constructor(storage) {
+    this.storage = storage;
+  }
+  async exec(sql) {
+    this.check();
+    this.storage.sql.exec(sql);
+  }
+  async run(sql, ...params) {
+    this.check();
+    this.storage.sql.exec(sql, ...bind(params));
+  }
+  async runCounted(sql, ...params) {
+    this.check();
+    this.storage.sql.exec(sql, ...bind(params));
+    const counted = this.storage.sql.exec("SELECT changes() AS changes").next();
+    return counted.done ? 0 : Number(counted.value.changes);
+  }
+  async get(sql, ...params) {
+    this.check();
+    const result = this.storage.sql.exec(sql, ...bind(params)).next();
+    return result.done ? undefined : row(result.value);
+  }
+  async all(sql, ...params) {
+    this.check();
+    return this.storage.sql.exec(sql, ...bind(params)).toArray().map((value) => row(value));
+  }
+  check() {}
+}
+
+class DurableObjectSqliteTransaction extends DurableObjectSqliteExecutor {
+  active = true;
+  check() {
+    if (!this.active)
+      throw new Error("SQLite transaction handle is no longer active");
+  }
+}
+
+class DurableObjectSqliteDatabase extends DurableObjectSqliteExecutor {
+  queue;
+  constructor(storage) {
+    super(storage);
+    this.queue = queueFor(storage);
+  }
+  exec(sql) {
+    return this.queue.run(() => super.exec(sql));
+  }
+  run(sql, ...params) {
+    return this.queue.run(() => super.run(sql, ...params));
+  }
+  runCounted(sql, ...params) {
+    return this.queue.run(() => super.runCounted(sql, ...params));
+  }
+  get(sql, ...params) {
+    return this.queue.run(() => super.get(sql, ...params));
+  }
+  all(sql, ...params) {
+    return this.queue.run(() => super.all(sql, ...params));
+  }
+  transaction(callback) {
+    return this.queue.hold(() => this.storage.transaction(async () => {
+      const transaction = new DurableObjectSqliteTransaction(this.storage);
+      try {
+        return await callback(transaction);
+      } finally {
+        transaction.active = false;
+      }
+    }));
+  }
+  close() {
+    return this.queue.run(() => {});
+  }
+}
+
+// node_modules/@earendil-works/pi-durable/dist/storage/scan.js
+function scanStart(requested, cursor, fallback) {
+  if (requested !== undefined && requested !== "ascending" && requested !== "descending") {
+    throw new StorageRequestError(`Invalid scan order: ${String(requested)}`);
+  }
+  if (cursor === undefined)
+    return { order: requested ?? fallback, after: undefined };
+  const { after, order: stored } = cursor;
+  if (typeof after !== "number" || !Number.isSafeInteger(after))
+    throw new StorageRequestError("Invalid storage cursor");
+  if (stored !== undefined && stored !== "ascending" && stored !== "descending") {
+    throw new StorageRequestError("Invalid storage cursor");
+  }
+  const order = stored ?? fallback;
+  if (requested !== undefined && requested !== order) {
+    throw new StorageRequestError(`The cursor continues a ${order} scan; the query asks for ${requested}`);
+  }
+  return { order, after };
+}
+function nextCursor(id, order) {
+  return { after: id, order };
+}
+
+// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/rows.js
+var parseJson = (value) => JSON.parse(value);
+var encodeJson = (value) => JSON.stringify(value);
+var encodeIndexedString = (value) => JSON.stringify(value);
+var scopeColumns = (scope) => {
+  switch (scope.kind) {
+    case "session":
+      return { scopeKind: "session", ownerId: 0 };
+    case "conversation":
+      return { scopeKind: "conversation", ownerId: scope.conversationId };
+    case "task":
+      return { scopeKind: "task", ownerId: scope.taskId };
+  }
+};
+var addressParts = (address) => {
+  const scope = scopeColumns(address.scope);
+  return {
+    kind: encodeIndexedString(address.kind),
+    ...scope,
+    family: address.key === undefined ? 0 : 1,
+    keyValue: encodeIndexedString(address.key ?? "")
+  };
+};
+var addressColumnsKey = (kind, scopeKind, ownerId, family, keyValue) => JSON.stringify([kind, scopeKind, ownerId, family, keyValue]);
+var addressKey = (address) => {
+  const parts = addressParts(address);
+  return addressColumnsKey(parts.kind, parts.scopeKind, parts.ownerId, parts.family, parts.keyValue);
+};
+var isCurrentOnly = (record) => record.scope.kind !== "conversation" || record.history === "latest";
+function documentRow(record) {
+  const parts = addressParts(record);
+  return [
+    record.id,
+    parts.kind,
+    parts.family,
+    parts.keyValue,
+    parts.scopeKind,
+    parts.ownerId,
+    record.createdAt,
+    record.retiredAt ?? null,
+    encodeJson(record)
+  ];
+}
+
+// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/statements.js
+async function readRows(executor, sql, values) {
+  const rows = [];
+  for (const array of jsonArrays(values.map((value) => JSON.stringify(value)))) {
+    rows.push(...await executor.all(sql, array));
+  }
+  return rows;
+}
+async function runForEach(executor, sql, values) {
+  for (const array of jsonArrays(values.map((value) => JSON.stringify(value))))
+    await executor.run(sql, array);
+}
+var LARGE_ROW_CHARACTERS = 8 * 1024;
+async function insertRows(executor, table, columns, rows, conflict = "") {
+  const small = [];
+  const large = [];
+  for (const row of rows) {
+    let text = 0;
+    for (const cell of row)
+      if (typeof cell === "string")
+        text += cell.length;
+    if (text > LARGE_ROW_CHARACTERS)
+      large.push(row);
+    else
+      small.push(JSON.stringify(row));
+  }
+  const names = columns.join(", ");
+  if (small.length > 0) {
+    const cells = columns.map((_, index) => `json_extract(item.value, '$[${index}]')`).join(", ");
+    const sql = `INSERT INTO ${table} (${names}) SELECT ${cells} FROM json_each(?) AS item WHERE true ${conflict}`;
+    for (const array of jsonArrays(small))
+      await executor.run(sql, array);
+  }
+  await insertBound(executor, `INSERT INTO ${table} (${names}) VALUES`, columns.length, large, conflict);
+}
+var MAX_PARAMETERS = 100;
+async function insertBound(executor, head, width, rows, conflict) {
+  const row = `(${new Array(width).fill("?").join(", ")})`;
+  let size = 1;
+  while (size * 2 * width <= MAX_PARAMETERS)
+    size *= 2;
+  for (let start = 0;start < rows.length; start += size) {
+    while (size > rows.length - start)
+      size /= 2;
+    const chunk = rows.slice(start, start + size);
+    await executor.run(`${head} ${new Array(size).fill(row).join(", ")} ${conflict}`, ...chunk.flat());
+  }
+}
+var MAX_ARRAY_CHARACTERS = 512 * 1024;
+function jsonArrays(parts) {
+  const arrays = [];
+  let chunk = [];
+  let length = 2;
+  for (const part of parts) {
+    if (chunk.length > 0 && length + 1 + part.length > MAX_ARRAY_CHARACTERS) {
+      arrays.push(`[${chunk.join(",")}]`);
+      chunk = [];
+      length = 2;
+    }
+    length += (chunk.length > 0 ? 1 : 0) + part.length;
+    chunk.push(part);
+  }
+  if (chunk.length > 0)
+    arrays.push(`[${chunk.join(",")}]`);
+  return arrays;
+}
+
+// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/commit.js
+var claimOf = (write) => {
+  switch (write.type) {
+    case "conversation":
+    case "entry":
+    case "task":
+    case "submission":
+      return { id: write.value.id, table: write.type };
+    case "document.create":
+    case "document.copy":
+      return { id: write.record.id, table: "document" };
+    case "document.change":
+    case "document.retire":
+      return;
+  }
+};
+function prepareDocumentActions(writes) {
+  const actions = new Map;
+  for (const write of writes) {
+    if (write.type !== "document.create" && write.type !== "document.copy" && write.type !== "document.change" && write.type !== "document.retire") {
+      continue;
+    }
+    const id = write.type === "document.create" || write.type === "document.copy" ? write.record.id : write.id;
+    let action = actions.get(id);
+    if (action === undefined) {
+      action = { retire: false };
+      actions.set(id, action);
+    }
+    switch (write.type) {
+      case "document.create":
+        if (action.create !== undefined || action.content !== undefined || action.copy !== undefined) {
+          throw new Error(`Document ${id} has more than one content command`);
+        }
+        action.create = write.record;
+        action.content = write.content;
+        break;
+      case "document.copy":
+        if (action.create !== undefined || action.content !== undefined || action.copy !== undefined) {
+          throw new Error(`Document ${id} has more than one content command`);
+        }
+        action.create = write.record;
+        action.copy = write.source;
+        break;
+      case "document.change":
+        if (action.content !== undefined || action.copy !== undefined) {
+          throw new Error(`Document ${id} has more than one content command`);
+        }
+        action.content = write.content;
+        break;
+      case "document.retire":
+        if (action.retire)
+          throw new Error(`Document ${id} is retired more than once`);
+        action.retire = true;
+        break;
+    }
+  }
+  return actions;
+}
+
+class CommitState {
+  #recordIds;
+  #documents;
+  #versions;
+  #current;
+  constructor(recordIds, documents, versions, current) {
+    this.#recordIds = recordIds;
+    this.#documents = documents;
+    this.#versions = versions;
+    this.#current = current;
+  }
+  static async read(executor, tables, batches) {
+    const ids = new Set;
+    const documentIds = new Set;
+    const deltaIds = new Set;
+    const addresses = new Map;
+    for (const writes of batches) {
+      for (const write of writes) {
+        const claim = claimOf(write);
+        if (claim !== undefined)
+          ids.add(claim.id);
+        switch (write.type) {
+          case "document.create":
+          case "document.copy":
+            documentIds.add(write.record.id);
+            addresses.set(addressKey(write.record), addressParts(write.record));
+            break;
+          case "document.change":
+            documentIds.add(write.id);
+            if (write.content.kind === "delta")
+              deltaIds.add(write.id);
+            break;
+          case "document.retire":
+            documentIds.add(write.id);
+            break;
+          default:
+            break;
+        }
+      }
+    }
+    const recordIds = new Map;
+    for (const row of await readRows(executor, `SELECT id, record_type FROM ${tables.recordIds} WHERE id IN (SELECT value FROM json_each(?))`, [...ids])) {
+      recordIds.set(row.id, row.record_type);
+    }
+    const documents = new Map;
+    for (const row of await readRows(executor, `SELECT record FROM ${tables.documents} WHERE id IN (SELECT value FROM json_each(?))`, [...documentIds])) {
+      const record = parseJson(row.record);
+      documents.set(record.id, record);
+    }
+    const versions = new Map;
+    for (const row of await readRows(executor, `SELECT requested.value AS document_id, (
+				SELECT version FROM ${tables.documentRevisions} WHERE document_id = requested.value ORDER BY seq DESC LIMIT 1
+			) AS version FROM json_each(?) AS requested`, [...deltaIds])) {
+      if (row.version !== null)
+        versions.set(row.document_id, row.version);
+    }
+    return new CommitState(recordIds, documents, versions, await readCurrent(executor, tables, addresses));
+  }
+  check(writes, actions) {
+    this.#checkIds(writes);
+    this.#checkDocuments(actions);
+  }
+  apply(writes, actions, seq) {
+    for (const write of writes) {
+      const claim = claimOf(write);
+      if (claim !== undefined)
+        this.#recordIds.set(claim.id, claim.table);
+    }
+    for (const [id, action] of actions) {
+      if (action.create !== undefined) {
+        const record = { ...action.create, createdAt: seq, ...action.retire ? { retiredAt: seq } : {} };
+        this.#documents.set(id, record);
+        if (!action.retire)
+          this.#current.set(addressKey(record), id);
+      } else if (action.retire) {
+        const record = { ...this.#documents.get(id), retiredAt: seq };
+        this.#documents.set(id, record);
+        const key = addressKey(record);
+        if (this.#current.get(key) === id)
+          this.#current.set(key, undefined);
+      }
+      if (action.content !== undefined)
+        this.#versions.set(id, action.content.version);
+    }
+  }
+  document(id) {
+    return this.#documents.get(id);
+  }
+  #checkIds(writes) {
+    const claimed = new Map;
+    for (const write of writes) {
+      const claim = claimOf(write);
+      if (claim === undefined)
+        continue;
+      const { id, table } = claim;
+      const existing = this.#recordIds.get(id);
+      const earlier = claimed.get(id);
+      if (table === "conversation" || table === "entry" || table === "document") {
+        if (existing !== undefined)
+          throw new Error(`ID ${id} already belongs to ${existing}`);
+        if (earlier !== undefined)
+          throw new Error(`ID ${id} is written more than once`);
+      } else {
+        if (existing !== undefined && existing !== table)
+          throw new Error(`ID ${id} already belongs to ${existing}`);
+        if (earlier !== undefined && earlier !== table)
+          throw new Error(`ID ${id} is written as two record types`);
+      }
+      claimed.set(id, table);
+    }
+  }
+  #checkDocuments(actions) {
+    const liveCounts = new Map;
+    for (const [id, action] of actions) {
+      if (action.copy !== undefined && actions.has(action.copy.id)) {
+        throw new Error(`Document copy ${id} source is changed in the copy batch`);
+      }
+      const existing = this.#documents.get(id);
+      if (action.create === undefined && existing === undefined)
+        throw new Error(`Unknown document: ${id}`);
+      if (action.create !== undefined && existing !== undefined)
+        throw new Error(`Document ${id} already exists`);
+      if (existing?.retiredAt !== undefined)
+        throw new Error(`Document ${id} is retired`);
+      if (action.content?.kind === "delta") {
+        const previous = this.#versions.get(id);
+        if (previous === undefined)
+          throw new Error(`Document ${id} delta has no base`);
+        if (previous !== action.content.version)
+          throw new Error(`Document ${id} version transition requires a base`);
+      }
+      if (action.create === undefined && !action.retire)
+        continue;
+      const key = addressKey(action.create ?? existing);
+      let live = liveCounts.get(key);
+      if (live === undefined)
+        live = this.#current.get(key) === undefined ? 0 : 1;
+      if (action.retire && existing !== undefined)
+        live--;
+      if (action.create !== undefined && !action.retire)
+        live++;
+      liveCounts.set(key, live);
+    }
+    for (const live of liveCounts.values()) {
+      if (live > 1)
+        throw new Error("Document address already has a current incarnation");
+    }
+  }
+}
+async function readCurrent(executor, tables, addresses) {
+  const current = new Map;
+  for (const key of addresses.keys())
+    current.set(key, undefined);
+  const rows = await readRows(executor, `SELECT document.id, document.kind, document.scope_kind, document.owner_id, document.family, document.key_value
+			FROM json_each(?) AS address JOIN ${tables.documents} AS document
+			ON document.kind = json_extract(address.value, '$[0]') AND document.scope_kind = json_extract(address.value, '$[1]')
+			AND document.owner_id = json_extract(address.value, '$[2]') AND document.family = json_extract(address.value, '$[3]')
+			AND document.key_value = json_extract(address.value, '$[4]')
+			WHERE document.retired_at IS NULL`, [...addresses.values()].map((part) => [part.kind, part.scopeKind, part.ownerId, part.family, part.keyValue]));
+  for (const row of rows) {
+    current.set(addressColumnsKey(row.kind, row.scope_kind, row.owner_id, row.family, row.key_value), row.id);
+  }
+  return current;
+}
+
+class PendingWrites {
+  #recordIds = new Map;
+  #conversations = [];
+  #entries = [];
+  #tasks = new Map;
+  #submissions = new Map;
+  #documents = new Map;
+  #cleared = new Set;
+  #revisions = new Map;
+  add(writes, actions, seq, state) {
+    for (const write of writes)
+      this.#addWrite(write, seq);
+    for (const [id, action] of actions)
+      this.#addDocument(id, action, seq, state.document(id));
+  }
+  #addWrite(write, seq) {
+    const claim = claimOf(write);
+    if (claim !== undefined)
+      this.#recordIds.set(claim.id, claim.table);
+    switch (write.type) {
+      case "conversation":
+        this.#conversations.push([
+          write.value.id,
+          write.value.owner?.conversationId ?? null,
+          write.value.owner?.taskId ?? null,
+          encodeJson(write.value)
+        ]);
+        break;
+      case "entry":
+        this.#entries.push([
+          write.value.id,
+          write.value.conversationId,
+          write.value.head ?? null,
+          seq,
+          encodeJson(write.value)
+        ]);
+        break;
+      case "task":
+        this.#tasks.set(write.value.id, [
+          write.value.id,
+          write.value.conversationId,
+          encodeIndexedString(write.value.kind),
+          write.value.state.status,
+          write.value.abortRequested ? 1 : 0,
+          write.value.background ? 1 : 0,
+          encodeJson(write.value)
+        ]);
+        break;
+      case "submission":
+        this.#submissions.set(write.value.id, [
+          write.value.id,
+          write.value.conversationId,
+          write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
+          write.value.status,
+          encodeJson(write.value)
+        ]);
+        break;
+      default:
+        break;
+    }
+  }
+  #addDocument(id, action, seq, record) {
+    if (action.create !== undefined || action.retire)
+      this.#documents.set(id, record);
+    const content = action.content;
+    if (content !== undefined) {
+      if (content.kind === "base" && isCurrentOnly(record))
+        this.#clear(id);
+      const encoded = content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops);
+      let revisions = this.#revisions.get(id);
+      if (revisions === undefined) {
+        revisions = [];
+        this.#revisions.set(id, revisions);
+      }
+      revisions.push([id, seq, content.kind, content.version, encoded]);
+    }
+    if (action.retire && isCurrentOnly(record))
+      this.#clear(id);
+  }
+  #clear(id) {
+    this.#cleared.add(id);
+    this.#revisions.delete(id);
+  }
+  async flush(executor, tables) {
+    await insertRows(executor, tables.recordIds, ["id", "record_type"], [...this.#recordIds].map(([id, table]) => [id, table]), "ON CONFLICT(id) DO NOTHING");
+    await insertRows(executor, tables.conversations, ["id", "owner_conversation_id", "owner_task_id", "record"], this.#conversations);
+    await insertRows(executor, tables.entries, ["id", "conversation_id", "head", "commit_seq", "record"], this.#entries);
+    await insertRows(executor, tables.tasks, ["id", "conversation_id", "kind", "status", "abort_requested", "background", "record"], [...this.#tasks.values()], `ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
+				status = excluded.status, abort_requested = excluded.abort_requested,
+				background = excluded.background, record = excluded.record`);
+    await insertRows(executor, tables.submissions, ["id", "conversation_id", "request_id", "status", "record"], [...this.#submissions.values()], `ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
+				request_id = excluded.request_id, status = excluded.status, record = excluded.record`);
+    await insertRows(executor, tables.documents, ["id", "kind", "family", "key_value", "scope_kind", "owner_id", "created_at", "retired_at", "record"], [...this.#documents.values()].map(documentRow), "ON CONFLICT(id) DO UPDATE SET retired_at = excluded.retired_at, record = excluded.record");
+    await runForEach(executor, `DELETE FROM ${tables.documentRevisions} WHERE document_id IN (SELECT value FROM json_each(?))`, [...this.#cleared]);
+    await insertRows(executor, tables.documentRevisions, ["document_id", "seq", "kind", "version", "content"], [...this.#revisions.values()].flat());
+    this.#recordIds.clear();
+    this.#conversations.length = 0;
+    this.#entries.length = 0;
+    this.#tasks.clear();
+    this.#submissions.clear();
+    this.#documents.clear();
+    this.#cleared.clear();
+    this.#revisions.clear();
+  }
+}
+
+// node_modules/@earendil-works/chord/dist/sqlite/schema.js
+function validateSqliteSchemaPrefix(prefix) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(prefix)) {
+    throw new Error(`Invalid SQLite schema prefix ${JSON.stringify(prefix)}`);
+  }
+  if (prefix.toLowerCase().startsWith("sqlite_")) {
+    throw new Error(`SQLite schema prefix ${JSON.stringify(prefix)} is reserved`);
+  }
+}
+
+// node_modules/@earendil-works/chord/dist/sqlite/migrations.js
+async function applySqliteMigrations(database, migrations, options) {
+  const { table } = options;
+  validateSqliteSchemaPrefix(table);
+  for (let index = 0;index < migrations.length; index++) {
+    if (migrations[index]?.version !== index + 1) {
+      throw new Error("SQLite migrations must have contiguous versions starting at 1");
+    }
+  }
+  await database.transaction(async (transaction) => {
+    await transaction.exec(`CREATE TABLE IF NOT EXISTS ${table} (
+			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			version INTEGER NOT NULL CHECK (version >= 0)
+		) STRICT`);
+    await transaction.run(`INSERT OR IGNORE INTO ${table} (singleton, version) VALUES (1, 0)`);
+    const row = await transaction.get(`SELECT version FROM ${table} WHERE singleton = 1`);
+    if (row === undefined)
+      throw new Error("SQLite schema metadata is missing");
+    const currentVersion = migrations.at(-1)?.version ?? 0;
+    if (row.version > currentVersion) {
+      throw new Error(`SQLite schema version ${row.version} is newer than supported version ${currentVersion}`);
+    }
+    for (const migration of migrations) {
+      if (migration.version <= row.version)
+        continue;
+      for (const statement of migration.statements)
+        await transaction.exec(statement);
+      await transaction.run(`UPDATE ${table} SET version = ? WHERE singleton = 1`, migration.version);
+    }
+  });
+}
+// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/schema.js
+var TABLE_NAMES = {
+  durableSchema: "durable_schema",
+  durableMetadata: "durable_metadata",
+  recordIds: "record_ids",
+  conversations: "conversations",
+  entries: "entries",
+  tasks: "tasks",
+  submissions: "submissions",
+  documents: "documents",
+  documentRevisions: "document_revisions"
+};
+var INDEX_NAMES = {
+  conversationsByOwnerConversation: "conversations_by_owner_conversation",
+  conversationsByOwnerTask: "conversations_by_owner_task",
+  entriesByConversation: "entries_by_conversation",
+  entryHeadsByConversation: "entry_heads_by_conversation",
+  tasksByStatus: "tasks_by_status",
+  tasksByConversation: "tasks_by_conversation",
+  tasksByKind: "tasks_by_kind",
+  tasksByAbortRequested: "tasks_by_abort_requested",
+  tasksByBackground: "tasks_by_background",
+  submissionsByRequest: "submissions_by_request",
+  submissionsByConversation: "submissions_by_conversation",
+  submissionsByStatus: "submissions_by_status",
+  documentsByAddress: "documents_by_address",
+  documentsByScope: "documents_by_scope",
+  documentsByScopeKind: "documents_by_scope_kind",
+  documentRevisionsByKind: "document_revisions_by_kind"
+};
+function prefixIdentifiers(names, prefix) {
+  return Object.fromEntries(Object.entries(names).map(([key, name]) => [key, `${prefix}${name}`]));
+}
+function createSqliteSchema(prefix) {
+  if (prefix !== undefined)
+    validateSqliteSchemaPrefix(prefix);
+  const actualPrefix = prefix ?? "";
+  return {
+    tables: prefixIdentifiers(TABLE_NAMES, actualPrefix),
+    indexes: prefixIdentifiers(INDEX_NAMES, actualPrefix)
+  };
+}
+var DEFAULT_SQLITE_SCHEMA = createSqliteSchema();
+
+// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/migrations.js
+function createSqliteMigrations(schema) {
+  const { tables, indexes } = schema;
+  const initialSchema = [
+    `CREATE TABLE ${tables.durableMetadata} (
+			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			next_id TEXT NOT NULL,
+			next_seq INTEGER NOT NULL
+		) STRICT`,
+    `INSERT INTO ${tables.durableMetadata} (singleton, next_id, next_seq) VALUES (1, '2', 1)`,
+    `CREATE TABLE ${tables.recordIds} (
+			id INTEGER PRIMARY KEY,
+			record_type TEXT NOT NULL CHECK (record_type IN ('conversation', 'entry', 'task', 'submission', 'document'))
+		) STRICT`,
+    `CREATE TABLE ${tables.conversations} (
+			id INTEGER PRIMARY KEY,
+			owner_conversation_id INTEGER,
+			owner_task_id INTEGER,
+			record TEXT NOT NULL CHECK (json_valid(record))
+		) STRICT`,
+    `CREATE INDEX ${indexes.conversationsByOwnerConversation} ON ${tables.conversations} (owner_conversation_id, id)`,
+    `CREATE INDEX ${indexes.conversationsByOwnerTask} ON ${tables.conversations} (owner_task_id, id)`,
+    `CREATE TABLE ${tables.entries} (
+			id INTEGER PRIMARY KEY,
+			conversation_id INTEGER NOT NULL,
+			head INTEGER,
+			commit_seq INTEGER NOT NULL,
+			record TEXT NOT NULL CHECK (json_valid(record))
+		) STRICT`,
+    `CREATE INDEX ${indexes.entriesByConversation} ON ${tables.entries} (conversation_id, id DESC)`,
+    `CREATE INDEX ${indexes.entryHeadsByConversation} ON ${tables.entries} (conversation_id, id DESC) WHERE head IS NOT NULL`,
+    `CREATE TABLE ${tables.tasks} (
+			id INTEGER PRIMARY KEY,
+			conversation_id INTEGER NOT NULL,
+			kind TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'waiting', 'completing', 'terminal')),
+			abort_requested INTEGER NOT NULL CHECK (abort_requested IN (0, 1)),
+			background INTEGER NOT NULL CHECK (background IN (0, 1)),
+			record TEXT NOT NULL CHECK (json_valid(record))
+		) STRICT`,
+    `CREATE INDEX ${indexes.tasksByStatus} ON ${tables.tasks} (status, id)`,
+    `CREATE INDEX ${indexes.tasksByConversation} ON ${tables.tasks} (conversation_id, id)`,
+    `CREATE INDEX ${indexes.tasksByKind} ON ${tables.tasks} (kind, id)`,
+    `CREATE INDEX ${indexes.tasksByAbortRequested} ON ${tables.tasks} (abort_requested, id)`,
+    `CREATE INDEX ${indexes.tasksByBackground} ON ${tables.tasks} (background, id)`,
+    `CREATE TABLE ${tables.submissions} (
+			id INTEGER PRIMARY KEY,
+			conversation_id INTEGER NOT NULL,
+			request_id TEXT,
+			status TEXT NOT NULL CHECK (status IN ('queued', 'placed', 'done', 'unanswered')),
+			record TEXT NOT NULL CHECK (json_valid(record))
+		) STRICT`,
+    `CREATE INDEX ${indexes.submissionsByRequest} ON ${tables.submissions} (conversation_id, request_id)`,
+    `CREATE INDEX ${indexes.submissionsByConversation} ON ${tables.submissions} (conversation_id, id)`,
+    `CREATE INDEX ${indexes.submissionsByStatus} ON ${tables.submissions} (status, id)`,
+    `CREATE TABLE ${tables.documents} (
+			id INTEGER PRIMARY KEY,
+			kind TEXT NOT NULL,
+			family INTEGER NOT NULL CHECK (family IN (0, 1)),
+			key_value TEXT NOT NULL,
+			scope_kind TEXT NOT NULL CHECK (scope_kind IN ('session', 'conversation', 'task')),
+			owner_id INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			retired_at INTEGER,
+			record TEXT NOT NULL CHECK (json_valid(record))
+		) STRICT`,
+    `CREATE INDEX ${indexes.documentsByAddress}
+			ON ${tables.documents} (kind, scope_kind, owner_id, family, key_value, created_at DESC, retired_at)`,
+    `CREATE INDEX ${indexes.documentsByScope} ON ${tables.documents} (scope_kind, owner_id, id)`,
+    `CREATE INDEX ${indexes.documentsByScopeKind} ON ${tables.documents} (scope_kind, owner_id, kind, id)`,
+    `CREATE TABLE ${tables.documentRevisions} (
+			document_id INTEGER NOT NULL,
+			seq INTEGER NOT NULL,
+			kind TEXT NOT NULL CHECK (kind IN ('base', 'delta')),
+			version INTEGER NOT NULL,
+			content TEXT NOT NULL CHECK (json_valid(content)),
+			PRIMARY KEY (document_id, seq)
+		) STRICT`,
+    `CREATE INDEX ${indexes.documentRevisionsByKind} ON ${tables.documentRevisions} (document_id, kind, seq DESC)`
+  ];
+  const rebuiltTasks = `${tables.tasks}_v2`;
+  const sleepingStatus = [
+    `CREATE TABLE ${rebuiltTasks} (
+			id INTEGER PRIMARY KEY,
+			conversation_id INTEGER NOT NULL,
+			kind TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'waiting', 'sleeping', 'completing', 'terminal')),
+			abort_requested INTEGER NOT NULL CHECK (abort_requested IN (0, 1)),
+			background INTEGER NOT NULL CHECK (background IN (0, 1)),
+			record TEXT NOT NULL CHECK (json_valid(record))
+		) STRICT`,
+    `INSERT INTO ${rebuiltTasks} (id, conversation_id, kind, status, abort_requested, background, record)
+			SELECT id, conversation_id, kind, status, abort_requested, background, record FROM ${tables.tasks}`,
+    `DROP TABLE ${tables.tasks}`,
+    `ALTER TABLE ${rebuiltTasks} RENAME TO ${tables.tasks}`,
+    `CREATE INDEX ${indexes.tasksByStatus} ON ${tables.tasks} (status, id)`,
+    `CREATE INDEX ${indexes.tasksByConversation} ON ${tables.tasks} (conversation_id, id)`,
+    `CREATE INDEX ${indexes.tasksByKind} ON ${tables.tasks} (kind, id)`,
+    `CREATE INDEX ${indexes.tasksByAbortRequested} ON ${tables.tasks} (abort_requested, id)`,
+    `CREATE INDEX ${indexes.tasksByBackground} ON ${tables.tasks} (background, id)`
+  ];
+  return [
+    { version: 1, statements: initialSchema },
+    { version: 2, statements: sleepingStatus }
+  ];
+}
+var SQLITE_MIGRATIONS = createSqliteMigrations(DEFAULT_SQLITE_SCHEMA);
+var CURRENT_SQLITE_SCHEMA_VERSION = SQLITE_MIGRATIONS.at(-1)?.version ?? 0;
+async function applySqliteMigrationsForSchema(database, schema, migrations = createSqliteMigrations(schema)) {
+  await applySqliteMigrations(database, migrations, { table: schema.tables.durableSchema });
+}
+
+// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/storage.js
+var cursorId = (cursor) => {
+  const after = cursor?.after;
+  if (after === undefined)
+    return;
+  if (typeof after !== "number" || !Number.isSafeInteger(after))
+    throw new StorageRequestError("Invalid storage cursor");
+  return idFromNumber(after);
+};
+var page = (values, limit, order = "ascending") => {
+  const items = values.slice(0, limit);
+  if (values.length <= limit)
+    return { items };
+  return { items, next: nextCursor(items.at(-1).id, order) };
+};
+var scanSql = (start) => start.order === "ascending" ? { clause: "id > ?", param: start.after ?? -1, direction: "ASC" } : { clause: "id < ?", param: start.after ?? Number.MAX_SAFE_INTEGER, direction: "DESC" };
+var isAliveAt = (record, at) => {
+  if (at === "current")
+    return record.retiredAt === undefined;
+  return record.createdAt <= at && (record.retiredAt === undefined || at < record.retiredAt);
+};
+function watchCalls(executor, calls) {
+  const watched = async (call) => {
+    try {
+      return await call();
+    } catch (error) {
+      calls.failed = true;
+      throw error;
+    }
+  };
+  return {
+    exec: (sql) => watched(() => executor.exec(sql)),
+    run: (sql, ...params) => watched(() => executor.run(sql, ...params)),
+    runCounted: (sql, ...params) => watched(() => executor.runCounted(sql, ...params)),
+    get: (sql, ...params) => watched(() => executor.get(sql, ...params)),
+    all: (sql, ...params) => watched(() => executor.all(sql, ...params))
+  };
+}
+
+class SqliteStorage {
+  db;
+  schema;
+  nextId;
+  closed = false;
+  closing;
+  admittedReads = 0;
+  readsDrained;
+  constructor(db, schema, nextId) {
+    this.db = db;
+    this.schema = schema;
+    this.nextId = nextId;
+  }
+  static async open(db, options = {}) {
+    try {
+      const schema = createSqliteSchema(options.prefix);
+      await applySqliteMigrationsForSchema(db, schema);
+      const metadata = await db.get(`SELECT next_id, next_seq FROM ${schema.tables.durableMetadata} WHERE singleton = 1`);
+      if (metadata === undefined)
+        throw new Error("Durable SQLite metadata is missing");
+      return new SqliteStorage(db, schema, Number(metadata.next_id));
+    } catch (error) {
+      try {
+        await db.close();
+      } catch {}
+      throw error;
+    }
+  }
+  async commit(batches, receive, _context) {
+    this.assertOpen();
+    const seqs = [];
+    let refused;
+    let candidateNextId = this.nextId;
+    await this.db.transaction(async (transaction) => {
+      const metadata = await this.readMetadata(transaction);
+      let next = metadata.next_seq;
+      const state = await CommitState.read(transaction, this.schema.tables, batches);
+      const pending = new PendingWrites;
+      for (const writes of batches) {
+        const checked = await this.checkBatch(transaction, state, pending, writes);
+        if ("refused" in checked) {
+          refused = { error: checked.refused };
+          break;
+        }
+        const seq = seqFromNumber(next++);
+        state.apply(writes, checked.actions, seq);
+        pending.add(writes, checked.actions, seq, state);
+        seqs.push(seq);
+        candidateNextId = Math.max(candidateNextId, this.candidateNextId(writes));
+      }
+      await pending.flush(transaction, this.schema.tables);
+      if (seqs.length > 0) {
+        await this.writeMetadata(transaction, Math.max(Number(metadata.next_id), candidateNextId), next);
+      }
+    });
+    this.nextId = Math.max(this.nextId, candidateNextId);
+    for (const [index, seq] of seqs.entries())
+      receive(index, seq);
+    return refused === undefined ? { stored: seqs.length } : { stored: seqs.length, refused: refused.error };
+  }
+  async readMetadata(executor) {
+    const metadata = await executor.get(`SELECT next_id, next_seq FROM ${this.schema.tables.durableMetadata} WHERE singleton = 1`);
+    if (metadata === undefined)
+      throw new Error("Durable SQLite metadata is missing");
+    return metadata;
+  }
+  async writeMetadata(executor, nextId, nextSeq) {
+    await executor.run(`UPDATE ${this.schema.tables.durableMetadata} SET next_id = ?, next_seq = ? WHERE singleton = 1`, String(nextId), nextSeq);
+  }
+  async checkBatch(transaction, state, pending, writes) {
+    let actions;
+    try {
+      actions = prepareDocumentActions(writes);
+      state.check(writes, actions);
+    } catch (error) {
+      return { refused: error };
+    }
+    if (![...actions.values()].some((action) => action.copy !== undefined))
+      return { actions };
+    await pending.flush(transaction, this.schema.tables);
+    const calls = { failed: false };
+    try {
+      await this.resolveCopies(watchCalls(transaction, calls), actions);
+    } catch (error) {
+      if (calls.failed)
+        throw error;
+      return { refused: error };
+    }
+    return { actions };
+  }
+  async mintId() {
+    this.assertOpen();
+    if (!Number.isSafeInteger(this.nextId))
+      throw new Error("ID space is exhausted");
+    return idFromNumber(this.nextId++);
+  }
+  async conversation(id, _context) {
+    this.assertOpen();
+    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.conversations} WHERE id = ?`, id);
+    return row === undefined ? undefined : parseJson(row.record);
+  }
+  async scanConversations(query, limit, cursor, _context) {
+    this.assertOpen();
+    const start = scanStart(query.order, cursor, "ascending");
+    const scan = scanSql(start);
+    const clauses = [scan.clause];
+    const params = [scan.param];
+    if (query.ownerConversationId !== undefined) {
+      clauses.push("owner_conversation_id = ?");
+      params.push(query.ownerConversationId);
+    }
+    if (query.ownerTaskId !== undefined) {
+      clauses.push("owner_task_id = ?");
+      params.push(query.ownerTaskId);
+    }
+    params.push(limit + 1);
+    const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.conversations} WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`, ...params);
+    return page(rows.map((row) => parseJson(row.record)), limit, start.order);
+  }
+  entry(idOrConversationId, idOrContext, context) {
+    return this.admitRead(() => this.readEntry(idOrConversationId, idOrContext, context));
+  }
+  findLatestHeadMarker(conversationId, atOrBeforeEntryId, _context) {
+    return this.admitRead(() => this.readLatestHeadMarker(conversationId, atOrBeforeEntryId));
+  }
+  scanEntries(query, limit, cursor, _context) {
+    return this.admitRead(() => this.readEntries(query, limit, cursor));
+  }
+  async readEntry(idOrConversationId, idOrContext, context) {
+    const id = context === undefined ? idFromNumber(idOrConversationId) : typeof idOrContext === "number" ? idFromNumber(idOrContext) : undefined;
+    if (id === undefined)
+      throw new StorageRequestError("Storage.entry() requires an entry ID");
+    let conversation;
+    if (context !== undefined) {
+      const conversationId = idFromNumber(idOrConversationId);
+      conversation = await this.readConversation(conversationId);
+      if (conversation === undefined)
+        throw new StorageRequestError(`Unknown conversation: ${conversationId}`);
+    }
+    const row = await this.db.get(`SELECT record, commit_seq FROM ${this.schema.tables.entries} WHERE id = ?`, id);
+    if (row === undefined)
+      return;
+    const entry = parseJson(row.record);
+    if (conversation !== undefined) {
+      let upperEntryId = Number.POSITIVE_INFINITY;
+      while (conversation.id !== entry.conversationId) {
+        if (conversation.parent === undefined)
+          return;
+        upperEntryId = Math.min(upperEntryId, conversation.parent.at);
+        conversation = await this.readConversation(conversation.parent.conversationId);
+      }
+      if (entry.id > upperEntryId)
+        return;
+    }
+    return { entry, commitSeq: seqFromNumber(row.commit_seq) };
+  }
+  async readLatestHeadMarker(conversationId, atOrBeforeEntryId) {
+    let conversation = await this.readConversation(conversationId);
+    if (conversation === undefined)
+      throw new StorageRequestError(`Unknown conversation: ${conversationId}`);
+    let upper = atOrBeforeEntryId;
+    while (true) {
+      const row = upper === undefined ? await this.db.get(`SELECT record FROM ${this.schema.tables.entries} WHERE conversation_id = ? AND head IS NOT NULL ORDER BY id DESC LIMIT 1`, conversation.id) : await this.db.get(`SELECT record FROM ${this.schema.tables.entries} WHERE conversation_id = ? AND head IS NOT NULL AND id <= ? ORDER BY id DESC LIMIT 1`, conversation.id, upper);
+      if (row !== undefined)
+        return parseJson(row.record);
+      if (conversation.parent === undefined)
+        return;
+      upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
+      conversation = await this.readConversation(conversation.parent.conversationId);
+    }
+  }
+  async readEntries(query, limit, cursor) {
+    const { order, after } = scanStart(query.order, cursor, "descending");
+    if (order === "ascending")
+      return this.readEntriesAscending(query, limit, after);
+    let conversation = await this.readConversation(query.conversationId);
+    if (conversation === undefined)
+      throw new StorageRequestError(`Unknown conversation: ${query.conversationId}`);
+    let upper = query.maxEntryId;
+    if (after !== undefined)
+      upper = Math.min(upper ?? Number.MAX_SAFE_INTEGER, after - 1);
+    const values = [];
+    while (true) {
+      const clauses = ["conversation_id = ?"];
+      const params = [conversation.id];
+      if (query.minEntryId !== undefined) {
+        clauses.push("id >= ?");
+        params.push(query.minEntryId);
+      }
+      if (upper !== undefined) {
+        clauses.push("id <= ?");
+        params.push(upper);
+      }
+      params.push(limit + 1 - values.length);
+      const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.entries} WHERE ${clauses.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...params);
+      values.push(...rows.map((row) => parseJson(row.record)));
+      if (values.length > limit || conversation.parent === undefined)
+        break;
+      upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
+      if (query.minEntryId !== undefined && upper < query.minEntryId)
+        break;
+      conversation = await this.readConversation(conversation.parent.conversationId);
+    }
+    return page(values, limit, "descending");
+  }
+  async readEntriesAscending(query, limit, after) {
+    const segments = [];
+    let conversation = await this.readConversation(query.conversationId);
+    if (conversation === undefined)
+      throw new StorageRequestError(`Unknown conversation: ${query.conversationId}`);
+    let upper = query.maxEntryId;
+    while (true) {
+      segments.push({ conversationId: conversation.id, upper });
+      if (conversation.parent === undefined)
+        break;
+      upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
+      if (query.minEntryId !== undefined && upper < query.minEntryId)
+        break;
+      conversation = await this.readConversation(conversation.parent.conversationId);
+    }
+    let lower = query.minEntryId;
+    if (after !== undefined)
+      lower = Math.max(lower ?? after + 1, after + 1);
+    const values = [];
+    for (const segment of segments.reverse()) {
+      const clauses = ["conversation_id = ?"];
+      const params = [segment.conversationId];
+      if (lower !== undefined) {
+        clauses.push("id >= ?");
+        params.push(lower);
+      }
+      if (segment.upper !== undefined) {
+        clauses.push("id <= ?");
+        params.push(segment.upper);
+      }
+      params.push(limit + 1 - values.length);
+      const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.entries} WHERE ${clauses.join(" AND ")} ORDER BY id ASC LIMIT ?`, ...params);
+      values.push(...rows.map((row) => parseJson(row.record)));
+      if (values.length > limit)
+        break;
+    }
+    return page(values, limit, "ascending");
+  }
+  async task(id, _context) {
+    this.assertOpen();
+    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.tasks} WHERE id = ?`, id);
+    return row === undefined ? undefined : parseJson(row.record);
+  }
+  async scanTasks(query, limit, cursor, _context) {
+    this.assertOpen();
+    const start = scanStart(query.order, cursor, "ascending");
+    const scan = scanSql(start);
+    const clauses = [scan.clause];
+    const params = [scan.param];
+    if (query.conversationId !== undefined) {
+      clauses.push("conversation_id = ?");
+      params.push(query.conversationId);
+    }
+    if (query.kind !== undefined) {
+      clauses.push("kind = ?");
+      params.push(encodeIndexedString(query.kind));
+    }
+    if (query.status !== undefined) {
+      clauses.push("status = ?");
+      params.push(query.status);
+    }
+    if (query.abortRequested !== undefined) {
+      clauses.push("abort_requested = ?");
+      params.push(query.abortRequested ? 1 : 0);
+    }
+    if (query.background !== undefined) {
+      clauses.push("background = ?");
+      params.push(query.background ? 1 : 0);
+    }
+    params.push(limit + 1);
+    const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.tasks} WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`, ...params);
+    return page(rows.map((row) => parseJson(row.record)), limit, start.order);
+  }
+  async submission(id, _context) {
+    this.assertOpen();
+    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.submissions} WHERE id = ?`, id);
+    return row === undefined ? undefined : parseJson(row.record);
+  }
+  async scanSubmissions(query, limit, cursor, _context) {
+    this.assertOpen();
+    const start = scanStart(query.order, cursor, "ascending");
+    const scan = scanSql(start);
+    const clauses = [scan.clause];
+    const params = [scan.param];
+    if (query.conversationId !== undefined) {
+      clauses.push("conversation_id = ?");
+      params.push(query.conversationId);
+    }
+    if (query.status !== undefined) {
+      clauses.push("status = ?");
+      params.push(query.status);
+    }
+    params.push(limit + 1);
+    const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.submissions} WHERE ${clauses.join(" AND ")} ORDER BY id ${scan.direction} LIMIT ?`, ...params);
+    return page(rows.map((row) => parseJson(row.record)), limit, start.order);
+  }
+  async submissionByRequest(conversationId, requestId, _context) {
+    this.assertOpen();
+    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.submissions} WHERE conversation_id = ? AND request_id = ?`, conversationId, encodeIndexedString(requestId));
+    return row === undefined ? undefined : parseJson(row.record);
+  }
+  async findDocument(address, at, _context) {
+    this.assertOpen();
+    const parts = addressParts(address);
+    const sql = at === "current" ? `SELECT record FROM ${this.schema.tables.documents}
+					WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
+					AND retired_at IS NULL ORDER BY created_at DESC LIMIT 1` : `SELECT record FROM ${this.schema.tables.documents}
+					WHERE kind = ? AND scope_kind = ? AND owner_id = ? AND family = ? AND key_value = ?
+					AND created_at <= ? AND (retired_at IS NULL OR retired_at > ?)
+					ORDER BY created_at DESC LIMIT 1`;
+    const params = [parts.kind, parts.scopeKind, parts.ownerId, parts.family, parts.keyValue];
+    if (at !== "current")
+      params.push(at, at);
+    const row = await this.db.get(sql, ...params);
+    return row === undefined ? undefined : parseJson(row.record);
+  }
+  async document(id, at, _context) {
+    this.assertOpen();
+    return this.db.transaction((transaction) => this.materializeDocument(transaction, id, at));
+  }
+  async scanDocuments(query, limit, cursor, _context) {
+    this.assertOpen();
+    const scope = scopeColumns(query.scope);
+    const clauses = ["scope_kind = ?", "owner_id = ?", "id > ?"];
+    const params = [scope.scopeKind, scope.ownerId, cursorId(cursor) ?? -1];
+    if (query.kind !== undefined) {
+      clauses.push("kind = ?");
+      params.push(encodeIndexedString(query.kind));
+    }
+    if (query.at === "current") {
+      clauses.push("retired_at IS NULL");
+    } else {
+      clauses.push("created_at <= ?", "(retired_at IS NULL OR retired_at > ?)");
+      params.push(query.at, query.at);
+    }
+    params.push(limit + 1);
+    const rows = await this.db.all(`SELECT record FROM ${this.schema.tables.documents} WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT ?`, ...params);
+    return page(rows.map((row) => parseJson(row.record)), limit);
+  }
+  close(_context) {
+    if (this.closing === undefined) {
+      this.closed = true;
+      this.closing = this.closeDatabase();
+    }
+    return this.closing;
+  }
+  async closeDatabase() {
+    if (this.admittedReads > 0) {
+      await new Promise((resolve) => {
+        this.readsDrained = resolve;
+      });
+    }
+    await this.db.close();
+  }
+  async admitRead(read) {
+    this.assertOpen();
+    this.admittedReads++;
+    try {
+      return await read();
+    } finally {
+      if (--this.admittedReads === 0)
+        this.readsDrained?.();
+    }
+  }
+  async readConversation(id) {
+    const row = await this.db.get(`SELECT record FROM ${this.schema.tables.conversations} WHERE id = ?`, id);
+    return row === undefined ? undefined : parseJson(row.record);
+  }
+  async materializeDocument(executor, id, at) {
+    const row = await executor.get(`SELECT record FROM ${this.schema.tables.documents} WHERE id = ?`, id);
+    if (row === undefined)
+      return;
+    const record = parseJson(row.record);
+    if (at !== "current" && isCurrentOnly(record)) {
+      throw new StorageRequestError(`Document ${id} does not retain historical content`);
+    }
+    if (!isAliveAt(record, at))
+      return;
+    const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
+    const base = await executor.get(`SELECT seq, kind, version, content FROM ${this.schema.tables.documentRevisions}
+				WHERE document_id = ? AND kind = 'base' AND seq <= ? ORDER BY seq DESC LIMIT 1`, id, upper);
+    if (base === undefined)
+      throw new Error(`Document ${id} is missing a required base`);
+    let value = parseJson(base.content);
+    const tail = await executor.all(`SELECT seq, kind, version, content FROM ${this.schema.tables.documentRevisions}
+				WHERE document_id = ? AND seq > ? AND seq <= ? ORDER BY seq`, id, base.seq, upper);
+    for (const revision of tail) {
+      if (revision.kind !== "delta" || revision.version !== base.version) {
+        throw new Error(`Document ${id} crosses a stored version boundary without a base`);
+      }
+      value = apply(value, parseJson(revision.content));
+    }
+    return { record, version: base.version, value, deltasSinceBase: tail.length };
+  }
+  candidateNextId(writes) {
+    let nextId = this.nextId;
+    for (const write of writes) {
+      const id = claimOf(write)?.id;
+      if (id !== undefined)
+        nextId = Math.max(nextId, id + 1);
+    }
+    return nextId;
+  }
+  async resolveCopies(executor, actions) {
+    for (const [id, action] of actions) {
+      if (action.copy === undefined)
+        continue;
+      try {
+        const stored = await this.materializeDocument(executor, action.copy.id, action.copy.at);
+        if (stored === undefined)
+          throw new Error(`Fork source document ${action.copy.id} cannot be read`);
+        const create = action.create;
+        if (stored.record.scope.kind !== "conversation" || create.scope.kind !== "conversation" || stored.record.kind !== create.kind || stored.record.key !== create.key || stored.record.history !== create.history || stored.record.fork !== create.fork) {
+          throw new Error(`Fork source document ${action.copy.id} does not match the copied record`);
+        }
+        action.content = { kind: "base", version: stored.version, value: stored.value };
+      } catch (error) {
+        throw new Error(`Document copy ${id} was rejected`, { cause: error });
+      }
+    }
+  }
+  assertOpen() {
+    if (this.closed)
+      throw new Error("SqliteStorage is closed");
+  }
+}
+
+// node_modules/@earendil-works/pi-durable/dist/storage/sqlite/cloudflare.js
+function openDurableObjectSqliteStorage(storage, options = {}) {
+  return SqliteStorage.open(new DurableObjectSqliteDatabase(storage), options);
+}
+
+// node_modules/agents/dist/harness/pi/index.js
+var DEFAULT_PREFIX = "pi_";
+function openPiSessionStore(storage, options = {}) {
+  const prefix = options.prefix ?? DEFAULT_PREFIX;
+  if (prefix.toLowerCase().startsWith("_cf_"))
+    return Promise.reject(/* @__PURE__ */ new Error("The pi session store prefix must not start with _cf_"));
+  return openDurableObjectSqliteStorage(storage, { prefix });
+}
+var BG = BACKGROUND_CONTEXT;
+var ROOT_SESSION = String(ROOT_CONVERSATION_ID);
+var WAIT_BUDGET_MS = 10 * 60000;
+var HEARTBEAT_MS = 30000;
+var POLL_MS = 1000;
+var MAX_WAKE_BACKOFF_MS = 10 * 60000;
+var WAKE_ERRORS_KEY = "pi-harness:wake-errors";
+var WAKE_FN = "wake";
+var WAKE_JOB_ID = "pi-wake";
+function modelRef(model) {
+  return {
+    provider: model.provider,
+    modelId: model.id
+  };
+}
+function conversationId(session) {
+  const id = Number(session);
+  if (!Number.isSafeInteger(id) || id < 1)
+    throw new Error(`Invalid pi session ${JSON.stringify(session)}`);
+  return id;
+}
+function assistantText(entry) {
+  const message = entry?.model?.[0];
+  if (message?.role !== "assistant")
+    return "";
+  return message.content.map((part) => part.type === "text" ? part.text : "").join("");
+}
+function signalContext(signal) {
+  return signal ? withAbortSignal(signal, BG) : BG;
+}
+var _options = /* @__PURE__ */ new WeakMap;
+var _waiting = /* @__PURE__ */ new WeakMap;
+var _changed = /* @__PURE__ */ new WeakMap;
+var _admitting = /* @__PURE__ */ new WeakMap;
+var _onWakeWired = /* @__PURE__ */ new WeakMap;
+var _waitBudgetMs = /* @__PURE__ */ new WeakMap;
+var _heartbeatMs = /* @__PURE__ */ new WeakMap;
+var _pollMs = /* @__PURE__ */ new WeakMap;
+var _opening = /* @__PURE__ */ new WeakMap;
+var _lastClose = /* @__PURE__ */ new WeakMap;
+var _closing = /* @__PURE__ */ new WeakMap;
+var _PiHarness_brand = /* @__PURE__ */ new WeakSet;
+var _onWake = /* @__PURE__ */ new WeakMap;
+var PiHarness = class extends LifecycleCapability {
+  constructor(options) {
+    super("pi-harness");
+    _classPrivateMethodInitSpec(this, _PiHarness_brand);
+    _classPrivateFieldInitSpec(this, _options, undefined);
+    _classPrivateFieldInitSpec(this, _waiting, undefined);
+    _classPrivateFieldInitSpec(this, _changed, undefined);
+    _classPrivateFieldInitSpec(this, _admitting, 0);
+    _classPrivateFieldInitSpec(this, _onWakeWired, false);
+    _classPrivateFieldInitSpec(this, _waitBudgetMs, WAIT_BUDGET_MS);
+    _classPrivateFieldInitSpec(this, _heartbeatMs, HEARTBEAT_MS);
+    _classPrivateFieldInitSpec(this, _pollMs, POLL_MS);
+    _classPrivateFieldInitSpec(this, _opening, undefined);
+    _classPrivateFieldInitSpec(this, _lastClose, Promise.resolve());
+    _classPrivateFieldInitSpec(this, _closing, /* @__PURE__ */ new WeakSet);
+    _classPrivateFieldInitSpec(this, _onWake, (wake) => {
+      _classPrivateFieldSet2(_onWakeWired, this, true);
+      _classPrivateFieldGet2(_changed, this)?.call(this);
+      if (_classPrivateFieldGet2(_waiting, this))
+        return;
+      _assertClassBrand(_PiHarness_brand, this, _wakeFor).call(this, wake).catch((error) => _assertClassBrand(_PiHarness_brand, this, _wakeError).call(this, error));
+    });
+    _classPrivateFieldSet2(_options, this, options);
+    this.sessions = new PiSessions(this);
+  }
+  async onStart(_context) {
+    await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
+  }
+  async onJob(context) {
+    if (context.job.fn !== WAKE_FN)
+      return;
+    let outcome;
+    if (context.job.id !== WAKE_JOB_ID) {
+      await _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
+      outcome = undefined;
+    } else
+      outcome = await _assertClassBrand(_PiHarness_brand, this, _wakeStep).call(this);
+    const kv = this.lifecycle.storage.kv;
+    if (kv.get(WAKE_ERRORS_KEY) !== undefined)
+      kv.delete(WAKE_ERRORS_KEY);
+    return outcome;
+  }
+  onJobError(context, error) {
+    if (context.job.fn !== WAKE_FN)
+      return;
+    console.error(`pi wake job "${context.job.id}" failed after ${context.attempt} attempts; retrying with backoff`, error);
+    _assertClassBrand(_PiHarness_brand, this, _wakeError).call(this, error);
+    const kv = this.lifecycle.storage.kv;
+    const errors = (kv.get(WAKE_ERRORS_KEY) ?? 0) + 1;
+    kv.put(WAKE_ERRORS_KEY, errors);
+    const delay = Math.min(_classPrivateFieldGet2(_heartbeatMs, this) * 2 ** (errors - 1), MAX_WAKE_BACKOFF_MS);
+    return { rescheduleAt: Date.now() + delay };
+  }
+  async dispose() {
+    const opening = _classPrivateFieldGet2(_opening, this);
+    _classPrivateFieldSet2(_opening, this, undefined);
+    await (await opening?.catch(() => {
+      return;
+    }))?.pi.close(BG);
+  }
+  session(id = ROOT_SESSION) {
+    return new PiSession(this, id);
+  }
+  prompt(input, options = {}) {
+    return this.session(options.session).prompt(input, options);
+  }
+  submit(input, options = {}) {
+    return this.session(options.session).submit(input, options);
+  }
+  continue(options = {}) {
+    return this.session(options.session).continue(options);
+  }
+  abort(options = {}) {
+    return this.session(options.session).abort(options.operationId);
+  }
+  wait(operationId, options = {}) {
+    return this.session(options.session).wait(operationId, options.signal);
+  }
+  messages(options = {}) {
+    return this.session(options.session).messages();
+  }
+  async pending(options = {}) {
+    const { pi } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
+    const id = options.session === undefined ? undefined : conversationId(options.session);
+    return (await pi.inspect(BG)).submissions.flatMap((record) => {
+      if (record.requestId === undefined)
+        return [];
+      if (id !== undefined && record.conversationId !== id)
+        return [];
+      let status;
+      switch (record.status) {
+        case "queued":
+          status = "queued";
+          break;
+        case "placed":
+          status = "running";
+          break;
+        case "done":
+        case "unanswered":
+          return [];
+        default:
+          return record;
+      }
+      return [{
+        operationId: record.requestId,
+        session: String(record.conversationId),
+        status
+      }];
+    });
+  }
+  async pi() {
+    return (await _assertClassBrand(_PiHarness_brand, this, _open).call(this)).pi;
+  }
+  async conversation(session) {
+    const { pi } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
+    const conversation = await pi.conversation(conversationId(session), BG);
+    if (!conversation)
+      throw new Error(`Unknown pi session ${session}`);
+    return conversation;
+  }
+  async storage() {
+    return (await _assertClassBrand(_PiHarness_brand, this, _open).call(this)).storage;
+  }
+  async enqueue(session, input, options) {
+    return _assertClassBrand(_PiHarness_brand, this, _admitDraft).call(this, session, options.operationId, {
+      type: "input",
+      content: input,
+      whenBusy: options.whenBusy ?? "followUp",
+      ...options.whenIdle ? { whenIdle: options.whenIdle } : {},
+      ...options.entry ? { entry: options.entry } : {}
+    });
+  }
+  enqueueContinue(session, options) {
+    return _assertClassBrand(_PiHarness_brand, this, _admitDraft).call(this, session, options.operationId, { type: "continue" });
+  }
+  async withdraw(session, operationId) {
+    const { pi, storage } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
+    const id = conversationId(session);
+    const record = await storage.submissionByRequest(id, operationId, BG);
+    if (!record || record.status === "done" || record.status === "unanswered")
+      return false;
+    const outcome = await pi.abortSubmission(record.id, BG, id);
+    switch (outcome) {
+      case "aborted":
+        return true;
+      case "already_placed":
+        await (await pi.conversation(id, BG))?.abort(BG);
+        return true;
+      case "settled":
+      case "not_found":
+        return false;
+      default:
+        return outcome;
+    }
+  }
+  async settled(session, operationId, signal) {
+    const conversation = await this.conversation(session);
+    const context = signalContext(signal);
+    const submission = await _assertClassBrand(_PiHarness_brand, this, _findSubmission).call(this, conversation.id, operationId, context);
+    if (!submission)
+      return {
+        operationId,
+        session,
+        status: "unanswered",
+        reason: "not_found"
+      };
+    return _assertClassBrand(_PiHarness_brand, this, _result).call(this, session, operationId, await submission.wait(context), context);
+  }
+  agentDefaults() {
+    const defaults = _classPrivateFieldGet2(_options, this).defaults;
+    return {
+      ...defaults?.model === undefined ? {} : { model: modelRef(defaults.model) },
+      ...defaults?.thinkingLevel === undefined ? {} : { thinkingLevel: defaults.thinkingLevel },
+      ...defaults?.maxTurns === undefined ? {} : { maxTurns: defaults.maxTurns }
+    };
+  }
+};
+async function _admitDraft(session, requested, draft) {
+  const operationId = requested ?? crypto.randomUUID();
+  const { storage } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
+  const conversation = await this.conversation(session);
+  return {
+    operationId,
+    session,
+    accepted: await _assertClassBrand(_PiHarness_brand, this, _admit).call(this, async () => {
+      const accepted = await storage.submissionByRequest(conversation.id, operationId, BG) === undefined;
+      await conversation.submit({
+        ...draft,
+        requestId: operationId
+      }, BG);
+      return accepted;
+    })
+  };
+}
+async function _admit(hand) {
+  var _this$admitting;
+  _classPrivateFieldSet2(_admitting, this, (_this$admitting = _classPrivateFieldGet2(_admitting, this), _this$admitting++, _this$admitting));
+  let result;
+  try {
+    await _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
+    result = await hand();
+  } finally {
+    var _this$admitting3;
+    _classPrivateFieldSet2(_admitting, this, (_this$admitting3 = _classPrivateFieldGet2(_admitting, this), _this$admitting3--, _this$admitting3));
+  }
+  await _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
+  return result;
+}
+function _wake(time = Date.now()) {
+  return this.lifecycle.jobs.push({
+    id: WAKE_JOB_ID,
+    fn: WAKE_FN,
+    time,
+    singleflight: true,
+    recoveryLoop: true
+  });
+}
+async function _wakeFor(wake) {
+  if (wake.active)
+    await _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
+  else if (wake.at !== undefined)
+    await _assertClassBrand(_PiHarness_brand, this, _wake).call(this, wake.at);
+}
+async function _wakeStep() {
+  const heartbeat = { rescheduleAt: Date.now() + _classPrivateFieldGet2(_heartbeatMs, this) };
+  if (_classPrivateFieldGet2(_waiting, this))
+    return heartbeat;
+  const { pi } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
+  pi.resume();
+  const wake = pi.wake();
+  if (wake.active) {
+    const wait = _assertClassBrand(_PiHarness_brand, this, _waitWhileActive).call(this, pi).then((ended) => {
+      _classPrivateFieldSet2(_waiting, this, undefined);
+      if (ended)
+        _assertClassBrand(_PiHarness_brand, this, _wake).call(this);
+    }, (error) => {
+      _classPrivateFieldSet2(_waiting, this, undefined);
+      throw error;
+    });
+    _classPrivateFieldSet2(_waiting, this, wait);
+    if (!this.lifecycle.trackAlarmWork(wait))
+      wait.catch(() => {});
+    return heartbeat;
+  }
+  if (_classPrivateFieldGet2(_admitting, this) > 0)
+    return heartbeat;
+  if (wake.at !== undefined)
+    return { rescheduleAt: wake.at };
+}
+async function _waitWhileActive(pi) {
+  const deadline = Date.now() + _classPrivateFieldGet2(_waitBudgetMs, this);
+  try {
+    let wake = pi.wake();
+    while (wake.active) {
+      const now = Date.now();
+      const left = deadline - now;
+      if (left <= 0)
+        return true;
+      let sleep = _classPrivateFieldGet2(_onWakeWired, this) ? left : Math.min(left, _classPrivateFieldGet2(_pollMs, this));
+      if (wake.at !== undefined)
+        sleep = Math.min(sleep, wake.at - now);
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, sleep);
+        _classPrivateFieldSet2(_changed, this, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      _classPrivateFieldSet2(_changed, this, undefined);
+      if (wake.at !== undefined && Date.now() >= wake.at)
+        pi.resume();
+      wake = pi.wake();
+    }
+    return true;
+  } catch (error) {
+    if (!_classPrivateFieldGet2(_closing, this).has(pi))
+      _assertClassBrand(_PiHarness_brand, this, _wakeError).call(this, error);
+    if (isDurableObjectMemoryLimitReset(error))
+      throw error;
+    return false;
+  }
+}
+function _wakeError(error) {
+  this.lifecycle.events.emit("pi:wake_error", { error: error instanceof Error ? error.message : String(error) });
+}
+async function _open() {
+  await this.lifecycle.ready();
+  if (_classPrivateFieldGet2(_opening, this) === undefined) {
+    const opening = _assertClassBrand(_PiHarness_brand, this, _doOpen).call(this, (pi, closed) => _assertClassBrand(_PiHarness_brand, this, _piClosing).call(this, opening, pi, closed)).catch((error) => {
+      if (_classPrivateFieldGet2(_opening, this) === opening)
+        _classPrivateFieldSet2(_opening, this, undefined);
+      throw error;
+    });
+    _classPrivateFieldSet2(_opening, this, opening);
+  }
+  return _classPrivateFieldGet2(_opening, this);
+}
+async function _doOpen(onClose) {
+  await _classPrivateFieldGet2(_lastClose, this);
+  const storage = await openPiSessionStore(this.lifecycle.storage);
+  const pi = await _classPrivateFieldGet2(_options, this).harness({
+    storage,
+    context: BG,
+    onWake: _classPrivateFieldGet2(_onWake, this)
+  });
+  try {
+    const closed = pi.closed;
+    pi.subscribeClose(() => onClose(pi, closed));
+    await pi.root(BG, { agent: this.agentDefaults() });
+    pi.resume();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (!_classPrivateFieldGet2(_onWakeWired, this))
+      console.warn("PiHarness: the harness factory did not pass onWake to Harness.open, so pi's timers keep this Durable Object in memory while a task sleeps. Pass it: harness: ({ storage, context, onWake }) => Harness.open(storage, { ...options, onWake }, context)");
+    await _assertClassBrand(_PiHarness_brand, this, _wakeFor).call(this, pi.wake());
+  } catch (error) {
+    pi.close(BG).catch(() => {});
+    throw error;
+  }
+  return {
+    pi,
+    storage
+  };
+}
+function _piClosing(opening, pi, closed) {
+  _classPrivateFieldGet2(_closing, this).add(pi);
+  _classPrivateFieldGet2(_changed, this)?.call(this);
+  if (_classPrivateFieldGet2(_opening, this) !== opening)
+    return;
+  _classPrivateFieldSet2(_opening, this, undefined);
+  _classPrivateFieldSet2(_lastClose, this, closed);
+}
+async function _findSubmission(id, operationId, context) {
+  const { pi, storage } = await _assertClassBrand(_PiHarness_brand, this, _open).call(this);
+  const record = await storage.submissionByRequest(id, operationId, context);
+  return record ? pi.submission(record.id, context) : undefined;
+}
+async function _result(session, operationId, settled, context) {
+  if (settled.status === "unanswered")
+    return {
+      operationId,
+      session,
+      status: "unanswered",
+      reason: settled.reason
+    };
+  if (settled.type === "write")
+    return {
+      operationId,
+      session,
+      status: "done"
+    };
+  return {
+    operationId,
+    session,
+    status: "done",
+    text: assistantText((await (await this.conversation(session)).entries({
+      minEntryId: settled.answer,
+      maxEntryId: settled.answer
+    }, 1, undefined, context)).items[0])
+  };
+}
+var _harness = /* @__PURE__ */ new WeakMap;
+var PiSession = class {
+  constructor(harness, id) {
+    _classPrivateFieldInitSpec(this, _harness, undefined);
+    _classPrivateFieldSet2(_harness, this, harness);
+    this.id = id;
+  }
+  submit(input, options = {}) {
+    return _classPrivateFieldGet2(_harness, this).enqueue(this.id, input, options);
+  }
+  async prompt(input, options = {}) {
+    const receipt = await this.submit(input, options);
+    return {
+      ...await this.wait(receipt.operationId),
+      messages: await this.messages()
+    };
+  }
+  continue(options = {}) {
+    return _classPrivateFieldGet2(_harness, this).enqueueContinue(this.id, options);
+  }
+  steer(input, options = {}) {
+    return this.submit(input, {
+      ...options,
+      whenBusy: "steer"
+    });
+  }
+  wait(operationId, signal) {
+    return _classPrivateFieldGet2(_harness, this).settled(this.id, operationId, signal);
+  }
+  async abort(operationId) {
+    if (operationId !== undefined)
+      return _classPrivateFieldGet2(_harness, this).withdraw(this.id, operationId);
+    await (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).abort(BG);
+    return true;
+  }
+  async reset(handoff) {
+    await (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).reset(handoff, BG);
+  }
+  async setModel(model) {
+    await (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).configure({ model: modelRef(model) }, BG);
+  }
+  async messages() {
+    return [...(await (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).context(BG)).entries];
+  }
+  async watch(window2, context = BG) {
+    return (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).watch(context, window2);
+  }
+  async entries(query, limit, context = BG) {
+    return (await _classPrivateFieldGet2(_harness, this).conversation(this.id)).entries(query, limit, undefined, context);
+  }
+  async busy() {
+    return (await (await _classPrivateFieldGet2(_harness, this).pi()).snapshot(LiveDoc, conversationId(this.id), BG))?.run !== undefined;
+  }
+};
+var _harness2 = /* @__PURE__ */ new WeakMap;
+var PiSessions = class {
+  constructor(harness) {
+    _classPrivateFieldInitSpec(this, _harness2, undefined);
+    _classPrivateFieldSet2(_harness2, this, harness);
+  }
+  get(id) {
+    return _classPrivateFieldGet2(_harness2, this).session(id);
+  }
+  async create() {
+    const conversation = await (await _classPrivateFieldGet2(_harness2, this).pi()).createConversation({
+      ownership: { kind: "ownerless" },
+      agent: _classPrivateFieldGet2(_harness2, this).agentDefaults()
+    }, BG);
+    return _classPrivateFieldGet2(_harness2, this).session(String(conversation.id));
+  }
+  async fork(from) {
+    const conversation = await _classPrivateFieldGet2(_harness2, this).conversation(from);
+    const at = (await conversation.entries({}, 1, undefined, BG)).items[0];
+    if (!at)
+      throw new Error(`Session ${from} has no entries to fork from`);
+    const fork = await conversation.fork(at.id, { ownership: { kind: "ownerless" } }, BG);
+    return _classPrivateFieldGet2(_harness2, this).session(String(fork.id));
+  }
+  async list() {
+    const storage = await _classPrivateFieldGet2(_harness2, this).storage();
+    const pi = await _classPrivateFieldGet2(_harness2, this).pi();
+    const sessions = [];
+    let cursor;
+    for (;; ) {
+      const page = await storage.scanConversations({}, 100, cursor, BG);
+      for (const record of page.items) {
+        const live = await pi.snapshot(LiveDoc, record.id, BG);
+        sessions.push({
+          id: String(record.id),
+          ...record.parent ? { parent: String(record.parent.conversationId) } : {},
+          busy: live?.run !== undefined
+        });
+      }
+      if (page.next === undefined)
+        return sessions;
+      cursor = page.next;
+    }
+  }
+};
+function textResult(text) {
+  return { output: [{
+    type: "text",
+    text
+  }] };
+}
+function errorResult(error) {
+  return {
+    output: [{
+      type: "text",
+      text: error.message
+    }],
+    isError: true
+  };
+}
+function skillTools(catalog) {
+  const names = catalog.skills.map((entry) => entry.skill.name);
+  if (names.length === 0)
+    return [];
+  const nameSchema = StringEnum(names);
+  return [{
+    name: "activate_skill",
+    description: "Activate a skill by name. Use this when the user's task matches one of the available skills; the response contains the skill's full instructions.",
+    parameters: obj({ name: nameSchema }, { open: true }),
+    replay: "safe",
+    async execute(input) {
+      const activated = catalog.activate(input.name);
+      return activated.ok ? textResult(activated.value) : errorResult(activated.error);
+    }
+  }, {
+    name: "read_skill_resource",
+    description: "Read a file bundled with a skill, such as a reference document or template. Provide the skill name and the file's path from the skill's resource list, or a qualified path like skill-name/references/file.md.",
+    parameters: obj({
+      name: opt(nameSchema),
+      path: str({ minLength: 1 })
+    }, { open: true }),
+    replay: "safe",
+    async execute(input) {
+      const read = await catalog.readResource(input.name === undefined ? { path: input.path } : {
+        name: input.name,
+        path: input.path
+      });
+      return read.ok ? textResult(renderSkillResource(read.value)) : errorResult(read.error);
+    }
+  }];
+}
+async function skills(sources) {
+  const catalog = await loadSkillCatalog(sources);
+  for (const diagnostic of catalog.diagnostics)
+    console.warn(`pi skills: ${formatSkillDiagnostic(diagnostic)}`);
+  const prompt = catalog.prompt();
+  return {
+    name: "agents.skills",
+    tools: skillTools(catalog),
+    sections: prompt === null ? [] : [{
+      key: "skills",
+      render: () => prompt
+    }]
+  };
+}
+
+// node_modules/agents/dist/current-agent-DhoDkSnH.js
+import { AsyncLocalStorage } from "node:async_hooks";
+var __DO_NOT_USE_WILL_BREAK__agentContext = new AsyncLocalStorage;
+function runInLifecycleHostContext(context, operation) {
+  return __DO_NOT_USE_WILL_BREAK__agentContext.run({
+    agent: context.host,
+    connection: context.connection,
+    request: context.request,
+    email: undefined
+  }, operation);
+}
+function runWithoutCurrentAgent(operation) {
+  return __DO_NOT_USE_WILL_BREAK__agentContext.exit(operation);
+}
+
+// node_modules/agents/dist/diagnostics-BzvaX2UT.js
+import { channel } from "node:diagnostics_channel";
+var channels = {
+  state: channel("agents:state"),
+  rpc: channel("agents:rpc"),
+  message: channel("agents:message"),
+  chat: channel("agents:chat"),
+  transcript: channel("agents:transcript"),
+  fiber: channel("agents:fiber"),
+  task: channel("agents:task"),
+  stream: channel("agents:stream"),
+  agentTool: channel("agents:agent_tool"),
+  schedule: channel("agents:schedule"),
+  lifecycle: channel("agents:lifecycle"),
+  workflow: channel("agents:workflow"),
+  mcp: channel("agents:mcp"),
+  email: channel("agents:email"),
+  channel: channel("agents:channel")
+};
+function getChannel(type) {
+  if (type.startsWith("mcp:"))
+    return channels.mcp;
+  if (type.startsWith("workflow:"))
+    return channels.workflow;
+  if (type.startsWith("fiber:"))
+    return channels.fiber;
+  if (type.startsWith("task:"))
+    return channels.task;
+  if (type.startsWith("stream:"))
+    return channels.stream;
+  if (type.startsWith("transcript:") || type.startsWith("chat:transcript:"))
+    return channels.transcript;
+  if (type.startsWith("chat:"))
+    return channels.chat;
+  if (type.startsWith("agent_tool:"))
+    return channels.agentTool;
+  if (type.startsWith("schedule:") || type.startsWith("queue:"))
+    return channels.schedule;
+  if (type.startsWith("message:") || type.startsWith("tool:") || type.startsWith("submission:") || type.startsWith("action:"))
+    return channels.message;
+  if (type === "rpc" || type.startsWith("rpc:"))
+    return channels.rpc;
+  if (type.startsWith("state:"))
+    return channels.state;
+  if (type.startsWith("email:"))
+    return channels.email;
+  if (type.startsWith("channel:") || type.startsWith("notice:"))
+    return channels.channel;
+  return channels.lifecycle;
+}
+function publishDiagnosticsEvent(event) {
+  getChannel(event.type).publish(event);
+}
+
+// node_modules/agents/dist/sql-error.js
+var SqlError = class extends Error {
+  constructor(query, cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(`SQL query failed: ${message}`, { cause });
+    this.name = "SqlError";
+    this.query = query;
+  }
+};
+
+// node_modules/agents/dist/lifecycle-v1rKHV2C.js
+import { AsyncLocalStorage as AsyncLocalStorage2 } from "node:async_hooks";
+import"cloudflare:workers";
+
+// node_modules/nanoid/url-alphabet/index.js
+var urlAlphabet = "useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict";
+
+// node_modules/nanoid/index.browser.js
+var nanoid = (size = 21) => {
+  let id = "";
+  let bytes = crypto.getRandomValues(new Uint8Array(size |= 0));
+  while (size--) {
+    id += urlAlphabet[bytes[size] & 63];
+  }
+  return id;
+};
+
+// node_modules/agents/dist/lifecycle-v1rKHV2C.js
+var _resolveCapabilities = /* @__PURE__ */ new WeakMap;
+var _capabilities$1 = /* @__PURE__ */ new WeakMap;
+var _startPromise = /* @__PURE__ */ new WeakMap;
+var _started = /* @__PURE__ */ new WeakMap;
+var _CapabilityRunner_brand = /* @__PURE__ */ new WeakSet;
+var CapabilityRunner = class {
+  constructor(resolveCapabilities) {
+    _classPrivateMethodInitSpec(this, _CapabilityRunner_brand);
+    _classPrivateFieldInitSpec(this, _resolveCapabilities, undefined);
+    _classPrivateFieldInitSpec(this, _capabilities$1, undefined);
+    _classPrivateFieldInitSpec(this, _startPromise, undefined);
+    _classPrivateFieldInitSpec(this, _started, false);
+    _classPrivateFieldSet2(_resolveCapabilities, this, resolveCapabilities);
+  }
+  async start(context) {
+    if (_classPrivateFieldGet2(_started, this))
+      return;
+    const pending = _classPrivateFieldGet2(_startPromise, this);
+    if (pending) {
+      await pending;
+      return;
+    }
+    const attempt = _assertClassBrand(_CapabilityRunner_brand, this, _runStart).call(this, context);
+    _classPrivateFieldSet2(_startPromise, this, attempt);
+    try {
+      await attempt;
+    } catch (error) {
+      if (_classPrivateFieldGet2(_startPromise, this) === attempt)
+        _classPrivateFieldSet2(_startPromise, this, undefined);
+      throw error;
+    }
+  }
+  async request(context) {
+    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a request");
+    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this)) {
+      const response = await capability.onRequest?.(context);
+      if (response !== undefined)
+        return response;
+    }
+  }
+  async webSocketUpgrade(context) {
+    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a WebSocket upgrade");
+    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this)) {
+      const response = await capability.onWebSocketUpgrade?.(context);
+      if (response !== undefined)
+        return response;
+    }
+  }
+  async webSocketMessage(ws, message) {
+    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a WebSocket message");
+    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
+      if (await capability.onWebSocketMessage?.(ws, message) === true)
+        return true;
+    return false;
+  }
+  async webSocketClose(ws, code, reason, wasClean) {
+    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a WebSocket close");
+    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
+      if (await capability.onWebSocketClose?.(ws, code, reason, wasClean) === true)
+        return true;
+    return false;
+  }
+  async webSocketError(ws, error) {
+    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "handle a WebSocket error");
+    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
+      if (await capability.onWebSocketError?.(ws, error) === true)
+        return true;
+    return false;
+  }
+  async findById(capabilityId) {
+    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "dispatch capability work");
+    return _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this).find((candidate) => lifecycleCapabilityId(candidate) === capabilityId);
+  }
+  async route(capabilityId, context) {
+    await _assertClassBrand(_CapabilityRunner_brand, this, _ensureReady).call(this, "route a capability message");
+    const capability = _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this).find((candidate) => lifecycleCapabilityId(candidate) === capabilityId);
+    if (!capability?.onRoute)
+      throw new Error(`Lifecycle capability ${JSON.stringify(capabilityId)} cannot receive routed messages`);
+    return capability.onRoute(context);
+  }
+  async memoryLimit(context) {
+    for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
+      try {
+        await capability.onMemoryLimit?.(context);
+      } catch (error) {
+        console.error("Lifecycle capability memory-limit policy failed", error);
+      }
+  }
+  async dispose() {
+    for (const capability of [..._assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this)].reverse())
+      try {
+        await capability.dispose?.();
+      } catch (error) {
+        console.error("Lifecycle capability disposal failed", error);
+      }
+  }
+};
+async function _runStart(context) {
+  for (const capability of _assertClassBrand(_CapabilityRunner_brand, this, _getCapabilities).call(this))
+    await capability.onStart?.(context);
+  _classPrivateFieldSet2(_started, this, true);
+}
+async function _ensureReady(operation) {
+  const pending = _classPrivateFieldGet2(_startPromise, this);
+  if (pending)
+    await pending;
+  if (!_classPrivateFieldGet2(_started, this))
+    throw new Error(`Cannot ${operation} before the Durable Object lifecycle has started`);
+}
+function _getCapabilities() {
+  if (!_classPrivateFieldGet2(_capabilities$1, this))
+    _classPrivateFieldSet2(_capabilities$1, this, Object.freeze([..._classPrivateFieldGet2(_resolveCapabilities, this).call(this)]));
+  return _classPrivateFieldGet2(_capabilities$1, this);
+}
+function abortWithoutAlarmRetry(ctx, reason) {
+  ctx.abort(reason, { retryAlarm: false });
+}
+var HOST_JOB_CAPABILITY = "host";
+var DEFAULT_HUNG_TIMEOUT_SECONDS = 30;
+function jobFromRow(row) {
+  return {
+    id: row.id,
+    capability: row.capability,
+    fn: row.fn,
+    time: row.time,
+    payload: typeof row.payload === "string" ? JSON.parse(row.payload) : undefined,
+    retry: typeof row.retry_options === "string" ? JSON.parse(row.retry_options) : undefined,
+    singleflight: row.singleflight === 1,
+    exclusive: row.exclusive === 1,
+    recoveryLoop: row.recovery_loop === 1,
+    createdAt: row.created_at
+  };
+}
+function hungTimeoutMs(row) {
+  return (row.hung_timeout_seconds ?? DEFAULT_HUNG_TIMEOUT_SECONDS) * 1000;
+}
+function isHungRow(row, nowMs) {
+  return nowMs - (row.execution_started_at ?? 0) >= hungTimeoutMs(row);
+}
+var _storage = /* @__PURE__ */ new WeakMap;
+var _tableEnsured = /* @__PURE__ */ new WeakMap;
+var _JobQueue_brand = /* @__PURE__ */ new WeakSet;
+var JobQueue = class {
+  constructor(storage) {
+    _classPrivateMethodInitSpec(this, _JobQueue_brand);
+    _classPrivateFieldInitSpec(this, _storage, undefined);
+    _classPrivateFieldInitSpec(this, _tableEnsured, false);
+    _classPrivateFieldSet2(_storage, this, storage);
+  }
+  push(capability, options) {
+    if (!Number.isFinite(options.time) || options.time < 0)
+      throw new Error(`Invalid job time: ${String(options.time)}`);
+    if (typeof options.fn !== "string" || options.fn.trim() === "")
+      throw new Error("Jobs require a non-empty fn");
+    const id = options.id ?? nanoid(9);
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `INSERT INTO cf_agents_jobs
+        (id, capability, fn, time, payload, retry_options, singleflight,
+         hung_timeout_seconds, exclusive, recovery_loop, running,
+         execution_started_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+       ON CONFLICT(id) DO UPDATE SET
+         fn = excluded.fn,
+         time = excluded.time,
+         payload = excluded.payload,
+         retry_options = excluded.retry_options,
+         singleflight = excluded.singleflight,
+         hung_timeout_seconds = excluded.hung_timeout_seconds,
+         exclusive = excluded.exclusive,
+         recovery_loop = excluded.recovery_loop,
+         running = 0,
+         execution_started_at = NULL
+       WHERE cf_agents_jobs.capability = excluded.capability`, id, capability, options.fn, Math.floor(options.time), options.payload === undefined ? null : JSON.stringify(options.payload), options.retry ? JSON.stringify(options.retry) : null, options.singleflight ? 1 : 0, options.hungTimeoutSeconds ?? null, options.exclusive ? 1 : 0, options.recoveryLoop ? 1 : 0);
+    const job = this.get(capability, id);
+    if (!job) {
+      const owner = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT capability FROM cf_agents_jobs WHERE id = ?", id)[0]?.capability;
+      throw new Error(owner !== undefined ? `Job id ${JSON.stringify(id)} already belongs to ${JSON.stringify(owner)}; job ids are scoped to their owner` : `Failed to persist job ${id}`);
+    }
+    return job;
+  }
+  cancel(capability, id) {
+    if (_assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT id FROM cf_agents_jobs WHERE id = ? AND capability = ?", id, capability).length === 0)
+      return false;
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "DELETE FROM cf_agents_jobs WHERE id = ? AND capability = ?", id, capability);
+    return true;
+  }
+  reschedule(capability, id, time) {
+    if (!Number.isFinite(time) || time < 0)
+      throw new Error(`Invalid job time: ${String(time)}`);
+    if (_assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT id FROM cf_agents_jobs WHERE id = ? AND capability = ?", id, capability).length === 0)
+      return false;
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
+       SET time = ?, running = 0, execution_started_at = NULL
+       WHERE id = ? AND capability = ?`, Math.floor(time), id, capability);
+    return true;
+  }
+  get(capability, id) {
+    const rows = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE id = ? AND capability = ?", id, capability);
+    return rows[0] ? jobFromRow(rows[0]) : undefined;
+  }
+  list(capability) {
+    return _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE capability = ? ORDER BY time ASC", capability).map(jobFromRow);
+  }
+  due(nowMs) {
+    return _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE time <= ? ORDER BY time ASC", Math.floor(nowMs));
+  }
+  dueRow(id, nowMs) {
+    return _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE id = ? AND time <= ?", id, Math.floor(nowMs))[0];
+  }
+  markRunning(id, nowMs) {
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
+       SET running = 1, execution_started_at = ?
+       WHERE id = ?`, Math.floor(nowMs), id);
+  }
+  clearRunning(id) {
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
+       SET running = 0, execution_started_at = NULL
+       WHERE id = ?`, id);
+  }
+  delete(id) {
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "DELETE FROM cf_agents_jobs WHERE id = ?", id);
+  }
+  retime(id, time) {
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
+       SET time = ?, running = 0, execution_started_at = NULL
+       WHERE id = ?`, Math.floor(time), id);
+  }
+  delayRecoveryLoopJobs(time) {
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
+       SET time = ?, running = 0, execution_started_at = NULL
+       WHERE recovery_loop = 1 AND time <= ?`, Math.floor(time), Math.floor(time));
+  }
+  recoveryLoopJobs() {
+    return _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT * FROM cf_agents_jobs WHERE recovery_loop = 1 ORDER BY time ASC").map(jobFromRow);
+  }
+  purgeRecoveryLoopJobs() {
+    _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "DELETE FROM cf_agents_jobs WHERE recovery_loop = 1");
+  }
+  applyOutcome(id, outcome) {
+    if (outcome === undefined) {
+      _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "DELETE FROM cf_agents_jobs WHERE id = ? AND running = 1", id);
+      return;
+    }
+    if (outcome === "yield") {
+      this.clearRunning(id);
+      return;
+    }
+    if (typeof outcome === "object" && Number.isFinite(outcome.rescheduleAt) && outcome.rescheduleAt >= 0) {
+      _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `UPDATE cf_agents_jobs
+         SET time = ?, running = 0, execution_started_at = NULL
+         WHERE id = ? AND running = 1`, Math.floor(outcome.rescheduleAt), id);
+      return;
+    }
+    throw new Error(`Invalid job outcome for ${id}`);
+  }
+  nextAlarmTime(nowMs) {
+    const exclusive = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, "SELECT MIN(time) AS time FROM cf_agents_jobs WHERE exclusive = 1");
+    if (exclusive[0]?.time !== null && exclusive[0]?.time !== undefined)
+      return exclusive[0].time;
+    const now = Math.floor(nowMs);
+    let candidate = null;
+    const ready = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `SELECT MIN(time) AS time FROM cf_agents_jobs
+       WHERE singleflight = 0
+          OR running = 0
+          OR coalesce(execution_started_at, 0) + coalesce(hung_timeout_seconds, ?) * 1000 <= ?`, DEFAULT_HUNG_TIMEOUT_SECONDS, now);
+    if (ready[0]?.time !== null && ready[0]?.time !== undefined)
+      candidate = Math.max(ready[0].time, now + 1);
+    const recheck = _assertClassBrand(_JobQueue_brand, this, _sql).call(this, `SELECT MIN(coalesce(execution_started_at, 0) + coalesce(hung_timeout_seconds, ?) * 1000) AS recheck
+       FROM cf_agents_jobs
+       WHERE singleflight = 1
+         AND running = 1
+         AND coalesce(execution_started_at, 0) + coalesce(hung_timeout_seconds, ?) * 1000 > ?`, DEFAULT_HUNG_TIMEOUT_SECONDS, DEFAULT_HUNG_TIMEOUT_SECONDS, now)[0]?.recheck;
+    if (recheck !== null && recheck !== undefined)
+      candidate = candidate === null ? recheck : Math.min(candidate, recheck);
+    return candidate;
+  }
+};
+function _sql(query, ...params) {
+  _assertClassBrand(_JobQueue_brand, this, _ensureTable).call(this);
+  try {
+    return [..._classPrivateFieldGet2(_storage, this).sql.exec(query, ...params)];
+  } catch (cause) {
+    throw new SqlError(query, cause);
+  }
+}
+function _ensureTable() {
+  if (_classPrivateFieldGet2(_tableEnsured, this))
+    return;
+  _classPrivateFieldGet2(_storage, this).sql.exec(`
+      CREATE TABLE IF NOT EXISTS cf_agents_jobs (
+        id TEXT PRIMARY KEY NOT NULL,
+        capability TEXT NOT NULL,
+        fn TEXT NOT NULL,
+        time INTEGER NOT NULL,
+        payload TEXT,
+        retry_options TEXT,
+        singleflight INTEGER NOT NULL DEFAULT 0,
+        hung_timeout_seconds INTEGER,
+        exclusive INTEGER NOT NULL DEFAULT 0,
+        recovery_loop INTEGER NOT NULL DEFAULT 0,
+        running INTEGER NOT NULL DEFAULT 0,
+        execution_started_at INTEGER,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      ) WITHOUT ROWID`);
+  _classPrivateFieldSet2(_tableEnsured, this, true);
+}
+var DEFAULT_MAX_ALARM_MEMORY_LIMIT_STRIKES = 3;
+var OOM_ALARM_STRIKES_KEY = "cf_agents:oom_alarm_strikes";
+var DEFAULT_JOB_RETRY = {
+  maxAttempts: 3,
+  baseDelayMs: 100,
+  maxDelayMs: 3000
+};
+var JOB_BACKLOG_WARNING_THRESHOLD = 10;
+var DEADMAN_ALARM_DELAY_MS = 30000;
+var AttributedPlatformFailure = class {
+  constructor(row, cause) {
+    this.row = row;
+    this.cause = cause;
+  }
+};
+var _options2 = /* @__PURE__ */ new WeakMap;
+var _alarmScope = /* @__PURE__ */ new WeakMap;
+var _alarmsInFlight = /* @__PURE__ */ new WeakMap;
+var _outstandingAlarmWork = /* @__PURE__ */ new WeakMap;
+var _strike = /* @__PURE__ */ new WeakMap;
+var _strikeRecordedThisIsolate = /* @__PURE__ */ new WeakMap;
+var _JobDriver_brand = /* @__PURE__ */ new WeakSet;
+var JobDriver = class {
+  constructor(options) {
+    _classPrivateMethodInitSpec(this, _JobDriver_brand);
+    _classPrivateFieldInitSpec(this, _options2, undefined);
+    _classPrivateFieldInitSpec(this, _alarmScope, new AsyncLocalStorage2);
+    _classPrivateFieldInitSpec(this, _alarmsInFlight, 0);
+    _classPrivateFieldInitSpec(this, _outstandingAlarmWork, /* @__PURE__ */ new Set);
+    _classPrivateFieldInitSpec(this, _strike, undefined);
+    _classPrivateFieldInitSpec(this, _strikeRecordedThisIsolate, false);
+    _classPrivateFieldSet2(_options2, this, options);
+  }
+  async runAlarm(initialize, runHostAlarm) {
+    var _this$alarmsInFlight;
+    _classPrivateFieldSet2(_alarmsInFlight, this, (_this$alarmsInFlight = _classPrivateFieldGet2(_alarmsInFlight, this), _this$alarmsInFlight++, _this$alarmsInFlight));
+    let clean = false;
+    try {
+      try {
+        await this.armStartupFallback();
+        await initialize();
+        await _assertClassBrand(_JobDriver_brand, this, _driveDueJobs).call(this);
+        await _classPrivateFieldGet2(_alarmScope, this).run({ executing: undefined }, runHostAlarm);
+        clean = true;
+      } catch (error) {
+        const attributed = error instanceof AttributedPlatformFailure;
+        const cause = attributed ? error.cause : error;
+        if (!isDurableObjectMemoryLimitReset(cause))
+          throw attributed ? cause : error;
+        await _assertClassBrand(_JobDriver_brand, this, _handleMemoryLimitReset).call(this, cause, attributed ? error.row : undefined);
+        return;
+      }
+    } finally {
+      var _this$alarmsInFlight3;
+      _classPrivateFieldSet2(_alarmsInFlight, this, (_this$alarmsInFlight3 = _classPrivateFieldGet2(_alarmsInFlight, this), _this$alarmsInFlight3--, _this$alarmsInFlight3));
+      if (clean)
+        await _assertClassBrand(_JobDriver_brand, this, _clearMemoryLimitStrikesWhenQuiescent).call(this);
+    }
+    await _classPrivateFieldGet2(_options2, this).rearm();
+  }
+  trackAlarmWork(work) {
+    const scope = _classPrivateFieldGet2(_alarmScope, this).getStore();
+    if (!scope)
+      return false;
+    if (_classPrivateFieldGet2(_outstandingAlarmWork, this).has(work))
+      return true;
+    _classPrivateFieldGet2(_outstandingAlarmWork, this).add(work);
+    work.then(() => _assertClassBrand(_JobDriver_brand, this, _settleAlarmWork).call(this, work, undefined, scope.executing), (error) => _assertClassBrand(_JobDriver_brand, this, _settleAlarmWork).call(this, work, error, scope.executing));
+    return true;
+  }
+  async armStartupFallback() {
+    if (_classPrivateFieldGet2(_options2, this).disabled())
+      return;
+    const nowMs = Date.now();
+    const next = _classPrivateFieldGet2(_options2, this).queue.nextAlarmTime(nowMs);
+    if (next === null)
+      return;
+    await _classPrivateFieldGet2(_options2, this).storage.setAlarm(Math.max(next, nowMs + DEADMAN_ALARM_DELAY_MS));
+  }
+};
+async function _settleAlarmWork(work, error, executing) {
+  try {
+    if (_classPrivateFieldGet2(_options2, this).disabled())
+      return;
+    if (isDurableObjectMemoryLimitReset(error)) {
+      await _assertClassBrand(_JobDriver_brand, this, _handleMemoryLimitReset).call(this, error, executing);
+      return;
+    }
+  } finally {
+    _classPrivateFieldGet2(_outstandingAlarmWork, this).delete(work);
+  }
+  await _assertClassBrand(_JobDriver_brand, this, _clearMemoryLimitStrikesWhenQuiescent).call(this);
+}
+async function _clearMemoryLimitStrikesWhenQuiescent() {
+  if (_classPrivateFieldGet2(_alarmsInFlight, this) > 0)
+    return;
+  if (_classPrivateFieldGet2(_outstandingAlarmWork, this).size > 0)
+    return;
+  if (_classPrivateFieldGet2(_strikeRecordedThisIsolate, this))
+    return;
+  _classPrivateFieldSet2(_strike, this, undefined);
+  await _assertClassBrand(_JobDriver_brand, this, _clearMemoryLimitStrikes).call(this);
+}
+async function _driveDueJobs() {
+  const nowMs = Date.now();
+  const due = _classPrivateFieldGet2(_options2, this).queue.due(nowMs);
+  if (due.length === 0)
+    return;
+  _assertClassBrand(_JobDriver_brand, this, _warnBacklog).call(this, due);
+  if (!_classPrivateFieldGet2(_options2, this).disabled())
+    await _classPrivateFieldGet2(_options2, this).storage.setAlarm(nowMs + DEADMAN_ALARM_DELAY_MS);
+  for (const stale of due) {
+    if (_classPrivateFieldGet2(_options2, this).disabled())
+      return;
+    const row = _classPrivateFieldGet2(_options2, this).queue.dueRow(stale.id, nowMs);
+    if (!row)
+      continue;
+    if (row.singleflight === 1 && row.running === 1) {
+      if (!isHungRow(row, nowMs)) {
+        console.warn(`Skipping job ${row.id}: previous execution still running`);
+        continue;
+      }
+      console.warn(`Forcing reset of hung job ${row.id} (started ${Math.round((nowMs - (row.execution_started_at ?? 0)) / 1000)}s ago)`);
+    }
+    _classPrivateFieldGet2(_options2, this).queue.markRunning(row.id, nowMs);
+    await _assertClassBrand(_JobDriver_brand, this, _driveJob).call(this, row);
+  }
+}
+async function _driveJob(row) {
+  const { queue, resolveDispatch, disabled } = _classPrivateFieldGet2(_options2, this);
+  const job = jobFromRow(row);
+  const dispatch = await resolveDispatch(row.capability);
+  if (!dispatch) {
+    console.error(`No installed capability or host handler for job ${row.id} (owner ${JSON.stringify(row.capability)}); dropping it`);
+    queue.delete(row.id);
+    return;
+  }
+  const maxAttempts = job.retry?.maxAttempts ?? DEFAULT_JOB_RETRY.maxAttempts;
+  const slowWatchdog = setTimeout(() => {
+    const seconds = Math.round(hungTimeoutMs(row) / 1000);
+    console.warn(`Job ${row.id} (${row.capability}/${row.fn}) has been dispatching for over ${seconds}s. Long dispatches starve every other job on this object; onJob must detach unbounded work and return.`);
+    try {
+      _classPrivateFieldGet2(_options2, this).emit("job:slow_dispatch", {
+        capability: row.capability,
+        fn: row.fn,
+        id: row.id,
+        thresholdMs: hungTimeoutMs(row)
+      });
+    } catch {}
+  }, hungTimeoutMs(row));
+  let outcome;
+  try {
+    outcome = await _classPrivateFieldGet2(_alarmScope, this).run({ executing: row }, () => tryN(maxAttempts, (attempt) => dispatch.onJob({
+      job,
+      attempt
+    }), {
+      baseDelayMs: job.retry?.baseDelayMs ?? DEFAULT_JOB_RETRY.baseDelayMs,
+      maxDelayMs: job.retry?.maxDelayMs ?? DEFAULT_JOB_RETRY.maxDelayMs,
+      shouldRetry: (error) => !isDurableObjectCodeUpdateReset(error) && !isDurableObjectMemoryLimitReset(error)
+    }));
+  } catch (error) {
+    if (disabled())
+      return;
+    if (isPlatformFailure(error)) {
+      try {
+        queue.clearRunning(row.id);
+      } catch {}
+      console.warn(`Deferring job ${row.id} to a fresh invocation after a platform failure; the job is preserved.`);
+      throw new AttributedPlatformFailure(row, error);
+    }
+    try {
+      outcome = await dispatch.onJobError?.({
+        job,
+        attempt: maxAttempts
+      }, error);
+    } catch (hookError) {
+      console.error(`Job failure hook threw for ${row.id}`, hookError);
+    }
+  } finally {
+    clearTimeout(slowWatchdog);
+  }
+  if (disabled())
+    return;
+  queue.applyOutcome(row.id, outcome ?? undefined);
+}
+function _warnBacklog(due) {
+  const counts = /* @__PURE__ */ new Map;
+  for (const row of due)
+    counts.set(row.capability, (counts.get(row.capability) ?? 0) + 1);
+  for (const [owner, count] of counts) {
+    if (count < JOB_BACKLOG_WARNING_THRESHOLD)
+      continue;
+    try {
+      console.warn(`Processing ${count} due jobs for ${JSON.stringify(owner)} in a single alarm cycle. This usually means one-shot jobs are pushed repeatedly without a stable id.`);
+      _classPrivateFieldGet2(_options2, this).emit("job:backlog_warning", {
+        capability: owner,
+        count
+      });
+    } catch {}
+  }
+}
+async function _clearMemoryLimitStrikes() {
+  const { storage } = _classPrivateFieldGet2(_options2, this);
+  try {
+    const prior = await storage.get(OOM_ALARM_STRIKES_KEY);
+    if (typeof prior === "number" && prior > 0)
+      await storage.delete(OOM_ALARM_STRIKES_KEY);
+  } catch {}
+}
+async function _handleMemoryLimitReset(error, executing) {
+  const { queue } = _classPrivateFieldGet2(_options2, this);
+  const first = _classPrivateFieldGet2(_strike, this) === undefined;
+  _classPrivateFieldSet2(_strikeRecordedThisIsolate, this, true);
+  _classPrivateFieldGet2(_strike, this) ?? _classPrivateFieldSet2(_strike, this, _assertClassBrand(_JobDriver_brand, this, _recordMemoryLimitStrike).call(this, error));
+  const strike = await _classPrivateFieldGet2(_strike, this);
+  try {
+    if (executing) {
+      if (strike.sealed)
+        queue.delete(executing.id);
+      else if (strike.nextTime !== undefined)
+        queue.retime(executing.id, strike.nextTime);
+    }
+  } catch {}
+  try {
+    await _classPrivateFieldGet2(_options2, this).onMemoryLimit({
+      sealed: strike.sealed,
+      nextTime: strike.nextTime,
+      executing: executing ? jobFromRow(executing) : undefined,
+      purgedRecoveryLoopJobs: first ? strike.purgedRecoveryLoopJobs : undefined
+    });
+  } catch {}
+  if (!first)
+    return;
+  try {
+    await _classPrivateFieldGet2(_options2, this).rearm();
+  } catch {}
+  try {
+    await _classPrivateFieldGet2(_options2, this).storage.sync();
+    _classPrivateFieldGet2(_options2, this).reset(`Alarm memory-limit strike ${strike.strikes}/${strike.limit}${strike.sealed ? " (sealed)" : ""}; resetting isolate (#1825)`);
+  } catch {}
+}
+async function _recordMemoryLimitStrike(error) {
+  const { queue, storage } = _classPrivateFieldGet2(_options2, this);
+  let strikes = 1;
+  let counted = true;
+  try {
+    const prior = await storage.get(OOM_ALARM_STRIKES_KEY);
+    strikes = (typeof prior === "number" ? prior : 0) + 1;
+    await storage.put(OOM_ALARM_STRIKES_KEY, strikes);
+  } catch {
+    counted = false;
+  }
+  const limit = _classPrivateFieldGet2(_options2, this).maxMemoryLimitStrikes() ?? DEFAULT_MAX_ALARM_MEMORY_LIMIT_STRIKES;
+  const sealed = strikes >= limit;
+  const strikeLabel = counted ? `strike ${strikes}/${limit}` : "strike not counted: storage rejected it after the reset";
+  console.error(`Alarm hit a Durable Object memory-limit reset (${strikeLabel}${sealed ? ", sealing recovery" : ", will retry with backoff"}). Breaking the platform alarm-retry loop (#1825).`, error instanceof Error ? error.message : String(error));
+  const nextTime = sealed ? undefined : Date.now() + Math.min(300, 30 * strikes) * 1000;
+  let purgedRecoveryLoopJobs;
+  try {
+    if (sealed)
+      purgedRecoveryLoopJobs = queue.recoveryLoopJobs();
+  } catch {}
+  try {
+    if (sealed)
+      queue.purgeRecoveryLoopJobs();
+    else if (nextTime !== undefined)
+      queue.delayRecoveryLoopJobs(nextTime);
+  } catch {}
+  if (sealed)
+    try {
+      await storage.delete(OOM_ALARM_STRIKES_KEY);
+    } catch {}
+  try {
+    _classPrivateFieldGet2(_options2, this).emit("alarm:memory_limit_reset", {
+      strikes,
+      limit,
+      sealed,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  } catch {}
+  return {
+    strikes,
+    limit,
+    sealed,
+    nextTime,
+    purgedRecoveryLoopJobs
+  };
+}
+var CLOSING = 2;
+var CLOSED = 3;
+function isBenignTeardownError(ws, error) {
+  const state = ws.readyState;
+  if (state !== CLOSING && state !== CLOSED)
+    return false;
+  if (typeof error !== "object" || error === null)
+    return false;
+  const typed = error;
+  if (typed.retryable === true)
+    return true;
+  const message = typeof typed.message === "string" ? typed.message : "";
+  return /Network connection lost|WebSocket peer disconnected/i.test(message);
+}
+var LEGACY_NAME_STORAGE_KEY = "__ps_name";
+function mutableRequest(request) {
+  return new Request(request);
+}
+function decodeProps(header) {
+  const trimmed = header.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("["))
+    return JSON.parse(trimmed);
+  const binary = atob(header);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0;i < binary.length; i++)
+    bytes[i] = binary.charCodeAt(i);
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+var lifecycleEventSinks = /* @__PURE__ */ new WeakMap;
+var lifecycleRouteTransports = /* @__PURE__ */ new WeakMap;
+var lifecycleHostInvokers = /* @__PURE__ */ new WeakMap;
+var lifecycleStartupScope = new AsyncLocalStorage2;
+var CATCH_ALL_HOOKS = ["onRequest", "onWebSocketUpgrade"];
+var _host = /* @__PURE__ */ new WeakMap;
+var _ctx = /* @__PURE__ */ new WeakMap;
+var _parentClassName = /* @__PURE__ */ new WeakMap;
+var _capabilities = /* @__PURE__ */ new WeakMap;
+var _capabilityRunner = /* @__PURE__ */ new WeakMap;
+var _jobQueue = /* @__PURE__ */ new WeakMap;
+var _jobDriver = /* @__PURE__ */ new WeakMap;
+var _status = /* @__PURE__ */ new WeakMap;
+var _alarmRearmQueue = /* @__PURE__ */ new WeakMap;
+var _rearmRequestedDuringStart = /* @__PURE__ */ new WeakMap;
+var _pendingEvents = /* @__PURE__ */ new WeakMap;
+var _alarmsDisabled = /* @__PURE__ */ new WeakMap;
+var _capabilitiesLocked = /* @__PURE__ */ new WeakMap;
+var _handlersInstalled = /* @__PURE__ */ new WeakMap;
+var _Lifecycle_brand = /* @__PURE__ */ new WeakSet;
+var _startup = /* @__PURE__ */ new WeakMap;
+var _startupToken = /* @__PURE__ */ new WeakMap;
+var _legacyName = /* @__PURE__ */ new WeakMap;
+var _props = /* @__PURE__ */ new WeakMap;
+var Lifecycle = class Lifecycle {
+  static install(host, options) {
+    const lifecycle = new Lifecycle(host, options);
+    lifecycle.installHandlers();
+    return lifecycle;
+  }
+  constructor(host, options) {
+    _classPrivateMethodInitSpec(this, _Lifecycle_brand);
+    _classPrivateFieldInitSpec(this, _host, undefined);
+    _classPrivateFieldInitSpec(this, _ctx, undefined);
+    _classPrivateFieldInitSpec(this, _parentClassName, undefined);
+    _classPrivateFieldInitSpec(this, _capabilities, []);
+    _classPrivateFieldInitSpec(this, _capabilityRunner, new CapabilityRunner(() => _classPrivateFieldGet2(_capabilities, this)));
+    _classPrivateFieldInitSpec(this, _jobQueue, undefined);
+    _classPrivateFieldInitSpec(this, _jobDriver, undefined);
+    _classPrivateFieldInitSpec(this, _status, "zero");
+    _classPrivateFieldInitSpec(this, _alarmRearmQueue, Promise.resolve());
+    _classPrivateFieldInitSpec(this, _rearmRequestedDuringStart, false);
+    _classPrivateFieldInitSpec(this, _pendingEvents, []);
+    _classPrivateFieldInitSpec(this, _alarmsDisabled, false);
+    _classPrivateFieldInitSpec(this, _capabilitiesLocked, false);
+    _classPrivateFieldInitSpec(this, _handlersInstalled, false);
+    _classPrivateFieldInitSpec(this, _startup, undefined);
+    _classPrivateFieldInitSpec(this, _startupToken, {});
+    _classPrivateFieldInitSpec(this, _legacyName, undefined);
+    _classPrivateFieldInitSpec(this, _props, undefined);
+    _classPrivateFieldSet2(_host, this, host);
+    _classPrivateFieldSet2(_ctx, this, _classPrivateFieldGet2(_host, this).ctx);
+    _classPrivateFieldSet2(_parentClassName, this, _classPrivateFieldGet2(_host, this).constructor.name);
+    _classPrivateFieldSet2(_jobQueue, this, new JobQueue(_classPrivateFieldGet2(_ctx, this).storage));
+    _classPrivateFieldSet2(_jobDriver, this, new JobDriver({
+      queue: _classPrivateFieldGet2(_jobQueue, this),
+      storage: _classPrivateFieldGet2(_ctx, this).storage,
+      disabled: () => _classPrivateFieldGet2(_alarmsDisabled, this),
+      resolveDispatch: (owner) => _assertClassBrand(_Lifecycle_brand, this, _resolveJobDispatch).call(this, owner),
+      maxMemoryLimitStrikes: () => options?.maxAlarmMemoryLimitStrikes,
+      onMemoryLimit: async (context) => {
+        await _classPrivateFieldGet2(_capabilityRunner, this).memoryLimit(context);
+        await runInLifecycleHostContext({ host: _classPrivateFieldGet2(_host, this) }, () => _classPrivateFieldGet2(_host, this).onAlarmMemoryLimit?.(context));
+      },
+      emit: (type, payload) => _assertClassBrand(_Lifecycle_brand, this, _emitCapabilityEvent).call(this, {
+        source: "lifecycle",
+        type,
+        payload
+      }),
+      rearm: () => this.rearmAlarm(),
+      reset: (reason) => {
+        setTimeout(() => abortWithoutAlarmRetry(_classPrivateFieldGet2(_ctx, this), reason), 0);
+      }
+    }));
+  }
+  installHandlers() {
+    if (_classPrivateFieldGet2(_handlersInstalled, this))
+      throw new Error("Durable Object lifecycle handlers are already installed");
+    _classPrivateFieldSet2(_handlersInstalled, this, true);
+    const handlers = {
+      fetch: this.fetch.bind(this),
+      alarm: this.alarm.bind(this),
+      webSocketMessage: this.webSocketMessage.bind(this),
+      webSocketClose: this.webSocketClose.bind(this),
+      webSocketError: this.webSocketError.bind(this)
+    };
+    for (const [name, handler] of Object.entries(handlers)) {
+      if (name in _classPrivateFieldGet2(_host, this))
+        continue;
+      Object.defineProperty(_classPrivateFieldGet2(_host, this), name, {
+        value: handler,
+        configurable: true
+      });
+    }
+  }
+  use(capability) {
+    if (_classPrivateFieldGet2(_capabilitiesLocked, this))
+      throw new Error("Lifecycle capabilities must be added before startup");
+    const capabilityId = lifecycleCapabilityId(capability);
+    if (capabilityId && _classPrivateFieldGet2(_capabilities, this).some((candidate) => lifecycleCapabilityId(candidate) === capabilityId))
+      throw new Error(`Lifecycle capability ${JSON.stringify(capabilityId)} is already installed`);
+    const catchAllIndex = _classPrivateFieldGet2(_capabilities, this).findIndex((candidate) => candidate.claims === "catch-all");
+    if (capability.claims === "catch-all") {
+      for (const hook of CATCH_ALL_HOOKS) {
+        if (!capability[hook])
+          continue;
+        const rival = _classPrivateFieldGet2(_capabilities, this).find((candidate) => candidate.claims === "catch-all" && candidate[hook]);
+        if (!rival)
+          continue;
+        const installed = lifecycleCapabilityId(rival);
+        throw new Error(`Lifecycle already has a catch-all for ${hook}${installed ? ` (${JSON.stringify(installed)})` : ""}; a second one could never be reached`);
+      }
+      _classPrivateFieldGet2(_capabilities, this).push(capability);
+    } else
+      _classPrivateFieldGet2(_capabilities, this).splice(catchAllIndex === -1 ? _classPrivateFieldGet2(_capabilities, this).length : catchAllIndex, 0, capability);
+    if (capability instanceof LifecycleCapability)
+      bindLifecycleCapability(capability, _assertClassBrand(_Lifecycle_brand, this, _servicesForCapability).call(this, capability.capabilityId));
+    return this;
+  }
+  route(envelope) {
+    return _assertClassBrand(_Lifecycle_brand, this, _dispatchRoute).call(this, envelope);
+  }
+  sql(strings, ...values) {
+    let query = "";
+    try {
+      query = strings.reduce((acc, str, i) => acc + str + (i < values.length ? "?" : ""), "");
+      return [..._classPrivateFieldGet2(_ctx, this).storage.sql.exec(query, ...values)];
+    } catch (error) {
+      console.error(`failed to execute sql query: ${query}`, error);
+      throw error;
+    }
+  }
+  async fetch(request) {
+    try {
+      const encodedProps = request.headers.get("x-agents-lifecycle-props");
+      if (encodedProps) {
+        _classPrivateFieldSet2(_props, this, decodeProps(encodedProps));
+        request = mutableRequest(request);
+        request.headers.delete("x-agents-lifecycle-props");
+      }
+      await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
+      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        const capabilityResponse = await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).request({ request }));
+        if (capabilityResponse !== undefined)
+          return capabilityResponse;
+        if (_classPrivateFieldGet2(_host, this).onRequest)
+          return await runInLifecycleHostContext({
+            host: _classPrivateFieldGet2(_host, this),
+            request
+          }, () => _classPrivateFieldGet2(_host, this).onRequest(request));
+        return new Response("Not implemented", { status: 404 });
+      } else {
+        const upgradeResponse = await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).webSocketUpgrade({ request }));
+        if (upgradeResponse !== undefined)
+          return upgradeResponse;
+        return new Response("WebSocket upgrades are not enabled on this Durable Object. Install a capability that claims them (e.g. WebSockets).", { status: 404 });
+      }
+    } catch (err) {
+      console.error(`Error in ${_classPrivateFieldGet2(_parentClassName, this)}:${_classPrivateFieldGet2(_ctx, this).id.name ?? "<unnamed>"} fetch:`, err);
+      if (!(err instanceof Error))
+        throw err;
+      if (request.headers.get("Upgrade") === "websocket") {
+        const pair = new WebSocketPair;
+        pair[1].accept();
+        pair[1].send(JSON.stringify({ error: err.stack }));
+        pair[1].close(1011, "Uncaught exception during session setup");
+        return new Response(null, {
+          status: 101,
+          webSocket: pair[0]
+        });
+      } else
+        return new Response(err.stack, { status: 500 });
+    }
+  }
+  async webSocketMessage(ws, message) {
+    try {
+      await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
+      await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).webSocketMessage(ws, message));
+    } catch (e) {
+      console.error(`Error in ${_classPrivateFieldGet2(_parentClassName, this)}:${_classPrivateFieldGet2(_ctx, this).id.name ?? "<unnamed>"} webSocketMessage:`, e);
+    }
+  }
+  async webSocketClose(ws, code, reason, wasClean) {
+    try {
+      await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
+      await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).webSocketClose(ws, code, reason, wasClean));
+    } catch (e) {
+      console.error(`Error in ${_classPrivateFieldGet2(_parentClassName, this)}:${_classPrivateFieldGet2(_ctx, this).id.name ?? "<unnamed>"} webSocketClose:`, e);
+    }
+  }
+  async webSocketError(ws, error) {
+    if (isBenignTeardownError(ws, error))
+      return;
+    try {
+      await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
+      await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).webSocketError(ws, error));
+    } catch (e) {
+      console.error(`Error in ${_classPrivateFieldGet2(_parentClassName, this)}:${_classPrivateFieldGet2(_ctx, this).id.name ?? "<unnamed>"} webSocketError:`, e);
+    }
+  }
+  async start(props) {
+    if (props !== undefined && _classPrivateFieldGet2(_startup, this) === undefined)
+      _classPrivateFieldSet2(_props, this, props);
+    await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
+  }
+  isStarted() {
+    return _classPrivateFieldGet2(_status, this) === "started";
+  }
+  get name() {
+    const name = _classPrivateFieldGet2(_ctx, this).id.name ?? _classPrivateFieldGet2(_legacyName, this);
+    if (name !== undefined)
+      return name;
+    throw new Error(`${_classPrivateFieldGet2(_parentClassName, this)} could not determine its Durable Object name. Address it with idFromName() or getByName(). In local development, update Wrangler/workerd and use a current compatibility_date. newUniqueId(), idFromString(), and names over 1,024 bytes do not expose ctx.id.name. Alarms created before 2026-03-15 must be rescheduled from a named fetch or RPC handler.`);
+  }
+  get jobs() {
+    return _assertClassBrand(_Lifecycle_brand, this, _jobsForOwner).call(this, HOST_JOB_CAPABILITY);
+  }
+  async rearmAlarm() {
+    if (_classPrivateFieldGet2(_alarmsDisabled, this))
+      return;
+    if (_classPrivateFieldGet2(_status, this) === "starting") {
+      _classPrivateFieldSet2(_rearmRequestedDuringStart, this, true);
+      return;
+    }
+    await _assertClassBrand(_Lifecycle_brand, this, _serializeAlarmWrite).call(this, async () => {
+      if (_classPrivateFieldGet2(_alarmsDisabled, this))
+        return;
+      const alarm = _classPrivateFieldGet2(_jobQueue, this).nextAlarmTime(Date.now());
+      if (alarm === null)
+        await _classPrivateFieldGet2(_ctx, this).storage.deleteAlarm();
+      else
+        await _classPrivateFieldGet2(_ctx, this).storage.setAlarm(alarm);
+    });
+  }
+  trackAlarmWork(work) {
+    return _classPrivateFieldGet2(_jobDriver, this).trackAlarmWork(work);
+  }
+  async dispose() {
+    await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).dispose());
+  }
+  async disableAlarms() {
+    _classPrivateFieldSet2(_alarmsDisabled, this, true);
+    await _classPrivateFieldGet2(_alarmRearmQueue, this).catch(() => {});
+    await _classPrivateFieldGet2(_ctx, this).storage.deleteAlarm();
+  }
+  async alarm() {
+    await _classPrivateFieldGet2(_jobDriver, this).runAlarm(() => _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this), () => runInLifecycleHostContext({ host: _classPrivateFieldGet2(_host, this) }, async () => {
+      await _classPrivateFieldGet2(_host, this).onAlarm?.();
+    }));
+  }
+};
+function _servicesForCapability(capabilityId) {
+  const lifecycle = this;
+  const envelope = (payload) => ({
+    capability: capabilityId,
+    source: lifecycleRouteTransports.get(lifecycle)?.source,
+    payload
+  });
+  return Object.freeze({
+    get name() {
+      return lifecycle.name;
+    },
+    className: _classPrivateFieldGet2(_parentClassName, this),
+    storage: _classPrivateFieldGet2(_ctx, this).storage,
+    sockets: Object.freeze({
+      accept: (ws, tags) => _classPrivateFieldGet2(_ctx, this).acceptWebSocket(ws, tags),
+      get: (tag) => _classPrivateFieldGet2(_ctx, this).getWebSockets(tag)
+    }),
+    ready: () => _assertClassBrand(_Lifecycle_brand, this, _readyForCapabilityOperation).call(this),
+    status: () => _classPrivateFieldGet2(_status, this),
+    jobs: _assertClassBrand(_Lifecycle_brand, this, _jobsForOwner).call(this, capabilityId),
+    trackAlarmWork: (work) => _classPrivateFieldGet2(_jobDriver, this).trackAlarmWork(work),
+    runInHostContext: async (fn, scope) => _assertClassBrand(_Lifecycle_brand, this, _runInHostBoundary).call(this, fn, scope),
+    events: Object.freeze({ emit: (type, payload) => _assertClassBrand(_Lifecycle_brand, this, _emitCapabilityEvent).call(this, {
+      source: capabilityId,
+      type,
+      payload
+    }) }),
+    routes: Object.freeze({
+      get source() {
+        return lifecycleRouteTransports.get(lifecycle)?.source;
+      },
+      toRoot: (payload) => {
+        const transport = lifecycleRouteTransports.get(lifecycle);
+        return transport ? transport.toRoot(envelope(payload)) : _assertClassBrand(_Lifecycle_brand, this, _dispatchRoute).call(this, envelope(payload));
+      },
+      to: (target, payload) => {
+        const transport = lifecycleRouteTransports.get(lifecycle);
+        if (!transport)
+          throw new Error("Lifecycle has no transport for routed capabilities");
+        return transport.to(target, envelope(payload));
+      }
+    })
+  });
+}
+function _runInHostBoundary(fn, scope) {
+  const boundary = lifecycleHostInvokers.get(this);
+  return Promise.resolve(boundary ? boundary(fn, scope) : runInLifecycleHostContext({
+    host: _classPrivateFieldGet2(_host, this),
+    connection: scope?.connection,
+    request: scope?.request
+  }, fn));
+}
+function _readyForCapabilityOperation() {
+  return _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
+}
+async function _dispatchRoute(envelope) {
+  await _assertClassBrand(_Lifecycle_brand, this, _ensureInitialized).call(this);
+  return runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).route(envelope.capability, {
+    source: envelope.source,
+    payload: envelope.payload
+  }));
+}
+function _emitCapabilityEvent(event) {
+  if (event.source.trim() === "" || event.type.trim() === "")
+    throw new Error("Lifecycle events require non-empty source and type");
+  if (_classPrivateFieldGet2(_status, this) !== "started") {
+    _classPrivateFieldGet2(_pendingEvents, this).push(event);
+    return;
+  }
+  _assertClassBrand(_Lifecycle_brand, this, _publishCapabilityEvent).call(this, event);
+}
+function _publishCapabilityEvent(event) {
+  runWithoutCurrentAgent(() => {
+    const sink = lifecycleEventSinks.get(this);
+    try {
+      if (!sink) {
+        publishDiagnosticsEvent({
+          source: event.source,
+          type: event.type,
+          agent: _classPrivateFieldGet2(_parentClassName, this),
+          name: this.name,
+          payload: event.payload,
+          timestamp: Date.now()
+        });
+        return;
+      }
+      const pending = sink(event);
+      if (pending !== undefined)
+        _classPrivateFieldGet2(_ctx, this).waitUntil(Promise.resolve(pending).catch((error) => {
+          _assertClassBrand(_Lifecycle_brand, this, _reportEventSinkFailure).call(this, event, error);
+        }));
+    } catch (error) {
+      _assertClassBrand(_Lifecycle_brand, this, _reportEventSinkFailure).call(this, event, error);
+    }
+  });
+}
+function _reportEventSinkFailure(event, error) {
+  console.error(`Lifecycle event sink failed for ${event.source}:${event.type}`, error);
+}
+function _deliverPendingEvents() {
+  for (const event of _classPrivateFieldGet2(_pendingEvents, this).splice(0))
+    _assertClassBrand(_Lifecycle_brand, this, _publishCapabilityEvent).call(this, event);
+}
+function _ensureInitialized() {
+  if (_classPrivateFieldGet2(_status, this) === "started")
+    return Promise.resolve();
+  if (_classPrivateFieldGet2(_startup, this) === undefined) {
+    const startup = Promise.resolve().then(() => _assertClassBrand(_Lifecycle_brand, this, _runStartup).call(this)).finally(() => {
+      if (_classPrivateFieldGet2(_startup, this) === startup)
+        _classPrivateFieldSet2(_startup, this, undefined);
+    });
+    _classPrivateFieldSet2(_startup, this, startup);
+    return startup;
+  }
+  if (lifecycleStartupScope.getStore()?.has(_classPrivateFieldGet2(_startupToken, this)))
+    return Promise.resolve();
+  return _classPrivateFieldGet2(_startup, this);
+}
+async function _runStartup() {
+  if (_classPrivateFieldGet2(_ctx, this).id.name === undefined && _classPrivateFieldGet2(_legacyName, this) === undefined)
+    _classPrivateFieldSet2(_legacyName, this, await _classPrivateFieldGet2(_ctx, this).storage.get(LEGACY_NAME_STORAGE_KEY));
+  this.name;
+  _classPrivateFieldSet2(_capabilitiesLocked, this, true);
+  const scope = new Set(lifecycleStartupScope.getStore());
+  scope.add(_classPrivateFieldGet2(_startupToken, this));
+  let error;
+  await _classPrivateFieldGet2(_ctx, this).blockConcurrencyWhile(() => lifecycleStartupScope.run(scope, async () => {
+    _classPrivateFieldSet2(_status, this, "starting");
+    try {
+      await runWithoutCurrentAgent(() => _classPrivateFieldGet2(_capabilityRunner, this).start({ props: _classPrivateFieldGet2(_props, this) }));
+      await runInLifecycleHostContext({ host: _classPrivateFieldGet2(_host, this) }, () => _classPrivateFieldGet2(_host, this).onStart?.(_classPrivateFieldGet2(_props, this)));
+      _classPrivateFieldSet2(_status, this, "started");
+    } catch (cause) {
+      _classPrivateFieldSet2(_status, this, "zero");
+      error = cause;
+    }
+  }));
+  if (error) {
+    const rearmRequested = _classPrivateFieldGet2(_rearmRequestedDuringStart, this);
+    _classPrivateFieldSet2(_rearmRequestedDuringStart, this, false);
+    _classPrivateFieldGet2(_pendingEvents, this).length = 0;
+    if (rearmRequested)
+      await _assertClassBrand(_Lifecycle_brand, this, _serializeAlarmWrite).call(this, () => _classPrivateFieldGet2(_jobDriver, this).armStartupFallback()).catch(() => {});
+    throw error;
+  }
+  _assertClassBrand(_Lifecycle_brand, this, _deliverPendingEvents).call(this);
+  if (_classPrivateFieldGet2(_rearmRequestedDuringStart, this)) {
+    _classPrivateFieldSet2(_rearmRequestedDuringStart, this, false);
+    await this.rearmAlarm();
+  }
+}
+function _jobsForOwner(owner) {
+  const rearmAfter = async (mutate) => {
+    const result = mutate();
+    await this.rearmAlarm();
+    return result;
+  };
+  return Object.freeze({
+    push: (options) => rearmAfter(() => _classPrivateFieldGet2(_jobQueue, this).push(owner, options)),
+    cancel: (id) => rearmAfter(() => _classPrivateFieldGet2(_jobQueue, this).cancel(owner, id)),
+    reschedule: (id, time) => rearmAfter(() => _classPrivateFieldGet2(_jobQueue, this).reschedule(owner, id, time)),
+    get: (id) => _classPrivateFieldGet2(_jobQueue, this).get(owner, id),
+    list: () => _classPrivateFieldGet2(_jobQueue, this).list(owner),
+    rearm: () => this.rearmAlarm()
+  });
+}
+function _serializeAlarmWrite(write) {
+  const next = _classPrivateFieldGet2(_alarmRearmQueue, this).catch(() => {}).then(write);
+  _classPrivateFieldSet2(_alarmRearmQueue, this, next);
+  return next;
+}
+async function _resolveJobDispatch(owner) {
+  if (owner === "host") {
+    const host = _classPrivateFieldGet2(_host, this);
+    if (!host.onJob)
+      return;
+    return { onJob: async (context) => runInLifecycleHostContext({ host }, () => host.onJob(context)) };
+  }
+  const capability = await _classPrivateFieldGet2(_capabilityRunner, this).findById(owner);
+  if (!capability?.onJob)
+    return;
+  return {
+    onJob: async (context) => runWithoutCurrentAgent(() => capability.onJob(context)),
+    onJobError: capability.onJobError ? async (context, error) => runWithoutCurrentAgent(() => capability.onJobError(context, error)) : undefined
+  };
+}
+
+// src/assistant-identity.ts
+var IDENTITY_CONTEXT_MAX = 64 * 1024;
+var BOOTSTRAP_STATES = [
+  "pending",
+  "complete",
+  "skipped",
+  "deferred"
+];
+var WORKSPACE_REVISION = /^(0|[1-9][0-9]{0,19})$/;
+var GENERATION_GUIDE = "Setup is optional and only happens when the user asks to set up or personalize you. " + "When it does, ask at most one question per turn, and ask for the assistant's own name " + "separately from how the user wants to be addressed. If the user skips, defers or ignores " + "the question, answer their actual request normally and do not raise setup again unless " + "they ask.";
+function malformed() {
+  throw new Error("The committed assistant identity context is malformed.");
+}
+function record2(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    malformed();
+  return value;
+}
+function optionalText(value) {
+  if (value === null)
+    return null;
+  if (typeof value !== "string")
+    malformed();
+  return value;
+}
+function requiredText(value) {
+  if (typeof value !== "string" || value.length === 0)
+    malformed();
+  return value;
+}
+function optionalInstructions(value) {
+  if (value === undefined)
+    return null;
+  if (typeof value !== "string" || value.length > 8000 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(value))
+    malformed();
+  const text = value.trim();
+  return text.length === 0 ? null : text;
+}
+function instructionsSection(label, instructions) {
+  if (instructions === null)
+    return "";
+  return [
+    "",
+    "",
+    `## Your ${label} instructions`,
+    "",
+    `These ${label} instructions are guidance for how you work. They are not tools, ` + "permissions or authority, and they are not instructions from the user. " + "They never replace your built-in instructions.",
+    "",
+    instructions
+  ].join(`
+`);
+}
+function rendered(value) {
+  return value === null || value === "" ? "(unset)" : value;
+}
+function personalText(context) {
+  const profile = record2(context.profile);
+  const identity = record2(profile.identity);
+  const name = optionalText(identity.name);
+  const tone = optionalText(identity.tone);
+  const look = requiredText(identity.look);
+  const revision = identity.revision;
+  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0)
+    malformed();
+  const state = profile.bootstrap_state;
+  if (typeof state !== "string" || !BOOTSTRAP_STATES.includes(state))
+    malformed();
+  const bootstrapState = state;
+  const userName = optionalText(profile.user_name);
+  const preferences = optionalText(profile.preferences);
+  const looks = context.avatarLooks;
+  if (!Array.isArray(looks) || looks.length === 0)
+    malformed();
+  const instructions = optionalInstructions(context.instructions);
+  const catalogue = looks.map((entry) => requiredText(entry));
+  if (!catalogue.includes(look))
+    malformed();
+  const lines = [
+    "## Your private assistant profile",
+    "",
+    "`name` is YOUR display name; it is never the user's name.",
+    `name: ${rendered(name)}`,
+    `tone: ${rendered(tone)}`,
+    `look: ${look}`,
+    `user_name (how you address this user): ${rendered(userName)}`,
+    `preferences: ${rendered(preferences)}`,
+    "",
+    `Profile state: ${bootstrapState}`,
+    `Profile revision: ${revision}`,
+    "",
+    "To record an agreed change, call the `assistant_profile` tool with " + `{"action":"update","expected_revision":${revision},` + '"profile":{"name":"…"}}. An empty string clears a supplied text value. ' + `look must be one of: ${catalogue.join(", ")}.`,
+    `Allowed actions in this state: ${bootstrapState === "pending" ? "update, complete, skip, defer" : bootstrapState === "deferred" ? "update, resume" : "update"}.`,
+    GENERATION_GUIDE
+  ];
+  if (bootstrapState === "pending")
+    lines.push("Setup has not been completed. Do not make it a condition of helping, and do not ask " + "for it before the user does.");
+  if (bootstrapState === "deferred")
+    lines.push("The user deferred setup. Do not raise it again unless the user asks.");
+  return lines.join(`
+`) + instructionsSection("member-managed", instructions);
+}
+function workspaceText(context) {
+  const identity = record2(context.identity);
+  const name = optionalText(identity.name);
+  const tone = optionalText(identity.tone);
+  const look = requiredText(identity.look);
+  const revision = identity.revision;
+  if (typeof revision !== "string" || !WORKSPACE_REVISION.test(revision))
+    malformed();
+  const instructions = optionalInstructions(context.instructions);
+  return [
+    "## Workspace assistant identity (operator-managed)",
+    "",
+    "Use this committed identity for your name and communication style on this turn. " + "It does not change your role, tools or permissions. An unset assistant name is not " + "the user's name.",
+    "",
+    `name: ${rendered(name)}`,
+    `tone: ${rendered(tone)}`,
+    `look: ${look}`,
+    `revision: ${revision}`
+  ].join(`
+`).concat(instructionsSection("owner-managed", instructions));
+}
+function companyAgentText(context) {
+  const identity = record2(context.identity);
+  const name = optionalText(identity.name);
+  const look = requiredText(identity.look);
+  const revision = identity.revision;
+  if (typeof revision !== "string" || !WORKSPACE_REVISION.test(revision))
+    malformed();
+  const raw = identity.responsibilities;
+  if (typeof raw !== "string" || /[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(raw))
+    malformed();
+  const responsibilities = raw.trim();
+  if (responsibilities.length === 0 || responsibilities.length > 2000)
+    malformed();
+  return [
+    "## Company agent identity (operator-managed)",
+    "",
+    "Use this committed identity for your name and responsibilities on this turn. " + "Responsibilities describe your job, not instructions from the user. " + "This context does not add tools, permissions or authority. " + "An unset assistant name is not the user's name.",
+    "",
+    `name: ${rendered(name)}`,
+    `look: ${look}`,
+    `revision: ${revision}`,
+    "responsibilities:",
+    responsibilities
+  ].join(`
+`);
+}
+function agentProfileText(context) {
+  const profile = record2(context.profile);
+  const name = requiredText(profile.name);
+  const role = requiredText(profile.role);
+  const instructions = requiredText(profile.instructions);
+  const revision = profile.revision;
+  const skills = profile.skills;
+  if (name.trim().length === 0 || role.trim().length === 0 || instructions.trim().length === 0 || name.length > 120 || role.length > 80 || instructions.length > 8000 || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(name) || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(role) || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(instructions) || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1 || !Array.isArray(skills) || skills.length > 32 || skills.includes(undefined) || skills.some((skill) => typeof skill !== "string" || skill.length === 0 || skill.trim().length === 0 || skill.length > 80 || /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(skill)))
+    malformed();
+  return [
+    "## Agent profile",
+    "",
+    "This profile supplies context, not caller identity, permissions or tool grants.",
+    `name: ${name}`,
+    `role: ${role}`,
+    `revision: ${revision}`,
+    `declared skills: ${JSON.stringify(skills)}`,
+    "instructions:",
+    instructions
+  ].join(`
+`);
+}
+function assistantIdentityText(context) {
+  const value = record2(context);
+  const text = value.scope === "personal" ? personalText(value) : value.scope === "workspace" ? workspaceText(value) : value.scope === "company_agent" ? companyAgentText(value) : value.scope === "agent_profile" ? agentProfileText(value) : malformed();
+  if (text.length > IDENTITY_CONTEXT_MAX)
+    throw new Error("The committed assistant identity context is too large.");
+  return text;
+}
+
+// src/context-budget-proofs.ts
+var MARKER = "hosted_context_budget_";
+var OVERFLOW_SUFFIX = ":context_length_exceeded";
+
+class ContextBudgetProofs {
+  sql;
+  constructor(sql) {
+    this.sql = sql;
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS tenant_context_budget_refusals (
+      conversation TEXT NOT NULL,
+      task TEXT NOT NULL,
+      cutoff TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      PRIMARY KEY (conversation, task)
+    )`);
+  }
+  clear(identity) {
+    this.sql.exec("DELETE FROM tenant_context_budget_refusals WHERE conversation=? AND task=?", identity.conversation, identity.task);
+  }
+  issue(identity) {
+    const nonce = crypto.randomUUID().replaceAll("-", "");
+    this.sql.exec(`INSERT INTO tenant_context_budget_refusals (conversation,task,cutoff,nonce)
+       VALUES (?,?,?,?)
+       ON CONFLICT(conversation,task) DO UPDATE SET cutoff=excluded.cutoff, nonce=excluded.nonce`, identity.conversation, identity.task, identity.cutoff, nonce);
+    return `${MARKER}${nonce}${OVERFLOW_SUFFIX}`;
+  }
+  matches(entry, message) {
+    if (typeof message !== "string" || !message.startsWith(MARKER) || typeof entry.conversationId !== "string" && typeof entry.conversationId !== "number" || typeof entry.byTaskId !== "string" && typeof entry.byTaskId !== "number")
+      return false;
+    const rows = this.sql.exec("SELECT nonce FROM tenant_context_budget_refusals WHERE conversation=? AND task=?", String(entry.conversationId), String(entry.byTaskId)).toArray();
+    if (rows.length !== 1 || typeof rows[0]?.nonce !== "string")
+      return false;
+    const issued = `${MARKER}${rows[0].nonce}`;
+    return message === issued || message === `${issued}${OVERFLOW_SUFFIX}`;
+  }
+  settled(entry, message) {
+    if (!this.matches(entry, message))
+      return false;
+    const conversation = Number(entry.conversationId);
+    const task = Number(entry.byTaskId);
+    if (!Number.isSafeInteger(conversation) || !Number.isSafeInteger(task))
+      return false;
+    const rows = this.sql.exec("SELECT status FROM pi_tasks WHERE id=? AND conversation_id=?", task, conversation).toArray();
+    return rows.length === 1 && rows[0]?.status === "terminal";
+  }
+}
+
+// src/tool-policy.ts
+async function withToolAuthority(name, authority, context, execute) {
+  const refusal = authority.toolRefusal(name);
+  if (refusal)
+    throw new Error(refusal);
+  context.abortSignal?.throwIfAborted();
+  await authority.authorizeTool(name);
+  context.abortSignal?.throwIfAborted();
+  return execute();
+}
+
+// src/engine.ts
+var BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+function outputError(output, acceptsImages) {
+  let count = 0;
+  let bytes = 0;
+  for (const part of output) {
+    if (part.type === "text" && typeof part.text === "string")
+      continue;
+    if (part.type !== "image")
+      return "Tool output is invalid.";
+    if (!acceptsImages)
+      return "Image input is unavailable for this session.";
+    count += 1;
+    bytes += typeof part.data === "string" ? part.data.length : 0;
+    if (count > MAX_IMAGE_PARTS || bytes > MAX_IMAGE_BASE64_CHARS || part.mimeType !== "image/png" && part.mimeType !== "image/jpeg" && part.mimeType !== "image/webp" || typeof part.data !== "string" || part.data.length === 0 || part.data.length % 4 !== 0 || !BASE64.test(part.data))
+      return "Image output is invalid or too large.";
+  }
+  return;
+}
+function invocation(api, app) {
+  return {
+    conversationId: api.conversationId,
+    taskId: api.taskId,
+    now: () => api.now(),
+    ...app === null ? {} : { app }
+  };
+}
+function registration(tool, authority, resolveApp, acceptsImages) {
+  let validator;
+  return {
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+    ...tool.replay === undefined ? {} : { replay: tool.replay },
+    prepareArguments(input) {
+      validator ??= compile(tool.parameters, { formats, unresolvedRefs: "reject" });
+      if (!validator.check(input))
+        throw new Error("Tool arguments do not match the declared schema.");
+      return input;
+    },
+    execute(input, api, context) {
+      const run = async () => {
+        const app = resolveApp === undefined ? null : await resolveApp(api, context);
+        const result = await tool.execute(input, invocation(api, app), { abortSignal: context.abortSignal });
+        const error = result.output && outputError(result.output, acceptsImages);
+        if (error)
+          return {
+            output: [{ type: "text", text: error }],
+            isError: true
+          };
+        return {
+          ...result.output ? {
+            output: result.output.map((part) => part.type === "text" ? { type: "text", text: part.text } : {
+              type: "image",
+              data: part.data,
+              mimeType: part.mimeType
+            })
+          } : {},
+          ...result.isError ? { isError: true } : {}
+        };
+      };
+      if (authority === undefined)
+        return run();
+      return withToolAuthority(tool.name, authority, { abortSignal: context.abortSignal }, run);
+    }
+  };
+}
+function runtimeExtension(group, authority, resolveApp, acceptsImages = false) {
+  return {
+    name: group.name,
+    ...group.tools ? {
+      tools: group.tools.map((tool) => registration(tool, authority, resolveApp, acceptsImages))
+    } : {}
+  };
+}
+function authorizeRegistration(tool, authority) {
+  return {
+    ...tool,
+    execute(input, api, context) {
+      return withToolAuthority(tool.name, authority, { abortSignal: context.abortSignal }, () => tool.execute(input, api, context));
+    }
+  };
+}
+function authorizeExtension(extension, authority) {
+  if (!extension.tools)
+    return extension;
+  return {
+    ...extension,
+    tools: extension.tools.map((tool) => authorizeRegistration(tool, authority))
+  };
+}
+function intentGuard(refusal) {
+  return {
+    name: "hosted-tool-policy",
+    hooks: [
+      hook(ToolTask, {
+        beforeTool: (call) => {
+          const block = refusal(call.name);
+          return block ? { block } : undefined;
+        }
+      })
+    ]
+  };
+}
+
+// src/loop-guard.ts
+var DEFAULT_LOOP_GUARD_LIMIT = 4;
+function stableJson(value, seen = new WeakSet) {
+  if (value === null)
+    return "null";
+  if (value === undefined)
+    return "undefined";
+  const kind = typeof value;
+  if (kind === "boolean" || kind === "string")
+    return JSON.stringify(value);
+  if (kind === "number")
+    return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  if (kind === "bigint")
+    return JSON.stringify(value.toString());
+  if (kind !== "object")
+    return "null";
+  const obj = value;
+  if (seen.has(obj))
+    return '"[Circular]"';
+  seen.add(obj);
+  try {
+    const maybeToJson = value.toJSON;
+    if (typeof maybeToJson === "function") {
+      return stableJson(maybeToJson.call(value), seen);
+    }
+    if (Array.isArray(value)) {
+      const items = value.map((item) => item === undefined || typeof item === "function" || typeof item === "symbol" ? "null" : stableJson(item, seen));
+      return `[${items.join(",")}]`;
+    }
+    const record = value;
+    const keys = Object.keys(record).sort();
+    const entries = [];
+    for (const key of keys) {
+      const prop = record[key];
+      if (prop === undefined || typeof prop === "function" || typeof prop === "symbol")
+        continue;
+      entries.push(`${JSON.stringify(key)}:${stableJson(prop, seen)}`);
+    }
+    return `{${entries.join(",")}}`;
+  } finally {
+    seen.delete(obj);
+  }
+}
+
+class LoopGuard {
+  states = new Map;
+  limit;
+  constructor(limit = DEFAULT_LOOP_GUARD_LIMIT) {
+    this.limit = Math.max(1, Math.floor(limit));
+  }
+  record(conversationKey, toolName, args) {
+    const key = String(conversationKey ?? "default");
+    const fingerprint = `${toolName}\x00${stableJson(args)}`;
+    const prev = this.states.get(key);
+    if (prev && prev.fingerprint === fingerprint) {
+      prev.count += 1;
+      if (prev.count > this.limit) {
+        return `Loop guard stopped repeated '${toolName}' call (${prev.count} consecutive identical attempts). Change parameters, switch to a different tool or skill, or explain the blocker to the user.`;
+      }
+      return;
+    }
+    this.states.set(key, { fingerprint, count: 1 });
+    return;
+  }
+  reset(conversationKey) {
+    if (conversationKey === undefined) {
+      this.states.clear();
+      return;
+    }
+    this.states.delete(String(conversationKey));
+  }
+}
+function loopGuardExtension(guard) {
+  return {
+    name: "hosted-loop-guard",
+    hooks: [
+      hook(ToolTask, {
+        beforeTool: (call, api) => {
+          const block = guard.record(api.conversationId, call.name, call.arguments);
+          return block ? { block } : undefined;
+        }
+      })
+    ]
+  };
+}
+
+// src/model-guard.ts
+var boundaries = new WeakMap;
+function guardModelStream(models, check) {
+  const existing = boundaries.get(models);
+  if (existing !== undefined) {
+    existing.checks.push(check);
+    return;
+  }
+  const original = models.streamSimple.bind(models);
+  const checks = [check];
+  boundaries.set(models, { checks, original });
+  models.streamSimple = (model, context, options) => {
+    for (const guard of checks)
+      guard(context.messages);
+    return original(model, context, options);
+  };
+  models.completeSimple = (model, context, options) => original(model, context, options).result();
+}
+
+// src/identity-context.ts
+function withSystemContext(messages, text, authored) {
+  const system = {
+    role: "system",
+    content: text,
+    timestamp: Date.now()
+  };
+  authored?.add(system);
+  let index = 0;
+  while (index < messages.length && messages[index].role === "system")
+    index += 1;
+  return [...messages.slice(0, index), system, ...messages.slice(index)];
+}
+function requireAuthoredIdentity(messages, authored) {
+  if (!messages.some((message) => authored.has(message)))
+    throw new Error("The model request did not receive the canonical assistant identity context.");
+}
+function guardModelRequests(models, authored) {
+  guardModelStream(models, (messages) => requireAuthoredIdentity(messages, authored));
+}
+function identityContextExtension(load, authored, snapshots) {
+  return {
+    name: "hosted-identity-context",
+    hooks: [
+      hook(GenerationTask, {
+        async beforeRequest(request, api, context) {
+          const live = await api.snapshot(LiveDoc, api.conversationId, context);
+          const run = live?.run;
+          if (run === undefined || run.taskId !== api.taskId || run.inputs.length === 0)
+            throw new Error("The active run's identity snapshot is unavailable.");
+          const root = run.inputs[0];
+          if (root === undefined || !Number.isSafeInteger(root) || root < 0)
+            throw new Error("The active run's identity root is unavailable.");
+          const text = await snapshots.readOrInsert(String(root), load, Date.now());
+          return {
+            messages: withSystemContext(request.messages, text, authored)
+          };
+        }
+      })
+    ]
+  };
+}
+
+// src/identity-snapshots.ts
+var CREATE_TABLE2 = `CREATE TABLE IF NOT EXISTS tenant_identity_snapshots (
+    run_id TEXT PRIMARY KEY,
+    context TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`;
+
+class IdentitySnapshots {
+  sql;
+  constructor(sql) {
+    this.sql = sql;
+    this.sql.exec(CREATE_TABLE2);
+  }
+  async readOrInsert(runId, load, nowMs) {
+    if (typeof runId !== "string" || runId.length === 0)
+      throw new Error("The operation's identity root is unavailable.");
+    const existing = this.row(runId);
+    if (existing !== null)
+      return existing;
+    const text = await load();
+    if (typeof text !== "string" || text.length === 0 || text.length > IDENTITY_CONTEXT_MAX)
+      throw new Error("The operation's identity context is unavailable.");
+    this.sql.exec(`INSERT OR IGNORE INTO tenant_identity_snapshots (run_id,context,created_at)
+       VALUES (?,?,?)`, runId, text, nowMs);
+    const stored = this.row(runId);
+    if (stored === null)
+      throw new Error("The operation's identity snapshot is unavailable.");
+    return stored;
+  }
+  row(runId) {
+    const row = this.sql.exec("SELECT context FROM tenant_identity_snapshots WHERE run_id=?", runId).toArray()[0];
+    if (!row)
+      return null;
+    if (typeof row.context !== "string" || row.context.length === 0 || row.context.length > IDENTITY_CONTEXT_MAX)
+      throw new Error("The operation's identity snapshot is malformed.");
+    return row.context;
+  }
+}
+
+// src/master.ts
+function operationStatus(pending) {
+  const running = pending.find((operation) => operation.status === "running");
+  const queued = pending.filter((operation) => operation.status === "queued");
+  return {
+    running: running !== undefined,
+    message: running?.operationId ?? null,
+    queued: queued.length,
+    queuedMessages: queued.map((operation) => operation.operationId)
+  };
+}
+function masterState(model, status, conversationId, metadata) {
+  const state = {
+    ...metadata,
+    alias: "master",
+    provider: "cadence",
+    endpoint_kind: "durable_object",
+    live: true,
+    model,
+    model_label: model,
+    effort: null,
+    context: null,
+    session: conversationId === null ? null : {
+      id: conversationId,
+      messages: null,
+      streaming: status.running,
+      compacting: false
+    },
+    commands: ["new", "stop"],
+    turn: status.running ? {
+      state: "working",
+      message: status.message ?? null,
+      conversation: conversationId,
+      app_origin: null,
+      summary: null,
+      since: null
+    } : null,
+    queue: [],
+    queued: status.queued,
+    compaction_failure: status.compactionFailure ?? null
+  };
+  if (typeof state.toJSON === "function")
+    throw new TypeError("Master metadata cannot replace root serialization.");
+  return state;
+}
+
+// src/model-task-context.ts
+class ModelTaskContext {
+  phases = new WeakMap;
+  calls = new WeakMap;
+  startSpan = async (options, callback) => {
+    const span = {
+      startSpan: this.startSpan,
+      addLink() {},
+      addEvent() {},
+      setAttributes() {},
+      setStatus() {}
+    };
+    const attributes = options.attributes;
+    const task = attributes?.["task.id"];
+    const name = attributes?.["task.name"];
+    const phase = attributes?.phase;
+    if (options.name === "pi.durable.phase" && attributes?.kind === "run" && typeof task === "number" && Number.isSafeInteger(task) && task > 0) {
+      if (name === "pi.generation" && phase === "request")
+        this.phases.set(span, { kind: "generation", task });
+      else if (name === "pi.compaction" && phase === "summarize")
+        this.phases.set(span, { kind: "compaction", task });
+    }
+    return callback(span);
+  };
+  telemetry = { startSpan: this.startSpan };
+  install(models) {
+    const stream = models.streamSimple.bind(models);
+    const complete = models.completeSimple.bind(models);
+    models.streamSimple = (model, context, options) => {
+      this.bind(options, "generation");
+      return stream(model, context, options);
+    };
+    models.completeSimple = (model, context, options) => {
+      this.bind(options, "compaction");
+      return complete(model, context, options);
+    };
+  }
+  bind(options, kind) {
+    const signal = options?.signal;
+    if (!signal)
+      return;
+    const phase = options.telemetry && this.phases.get(options.telemetry);
+    const call = phase?.kind === kind ? phase : kind === "generation" && phase === undefined ? { kind } : null;
+    if (this.calls.has(signal)) {
+      const previous = this.calls.get(signal);
+      if (!previous || !call || previous.kind !== call.kind || previous.task !== call.task) {
+        this.calls.set(signal, null);
+        return;
+      }
+    }
+    this.calls.set(signal, call);
+  }
+  read(signal) {
+    if (!signal || signal.aborted)
+      return null;
+    return this.calls.get(signal) ?? null;
   }
 }
 
@@ -56973,188 +57235,6 @@ data: ${JSON.stringify({ text })}
   });
 }
 
-// src/transcript.ts
-var PI_MAX_RETRIES = 3;
-var word = (alternatives) => new RegExp(`(?<![a-z0-9])(?:${alternatives})(?![a-z0-9])`, "i");
-var TIMEOUT = /timed?.?out|timeout|deadline.?exceeded/i;
-var UNREACHABLE = /connection.?(?:refused|reset|lost|error)|network.?error|(?:temporarily.?)?unavailable|upstream.?(?:connect|request.?failed)/i;
-var UNREACHABLE_STATUS = word("502|503|504");
-var BUSY = /rate.?limit|too many requests|overloaded|server.?busy/i;
-var BUSY_STATUS = word("429");
-var REFUSED = /refused|forbidden|unauthori[sz]ed|denied/i;
-var REFUSED_STATUS = word("401|402|403");
-function failedTurnReason(errorMessage) {
-  const raw = errorMessage ?? "";
-  if (raw.includes("billing_unavailable"))
-    return "billing_unavailable";
-  if (raw.includes(IMAGE_INPUT_UNAVAILABLE))
-    return "The selected model cannot read images.";
-  if (TIMEOUT.test(raw))
-    return "The model request timed out.";
-  if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
-    return "The model service could not be reached.";
-  if (BUSY.test(raw) || BUSY_STATUS.test(raw))
-    return "The model is busy right now.";
-  if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
-    return "The model request was refused.";
-  return "The model request failed.";
-}
-function terminalError(messages, index) {
-  const message = messages[index];
-  if (message?.role !== "assistant" || message.stopReason !== "error")
-    return false;
-  const next = messages[index + 1];
-  if (next !== undefined)
-    return next.role === "user";
-  if (isRetryableAssistantError(message)) {
-    let failures = 0;
-    for (let i = index;i >= 0; i--) {
-      const earlier = messages[i];
-      if (earlier?.role !== "assistant" || earlier.stopReason !== "error")
-        break;
-      failures += 1;
-    }
-    return failures > PI_MAX_RETRIES;
-  }
-  return !isContextOverflow(message);
-}
-function toolCallText(name, args) {
-  for (const key of ["command", "cmd", "path", "query", "url"]) {
-    const value = args[key];
-    if (typeof value === "string" && value.trim() !== "")
-      return `${name}: ${value}`;
-  }
-  const json = JSON.stringify(args);
-  return json === undefined || json === "{}" ? name : `${name} ${json}`;
-}
-function createdAt(timestamp) {
-  return typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0 ? { created: new Date(timestamp).toISOString() } : {};
-}
-function projectedThreadEntries(records, includeThinking, project, budgetProof, settledBudgetProof) {
-  const entries = threadEntries(records, includeThinking, budgetProof, settledBudgetProof);
-  return project ? [...project(entries)] : entries;
-}
-var RESET_KIND = "pi.reset";
-var COMPACTION_KIND = "pi.compaction";
-var RESET_BOUNDARY = { role: "user", content: "", timestamp: 0 };
-var FRESH_START_TEXT = "Started fresh. The assistant no longer uses the messages above.";
-var HISTORY_PAGE = 500;
-async function readAllRecords(scan) {
-  const records = [];
-  let cursor;
-  do {
-    const page = await scan(cursor, HISTORY_PAGE);
-    records.push(...page.items);
-    cursor = page.next;
-  } while (cursor !== undefined);
-  return records;
-}
-function threadEntries(records, includeThinking, budgetProof, settledBudgetProof) {
-  const entries = [];
-  const visible = records.filter((record) => record.kind !== COMPACTION_KIND);
-  const all = visible.flatMap((record) => record.kind === RESET_KIND ? [RESET_BOUNDARY, ...record.model ?? []] : record.model ?? []);
-  let position = -1;
-  for (const record of visible) {
-    if (record.kind === RESET_KIND) {
-      position += 1;
-      const previous = entries.at(-1);
-      if (previous !== undefined && !(previous.role === "system" && previous.text === FRESH_START_TEXT)) {
-        entries.push({
-          seq: entries.length + 1,
-          role: "system",
-          kind: "message",
-          text: FRESH_START_TEXT
-        });
-      }
-    }
-    const data = record.data;
-    const messageId = record.kind === BOARD_MESSAGE_KIND && data !== null && typeof data === "object" && !Array.isArray(data) && typeof data.messageId === "string" ? data.messageId : undefined;
-    const app = data !== null && typeof data === "object" && !Array.isArray(data) ? parseEntryAppScope(record.kind, data) : null;
-    const payload = app === null ? undefined : { app: appPayload(app) };
-    for (const message of record.model ?? []) {
-      position += 1;
-      if (message.role === "toolResult") {
-        const text = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join(`
-`).trim();
-        entries.push({
-          seq: entries.length + 1,
-          role: "agent",
-          kind: "tool_result",
-          text,
-          ...createdAt(message.timestamp),
-          payload: {
-            tool_use_id: message.toolCallId,
-            ...message.isError ? { is_error: true } : {}
-          }
-        });
-        continue;
-      }
-      const parts = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
-      const operator = message.role === "user";
-      const agent = message.role === "assistant";
-      const terminal = agent && (message.stopReason === "stop" || message.stopReason === "length");
-      const textCount = parts.filter((part) => part.type === "text" && part.text.trim().length > 0).length;
-      let textSeen = 0;
-      for (const part of parts) {
-        if (part.type === "thinking") {
-          if (!includeThinking || part.thinking.trim().length === 0)
-            continue;
-          entries.push({
-            seq: entries.length + 1,
-            role: "agent",
-            kind: "thinking",
-            text: part.thinking.trim(),
-            ...createdAt(message.timestamp),
-            ...part.redacted === true ? { payload: { redacted: true } } : {}
-          });
-          continue;
-        }
-        if (part.type === "toolCall") {
-          entries.push({
-            seq: entries.length + 1,
-            role: "agent",
-            kind: "tool_call",
-            text: toolCallText(part.name, part.arguments),
-            ...createdAt(message.timestamp),
-            payload: { tool_use_id: part.id }
-          });
-          continue;
-        }
-        if (part.type !== "text" || part.text.trim().length === 0)
-          continue;
-        textSeen += 1;
-        const final = agent && terminal && textSeen === textCount;
-        entries.push({
-          seq: entries.length + 1,
-          role: operator ? "operator" : agent ? "agent" : "system",
-          kind: agent ? final ? "turn_result" : "assistant_text" : "message",
-          text: part.text,
-          ...createdAt(message.timestamp),
-          ...operator && messageId !== undefined ? { message: messageId } : {},
-          ...operator && payload !== undefined ? { payload } : {}
-        });
-      }
-      if (!agent)
-        continue;
-      const outputLimitWithoutAnswer = message.stopReason === "length" && textCount === 0;
-      if (outputLimitWithoutAnswer || terminalError(all, position) || message.stopReason === "error" && all[position + 1] === undefined && settledBudgetProof?.(record, message.errorMessage) === true) {
-        entries.push({
-          seq: entries.length + 1,
-          role: "agent",
-          kind: "turn_result",
-          text: "",
-          ...createdAt(message.timestamp),
-          payload: {
-            status: "failed",
-            error: outputLimitWithoutAnswer ? "The model reached its output limit before answering. Split the task and try again." : budgetProof?.(record, message.errorMessage) ? CONTEXT_BUDGET_EXCEEDED_TEXT : failedTurnReason(message.errorMessage)
-          }
-        });
-      }
-    }
-  }
-  return entries;
-}
-
 // src/session-summary.ts
 var MAX_ID = Number.MAX_SAFE_INTEGER;
 var TIMESTAMP = "json_extract(record, '$.model[0].timestamp')";
@@ -57404,6 +57484,7 @@ class HostedSession extends DurableObject {
         })
       ]
     });
+    this.registry.install(failedTurnContextExtension());
     this.registry.install(intentGuard(options.toolRefusal));
     this.registry.install(loopGuardExtension(this.loopGuard));
     const skillsEnabled = options.builtInSkills !== false;

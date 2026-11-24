@@ -122,6 +122,15 @@ cache or exfiltrate the key. Therefore:
   `refs/heads/main` only, one leg per cross target, writing only the
   `cross-dual2-<target>` rust-cache keys the cross-build matrix restores with
   `save-if: false`. It holds no secrets and no environment.
+- `test-seed-pilot` (CAD-2749) is manual only. Dispatch CI cache warming on
+  `main` with `expected_sha` set to the exact current main commit. The
+  job skips other refs and rejects a mismatched SHA before checkout. On an
+  exact cache hit it skips the build; on a miss it compiles the test-seam
+  library and suite without running tests, then saves only dependencies
+  to `gate-test-ld2` on success. It has no sccache credentials or environment.
+  Record whether a fallback cache was restored before comparing the seed's
+  build time with a cold build. `changed-tests` still restores read-only,
+  and no main push runs the pilot.
 - Every other job, including all gate jobs on `pull_request` and `merge_group`
   and on main pushes, gets only the read-only pair and no `environment:`.
 

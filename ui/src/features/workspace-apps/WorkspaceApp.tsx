@@ -55,7 +55,8 @@ import type { MediaChatAttach } from "./screen/screenLifecycle";
 import { makePlanner, runCall, type ActionContext } from "./screen/screenActions";
 import { useScreenExtras } from "./screen/useScreenExtras";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
-import { screenFailurePane, type ScreenPaneState } from "./screen/screenFailure";
+import type { ScreenPaneState } from "./screen/screenFailure";
+import ScreenFailurePane from "./screen/ScreenFailurePane";
 import { socialPublish } from "./socialPublish";
 import { supportsSocialContentWorkspace } from "./socialContentSupport";
 import { isUnchangedUpgradeError } from "../explorer/appErrors";
@@ -133,30 +134,6 @@ function AppVersion({ version }: { version?: string }) {
  * remount of the same projection); `onReinstall` exists only when the app has
  * a recorded install source and this viewer may write.
  */
-function ScreenFailurePane({ failure, appName, onRetry, onReinstall, busy }: {
-  failure: ScreenPaneState;
-  appName: string;
-  onRetry: () => void;
-  onReinstall?: () => void;
-  busy?: boolean;
-}) {
-  const t = useTranslate();
-  const pane = screenFailurePane(failure, onReinstall !== undefined);
-  const title = failure.kind === "needs_host_update"
-    ? t(pane.title).replace("{required}", () => failure.required).replace("{current}", () => failure.current)
-    : t(pane.title).replace("{app}", () => appName);
-  return (
-    <section className="card px-4 py-5" aria-label={t("Installed app screen")} data-screen-pane={failure.kind} role="status">
-      <p className="wa-muted">{title}</p>
-      <div className="wa-row">
-        {pane.actions.includes("sign_in") && <Button href="/login">{t("Sign in")}</Button>}
-        {pane.actions.includes("retry") && <Button onClick={onRetry}>{t("Retry")}</Button>}
-        {pane.actions.includes("reinstall") && onReinstall && <Button onClick={onReinstall} loading={busy}>{t("Reinstall")}</Button>}
-        {pane.actions.includes("check_update") && <Button onClick={() => window.location.reload()}>{t("Check for update")}</Button>}
-      </div>
-    </section>
-  );
-}
 
 const message = (error: unknown) =>
   error instanceof Error

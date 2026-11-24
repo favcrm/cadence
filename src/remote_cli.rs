@@ -2461,6 +2461,10 @@ fn settings_receipt_correlates(
 /// Stable code for a board that refused `include_body` on the verdict read.
 pub const VERDICT_BODY_UNSUPPORTED: &str = "verdict_body_unsupported";
 
+/// Stable code for a board that refused `include_agent_reviews` on the
+/// verdict read (AOS-727): it predates agent reviewers, so it has no such rows.
+pub const VERDICT_AGENT_REVIEWS_UNSUPPORTED: &str = "verdict_agent_reviews_unsupported";
+
 /// Stable code for a board that predates `limit` on `issue_ls`.
 pub const ISSUE_LS_LIMIT_UNSUPPORTED: &str = "issue_ls_limit_unsupported";
 
@@ -5366,6 +5370,22 @@ fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Err
             "not_permitted",
             "this login may not read that profile; nothing was read",
         )),
+        // AOS-727: an agent reviewer's own verdict, refused before it is recorded.
+        ("audit_verdict_project", Some("reviewer_profile_not_eligible")) => Some((
+            "reviewer_profile_not_eligible",
+            "this agent's profile is not active, so its verdicts cannot count; the workspace \
+             owner must reactivate it or use an active profile. Nothing was recorded",
+        )),
+        ("audit_verdict_project", Some("reviewer_is_author")) => Some((
+            "reviewer_is_author",
+            "this agent's profile worked on the ticket, so it cannot review it; use a \
+             profile that did not. Nothing was recorded",
+        )),
+        ("audit_verdict_project", Some("agent_review_kind_not_allowed")) => Some((
+            "agent_review_kind_not_allowed",
+            "an agent reviewer files only `standards` and `spec-security` verdicts; Browser \
+             QA and combined reviews stay with people. Nothing was recorded",
+        )),
         ("agent_profile_show" | "agent_profile_update", Some("not_found")) => Some((
             "not_found",
             "this workspace has no profile with that id, or it is archived and only the \
@@ -7488,6 +7508,19 @@ fn call_verb_until_retry(
         }
         if let Some(error) = template_store_refusal(verb, status, body.as_ref()) {
             return Err(error);
+        }
+        // AOS-727: a board that predates `include_agent_reviews` refuses it the
+        // same way. Checked first: a board that knows it knows `include_body`,
+        // so a refusal with both fields names this one.
+        if verb == "audit_verdicts_project"
+            && arguments.contains_key("include_agent_reviews")
+            && status == 400
+            && refusal_code.as_deref() == Some("invalid_request")
+        {
+            return Err(Error::invalid(
+                VERDICT_AGENT_REVIEWS_UNSUPPORTED,
+                "the board does not know `include_agent_reviews` for verdicts",
+            ));
         }
         // CAD-2150: a board that predates `include_body` refuses the field as an
         // invalid request. That is not "the tenant cannot serve the verb": the

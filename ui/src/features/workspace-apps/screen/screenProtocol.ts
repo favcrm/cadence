@@ -57,6 +57,7 @@ export type ChildToHost =
   | { v: 2; op: "whatsapp-compose"; conversation_id: string | null; provider?: WhatsAppComposeProvider }
   | { v: 2; op: "whatsapp-reply-layout"; nomination: number; bounds: WhatsAppReplyBounds | null }
   | { v: 2; op: "whatsapp-reply-inset-ready"; nomination: number; seq: number; px: number }
+  | { v: 2; op: "whatsapp-thread-unread"; conversation_id: string; provider: WhatsAppComposeProvider; unread: boolean }
   | WhatsAppMediaRequest
   | AudioRequest
   | AudioSessionRequest
@@ -212,7 +213,7 @@ export const isMediaVerb = (verb: string): verb is MediaVerb =>
  *  deliberately absent; the channel appends a mount's declared media
  *  rights itself. */
 export const ACTION_VERBS: string[] = [...new Set([...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v) && v !== SCREEN_DRAWER_CONTEXT), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)])];
-export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "records.batch", "records.aggregate", "records.merge", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "sends.cancel", "smtp.show", "origin.show", "campaign-work.show", "campaign-work.save", "screen.preview.show", "screen.preview.clear", "screen.route.patch", "whatsapp.status", "whatsapp.connect_session", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.prepare", "whatsapp.reply.status", "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.prepare", "whatsapp.template.status", "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate", "whatsapp.broadcast.results", "whatsapp.broadcast.draft", "whatsapp.broadcast.test.prepare", "whatsapp.broadcast.prepare", "whatsapp.handoff.set", "chat.whatsapp.open", "whatsapp.draft.show", "whatsapp.draft.discard", "works.query", "works.get", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review", "calendar.query", "routines.list", "connections.assets", "connections.connect", "catalog.call", "catalog.status"] as const;
+export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "records.batch", "records.aggregate", "records.merge", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "sends.cancel", "smtp.show", "origin.show", "campaign-work.show", "campaign-work.save", "screen.preview.show", "screen.preview.clear", "screen.route.patch", "whatsapp.status", "whatsapp.connect_session", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.prepare", "whatsapp.reply.status", "whatsapp.templates.list", "whatsapp.template.show", "whatsapp.template.prepare", "whatsapp.template.status", "whatsapp.broadcasts.list", "whatsapp.broadcast.show", "whatsapp.broadcast.estimate", "whatsapp.broadcast.results", "whatsapp.broadcast.draft", "whatsapp.broadcast.test.prepare", "whatsapp.broadcast.prepare", "whatsapp.handoff.set", "chat.whatsapp.open", "whatsapp.draft.show", "whatsapp.draft.discard", "works.query", "works.get", "works.create", "works.patch", "works.trash", "works.restore", "works.request_review", "calendar.query", "routines.list", "connections.assets", "connections.connect", "connections.ads.campaigns", "catalog.call", "catalog.status"] as const;
 export const RECORD_SLOT_VERBS = ["records.csv.import", "records.csv.confirm", "content.approve", "smtp.manage", "smtp.bind", "smtp.rebind", "smtp.revoke", "smtp.test-send", "sends.approve", "sends.resolve", "origin.manage", "chat.campaign.open", "chat.campaign.brief", "whatsapp.reply.send", "whatsapp.template.send", "whatsapp.broadcast.test.send", "whatsapp.broadcast.send", "whatsapp.broadcast.stop", "whatsapp.handoff.release", "chat.whatsapp.brief", "works.review", "works.export", "catalog.confirm"] as const;
 export const RECORD_OPERATIONS: readonly string[] = [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
 export type RecordCallVerb = (typeof RECORD_CALL_VERBS)[number];
@@ -287,6 +288,33 @@ export function validLinkedMediaId(value: unknown): value is string {
     if (code < 32 || code === 127) return false;
   }
   return true;
+}
+
+/** CAD-2743 — opt-in host<->child UX sync (unread clear/mark, deep-link, draft previews, optimistic send echo). */
+export const SCREEN_WHATSAPP_UX_V1 = "screen-whatsapp-ux.v1";
+export type WhatsAppOutboundEchoPhase = "pending" | "sent" | "failed" | "cancelled";
+export type WhatsAppUxMediaKind = "image" | "video" | "audio" | "document";
+export interface WhatsAppOpenThreadMessage {
+  v: 2;
+  op: "whatsapp-open-thread";
+  conversation_id: string;
+}
+export interface WhatsAppDraftsMessage {
+  v: 2;
+  op: "whatsapp-drafts";
+  drafts: Record<string, string>;
+}
+export interface WhatsAppOutboundEchoMessage {
+  v: 2;
+  op: "whatsapp-outbound-echo";
+  phase: WhatsAppOutboundEchoPhase;
+  temp_id: string;
+  conversation_id: string;
+  provider: WhatsAppComposeProvider;
+  text: string;
+  media_kind: WhatsAppUxMediaKind | null;
+  file_name: string | null;
+  created_at: string;
 }
 /** Generic host-mediated microphone recording and audio file upload (`screen-audio.v1`). */
 export const SCREEN_AUDIO_V1 = "screen-audio.v1";
@@ -556,7 +584,7 @@ export const SCREEN_ROUTE_PARAMS_V1 = "screen-route-params.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2 | typeof SCREEN_WHATSAPP_MEDIA_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof SCREEN_LOCALE_V1 | typeof SCREEN_AUDIO_V1 | typeof SCREEN_AUDIO_V2 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1 | typeof SCREEN_CANVAS_V1 | typeof SCREEN_ROUTE_PARAMS_V1 | typeof SCREEN_WHATSAPP_COMPOSE_V1 | typeof SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V1 | typeof SCREEN_WHATSAPP_REPLY_LAYOUT_V2 | typeof SCREEN_WHATSAPP_MEDIA_V1 | typeof SCREEN_WHATSAPP_UX_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -890,7 +918,7 @@ export interface ScreenPush {
   presentation_locale?: "en" | "zh-TW";
 }
 
-export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface | AudioSessionEvent | WhatsAppMediaReply;
+export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface | AudioSessionEvent | WhatsAppMediaReply | WhatsAppOpenThreadMessage | WhatsAppDraftsMessage | WhatsAppOutboundEchoMessage;
 
 /** Parse a window message into a `ScreenInit`, or `null`. The port is a
  *  `MessagePort` in `event.ports[0]` — the caller checks `event.origin`
@@ -968,7 +996,7 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
     new Set(d.accepts).size === d.accepts.length &&
     !(d.accepts.includes(SCREEN_AUDIO_V1) && d.accepts.includes(SCREEN_AUDIO_V2)) &&
     !(d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V1) && d.accepts.includes(SCREEN_WHATSAPP_REPLY_LAYOUT_V2)) &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2 || a === SCREEN_WHATSAPP_MEDIA_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === SCREEN_LOCALE_V1 || a === SCREEN_AUDIO_V1 || a === SCREEN_AUDIO_V2 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1 || a === SCREEN_CANVAS_V1 || a === SCREEN_ROUTE_PARAMS_V1 || a === SCREEN_WHATSAPP_COMPOSE_V1 || a === SCREEN_WHATSAPP_REPLY_AVAILABILITY_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V1 || a === SCREEN_WHATSAPP_REPLY_LAYOUT_V2 || a === SCREEN_WHATSAPP_MEDIA_V1 || a === SCREEN_WHATSAPP_UX_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -1088,6 +1116,22 @@ export function parseChild(data: unknown, records?: readonly string[], drawer: b
       conversation_id: d.conversation_id,
       message_id: d.message_id,
       ...(d.disposition !== undefined ? { disposition: d.disposition as WhatsAppMediaDisposition } : {}),
+    };
+  }
+  if (
+    d.v === 2 &&
+    d.op === "whatsapp-thread-unread" &&
+    Object.keys(d).sort().join() === "conversation_id,op,provider,unread,v" &&
+    validLinkedMediaId(d.conversation_id) &&
+    (d.provider === "linked" || d.provider === "official") &&
+    typeof d.unread === "boolean"
+  ) {
+    return {
+      v: 2,
+      op: "whatsapp-thread-unread",
+      conversation_id: d.conversation_id,
+      provider: d.provider,
+      unread: d.unread,
     };
   }
   if (Object.keys(d).sort().join() === "op,ref,v" && d.v === 2 && d.op === "asset" &&
