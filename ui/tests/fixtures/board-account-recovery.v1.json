@@ -10,6 +10,12 @@
     "pending": {
       "kind": "subscription",
       "attemptId": "bco_11111111111111111111111111111111",
+      "state": "pending",
+      "resumeUrl": "https://checkout.stripe.com/c/pay/cs_test_fixture"
+    },
+    "settling": {
+      "kind": "subscription",
+      "attemptId": "bco_11111111111111111111111111111111",
       "state": "pending"
     },
     "cancel": { "checkoutId": "bco_11111111111111111111111111111111" },

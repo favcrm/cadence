@@ -29,7 +29,6 @@ import {
   readBillingReturnParams,
   resolveUsageSummary,
   safeManageUrl,
-  safeStripeCheckoutUrl,
   type BillingAttempt,
   type BillingAttemptKind,
   type BillingAttemptState,
@@ -356,7 +355,7 @@ function saveBillingAttempt(saved: SavedBillingAttempt): boolean {
   } catch { return false; }
 }
 
-function readBillingAttempt(kind: BillingAttemptKind, workspace: string, principal: string): BillingAttempt | "unknown" | "unidentified" | null {
+function readBillingAttempt(kind: BillingAttemptKind, workspace: string, principal: string): BillingAttempt | "unknown" | null {
   try {
     const raw = sessionStorage.getItem(attemptKey(workspace, principal, kind));
     if (raw === null) return null;
@@ -364,7 +363,7 @@ function readBillingAttempt(kind: BillingAttemptKind, workspace: string, princip
     if (!saved || typeof saved !== "object" || !("workspace" in saved) || !("principal" in saved)
       || !("kind" in saved) || !("attemptId" in saved)
       || saved.workspace !== workspace || saved.principal !== principal || saved.kind !== kind) return "unknown";
-    if (saved.attemptId === null) return "unidentified";
+    if (saved.attemptId === null) return "unknown";
     if (!isBillingAttempt(kind, saved.attemptId)) return "unknown";
     return { kind, attemptId: saved.attemptId };
   } catch { return "unknown"; }
@@ -404,12 +403,14 @@ function HostedBilling({
   const [extraUsageCursor, setExtraUsageCursor] = useState<string | null | undefined>(undefined);
   const [loadingMoreUsage, setLoadingMoreUsage] = useState(false);
   const [attemptStates, setAttemptStates] = useState<Record<BillingAttemptKind, BillingAttemptState | null>>({ subscription: null, topup: null });
-  const [checkoutStatus, setCheckoutStatus] = useState<{ attemptId: string; state: BillingAttemptState } | null>(null);
+  const [checkoutStatus, setCheckoutStatus] = useState<(ReturnType<typeof parseBillingAttempt> & { attemptId: string }) | null>(null);
+  const [closeState, setCloseState] = useState<BillingAttemptState | null>(null);
   const [checkingPayment, setCheckingPayment] = useState(false);
   const [purchaseUnsupported, setPurchaseUnsupported] = useState(false);
   const [confirmClose, setConfirmClose] = useState<string | null>(null);
   const actionGuard = useRef(false);
   const refreshVersion = useRef(0);
+  const lastCloseId = useRef<string | null>(null);
   const returnHint = useRef(readBillingReturnParams(window.location.search));
   const invalidReturn = useRef(!returnHint.current && (() => {
     const params = new URLSearchParams(window.location.search);
@@ -424,6 +425,8 @@ function HostedBilling({
   useEffect(() => onPrivateSessionReset(() => {
     refreshVersion.current++;
     setCheckoutStatus(null);
+    lastCloseId.current = null;
+    setCloseState(null);
     setCheckingPayment(false);
     setData(null);
     setAttemptStates({ subscription: "unknown", topup: "unknown" });
@@ -475,7 +478,8 @@ function HostedBilling({
         onBillingSnapshot?.(parsed);
 
         const states: Record<BillingAttemptKind, BillingAttemptState | null> = { subscription: null, topup: null };
-        let checkedCheckout: { attemptId: string; state: BillingAttemptState } | null = null;
+        let checkedCheckout: typeof checkoutStatus = null;
+        let checkedClose: BillingAttemptState | null = null;
         if (parsed.role === "owner" && parsed.canManage && sessionScope) {
           const check = async (attempt: BillingAttempt) => {
             try {
@@ -486,38 +490,43 @@ function HostedBilling({
               return parseBillingAttempt(payload, attempt);
             } catch {
               op.assertCurrent();
-              return "unknown";
+              return { state: "unknown" as const, resumeUrl: null };
             }
           };
           const checkout = parsed.offer?.checkout;
           const checkoutId = checkout && ["open", "pending", "completed", "unknown"].includes(checkout.state)
             && isBillingAttempt("subscription", checkout.id) ? checkout.id : null;
           for (const kind of ["subscription", "topup"] as const) {
-            let attempt = readBillingAttempt(kind, parsed.workspace.id, sessionScope);
-            const recover = kind === "subscription" && attempt === "unidentified"
-              && !returnHint.current && !invalidReturn.current && checkoutId !== null;
-            if (recover && checkoutId !== null) attempt = { kind, attemptId: checkoutId };
+            const attempt = readBillingAttempt(kind, parsed.workspace.id, sessionScope);
             if (attempt && typeof attempt === "object") {
-              const state = await check(attempt);
+              const result = await check(attempt);
               if (!current()) return;
               if (kind === "subscription" && attempt.attemptId === checkoutId) {
-                checkedCheckout = { attemptId: checkoutId, state };
+                checkedCheckout = { attemptId: checkoutId, ...result };
               }
-              states[kind] = recover && state !== "unknown"
-                && !savedAttempt(kind, parsed.workspace.id, attempt.attemptId) ? "unknown" : state;
+              if (kind === "subscription" && attempt.attemptId === lastCloseId.current) checkedClose = result.state;
+              states[kind] = result.state;
             } else if (typeof attempt === "string" || returnHint.current?.kind === kind || invalidReturn.current) {
               states[kind] = "unknown";
             }
           }
           if (checkoutId && !checkedCheckout) {
-            const state = await check({ kind: "subscription", attemptId: checkoutId });
-            checkedCheckout = { attemptId: checkoutId, state };
+            checkedCheckout = { attemptId: checkoutId, ...await check({ kind: "subscription", attemptId: checkoutId }) };
+          }
+          const closeId = lastCloseId.current;
+          if (closeId && !checkedClose) {
+            checkedClose = checkedCheckout?.attemptId === closeId ? checkedCheckout.state
+              : (await check({ kind: "subscription", attemptId: closeId })).state;
           }
         }
         if (!current()) return;
         op.assertCurrent();
         setAttemptStates(states);
         setCheckoutStatus(checkedCheckout);
+        if (checkedClose) {
+          if (checkedClose === "closed" || checkedClose === "confirmed") lastCloseId.current = null;
+          setCloseState(checkedClose);
+        }
       }, opts.signal);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
@@ -529,7 +538,7 @@ function HostedBilling({
         setCheckingPayment(false);
       }
     }
-  }, [onBillingSnapshot, savedAttempt, sessionScope]);
+  }, [onBillingSnapshot, sessionScope]);
 
   useEffect(() => {
     const abort = new AbortController();
@@ -579,6 +588,7 @@ function HostedBilling({
   const matchingCheckout = checkoutStatus?.attemptId === checkout?.id ? checkoutStatus : null;
   const outstandingCheckout = checkout && ["open", "pending", "completed", "unknown"].includes(checkout.state);
   const unresolvedPayment = Object.values(attemptStates).some((state) => state === "pending" || state === "unknown")
+    || closeState === "pending" || closeState === "unknown"
     || (outstandingCheckout && matchingCheckout?.state !== "closed" && matchingCheckout?.state !== "confirmed");
 
   const runAction = useCallback(async (actionId: string, path: string, body: unknown) => {
@@ -664,16 +674,18 @@ function HostedBilling({
     }
   }, [data, sessionScope, dataScope, error, unsupported, loading, checkingPayment, purchaseUnsupported, unresolvedPayment, checkout?.available, attemptStates, savedAttempt, navigateExternal, t]);
 
-  const openCheckoutUrl = safeStripeCheckoutUrl(data?.offer?.checkout.url ?? null);
-  const resumeUrl = openCheckoutUrl?.startsWith("https://checkout.stripe.com/") ? openCheckoutUrl : null;
+  // Do not overwrite an unresolved return (or an unidentified Start) with a different checkout ID.
+  const storedSubscription = data && sessionScope ? readBillingAttempt("subscription", data.workspace.id, sessionScope) : null;
+  const canTrackResume = attemptStates.subscription === null || attemptStates.subscription === "closed"
+    || attemptStates.subscription === "confirmed"
+    || (storedSubscription && typeof storedSubscription === "object" && storedSubscription.attemptId === checkout?.id);
 
   const resumeCheckout = useCallback(async () => {
     const checkout = data?.offer?.checkout;
     const id = checkout?.id;
     if (actionGuard.current || !data?.canManage || data.role !== "owner" || !sessionScope
       || dataScope !== sessionScope || error || loading || checkingPayment || unsupported || checkout?.state !== "open"
-      || matchingCheckout?.state !== "pending" || !isBillingAttempt("subscription", id)
-      || !resumeUrl) return;
+      || !matchingCheckout?.resumeUrl || !isBillingAttempt("subscription", id) || !canTrackResume) return;
     actionGuard.current = true;
     refreshVersion.current++;
     setBusyAction("resume");
@@ -681,22 +693,25 @@ function HostedBilling({
       await withPrivateOperation(async (op) => {
         const query = new URLSearchParams({ kind: "subscription", attemptId: id });
         const response = await privateFetch(`/api/account/billing/attempt?${query}`, { headers: sessionHeaders() }, op);
-        const state = parseBillingAttempt(response.ok ? await response.json() : null, { kind: "subscription", attemptId: id });
+        const result = parseBillingAttempt(response.ok ? await response.json() : null, { kind: "subscription", attemptId: id });
         op.assertCurrent();
         if (scopeRef.current !== sessionScope) return;
-        setCheckoutStatus({ attemptId: id, state });
-        if (state !== "pending") return;
+        setCheckoutStatus({ attemptId: id, ...result });
+        if (typeof storedSubscription === "object" && storedSubscription?.attemptId === id) {
+          setAttemptStates((prev) => ({ ...prev, subscription: result.state }));
+        }
+        if (!result.resumeUrl) return;
         const persisted = savedAttempt("subscription", data.workspace.id, id);
         setAttemptStates((prev) => ({ ...prev, subscription: persisted ? "pending" : "unknown" }));
-        if (persisted) navigateExternal(resumeUrl);
+        if (persisted) navigateExternal(result.resumeUrl);
       });
     } catch {
-      setCheckoutStatus({ attemptId: id, state: "unknown" });
+      setCheckoutStatus({ attemptId: id, state: "unknown", resumeUrl: null });
     } finally {
       actionGuard.current = false;
       setBusyAction(null);
     }
-  }, [data, sessionScope, dataScope, error, loading, checkingPayment, unsupported, matchingCheckout, savedAttempt, navigateExternal, resumeUrl]);
+  }, [data, sessionScope, dataScope, error, loading, checkingPayment, unsupported, matchingCheckout, savedAttempt, navigateExternal, canTrackResume, storedSubscription]);
 
   const closeCheckout = useCallback(async () => {
     const id = data?.offer?.checkout.id;
@@ -704,16 +719,19 @@ function HostedBilling({
       || !isBillingAttempt("subscription", id) || id !== confirmClose || error || loading || checkingPayment || unsupported
       || checkout?.state !== "open") return;
     const stored = readBillingAttempt("subscription", data.workspace.id, sessionScope);
-    const trackHere = (stored === null && !returnHint.current && !invalidReturn.current)
+    const trackHere = (!returnHint.current && !invalidReturn.current
+      && (stored === null || attemptStates.subscription === "closed" || attemptStates.subscription === "confirmed"))
       || (typeof stored === "object" && stored?.attemptId === id);
     if (trackHere && !savedAttempt("subscription", data.workspace.id, id)) {
-      setCheckoutStatus({ attemptId: id, state: "unknown" });
+      setCloseState("unknown");
       return;
     }
     actionGuard.current = true;
     refreshVersion.current++;
     setBusyAction("cancel");
-    setCheckoutStatus({ attemptId: id, state: "unknown" });
+    lastCloseId.current = id;
+    setCloseState("unknown");
+    setCheckoutStatus({ attemptId: id, state: "unknown", resumeUrl: null });
     if (trackHere) setAttemptStates((prev) => ({ ...prev, subscription: "unknown" }));
     try {
       await withPrivateOperation(async (op) => {
@@ -731,19 +749,21 @@ function HostedBilling({
         const payload: unknown = check.ok ? await check.json() : null;
         op.assertCurrent();
         if (scopeRef.current !== sessionScope) return;
-        const state = parseBillingAttempt(payload, { kind: "subscription", attemptId: id });
-        setCheckoutStatus({ attemptId: id, state });
-        if (trackHere) setAttemptStates((prev) => ({ ...prev, subscription: state }));
+        const exact = parseBillingAttempt(payload, { kind: "subscription", attemptId: id });
+        setCheckoutStatus({ attemptId: id, ...exact });
+        if (exact.state === "closed" || exact.state === "confirmed") lastCloseId.current = null;
+        setCloseState(exact.state);
+        if (trackHere) setAttemptStates((prev) => ({ ...prev, subscription: exact.state }));
       });
     } catch {
-      setCheckoutStatus({ attemptId: id, state: "unknown" });
+      setCheckoutStatus({ attemptId: id, state: "unknown", resumeUrl: null });
     } finally {
       actionGuard.current = false;
       setBusyAction(null);
       setConfirmClose(null);
       void refresh();
     }
-  }, [data, sessionScope, dataScope, confirmClose, error, loading, checkingPayment, unsupported, checkout?.state, savedAttempt, refresh]);
+  }, [data, sessionScope, dataScope, confirmClose, error, loading, checkingPayment, unsupported, checkout?.state, attemptStates.subscription, savedAttempt, refresh]);
 
   const openModal = useCallback((kind: "plans" | "extra") => {
     setActionError(null);
@@ -778,7 +798,7 @@ function HostedBilling({
   const subActive = account?.plan?.status === "active" || account?.plan?.status === "past_due";
   const canCloseCheckout = checkout?.state === "open" && isBillingAttempt("subscription", checkout.id)
     && matchingCheckout?.state !== "closed" && matchingCheckout?.state !== "confirmed";
-  const canResumeCheckout = canCloseCheckout && matchingCheckout?.state === "pending" && resumeUrl !== null;
+  const canResumeCheckout = canCloseCheckout && Boolean(matchingCheckout?.resumeUrl && canTrackResume);
   const purchasesBlocked = loading || error || checkingPayment || unsupported || !sessionScope || dataScope !== sessionScope || busyAction !== null;
   const summary = account ? resolveUsageSummary(account, offer) : null;
   const isExtraPrimary = summary?.mode === "overflow" || summary?.mode === "refill_only";
@@ -839,12 +859,12 @@ function HostedBilling({
         </div>
       </header>
 
-      {data?.role === "owner" && dataScope === sessionScope && (returnBanner || attemptStates.subscription || attemptStates.topup || checkoutStatus) && (
+      {data?.role === "owner" && dataScope === sessionScope && (returnBanner || attemptStates.subscription || attemptStates.topup || checkoutStatus || closeState) && (
         <div className="account-notice" role="status">
           {returnBanner?.status === "cancel" && <strong>{t("You left Checkout")}</strong>}
           {returnBanner?.status === "cancel" && <p>{t("Payment may still have been processed.")}</p>}
           {(["subscription", "topup"] as const).map((kind) => {
-            const state = attemptStates[kind] ?? (kind === "subscription" && returnBanner?.kind !== kind ? checkoutStatus?.state : null);
+            const state = attemptStates[kind] ?? (kind === "subscription" && returnBanner?.kind !== kind && !closeState ? checkoutStatus?.state : null);
             if (!state && returnBanner?.kind !== kind) return null;
             return <p key={kind}>{state === "confirmed"
               ? t("Checkout confirmed. Current access is shown below.")
@@ -852,6 +872,12 @@ function HostedBilling({
                 : state === "pending" || (!state && checkingPayment) ? t("Confirming payment")
                   : t("Checkout status is unknown. Refresh before trying another payment.")}</p>;
           })}
+          {closeState && closeState !== attemptStates.subscription && (
+            <p>{closeState === "closed" ? t("Checkout closed.")
+              : closeState === "confirmed" ? t("Checkout confirmed. Current access is shown below.")
+              : closeState === "pending" ? t("Confirming payment")
+              : t("Checkout status is unknown. Refresh before trying another payment.")}</p>
+          )}
         </div>
       )}
 

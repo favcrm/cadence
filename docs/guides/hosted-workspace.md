@@ -34,9 +34,11 @@ Use **Settings → Billing** for the workspace plan, usage and wallet refills.
 Returning from Stripe does not prove payment. Cadence checks the exact attempt;
 use **Refresh** to check again without starting another purchase. The current
 plan and access stay visible while a payment is being confirmed. An owner can
-resume an open subscription checkout or explicitly close it before choosing
-another plan. An unknown outcome blocks a replacement. Apple and Google
-subscriptions are still managed in their stores.
+resume a subscription checkout only while Stripe still reports it open, or
+explicitly close it before choosing another plan. A different checkout cannot
+resolve a lost or unverified payment. If refresh cannot verify it, leave the
+payment blocked and ask support to reconcile it. Apple and Google subscriptions
+are still managed in their stores.
 
 In **Settings → Security**, personal two-factor enrollment is separate from
 the workspace policy. Only an owner can change the workspace requirement,

@@ -1017,18 +1017,29 @@ export function isBillingAttempt(kind: unknown, attemptId: unknown): attemptId i
   );
 }
 
-export function parseBillingAttempt(value: unknown, expected: BillingAttempt): BillingAttemptState {
-  if (!isRecord(value) || value.kind !== expected.kind || value.attemptId !== expected.attemptId) return "unknown";
-  return value.state === "pending" || value.state === "confirmed" || value.state === "closed"
+export type BillingAttemptResult = { state: BillingAttemptState; resumeUrl: string | null };
+
+export function parseBillingAttempt(value: unknown, expected: BillingAttempt): BillingAttemptResult {
+  if (!isRecord(value) || value.kind !== expected.kind || value.attemptId !== expected.attemptId) {
+    return { state: "unknown", resumeUrl: null };
+  }
+  const state = value.state === "pending" || value.state === "confirmed" || value.state === "closed"
     ? value.state : "unknown";
+  const resumeUrl = expected.kind === "subscription" && state === "pending" ? liveCheckoutUrl(value.resumeUrl) : null;
+  return { state, resumeUrl };
+}
+
+function liveCheckoutUrl(value: unknown): string | null {
+  const safe = typeof value === "string" ? safeStripeCheckoutUrl(value) : null;
+  if (!safe) return null;
+  const url = new URL(safe);
+  return url.origin === "https://checkout.stripe.com" && url.pathname.startsWith("/c/pay/") ? safe : null;
 }
 
 export function parseTrackedCheckout(value: unknown, kind: BillingAttemptKind): { attempt: BillingAttempt; state: "ready" | "blocked"; url: string | null } | null {
   if (!isRecord(value) || value.kind !== kind || !isBillingAttempt(kind, value.attemptId)
     || (value.state !== "ready" && value.state !== "blocked")) return null;
-  const safe = value.state === "ready" && typeof value.url === "string" ? safeStripeCheckoutUrl(value.url) : null;
-  const url = safe && new URL(safe).origin === "https://checkout.stripe.com"
-    && new URL(safe).pathname.startsWith("/c/pay/") ? safe : null;
+  const url = value.state === "ready" ? liveCheckoutUrl(value.url) : null;
   return { attempt: { kind, attemptId: value.attemptId }, state: value.state, url };
 }
 

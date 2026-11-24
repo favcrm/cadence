@@ -15,7 +15,8 @@ declare function require<T>(name: string): T;
 const recovery = require<{
   subscription: {
     ready: { kind: "subscription"; state: "ready"; attemptId: string; url: string };
-    pending: { kind: "subscription"; state: "pending"; attemptId: string };
+    pending: { kind: "subscription"; state: "pending"; attemptId: string; resumeUrl: string };
+    settling: { kind: "subscription"; state: "pending"; attemptId: string };
   };
   topup: { blocked: { kind: "topup"; state: "blocked"; attemptId: string } };
 }>(`${process.cwd()}/tests/fixtures/board-account-recovery.v1.json`);
@@ -196,6 +197,7 @@ async function run(): Promise<void> {
   let nextPostPayload: unknown = recovery.subscription.ready;
   let nextPostStatus = 200;
   let attemptState = "pending";
+  let checkoutStillOpen = true;
   let requestedSubscriptionAttempt: string | null = null;
 
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -243,7 +245,7 @@ async function run(): Promise<void> {
       if (query.get("kind") !== "subscription" || query.get("attemptId") !== recovery.subscription.ready.attemptId) {
         return new Response(null, { status: 404 });
       }
-      return Response.json({ ...recovery.subscription.pending, state: attemptState });
+      return Response.json({ ...(checkoutStillOpen ? recovery.subscription.pending : recovery.subscription.settling), state: attemptState });
     }
     return new Response(JSON.stringify(nextPostPayload), {
       status: nextPostStatus,
@@ -838,12 +840,31 @@ async function run(): Promise<void> {
     },
   };
   unmount = await mountView(() => waitForDom(
-    React.act,
-    host,
-    () => Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Resume checkout" && !button.disabled),
-    "authoritative open checkout recovered after lost response",
+    React.act, host, () => requestedSubscriptionAttempt === recovery.subscription.ready.attemptId,
+    "current offer checked independently of the lost response",
   ));
-  equal(requestedSubscriptionAttempt, recovery.subscription.ready.attemptId, "refresh verifies the newly observed exact checkout");
+  const resumeButton = () => Array.from(host.querySelectorAll("button"))
+    .find((button) => button.textContent === "Resume checkout");
+  assert(!resumeButton(), "resuming a different checkout cannot overwrite a lost response");
+  attemptState = "closed";
+  const recheck = Array.from(host.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Refresh");
+  assert(recheck, "lost response offers safe refresh");
+  await React.act(async () => recheck.click());
+  await React.act(async () => (host.querySelector("#billing-open-plans") as HTMLButtonElement).click());
+  assert((host.querySelector('[data-plan-id="synth_basic_mo"] button') as HTMLButtonElement).disabled,
+    "closing another checkout cannot unlock a new purchase");
+  await unmount();
+
+  win.sessionStorage.clear();
+  attemptState = "pending";
+  unmount = await mountView(() => waitForDom(
+    React.act, host, () => Boolean(resumeButton() && !resumeButton()?.disabled), "open subscription can resume",
+  ));
+  const beforeResume = redirects.length;
+  checkoutStillOpen = false;
+  await React.act(async () => resumeButton()?.click());
+  assert(!resumeButton(), "completed checkout still awaiting payment cannot resume");
+  equal(redirects.length, beforeResume, "an earlier checkout URL is not used after session completion");
   await unmount();
   host.remove();
   console.log("hostedBilling checks passed");
