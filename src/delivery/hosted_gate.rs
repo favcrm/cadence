@@ -801,16 +801,31 @@ fn verdict_answer(
         if !body["duplicate"].is_boolean() {
             return Err(refuse(format!("`{verb}` receipt has no duplicate flag")));
         }
-        if body["identity_source"].as_str() != Some("owner-attested") {
-            return Err(refuse(format!(
-                "`{verb}` receipt does not name an owner-attested identity"
-            )));
-        }
-        let login = text(body, "github_login", verb)?;
-        if !valid_login(login) {
-            return Err(refuse(format!(
-                "`{verb}` receipt names github_login {login:?}, which is not a GitHub login"
-            )));
+        // AOS-727: an agent reviewer profile files with no GitHub login; an
+        // owner-attested identity must name a valid one. Any other source is
+        // not evidence this reader knows how to check.
+        match body["identity_source"].as_str() {
+            Some("owner-attested") => {
+                let login = text(body, "github_login", verb)?;
+                if !valid_login(login) {
+                    return Err(refuse(format!(
+                        "`{verb}` receipt names github_login {login:?}, which is not a GitHub login"
+                    )));
+                }
+            }
+            Some("agent-profile") => {
+                if body.get("github_login").is_some_and(|v| !v.is_null()) {
+                    return Err(refuse(format!(
+                        "`{verb}` agent-profile receipt names a github_login: {}",
+                        short(body)
+                    )));
+                }
+            }
+            _ => {
+                return Err(refuse(format!(
+                    "`{verb}` receipt does not name an owner-attested or agent-profile identity"
+                )))
+            }
         }
         let reviewer = text(body, "reviewer_id", verb)?;
         let note = body
@@ -855,35 +870,59 @@ pub fn verdicts(
     binding: &GateBinding,
     include_body: bool,
 ) -> Result<(Value, i32)> {
+    verdicts_with(
+        &mut |asked| call(target, wake_timeout, "audit_verdicts_project", asked),
+        binding,
+        include_body,
+    )
+}
+
+/// One `audit_verdicts_project` read: the arguments in, the board's body out.
+type VerdictRead<'a> = &'a mut dyn FnMut(Map<String, Value>) -> Result<Value>;
+
+/// [`verdicts`] over an injectable read, so a test can stand in for the board.
+/// At most four reads: agent+body, body, agent, plain.
+fn verdicts_with(
+    read: VerdictRead<'_>,
+    binding: &GateBinding,
+    include_body: bool,
+) -> Result<(Value, i32)> {
     if !include_body {
-        let body = call(
-            target,
-            wake_timeout,
-            "audit_verdicts_project",
-            binding.arguments(),
-        )?;
+        let body = call_verdicts(read, binding.arguments())?;
         return verdicts_answer(&body, binding);
     }
     let mut asked = binding.arguments();
     asked.insert("include_body".to_string(), json!(true));
-    match call(target, wake_timeout, "audit_verdicts_project", asked) {
+    match call_verdicts(read, asked) {
         Ok(body) => verdicts_answer_with_bodies(&body, binding),
         Err(Error::Structured(s)) if s.code == crate::remote_cli::VERDICT_BODY_UNSUPPORTED => {
             crate::output::eprint_line(
                 "audit verdicts: this board predates review text, so the findings are not \
                  shown; the rows below are unchanged",
             );
-            let body = call(
-                target,
-                wake_timeout,
-                "audit_verdicts_project",
-                binding.arguments(),
-            )?;
+            let body = call_verdicts(read, binding.arguments())?;
             let (mut doc, code) = verdicts_answer(&body, binding)?;
             doc["bodies"] = json!("unavailable: the board predates review text");
             Ok((doc, code))
         }
         Err(other) => Err(other),
+    }
+}
+
+/// The verdict read, asking for agent reviewers' verdicts too (AOS-727). A
+/// board that predates `include_agent_reviews` refuses the field as an invalid
+/// request; the read is then repeated without it, so such a board answers
+/// exactly what it did before and no agent row can appear.
+fn call_verdicts(read: VerdictRead<'_>, mut asked: Map<String, Value>) -> Result<Value> {
+    let plain = asked.clone();
+    asked.insert("include_agent_reviews".to_string(), json!(true));
+    match read(asked) {
+        Err(Error::Structured(s))
+            if s.code == crate::remote_cli::VERDICT_AGENT_REVIEWS_UNSUPPORTED =>
+        {
+            read(plain)
+        }
+        other => other,
     }
 }
 
@@ -1028,7 +1067,11 @@ fn verdict_entry(row: &Value, repo: &str, verb: &str) -> Result<Value> {
     // field is an owner-attested one, as before.
     let identity_source = match row.get("identity_source") {
         None | Some(Value::Null) => "owner-attested",
-        Some(Value::String(s)) if s == "owner-attested" || s == "workflow-oidc" => s.as_str(),
+        Some(Value::String(s))
+            if s == "owner-attested" || s == "workflow-oidc" || s == "agent-profile" =>
+        {
+            s.as_str()
+        }
         Some(other) => {
             return Err(refuse(format!(
                 "`{verb}` row names identity_source {}",
@@ -1037,12 +1080,13 @@ fn verdict_entry(row: &Value, repo: &str, verb: &str) -> Result<Value> {
         }
     };
     let workflow = identity_source == "workflow-oidc";
-    let login = if workflow {
-        // A workflow principal is not a person: it has no login, and a row
-        // that names one is contradicting itself.
+    let login = if workflow || identity_source == "agent-profile" {
+        // A workflow principal or an agent reviewer profile (AOS-727, where
+        // `reviewer` is the `agent_ap_<id>` subject) is not a person: it has
+        // no login, and a row that names one is contradicting itself.
         if row.get("github_login").is_some_and(|v| !v.is_null()) {
             return Err(refuse(format!(
-                "`{verb}` workflow row names a github_login: {}",
+                "`{verb}` {identity_source} row names a github_login: {}",
                 short_row(row)
             )));
         }
@@ -3355,6 +3399,179 @@ mod tests {
         let mut doc = hosted_doc();
         doc["verdicts"] = json!([row]);
         doc
+    }
+
+    // CAD-2740: a mock board that predates the fields refuses each with the
+    // typed code the transport raises for a 400 `invalid_request`.
+    fn mock_board(
+        knows_agent: bool,
+        knows_body: bool,
+        reads: &mut Vec<Map<String, Value>>,
+    ) -> impl FnMut(Map<String, Value>) -> Result<Value> + '_ {
+        move |asked| {
+            reads.push(asked.clone());
+            if asked.contains_key("include_agent_reviews") && !knows_agent {
+                return Err(Error::invalid(
+                    crate::remote_cli::VERDICT_AGENT_REVIEWS_UNSUPPORTED,
+                    "unsupported",
+                ));
+            }
+            if asked.contains_key("include_body") && !knows_body {
+                return Err(Error::invalid(
+                    crate::remote_cli::VERDICT_BODY_UNSUPPORTED,
+                    "unsupported",
+                ));
+            }
+            let mut doc = hosted_doc();
+            if asked.contains_key("include_agent_reviews") {
+                let human = doc["verdicts"][0].clone();
+                doc["verdicts"] = json!([human, agent_entry("spec-security")]);
+            }
+            if asked.contains_key("include_body") {
+                for row in doc["verdicts"].as_array_mut().unwrap() {
+                    row["body"] = json!("text");
+                }
+            }
+            Ok(doc)
+        }
+    }
+
+    #[test]
+    fn a_board_without_agent_reviews_is_read_again_without_the_field() {
+        // Older board: refuses the field, then answers the plain read.
+        let mut reads = Vec::new();
+        let (doc, code) =
+            verdicts_with(&mut mock_board(false, false, &mut reads), &binding(), false).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(doc["verdicts"].as_array().unwrap().len(), 1);
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0]["include_agent_reviews"], json!(true));
+        assert!(!reads[1].contains_key("include_agent_reviews"));
+        // Current board: one read, agent row shown.
+        let mut reads = Vec::new();
+        let (doc, _) =
+            verdicts_with(&mut mock_board(true, true, &mut reads), &binding(), false).unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(doc["verdicts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_body_read_chain_is_bounded_and_ends_in_the_plain_read() {
+        // Neither field known: agent+body, body, plain-with-agent, plain.
+        let mut reads = Vec::new();
+        let (doc, code) =
+            verdicts_with(&mut mock_board(false, false, &mut reads), &binding(), true).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(reads.len(), 4, "{reads:?}");
+        assert!(
+            reads[0].contains_key("include_agent_reviews") && reads[0].contains_key("include_body")
+        );
+        assert!(
+            !reads[1].contains_key("include_agent_reviews")
+                && reads[1].contains_key("include_body")
+        );
+        assert!(
+            reads[2].contains_key("include_agent_reviews")
+                && !reads[2].contains_key("include_body")
+        );
+        assert!(
+            !reads[3].contains_key("include_agent_reviews")
+                && !reads[3].contains_key("include_body")
+        );
+        assert_eq!(doc["verdicts"].as_array().unwrap().len(), 1);
+        assert!(doc["bodies"].as_str().unwrap().starts_with("unavailable"));
+        // Knows agent reviews, not bodies: 2 reads, the agent row survives.
+        let mut reads = Vec::new();
+        let (doc, _) =
+            verdicts_with(&mut mock_board(true, false, &mut reads), &binding(), true).unwrap();
+        assert_eq!(reads.len(), 2, "{reads:?}");
+        assert_eq!(doc["verdicts"].as_array().unwrap().len(), 2);
+        // Knows bodies, not agent reviews (a board from before AOS-727):
+        // 2 reads, the second keeps include_body, and the text survives.
+        let mut reads = Vec::new();
+        let (doc, _) =
+            verdicts_with(&mut mock_board(false, true, &mut reads), &binding(), true).unwrap();
+        assert_eq!(reads.len(), 2, "{reads:?}");
+        assert!(
+            !reads[1].contains_key("include_agent_reviews")
+                && reads[1].contains_key("include_body")
+        );
+        assert_eq!(doc["verdicts"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["bodies"], "included");
+        // Knows both: one read with text.
+        let mut reads = Vec::new();
+        let (doc, _) =
+            verdicts_with(&mut mock_board(true, true, &mut reads), &binding(), true).unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(doc["bodies"], "included");
+    }
+
+    // CAD-2740 / AOS-727: an agent reviewer profile's row has no login and the
+    // `agent_ap_<id>` subject as reviewer; it must not fail the whole read.
+    fn agent_entry(kind: &str) -> Value {
+        let mut row = entry(
+            "favcrm/cadence",
+            kind,
+            "agent_ap_0123",
+            "ignored",
+            "20261103130000",
+        );
+        let obj = row.as_object_mut().unwrap();
+        obj.insert("github_login".into(), Value::Null);
+        obj.insert("reviewer".into(), json!("agent_ap_0123"));
+        obj.insert("identity_source".into(), json!("agent-profile"));
+        row
+    }
+
+    #[test]
+    fn an_agent_profile_row_reads_beside_owner_attested_rows() {
+        let mut doc = hosted_doc();
+        let human = doc["verdicts"][0].clone();
+        doc["verdicts"] = json!([human, agent_entry("spec-security")]);
+        let (read, code) = verdicts_answer(&doc, &binding()).unwrap();
+        assert_eq!(code, 0);
+        let rows = read["verdicts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["identity_source"], "owner-attested");
+        assert_eq!(rows[0]["github_login"], "alice");
+        assert_eq!(rows[1]["identity_source"], "agent-profile");
+        assert_eq!(rows[1]["reviewer"], "agent_ap_0123");
+        assert!(rows[1].get("github_login").is_none(), "{}", rows[1]);
+        // An absent github_login reads the same as null.
+        let mut absent = agent_entry("standards");
+        absent.as_object_mut().unwrap().remove("github_login");
+        assert!(verdicts_answer(&doc_with(absent), &binding()).is_ok());
+        // An agent row that names a login contradicts itself.
+        let mut named = agent_entry("standards");
+        named["github_login"] = json!("alice");
+        assert!(verdicts_answer(&doc_with(named), &binding()).is_err());
+        // A source nobody defined is still refused, never read as attested.
+        let mut future = agent_entry("standards");
+        future["identity_source"] = json!("agent-profile-v2");
+        assert!(verdicts_answer(&doc_with(future), &binding()).is_err());
+    }
+
+    #[test]
+    fn an_agent_profile_receipt_needs_no_login_but_an_attested_one_does() {
+        let mut receipt = json!({"state": "recorded", "duplicate": false, "project": "cadence",
+                             "repo": "favcrm/cadence", "issue": "CAD-1", "pr": 7, "head": HEAD,
+                             "reviewer": "agent_ap_0123", "reviewer_id": "agent_ap_0123",
+                             "github_login": null, "identity_source": "agent-profile",
+                             "verdict": {"project": "cadence", "repo": "favcrm/cadence",
+                                         "name": "20261101120000-standards-verdict.md",
+                                         "stamp": "20261101120000",
+                                         "kind": "standards", "outcome": "pass",
+                                         "title_outcome": "pass", "section_outcome": "pass",
+                                         "reviewer": "agent_ap_0123", "risk": "auto",
+                                         "reviewer_id": "agent_ap_0123"}});
+        assert!(verdict_answer(&receipt, &binding(), "standards", "pass", "pass", "pass").is_ok());
+        receipt["github_login"] = json!("alice");
+        assert!(verdict_answer(&receipt, &binding(), "standards", "pass", "pass", "pass").is_err());
+        receipt["github_login"] = Value::Null;
+        receipt["identity_source"] = json!("owner-attested");
+        assert!(verdict_answer(&receipt, &binding(), "standards", "pass", "pass", "pass").is_err());
+        receipt["identity_source"] = json!("agent-profile-v2");
+        assert!(verdict_answer(&receipt, &binding(), "standards", "pass", "pass", "pass").is_err());
     }
 
     #[test]
