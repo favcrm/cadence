@@ -420,6 +420,7 @@ const RECONCILE_PROFILE_UPDATE: &str = "the edit may or may not have been applie
 const RECONCILE_PLATFORM_CALL: &str = "the tool call may or may not have been recorded or charged — inspect `cadence --org <org> platform status` for the same `--request` key before repeating it; replaying `platform call` returns a recorded call's outcome, but will start and charge a new call if the original was unrecorded (`get_media_job` polls the existing job)";
 const RECONCILE_WHATSAPP_STATUS: &str = "check live WhatsApp connection state with `cadence --org <org> connection whatsapp status --provider <linked|official>` before repeating";
 const RECONCILE_APP_ACTION: &str = "the app action may or may not have been applied — inspect the app's records before repeating it; keep the same request and input, and do not use an unrecorded platform status as proof that no app write landed";
+const RECONCILE_PRIVATE_APP_REVIEW: &str = "read `platform call private_app_review_reconcile` with the same review ID and acting identity before repeating the apply";
 const RECONCILE_PLATFORM_STAGE: &str = "the staged action may or may not have been recorded — nothing runs without an owner's approval, and `platform status` does not cover staged actions; repeat the same `platform stage` with the same `--request` key, which replays the same action instead of staging a second one";
 const RECONCILE_CONNECTION_START: &str = "the provider authorization link may or may not have been created — the account appears in `cadence --org <org> connection ls` only after the provider callback completes, so an empty list does not prove no link was issued. Nothing is retried automatically; start again only as a deliberate new enrollment";
 const RECONCILE_DELIVERY_POLICY: &str = "the project's delivery inputs may or may not have been recorded — read the project's delivery policy again before repeating it";
@@ -619,6 +620,8 @@ fn call_effect(surface: Surface, verb: &str, arguments: &Map<String, Value>) -> 
                         | "private_app_review_reconcile",
                     ) => Effect::Read,
                     Some("app_call") => mutation(RECONCILE_APP_ACTION),
+                    Some("private_app_review_reconcile") => Effect::Read,
+                    Some("private_app_review_apply") => mutation(RECONCILE_PRIVATE_APP_REVIEW),
                     _ => cli_effect(verb),
                 },
                 _ => cli_effect(verb),
@@ -7074,7 +7077,12 @@ fn call_verb_until_retry(
         }
         let (status, retry_after, mut body) = answered?;
         if effect.is_mutation() {
-            if let Some(code) = explicit_mutation_uncertainty(body.as_ref()) {
+            let uncertainty = explicit_mutation_uncertainty(body.as_ref()).or_else(|| {
+                (effect.reconciliation() == Some(RECONCILE_PRIVATE_APP_REVIEW)
+                    && refusal_fields(body.as_ref()).0 == Some("operation_uncertain"))
+                .then_some("operation_uncertain")
+            });
+            if let Some(code) = uncertainty {
                 return Err(Error::unknown(format!(
                     "the remote action may already have committed \
                      (outcome_unknown, HTTP {status}, reason {code}); {}. \

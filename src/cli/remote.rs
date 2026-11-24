@@ -3065,6 +3065,17 @@ where
         args.get("tool").and_then(Value::as_str),
         Some("app_call" | "app_describe" | "app_skill" | "board_pending_actions")
     );
+    let private_review_apply = verb == "platform_call"
+        && args.get("operation").and_then(Value::as_str) == Some("call")
+        && args.get("tool").and_then(Value::as_str) == Some("private_app_review_apply");
+    let private_review_id: Option<[u8; 36]> = private_review_apply
+        .then(|| {
+            let id = args.get("body")?.get("id")?.as_str()?;
+            valid_private_review_id(id)
+                .then(|| id.as_bytes().try_into().ok())
+                .flatten()
+        })
+        .flatten();
     if verb == "platform_call" {
         use std::fmt::Write as _;
 
@@ -3243,9 +3254,19 @@ where
                         target.org
                     ));
                 }
-                if let Some(key) = platform_key
-                    .filter(|_| error.kind() == "unknown" && !stage_operation && !app_action)
+                if let Some(id) = private_review_id
+                    .as_ref()
+                    .filter(|_| error.kind() == "unknown")
+                    .and_then(|id| std::str::from_utf8(id).ok())
                 {
+                    eprint_line(&private_review_reconcile_hint(&target.org, id));
+                }
+                if let Some(key) = platform_key.filter(|_| {
+                    error.kind() == "unknown"
+                        && !stage_operation
+                        && !app_action
+                        && !private_review_apply
+                }) {
                     eprint_line(&format!(
                         "remote platform call `{key}` on org `{}` was not confirmed — \
                          reconcile read-only with `cadence --org {} platform status --request {key}` \
@@ -3340,6 +3361,23 @@ where
             Ok(5)
         }
     }
+}
+
+fn valid_private_review_id(id: &str) -> bool {
+    id.strip_prefix("par_").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn private_review_reconcile_hint(org: &str, id: &str) -> String {
+    let org = org.replace('\'', "'\\''");
+    format!(
+        "Private app apply `{id}` was not confirmed. Reconcile without repeating the apply:\n\
+         printf '%s\\n' '{{\"id\":\"{id}\"}}' | cadence --org '{org}' platform call private_app_review_reconcile --input -"
+    )
 }
 
 /// A terminal refusal remains nonzero while the action receipt stays visible.
