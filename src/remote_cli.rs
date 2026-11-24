@@ -4262,8 +4262,14 @@ fn upload_artifact_in(
             ),
             None if managed_pane => (renewed_credential(dir, target, deadline)?, None),
             None => {
-                let (c, src) =
-                    actor_credential::bearer_for(target, dir, deadline, "artifact_put", None)?;
+                let (c, src) = actor_credential::bearer_for(
+                    target,
+                    dir,
+                    deadline,
+                    Surface::Cli,
+                    "artifact_put",
+                    None,
+                )?;
                 (c, Some(src))
             }
         };
@@ -4513,8 +4519,14 @@ fn upload_template_in(
             Some((c, _)) => (c, None),
             None if managed_pane => (renewed_credential(dir, target, deadline)?, None),
             None => {
-                let (c, src) =
-                    actor_credential::bearer_for(target, dir, deadline, "template_upload", None)?;
+                let (c, src) = actor_credential::bearer_for(
+                    target,
+                    dir,
+                    deadline,
+                    Surface::Cli,
+                    "template_upload",
+                    None,
+                )?;
                 (c, Some(src))
             }
         };
@@ -7040,7 +7052,8 @@ fn call_verb_until_retry(
             None if managed_pane => (renewed_credential(dir, target, deadline)?, None),
             None => {
                 let op = arguments.get("operation").and_then(Value::as_str);
-                let (c, src) = actor_credential::bearer_for(target, dir, deadline, verb, op)?;
+                let (c, src) =
+                    actor_credential::bearer_for(target, dir, deadline, surface, verb, op)?;
                 (c, Some(src))
             }
         };
@@ -8208,7 +8221,8 @@ mod actor_credential;
 pub use actor_credential::unbind_cli_actor;
 pub use actor_credential::{
     bind_cli_actor, cli_actor, cli_actor_is_non_human, detect_unmanaged_actor,
-    saved_login_is_assistant_only, valid_profile_id, CliActor, CliActorMode,
+    refuse_non_human_actor, saved_login_is_assistant_only, valid_profile_id, CliActor,
+    CliActorMode,
 };
 mod agent_credential;
 pub use agent_credential::{bind_managed_session, bound_session, AgentSlot};

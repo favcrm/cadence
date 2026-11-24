@@ -2757,19 +2757,7 @@ where
                 ),
             ));
         }
-        let assistant_login = cadence_agent::remote_cli::saved_login_is_assistant_only(&target);
-        if cadence_agent::remote_cli::cli_actor_is_non_human() || assistant_login {
-            let remedy = if assistant_login {
-                "re-login via `cadence login` from an authorized human shell"
-            } else {
-                "re-run explicitly with `--as-human` from an authorized human shell"
-            };
-            return Err(Error::rejected(format!(
-                "remote `{}` requires human/owner authority and is refused in assistant/agent \
-                 CLI mode — {remedy}. Nothing was sent",
-                name(&command)
-            )));
-        }
+        cadence_agent::remote_cli::refuse_non_human_actor(Some(&target), name(&command))?;
     }
     // CAD-1586: resource commands carry their payloads directly through the
     // explicit `settings_agents` verb before the generic

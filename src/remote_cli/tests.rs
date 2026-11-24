@@ -5187,10 +5187,7 @@ fn upload_total_deadline_covers_response_body() {
         if path == "/__platform/wiki/authorize" {
             upload_authorize_answer(socket);
         } else {
-            let _ = write!(
-                socket,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{{"
-            );
+            let _ = write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{{");
             let _ = socket.flush();
             thread::sleep(Duration::from_secs(3));
             let _ = socket.write_all(b"\"ok\":true}");
@@ -9297,21 +9294,9 @@ mod agent_credential_acceptance {
         }
 
         for (mode, exp, nlen) in [
-            (
-                UploadMode::AgentOk,
-                "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent",
-                0,
-            ),
-            (
-                UploadMode::StaleCached401Once,
-                "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent agent-credential:login authorize:agent upload:agent",
-                0,
-            ),
-            (
-                UploadMode::HumanSessionRequired,
-                "agent-credential:login authorize:agent upload:agent authorize:login upload:login",
-                1,
-            ),
+            (UploadMode::AgentOk, "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent", 0),
+            (UploadMode::StaleCached401Once, "agent-credential:login authorize:agent upload:agent authorize:agent upload:agent agent-credential:login authorize:agent upload:agent", 0),
+            (UploadMode::HumanSessionRequired, "agent-credential:login authorize:agent upload:agent authorize:login upload:login", 1),
         ] {
             let (trail, notes, res) = run_case(mode);
             let got: Vec<String> = trail.into_iter().map(|(r, w)| format!("{r}:{w}")).collect();

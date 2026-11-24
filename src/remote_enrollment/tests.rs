@@ -633,10 +633,7 @@ fn browser_continuity_bind_proves_key_and_retains_exact_private_lineage() {
         let signature = request["signature"].as_str().unwrap();
         let proof = format!(
             "{{\"version\":\"hosted-cadence-continuity.v1\",\"action\":\"bind_key\",\"challengeId\":\"ch_{}\",\"nonce\":\"{}\",\"registryEpoch\":\"{}\",\"publicKey\":\"{}\"}}",
-            "A".repeat(43),
-            "C".repeat(43),
-            "D".repeat(43),
-            public
+            "A".repeat(43), "C".repeat(43), "D".repeat(43), public
         );
         ring::signature::UnparsedPublicKey::new(
             &ring::signature::ED25519,
@@ -1384,10 +1381,7 @@ fn browser_continuity_bind_metadata_recovers_only_the_same_pending_key() {
         assert_ne!(second_body["signature"], first_body["signature"]);
         let proof = format!(
             "{{\"version\":\"hosted-cadence-continuity.v1\",\"action\":\"bind_key\",\"challengeId\":\"ch_{}\",\"nonce\":\"{}\",\"registryEpoch\":\"{}\",\"publicKey\":\"{}\"}}",
-            "F".repeat(43),
-            "H".repeat(43),
-            "I".repeat(43),
-            first_public
+            "F".repeat(43), "H".repeat(43), "I".repeat(43), first_public
         );
         ring::signature::UnparsedPublicKey::new(
             &ring::signature::ED25519,
@@ -3865,11 +3859,7 @@ mod cad2009_enrollment_uncertainty_acceptance {
             Fault::Bare503 => ("503 Service Unavailable", b"{}".to_vec()),
         };
         // A client that reaches its response cap may close before this write.
-        let _ = write!(
-            socket,
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            bytes.len()
-        );
+        let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
         let _ = socket.write_all(&bytes);
         let _ = socket.flush();
     }
@@ -4046,11 +4036,8 @@ mod cad2009_enrollment_uncertainty_acceptance {
                             SERVICE,
                             &dir,
                         );
-                        assert_eq!(
-                            fs::read(dir.join(RECORD)).unwrap(),
-                            before,
-                            "{fault:?}: an unproved enrollment must not replace or delete existing custody"
-                        );
+                        assert_eq!(fs::read(dir.join(RECORD)).unwrap(), before,
+                        "{fault:?}: an unproved enrollment must not replace or delete existing custody");
                         result
                     },
                     |index, request, socket| {
@@ -4445,11 +4432,7 @@ mod cad2009_device_token_uncertainty_acceptance {
             ),
         };
         // Early client closure after its response cap is expected.
-        let _ = write!(
-            socket,
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            bytes.len()
-        );
+        let _ = write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
         let _ = socket.write_all(&bytes);
         let _ = socket.flush();
     }
@@ -4710,7 +4693,6 @@ mod cad2009_device_token_uncertainty_acceptance {
             }
         }
     }
-
     #[test]
     fn cad2747_assistant_device_flow_requests_and_persists_actor_mode() {
         struct AssistantRuntime {

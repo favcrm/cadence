@@ -1255,9 +1255,7 @@ pub fn web_issuer_request(
     let auth = format!("Bearer {bearer}");
     let failed_response = |message: &str| {
         if matches!(method, "POST" | "PUT") {
-            Error::unknown(
-                "the hosted web mutation may have committed; reconcile its saved intent before retrying",
-            )
+            Error::unknown("the hosted web mutation may have committed; reconcile its saved intent before retrying")
         } else {
             reject(message)
         }
@@ -2023,15 +2021,9 @@ impl ContinuityRefusal {
             Self::FreshConsent => {
                 "Hosted continuity requires fresh consent in a new private enrollment directory"
             }
-            Self::Parked => {
-                "Hosted continuity is parked while original session status is uncertain"
-            }
-            Self::Authorization => {
-                "Hosted continuity authorization or issuer configuration refused"
-            }
-            Self::Uncertain => {
-                "Hosted continuity request uncertain; retry the same pending key with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`"
-            }
+            Self::Parked => "Hosted continuity is parked while original session status is uncertain",
+            Self::Authorization => "Hosted continuity authorization or issuer configuration refused",
+            Self::Uncertain => "Hosted continuity request uncertain; retry the same pending key with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`",
             Self::Invalid => "Invalid hosted continuity issuer response",
         })
     }
@@ -2451,7 +2443,7 @@ fn enroll_browser_with(
             (400, Some("access_denied")) => return Err(reject("Hosted browser consent denied")),
             (400, Some("expired_token")) => return Err(reject("Hosted device code expired")),
             (400, Some("invalid_grant" | "invalid_request")) => {
-                return Err(reject("Hosted browser grant refused"));
+                return Err(reject("Hosted browser grant refused"))
             }
             (
                 403,

@@ -258,7 +258,7 @@ fn auth_status_body(
                             return Err(Error::rejected(format!(
                                 "several hosted workspaces are registered ({}); name one with `cadence auth status --org <name>`",
                                 remotes.join(", ")
-                            )));
+                            )))
                         }
                     }
                 }
@@ -298,7 +298,7 @@ fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
     {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Registry::default(), None));
+            return Ok((Registry::default(), None))
         }
         // `O_NOFOLLOW` refuses any symlink, dangling or not. Name that
         // plainly: a link is a registry this process will not read, never
@@ -306,7 +306,7 @@ fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
             return Err(Error::rejected(
                 "org registry must not be a symbolic link; refusing destination selection",
-            ));
+            ))
         }
         Err(e) => return Err(e.into()),
     };

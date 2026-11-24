@@ -150,46 +150,128 @@ pub fn saved_login_is_assistant_only(target: &RemoteTarget) -> bool {
         == Some("assistant")
 }
 
-/// Whether `verb` + optional `operation` require human/owner authority and must
-/// refuse on assistant or agent CLI sessions rather than impersonating the
-/// human owner.
-pub(super) fn is_human_only_verb(verb: &str, operation: Option<&str>) -> bool {
-    if matches!(
-        verb,
-        "settings_agents"
-            | "master_status"
-            | "master_resume"
-            | "project_new"
-            | "audit_approve"
-            | "audit_approve_project"
-            | "audit_approve_scope_project"
-            | "audit_approve_delegated_project"
-            | "audit_reviewers_set"
-            | "audit_identities_set"
-            | "audit_designate"
-            | "audit_revoke"
-            | "audit_accept_revise"
-            | "delivery_enqueue"
-            | "issue_project_delivery"
-            | "team_list"
-            | "team_invites"
-            | "team_invite"
-            | "team_revoke_invite"
-            | "team_set_role"
-            | "team_remove"
-            | "agent_profile_create"
-            | "agent_profile_update"
-            | "agent_profile_delete"
-            | "agent_profile_set_role"
-    ) {
+/// Shared client-side refusal when an assistant or agent CLI session attempts
+/// an action that requires human/owner authority.
+pub fn refuse_non_human_actor(target: Option<&RemoteTarget>, command: &str) -> Result<()> {
+    let assistant_login = target.is_some_and(saved_login_is_assistant_only);
+    if cli_actor_is_non_human() || assistant_login {
+        return Err(non_human_authority_refusal(command, assistant_login));
+    }
+    Ok(())
+}
+
+fn non_human_authority_refusal(command: &str, assistant_login: bool) -> Error {
+    let remedy = if assistant_login {
+        "re-login via `cadence login` from an authorized human shell"
+    } else {
+        "re-run explicitly with `--as-human` from an authorized human shell"
+    };
+    reject(format!(
+        "remote `{command}` requires human/owner authority and is refused in assistant/agent \
+         CLI mode — {remedy}. Nothing was sent"
+    ))
+}
+
+/// Allowlist of hosted actions permitted in unmanaged assistant or `--agent`
+/// CLI mode. Any verb not explicitly allowlisted here (including new/unknown
+/// owner verbs, `settings_agents`, `team_*`, `project_new`, `delivery_enqueue`,
+/// `audit_approve*`, `agent_profile_create/update`, and connection/WhatsApp ops)
+/// is refused fail-closed without falling back to human privileges.
+pub(super) fn is_assistant_allowed_call(
+    surface: Surface,
+    verb: &str,
+    operation: Option<&str>,
+) -> bool {
+    if matches!(surface, Surface::Wiki) {
         return true;
     }
     if verb == "platform_call" {
-        if let Some(op) = operation {
-            return op.starts_with("connection_");
-        }
+        return matches!(
+            operation,
+            Some(
+                "tools"
+                    | "status"
+                    | "artifact"
+                    | "call"
+                    | "connected_read"
+                    | "connected_effect"
+                    | "app_call"
+                    | "app_describe"
+                    | "app_skill"
+                    | "board_pending_actions"
+                    | "describe"
+                    | "skill"
+                    | "pending"
+            )
+        );
     }
-    false
+    matches!(
+        verb,
+        "agent_roles"
+            | "agent_profile_list"
+            | "agent_profile_context"
+            | "agent_profile_show"
+            | "workspace_skill_list"
+            | "workspace_skill_show"
+            | "workspace_skill_check"
+            | "workspace_skill_draft"
+            | "workspace_skill_delete"
+            | "issue_ls"
+            | "issue_show"
+            | "issue_history"
+            | "issue_messages"
+            | "issue_artifact"
+            | "issue_new"
+            | "issue_comment"
+            | "issue_attach"
+            | "issue_review"
+            | "issue_message_send"
+            | "issue_messages_read"
+            | "issue_set"
+            | "issue_link"
+            | "issue_unlink"
+            | "artifact_find"
+            | "artifact_show"
+            | "artifact_read"
+            | "artifact_put"
+            | "message_read"
+            | "message_inbox"
+            | "message_send"
+            | "message_ack"
+            | "project_ls"
+            | "project_timeline"
+            | "project_policy_read"
+            | "project_policy"
+            | "document_types"
+            | "document_submit"
+            | "document_create"
+            | "document_show"
+            | "document_export"
+            | "template_list"
+            | "template_show"
+            | "template_blob_read"
+            | "template_create"
+            | "template_revise"
+            | "template_sample"
+            | "template_intake"
+            | "template_upload"
+            | "delivery_policy"
+            | "delivery_check"
+            | "audit_approval"
+            | "audit_verdicts"
+            | "audit_verdict"
+            | "audit_scope"
+            | "audit_reviewers"
+            | "audit_approval_project"
+            | "audit_findings_project"
+            | "audit_verdicts_project"
+            | "audit_verdict_project"
+            | "audit_reviewers_project"
+            | "audit_identities"
+            | "audit_scope_project"
+            | "audit_designations_project"
+            | "audit_digest_project"
+    )
 }
 
 pub(super) enum ActorSource {
@@ -218,6 +300,7 @@ pub(super) fn bearer_for(
     target: &RemoteTarget,
     dir: &Path,
     deadline: Instant,
+    surface: Surface,
     verb: &str,
     operation: Option<&str>,
 ) -> Result<(Credential, ActorSource)> {
@@ -225,6 +308,7 @@ pub(super) fn bearer_for(
         target,
         dir,
         deadline,
+        surface,
         verb,
         operation,
         cli_session_post_detailed,
@@ -235,6 +319,7 @@ fn bearer_for_with(
     target: &RemoteTarget,
     dir: &Path,
     deadline: Instant,
+    surface: Surface,
     verb: &str,
     operation: Option<&str>,
     post: impl FnOnce(
@@ -277,16 +362,8 @@ fn bearer_for_with(
         return Ok((login, ActorSource::HumanLogin));
     };
 
-    if is_human_only_verb(verb, operation) {
-        let remedy = if assistant_login {
-            "re-login via `cadence login` from an authorized human shell"
-        } else {
-            "re-run explicitly with `--as-human` from an authorized human shell"
-        };
-        return Err(reject(format!(
-            "remote `{verb}` requires human/owner authority and is refused in assistant/agent \
-             CLI mode — {remedy}. Nothing was sent"
-        )));
+    if !is_assistant_allowed_call(surface, verb, operation) {
+        return Err(non_human_authority_refusal(verb, assistant_login));
     }
 
     let path = cache_path(dir, target, &mode)?;
@@ -673,17 +750,49 @@ mod tests {
     }
 
     #[test]
-    fn human_only_verbs_cover_owner_surfaces_and_connections() {
-        assert!(is_human_only_verb("settings_agents", None));
-        assert!(is_human_only_verb("audit_approve", None));
-        assert!(is_human_only_verb("delivery_enqueue", None));
-        assert!(is_human_only_verb("team_invite", None));
-        assert!(is_human_only_verb(
+    fn allowlist_permits_board_and_wiki_verbs_and_denies_owner_and_unknown_verbs() {
+        assert!(is_assistant_allowed_call(Surface::Cli, "issue_show", None));
+        assert!(is_assistant_allowed_call(Surface::Wiki, "write", None));
+        assert!(is_assistant_allowed_call(
+            Surface::Cli,
+            "platform_call",
+            Some("call")
+        ));
+        assert!(!is_assistant_allowed_call(
+            Surface::Cli,
+            "settings_agents",
+            None
+        ));
+        assert!(!is_assistant_allowed_call(
+            Surface::Cli,
+            "audit_approve",
+            None
+        ));
+        assert!(!is_assistant_allowed_call(
+            Surface::Cli,
+            "delivery_enqueue",
+            None
+        ));
+        assert!(!is_assistant_allowed_call(
+            Surface::Cli,
+            "team_invite",
+            None
+        ));
+        assert!(!is_assistant_allowed_call(
+            Surface::Cli,
             "platform_call",
             Some("connection_start")
         ));
-        assert!(!is_human_only_verb("issue_show", None));
-        assert!(!is_human_only_verb("platform_call", Some("call")));
+        assert!(!is_assistant_allowed_call(
+            Surface::Cli,
+            "platform_call",
+            Some("whatsapp_connect")
+        ));
+        assert!(!is_assistant_allowed_call(
+            Surface::Cli,
+            "future_owner_verb",
+            None
+        ));
     }
 
     #[test]
@@ -734,7 +843,8 @@ mod tests {
             &target,
             &dir,
             Instant::now() + AUTH_TIMEOUT,
-            "issue_list",
+            Surface::Cli,
+            "issue_ls",
             None,
         )
         .err()
@@ -746,6 +856,7 @@ mod tests {
             &target,
             &dir,
             Instant::now() + AUTH_TIMEOUT,
+            Surface::Cli,
             "settings_agents",
             None,
         )
@@ -817,7 +928,8 @@ mod tests {
             &target,
             &dir,
             Instant::now() + AUTH_TIMEOUT,
-            "issue_list",
+            Surface::Cli,
+            "issue_ls",
             None,
             |_, iss, path, bearer, body, _| {
                 posts.set(posts.get() + 1);
@@ -859,7 +971,8 @@ mod tests {
             &target,
             &dir,
             Instant::now() + AUTH_TIMEOUT,
-            "issue_list",
+            Surface::Cli,
+            "issue_ls",
             None,
             |_, _, _, _, _, _| panic!("cached actor credential must not mint again"),
         )
@@ -874,7 +987,8 @@ mod tests {
             &target,
             &dir,
             Instant::now() + AUTH_TIMEOUT,
-            "issue_list",
+            Surface::Cli,
+            "issue_ls",
             None,
             |_, _, path, _, body, _| {
                 posts.set(posts.get() + 1);
@@ -919,7 +1033,8 @@ mod tests {
             &target,
             &dir,
             Instant::now() + AUTH_TIMEOUT,
-            "issue_list",
+            Surface::Cli,
+            "issue_ls",
             None,
             |_, _, _, _, _, _| {
                 posts.set(posts.get() + 1);

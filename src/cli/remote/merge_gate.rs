@@ -219,21 +219,20 @@ pub(super) fn merge_gate(
             }
             // The findings are read client-side; `-` is stdin. A verdict
             // without findings is refused before send.
-            let body = match (text, file) {
-                (Some(t), _) => t.clone(),
-                (None, Some(f)) if f.as_os_str() == "-" => io::read_to_string(io::stdin())?,
-                (None, Some(f)) => fs::read_to_string(f).map_err(|e| {
-                    Error::rejected(format!(
-                        "audit verdict --file {}: cannot read it locally: {e}",
-                        f.display()
-                    ))
-                })?,
-                (None, None) => {
-                    return Err(Error::usage(
+            let body =
+                match (text, file) {
+                    (Some(t), _) => t.clone(),
+                    (None, Some(f)) if f.as_os_str() == "-" => io::read_to_string(io::stdin())?,
+                    (None, Some(f)) => fs::read_to_string(f).map_err(|e| {
+                        Error::rejected(format!(
+                            "audit verdict --file {}: cannot read it locally: {e}",
+                            f.display()
+                        ))
+                    })?,
+                    (None, None) => return Err(Error::usage(
                         "a verdict needs its findings — pass --text or --file; nothing was sent",
-                    ));
-                }
-            };
+                    )),
+                };
             if body.trim().is_empty() {
                 return Err(Error::usage(
                     "a verdict needs its findings — nothing was sent",
@@ -599,17 +598,6 @@ pub(super) fn refuse_managed(target: &RemoteTarget, command: &str) -> Result<()>
              Nothing was sent."
         )));
     }
-    let assistant_login = cadence_agent::remote_cli::saved_login_is_assistant_only(target);
-    if cadence_agent::remote_cli::cli_actor_is_non_human() || assistant_login {
-        let remedy = if assistant_login {
-            "re-login via `cadence login` from an authorized human shell"
-        } else {
-            "re-run explicitly with `--as-human` from an authorized human shell"
-        };
-        return Err(Error::rejected(format!(
-            "remote `{command}` requires human/owner authority and is refused in assistant/agent \
-             CLI mode — {remedy}. Nothing was sent."
-        )));
-    }
+    cadence_agent::remote_cli::refuse_non_human_actor(Some(target), command)?;
     Ok(())
 }

@@ -719,7 +719,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                         cadence_agent::remote_auth::logout(&dir)
                     }
                 }
-            };
+            }
         }
         _ => {}
     }
@@ -848,11 +848,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     ) {
         let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), None)? {
             org::Resolved::Remote(target) => target,
-            org::Resolved::Local(_) => {
-                return Err(Error::usage(
-                    "published app lifecycle requires --org <logged-in-workspace>; no local daemon or hosted request was started",
-                ));
-            }
+            org::Resolved::Local(_) => return Err(Error::usage(
+                "published app lifecycle requires --org <logged-in-workspace>; no local daemon or hosted request was started",
+            )),
         };
         return remote::run(
             target,
@@ -872,12 +870,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 "a managed agent cannot administer the human team. A saved login is not team authority. Nothing was sent",
             ));
         }
-        if cadence_agent::remote_cli::cli_actor_is_non_human() {
-            return Err(Error::rejected(
-                "assistant/agent CLI mode cannot administer the human team — re-run explicitly \
-                 with `--as-human` from an authorized human shell. Nothing was sent",
-            ));
-        }
+        cadence_agent::remote_cli::refuse_non_human_actor(None, "team")?;
         let tracker = tracker_pin()?;
         let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
             org::Resolved::Remote(target) => target,
@@ -906,7 +899,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             org::Resolved::Local(_) => {
                 return Err(Error::rejected(
                     "cadence web needs a remote workspace: pass --org <org> for a logged-in workspace; nothing was sent",
-                ));
+                ))
             }
         };
         let local_state = match cli.state_dir.clone() {
