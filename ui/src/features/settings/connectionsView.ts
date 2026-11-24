@@ -367,6 +367,7 @@ export function serviceLabel(providerName: string): string {
     return "AgenticOS";
   if (providerName === "local") return "Local outbox";
   if (providerName === "custom_mcp") return "Custom MCP";
+  if (providerName === "linkedin") return "LinkedIn";
   return providerName;
 }
 

@@ -147,6 +147,13 @@ pub(crate) enum PlatformAction {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Hosted orgs only: list connected-account read/stage tools and usable connection IDs.
+    #[command(name = "connected-tools")]
+    ConnectedTools {
+        /// Optional substring filter over toolkit, slug, or connection name.
+        #[arg(long)]
+        query: Option<String>,
+    },
     /// Call one platform tool through the selected org's gate.
     Call {
         /// The tool name as `platform tools` prints it.
@@ -536,6 +543,11 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
         PlatformAction::Stage { .. } => {
             return Err(Error::rejected(
                 "`platform stage` stages a connected tool for a hosted workspace owner's approval — pass `--org <workspace>`. Nothing was sent",
+            ));
+        }
+        PlatformAction::ConnectedTools { .. } => {
+            return Err(Error::rejected(
+                "`platform connected-tools` is only available on a hosted org (`--org <name>`)",
             ));
         }
         PlatformAction::Status { .. } => {

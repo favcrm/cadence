@@ -237,6 +237,7 @@ equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "loca
   equal(groups[0].label, "AgenticOS", "agenticos_external presents as AgenticOS");
   equal(groups[1].label, "Email (SMTP)", "smtp presents as Email (SMTP)");
   equal(serviceLabel("agenticos"), "AgenticOS", "agenticos presents as AgenticOS");
+  equal(serviceLabel("linkedin"), "LinkedIn", "linkedin presents as LinkedIn");
   equal(serviceLabel("unknown_svc"), "unknown_svc", "unknown provider label is unchanged");
   equal(groups[2].builtin, true, "local group is built-in");
   equal(groups[0].builtin, false, "enrollable group is not built-in");
