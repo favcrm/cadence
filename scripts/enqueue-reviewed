@@ -82,13 +82,14 @@ UNATTESTED_AUTHOR_HINT = (" (changing reviewer identities is the operator's deci
 LOCAL_AUTHOR_ROW_HINT = (" (a note under the author's identity still refuses under --exception, and an "
                          "advisory link does not clear it. The author's own review can never be an advisory; "
                          "only a fresh non-author session's review can)")
-REVIEW_STANDARD_HINT = (" (the review standard is a fresh-session review by a non-author session, "
+REVIEW_STANDARD_HINT = (" (the review standard is a fresh, read-only, non-author session's review, "
                         "and this gate cannot yet tell one from the author under one login. On hosted, "
                         "agents file no verdict: post findings as a PR comment, which is the advisory link "
                         "(AGENTS.md \"Review\"). Routes: workflow-issued rows (dispatch review-standards.yml "
-                        "and review-spec.yml; a cheap first pass on gate, security, schema and release PRs, "
-                        "where fresh-session Opus reviews stay the real review; two rows satisfy other PRs), "
-                        "or --exception --advisory ... until EXCEPTION_ENDS in scripts/delivery-gate)")
+                        "and review-spec.yml; two rows satisfy a two-review ticket), or source reports from "
+                        "separate fresh, read-only sessions per the approved reviewer routing, pinning the "
+                        "full PR head and the resolved model, or --exception --advisory ... until "
+                        "EXCEPTION_ENDS in scripts/delivery-gate)")
 
 # Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
 # AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
