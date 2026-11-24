@@ -472,6 +472,7 @@ export function CustomMcpInspectDrawer({
   const toolsDirty = changedTools.length > 0;
   const guideDirty = guideDraft !== (connection.agent_guide_md ?? "");
   const isOAuth = connection.auth_kind === "oauth" || connection.auth_kind === "oauth_static";
+  const isStandingCatalog = connection.standing_read_profile === "emw_catalog_v1" || connection.standing_read_access === "confirm";
   const hasDrift =
     connection.status === "needs_review" ||
     connection.tools_summary.drifted > 0 ||
@@ -497,6 +498,15 @@ export function CustomMcpInspectDrawer({
     const res = await api.customMcpSync(connection.id);
     onUpdated(res.connection);
     setFeedback({ ok: true, text: t("Tool snapshot synced from remote MCP server.") });
+  });
+
+  const allowCatalogReads = () => runAction("catalog", async () => {
+    if (!Number.isSafeInteger(connection.snapshot_revision) || connection.snapshot_revision <= 0) {
+      throw new Error("Refresh and review the connection before allowing catalog reads.");
+    }
+    const res = await api.customMcpAllowCatalogReads(connection.id, connection.snapshot_revision);
+    onUpdated(res.connection);
+    setFeedback({ ok: true, text: t("Atlas catalog access updated.") });
   });
 
   const saveToolModes = () => {
@@ -603,7 +613,7 @@ export function CustomMcpInspectDrawer({
   };
 
   const submitRevoke = () => {
-    if (!canEdit || !revokeArmed || busyAction) return;
+    if (!canEdit || (!isStandingCatalog && !revokeArmed) || busyAction) return;
     setBusyAction("revoke");
     setFeedback(null);
     void api.customMcpRevoke(connection.id)
@@ -616,9 +626,52 @@ export function CustomMcpInspectDrawer({
 
   const okBanner = feedback?.ok ? <div className="custmcp-ok-banner" role="status">{feedback.text}</div> : null;
 
+  const disconnectControl = canEdit && (
+    <div className="border-t border-ink-700 pt-3 space-y-2">
+      {!revokeOpen ? (
+        <Button size="sm" variant="danger" disabled={busyAction !== null} onClick={() => setRevokeOpen(true)}>{t(isStandingCatalog ? "Disconnect EMW" : "Disconnect server…")}</Button>
+      ) : (
+        <div className="space-y-2">
+          <p className="text-label text-ink-200 break-words">
+            {t(isStandingCatalog ? "Disconnecting stops Atlas from using this catalog connection." : "Disconnecting removes stored credentials and pinned tools for this Custom MCP server immediately.")}
+          </p>
+          {!isStandingCatalog && (
+            <label className="flex items-start gap-2 text-label text-ink-300">
+              <input type="checkbox" checked={revokeArmed} onChange={(e) => setRevokeArmed(e.target.checked)} disabled={busyAction !== null} className="mt-0.5" />
+              <span>{t("I understand disconnecting disables all tools from this server.")}</span>
+            </label>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="danger" loading={busyAction === "revoke"} disabled={(!isStandingCatalog && !revokeArmed) || busyAction !== null} onClick={submitRevoke}>
+              {busyAction === "revoke" ? t("Disconnecting…") : t("Disconnect")}
+            </Button>
+            <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => { setRevokeOpen(false); setRevokeArmed(false); }}>
+              {t("Cancel")}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   const toolsPanel = (
     <div className="space-y-3 min-w-0">
       {okBanner}
+      {isStandingCatalog && (
+        <div className="rounded border border-ink-700 bg-ink-850 px-3 py-2 space-y-2">
+          <p className="text-label font-medium text-ink-100">{t(connection.standing_read_access === "allowed" ? "Connected · Catalog read access" : "EMW catalog access")}</p>
+          <p className="text-micro text-ink-300">{t(connection.standing_read_access === "allowed"
+            ? "Atlas can read the EMW catalog in your chats. Other people, agents and scheduled runs cannot use this access."
+            : "Atlas can use catalog read access only in your chats.")}</p>
+          {canEdit && connection.connected_by_you && connection.standing_read_access === "confirm" && (
+            <>
+              <p className="text-micro text-ink-300">{t("Use your existing sign-in and make this connection personal. Atlas can read the catalog until you disconnect.")}</p>
+              <Button size="sm" variant="primary" loading={busyAction === "catalog"} disabled={busyAction !== null} onClick={() => void allowCatalogReads()}>{t("Allow Atlas catalog reads")}</Button>
+            </>
+          )}
+          {disconnectControl}
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-ink-700 bg-ink-850 px-3 py-2">
         <dl className="text-micro text-ink-300 space-y-0.5 min-w-0">
           <MetaRow label={t("Endpoint")} value={connection.endpoint_url} />
@@ -883,7 +936,7 @@ export function CustomMcpInspectDrawer({
           {connection.oauth_scopes.length > 0 && <MetaRow label={t("Scopes")} value={connection.oauth_scopes.join(" ")} />}
         </dl>
       </div>
-      {canEdit && (
+      {canEdit && (!isStandingCatalog || connection.status === "auth_expired") && (
         <div className="border-t border-ink-700 pt-3 space-y-2.5">
           {isOAuth ? (
             <div className="space-y-2">
@@ -923,31 +976,7 @@ export function CustomMcpInspectDrawer({
           )}
         </div>
       )}
-      {canEdit && (
-        <div className="border-t border-ink-700 pt-3 space-y-2">
-          {!revokeOpen ? (
-            <Button size="sm" variant="danger" disabled={busyAction !== null} onClick={() => setRevokeOpen(true)}>{t("Disconnect server…")}</Button>
-          ) : (
-            <div className="space-y-2">
-              <p className="text-label text-ink-200 break-words">
-                {t("Disconnecting removes stored credentials and pinned tools for this Custom MCP server immediately.")}
-              </p>
-              <label className="flex items-start gap-2 text-label text-ink-300">
-                <input type="checkbox" checked={revokeArmed} onChange={(e) => setRevokeArmed(e.target.checked)} disabled={busyAction !== null} className="mt-0.5" />
-                <span>{t("I understand disconnecting disables all tools from this server.")}</span>
-              </label>
-              <div className="flex flex-wrap gap-2">
-                <Button size="sm" variant="danger" loading={busyAction === "revoke"} disabled={!revokeArmed || busyAction !== null} onClick={() => void submitRevoke()}>
-                  {busyAction === "revoke" ? t("Disconnecting…") : t("Disconnect")}
-                </Button>
-                <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => { setRevokeOpen(false); setRevokeArmed(false); }}>
-                  {t("Cancel")}
-                </Button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      {!isStandingCatalog && disconnectControl}
     </div>
   );
 
