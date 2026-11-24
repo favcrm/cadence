@@ -66,21 +66,35 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   return json({});
 }) as typeof fetch;
 
-const flush = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+// The arming delay runs on a controlled clock: the card's ARM_MS timer is
+// captured, and `arm()` advances Date.now and fires it. No wall-clock sleeps.
+const { ARM_MS } = require("../src/features/decisions/StagedWriteDetail") as typeof import("../src/features/decisions/StagedWriteDetail");
+const realNow = Date.now.bind(Date), realSetTimeout = globalThis.setTimeout;
+let skew = 0;
+Date.now = () => realNow() + skew;
+const armTimers: Array<() => void> = [];
+globalThis.setTimeout = ((fn: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+  if (ms === ARM_MS) { armTimers.push(() => fn(...rest)); return 0; }
+  return realSetTimeout(fn, ms, ...rest);
+}) as typeof setTimeout;
+async function arm() {
+  skew += ARM_MS;
+  await React.act(async () => { for (const fire of armTimers.splice(0)) fire(); });
+}
+/** Yield one macrotask so fetches resolve and React commits. */
+const flush = () => React.act(async () => { await new Promise((resolve) => realSetTimeout(resolve, 0)); });
+/** Wait for the condition; the iteration bound is only a loud failure safeguard. */
 async function settle(check: () => void) {
-  for (let i = 0; i < 80; i++) {
-    await flush();
-    await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 12)); });
-    try { check(); return; } catch { /* keep polling */ }
+  for (let i = 0; i < 200; i++) {
+    try { check(); return; } catch { await flush(); }
   }
   check();
 }
 const text = (el: Element | null | undefined) => (el?.textContent ?? "").replace(/[\u2066-\u2069]/g, "").replace(/\s+/g, " ").trim();
 const button = (host: Element, label: string) => Array.from(host.querySelectorAll("button")).find((b) => text(b) === label) as HTMLElement | undefined;
-const sleep = (ms: number) => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); });
 async function click(el: Element | undefined | null, quick = false) {
   assert(el, "click target exists");
-  if (!quick && (text(el) === "Approve" || text(el) === "Always allow")) await sleep(850);
+  if (!quick && (text(el) === "Approve" || text(el) === "Always allow")) await arm();
   await React.act(async () => { el.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 } as any)); });
   await flush();
 }
