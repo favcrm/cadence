@@ -26,6 +26,7 @@ claudedocs/
 # manifest). Every tracked document needs its own negation here: a tracked
 # file keeps working, but a delete-and-readd silently drops it otherwise.
 docs/*
+!docs/ACCEPTANCE.md
 !docs/ARCHITECTURE.md
 !docs/AUDIT.md
 !docs/BOARD.md
