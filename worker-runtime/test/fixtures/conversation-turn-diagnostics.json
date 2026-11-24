@@ -2,8 +2,8 @@
   "toolFailure": {
     "events": [
       { "kind": "input", "at": null, "messageId": "operation-1" },
-      { "kind": "tool_call", "at": null, "toolName": "lookup_audit_catalog", "toolUseId": "lookup-1" },
-      { "kind": "tool_result", "at": null, "toolUseId": "lookup-1", "outcome": "error" },
+      { "kind": "tool_call", "at": null, "toolName": "lookup_audit_catalog", "toolUseId": "lookup:1" },
+      { "kind": "tool_result", "at": null, "toolUseId": "lookup:1", "outcome": "error" },
       { "kind": "response_finished", "at": null, "model": "default", "reason": "stop" }
     ],
     "nextBefore": null

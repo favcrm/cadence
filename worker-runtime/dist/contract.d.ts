@@ -439,6 +439,9 @@ export type HostedTurnDiagnosticEvent = {
     kind: "response_finished";
     model: string | null;
     reason: "stop" | "length";
+} | {
+    kind: "evidence_gap";
+    code: "record_too_large" | "too_many_events" | "identifier_unavailable";
 });
 export interface HostedTurnDiagnosticsPage {
     events: HostedTurnDiagnosticEvent[];

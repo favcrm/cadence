@@ -130,3 +130,46 @@ export function readSessionBounds(
     return null;
   }
 }
+
+/**
+ * Diagnostics needs only identity and a reset window, not the summary's
+ * first/last activity or run scans. Bound the partial-index head candidates
+ * before inspecting their records. Too much head evidence fails closed.
+ */
+export function readBoundedDiagnosticWindow(
+  sql: TaskSql,
+  objectId: string,
+  sessionId: string,
+): { anchor: number; upper: number } | null {
+  const prefix = `${objectId}:`;
+  if (!sessionId.startsWith(prefix)) return null;
+  const suffix = sessionId.slice(prefix.length);
+  const anchor = Number(suffix);
+  if (!Number.isSafeInteger(anchor) || anchor < 0 || String(anchor) !== suffix) return null;
+  const maxHeadBytes = 128 * 1024;
+  const maxHeads = 64;
+  try {
+    if (anchor !== 0 && !sql.exec(
+      `SELECT id FROM pi_entries WHERE conversation_id=? AND id=? AND head=id
+       AND CASE WHEN length(CAST(record AS BLOB)) <= ? THEN json_extract(record, '$.kind') END = ?`,
+      ROOT_CONVERSATION_ID, anchor, maxHeadBytes, RESET_KIND,
+    ).toArray()[0]) return null;
+
+    const heads = sql.exec(
+      `SELECT id, head, CASE WHEN head=id AND length(CAST(record AS BLOB)) <= ?
+           THEN json_extract(record, '$.kind') END AS kind
+       FROM pi_entries INDEXED BY pi_entry_heads_by_conversation
+       WHERE conversation_id=? AND id>? AND head IS NOT NULL ORDER BY id LIMIT ?`,
+      maxHeadBytes, ROOT_CONVERSATION_ID, anchor, maxHeads + 1,
+    ).toArray();
+    for (const row of heads) {
+      if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || row.id <= anchor) return null;
+      if (row.head !== row.id) continue;
+      if (typeof row.kind !== "string") return null;
+      if (row.kind === RESET_KIND) return { anchor, upper: row.id - 1 };
+    }
+    return heads.length > maxHeads ? null : { anchor, upper: MAX_ID };
+  } catch {
+    return null;
+  }
+}

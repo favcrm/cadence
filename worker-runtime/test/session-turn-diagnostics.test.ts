@@ -12,7 +12,7 @@ it("distinguishes a failed tool from a failed model across a reset without retur
   const run = await session((requests) => {
     if (requests.length === 1) return new Response(
       chunk({ role: "assistant", content: "" }) + chunk({ tool_calls: [{
-        index: 0, id: "lookup-1", type: "function",
+        index: 0, id: "lookup:1", type: "function",
         function: { name: "lookup_audit_catalog", arguments: '{"query":"private-tool-argument"}' },
       }] }) + chunk({}, "tool_calls") + "data: [DONE]\n\n",
       { headers: { "content-type": "text/event-stream" } },
@@ -65,4 +65,35 @@ it("pages older evidence without skipping turns and rejects a cursor from a diff
   const after = run.hosted.sessionSummary();
   if (after.state !== "observed") throw new Error("missing newer generation");
   expect(run.hosted.sessionTurnDiagnostics(after.session.sessionId, head.nextBefore)).toBeNull();
+});
+
+it("bounds sparse pages even when no diagnostic events appear in the newest stored records", async () => {
+  const run = await session(() => answer("private-answer-text"));
+  await (await run.submit("private-user-text")).wait(BACKGROUND_CONTEXT);
+  const summary = run.hosted.sessionSummary();
+  if (summary.state !== "observed") throw new Error("missing generation");
+  for (let i = 0; i < 25; i++) await run.writeRecord({
+    kind: "private.note",
+    data: { text: "private sparse record" },
+  });
+  const newest = run.hosted.sessionTurnDiagnostics(summary.session.sessionId);
+  expect(newest?.events).toEqual([]);
+  if (newest?.nextBefore == null) throw new Error("the empty window must still advance");
+  expect(run.hosted.sessionTurnDiagnostics(summary.session.sessionId, newest.nextBefore)?.events)
+    .toContainEqual({ kind: "input", at: expect.any(Number), messageId: "operation-1" });
+});
+
+it("reports a bounded evidence gap without discarding other turns", async () => {
+  const run = await session(() => answer("private-answer-text"));
+  await (await run.submit("private-user-text")).wait(BACKGROUND_CONTEXT);
+  const summary = run.hosted.sessionSummary();
+  if (summary.state !== "observed") throw new Error("missing generation");
+  await run.writeRecord({
+    kind: "private.note",
+    data: { text: "private oversize content ".repeat(10_000) },
+  });
+  const page = run.hosted.sessionTurnDiagnostics(summary.session.sessionId);
+  expect(page?.events.map(({ kind }) => kind)).toEqual(["input", "response_finished", "evidence_gap"]);
+  expect(page?.events.at(-1)).toEqual({ kind: "evidence_gap", at: null, code: "record_too_large" });
+  expect(JSON.stringify(page)).not.toContain("private oversize content");
 });

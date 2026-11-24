@@ -57261,6 +57261,39 @@ function readSessionBounds(sql, objectId, sessionId) {
     return null;
   }
 }
+function readBoundedDiagnosticWindow(sql, objectId, sessionId) {
+  const prefix = `${objectId}:`;
+  if (!sessionId.startsWith(prefix))
+    return null;
+  const suffix = sessionId.slice(prefix.length);
+  const anchor = Number(suffix);
+  if (!Number.isSafeInteger(anchor) || anchor < 0 || String(anchor) !== suffix)
+    return null;
+  const maxHeadBytes = 128 * 1024;
+  const maxHeads = 64;
+  try {
+    if (anchor !== 0 && !sql.exec(`SELECT id FROM pi_entries WHERE conversation_id=? AND id=? AND head=id
+       AND CASE WHEN length(CAST(record AS BLOB)) <= ? THEN json_extract(record, '$.kind') END = ?`, ROOT_CONVERSATION_ID, anchor, maxHeadBytes, RESET_KIND).toArray()[0])
+      return null;
+    const heads = sql.exec(`SELECT id, head, CASE WHEN head=id AND length(CAST(record AS BLOB)) <= ?
+           THEN json_extract(record, '$.kind') END AS kind
+       FROM pi_entries INDEXED BY pi_entry_heads_by_conversation
+       WHERE conversation_id=? AND id>? AND head IS NOT NULL ORDER BY id LIMIT ?`, maxHeadBytes, ROOT_CONVERSATION_ID, anchor, maxHeads + 1).toArray();
+    for (const row of heads) {
+      if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || row.id <= anchor)
+        return null;
+      if (row.head !== row.id)
+        continue;
+      if (typeof row.kind !== "string")
+        return null;
+      if (row.kind === RESET_KIND)
+        return { anchor, upper: row.id - 1 };
+    }
+    return heads.length > maxHeads ? null : { anchor, upper: MAX_ID };
+  } catch {
+    return null;
+  }
+}
 
 // src/session-transcript.ts
 var VISIBLE = `(json_extract(record, '$.kind') = 'pi.assistant' OR
@@ -57324,33 +57357,49 @@ function readSessionTranscript(sql, objectId, sessionId, after, project) {
 }
 
 // src/session-turn-diagnostics.ts
+import { createHash as createHash2 } from "node:crypto";
 var PAGE_RECORDS2 = 24;
 var MAX_EVENTS = 100;
 var MAX_MODEL_MESSAGES = 4;
-var IDENTIFIER = /^[A-Za-z0-9_.-]{1,160}$/;
+var MAX_RECORD_BYTES2 = 128 * 1024;
+var IDENTIFIER = /^[A-Za-z0-9_.:-]{1,200}$/;
 var MODEL = /^[A-Za-z0-9_-][A-Za-z0-9_./:-]{0,159}$/;
-var SOURCE = `(json_extract(record, '$.kind') IN ('pi.assistant', 'pi.tool-result') OR
-  (json_extract(record, '$.kind') = ? AND json_extract(record, '$.data.transcriptRole') = 'operator'))`;
-function identifier(value) {
-  return typeof value === "string" && IDENTIFIER.test(value) ? value : null;
+function toolReference(value) {
+  if (typeof value !== "string" || value.length === 0)
+    return null;
+  if (IDENTIFIER.test(value))
+    return value;
+  return `$sha256:${createHash2("sha256").update("cadence.diagnostics.tool-use/v1\x00").update(JSON.stringify(value)).digest("hex")}`;
+}
+function gap(code) {
+  return { kind: "evidence_gap", at: null, code };
 }
 function timestamp(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000 ? value : null;
 }
 function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
-  const bounds = readSessionBounds(sql, objectId, sessionId);
+  const bounds = readBoundedDiagnosticWindow(sql, objectId, sessionId);
   if (bounds === null)
     return null;
   try {
     if (before !== undefined) {
       if (!Number.isSafeInteger(before) || before <= bounds.anchor || before > bounds.upper)
         return null;
-      if (!sql.exec(`SELECT id FROM pi_entries WHERE conversation_id=? AND id=? AND ${SOURCE} LIMIT 1`, ROOT_CONVERSATION_ID, before, BOARD_MESSAGE_KIND).toArray()[0])
+      if (!sql.exec("SELECT id FROM pi_entries WHERE conversation_id=? AND id=?", ROOT_CONVERSATION_ID, before).toArray()[0])
         return null;
     }
-    const rows = sql.exec(`SELECT id, json_extract(record, '$.kind') AS kind,
-         substr(json_extract(record, '$.data.messageId'), 1, 161) AS messageId,
+    const rows = sql.exec(`WITH candidates AS MATERIALIZED (
+         SELECT id, CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record END AS record
+         FROM pi_entries INDEXED BY pi_entries_by_conversation
+         WHERE conversation_id=? AND id>? AND id<=? ORDER BY id DESC LIMIT ?
+       )
+       SELECT id, record IS NULL AS oversized,
+         CASE WHEN json_extract(record,'$.kind') = ?
+           AND json_extract(record,'$.data.transcriptRole') = 'operator' THEN 1 ELSE 0 END AS isInput,
+         CASE WHEN json_type(record, '$.data.messageId')='text'
+           THEN substr(json_extract(record, '$.data.messageId'), 1, 201) END AS messageId,
          json_extract(record, '$.model[0].timestamp') AS inputAt,
+         CASE WHEN json_extract(record, '$.kind') IN ('pi.assistant', 'pi.tool-result') THEN
          (SELECT json_group_array(json(evidence)) FROM (
            SELECT json_object(
              'role', json_extract(m.value, '$.role'),
@@ -57359,13 +57408,13 @@ function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
              'stop', json_extract(m.value, '$.stopReason'),
              'error', CASE WHEN json_extract(m.value, '$.stopReason')='error'
                THEN substr(json_extract(m.value, '$.errorMessage'), 1, 4096) END,
-             'toolUseId', substr(json_extract(m.value, '$.toolCallId'), 1, 161),
+             'toolUseId', json_extract(m.value, '$.toolCallId'),
              'isError', json_extract(m.value, '$.isError'),
              'calls', json(CASE WHEN json_extract(m.value, '$.role')='assistant' THEN (
                SELECT json_group_array(json(call)) FROM (
                  SELECT json_object(
-                   'name', substr(json_extract(p.value, '$.name'), 1, 161),
-                   'id', substr(json_extract(p.value, '$.id'), 1, 161)
+                   'name', substr(json_extract(p.value, '$.name'), 1, 201),
+                   'id', json_extract(p.value, '$.id')
                  ) AS call FROM json_each(m.value, '$.content') p
                  WHERE p.type='object' AND json_extract(p.value, '$.type')='toolCall'
                  ORDER BY p.key LIMIT ?
@@ -57374,11 +57423,10 @@ function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
            ) AS evidence FROM json_each(record, '$.model') m
            WHERE m.type='object' AND json_extract(m.value, '$.role') IN ('assistant', 'toolResult')
            ORDER BY m.key LIMIT ?
-         )) AS evidence
-       FROM (
-         SELECT id, record FROM pi_entries WHERE conversation_id=? AND id>? AND id<=?
-           AND ${SOURCE} ORDER BY id DESC LIMIT ?
-       ) ORDER BY id DESC`, MAX_EVENTS + 1, MAX_MODEL_MESSAGES + 1, ROOT_CONVERSATION_ID, bounds.anchor, before === undefined ? bounds.upper : before - 1, BOARD_MESSAGE_KIND, PAGE_RECORDS2 + 1).toArray();
+         )) ELSE '[]' END AS evidence
+       FROM candidates ORDER BY id DESC`, MAX_RECORD_BYTES2, ROOT_CONVERSATION_ID, bounds.anchor, before === undefined ? bounds.upper : before - 1, PAGE_RECORDS2 + 1, BOARD_MESSAGE_KIND, MAX_EVENTS + 1, MAX_MODEL_MESSAGES + 1).toArray();
+    if (bounds.anchor === 0 && before === undefined && rows.length === 0)
+      return null;
     const groups = [];
     let eventCount = 0;
     let oldest = null;
@@ -57386,36 +57434,41 @@ function readSessionTurnDiagnostics(sql, objectId, sessionId, before) {
       const row = rows[i];
       if (typeof row.id !== "number" || !Number.isSafeInteger(row.id) || typeof row.evidence !== "string")
         return null;
-      const group = [];
-      const messageId = row.kind === BOARD_MESSAGE_KIND ? identifier(row.messageId) : null;
-      if (messageId !== null)
-        group.push({ kind: "input", at: timestamp(row.inputAt), messageId });
-      const evidence = JSON.parse(row.evidence);
-      if (evidence.length > MAX_MODEL_MESSAGES)
-        return null;
-      for (const entry of evidence) {
-        const at = timestamp(entry.at);
-        if (entry.role === "toolResult") {
-          const toolUseId = identifier(entry.toolUseId);
-          if (toolUseId !== null)
-            group.push({ kind: "tool_result", at, toolUseId, outcome: entry.isError === 1 ? "error" : "ok" });
-          continue;
-        }
-        if (entry.calls.length > MAX_EVENTS)
-          return null;
-        for (const call of entry.calls) {
-          const toolName = identifier(call.name);
-          const toolUseId = identifier(call.id);
-          if (toolName !== null && toolUseId !== null)
-            group.push({ kind: "tool_call", at, toolName, toolUseId });
-        }
-        const model = typeof entry.model === "string" && MODEL.test(entry.model) && !entry.model.includes("://") ? entry.model : null;
-        if (entry.stop === "error") {
-          group.push({ kind: "model_error", at, model, code: modelDiagnosticCode(entry.error ?? undefined) });
-        } else if (entry.stop === "stop" || entry.stop === "length") {
-          group.push({ kind: "response_finished", at, model, reason: entry.stop });
+      let group = [];
+      if (row.oversized === 1)
+        group.push(gap("record_too_large"));
+      if (row.isInput === 1) {
+        try {
+          group.push({ kind: "input", at: timestamp(row.inputAt), messageId: requireOperationId(row.messageId) });
+        } catch {
+          group.push(gap("identifier_unavailable"));
         }
       }
+      const evidence = JSON.parse(row.evidence);
+      if (evidence.length > MAX_MODEL_MESSAGES || evidence.some((entry) => entry.calls.length > MAX_EVENTS)) {
+        group = [gap("too_many_events")];
+      } else
+        for (const entry of evidence) {
+          const at = timestamp(entry.at);
+          if (entry.role === "toolResult") {
+            const toolUseId = toolReference(entry.toolUseId);
+            group.push(toolUseId === null ? gap("identifier_unavailable") : { kind: "tool_result", at, toolUseId, outcome: entry.isError === 1 ? "error" : "ok" });
+            continue;
+          }
+          for (const call of entry.calls) {
+            const toolName = typeof call.name === "string" && IDENTIFIER.test(call.name) ? call.name : null;
+            const toolUseId = toolReference(call.id);
+            group.push(toolName === null || toolUseId === null ? gap("identifier_unavailable") : { kind: "tool_call", at, toolName, toolUseId });
+          }
+          const model = typeof entry.model === "string" && MODEL.test(entry.model) && !entry.model.includes("://") ? entry.model : null;
+          if (entry.stop === "error") {
+            group.push({ kind: "model_error", at, model, code: modelDiagnosticCode(entry.error ?? undefined) });
+          } else if (entry.stop === "stop" || entry.stop === "length") {
+            group.push({ kind: "response_finished", at, model, reason: entry.stop });
+          }
+        }
+      if (group.length > MAX_EVENTS)
+        group = [gap("too_many_events")];
       if (eventCount + group.length > MAX_EVENTS) {
         if (oldest === null)
           return null;

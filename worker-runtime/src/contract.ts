@@ -464,6 +464,7 @@ export type HostedTurnDiagnosticEvent = { at: number | null } & (
   | { kind: "tool_result"; toolUseId: string; outcome: "ok" | "error" }
   | { kind: "model_error"; model: string | null; code: HostedModelDiagnosticCode }
   | { kind: "response_finished"; model: string | null; reason: "stop" | "length" }
+  | { kind: "evidence_gap"; code: "record_too_large" | "too_many_events" | "identifier_unavailable" }
 );
 
 export interface HostedTurnDiagnosticsPage {
